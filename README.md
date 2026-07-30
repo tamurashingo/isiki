@@ -45,3 +45,10 @@ Copyright (c) 2018-2026, Frederic Cambus
 
 see [LICENSE](./assets/fonts/LICENSE)
 
+## 開発状況
+
+- UEFIを使ったhello world
+- キー入力結果を画面に表示(GOP)
+
+![screenshot](./documents/images/version_0_0_0.png)
+
