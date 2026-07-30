@@ -1,11 +1,8 @@
+#include "types.h"
+#include "kernel.h"
+
 #define EFIAPI __attribute__((ms_abi))
 
-typedef unsigned char UINT8;
-typedef unsigned short CHAR16;
-typedef unsigned short UINT16;
-typedef unsigned int UINT32;
-typedef unsigned long long UINT64;
-typedef unsigned long long UINTN;
 typedef long long EFI_STATUS;
 typedef void *EFI_HANDLE;
 
@@ -67,6 +64,17 @@ typedef EFI_STATUS (EFIAPI *EFI_GET_MEMORY_MAP)(
     UINT32 *DescriptorVersion
 );
 
+typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(
+    EFI_HANDLE ImageHandle,
+    UINTN MapKey
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(
+    EFI_GUID *Protocol,
+    void *Registration,
+    void **Interface
+);
+
 
 typedef struct _EFI_BOOT_SERVICES {
     EFI_TABLE_HEADER Hdr;
@@ -101,7 +109,7 @@ typedef struct _EFI_BOOT_SERVICES {
     void *StartImage;
     void *Exit;
     void *UnloadImage;
-    void *ExitBootServices;
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;
 
     void *GetNextMonotonicCount;
     void *Stall;
@@ -116,7 +124,7 @@ typedef struct _EFI_BOOT_SERVICES {
 
     void *ProtocolsPerHandle;
     void *LocateHandleBuffer;
-    void *LocateProtocol;
+    EFI_LOCATE_PROTOCOL LocateProtocol;
 } EFI_BOOT_SERVICES;
 
 
@@ -146,6 +154,52 @@ typedef struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
     void *WaitForKey;
 } EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
 
+
+typedef enum {
+    PixelRedGreenBlueReserved8BitPerColor,
+    PixelBlueGreenRedReserved8BitPerColor,
+    PixelBitMask,
+    PixelBltOnly,
+    PixelFormatMax
+} EFI_GRAPHICS_PIXEL_FORMAT;
+
+typedef struct {
+    UINT32 RedMask;
+    UINT32 GreenMask;
+    UINT32 BlueMask;
+    UINT32 ReservedMask;
+} EFI_PIXEL_BITMASK;
+
+
+typedef struct {
+    UINT32 Version;
+    UINT32 HorizontalResolution;
+    UINT32 VerticalResolution;
+    EFI_GRAPHICS_PIXEL_FORMAT PixelFormat;
+    EFI_PIXEL_BITMASK PixelInformation;
+    UINT32 PixelPerScanLine;
+} EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+
+typedef struct {
+    UINT32 MaxMode;
+    UINT32 Mode;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info;
+    UINTN SizeOfInfo;
+    UINT64 FrameBufferBase;
+    UINTN FrameBufferSize;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
+
+
+typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
+    void *QueryMode;
+    void *SetMode;
+    void *Blt;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+static EFI_GUID gEfiGraphicsOutputProtocolGuid = {
+    0x9042a9de, 0x23dc, 0x4a38, {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}
+};
 
 char memory_map_buffer[1024 * 256];
 
@@ -232,7 +286,49 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         }
     }
    
+    // GOP frame buffer
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = (void *)0;
+    status = SystemTable->BootServices->LocateProtocol(&gEfiGraphicsOutputProtocolGuid, (void *)0, (void **)&gop);
 
-    for (;;) {
+    if (status != 0) {
+        CHAR16 hex_status[20];
+        UINT64ToHexStr((UINT64)status, hex_status);
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, L"Failed to locate GOP. Status: ");
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, hex_status);
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, L"\r\n");
+        for (;;) {
+        }
     }
+
+    UINT64 fb_base = gop->Mode->FrameBufferBase;
+    UINT32 fb_width = gop->Mode->Info->HorizontalResolution;
+    UINT32 fb_height = gop->Mode->Info->VerticalResolution;
+    UINT32 fb_pixels_per_scanline = gop->Mode->Info->PixelPerScanLine;
+
+    memory_map_size = sizeof(memory_map_buffer);
+    status = SystemTable->BootServices->GetMemoryMap(
+        &memory_map_size, memory_map, &map_key, &descriptor_size, &descriptor_version
+    );
+    if (status != 0) {
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, L"Failed to refresh Memory Map before ExitBootServices.\r\n");
+        for (;;) {
+        }
+    }
+
+    status = SystemTable->BootServices->ExitBootServices(ImageHandle, map_key);
+
+    if (status != 0) {
+        CHAR16 hex_status[20];
+        UINT64ToHexStr((UINT64)status, hex_status);
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, L"Failed to ExitBootServices. Status: ");
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, hex_status);
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, L"\r\n");
+        for (;;) {
+        }
+    }
+
+
+    kernel_main(fb_base, fb_width, fb_height, fb_pixels_per_scanline, heap_start, max_free_size);
+
+    return 0;
 }

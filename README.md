@@ -24,7 +24,7 @@ UEFIからブートした直後の真っ暗なベアメタル空間にLispラン
 - **ターゲット言語:** ISLisp
 
 ## 開発のロードマップ
-- [ ] UEFIブートおよびGOP（Graphics Output Protocol）によるコンソール出力の確立
+- [x] UEFIブートおよびGOP（Graphics Output Protocol）によるコンソール出力の確立
 - [ ] `%%` レイヤー（物理I/O、生ポインタ・タグメモリ制御）の実装
 - [ ] ISLisp準拠のコアランタイム・GCの移植
 - [ ] ベアメタル上でのREPLの起動および自己ブートストラップ環境の構築
@@ -36,4 +36,12 @@ UEFIからブートした直後の真っ暗なベアメタル空間にLispラン
 
 ## ライセンス
 [MIT License](LICENSE)
+
+## Third Party License
+
+### Spleen Font
+Spleen is released under the BSD 2-Clause license.
+Copyright (c) 2018-2026, Frederic Cambus
+
+see [LICENSE](./assets/fonts/LICENSE)
 
