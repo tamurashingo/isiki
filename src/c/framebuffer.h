@@ -4,6 +4,13 @@
 #include "types.h"
 
 
+/** 仮想バッファの数(F1〜F4に割り当てる) */
+#define VBUF_COUNT 4
+/** 仮想バッファが保持できる文字グリッドの最大列数・行数 */
+#define VBUF_MAX_COLS 256
+#define VBUF_MAX_ROWS 128
+
+
 typedef struct _frame_buffer {
     volatile UINT32 *buffer;
     UINT32 width;
@@ -15,6 +22,12 @@ typedef struct _frame_buffer {
         UINT32 x;
         UINT32 y;
     } cursor_position;
+
+    /**
+     * この仮想バッファに表示されている文字の内容。
+     * 非アクティブな間もここに保持され、アクティブになった際に画面へ再描画される。
+     */
+    UINT8 content[VBUF_MAX_ROWS][VBUF_MAX_COLS];
 
 
     /**
@@ -68,14 +81,26 @@ typedef struct _frame_buffer {
 
 
 /**
- * frame bufferを初期化する
- * @param base 書き込み先のframe bufferのアドレス
+ * VBUF_COUNT個の仮想frame bufferを初期化する
+ * @param base 書き込み先のframe bufferのアドレス(全バッファ共通の物理アドレス)
  * @param width 横幅
  * @param height 高さ
  * @param pixels_per_scanline 1行のピクセル数
- * @return 初期化したframe bufferのアドレス。現在は g_frame_buffer のアドレス
+ * @return 初期状態でアクティブなバッファ(index 0)のアドレス
  */
-frame_buffer* initialize_frame_buffer(UINT64 base, UINT32 width, UINT32 height, UINT32 pixels_per_scanlien);
+frame_buffer* initialize_virtual_buffers(UINT64 base, UINT32 width, UINT32 height, UINT32 pixels_per_scanline);
+
+/**
+ * 現在アクティブな仮想frame bufferを返す
+ * @return 現在アクティブな仮想frame buffer
+ */
+frame_buffer* get_active_frame_buffer(void);
+
+/**
+ * アクティブな仮想frame bufferを切り替え、画面を再描画する
+ * @param index 切り替え先のバッファ番号(0〜VBUF_COUNT-1)
+ */
+void switch_active_frame_buffer(UINT32 index);
 
 
 #endif /* _FRAMEBUFFER_H_ */

@@ -1,3 +1,5 @@
 esp_dir/
+tmp/
 .DS_Store
+*.swp
 
