@@ -107,6 +107,18 @@ void test_os_make_symbol() {
     assert(sym2 != sym4, "Foo と SYMBOL は違う symbol");
 }
 
+void test_os_make_symbol_prefix_is_not_confused() {
+    // 先にinternした短い名前が、後からinternする長い名前のprefixになっている場合でも
+    // 別のsymbolとして扱われることを確認する(UNQUOTE / UNQUOTE-SPLICINGで実際に踏んだ回帰)
+    lisp_val_t shorter = os_make_symbol("UNQUOTE");
+    lisp_val_t longer = os_make_symbol("UNQUOTE-SPLICING");
+
+    assert(shorter != longer, "UNQUOTEとUNQUOTE-SPLICINGは違うsymbolになる");
+
+    lisp_val_t longer_again = os_make_symbol("UNQUOTE-SPLICING");
+    assert(longer == longer_again, "UNQUOTE-SPLICINGを2回internすると同じsymbolが返る");
+}
+
 
 void test_os_get_variable() {
     lisp_val_t base_env = os_make_environment(os_make_symbol("BASE-ENV"), nil);
@@ -172,6 +184,7 @@ int main(int argc, char** argv) {
    test_os_make_char();
    test_os_make_string();
    test_os_make_symbol();
+   test_os_make_symbol_prefix_is_not_confused();
    test_os_get_variable();
    test_os_get_function();
 

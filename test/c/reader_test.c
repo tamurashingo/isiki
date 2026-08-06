@@ -185,6 +185,59 @@ void test_os_read_quote() {
     assert(cc_cdr(cc_cdr(v)) == nil, "'fooのcddrはnil");
 }
 
+void test_os_read_quasiquote() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "`foo");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == g_sym_quasiquote, "`fooのcarはquasiquote");
+    assert(cc_car(cc_cdr(v)) == os_make_symbol("foo"), "`fooのcadrはsymbol foo");
+    assert(cc_cdr(cc_cdr(v)) == nil, "`fooのcddrはnil");
+}
+
+void test_os_read_unquote() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, ",foo");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == g_sym_unquote, ",fooのcarはunquote");
+    assert(cc_car(cc_cdr(v)) == os_make_symbol("foo"), ",fooのcadrはsymbol foo");
+    assert(cc_cdr(cc_cdr(v)) == nil, ",fooのcddrはnil");
+}
+
+void test_os_read_unquote_splicing() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, ",@foo");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == g_sym_unquote_splicing, ",@fooのcarはunquote-splicing");
+    assert(cc_car(cc_cdr(v)) == os_make_symbol("foo"), ",@fooのcadrはsymbol foo");
+    assert(cc_cdr(cc_cdr(v)) == nil, ",@fooのcddrはnil");
+}
+
+void test_os_read_quasiquote_with_unquote_in_list() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "`(a ,b ,@c)");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == g_sym_quasiquote, "`(...)のcarはquasiquote");
+
+    lisp_val_t list = cc_car(cc_cdr(v));
+    assert(cc_car(list) == os_make_symbol("a"), "リストの1番目はsymbol a");
+
+    lisp_val_t unquote_form = cc_car(cc_cdr(list));
+    assert(cc_car(unquote_form) == g_sym_unquote, "リストの2番目は(unquote b)");
+    assert(cc_car(cc_cdr(unquote_form)) == os_make_symbol("b"), "(unquote b)のcadrはsymbol b");
+
+    lisp_val_t splicing_form = cc_car(cc_cdr(cc_cdr(list)));
+    assert(cc_car(splicing_form) == g_sym_unquote_splicing, "リストの3番目は(unquote-splicing c)");
+    assert(cc_car(cc_cdr(splicing_form)) == os_make_symbol("c"), "(unquote-splicing c)のcadrはsymbol c");
+}
+
 void test_os_read_multiple_expr_per_line() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
@@ -250,6 +303,49 @@ void test_os_read_multiline_list() {
     assert(g_next_line_index == 1, "1回だけ次の行が注入される");
 }
 
+void test_os_read_line_comment_only() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "; this is a comment\n");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == nil, "コメントのみの行ではnilが返る");
+}
+
+void test_os_read_comment_after_expr() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "42 ; the answer\n");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(42), "式の後の';'以降はコメントとして無視され42が読める");
+}
+
+void test_os_read_comment_immediately_after_token() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "42;comment\n");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(42), "空白を挟まない';'もトークンの区切りとしてコメント扱いされる");
+}
+
+void test_os_read_multiline_list_with_comment_line() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    clear_next_lines();
+    push_string(proc, "(defun foo (x)\n");
+    queue_next_line("  ; コメント行\n");
+    queue_next_line("  (+ x 1))\n");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == os_make_symbol("defun"), "コメント行を挟んでも1行目のcarはシンボルdefun");
+
+    lisp_val_t body = cc_car(cc_cdr(cc_cdr(cc_cdr(v))));
+    assert(cc_car(body) == os_make_symbol("+"), "コメント行の次の行まで読んだ本体のcarはシンボル+");
+    assert(cc_car(cc_cdr(cc_cdr(body))) == os_make_fixnum(1), "本体の3番目は1");
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -265,11 +361,19 @@ int main(int argc, char** argv) {
     test_os_read_empty_list();
     test_os_read_list();
     test_os_read_quote();
+    test_os_read_quasiquote();
+    test_os_read_unquote();
+    test_os_read_unquote_splicing();
+    test_os_read_quasiquote_with_unquote_in_list();
     test_os_read_multiple_expr_per_line();
     test_os_read_stray_close_paren();
     test_os_read_unterminated_string();
     test_os_read_unterminated_list();
     test_os_read_multiline_list();
+    test_os_read_line_comment_only();
+    test_os_read_comment_after_expr();
+    test_os_read_comment_immediately_after_token();
+    test_os_read_multiline_list_with_comment_line();
 
     return g_test_failed ? 1 : 0;
 }

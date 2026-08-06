@@ -47,8 +47,20 @@ extern lisp_val_t g_sym_current_process;
 extern lisp_val_t g_sym_quote;
 /** if特殊形式を表すシンボル */
 extern lisp_val_t g_sym_if;
+/** progn特殊形式を表すシンボル */
+extern lisp_val_t g_sym_progn;
 /** setq特殊形式を表すシンボル */
 extern lisp_val_t g_sym_setq;
+/** defun特殊形式を表すシンボル */
+extern lisp_val_t g_sym_defun;
+/** lambda特殊形式を表すシンボル */
+extern lisp_val_t g_sym_lambda;
+/** quasiquote(`)を表すシンボル。reader.cが`x`を(QUASIQUOTE x)へ読むために使う */
+extern lisp_val_t g_sym_quasiquote;
+/** unquote(,)を表すシンボル。reader.cが,xを(UNQUOTE x)へ読むために使う */
+extern lisp_val_t g_sym_unquote;
+/** unquote-splicing(,@)を表すシンボル。reader.cが,@xを(UNQUOTE-SPLICING x)へ読むために使う */
+extern lisp_val_t g_sym_unquote_splicing;
 /** car関数を表すシンボル */
 extern lisp_val_t g_sym_car;
 /** cdr関数を表すシンボル */
@@ -200,6 +212,30 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env);
  * @return 減算結果のFIXNUM
  */
 lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CONS。第一引数をcar、第二引数をcdrとするconsを返す。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新しく作られたCONS
+ */
+lisp_val_t primitive_cons(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数EQ。第一引数と第二引数が同一(==)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数NULL。第一引数がnilかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return nilならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env);
 
 #endif /* _RUNTIME_H_ */
 

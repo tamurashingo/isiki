@@ -75,12 +75,13 @@ static int is_whitespace(char c) {
 }
 
 /**
- * c がトークンの区切り文字(空白・括弧・ダブルクオート・クオート)かどうかを返す。
+ * c がトークンの区切り文字(空白・括弧・ダブルクオート・クオート・quasiquote・unquote・コメント開始)かどうかを返す。
  * @param c 判定する文字
  * @return 区切り文字なら非0、そうでなければ0
  */
 static int is_delimiter(char c) {
-    return is_whitespace(c) || c == '(' || c == ')' || c == '"' || c == '\'';
+    return is_whitespace(c) || c == '(' || c == ')' || c == '"' || c == '\''
+        || c == '`' || c == ',' || c == ';';
 }
 
 /**
@@ -93,12 +94,22 @@ static int is_digit(char c) {
 }
 
 /**
- * proc の読取カーソルを、空白文字でない文字が来るまで進める。
+ * proc の読取カーソルを、空白文字でも';'コメント(その行末まで)でもない文字が来るまで進める。
  * @param proc 対象のプロセス
  */
 static void skip_whitespace(process_t *proc) {
-    while (has_more(proc) && is_whitespace(peek(proc))) {
-        advance(proc);
+    while (has_more(proc)) {
+        if (is_whitespace(peek(proc))) {
+            advance(proc);
+            continue;
+        }
+        if (peek(proc) == ';') {
+            while (has_more(proc) && peek(proc) != '\n') {
+                advance(proc);
+            }
+            continue;
+        }
+        break;
     }
 }
 
@@ -192,7 +203,7 @@ static lisp_val_t read_atom(process_t *proc) {
 }
 
 /**
- * proc の読取カーソル位置から1つのS式(リスト・文字列・quote・アトム)を読む。
+ * proc の読取カーソル位置から1つのS式(リスト・文字列・quote・quasiquote・unquote・アトム)を読む。
  * @param proc 読み取り対象のプロセス
  * @return 読み取ったS式。構文エラーの場合はg_sym_read_error
  */
@@ -223,6 +234,35 @@ static lisp_val_t read_expr(process_t *proc) {
             return g_sym_read_error;
         }
         return os_make_cons(g_sym_quote, os_make_cons(quoted, nil));
+    }
+    if (c == '`') {
+        advance(proc);
+        skip_whitespace(proc);
+        if (!has_more(proc)) {
+            return g_sym_read_error;
+        }
+        lisp_val_t quoted = read_expr(proc);
+        if (quoted == g_sym_read_error) {
+            return g_sym_read_error;
+        }
+        return os_make_cons(g_sym_quasiquote, os_make_cons(quoted, nil));
+    }
+    if (c == ',') {
+        advance(proc);
+        lisp_val_t sym = g_sym_unquote;
+        if (has_more(proc) && peek(proc) == '@') {
+            advance(proc);
+            sym = g_sym_unquote_splicing;
+        }
+        skip_whitespace(proc);
+        if (!has_more(proc)) {
+            return g_sym_read_error;
+        }
+        lisp_val_t quoted = read_expr(proc);
+        if (quoted == g_sym_read_error) {
+            return g_sym_read_error;
+        }
+        return os_make_cons(sym, os_make_cons(quoted, nil));
     }
 
     return read_atom(proc);

@@ -57,6 +57,20 @@ struct idt_ptr {
 /** 割り込みハンドラの引数型として使う前方宣言のみの構造体 */
 struct interrupt_frame;
 
+/**
+ * I/Oポートへ1バイト出力する
+ * @param port 出力先のポート番号
+ * @param val 出力する値
+ */
+void outb(uint16_t port, uint8_t val);
+
+/**
+ * I/Oポートから1バイト読み込む
+ * @param port 読み込み元のポート番号
+ * @return 読み込んだ値
+ */
+uint8_t inb(uint16_t port);
+
 
 /** 割り込み/例外発生時にスタックに積まれるレジスタ一式 */
 typedef struct {
