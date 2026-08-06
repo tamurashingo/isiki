@@ -277,6 +277,106 @@ void test_os_eval_lambda_closes_over_defining_env() {
     assert(v == os_make_fixnum(105), "lambdaは定義時のenv(outer_env)をクロージャとして保持し、y=100が見える");
 }
 
+void test_os_eval_defun_rest_param_collects_remaining_args() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    // (defun my-list (&rest args) args)
+    lisp_val_t name = os_make_symbol("my-list");
+    lisp_val_t params = os_make_cons(g_sym_rest, os_make_cons(os_make_symbol("args"), nil));
+    lisp_val_t body = os_make_cons(os_make_symbol("args"), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t call_args[3] = { os_make_fixnum(1), os_make_fixnum(2), os_make_fixnum(3) };
+    lisp_val_t v = os_eval(make_call("my-list", 3, call_args), env);
+    assert(cc_car(v) == os_make_fixnum(1), "(my-list 1 2 3)のargsの1番目は1");
+    assert(cc_car(cc_cdr(v)) == os_make_fixnum(2), "(my-list 1 2 3)のargsの2番目は2");
+    assert(cc_car(cc_cdr(cc_cdr(v))) == os_make_fixnum(3), "(my-list 1 2 3)のargsの3番目は3");
+    assert(cc_cdr(cc_cdr(cc_cdr(v))) == nil, "(my-list 1 2 3)のargsの末尾はnil");
+
+    lisp_val_t empty = os_eval(make_call("my-list", 0, NULL), env);
+    assert(empty == nil, "(my-list)は実引数が無いのでargsはnil");
+}
+
+void test_os_eval_defun_rest_param_with_leading_fixed_params() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun my-add-all (first &rest rest) (+ first (apply-sum rest))) の代わりに
+    // firstとrestそれぞれが正しく束縛されることだけを直接確認する:
+    // (defun first-and-rest (first &rest rest) (cons first rest))
+    lisp_val_t name = os_make_symbol("first-and-rest");
+    lisp_val_t params = os_make_cons(os_make_symbol("first"),
+                            os_make_cons(g_sym_rest, os_make_cons(os_make_symbol("rest"), nil)));
+    lisp_val_t body = os_make_cons(
+                            make_call("cons", 2, (lisp_val_t[]){ os_make_symbol("first"), os_make_symbol("rest") }),
+                            nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_set_function(os_make_symbol("cons"), os_make_native_function((lisp_addr_t)(void *)primitive_cons), env);
+    os_eval(defun_form, env);
+
+    lisp_val_t call_args[3] = { os_make_fixnum(1), os_make_fixnum(2), os_make_fixnum(3) };
+    lisp_val_t v = os_eval(make_call("first-and-rest", 3, call_args), env);
+    assert(cc_car(v) == os_make_fixnum(1), "(first-and-rest 1 2 3)のfirstは1");
+    assert(cc_car(cc_cdr(v)) == os_make_fixnum(2), "(first-and-rest 1 2 3)のrestの1番目は2");
+    assert(cc_car(cc_cdr(cc_cdr(v))) == os_make_fixnum(3), "(first-and-rest 1 2 3)のrestの2番目は3");
+}
+
+void test_os_eval_defmacro_expands_and_evaluates() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    // (defmacro my-if (test then else) `(if ,test ,then ,else))
+    lisp_val_t name = os_make_symbol("my-if");
+    lisp_val_t params = os_make_cons(os_make_symbol("test"),
+                            os_make_cons(os_make_symbol("then"),
+                                os_make_cons(os_make_symbol("else"), nil)));
+
+    lisp_val_t unquote_test = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("test"), nil));
+    lisp_val_t unquote_then = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("then"), nil));
+    lisp_val_t unquote_else = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("else"), nil));
+    lisp_val_t if_template = os_make_cons(os_make_symbol("if"),
+                                os_make_cons(unquote_test,
+                                    os_make_cons(unquote_then, os_make_cons(unquote_else, nil))));
+    lisp_val_t body = os_make_cons(
+                            os_make_cons(g_sym_quasiquote, os_make_cons(if_template, nil)), nil);
+
+    lisp_val_t defmacro_form = os_make_cons(os_make_symbol("defmacro"),
+                                    os_make_cons(name, os_make_cons(params, body)));
+
+    lisp_val_t defined = os_eval(defmacro_form, env);
+    assert(defined == name, "defmacroの戻り値はマクロ名my-if");
+
+    // (my-if 1 10 20) はマクロ展開後 (if 1 10 20) として評価され10になる
+    lisp_val_t call_args[3] = { os_make_fixnum(1), os_make_fixnum(10), os_make_fixnum(20) };
+    lisp_val_t v = os_eval(make_call("my-if", 3, call_args), env);
+    assert(v == os_make_fixnum(10), "(my-if 1 10 20)はマクロ展開され(if 1 10 20)として評価され10になる");
+}
+
+void test_os_eval_defmacro_args_are_not_evaluated_before_expansion() {
+    lisp_val_t env = make_arith_env();
+
+    // (defmacro my-quote (x) `(quote ,x))
+    lisp_val_t name = os_make_symbol("my-quote");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t unquote_x = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("x"), nil));
+    lisp_val_t quote_template = os_make_cons(os_make_symbol("quote"), os_make_cons(unquote_x, nil));
+    lisp_val_t body = os_make_cons(
+                            os_make_cons(g_sym_quasiquote, os_make_cons(quote_template, nil)), nil);
+    lisp_val_t defmacro_form = os_make_cons(os_make_symbol("defmacro"),
+                                    os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defmacro_form, env);
+
+    // (my-quote (+ 1 2)) : マクロの引数(+ 1 2)は展開前に評価されず、
+    // 展開結果(quote (+ 1 2))を評価してリスト(+ 1 2)がそのまま返る
+    lisp_val_t unevaluated_arg = make_call("+", 2, (lisp_val_t[]){ os_make_fixnum(1), os_make_fixnum(2) });
+    lisp_val_t call_args[1] = { unevaluated_arg };
+    lisp_val_t v = os_eval(make_call("my-quote", 1, call_args), env);
+
+    assert((v & TAG_MASK) == TAG_CONS, "(my-quote (+ 1 2))の結果はconsのまま(評価されていない)");
+    assert(cc_car(v) == os_make_symbol("+"), "マクロ引数は展開前に評価されないので先頭はsymbol +のまま");
+}
+
 void test_os_eval_quasiquote_plain_list() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
 
@@ -380,6 +480,10 @@ int main(int argc, char** argv) {
     test_os_eval_defun_recursion();
     test_os_eval_lambda_immediate_invocation();
     test_os_eval_lambda_closes_over_defining_env();
+    test_os_eval_defun_rest_param_collects_remaining_args();
+    test_os_eval_defun_rest_param_with_leading_fixed_params();
+    test_os_eval_defmacro_expands_and_evaluates();
+    test_os_eval_defmacro_args_are_not_evaluated_before_expansion();
     test_os_eval_cons();
     test_os_eval_eq();
     test_os_eval_null();

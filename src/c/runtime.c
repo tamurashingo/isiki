@@ -95,6 +95,10 @@ lisp_val_t g_sym_setq;
 lisp_val_t g_sym_defun;
 /** lambda特殊形式を表すシンボル */
 lisp_val_t g_sym_lambda;
+/** defmacro特殊形式を表すシンボル */
+lisp_val_t g_sym_defmacro;
+/** 仮引数リストで残りの実引数をリストとしてまとめて受け取ることを示すマーカーシンボル(&rest) */
+lisp_val_t g_sym_rest;
 /** quasiquote(`)を表すシンボル。reader.cが`x`を(QUASIQUOTE x)へ読むために使う */
 lisp_val_t g_sym_quasiquote;
 /** unquote(,)を表すシンボル。reader.cが,xを(UNQUOTE x)へ読むために使う */
@@ -271,6 +275,8 @@ void os_bootstrap() {
         g_sym_setq = os_make_symbol("SETQ");
         g_sym_defun = os_make_symbol("DEFUN");
         g_sym_lambda = os_make_symbol("LAMBDA");
+        g_sym_defmacro = os_make_symbol("DEFMACRO");
+        g_sym_rest = os_make_symbol("&REST");
         g_sym_quasiquote = os_make_symbol("QUASIQUOTE");
         g_sym_unquote = os_make_symbol("UNQUOTE");
         g_sym_unquote_splicing = os_make_symbol("UNQUOTE-SPLICING");

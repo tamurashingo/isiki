@@ -25,6 +25,8 @@
 #define MAGIC_FUNCTION_INTERPRETED 0x2ULL
 /** TAG_INSTANCEのword0に入る、プロセスのPCBであることを示すMAGIC NUMBER */
 #define MAGIC_PROCESS              0x3ULL
+/** TAG_INSTANCEのword0に入る、Lisp(defmacro)で定義されたマクロであることを示すMAGIC NUMBER */
+#define MAGIC_MACRO                0x4ULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -55,6 +57,10 @@ extern lisp_val_t g_sym_setq;
 extern lisp_val_t g_sym_defun;
 /** lambda特殊形式を表すシンボル */
 extern lisp_val_t g_sym_lambda;
+/** defmacro特殊形式を表すシンボル */
+extern lisp_val_t g_sym_defmacro;
+/** 仮引数リストで残りの実引数をリストとしてまとめて受け取ることを示すマーカーシンボル(&rest) */
+extern lisp_val_t g_sym_rest;
 /** quasiquote(`)を表すシンボル。reader.cが`x`を(QUASIQUOTE x)へ読むために使う */
 extern lisp_val_t g_sym_quasiquote;
 /** unquote(,)を表すシンボル。reader.cが,xを(UNQUOTE x)へ読むために使う */

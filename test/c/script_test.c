@@ -207,6 +207,8 @@ int main(int argc, char** argv) {
     lisp_val_t env = os_make_environment(os_make_symbol("SCRIPT-TEST-ENV"), global_environment);
 
     run_lisp_file(proc, env, "test/lisp/square_test.lisp");
+    run_lisp_file(proc, env, "test/lisp/rest_test.lisp");
+    run_lisp_file(proc, env, "test/lisp/defmacro_test.lisp");
 
     return g_test_failed ? 1 : 0;
 }

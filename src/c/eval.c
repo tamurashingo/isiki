@@ -45,7 +45,9 @@ static lisp_val_t make_interpreted_function(lisp_val_t params, lisp_val_t body, 
 /**
  * 仮引数リストと評価済み実引数リストを先頭から順に対応させ、call_envにos_set_variableで束縛する。
  * 仮引数が多い場合の余りはnilに束縛され、実引数が多い場合の余りは無視される。
- * @param params 仮引数リスト(未評価のシンボルリスト)
+ * 仮引数リストに&restが現れた場合、その次の仮引数にその時点で残っている実引数を
+ * リストのまま束縛し、それ以降の仮引数は処理しない(&rest は仮引数リストの末尾に置く前提)。
+ * @param params 仮引数リスト(未評価のシンボルリスト。&restを含みうる)
  * @param evaluated_args 評価済みの実引数リスト
  * @param call_env 束縛先の環境
  */
@@ -53,8 +55,14 @@ static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t
     lisp_val_t p = params;
     lisp_val_t a = evaluated_args;
     while (p != nil) {
+        lisp_val_t param = cc_car(p);
+        if (param == g_sym_rest) {
+            lisp_val_t rest_param = cc_car(cc_cdr(p));
+            os_set_variable(rest_param, a, call_env);
+            return;
+        }
         lisp_val_t val = (a != nil) ? cc_car(a) : nil;
-        os_set_variable(cc_car(p), val, call_env);
+        os_set_variable(param, val, call_env);
         p = cc_cdr(p);
         a = (a != nil) ? cc_cdr(a) : nil;
     }
@@ -177,6 +185,66 @@ static lisp_val_t eval_lambda(lisp_val_t args, lisp_val_t env) {
     return make_interpreted_function(params, body, env);
 }
 
+/**
+ * (params . body)と定義時のenvから、defmacroで定義されたマクロオブジェクトを作る。
+ * MAGIC_FUNCTION_INTERPRETEDと同じ(params, body, env)のレイアウトだが、
+ * MAGIC_MACROの色を付けることで通常の関数と区別する。
+ * @param params 仮引数リスト(未評価のシンボルリスト)
+ * @param body 本体(未評価のフォーム列。評価結果は展開後のコード)
+ * @param env 定義時の環境
+ * @return MAGIC_MACROのINSTANCE
+ */
+static lisp_val_t make_macro(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+    return os_make_instance(MAGIC_MACRO, params, body, env);
+}
+
+/**
+ * defmacro特殊形式。(defmacro name (params...) body...)からマクロオブジェクトを作り、
+ * current environmentのfunctionsスロットに登録する。
+ * @param args (name (params...) . body)
+ * @param env 登録先の環境。かつマクロの定義時環境(クロージャ)にもなる
+ * @return name(defunと同じ戻り値規約)
+ */
+static lisp_val_t eval_defmacro(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t params = cc_car(cc_cdr(args));
+    lisp_val_t body = cc_cdr(cc_cdr(args));
+
+    lisp_val_t macro = make_macro(params, body, env);
+    os_set_function(name, macro, env);
+    return name;
+}
+
+/**
+ * fnがdefmacroで定義されたマクロ(TAG_INSTANCE, MAGIC_MACRO)かどうかを判定する。
+ * @param fn 判定対象の値
+ * @return マクロならnon-zero
+ */
+static int is_macro(lisp_val_t fn) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return 0;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    return obj[0] == MAGIC_MACRO;
+}
+
+/**
+ * マクロを未評価の実引数argsで展開する(argsはevalせずそのままパラメータに束縛する)。
+ * @param macro 展開するマクロオブジェクト(MAGIC_MACRO)
+ * @param args 未評価の実引数リスト
+ * @return 展開結果として得られた、これから評価すべきコード
+ */
+static lisp_val_t apply_macro(lisp_val_t macro, lisp_val_t args) {
+    lisp_addr_t addr = macro & ~TAG_MASK;
+    UINT64 *obj = (UINT64 *)addr;
+    lisp_val_t params = obj[1];
+    lisp_val_t body = obj[2];
+    lisp_val_t closure_env = obj[3];
+    lisp_val_t call_env = os_make_environment(os_make_symbol("MACRO-ENV"), closure_env);
+    bind_params(params, args, call_env);
+    return eval_progn(body, call_env);
+}
+
 static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env);
 
 /**
@@ -274,8 +342,18 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
         if (op == g_sym_lambda) {
             return eval_lambda(args, env);
         }
+        if (op == g_sym_defmacro) {
+            return eval_defmacro(args, env);
+        }
         if (op == g_sym_quasiquote) {
             return eval_quasiquote(args, env);
+        }
+        if ((op & TAG_MASK) == TAG_SYMBOL) {
+            lisp_val_t fn = os_get_function(op, env);
+            if (fn != nil && is_macro(fn)) {
+                lisp_val_t expanded = apply_macro(fn, args);
+                return os_eval(expanded, env);
+            }
         }
         return eval_form(op, args, env);
     }

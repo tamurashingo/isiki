@@ -124,6 +124,7 @@ see [LICENSE](./assets/fonts/LICENSE)
   - `%%out-8`
   - `%%peek`
   - `%%poke`
+- MACROが可能
 
-![screenshot](./documents/images/version_0_0_2.png)
+![screenshot](./documents/images/version_0_0_3.png)
 
