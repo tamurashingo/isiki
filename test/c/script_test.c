@@ -120,22 +120,37 @@ static lisp_val_t primitive_assert_equal(lisp_val_t args, lisp_val_t env) {
 #define SCRIPT_BUF_SIZE 4096
 static char g_script_buf[SCRIPT_BUF_SIZE];
 
+// queue_script_lines が各行を退避させておくための領域。g_script_buf を直接
+// 指すのではなく行ごとにコピーを持つのは、queue_next_line で積んだ行は
+// os_wait_for_more_input によって「後で」消費されるため。
+#define SCRIPT_LINE_MAX 256
+static char g_line_storage[NEXT_LINES_MAX][SCRIPT_LINE_MAX];
+
 // path の内容を改行で分割し、空行を除いて1行目はpush_string、残りはqueue_next_lineに積む。
 // 空行を注入するとos_wait_for_more_inputが何も追加できず、os_readが誤って
-// 「入力なし」と判定してしまうため空行はスキップする
+// 「入力なし」と判定してしまうため空行はスキップする。
+// 各行には末尾の'\n'を必ず付け直して積む: reader.c の';'コメント読み飛ばしは
+// 行末を'\n'で判定するため、'\n'を落として積むとコメント行が次の行を
+// 読み込むまで終端せず、後続の行がコメントとして無言で読み飛ばされてしまう。
 static void queue_script_lines(process_t *proc, char *buf) {
     char *line_start = buf;
     int pushed_first = 0;
+    UINT32 stored = 0;
     for (char *p = buf; ; p++) {
         if (*p == '\n' || *p == '\0') {
             int end = (*p == '\0');
-            *p = '\0';
-            if (line_start[0] != '\0') {
+            size_t line_len = (size_t)(p - line_start);
+            if (line_len > 0 && stored < NEXT_LINES_MAX) {
+                size_t copy_len = line_len < SCRIPT_LINE_MAX - 2 ? line_len : SCRIPT_LINE_MAX - 2;
+                char *dest = g_line_storage[stored++];
+                memcpy(dest, line_start, copy_len);
+                dest[copy_len] = '\n';
+                dest[copy_len + 1] = '\0';
                 if (!pushed_first) {
-                    push_string(proc, line_start);
+                    push_string(proc, dest);
                     pushed_first = 1;
                 } else {
-                    queue_next_line(line_start);
+                    queue_next_line(dest);
                 }
             }
             if (end) {
