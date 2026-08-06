@@ -6,6 +6,7 @@
 #include "runtime.h"
 #include "repl.h"
 #include "subprimitive.h"
+#include "virtio9p.h"
 
 
 /**
@@ -57,6 +58,8 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     init_idt();
 
     kernel_show_information(fb);
+
+    os_virtio9p_test_run(fb);
 
     process_scheduler_start();
 }

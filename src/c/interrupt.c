@@ -77,6 +77,46 @@ uint8_t inb(uint16_t port) {
     return ret;
 }
 
+/**
+ * I/Oポートへ2バイト出力する
+ * @param port 出力先のポート番号
+ * @param val 出力する値
+ */
+void outw(uint16_t port, uint16_t val) {
+    asm volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+/**
+ * I/Oポートから2バイト読み込む
+ * @param port 読み込み元のポート番号
+ * @return 読み込んだ値
+ */
+uint16_t inw(uint16_t port) {
+    uint16_t ret;
+    asm volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+/**
+ * I/Oポートへ4バイト出力する
+ * @param port 出力先のポート番号
+ * @param val 出力する値
+ */
+void outl(uint16_t port, uint32_t val) {
+    asm volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+/**
+ * I/Oポートから4バイト読み込む
+ * @param port 読み込み元のポート番号
+ * @return 読み込んだ値
+ */
+uint32_t inl(uint16_t port) {
+    uint32_t ret;
+    asm volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 
 /** GP例外(vector 13)のエントリポイント。エラーコードとvectorを積んでcpu_exception_commonへ入る */
 void asm_gpf_handler(void);
