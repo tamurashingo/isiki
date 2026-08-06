@@ -3,14 +3,41 @@ PWD = $(shell pwd)
 
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c
-HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c
+HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+TMPDIR = tmp
+OBJ = $(patsubst $(SRCDIR)/%.c,$(TMPDIR)/%.o,$(SRC))
 
-.PHONY: all setup image transpile build run test
+TESTDIR = test/c
+TEST_COMMON_SRC = $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c
+
+TEST_SRC_RUNTIME = $(TEST_COMMON_SRC) $(TESTDIR)/runtime_test.c
+TEST_BIN_RUNTIME = $(TMPDIR)/runtime_test
+
+TEST_SRC_LISP = $(TEST_COMMON_SRC) $(TESTDIR)/lisp_test.c
+TEST_BIN_LISP = $(TMPDIR)/lisp_test
+
+TEST_SRC_PROCESS = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(TESTDIR)/process_test.c
+TEST_BIN_PROCESS = $(TMPDIR)/process_test
+
+TEST_SRC_READER = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(TESTDIR)/reader_test.c
+TEST_BIN_READER = $(TMPDIR)/reader_test
+
+TEST_SRC_EVAL = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(TESTDIR)/eval_test.c
+TEST_BIN_EVAL = $(TMPDIR)/eval_test
+
+TEST_SRC_PRINT = $(TEST_COMMON_SRC) $(SRCDIR)/print.c $(TESTDIR)/print_test.c
+TEST_BIN_PRINT = $(TMPDIR)/print_test
+
+TEST_SRC_REPL = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(TESTDIR)/repl_test.c
+TEST_BIN_REPL = $(TMPDIR)/repl_test
+
+
+.PHONY: all setup image transpile build compile run test clean
 
 all: build
 
@@ -20,7 +47,7 @@ image:
 
 build: $(SRC) $(HDR)
 	mkdir -p esp_dir/EFI/BOOT
-	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace uefi-builder \
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
 		-nostdlib -mno-red-zone -mgeneral-regs-only -O1 -shared \
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
@@ -29,8 +56,67 @@ build: $(SRC) $(HDR)
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
 
+# ファイル単体のコンパイルチェック用。リンクは行わず、生成した .o は tmp/ に捨てる
+compile: $(OBJ)
+
+$(TMPDIR):
+	mkdir -p $(TMPDIR)
+
+$(TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(TMPDIR)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
+		-nostdlib -mno-red-zone -mgeneral-regs-only -O1 -c \
+		-mno-stack-arg-probe \
+		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
+		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
+		-o $@ $<
+
+# ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
+test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(HDR) | $(TMPDIR)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_RUNTIME) $(TEST_SRC_RUNTIME)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_LISP) $(TEST_SRC_LISP)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_PROCESS) $(TEST_SRC_PROCESS)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_READER) $(TEST_SRC_READER)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_EVAL) $(TEST_SRC_EVAL)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_PRINT) $(TEST_SRC_PRINT)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_REPL) $(TEST_SRC_REPL)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_RUNTIME) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_PROCESS) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_READER) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_EVAL) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_PRINT) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_REPL) -v "$(PWD)":/workspace isiki-builder
+
 clean:
-	rm -rf esp_dir
+	rm -rf esp_dir $(TMPDIR)
 
 run:
 	qemu-system-x86_64 \
