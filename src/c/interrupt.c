@@ -62,7 +62,7 @@ static const char SCANCODE_SHIFT[128] = {
  * @param port 出力先のポート番号
  * @param val 出力する値
  */
-static inline void outb(uint16_t port, uint8_t val) {
+void outb(uint16_t port, uint8_t val) {
     asm volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
@@ -71,7 +71,7 @@ static inline void outb(uint16_t port, uint8_t val) {
  * @param port 読み込み元のポート番号
  * @return 読み込んだ値
  */
-static inline uint8_t inb(uint16_t port) {
+uint8_t inb(uint16_t port) {
     uint8_t ret;
     asm volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;

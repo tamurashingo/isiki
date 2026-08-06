@@ -56,11 +56,10 @@
  *  [ inst-addr(61bit) ................................ ][1 0 1]
  *    instanceへのアドレス
  *    - word0: このinstanceの種別を表わすMAGIC NUMBER
- *    - word1: 実体のアドレス
- *             - nativeの場合: cの関数のアドレス
- *             - Lisp関数(defun)の場合: ラムダ式のアドレス((args . body) cons cellへのポインタ)
- *    - word2: 引数のアドレス
- *    - word3: 定義時の環境のアドレス
+ *    - word1: MAGIC_FUNCTION_NATIVEの場合: cの関数のアドレス
+ *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
+ *    - word2: MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
+ *    - word3: MAGIC_FUNCTION_INTERPRETEDの場合: 定義時の環境のアドレス
  *
  */
 
@@ -88,8 +87,20 @@ lisp_val_t g_sym_current_process;
 lisp_val_t g_sym_quote;
 /** if特殊形式を表すシンボル */
 lisp_val_t g_sym_if;
+/** progn特殊形式を表すシンボル */
+lisp_val_t g_sym_progn;
 /** setq特殊形式を表すシンボル */
 lisp_val_t g_sym_setq;
+/** defun特殊形式を表すシンボル */
+lisp_val_t g_sym_defun;
+/** lambda特殊形式を表すシンボル */
+lisp_val_t g_sym_lambda;
+/** quasiquote(`)を表すシンボル。reader.cが`x`を(QUASIQUOTE x)へ読むために使う */
+lisp_val_t g_sym_quasiquote;
+/** unquote(,)を表すシンボル。reader.cが,xを(UNQUOTE x)へ読むために使う */
+lisp_val_t g_sym_unquote;
+/** unquote-splicing(,@)を表すシンボル。reader.cが,@xを(UNQUOTE-SPLICING x)へ読むために使う */
+lisp_val_t g_sym_unquote_splicing;
 /** car関数を表すシンボル */
 lisp_val_t g_sym_car;
 /** cdr関数を表すシンボル */
@@ -256,7 +267,13 @@ void os_bootstrap() {
 
         g_sym_quote = os_make_symbol("QUOTE");
         g_sym_if = os_make_symbol("IF");
+        g_sym_progn = os_make_symbol("PROGN");
         g_sym_setq = os_make_symbol("SETQ");
+        g_sym_defun = os_make_symbol("DEFUN");
+        g_sym_lambda = os_make_symbol("LAMBDA");
+        g_sym_quasiquote = os_make_symbol("QUASIQUOTE");
+        g_sym_unquote = os_make_symbol("UNQUOTE");
+        g_sym_unquote_splicing = os_make_symbol("UNQUOTE-SPLICING");
         g_sym_car = os_make_symbol("CAR");
         g_sym_cdr = os_make_symbol("CDR");
         g_sym_cons = os_make_symbol("CONS");
@@ -269,6 +286,9 @@ void os_bootstrap() {
         os_set_function(g_sym_cdr, os_make_native_function((lisp_addr_t)(void *)primitive_cdr), global_environment);
         os_set_function(os_make_symbol("+"), os_make_native_function((lisp_addr_t)(void *)primitive_add), global_environment);
         os_set_function(os_make_symbol("-"), os_make_native_function((lisp_addr_t)(void *)primitive_subtract), global_environment);
+        os_set_function(g_sym_cons, os_make_native_function((lisp_addr_t)(void *)primitive_cons), global_environment);
+        os_set_function(os_make_symbol("EQ"), os_make_native_function((lisp_addr_t)(void *)primitive_eq), global_environment);
+        os_set_function(os_make_symbol("NULL"), os_make_native_function((lisp_addr_t)(void *)primitive_null), global_environment);
     }
 }
 
@@ -429,7 +449,7 @@ lisp_val_t os_make_symbol(const char *name) {
         UINT64 len = ((UINT64 *)str_addr)[0];
         const char *sym_name = (const char *)(str_addr + 8);
 
-        if (strncmpignorecase(sym_name, name, len) == 0) {
+        if (strncmpignorecase(sym_name, name, len) == 0 && name[len] == '\0') {
             return sym;
         }
    }
@@ -491,6 +511,9 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
 
 /**
  * parent_envを親とする新しい環境(name/variables/functions/parentの4slotを持つリスト)を作る。
+ * TODO: 特定の環境を一発で取得するにはnameで指定するしかないが、呼び出し元が渡すenv_symbolは
+ * ユニークであることが保証されていない。将来的に多値を返せるようにしたうえで、ここでユニークな
+ * symbolを生成し、環境本体とそのユニークなsymbolの両方を返すようにしたい。
  * @param env_symbol 環境の名前を表すsymbol
  * @param parent_env 親環境。ルート環境の場合はnil
  * @return 作成した環境
@@ -647,6 +670,40 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
         result -= cc_car(rest) >> 3;
     }
     return os_make_fixnum(result);
+}
+
+/**
+ * 組み込み関数CONS。第一引数をcar、第二引数をcdrとするconsを返す。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新しく作られたCONS
+ */
+lisp_val_t primitive_cons(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t car = cc_car(args);
+    lisp_val_t cdr = cc_car(cc_cdr(args));
+    return os_make_cons(car, cdr);
+}
+
+/**
+ * 組み込み関数EQ。第一引数と第二引数が同一(==)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t a = cc_car(args);
+    lisp_val_t b = cc_car(cc_cdr(args));
+    return a == b ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数NULL。第一引数がnilかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return nilならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env) {
+    return cc_car(args) == nil ? g_sym_t : nil;
 }
 
 
