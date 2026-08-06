@@ -108,6 +108,22 @@ see [LICENSE](./assets/fonts/LICENSE)
 - キー入力結果を画面に表示(GOP)
 - 複数の仮想バッファを切り替えて使用可能(F1〜F4)
 - REPL から + 演算が可能
+- 以下のprimitiveなオペレータを実装
+  - `quote`
+  - `if`
+  - `progn`
+  - `setq`
+  - `defun`
+  - `lambda`
+  - `cons`
+  - `car`
+  - `cdr`
+  - `eq`
+  - `null`
+  - `%%in-8`
+  - `%%out-8`
+  - `%%peek`
+  - `%%poke`
 
-![screenshot](./documents/images/version_0_0_1.png)
+![screenshot](./documents/images/version_0_0_2.png)
 
