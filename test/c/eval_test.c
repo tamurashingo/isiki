@@ -797,6 +797,28 @@ void test_os_eval_defdynamic_and_dynamic_bypass_lexical_env() {
     assert(v2 == os_make_fixnum(20), "動的変数はグローバルなので、どの環境から更新しても他の環境から新しい値20が見える");
 }
 
+void test_os_eval_top_level_catches_return_from_to_top_level_block() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    // (return-from %TOP-LEVEL 99) : os_eval_top_levelが張るblock %TOP-LEVELにcatchされ99になる
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(g_sym_top_level_block, os_make_cons(os_make_fixnum(99), nil)));
+
+    lisp_val_t v = os_eval_top_level(return_form, env);
+    assert(v == os_make_fixnum(99), "os_eval_top_levelはトップレベルへのreturn-fromをcatchして99を返す(生のMAGIC_BLOCK_EXITが漏れない)");
+}
+
+void test_os_eval_top_level_passes_through_normal_form() {
+    lisp_val_t env = make_arith_env();
+
+    // (+ 1 2) : 通常のフォームはそのまま3を返す
+    lisp_val_t args[2] = { os_make_fixnum(1), os_make_fixnum(2) };
+    lisp_val_t form = make_call("+", 2, args);
+
+    lisp_val_t v = os_eval_top_level(form, env);
+    assert(v == os_make_fixnum(3), "os_eval_top_levelは通常のフォームをそのまま評価して3を返す");
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -849,6 +871,8 @@ int main(int argc, char** argv) {
     test_os_eval_defvar_second_call_is_ignored();
     test_os_eval_defconstant_blocks_setq_but_only_in_its_own_env();
     test_os_eval_defdynamic_and_dynamic_bypass_lexical_env();
+    test_os_eval_top_level_catches_return_from_to_top_level_block();
+    test_os_eval_top_level_passes_through_normal_form();
 
     return g_test_failed ? 1 : 0;
 }

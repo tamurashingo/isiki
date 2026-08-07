@@ -144,6 +144,9 @@ lisp_val_t g_sym_read_error;
 /** 評価エラーを表すシンボル */
 lisp_val_t g_sym_eval_error;
 
+/** os_eval_top_levelが張るblockの名前を表すシンボル(%TOP-LEVEL) */
+lisp_val_t g_sym_top_level_block;
+
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 lisp_val_t global_environment;
 
@@ -332,6 +335,8 @@ void os_bootstrap() {
 
         g_sym_read_error = os_make_symbol("READ-ERROR");
         g_sym_eval_error = os_make_symbol("EVAL-ERROR");
+
+        g_sym_top_level_block = os_make_symbol("%TOP-LEVEL");
 
 
         os_set_function(g_sym_car, os_make_native_function((lisp_addr_t)(void *)primitive_car), global_environment);

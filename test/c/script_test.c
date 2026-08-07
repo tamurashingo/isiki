@@ -94,11 +94,11 @@ static void setup_buffers() {
     }
 }
 
-#define HEAP_SIZE (1024 * 1024)
+#define HEAP_SIZE (1024 * 1024 * 4)
 
 static void setup_heap() {
     void *heap = malloc(HEAP_SIZE);
-    assert(heap != NULL, "1MBのヒープ用メモリをmallocで確保できる");
+    assert(heap != NULL, "4MBのヒープ用メモリをmallocで確保できる");
     os_heap_init((UINT64)heap, HEAP_SIZE);
     os_bootstrap();
     os_register_eval_primitives();

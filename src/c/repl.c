@@ -24,7 +24,7 @@ void os_repl_step(process_t *proc) {
         return;
     }
 
-    lisp_val_t result = os_eval(form, proc->env);
+    lisp_val_t result = os_eval_top_level(form, proc->env);
 
     os_print(result, proc->stdout_buffer);
     proc->stdout_buffer->write_char(proc->stdout_buffer, '\n');

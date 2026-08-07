@@ -162,3 +162,44 @@
 (assert-equal nil (typep (make-instance 'point) 'point3d))
 (assert-equal t (subclassp (%find-class 'point3d) (%find-class 'point)))
 (assert-equal nil (subclassp (%find-class 'point) (%find-class 'point3d)))
+
+;;; --- Condition System: signal-condition / with-handler / error ---
+
+;; with-handler + block/return-fromでcatchできる
+(assert-equal 'caught
+  (block b
+    (with-handler (lambda (c) (return-from b 'caught))
+      (error "boom"))))
+
+;; ハンドラはconditionのインスタンスをそのまま受け取り、typepで型判定できる
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<simple-error>)))
+      (error "boom"))))
+
+;; format-string/format-argumentsスロットにerrorの引数が保持される。
+;; assert-equalは値の同一性(==)で比較しstringはsymbolのようにinternされないため、
+;; string-to-symbolを介して内容を比較する
+(assert-equal (string-to-symbol "bad value")
+  (block b
+    (with-handler (lambda (c) (return-from b (string-to-symbol (slot-value c 'format-string))))
+      (error "bad value" 1 2))))
+
+;; 型判定して処理しない場合は自分でsignal-conditionを呼び、外側のハンドラに渡せる
+(assert-equal 'outer
+  (block b
+    (with-handler (lambda (c) (return-from b 'outer))
+      (with-handler (lambda (c) (if (typep c '<simple-error>) (signal-condition c nil) (return-from b 'inner)))
+        (error "boom")))))
+
+;; continuableなsignal-conditionは、ハンドラが脱出せず返した値がそのまま結果になり、
+;; 呼び出し元の計算が中断されず続く
+(assert-equal 101
+  (+ 1
+     (with-handler (lambda (c) 100)
+       (signal-condition (make-instance '<condition>) t))))
+
+;; %abort-top-levelはos_eval_top_levelが張るblock %TOP-LEVELまで届く(単体での動作確認)
+(assert-equal 42
+  (block %top-level
+    (%abort-top-level 42)))

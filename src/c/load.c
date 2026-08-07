@@ -47,7 +47,7 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
             break;
         }
 
-        os_eval(form, env);
+        os_eval_top_level(form, env);
     }
 
     os_stream_close(&stream);

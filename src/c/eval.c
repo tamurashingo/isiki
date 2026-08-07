@@ -674,3 +674,18 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
     }
     return exp; // FIXNUM/STRING/CHAR/INSTANCE は自己評価
 }
+
+/**
+ * formを(block %TOP-LEVEL form)相当としてenvのもとで評価する。トップレベルの
+ * ドライバ(REPL/load)がこの関数を通すことで、途中でcatchされなかった
+ * (%abort-top-level経由の)非局所脱出をこの1フォームの評価だけに閉じ込め、
+ * 生の脱出シグナル(TAG_INSTANCE)がドライバやprintまで漏れるのを防ぐ。
+ * @param form 評価対象のトップレベルフォーム
+ * @param env 評価に使う環境
+ * @return formの評価結果。abortされた場合はabortに渡されたcondition
+ */
+lisp_val_t os_eval_top_level(lisp_val_t form, lisp_val_t env) {
+    lisp_val_t wrapped = os_make_cons(g_sym_block,
+        os_make_cons(g_sym_top_level_block, os_make_cons(form, nil)));
+    return os_eval(wrapped, env);
+}

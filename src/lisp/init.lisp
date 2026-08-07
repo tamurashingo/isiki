@@ -364,3 +364,55 @@
       (subclassp (%%instance-class instance)
                  (if (%%classp class-designator) class-designator (%find-class class-designator)))
       nil))
+
+;;; --- エラー処理とコンディショナルシステム(最小実装): signal-condition / with-handler / error ---
+;;;
+;;; コンディションはILOSのインスタンスとして表現する(専用のC構造体は増やさない)。
+;;; 既知の簡略化: report-condition等の総称関数によるメッセージ整形は実装しない。
+;;; format-string/format-argumentsスロットに素材を保持するのみ。
+
+(defclass <condition> () ())
+(defclass <error> (<condition>) ())
+(defclass <simple-error> (<error>)
+  ((format-string :initarg :format-string :initform nil)
+   (format-arguments :initarg :format-arguments :initform nil)))
+
+;; *handlers*はwith-handlerの動的スコープの間だけpush/popする、有効なhandler-functionの
+;; リスト(内側が先頭)。*classes*と同じ理由でdefdynamic+%%set-dynamicを使う(冒頭の
+;; 既知の制約: defvar+setqでは関数呼び出しの内側からのpush/popが呼び出し元に見えない)。
+(defdynamic *handlers* nil)
+
+;; handler-formを1度だけ評価し、bodyの動的スコープの間だけ*handlers*の先頭に積む。
+;; unwind-protectでbodyがどう脱出しても(非局所脱出でも)必ずpopする。
+(defmacro with-handler (handler-form &rest body)
+  (let ((saved (gensym)))
+    `(let ((,saved (dynamic *handlers*)))
+       (%%set-dynamic '*handlers* (cons ,handler-form ,saved))
+       (unwind-protect
+           (progn ,@body)
+         (%%set-dynamic '*handlers* ,saved)))))
+
+;; トップレベルでcatchされなかったconditionをabortする。os_eval_top_level(C側)が
+;; 張っているblock %TOP-LEVELへreturn-fromする。
+(defun %abort-top-level (condition)
+  (return-from %top-level condition))
+
+;; *handlers*の先頭(最も内側)のhandler-functionを、一時的に自分自身を取り除いた状態で
+;; 呼び出す(ハンドラ内でのsignal-conditionが次の外側のハンドラに渡るようにするため)。
+;; 呼び出し後は*handlers*を元に戻す。continuableでないconditionでハンドラが
+;; (非局所脱出せず)普通に返ってきた場合は、仕様上はエラーだがトップレベルへのabortに
+;; フォールバックする。
+(defun signal-condition (condition continuable)
+  (let ((handlers (dynamic *handlers*)))
+    (if (null handlers)
+        (if continuable nil (%abort-top-level condition))
+        (progn
+          (%%set-dynamic '*handlers* (cdr handlers))
+          (let ((result (funcall (car handlers) condition)))
+            (%%set-dynamic '*handlers* handlers)
+            (if continuable result (%abort-top-level condition)))))))
+
+(defun error (format-string &rest format-arguments)
+  (signal-condition
+    (make-instance '<simple-error> ':format-string format-string ':format-arguments format-arguments)
+    nil))

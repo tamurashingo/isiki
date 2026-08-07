@@ -109,6 +109,9 @@ extern lisp_val_t g_sym_read_error;
 /** 評価エラーを表すシンボル */
 extern lisp_val_t g_sym_eval_error;
 
+/** os_eval_top_levelが張るblockの名前を表すシンボル(%TOP-LEVEL) */
+extern lisp_val_t g_sym_top_level_block;
+
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 extern lisp_val_t global_environment;
 
