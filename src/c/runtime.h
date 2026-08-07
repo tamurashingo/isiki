@@ -91,6 +91,8 @@ extern lisp_val_t g_sym_defvar;
 extern lisp_val_t g_sym_defconstant;
 /** defdynamic特殊形式を表すシンボル */
 extern lisp_val_t g_sym_defdynamic;
+/** defglobal特殊形式を表すシンボル */
+extern lisp_val_t g_sym_defglobal;
 /** dynamic特殊形式を表すシンボル */
 extern lisp_val_t g_sym_dynamic;
 /** 仮引数リストで残りの実引数をリストとしてまとめて受け取ることを示すマーカーシンボル(&rest) */

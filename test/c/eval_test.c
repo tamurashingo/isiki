@@ -890,6 +890,27 @@ void test_os_eval_defdynamic_and_dynamic_bypass_lexical_env() {
     assert(v2 == os_make_fixnum(20), "動的変数はグローバルなので、どの環境から更新しても他の環境から新しい値20が見える");
 }
 
+void test_os_eval_defglobal_reevaluates_and_allows_setq() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t name = os_make_symbol("x");
+
+    lisp_val_t defglobal_form1 = os_make_cons(os_make_symbol("defglobal"), os_make_cons(name, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t v1 = os_eval(defglobal_form1, env);
+    assert(v1 == name, "defglobalの戻り値は変数名x");
+    assert(os_get_variable(name, env) == os_make_fixnum(1), "初回のdefglobalで値1がセットされる");
+
+    // defvarと異なり、既に束縛済みでも2回目のdefglobalはvalue-formを再評価して上書きする
+    lisp_val_t defglobal_form2 = os_make_cons(os_make_symbol("defglobal"), os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    os_eval(defglobal_form2, env);
+    assert(os_get_variable(name, env) == os_make_fixnum(2), "2回目のdefglobalで値2に上書きされる");
+
+    // defconstantと異なり、defglobalで定義した変数はsetqで書き換えられる
+    lisp_val_t setq_form = os_make_cons(os_make_symbol("setq"), os_make_cons(name, os_make_cons(os_make_fixnum(3), nil)));
+    lisp_val_t v = os_eval(setq_form, env);
+    assert(v == os_make_fixnum(3), "defglobalの変数はsetqで書き換えられる");
+    assert(os_get_variable(name, env) == os_make_fixnum(3), "setq後の値は3になる");
+}
+
 void test_os_eval_top_level_catches_return_from_to_top_level_block() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
 
@@ -968,6 +989,7 @@ int main(int argc, char** argv) {
     test_os_eval_defvar_second_call_is_ignored();
     test_os_eval_defconstant_blocks_setq_but_only_in_its_own_env();
     test_os_eval_defdynamic_and_dynamic_bypass_lexical_env();
+    test_os_eval_defglobal_reevaluates_and_allows_setq();
     test_os_eval_top_level_catches_return_from_to_top_level_block();
     test_os_eval_top_level_passes_through_normal_form();
 

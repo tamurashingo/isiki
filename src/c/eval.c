@@ -258,6 +258,27 @@ static lisp_val_t eval_defdynamic(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * defglobal特殊形式。(defglobal name value-form)のvalue-formを評価してcurrent environmentの
+ * 変数slotに登録する。defconstantと異なりos_mark_constantは呼ばず、setqでの再代入を許す
+ * (仕様上「変数を定義するためだけに使い、更新には使わない」のはdefglobal自身の再実行についての
+ * 注意であり、変数自体は可変)。defvarと異なり既存束縛の有無を確認せず、常にvalue-formを
+ * 評価してos_set_variableで(再)登録する。
+ * @param args (name value-form)
+ * @param env 登録先の環境
+ * @return name(defvarと同じ戻り値規約)
+ */
+static lisp_val_t eval_defglobal(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t value_form = cc_car(cc_cdr(args));
+    lisp_val_t val = os_eval(value_form, env);
+    if (is_control_transfer(val)) {
+        return val;
+    }
+    os_set_variable(name, val, env);
+    return name;
+}
+
+/**
  * dynamic特殊形式。(dynamic name)のnameは未評価のシンボルとして扱い(quoteと同様)、
  * g_dynamic_bindingsからその動的変数の値を取得して返す。
  * @param args (name)
@@ -778,6 +799,9 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
         }
         if (op == g_sym_defdynamic) {
             return eval_defdynamic(args, env);
+        }
+        if (op == g_sym_defglobal) {
+            return eval_defglobal(args, env);
         }
         if (op == g_sym_dynamic) {
             return eval_dynamic(args, env);

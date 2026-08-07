@@ -122,6 +122,8 @@ lisp_val_t g_sym_defvar;
 lisp_val_t g_sym_defconstant;
 /** defdynamic特殊形式を表すシンボル */
 lisp_val_t g_sym_defdynamic;
+/** defglobal特殊形式を表すシンボル */
+lisp_val_t g_sym_defglobal;
 /** dynamic特殊形式を表すシンボル */
 lisp_val_t g_sym_dynamic;
 /** 仮引数リストで残りの実引数をリストとしてまとめて受け取ることを示すマーカーシンボル(&rest) */
@@ -333,6 +335,7 @@ void os_bootstrap() {
         g_sym_defvar = os_make_symbol("DEFVAR");
         g_sym_defconstant = os_make_symbol("DEFCONSTANT");
         g_sym_defdynamic = os_make_symbol("DEFDYNAMIC");
+        g_sym_defglobal = os_make_symbol("DEFGLOBAL");
         g_sym_dynamic = os_make_symbol("DYNAMIC");
         g_sym_rest = os_make_symbol("&REST");
         g_sym_quasiquote = os_make_symbol("QUASIQUOTE");
