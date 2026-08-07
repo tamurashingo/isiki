@@ -12,7 +12,6 @@
 
 static UINT8 g_p9_tx_buf[P9_MSIZE] __attribute__((aligned(4096)));
 static UINT8 g_p9_rx_buf[P9_MSIZE] __attribute__((aligned(4096)));
-static UINT8 g_init_lisp_buf[4096] __attribute__((aligned(4096)));
 
 /** Tversion/Tattachによる9Pプロトコルレベルのセッション確立が済んでいるか */
 static int g_session_ready = 0;
@@ -256,51 +255,4 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
 
     *out_len = total;
     return 1;
-}
-
-static void write_u32_decimal(frame_buffer *fb, UINT32 value) {
-    char digits[11];
-    UINT32 i = 0;
-
-    if (value == 0) {
-        fb->write_char(fb, '0');
-        return;
-    }
-
-    while (value > 0) {
-        digits[i] = (char)('0' + (value % 10));
-        i++;
-        value /= 10;
-    }
-    while (i > 0) {
-        i--;
-        fb->write_char(fb, digits[i]);
-    }
-}
-
-void os_virtio9p_test_run(frame_buffer *fb) {
-    fb->write_string(fb, "virtio9p: loading src/lisp/init.lisp ...\n");
-
-    UINT32 out_len = 0;
-    char err_msg[160];
-    err_msg[0] = '\0';
-
-    int ok = os_virtio9p_load_file("src/lisp/init.lisp", g_init_lisp_buf, sizeof(g_init_lisp_buf),
-                                    &out_len, err_msg, sizeof(err_msg));
-
-    if (!ok) {
-        fb->write_string(fb, "virtio9p: FAILED: ");
-        fb->write_string(fb, err_msg);
-        fb->write_char(fb, '\n');
-        for (;;) {
-        }
-    }
-
-    fb->write_string(fb, "virtio9p: OK, ");
-    write_u32_decimal(fb, out_len);
-    fb->write_string(fb, " bytes:\n---\n");
-    for (UINT32 i = 0; i < out_len; i++) {
-        fb->write_char(fb, g_init_lisp_buf[i]);
-    }
-    fb->write_string(fb, "\n---\n");
 }
