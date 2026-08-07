@@ -203,3 +203,33 @@
 (assert-equal 42
   (block %top-level
     (%abort-top-level 42)))
+
+;;; --- dynamic-let / set-dynamic ---
+
+(defdynamic *dl-test* 1)
+
+;; dynamic-letの間だけ新しい値が見える
+(assert-equal 2 (dynamic-let ((*dl-test* 2)) (dynamic *dl-test*)))
+
+;; dynamic-letを抜けたら元の値に戻る
+(assert-equal 1 (dynamic *dl-test*))
+
+;; 非局所脱出(return-from)でdynamic-letを抜けても元の値に戻る
+(assert-equal 1
+  (progn
+    (block b
+      (dynamic-let ((*dl-test* 99))
+        (return-from b nil)))
+    (dynamic *dl-test*)))
+
+;; 複数変数を同時に動的束縛できる
+(defdynamic *dl-a* 'unbound-a)
+(defdynamic *dl-b* 'unbound-b)
+(assert-equal 10
+  (car (dynamic-let ((*dl-a* 10) (*dl-b* 20)) (cons (dynamic *dl-a*) (dynamic *dl-b*)))))
+(assert-equal 20
+  (cdr (dynamic-let ((*dl-a* 10) (*dl-b* 20)) (cons (dynamic *dl-a*) (dynamic *dl-b*)))))
+
+;; set-dynamicはvarを評価せずformの評価値をvarの動的値に設定する
+(defdynamic *sd-test* 1)
+(assert-equal 5 (progn (set-dynamic 5 *sd-test*) (dynamic *sd-test*)))

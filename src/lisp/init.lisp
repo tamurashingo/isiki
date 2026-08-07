@@ -416,3 +416,49 @@
   (signal-condition
     (make-instance '<simple-error> ':format-string format-string ':format-arguments format-arguments)
     nil))
+
+;;; --- dynamic-let / set-dynamic ---
+
+(defun %dynamic-let-vars (bindings)
+  (if (null bindings)
+      nil
+      (cons (car (car bindings)) (%dynamic-let-vars (cdr bindings)))))
+
+(defun %dynamic-let-inits (bindings)
+  (if (null bindings)
+      nil
+      (cons (car (cdr (car bindings))) (%dynamic-let-inits (cdr bindings)))))
+
+;; list1とlist2(同じ長さ)を(要素1 要素2)のペアのリストに束ねる。
+(defun %dynamic-let-zip (list1 list2)
+  (if (null list1)
+      nil
+      (cons (list (car list1) (car list2)) (%dynamic-let-zip (cdr list1) (cdr list2)))))
+
+;; varsとvalues(同じ長さ)から (%%set-dynamic 'var value) のフォーム列を作る。
+(defun %dynamic-let-set-forms (vars values)
+  (if (null vars)
+      nil
+      (cons (list '%%set-dynamic (list 'quote (car vars)) (car values))
+            (%dynamic-let-set-forms (cdr vars) (cdr values)))))
+
+;; (dynamic-let ((var1 form1) (var2 form2) ...) body...) : 全init-formを(現在の動的束縛の下で)
+;; 左から先にすべて評価してから、まとめて各varを動的に再束縛してbodyを評価する。
+;; with-handlerと同じ保存/%%set-dynamic/unwind-protect復元パターンを変数の数だけ繰り返す。
+;; 既知の制約: 未確立(defdynamic未実行)の変数を束縛するケースは扱わない(既存のdefdynamicの前提と同じ)。
+(defmacro dynamic-let (bindings &rest body)
+  (let ((vars (%dynamic-let-vars bindings))
+        (inits (%dynamic-let-inits bindings)))
+    (let ((temps (mapcar (lambda (v) (gensym)) vars))
+          (saved (mapcar (lambda (v) (gensym)) vars)))
+      `(let (,@(%dynamic-let-zip temps inits))
+         (let (,@(%dynamic-let-zip saved (mapcar (lambda (v) (list 'dynamic v)) vars)))
+           ,@(%dynamic-let-set-forms vars temps)
+           (unwind-protect
+               (progn ,@body)
+             ,@(%dynamic-let-set-forms vars saved)))))))
+
+;; (set-dynamic form var) : formを評価した値をvarの動的値に設定する(setqと引数順が逆で、
+;; varは評価しない)。既存primitive%%SET-DYNAMICをラップするだけ。
+(defmacro set-dynamic (form var)
+  `(%%set-dynamic ',var ,form))
