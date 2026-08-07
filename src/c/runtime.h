@@ -462,6 +462,32 @@ lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数CREATE-STRING。第一引数の長さ(FIXNUM)のSTRINGを確保する。
+ * 第二引数(省略可、CHAR)を指定すると全要素をその文字で初期化する(省略時は空白)。
+ * @param args 評価済みの引数リスト(第一引数はFIXNUM、第二引数は省略可のCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したSTRING
+ */
+lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING-ELT。第一引数のSTRINGの第二引数(0起算)番目の文字を返す。
+ * @param args 評価済みの引数リスト(第一引数はSTRING、第二引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 添字が指す文字(CHAR)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数LENGTH。第一引数のシーケンス(LIST/STRING/VECTOR)の要素数を返す。
+ * VECTORの場合は次元に関わらず全要素数(各次元のサイズの積)を返す。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 要素数(FIXNUM)
+ */
+lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env);
+
+/**
  * nバイト(8byte境界に整列)をLispヒープからアロケータ経由で確保する、os_alloc_bytesの公開版。
  * stream_lisp.cがos_stream_tをLispヒープ上に確保するために使う。
  * @param n 確保するバイト数

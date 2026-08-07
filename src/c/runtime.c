@@ -359,6 +359,9 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("SET-CAR"), os_make_native_function((lisp_addr_t)(void *)primitive_set_car), global_environment);
         os_set_function(os_make_symbol("SET-CDR"), os_make_native_function((lisp_addr_t)(void *)primitive_set_cdr), global_environment);
         os_set_function(os_make_symbol("SET-AREF"), os_make_native_function((lisp_addr_t)(void *)primitive_set_aref), global_environment);
+        os_set_function(os_make_symbol("CREATE-STRING"), os_make_native_function((lisp_addr_t)(void *)primitive_create_string), global_environment);
+        os_set_function(os_make_symbol("STRING-ELT"), os_make_native_function((lisp_addr_t)(void *)primitive_string_elt), global_environment);
+        os_set_function(os_make_symbol("LENGTH"), os_make_native_function((lisp_addr_t)(void *)primitive_length), global_environment);
     }
 }
 
@@ -1211,6 +1214,90 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
     data[offset] = val;
     return val;
+}
+
+/**
+ * 組み込み関数CREATE-STRING。第一引数の長さ(FIXNUM)のSTRINGを確保する。
+ * 第二引数(省略可、CHAR)を指定すると全要素をその文字で初期化する(省略時は空白)。
+ * @param args 評価済みの引数リスト(第一引数はFIXNUM、第二引数は省略可のCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したSTRING
+ */
+lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
+    UINT64 len = cc_car(args) >> 3;
+    lisp_val_t char_arg = cc_cdr(args);
+    UINT8 fill = ' ';
+    if (char_arg != nil) {
+        fill = (UINT8)(cc_car(char_arg) >> 3);
+    }
+
+    lisp_addr_t addr = os_alloc_bytes(8 + len);
+    lisp_val_t *header = (lisp_val_t *)addr;
+    header[0] = len;
+    UINT8 *bytes = (UINT8 *)(addr + 8);
+    for (UINT64 i = 0; i < len; i++) {
+        bytes[i] = fill;
+    }
+    return (lisp_val_t)(addr | TAG_STRING);
+}
+
+/**
+ * 組み込み関数STRING-ELT。第一引数のSTRINGの第二引数(0起算)番目の文字を返す。
+ * @param args 評価済みの引数リスト(第一引数はSTRING、第二引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 添字が指す文字(CHAR)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t str = cc_car(args);
+    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
+
+    lisp_addr_t addr = str & ~TAG_MASK;
+    UINT64 len = ((lisp_val_t *)addr)[0];
+    if (idx >= len) {
+        return g_sym_eval_error;
+    }
+    UINT8 *bytes = (UINT8 *)(addr + 8);
+    return os_make_char((char)bytes[idx]);
+}
+
+/**
+ * 組み込み関数LENGTH。第一引数のシーケンス(LIST/STRING/VECTOR)の要素数を返す。
+ * VECTORの場合は次元に関わらず全要素数(各次元のサイズの積)を返す。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 要素数(FIXNUM)
+ */
+lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t seq = cc_car(args);
+    if (seq == nil) {
+        return os_make_fixnum(0);
+    }
+
+    switch (seq & TAG_MASK) {
+        case TAG_CONS: {
+            UINT64 count = 0;
+            for (lisp_val_t cur = seq; cur != nil; cur = cc_cdr(cur)) {
+                count++;
+            }
+            return os_make_fixnum(count);
+        }
+        case TAG_STRING: {
+            lisp_addr_t addr = seq & ~TAG_MASK;
+            return os_make_fixnum(((lisp_val_t *)addr)[0]);
+        }
+        case TAG_VECTOR: {
+            lisp_addr_t addr = seq & ~TAG_MASK;
+            lisp_val_t *header = (lisp_val_t *)addr;
+            UINT64 rank = header[0];
+            UINT64 total = 1;
+            for (UINT64 i = 0; i < rank; i++) {
+                total *= header[1 + i];
+            }
+            return os_make_fixnum(total);
+        }
+        default:
+            return g_sym_eval_error;
+    }
 }
 
 

@@ -372,6 +372,55 @@ void test_primitive_set_aref_out_of_bounds() {
     assert(primitive_set_aref(args, nil) == g_sym_eval_error, "(set-aref a 3 1)は範囲外なのでg_sym_eval_error");
 }
 
+void test_primitive_create_string_default_fill() {
+    lisp_val_t str = primitive_create_string(os_make_cons(os_make_fixnum(3), nil), nil);
+    assert((str & TAG_MASK) == TAG_STRING, "(create-string 3)の戻り値はTAG_STRINGを持つ");
+
+    lisp_addr_t addr = str & ~TAG_MASK;
+    lisp_val_t *header = (lisp_val_t *)addr;
+    assert(header[0] == 3, "文字列長は3である");
+
+    UINT8 *bytes = (UINT8 *)(addr + 8);
+    assert(bytes[0] == ' ' && bytes[1] == ' ' && bytes[2] == ' ', "省略時は空白で初期化される");
+}
+
+void test_primitive_create_string_with_char() {
+    lisp_val_t args = os_make_cons(os_make_fixnum(3), os_make_cons(os_make_char('A'), nil));
+    lisp_val_t str = primitive_create_string(args, nil);
+
+    lisp_addr_t addr = str & ~TAG_MASK;
+    UINT8 *bytes = (UINT8 *)(addr + 8);
+    assert(bytes[0] == 'A' && bytes[1] == 'A' && bytes[2] == 'A', "第二引数を指定すればその文字で初期化される");
+}
+
+void test_primitive_string_elt() {
+    lisp_val_t str = os_make_string("hello");
+    lisp_val_t r = primitive_string_elt(os_make_cons(str, os_make_cons(os_make_fixnum(1), nil)), nil);
+    assert((r & TAG_MASK) == TAG_CHAR, "(string-elt \"hello\" 1)の戻り値はTAG_CHARを持つ");
+    assert((r >> 3) == 'e', "(string-elt \"hello\" 1)は'e'を返す");
+}
+
+void test_primitive_string_elt_out_of_bounds() {
+    lisp_val_t str = os_make_string("hi");
+    lisp_val_t r = primitive_string_elt(os_make_cons(str, os_make_cons(os_make_fixnum(2), nil)), nil);
+    assert(r == g_sym_eval_error, "(string-elt \"hi\" 2)は範囲外なのでg_sym_eval_error");
+}
+
+void test_primitive_length() {
+    lisp_val_t list = os_make_cons(os_make_fixnum(1),
+                        os_make_cons(os_make_fixnum(2),
+                          os_make_cons(os_make_fixnum(3), nil)));
+    assert(primitive_length(os_make_cons(list, nil), nil) >> 3 == 3, "(length '(1 2 3))は3");
+    assert(primitive_length(os_make_cons(nil, nil), nil) >> 3 == 0, "(length nil)は0");
+
+    lisp_val_t str = os_make_string("hello");
+    assert(primitive_length(os_make_cons(str, nil), nil) >> 3 == 5, "(length \"hello\")は5");
+
+    lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
+    lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
+    assert(primitive_length(os_make_cons(array, nil), nil) >> 3 == 6, "(length (make-array '(2 3)))は次元に関わらず全要素数の6");
+}
+
 int main(int argc, char** argv) {
    test_os_make_fixnum();
 
@@ -402,6 +451,11 @@ int main(int argc, char** argv) {
    test_primitive_set_car();
    test_primitive_set_cdr();
    test_primitive_set_aref_out_of_bounds();
+   test_primitive_create_string_default_fill();
+   test_primitive_create_string_with_char();
+   test_primitive_string_elt();
+   test_primitive_string_elt_out_of_bounds();
+   test_primitive_length();
 
    return g_test_failed ? 1 : 0;
 }
