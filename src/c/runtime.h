@@ -37,6 +37,10 @@
 #define MAGIC_CLASS                0x7ULL
 /** TAG_INSTANCEのword0に入る、ILOSのクラスインスタンスであることを示すMAGIC NUMBER。word1=class、word2=slots-vector(TAG_VECTOR)、word3=未使用 */
 #define MAGIC_CLASS_INSTANCE       0x8ULL
+/** TAG_INSTANCEのword0に入る、catch/throwの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(evalされた値)、word2=throwされた値 */
+#define MAGIC_CATCH_EXIT           0x9ULL
+/** TAG_INSTANCEのword0に入る、tagbody/goの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(未評価のsymbol) */
+#define MAGIC_GO_EXIT              0xAULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -111,6 +115,15 @@ extern lisp_val_t g_sym_eval_error;
 
 /** os_eval_top_levelが張るblockの名前を表すシンボル(%TOP-LEVEL) */
 extern lisp_val_t g_sym_top_level_block;
+
+/** catch特殊形式を表すシンボル */
+extern lisp_val_t g_sym_catch;
+/** throw特殊形式を表すシンボル */
+extern lisp_val_t g_sym_throw;
+/** tagbody特殊形式を表すシンボル */
+extern lisp_val_t g_sym_tagbody;
+/** go特殊形式を表すシンボル */
+extern lisp_val_t g_sym_go;
 
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 extern lisp_val_t global_environment;

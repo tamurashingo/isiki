@@ -2,7 +2,8 @@
 #include "lisp.h"
 
 /**
- * vがblock/return-from/unwind-protectの非局所脱出シグナル(TAG_INSTANCE, MAGIC_BLOCK_EXIT)かどうかを判定する。
+ * vがblock/return-from/unwind-protect/catch/throw/tagbody/goの非局所脱出シグナル
+ * (TAG_INSTANCE, MAGIC_BLOCK_EXIT/MAGIC_CATCH_EXIT/MAGIC_GO_EXIT)かどうかを判定する。
  * setjmp/longjmpが使えないfreestanding環境のため、脱出はこのシグナル値を評価器の各段で
  * 伝播させることで実現する(捕捉されるまでos_evalの呼び出しをすべて即座に巻き戻す)。
  * @param v 判定対象の値
@@ -13,7 +14,7 @@ static int is_control_transfer(lisp_val_t v) {
         return 0;
     }
     UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
-    return obj[0] == MAGIC_BLOCK_EXIT;
+    return obj[0] == MAGIC_BLOCK_EXIT || obj[0] == MAGIC_CATCH_EXIT || obj[0] == MAGIC_GO_EXIT;
 }
 
 /**
@@ -540,6 +541,124 @@ static lisp_val_t eval_unwind_protect(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * catch特殊形式。(catch tag-form form...)のtag-formを評価してcatch tagを得たうえで、
+ * bodyをblockと同様に順に評価する。bodyの評価中に(throw tag-form result-form)による
+ * 脱出シグナル(MAGIC_CATCH_EXIT)が起き、そのtagがeqで一致するならresultを返して捕捉し、
+ * 一致しなければそのまま上位へ伝播する(block/return-fromと同じ形)。
+ * @param args (tag-form . body)
+ * @param env 評価に使う環境
+ * @return bodyの最後の評価結果、またはthrowで渡された値
+ */
+static lisp_val_t eval_catch(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t tag_form = cc_car(args);
+    lisp_val_t body = cc_cdr(args);
+    lisp_val_t tag = os_eval(tag_form, env);
+    if (is_control_transfer(tag)) {
+        return tag;
+    }
+    lisp_val_t result = eval_progn(body, env);
+    if ((result & TAG_MASK) == TAG_INSTANCE) {
+        UINT64 *obj = (UINT64 *)(result & ~TAG_MASK);
+        if (obj[0] == MAGIC_CATCH_EXIT && obj[1] == tag) {
+            return obj[2];
+        }
+    }
+    return result;
+}
+
+/**
+ * throw特殊形式。(throw tag-form result-form)のtag-formとresult-formを評価し、
+ * tagを宛先とする非局所脱出シグナル(MAGIC_CATCH_EXIT)を作って返す。
+ * 対応するcatchが動的に外側に無い場合の扱いは未実装(仕様上はcontrol-error、
+ * 本実装ではシグナルがそのまま最上位まで伝播する)。
+ * @param args (tag-form result-form)
+ * @param env 評価に使う環境
+ * @return tagを宛先とする脱出シグナル
+ */
+static lisp_val_t eval_throw(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t tag_form = cc_car(args);
+    lisp_val_t result_form = cc_car(cc_cdr(args));
+    lisp_val_t tag = os_eval(tag_form, env);
+    if (is_control_transfer(tag)) {
+        return tag;
+    }
+    lisp_val_t result = os_eval(result_form, env);
+    if (is_control_transfer(result)) {
+        return result;
+    }
+    return os_make_instance(MAGIC_CATCH_EXIT, tag, result, nil);
+}
+
+/**
+ * elemがtagbodyのbody中でtagbody-tag(識別子)として扱われる要素かどうかを判定する。
+ * ISLisp仕様(§14.7.1)ではtagbody-tagは識別子(symbol)のみで、整数タグは扱わない。
+ * nilはtagbody上ではsymbolだが、body要素としては(空リストと表記上区別できないため)
+ * タグではなくformとして扱う。
+ * @param elem body中の1要素
+ * @return tagbody-tagならnon-zero
+ */
+static int is_tagbody_tag(lisp_val_t elem) {
+    return elem != nil && (elem & TAG_MASK) == TAG_SYMBOL;
+}
+
+/**
+ * tagbody特殊形式。(tagbody {tagbody-tag | form}*)のbodyを先頭から順に評価する
+ * (symbolの要素はタグとして読み飛ばし、それ以外はformとして評価して値を捨てる)。
+ * formの評価結果が(go tag)による脱出シグナル(MAGIC_GO_EXIT)で、そのtagが自分自身の
+ * body中のタグに一致する場合はそのタグの直後にジャンプして続行する(前方・後方どちらも可)。
+ * 一致しない場合はそのまま上位へ伝播する(外側のtagbodyが拾う可能性がある)。
+ * 最後まで正常終了した場合、常にnilを返す(仕様通り、formの値はすべて捨てる)。
+ * @param args body(tagbody-tagとformが混在するリスト)
+ * @param env 評価に使う環境
+ * @return 常にnil。捕捉されないgoが起きた場合はその脱出シグナル
+ */
+static lisp_val_t eval_tagbody(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t pos = args;
+    while (pos != nil) {
+        lisp_val_t elem = cc_car(pos);
+        if (is_tagbody_tag(elem)) {
+            pos = cc_cdr(pos);
+            continue;
+        }
+        lisp_val_t result = os_eval(elem, env);
+        if ((result & TAG_MASK) == TAG_INSTANCE) {
+            UINT64 *obj = (UINT64 *)(result & ~TAG_MASK);
+            if (obj[0] == MAGIC_GO_EXIT) {
+                lisp_val_t dest = nil;
+                int found = 0;
+                for (lisp_val_t p = args; p != nil; p = cc_cdr(p)) {
+                    if (is_tagbody_tag(cc_car(p)) && cc_car(p) == obj[1]) {
+                        dest = cc_cdr(p);
+                        found = 1;
+                        break;
+                    }
+                }
+                if (found) {
+                    pos = dest;
+                    continue;
+                }
+            }
+            return result; // 自分のタグではない脱出シグナル(catch/block/他のgo)。そのまま伝播
+        }
+        pos = cc_cdr(pos);
+    }
+    return nil;
+}
+
+/**
+ * go特殊形式。(go tag)のtagは評価しない(quoteと同様)。tagを宛先とする
+ * 非局所脱出シグナル(MAGIC_GO_EXIT)を作って返すのみで、実際のジャンプはtagbody側が行う。
+ * @param args (tag)
+ * @param env 未使用
+ * @return tagを宛先とする脱出シグナル
+ */
+static lisp_val_t eval_go(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t tag = cc_car(args);
+    return os_make_instance(MAGIC_GO_EXIT, tag, nil, nil);
+}
+
+/**
  * 組み込み関数MACROEXPAND-1。formの先頭がマクロとして定義されたsymbolなら1段だけ展開して返し、
  * そうでなければformをそのまま返す(このインタプリタには多値機構が無いため、
  * ISLisp仕様上の「展開したか否か」の真偽値は返さない)。
@@ -662,6 +781,18 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
         }
         if (op == g_sym_dynamic) {
             return eval_dynamic(args, env);
+        }
+        if (op == g_sym_catch) {
+            return eval_catch(args, env);
+        }
+        if (op == g_sym_throw) {
+            return eval_throw(args, env);
+        }
+        if (op == g_sym_tagbody) {
+            return eval_tagbody(args, env);
+        }
+        if (op == g_sym_go) {
+            return eval_go(args, env);
         }
         if ((op & TAG_MASK) == TAG_SYMBOL) {
             lisp_val_t fn = os_get_function(op, env);

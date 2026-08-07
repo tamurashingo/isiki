@@ -147,6 +147,15 @@ lisp_val_t g_sym_eval_error;
 /** os_eval_top_levelが張るblockの名前を表すシンボル(%TOP-LEVEL) */
 lisp_val_t g_sym_top_level_block;
 
+/** catch特殊形式を表すシンボル */
+lisp_val_t g_sym_catch;
+/** throw特殊形式を表すシンボル */
+lisp_val_t g_sym_throw;
+/** tagbody特殊形式を表すシンボル */
+lisp_val_t g_sym_tagbody;
+/** go特殊形式を表すシンボル */
+lisp_val_t g_sym_go;
+
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 lisp_val_t global_environment;
 
@@ -337,6 +346,11 @@ void os_bootstrap() {
         g_sym_eval_error = os_make_symbol("EVAL-ERROR");
 
         g_sym_top_level_block = os_make_symbol("%TOP-LEVEL");
+
+        g_sym_catch = os_make_symbol("CATCH");
+        g_sym_throw = os_make_symbol("THROW");
+        g_sym_tagbody = os_make_symbol("TAGBODY");
+        g_sym_go = os_make_symbol("GO");
 
 
         os_set_function(g_sym_car, os_make_native_function((lisp_addr_t)(void *)primitive_car), global_environment);

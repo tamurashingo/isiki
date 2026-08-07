@@ -613,6 +613,99 @@ void test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit() {
     assert(os_get_variable(flag, env) == os_make_fixnum(100), "return-fromで脱出する際もcleanupは必ず実行される");
 }
 
+void test_os_eval_catch_throw_basic() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t quoted_tag = os_make_cons(g_sym_quote, os_make_cons(os_make_symbol("tag"), nil));
+
+    // (catch 'tag (throw 'tag 42)) : throwで渡した42をcatchが捕捉して返す
+    lisp_val_t throw_form = os_make_cons(os_make_symbol("throw"),
+                                os_make_cons(quoted_tag, os_make_cons(os_make_fixnum(42), nil)));
+    lisp_val_t catch_form = os_make_cons(os_make_symbol("catch"),
+                                os_make_cons(quoted_tag, os_make_cons(throw_form, nil)));
+
+    lisp_val_t v = os_eval(catch_form, env);
+    assert(v == os_make_fixnum(42), "(catch 'tag (throw 'tag 42))はthrowの42を捕捉して返す");
+}
+
+void test_os_eval_catch_throw_mismatched_tag_propagates_to_outer_catch() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t quoted_outer = os_make_cons(g_sym_quote, os_make_cons(os_make_symbol("outer"), nil));
+    lisp_val_t quoted_inner = os_make_cons(g_sym_quote, os_make_cons(os_make_symbol("inner"), nil));
+
+    // (catch 'outer (catch 'inner (throw 'outer 99))) :
+    // innerのタグと不一致のthrowはinnerを素通りしてouterまで伝播し99になる
+    lisp_val_t throw_outer = os_make_cons(os_make_symbol("throw"),
+                                  os_make_cons(quoted_outer, os_make_cons(os_make_fixnum(99), nil)));
+    lisp_val_t inner_catch = os_make_cons(os_make_symbol("catch"),
+                                  os_make_cons(quoted_inner, os_make_cons(throw_outer, nil)));
+    lisp_val_t outer_catch = os_make_cons(os_make_symbol("catch"),
+                                  os_make_cons(quoted_outer, os_make_cons(inner_catch, nil)));
+
+    lisp_val_t v = os_eval(outer_catch, env);
+    assert(v == os_make_fixnum(99), "タグが一致しないthrowはinner catchを素通りしouter catchが99を捕捉する");
+}
+
+void test_os_eval_tagbody_go_forward_jump_skips_form() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t flag = os_make_symbol("flag");
+    os_set_variable(flag, os_make_fixnum(0), env);
+
+    // (tagbody (go skip) (setq flag 99) skip) : goで先へ飛び、setqは実行されずflagは0のまま
+    lisp_val_t skip_tag = os_make_symbol("skip");
+    lisp_val_t go_skip = os_make_cons(os_make_symbol("go"), os_make_cons(skip_tag, nil));
+    lisp_val_t setq_flag = os_make_cons(os_make_symbol("setq"),
+                                os_make_cons(flag, os_make_cons(os_make_fixnum(99), nil)));
+    lisp_val_t body = os_make_cons(go_skip, os_make_cons(setq_flag, os_make_cons(skip_tag, nil)));
+    lisp_val_t form = os_make_cons(os_make_symbol("tagbody"), body);
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == nil, "tagbodyは常にnilを返す");
+    assert(os_get_variable(flag, env) == os_make_fixnum(0), "goで前方ジャンプしたためsetqは実行されずflagは0のまま");
+}
+
+void test_os_eval_tagbody_go_backward_jump_loops_until_end_tag() {
+    lisp_val_t env = make_arith_env();
+    os_set_function(os_make_symbol("eq"), os_make_native_function((lisp_addr_t)(void *)primitive_eq), env);
+    lisp_val_t sum = os_make_symbol("sum");
+    lisp_val_t i = os_make_symbol("i");
+    os_set_variable(sum, os_make_fixnum(0), env);
+    os_set_variable(i, os_make_fixnum(1), env);
+
+    // (tagbody
+    //   loop
+    //   (if (eq i 6) (go end) nil)
+    //   (setq sum (+ sum i))
+    //   (setq i (+ i 1))
+    //   (go loop)
+    //   end)
+    // : i=1..5の間backward-goでloopし、sum=1+2+3+4+5=15になる。
+    // endはbody末尾のタグ(直後に何も無い)で、goで到達したときに正常終了することも確認する。
+    lisp_val_t loop_tag = os_make_symbol("loop");
+    lisp_val_t end_tag = os_make_symbol("end");
+
+    lisp_val_t eq_test = make_call("eq", 2, (lisp_val_t[]){ i, os_make_fixnum(6) });
+    lisp_val_t go_end = os_make_cons(os_make_symbol("go"), os_make_cons(end_tag, nil));
+    lisp_val_t if_form = make_call("if", 3, (lisp_val_t[]){ eq_test, go_end, nil });
+
+    lisp_val_t setq_sum = os_make_cons(os_make_symbol("setq"),
+                              os_make_cons(sum, os_make_cons(make_call("+", 2, (lisp_val_t[]){ sum, i }), nil)));
+    lisp_val_t setq_i = os_make_cons(os_make_symbol("setq"),
+                              os_make_cons(i, os_make_cons(make_call("+", 2, (lisp_val_t[]){ i, os_make_fixnum(1) }), nil)));
+    lisp_val_t go_loop = os_make_cons(os_make_symbol("go"), os_make_cons(loop_tag, nil));
+
+    lisp_val_t body = os_make_cons(loop_tag,
+                          os_make_cons(if_form,
+                              os_make_cons(setq_sum,
+                                  os_make_cons(setq_i,
+                                      os_make_cons(go_loop,
+                                          os_make_cons(end_tag, nil))))));
+    lisp_val_t form = os_make_cons(os_make_symbol("tagbody"), body);
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == nil, "tagbodyは常にnilを返す");
+    assert(os_get_variable(sum, env) == os_make_fixnum(15), "backward-goによるループでsumは1+2+3+4+5=15になる");
+}
+
 void test_os_eval_function_on_symbol_returns_function_object() {
     lisp_val_t env = make_arith_env();
 
@@ -857,6 +950,10 @@ int main(int argc, char** argv) {
     test_os_eval_nested_block_return_from_only_exits_inner();
     test_os_eval_unwind_protect_runs_cleanup_on_normal_return();
     test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit();
+    test_os_eval_catch_throw_basic();
+    test_os_eval_catch_throw_mismatched_tag_propagates_to_outer_catch();
+    test_os_eval_tagbody_go_forward_jump_skips_form();
+    test_os_eval_tagbody_go_backward_jump_loops_until_end_tag();
     test_primitive_macroexpand_1_expands_macro_call();
     test_primitive_macroexpand_1_returns_form_unchanged_when_not_macro();
     test_primitive_funcall_calls_native_function();
