@@ -1,25 +1,20 @@
 #include "virtio9p.h"
-#include "drivers/pci.h"
-#include "drivers/virtio.h"
-#include "drivers/virtqueue.h"
+#include "transport_virtio9p.h"
+#include "p9_transport.h"
 #include "p9.h"
 
 /** 9Pセッションで使う最大メッセージサイズ */
 #define P9_MSIZE 8192
-/** virtqueue用DMA領域のサイズ */
-#define VIRTQ9P_MEM_SIZE 8192
 /** パスの最大コンポーネント数(Twalk用) */
 #define P9_MAX_PATH_COMPONENTS 8
 /** パス文字列を保持するローカルバッファのサイズ */
 #define P9_PATH_BUF_SIZE 256
 
-static UINT8 g_virtq9p_mem[VIRTQ9P_MEM_SIZE] __attribute__((aligned(4096)));
 static UINT8 g_p9_tx_buf[P9_MSIZE] __attribute__((aligned(4096)));
 static UINT8 g_p9_rx_buf[P9_MSIZE] __attribute__((aligned(4096)));
 static UINT8 g_init_lisp_buf[4096] __attribute__((aligned(4096)));
 
-static os_virtio_device g_vdev;
-static os_virtqueue g_vq;
+/** Tversion/Tattachによる9Pプロトコルレベルのセッション確立が済んでいるか */
 static int g_session_ready = 0;
 
 static UINT32 str_len(const char *s) {
@@ -76,21 +71,24 @@ static UINT16 split_path(char *path_buf, const char *wnames_out[P9_MAX_PATH_COMP
     return count;
 }
 
-/** tx_buf/rx_bufでリクエストを送りpollで完了を待ち、タイムアウト/Rerrorをerr_msgへ整形する */
-static int p9_rpc(os_virtqueue *vq, UINT32 tx_len, UINT32 *out_rx_len, const char *stage,
+/** g_p9_tx_buf/g_p9_rx_bufでリクエストを送りrecvで完了を待ち、タイムアウト/Rerrorをerr_msgへ整形する */
+static int p9_rpc(UINT32 tx_len, UINT32 *out_rx_len, const char *stage,
                    char *err_msg, UINT32 err_msg_cap) {
-#ifndef ISIKIOS_UNIT_TEST
-    asm volatile("cli");
-#endif
-    os_virtqueue_submit(vq, (UINT64)(lisp_addr_t)g_p9_tx_buf, tx_len,
-                         (UINT64)(lisp_addr_t)g_p9_rx_buf, sizeof(g_p9_rx_buf));
-    int polled = os_virtqueue_poll(vq, out_rx_len);
-#ifndef ISIKIOS_UNIT_TEST
-    asm volatile("sti");
-#endif
-    if (!polled) {
+    p9_transport_t *transport = os_transport_virtio9p_instance();
+    char transport_err[96];
+    transport_err[0] = '\0';
+
+    if (!transport->send(transport, g_p9_tx_buf, tx_len, g_p9_rx_buf, sizeof(g_p9_rx_buf),
+                          transport_err, sizeof(transport_err))) {
         set_err(err_msg, err_msg_cap, stage);
-        str_append(err_msg, err_msg_cap, ": virtqueue poll timed out");
+        str_append(err_msg, err_msg_cap, ": ");
+        str_append(err_msg, err_msg_cap, transport_err);
+        return 0;
+    }
+    if (!transport->recv(transport, out_rx_len, transport_err, sizeof(transport_err))) {
+        set_err(err_msg, err_msg_cap, stage);
+        str_append(err_msg, err_msg_cap, ": ");
+        str_append(err_msg, err_msg_cap, transport_err);
         return 0;
     }
 
@@ -110,30 +108,10 @@ int os_virtio9p_ensure_session(char *err_msg, UINT32 err_msg_cap) {
         return 1;
     }
 
-    os_pci_device pci_dev;
-    if (!os_pci_find_virtio_9p(&pci_dev)) {
-        set_err(err_msg, err_msg_cap, "virtio-9p PCI device not found (check -device virtio-9p-pci in Makefile)");
+    p9_transport_t *transport = os_transport_virtio9p_instance();
+    if (!transport->ensure_ready(transport, err_msg, err_msg_cap)) {
         return 0;
     }
-
-    os_pci_enable_device(&pci_dev);
-
-    if ((pci_dev.bar0_raw & 0x1) == 0) {
-        set_err(err_msg, err_msg_cap, "virtio-9p BAR0 is not an I/O space BAR");
-        return 0;
-    }
-
-    g_vdev.io_base = os_pci_bar0_io_base(pci_dev.bar0_raw);
-
-    os_virtio_reset_and_negotiate(&g_vdev);
-
-    if (!os_virtqueue_init(&g_vq, &g_vdev, 0, g_virtq9p_mem, sizeof(g_virtq9p_mem))) {
-        set_err(err_msg, err_msg_cap,
-                "virtqueue init failed: device queue size exceeds VIRTQ_MAX_SIZE or reserved memory too small");
-        return 0;
-    }
-
-    os_virtio_set_driver_ok(&g_vdev);
 
     UINT32 tx_len;
     UINT32 rx_len;
@@ -141,7 +119,7 @@ int os_virtio9p_ensure_session(char *err_msg, UINT32 err_msg_cap) {
     /* Tversion: セッション確立前なのでtag=NOTAG(0xFFFF)を使う。
        QEMUのvirtio-9pサーバは素の"9P2000"を受け付けないため"9P2000.u"を使う */
     tx_len = os_p9_build_tversion(g_p9_tx_buf, 0xFFFF, P9_MSIZE, "9P2000.u");
-    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tversion", err_msg, err_msg_cap)) {
+    if (!p9_rpc(tx_len, &rx_len, "Tversion", err_msg, err_msg_cap)) {
         return 0;
     }
     UINT32 negotiated_msize;
@@ -153,7 +131,7 @@ int os_virtio9p_ensure_session(char *err_msg, UINT32 err_msg_cap) {
 
     /* Tattach: fid=0をroot(aname="")へattachする */
     tx_len = os_p9_build_tattach(g_p9_tx_buf, 0, 0, 0xFFFFFFFF, "root", "", P9_NONUNAME);
-    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tattach", err_msg, err_msg_cap)) {
+    if (!p9_rpc(tx_len, &rx_len, "Tattach", err_msg, err_msg_cap)) {
         return 0;
     }
     if (!os_p9_parse_rattach(g_p9_rx_buf, rx_len)) {
@@ -180,7 +158,7 @@ int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 er
     UINT16 nwname = split_path(path_buf, wnames);
 
     tx_len = os_p9_build_twalk(g_p9_tx_buf, 0, 0, 1, wnames, nwname);
-    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Twalk", err_msg, err_msg_cap)) {
+    if (!p9_rpc(tx_len, &rx_len, "Twalk", err_msg, err_msg_cap)) {
         return 0;
     }
     UINT16 nwqid;
@@ -195,7 +173,7 @@ int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 er
 
     /* Topen: newfid=1を読み込み専用でopenする */
     tx_len = os_p9_build_topen(g_p9_tx_buf, 0, 1, P9_OREAD);
-    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Topen", err_msg, err_msg_cap)) {
+    if (!p9_rpc(tx_len, &rx_len, "Topen", err_msg, err_msg_cap)) {
         return 0;
     }
     if (!os_p9_parse_ropen(g_p9_rx_buf, rx_len)) {
@@ -212,7 +190,7 @@ int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
                             char *err_msg, UINT32 err_msg_cap) {
     UINT32 tx_len = os_p9_build_tread(g_p9_tx_buf, 0, fid, offset, want);
     UINT32 rx_len;
-    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tread", err_msg, err_msg_cap)) {
+    if (!p9_rpc(tx_len, &rx_len, "Tread", err_msg, err_msg_cap)) {
         return 0;
     }
 
@@ -226,7 +204,7 @@ int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
 int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
     UINT32 tx_len = os_p9_build_tclunk(g_p9_tx_buf, 0, fid);
     UINT32 rx_len;
-    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tclunk", err_msg, err_msg_cap)) {
+    if (!p9_rpc(tx_len, &rx_len, "Tclunk", err_msg, err_msg_cap)) {
         return 0;
     }
     if (!os_p9_parse_rclunk(g_p9_rx_buf, rx_len)) {
