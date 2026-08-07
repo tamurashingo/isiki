@@ -2,31 +2,57 @@
 #include "lisp.h"
 
 /**
+ * vがblock/return-from/unwind-protectの非局所脱出シグナル(TAG_INSTANCE, MAGIC_BLOCK_EXIT)かどうかを判定する。
+ * setjmp/longjmpが使えないfreestanding環境のため、脱出はこのシグナル値を評価器の各段で
+ * 伝播させることで実現する(捕捉されるまでos_evalの呼び出しをすべて即座に巻き戻す)。
+ * @param v 判定対象の値
+ * @return 非局所脱出シグナルならnon-zero
+ */
+static int is_control_transfer(lisp_val_t v) {
+    if ((v & TAG_MASK) != TAG_INSTANCE) {
+        return 0;
+    }
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[0] == MAGIC_BLOCK_EXIT;
+}
+
+/**
  * args(未評価のリスト)を先頭から順にos_evalし、評価済みの値のリストを作る。
+ * 途中で非局所脱出シグナルが現れた場合、残りの引数は評価せずそのシグナルをそのまま返す。
  * @param args 未評価の引数リスト
  * @param env 評価に使う環境
- * @return 評価済みの値のリスト
+ * @return 評価済みの値のリスト。非局所脱出が起きた場合はその脱出シグナル
  */
 static lisp_val_t eval_args(lisp_val_t args, lisp_val_t env) {
     if (args == nil) {
         return nil;
     }
     lisp_val_t head = os_eval(cc_car(args), env);
+    if (is_control_transfer(head)) {
+        return head;
+    }
     lisp_val_t tail = eval_args(cc_cdr(args), env);
+    if (is_control_transfer(tail)) {
+        return tail;
+    }
     return os_make_cons(head, tail);
 }
 
 /**
  * body(未評価のフォーム列)を先頭から順にos_evalし、最後の評価結果を返す。
  * defun/lambdaの本体評価とprogn特殊形式の両方から使う。
+ * 途中で非局所脱出シグナルが現れた場合、残りのフォームは評価せずそのシグナルをそのまま返す。
  * @param body 未評価のフォーム列
  * @param env 評価に使う環境
- * @return 最後のフォームの評価結果。bodyが空ならnil
+ * @return 最後のフォームの評価結果。bodyが空ならnil。非局所脱出が起きた場合はその脱出シグナル
  */
 static lisp_val_t eval_progn(lisp_val_t body, lisp_val_t env) {
     lisp_val_t result = nil;
     for (lisp_val_t rest = body; rest != nil; rest = cc_cdr(rest)) {
         result = os_eval(cc_car(rest), env);
+        if (is_control_transfer(result)) {
+            return result;
+        }
     }
     return result;
 }
@@ -108,6 +134,9 @@ static lisp_val_t eval_form(lisp_val_t op, lisp_val_t args, lisp_val_t env) {
         return g_sym_eval_error; // 未定義の関数
     }
     lisp_val_t evaluated_args = eval_args(args, env);
+    if (is_control_transfer(evaluated_args)) {
+        return evaluated_args;
+    }
     return apply_function(fn, evaluated_args, env);
 }
 
@@ -134,7 +163,11 @@ static lisp_val_t eval_if(lisp_val_t args, lisp_val_t env) {
     lisp_val_t then_form = cc_car(cc_cdr(args));
     lisp_val_t else_rest = cc_cdr(cc_cdr(args));
 
-    if (os_eval(test, env) != nil) {
+    lisp_val_t test_result = os_eval(test, env);
+    if (is_control_transfer(test_result)) {
+        return test_result;
+    }
+    if (test_result != nil) {
         return os_eval(then_form, env);
     }
     if (else_rest != nil) {
@@ -153,6 +186,9 @@ static lisp_val_t eval_setq(lisp_val_t args, lisp_val_t env) {
     lisp_val_t sym = cc_car(args);
     lisp_val_t val_form = cc_car(cc_cdr(args));
     lisp_val_t val = os_eval(val_form, env);
+    if (is_control_transfer(val)) {
+        return val;
+    }
     return os_set_variable(sym, val, env);
 }
 
@@ -305,6 +341,62 @@ static lisp_val_t eval_quasiquote(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * block特殊形式。(block name body...)のbodyを順に評価する。
+ * bodyの評価中に(return-from name value)による脱出シグナルが起きた場合、
+ * それがこのblockのnameと一致するならvalueを返して捕捉し、一致しなければそのまま上位へ伝播する。
+ * @param args (name . body)
+ * @param env 評価に使う環境
+ * @return bodyの最後の評価結果、またはreturn-fromで渡された値
+ */
+static lisp_val_t eval_block(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t body = cc_cdr(args);
+    lisp_val_t result = eval_progn(body, env);
+    if (is_control_transfer(result)) {
+        UINT64 *obj = (UINT64 *)(result & ~TAG_MASK);
+        if (obj[1] == name) {
+            return obj[2];
+        }
+    }
+    return result;
+}
+
+/**
+ * return-from特殊形式。(return-from name value-form)のvalue-formを評価し、
+ * nameを宛先とする非局所脱出シグナル(MAGIC_BLOCK_EXIT)を作って返す。
+ * value-formの評価中に別の脱出シグナルが起きた場合は、それをそのまま返す(自分では包まない)。
+ * @param args (name . value-form-rest) value-form-restが空ならvalueはnil
+ * @param env 評価に使う環境
+ * @return nameを宛先とする脱出シグナル
+ */
+static lisp_val_t eval_return_from(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t value_rest = cc_cdr(args);
+    lisp_val_t val = (value_rest != nil) ? os_eval(cc_car(value_rest), env) : nil;
+    if (is_control_transfer(val)) {
+        return val;
+    }
+    return os_make_instance(MAGIC_BLOCK_EXIT, name, val, nil);
+}
+
+/**
+ * unwind-protect特殊形式。(unwind-protect protected-form cleanup-form...)のprotected-formを評価し、
+ * その結果(通常値・脱出シグナルのいずれでも)に関わらずcleanup-formを必ず評価してから、
+ * protected-formの評価結果を返す。
+ * 既知の簡略化: cleanup-form内で新たな脱出が起きた場合、その脱出は無視してprotected-formの結果を返す。
+ * @param args (protected-form . cleanup-form-rest)
+ * @param env 評価に使う環境
+ * @return protected-formの評価結果(通常値または脱出シグナル)
+ */
+static lisp_val_t eval_unwind_protect(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t protected_form = cc_car(args);
+    lisp_val_t cleanup_forms = cc_cdr(args);
+    lisp_val_t result = os_eval(protected_form, env);
+    eval_progn(cleanup_forms, env);
+    return result;
+}
+
+/**
  * exp を env のもとで評価する。
  * SYMBOLはenvから値をlookupし、CONSはcarが特殊形式シンボルならその処理を、
  * そうでなければcarを関数、cdrを引数として評価する。
@@ -347,6 +439,15 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
         }
         if (op == g_sym_quasiquote) {
             return eval_quasiquote(args, env);
+        }
+        if (op == g_sym_block) {
+            return eval_block(args, env);
+        }
+        if (op == g_sym_return_from) {
+            return eval_return_from(args, env);
+        }
+        if (op == g_sym_unwind_protect) {
+            return eval_unwind_protect(args, env);
         }
         if ((op & TAG_MASK) == TAG_SYMBOL) {
             lisp_val_t fn = os_get_function(op, env);

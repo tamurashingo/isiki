@@ -457,6 +457,96 @@ void test_os_eval_null() {
     assert(v2 == nil, "(null 1)はnilになる");
 }
 
+void test_os_eval_block_return_from_immediate_exit() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t name = os_make_symbol("done");
+
+    // (block done 1 (return-from done 2) 3) : return-fromで即脱出し、3は評価されず結果は2
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    lisp_val_t body = os_make_cons(os_make_fixnum(1),
+                            os_make_cons(return_form, os_make_cons(os_make_fixnum(3), nil)));
+    lisp_val_t form = os_make_cons(os_make_symbol("block"), os_make_cons(name, body));
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == os_make_fixnum(2), "(block done 1 (return-from done 2) 3)はreturn-fromで即脱出し2になる");
+}
+
+void test_os_eval_return_from_crosses_function_call() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t outer = os_make_symbol("outer");
+
+    // (defun inner () (return-from outer 42))
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(outer, os_make_cons(os_make_fixnum(42), nil)));
+    lisp_val_t inner_body = os_make_cons(return_form, nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(os_make_symbol("inner"), os_make_cons(nil, inner_body)));
+    os_eval(defun_form, env);
+
+    // (block outer (inner) 99) : innerの中のreturn-fromがouterまで関数呼び出しを飛び越えて届く
+    lisp_val_t block_body = os_make_cons(make_call("inner", 0, NULL), os_make_cons(os_make_fixnum(99), nil));
+    lisp_val_t block_form = os_make_cons(os_make_symbol("block"), os_make_cons(outer, block_body));
+
+    lisp_val_t v = os_eval(block_form, env);
+    assert(v == os_make_fixnum(42), "innerで呼んだreturn-fromが関数呼び出しをまたいでouterまで届き42になる");
+}
+
+void test_os_eval_nested_block_return_from_only_exits_inner() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t inner_name = os_make_symbol("inner");
+    lisp_val_t outer_name = os_make_symbol("outer2");
+
+    // (block outer2 (block inner (return-from inner 1) 2) 3)
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(inner_name, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t inner_body = os_make_cons(return_form, os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t inner_block = os_make_cons(os_make_symbol("block"), os_make_cons(inner_name, inner_body));
+
+    lisp_val_t outer_body = os_make_cons(inner_block, os_make_cons(os_make_fixnum(3), nil));
+    lisp_val_t outer_block = os_make_cons(os_make_symbol("block"), os_make_cons(outer_name, outer_body));
+
+    lisp_val_t v = os_eval(outer_block, env);
+    assert(v == os_make_fixnum(3), "innerへのreturn-fromはinnerだけを抜け、outerは残りの3まで評価される");
+}
+
+void test_os_eval_unwind_protect_runs_cleanup_on_normal_return() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t flag = os_make_symbol("flag");
+    os_set_variable(flag, os_make_fixnum(0), env);
+
+    // (unwind-protect 1 (setq flag 99))
+    lisp_val_t setq_flag = os_make_cons(os_make_symbol("setq"),
+                                os_make_cons(flag, os_make_cons(os_make_fixnum(99), nil)));
+    lisp_val_t form = os_make_cons(os_make_symbol("unwind-protect"),
+                            os_make_cons(os_make_fixnum(1), os_make_cons(setq_flag, nil)));
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == os_make_fixnum(1), "(unwind-protect 1 (setq flag 99))は保護対象の結果1を返す");
+    assert(os_get_variable(flag, env) == os_make_fixnum(99), "cleanupのsetqは通常時も実行される");
+}
+
+void test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t flag = os_make_symbol("flag");
+    os_set_variable(flag, os_make_fixnum(0), env);
+    lisp_val_t done = os_make_symbol("done");
+
+    // (block done (unwind-protect (return-from done 1) (setq flag 100)) 2)
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(done, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t setq_flag = os_make_cons(os_make_symbol("setq"),
+                                os_make_cons(flag, os_make_cons(os_make_fixnum(100), nil)));
+    lisp_val_t unwind_form = os_make_cons(os_make_symbol("unwind-protect"),
+                                os_make_cons(return_form, os_make_cons(setq_flag, nil)));
+    lisp_val_t block_body = os_make_cons(unwind_form, os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t block_form = os_make_cons(os_make_symbol("block"), os_make_cons(done, block_body));
+
+    lisp_val_t v = os_eval(block_form, env);
+    assert(v == os_make_fixnum(1), "return-fromでの脱出時もunwind-protectの結果はblockまで正しく伝播し1になる");
+    assert(os_get_variable(flag, env) == os_make_fixnum(100), "return-fromで脱出する際もcleanupは必ず実行される");
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -490,6 +580,11 @@ int main(int argc, char** argv) {
     test_os_eval_quasiquote_plain_list();
     test_os_eval_quasiquote_unquote();
     test_os_eval_quasiquote_unquote_splicing();
+    test_os_eval_block_return_from_immediate_exit();
+    test_os_eval_return_from_crosses_function_call();
+    test_os_eval_nested_block_return_from_only_exits_inner();
+    test_os_eval_unwind_protect_runs_cleanup_on_normal_return();
+    test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit();
 
     return g_test_failed ? 1 : 0;
 }
