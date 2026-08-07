@@ -331,3 +331,18 @@
 (assert-equal nil (error-output))
 (assert-equal t (with-error-output (open-output-stream) (if (error-output) t nil)))
 (assert-equal nil (error-output))
+
+;;; --- with-open-input-file ---
+
+;; このテスト環境では9Pの実ファイルアクセスをモックしていない(os_virtio9p_openが
+;; 常に失敗するダミー実装)ため、実際にファイルを開いて読む動作は確認できない。
+;; macroexpand-1でwith-open-input-streamへの展開結果の形だけを確認する
+;; (with-open-input-streamのcloseは既存実装のため、ここでは再テストしない)。
+(let ((expanded (macroexpand-1 '(with-open-input-file (s "foo.lsp") (read s)))))
+  (assert-equal 'with-open-input-stream (car expanded))
+  (let ((binding (car (cdr expanded))))
+    (assert-equal 's (car binding))
+    (let ((stream-form (car (cdr binding))))
+      (assert-equal 'open-input-stream (car stream-form))
+      (assert-equal (string-to-symbol "foo.lsp") (string-to-symbol (car (cdr stream-form))))))
+  (assert-equal 'read (car (car (cdr (cdr expanded))))))

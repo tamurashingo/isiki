@@ -183,6 +183,17 @@
          (progn ,@body)
        (close ,(car binding)))))
 
+;;; --- with-open-input-file ---
+
+;; (with-open-input-file (name filename [element-class]) body...) :
+;; filenameをopen-input-stream(9P経由のファイルopen)で開き、nameに束縛してbodyを
+;; 評価し、抜けたら必ずcloseする(with-open-input-streamそのまま利用)。
+;; 既知の制約: element-classは仕様上評価はされるが、既存のOPEN-INPUT-STREAMが
+;; 文字ストリーム固定(仕様の既定値<character>のみ相当)のため無視する。
+(defmacro with-open-input-file (binding &rest body)
+  `(with-open-input-stream (,(car binding) (open-input-stream ,(car (cdr binding))))
+     ,@body))
+
 ;;; --- setf ---
 
 ;; (setf place value) を place の形に応じて setq/set-car/set-cdr/set-arefに展開する。
