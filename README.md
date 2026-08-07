@@ -125,6 +125,10 @@ see [LICENSE](./assets/fonts/LICENSE)
   - `%%peek`
   - `%%poke`
 - MACROが可能
+- 9Pプロトコル(VirtIO-9p)を使い、ホスト共有ディレクトリのファイルを読み込み可能
+- Streamを抽象化し、`(load "path")` で9P経由のLispファイルをread→evalできる
+- Transport Layerを関数ポインタインタフェースで分離し、VirtIOの実装を `transport_virtio_9p` としてカプセル化
+- 起動時にVirtIO-9pデバイスの検出結果を画面に表示
 
-![screenshot](./documents/images/version_0_0_3.png)
+![screenshot](./documents/images/version_0_0_4.png)
 

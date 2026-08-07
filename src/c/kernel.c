@@ -6,10 +6,12 @@
 #include "runtime.h"
 #include "repl.h"
 #include "subprimitive.h"
+#include "virtio9p.h"
+#include "load.h"
 
 
 /**
- * バージョン文字列とビルド日時・ハッシュをfbへ表示する
+ * バージョン文字列・ビルド日時・ハッシュ・VirtIO-9pの検出結果をfbへ表示する
  * @param fb 表示先のframe buffer
  */
 static void kernel_show_information(frame_buffer *fb) {
@@ -22,6 +24,16 @@ static void kernel_show_information(frame_buffer *fb) {
     fb->write_string(fb, " (");
     fb->write_string(fb, ISIKIOS_BUILD_HASH);
     fb->write_string(fb, ")\n");
+
+    char err_msg[160];
+    err_msg[0] = '\0';
+    if (os_virtio9p_ensure_session(err_msg, sizeof(err_msg))) {
+        fb->write_string(fb, "virtio9p: VirtIO-9p device detected\n");
+    } else {
+        fb->write_string(fb, "virtio9p: not detected: ");
+        fb->write_string(fb, err_msg);
+        fb->write_char(fb, '\n');
+    }
 }
 
 
@@ -42,6 +54,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_heap_init(heap_base, heap_size);
     os_bootstrap();
     os_register_subprimitives();
+    os_register_load();
 
     frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);

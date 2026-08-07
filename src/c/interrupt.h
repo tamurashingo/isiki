@@ -71,6 +71,34 @@ void outb(uint16_t port, uint8_t val);
  */
 uint8_t inb(uint16_t port);
 
+/**
+ * I/Oポートへ2バイト出力する
+ * @param port 出力先のポート番号
+ * @param val 出力する値
+ */
+void outw(uint16_t port, uint16_t val);
+
+/**
+ * I/Oポートから2バイト読み込む
+ * @param port 読み込み元のポート番号
+ * @return 読み込んだ値
+ */
+uint16_t inw(uint16_t port);
+
+/**
+ * I/Oポートへ4バイト出力する
+ * @param port 出力先のポート番号
+ * @param val 出力する値
+ */
+void outl(uint16_t port, uint32_t val);
+
+/**
+ * I/Oポートから4バイト読み込む
+ * @param port 読み込み元のポート番号
+ * @return 読み込んだ値
+ */
+uint32_t inl(uint16_t port);
+
 
 /** 割り込み/例外発生時にスタックに積まれるレジスタ一式 */
 typedef struct {

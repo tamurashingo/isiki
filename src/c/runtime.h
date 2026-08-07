@@ -129,6 +129,15 @@ lisp_val_t os_make_char(const char c);
 lisp_val_t os_make_string(const char *s);
 
 /**
+ * STRINGオブジェクトの内容をNUL終端Cバッファへコピーする。
+ * out_cap-1バイトを超える分は切り詰める。
+ * @param str コピー元のSTRING
+ * @param out コピー先バッファ
+ * @param out_cap outの容量(NUL終端分を含む)
+ */
+void os_string_to_cstr(lisp_val_t str, char *out, UINT32 out_cap);
+
+/**
  * TAG_INSTANCE(32byte、magic+3word)のオブジェクトをヒープに確保する。
  * @param magic インスタンスの種別を表すMAGIC NUMBER
  * @param w1 word1に入れる値
