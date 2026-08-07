@@ -311,3 +311,23 @@
 
 ;; その他の未対応の組み合わせもerrorになる
 (assert-equal nil (ignore-errors (convert 5 <float>)))
+
+;;; --- with-standard-input / with-standard-output / with-error-output ---
+
+;; 束縛前はnil
+(assert-equal nil (standard-output))
+
+;; with-standard-outputの間だけ束縛した値が見える
+(assert-equal t
+  (with-standard-output (open-output-stream) (if (standard-output) t nil)))
+
+;; 抜けたら元の値(nil)に戻る
+(assert-equal nil (standard-output))
+
+(assert-equal nil (standard-input))
+(assert-equal t (with-standard-input (open-output-stream) (if (standard-input) t nil)))
+(assert-equal nil (standard-input))
+
+(assert-equal nil (error-output))
+(assert-equal t (with-error-output (open-output-stream) (if (error-output) t nil)))
+(assert-equal nil (error-output))

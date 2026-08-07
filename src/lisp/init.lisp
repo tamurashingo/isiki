@@ -590,3 +590,30 @@
 ;; varは評価しない)。既存primitive%%SET-DYNAMICをラップするだけ。
 (defmacro set-dynamic (form var)
   `(%%set-dynamic ',var ,form))
+
+;;; --- with-standard-input / with-standard-output / with-error-output ---
+;;;
+;;; 既知のスコープ限定: ここで実装するのは*standard-input*/*standard-output*/
+;;; *error-output*という動的変数とそのアクセサ、それらを動的に束縛するマクロだけ。
+;;; 既存のREAD/READ-CHAR/WRITE-CHAR等のI/O primitiveは全て明示的にstream引数を
+;;; 取る関数として実装済みで、それらを「省略時はこれらの動的変数を見る」ように
+;;; 改修することは対象外(documents/isiki-os.mdに注記)。したがって仕様例のような
+;;; 引数無しの(read)は動かない。動的束縛そのものが正しく機能することのみ確認する。
+
+(defdynamic *standard-input* nil)
+(defdynamic *standard-output* nil)
+(defdynamic *error-output* nil)
+
+(defun standard-input () (dynamic *standard-input*))
+(defun standard-output () (dynamic *standard-output*))
+(defun error-output () (dynamic *error-output*))
+
+;; dynamic-letの単一変数版として展開するだけ
+(defmacro with-standard-input (stream-form &rest body)
+  `(dynamic-let ((*standard-input* ,stream-form)) ,@body))
+
+(defmacro with-standard-output (stream-form &rest body)
+  `(dynamic-let ((*standard-output* ,stream-form)) ,@body))
+
+(defmacro with-error-output (stream-form &rest body)
+  `(dynamic-let ((*error-output* ,stream-form)) ,@body))
