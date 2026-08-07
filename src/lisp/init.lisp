@@ -69,6 +69,57 @@
            (progn ,@(cdr (car clauses)))
            (cond ,@(cdr clauses)))))
 
+;;; --- case / case-using ---
+;;;
+;;; 既知の簡略化: caseはeqlで照合する仕様だが、この実装ではfixnum/symbol/characterは
+;;; タグ付きimmediate値として表現されているため、eq(既存のmemberが使う比較)で
+;;; eql相当になる。
+
+;; keyがclauseのkeylist(t以外)のいずれかの要素とeqならそのclauseのbodyを、
+;; そうでなければ残りのclausesを調べるif連鎖を組み立てる。tのclauseはdefaultとして扱う。
+(defun %case-expand (key clauses)
+  (if (null clauses)
+      nil
+      (if (eq (car (car clauses)) t)
+          `(progn ,@(cdr (car clauses)))
+          `(if (member ,key ',(car (car clauses)))
+               (progn ,@(cdr (car clauses)))
+               ,(%case-expand key (cdr clauses))))))
+
+;; (case keyform (keylist form*)* (t form*)?) : keyformを1度だけ評価し、
+;; 各clauseのkeylistの要素とeqで照合する(eql相当、上記の既知の簡略化参照)。
+(defmacro case (keyform &rest clauses)
+  (let ((key (gensym)))
+    `(let ((,key ,keyform))
+       ,(%case-expand key clauses))))
+
+;; keylist中のいずれかのkについて(funcall pred key k)が真になるかを判定する。
+(defun %case-using-match (pred key keylist)
+  (if (null keylist)
+      nil
+      (if (funcall pred key (car keylist))
+          t
+          (%case-using-match pred key (cdr keylist)))))
+
+;; %case-using-matchの呼び出しをif連鎖として組み立てる版(caseと違い、
+;; 述語呼び出しはbody展開時ではなく実行時に行う必要があるためformを生成する)。
+(defun %case-using-expand (pred key clauses)
+  (if (null clauses)
+      nil
+      (if (eq (car (car clauses)) t)
+          `(progn ,@(cdr (car clauses)))
+          `(if (%case-using-match ,pred ,key ',(car (car clauses)))
+               (progn ,@(cdr (car clauses)))
+               ,(%case-using-expand pred key (cdr clauses))))))
+
+;; (case-using predform keyform (keylist form*)* (t form*)?) : predformとkeyformを
+;; それぞれ1度だけ評価し、各clauseのkeylistの要素kについて
+;; (funcall predform keyform-value k)が真になるものを探す(引数順はkeyform-valueが先)。
+(defmacro case-using (predform keyform &rest clauses)
+  (let ((pred (gensym)) (key (gensym)))
+    `(let ((,pred ,predform) (,key ,keyform))
+       ,(%case-using-expand pred key clauses))))
+
 ;;; --- for / while ---
 
 (defun %for-vars (bindings)

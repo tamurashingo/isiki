@@ -233,3 +233,27 @@
 ;; set-dynamicはvarを評価せずformの評価値をvarの動的値に設定する
 (defdynamic *sd-test* 1)
 (assert-equal 5 (progn (set-dynamic 5 *sd-test*) (dynamic *sd-test*)))
+
+;;; --- case / case-using ---
+
+(assert-equal 'composite (case (* 2 3) ((2 3 5 7) 'prime) ((4 6 8 9) 'composite)))
+(assert-equal 'prime (case 5 ((2 3 5 7) 'prime) ((4 6 8 9) 'composite)))
+
+;; どのkeylistにも該当しない場合はtのdefault節を評価する
+(assert-equal 'other (case 99 ((1) 'one) (t 'other)))
+
+;; どのkeylistにも該当せず、default節も無い場合はnil
+(assert-equal nil (case 99 ((1) 'one)))
+
+;; keyformは1度だけ評価される(2回評価されると2度目に'compositeを返してしまうため
+;; 期待通りの結果は評価回数が1であることの間接的な確認になる)
+(assert-equal 'prime
+  (let ((n 0))
+    (case (progn (setq n (+ n 1)) 5)
+      ((2 3 5 7) 'prime)
+      ((4 6 8 9) 'composite))))
+
+;; case-usingは(funcall predform keyform-value key)の順で呼ぶ。<は非対称なので、
+;; 引数順が逆になっていると(< 5 3)=nilとなり検出できる
+(assert-equal 'yes (case-using #'< 3 ((5) 'yes) (t 'no)))
+(assert-equal 'no (case-using #'< 5 ((3) 'yes) (t 'no)))
