@@ -20,7 +20,7 @@
  * #define TAG_CHAR     0x3ULL   // 011 即値
  * #define TAG_STRING   0x4ULL   // 100 アドレス
  * #define TAG_INSTANCE 0x5ULL   // 101 アドレス
- *                               // 110 予約
+ * #define TAG_VECTOR   0x6ULL   // 110 アドレス
  *                               // 111 予約
  *
  * ---- タグ別メモリ配置 ----
@@ -60,6 +60,13 @@
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
  *    - word2: MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
  *    - word3: MAGIC_FUNCTION_INTERPRETEDの場合: 定義時の環境のアドレス
+ *
+ * TAG_VECTOR: アドレス、ヒープ可変長(8*(1+rank+total)byte, 8byte境界に整列)
+ *  [ vector-addr(61bit) .............................. ][1 1 0]
+ *    多次元配列(general array)のアドレスが入っている
+ *    - word0:          次元数(rank、タグなしの整数)
+ *    - word[1..rank]:  各次元のサイズ(タグなしの整数)
+ *    - word[rank+1..]: 要素本体(タグ付きのlisp_val_t、行優先(row-major)順)
  *
  */
 
@@ -346,6 +353,12 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("SYMBOL-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_symbol_name), global_environment);
         os_set_function(os_make_symbol("STRING-TO-SYMBOL"), os_make_native_function((lisp_addr_t)(void *)primitive_string_to_symbol), global_environment);
         os_set_function(os_make_symbol("GENSYM"), os_make_native_function((lisp_addr_t)(void *)primitive_gensym), global_environment);
+        os_set_function(os_make_symbol("MAKE-ARRAY"), os_make_native_function((lisp_addr_t)(void *)primitive_make_array), global_environment);
+        os_set_function(os_make_symbol("AREF"), os_make_native_function((lisp_addr_t)(void *)primitive_aref), global_environment);
+        os_set_function(os_make_symbol("ARRAY-DIMENSIONS"), os_make_native_function((lisp_addr_t)(void *)primitive_array_dimensions), global_environment);
+        os_set_function(os_make_symbol("SET-CAR"), os_make_native_function((lisp_addr_t)(void *)primitive_set_car), global_environment);
+        os_set_function(os_make_symbol("SET-CDR"), os_make_native_function((lisp_addr_t)(void *)primitive_set_cdr), global_environment);
+        os_set_function(os_make_symbol("SET-AREF"), os_make_native_function((lisp_addr_t)(void *)primitive_set_aref), global_environment);
     }
 }
 
@@ -1034,6 +1047,170 @@ lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
     }
     buf[len] = '\0';
     return os_make_symbol(buf);
+}
+
+/** dimensions引数として一度に受け付けられる最大次元数(rank)。reader.cのREADER_TOKEN_MAX等と同種の固定長バッファ上限 */
+#define MAX_ARRAY_RANK 8
+
+/**
+ * 組み込み関数MAKE-ARRAY。第一引数の次元(FIXNUM、またはFIXNUMのリスト)を持つ
+ * 多次元配列を確保する。要素はすべてnilで初期化される。
+ * @param args 評価済みの引数リスト(第一引数はFIXNUMまたはFIXNUMのリスト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したVECTOR
+ */
+lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t dims_arg = cc_car(args);
+
+    UINT64 dims[MAX_ARRAY_RANK];
+    UINT64 rank = 0;
+
+    if ((dims_arg & TAG_MASK) == TAG_FIXNUM) {
+        dims[rank++] = dims_arg >> 3;
+    } else {
+        for (lisp_val_t cur = dims_arg; cur != nil && rank < MAX_ARRAY_RANK; cur = cc_cdr(cur)) {
+            dims[rank++] = cc_car(cur) >> 3;
+        }
+    }
+
+    UINT64 total = 1;
+    for (UINT64 i = 0; i < rank; i++) {
+        total *= dims[i];
+    }
+
+    lisp_addr_t addr = os_alloc_bytes(8 * (1 + rank + total));
+    lisp_val_t *header = (lisp_val_t *)addr;
+    header[0] = rank;
+    for (UINT64 i = 0; i < rank; i++) {
+        header[1 + i] = dims[i];
+    }
+    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
+    for (UINT64 i = 0; i < total; i++) {
+        data[i] = nil;
+    }
+
+    return (lisp_val_t)(addr | TAG_VECTOR);
+}
+
+/**
+ * argsのcur以降を配列の各次元の添字として順に辿り、行優先(row-major)オフセットを計算する。
+ * 添字が対応する次元のサイズ以上の場合はg_sym_eval_errorを示すため*out_of_boundsを立てる。
+ * @param header 配列のヒープ先頭(word0=rank, word[1..rank]=各次元のサイズ)
+ * @param rank 配列の次元数
+ * @param cur 添字群の先頭cons
+ * @param out_of_bounds 範囲外の添字があった場合に非0を書き込む
+ * @return 計算したオフセット
+ */
+static UINT64 array_offset(lisp_val_t *header, UINT64 rank, lisp_val_t cur, int *out_of_bounds) {
+    UINT64 offset = 0;
+    *out_of_bounds = 0;
+    for (UINT64 i = 0; i < rank; i++) {
+        UINT64 idx = cc_car(cur) >> 3;
+        UINT64 dim = header[1 + i];
+        if (idx >= dim) {
+            *out_of_bounds = 1;
+        }
+        offset = offset * dim + idx;
+        cur = cc_cdr(cur);
+    }
+    return offset;
+}
+
+/**
+ * 組み込み関数AREF。第一引数の配列から、残りの引数(各次元の添字)が指す要素を返す。
+ * @param args 評価済みの引数リスト(第一引数はVECTOR、残りはFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t array = cc_car(args);
+    lisp_addr_t addr = array & ~TAG_MASK;
+    lisp_val_t *header = (lisp_val_t *)addr;
+    UINT64 rank = header[0];
+
+    int out_of_bounds;
+    UINT64 offset = array_offset(header, rank, cc_cdr(args), &out_of_bounds);
+    if (out_of_bounds) {
+        return g_sym_eval_error;
+    }
+
+    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
+    return data[offset];
+}
+
+/**
+ * 組み込み関数ARRAY-DIMENSIONS。第一引数の配列の各次元のサイズをリストで返す。
+ * @param args 評価済みの引数リスト(第一引数はVECTOR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 各次元のサイズ(FIXNUM)のリスト
+ */
+lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t array = cc_car(args);
+    lisp_addr_t addr = array & ~TAG_MASK;
+    lisp_val_t *header = (lisp_val_t *)addr;
+    UINT64 rank = header[0];
+
+    lisp_val_t result = nil;
+    for (UINT64 i = rank; i > 0; i--) {
+        result = os_make_cons(os_make_fixnum(header[i]), result);
+    }
+    return result;
+}
+
+/**
+ * 組み込み関数SET-CAR。第一引数のconsのcarを第二引数で破壊的に書き換える。
+ * @param args 評価済みの引数リスト(第一引数はCONS)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第二引数)
+ */
+lisp_val_t primitive_set_car(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t target = cc_car(args);
+    lisp_val_t val = cc_car(cc_cdr(args));
+    cc_set_car(target, val);
+    return val;
+}
+
+/**
+ * 組み込み関数SET-CDR。第一引数のconsのcdrを第二引数で破壊的に書き換える。
+ * @param args 評価済みの引数リスト(第一引数はCONS)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第二引数)
+ */
+lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t target = cc_car(args);
+    lisp_val_t val = cc_car(cc_cdr(args));
+    cc_set_cdr(target, val);
+    return val;
+}
+
+/**
+ * 組み込み関数SET-AREF。第一引数の配列の、続く添字が指す要素を最後の引数で破壊的に書き換える。
+ * @param args 評価済みの引数リスト(array idx1 idx2 ... value の並び)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(最後の引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t array = cc_car(args);
+    lisp_addr_t addr = array & ~TAG_MASK;
+    lisp_val_t *header = (lisp_val_t *)addr;
+    UINT64 rank = header[0];
+
+    int out_of_bounds;
+    lisp_val_t idx_cur = cc_cdr(args);
+    UINT64 offset = array_offset(header, rank, idx_cur, &out_of_bounds);
+    if (out_of_bounds) {
+        return g_sym_eval_error;
+    }
+
+    lisp_val_t value_cur = idx_cur;
+    for (UINT64 i = 0; i < rank; i++) {
+        value_cur = cc_cdr(value_cur);
+    }
+    lisp_val_t val = cc_car(value_cur);
+
+    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
+    data[offset] = val;
+    return val;
 }
 
 

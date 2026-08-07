@@ -85,6 +85,32 @@ static void print_list(frame_buffer *fb, lisp_val_t val) {
 }
 
 /**
+ * VECTORを"#(a b c)"形式で出力する。多次元の場合も次元の区切りは付けず、
+ * 要素本体をrow-major順にフラットに並べて表示する。
+ * @param fb 出力先のframe buffer
+ * @param val 出力するVECTOR
+ */
+static void print_vector(frame_buffer *fb, lisp_val_t val) {
+    lisp_val_t *header = (lisp_val_t *)(val & ~TAG_MASK);
+    UINT64 rank = header[0];
+    UINT64 total = 1;
+    for (UINT64 i = 0; i < rank; i++) {
+        total *= header[1 + i];
+    }
+    lisp_val_t *data = header + 1 + rank;
+
+    fb->write_char(fb, '#');
+    fb->write_char(fb, '(');
+    for (UINT64 i = 0; i < total; i++) {
+        if (i != 0) {
+            fb->write_char(fb, ' ');
+        }
+        print_value(fb, data[i]);
+    }
+    fb->write_char(fb, ')');
+}
+
+/**
  * valをTAGに応じて出力する(os_printの実処理本体)。
  * @param fb 出力先のframe buffer
  * @param val 出力するLisp値
@@ -112,6 +138,9 @@ static void print_value(frame_buffer *fb, lisp_val_t val) {
             return;
         case TAG_CONS:
             print_list(fb, val);
+            return;
+        case TAG_VECTOR:
+            print_vector(fb, val);
             return;
         case TAG_INSTANCE: {
             UINT64 magic = ((UINT64 *)(val & ~TAG_MASK))[0];

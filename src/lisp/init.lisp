@@ -131,3 +131,14 @@
      (unwind-protect
          (progn ,@body)
        (close ,(car binding)))))
+
+;;; --- setf ---
+
+;; (setf place value) を place の形に応じて setq/set-car/set-cdr/set-arefに展開する。
+;; placeがsymbolならsetq、(car x)ならset-car、(cdr x)ならset-cdr、
+;; (aref array i1 i2 ...)ならset-arefに展開する。
+(defmacro setf (place value)
+  (cond ((symbolp place) `(setq ,place ,value))
+        ((eq (car place) 'car) `(set-car ,(car (cdr place)) ,value))
+        ((eq (car place) 'cdr) `(set-cdr ,(car (cdr place)) ,value))
+        ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))))

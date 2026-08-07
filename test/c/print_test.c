@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include "test_assert.h"
@@ -34,6 +35,23 @@ static frame_buffer g_frame_buffer = {
 
 frame_buffer* get_active_frame_buffer(void) {
     return &g_frame_buffer;
+}
+
+// primitive_make_array/primitive_set_arefへの引数リスト(評価済みのlisp_val_t列)を組み立てる
+static lisp_val_t make_val_list(int argc, ...) {
+    lisp_val_t vals[8];
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        vals[i] = va_arg(ap, lisp_val_t);
+    }
+    va_end(ap);
+
+    lisp_val_t list = nil;
+    for (int i = argc - 1; i >= 0; i--) {
+        list = os_make_cons(vals[i], list);
+    }
+    return list;
 }
 
 static void reset_capture() {
@@ -109,6 +127,35 @@ void test_os_print_nested_list() {
     assert(strcmp(captured(), "((1 . 2) 3)") == 0, "ネストしたconsも再帰的に表示される");
 }
 
+void test_os_print_vector_empty() {
+    reset_capture();
+    lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
+    os_print(array, &g_frame_buffer);
+    assert(strcmp(captured(), "#(NIL NIL NIL)") == 0, "初期化直後の配列要素はNILとして表示される");
+}
+
+void test_os_print_vector_1d() {
+    reset_capture();
+    lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
+    primitive_set_aref(make_val_list(3, array, os_make_fixnum(0), os_make_fixnum(10)), nil);
+    primitive_set_aref(make_val_list(3, array, os_make_fixnum(1), os_make_fixnum(20)), nil);
+    primitive_set_aref(make_val_list(3, array, os_make_fixnum(2), os_make_fixnum(30)), nil);
+    os_print(array, &g_frame_buffer);
+    assert(strcmp(captured(), "#(10 20 30)") == 0, "1次元配列は\"#(10 20 30)\"のように表示される");
+}
+
+void test_os_print_vector_multi_dim() {
+    reset_capture();
+    lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
+    primitive_set_aref(make_val_list(4, array, os_make_fixnum(0), os_make_fixnum(0), os_make_fixnum(1)), nil);
+    primitive_set_aref(make_val_list(4, array, os_make_fixnum(0), os_make_fixnum(1), os_make_fixnum(2)), nil);
+    primitive_set_aref(make_val_list(4, array, os_make_fixnum(1), os_make_fixnum(0), os_make_fixnum(3)), nil);
+    primitive_set_aref(make_val_list(4, array, os_make_fixnum(1), os_make_fixnum(1), os_make_fixnum(4)), nil);
+    os_print(array, &g_frame_buffer);
+    assert(strcmp(captured(), "#(1 2 3 4)") == 0, "多次元配列も次元の区切りなしにフラットに表示される");
+}
+
 void test_os_print_native_function() {
     reset_capture();
     lisp_val_t fn = os_make_native_function((lisp_addr_t)(void *)primitive_car);
@@ -130,6 +177,9 @@ int main(int argc, char** argv) {
     test_os_print_list();
     test_os_print_dotted_pair();
     test_os_print_nested_list();
+    test_os_print_vector_empty();
+    test_os_print_vector_1d();
+    test_os_print_vector_multi_dim();
     test_os_print_native_function();
 
     return g_test_failed ? 1 : 0;

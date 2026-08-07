@@ -17,6 +17,8 @@
 #define TAG_STRING   0x4ULL
 /** instance(function/process等)へのアドレス(101) */
 #define TAG_INSTANCE 0x5ULL
+/** 多次元配列(general array)へのアドレス(110) */
+#define TAG_VECTOR   0x6ULL
 
 
 /** TAG_INSTANCEのword0に入る、ネイティブ(C)関数であることを示すMAGIC NUMBER */
@@ -409,6 +411,55 @@ lisp_val_t primitive_string_to_symbol(lisp_val_t args, lisp_val_t env);
  * @return 新しくinternされたSYMBOL
  */
 lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数MAKE-ARRAY。第一引数の次元(FIXNUM、またはFIXNUMのリスト)を持つ
+ * 多次元配列を確保する。要素はすべてnilで初期化される。
+ * @param args 評価済みの引数リスト(第一引数はFIXNUMまたはFIXNUMのリスト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したVECTOR
+ */
+lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数AREF。第一引数の配列から、残りの引数(各次元の添字)が指す要素を返す。
+ * @param args 評価済みの引数リスト(第一引数はVECTOR、残りはFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数ARRAY-DIMENSIONS。第一引数の配列の各次元のサイズをリストで返す。
+ * @param args 評価済みの引数リスト(第一引数はVECTOR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 各次元のサイズ(FIXNUM)のリスト
+ */
+lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SET-CAR。第一引数のconsのcarを第二引数で破壊的に書き換える。
+ * @param args 評価済みの引数リスト(第一引数はCONS)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第二引数)
+ */
+lisp_val_t primitive_set_car(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SET-CDR。第一引数のconsのcdrを第二引数で破壊的に書き換える。
+ * @param args 評価済みの引数リスト(第一引数はCONS)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第二引数)
+ */
+lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SET-AREF。第一引数の配列の、続く添字が指す要素を最後の引数で破壊的に書き換える。
+ * @param args 評価済みの引数リスト(array idx1 idx2 ... value の並び)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(最後の引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env);
 
 /**
  * nバイト(8byte境界に整列)をLispヒープからアロケータ経由で確保する、os_alloc_bytesの公開版。

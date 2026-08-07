@@ -4,6 +4,7 @@
 #include "types.h"
 #include "runtime.h"
 #include "framebuffer.h"
+#include "lisp.h"
 
 // runtime.c が参照する g_frame_buffer のダミー実装。
 // テスト環境では実画面がないため、write_string は何もしない
@@ -272,6 +273,105 @@ void test_primitive_gensym() {
     assert(g1 != g2, "(gensym)を2回呼ぶと異なるsymbolが返る");
 }
 
+void test_primitive_make_array_1d() {
+    lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
+    assert((array & TAG_MASK) == TAG_VECTOR, "(make-array 3)の戻り値はTAG_VECTORを持つ");
+
+    lisp_addr_t addr = array & ~TAG_MASK;
+    lisp_val_t *header = (lisp_val_t *)addr;
+    assert(header[0] == 1, "1次元配列のrankは1");
+    assert(header[1] == 3, "次元のサイズは3");
+
+    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + 1));
+    for (int i = 0; i < 3; i++) {
+        assert(data[i] == nil, "要素はすべてnilで初期化される");
+    }
+}
+
+void test_primitive_make_array_multi_dim() {
+    lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
+    lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
+    assert((array & TAG_MASK) == TAG_VECTOR, "(make-array '(2 3))の戻り値はTAG_VECTORを持つ");
+
+    lisp_addr_t addr = array & ~TAG_MASK;
+    lisp_val_t *header = (lisp_val_t *)addr;
+    assert(header[0] == 2, "2次元配列のrankは2");
+    assert(header[1] == 2, "1次元目のサイズは2");
+    assert(header[2] == 3, "2次元目のサイズは3");
+
+    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + 2));
+    for (int i = 0; i < 6; i++) {
+        assert(data[i] == nil, "要素はすべてnilで初期化される");
+    }
+}
+
+void test_primitive_array_dimensions() {
+    lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
+    lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
+
+    lisp_val_t result = primitive_array_dimensions(os_make_cons(array, nil), nil);
+    assert(cc_car(result) >> 3 == 2, "(array-dimensions a)の1番目は2");
+    assert(cc_car(cc_cdr(result)) >> 3 == 3, "(array-dimensions a)の2番目は3");
+    assert(cc_cdr(cc_cdr(result)) == nil, "(array-dimensions a)の終端はnil");
+}
+
+void test_primitive_aref_reads_back_value() {
+    lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
+    lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
+
+    // 位置(1,2)は行優先オフセットで1*3+2=5番目
+    lisp_val_t set_args = os_make_cons(array,
+        os_make_cons(os_make_fixnum(1),
+        os_make_cons(os_make_fixnum(2),
+        os_make_cons(os_make_fixnum(99), nil))));
+    lisp_val_t set_result = primitive_set_aref(set_args, nil);
+    assert(set_result >> 3 == 99, "(set-aref a 1 2 99)は書き込んだ99を返す");
+
+    lisp_val_t aref_args = os_make_cons(array,
+        os_make_cons(os_make_fixnum(1),
+        os_make_cons(os_make_fixnum(2), nil)));
+    assert(primitive_aref(aref_args, nil) >> 3 == 99, "(aref a 1 2)は書き込んだ99を返す");
+
+    lisp_val_t other_args = os_make_cons(array,
+        os_make_cons(os_make_fixnum(0),
+        os_make_cons(os_make_fixnum(0), nil)));
+    assert(primitive_aref(other_args, nil) == nil, "書き込んでいない要素はnilのまま");
+}
+
+void test_primitive_aref_out_of_bounds() {
+    lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
+    lisp_val_t args = os_make_cons(array, os_make_cons(os_make_fixnum(3), nil));
+    assert(primitive_aref(args, nil) == g_sym_eval_error, "(aref a 3)は範囲外なのでg_sym_eval_error");
+}
+
+void test_primitive_set_car() {
+    lisp_val_t c = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t args = os_make_cons(c, os_make_cons(os_make_fixnum(99), nil));
+
+    lisp_val_t r = primitive_set_car(args, nil);
+    assert(r >> 3 == 99, "(set-car c 99)は書き込んだ99を返す");
+    assert(cc_car(c) >> 3 == 99, "carが99に書き換えられている");
+    assert(cc_cdr(c) >> 3 == 2, "cdrは書き換えられていない");
+}
+
+void test_primitive_set_cdr() {
+    lisp_val_t c = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t args = os_make_cons(c, os_make_cons(os_make_fixnum(99), nil));
+
+    lisp_val_t r = primitive_set_cdr(args, nil);
+    assert(r >> 3 == 99, "(set-cdr c 99)は書き込んだ99を返す");
+    assert(cc_cdr(c) >> 3 == 99, "cdrが99に書き換えられている");
+    assert(cc_car(c) >> 3 == 1, "carは書き換えられていない");
+}
+
+void test_primitive_set_aref_out_of_bounds() {
+    lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
+    lisp_val_t args = os_make_cons(array,
+        os_make_cons(os_make_fixnum(3),
+        os_make_cons(os_make_fixnum(1), nil)));
+    assert(primitive_set_aref(args, nil) == g_sym_eval_error, "(set-aref a 3 1)は範囲外なのでg_sym_eval_error");
+}
+
 int main(int argc, char** argv) {
    test_os_make_fixnum();
 
@@ -294,6 +394,14 @@ int main(int argc, char** argv) {
    test_primitive_symbol_name();
    test_primitive_string_to_symbol();
    test_primitive_gensym();
+   test_primitive_make_array_1d();
+   test_primitive_make_array_multi_dim();
+   test_primitive_array_dimensions();
+   test_primitive_aref_reads_back_value();
+   test_primitive_aref_out_of_bounds();
+   test_primitive_set_car();
+   test_primitive_set_cdr();
+   test_primitive_set_aref_out_of_bounds();
 
    return g_test_failed ? 1 : 0;
 }

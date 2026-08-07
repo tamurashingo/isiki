@@ -71,3 +71,16 @@
 ;; bodyの評価結果が返り、変数もbody内で参照できる
 (assert-equal 42 (with-open-input-stream (s (open-output-stream)) 42))
 (assert-equal t (with-open-input-stream (s (open-output-stream)) (if s t nil)))
+
+;;; --- setf ---
+
+;; placeがsymbolならsetqに展開される
+(assert-equal 10 (let ((x 5)) (setf x 10) x))
+
+;; (car x)/(cdr x)ならset-car/set-cdrに展開される
+(assert-equal 99 (let ((c (cons 1 2))) (setf (car c) 99) (car c)))
+(assert-equal 99 (let ((c (cons 1 2))) (setf (cdr c) 99) (cdr c)))
+
+;; (aref a i1 i2 ...)ならset-arefに展開される
+(assert-equal 42 (let ((a (make-array 3))) (setf (aref a 1) 42) (aref a 1)))
+(assert-equal 7 (let ((a (make-array '(2 3)))) (setf (aref a 1 2) 7) (aref a 1 2)))
