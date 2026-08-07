@@ -515,6 +515,36 @@
            ,v
            (error "assure: value is not of the expected type" ,v)))))
 
+;;; --- convert ---
+;;;
+;;; ISLisp仕様(§17)のconvertの変換表(documents/islisp-v23.pdf、tmp/islisp-spec.txt
+;;; 3888-3895行)のうち、既存primitiveだけで組み立てられる変換にスコープを絞る:
+;;; symbol->string(symbol-name)、string->symbol(string-to-symbol)、
+;;; string->list(string-elt/length)。list->stringは表の該当欄が"–"
+;;; (エラーを発生させる、と明記)なので実装しないのは簡略化ではなく仕様通りの挙動。
+;;; それ以外の組み合わせ(character<->integer等)はchar-code/code-char等
+;;; 未実装のprimitiveが必要なため対象外とし、errorを発生させる。
+
+;; strから(文字idxから文字len-1までの)文字のリストを作る
+(defun %string-to-list-from (str idx len)
+  (if (= idx len)
+      nil
+      (cons (string-elt str idx) (%string-to-list-from str (+ idx 1) len))))
+
+(defun %string-to-list (str)
+  (%string-to-list-from str 0 (length str)))
+
+(defun %convert (obj class-name)
+  (case class-name
+    ((<string>) (if (symbolp obj) (symbol-name obj) (error "convert: unsupported conversion to <string>" obj)))
+    ((<symbol>) (string-to-symbol obj))
+    ((<list>) (%string-to-list obj))
+    (t (error "convert: unsupported target class" class-name))))
+
+;; (convert obj class-name) : class-nameは評価しない
+(defmacro convert (obj class-name)
+  `(%convert ,obj ',class-name))
+
 ;;; --- dynamic-let / set-dynamic ---
 
 (defun %dynamic-let-vars (bindings)

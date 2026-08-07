@@ -289,3 +289,25 @@
 ;; ILOSのユーザークラス名を指定した場合はtypepにフォールバックする
 (assert-equal t (typep (assure point (make-instance 'point)) 'point))
 (assert-equal nil (ignore-errors (assure point 5)))
+
+;;; --- convert ---
+
+;; symbol -> string(symbol-nameと同じ結果になる。stringはinternされないので
+;; string-to-symbol経由で比較する)
+(assert-equal (string-to-symbol "ABC") (string-to-symbol (convert 'abc <string>)))
+
+;; string -> symbol(大文字化されてinternされる。os_make_symbolは大文字小文字を
+;; 区別しないので'abcと同じsymbolになる)
+(assert-equal 'abc (convert "abc" <symbol>))
+
+;; string -> list(文字のリストに変換される)
+(assert-equal #\a (car (convert "ab" <list>)))
+(assert-equal #\b (car (cdr (convert "ab" <list>))))
+(assert-equal nil (cdr (cdr (convert "ab" <list>))))
+(assert-equal nil (convert "" <list>))
+
+;; list -> stringは仕様上エラーを発生させる変換(表の該当欄が"–")なので未対応
+(assert-equal nil (ignore-errors (convert (cons #\a (cons #\b nil)) <string>)))
+
+;; その他の未対応の組み合わせもerrorになる
+(assert-equal nil (ignore-errors (convert 5 <float>)))
