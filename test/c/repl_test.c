@@ -8,6 +8,37 @@
 #include "process.h"
 #include "repl.h"
 
+// reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
+// 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
+// ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
+int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
+                            const UINT8 **out_data, UINT32 *out_count,
+                            char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)want;
+    (void)out_data;
+    (void)out_count;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
 // os_print が書き込んだ内容を検証できるよう、write_char/write_string を
 // 実画面ではなく静的バッファへキャプチャするダミー実装にする
 #define CAPTURE_BUF_SIZE 256

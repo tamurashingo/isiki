@@ -495,6 +495,23 @@ lisp_val_t os_make_string(const char *s) {
     return os_make_string_for(s, 0 /* normal */);
 }
 
+void os_string_to_cstr(lisp_val_t str, char *out, UINT32 out_cap) {
+    lisp_addr_t addr = (lisp_addr_t)(str & ~TAG_MASK);
+    UINT64 len = ((UINT64 *)addr)[0];
+    const UINT8 *bytes = (const UINT8 *)(addr + 8);
+
+    UINT32 copy_len = (UINT32)len;
+    if (out_cap > 0 && copy_len > out_cap - 1) {
+        copy_len = out_cap - 1;
+    }
+    for (UINT32 i = 0; i < copy_len; i++) {
+        out[i] = (char)bytes[i];
+    }
+    if (out_cap > 0) {
+        out[copy_len] = '\0';
+    }
+}
+
 
 /**
  * TAG_INSTANCE(32byte、magic+3word)のオブジェクトをヒープに確保する。

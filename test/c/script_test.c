@@ -10,6 +10,37 @@
 #include "reader.h"
 #include "eval.h"
 
+// reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
+// 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
+// ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
+int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
+                            const UINT8 **out_data, UINT32 *out_count,
+                            char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)want;
+    (void)out_data;
+    (void)out_count;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
 // runtime.c が参照する get_active_frame_buffer のダミー実装。
 // テスト環境では実画面がないため、write_string は何もしない
 static void dummy_write_string(struct _frame_buffer *self, const char *s) {

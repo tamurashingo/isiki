@@ -138,6 +138,13 @@ UINT32 os_p9_build_tread(UINT8 *buf, UINT16 tag, UINT32 fid, UINT64 offset, UINT
     return pos;
 }
 
+UINT32 os_p9_build_tclunk(UINT8 *buf, UINT16 tag, UINT32 fid) {
+    UINT32 pos = P9_HEADER_SIZE;
+    p9_put_u32(buf, &pos, fid);
+    p9_write_header(buf, pos, P9_TCLUNK, tag);
+    return pos;
+}
+
 static int p9_check_min_len(UINT32 len, UINT32 required) {
     return len >= required;
 }
@@ -206,6 +213,15 @@ int os_p9_parse_rread(const UINT8 *buf, UINT32 len, const UINT8 **out_data, UINT
     *out_data = buf + pos;
     *out_count = count;
     return 1;
+}
+
+int os_p9_parse_rclunk(const UINT8 *buf, UINT32 len) {
+    if (!p9_check_min_len(len, P9_HEADER_SIZE)) {
+        return 0;
+    }
+    UINT32 pos = 4;
+    UINT8 type = p9_get_u8(buf, &pos);
+    return type == P9_RCLUNK;
 }
 
 int os_p9_check_error(const UINT8 *buf, UINT32 len, char *errbuf, UINT32 errbuf_cap) {

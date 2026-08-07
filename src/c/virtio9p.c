@@ -18,6 +18,10 @@ static UINT8 g_p9_tx_buf[P9_MSIZE] __attribute__((aligned(4096)));
 static UINT8 g_p9_rx_buf[P9_MSIZE] __attribute__((aligned(4096)));
 static UINT8 g_init_lisp_buf[4096] __attribute__((aligned(4096)));
 
+static os_virtio_device g_vdev;
+static os_virtqueue g_vq;
+static int g_session_ready = 0;
+
 static UINT32 str_len(const char *s) {
     UINT32 n = 0;
     while (s[n] != '\0') {
@@ -75,9 +79,16 @@ static UINT16 split_path(char *path_buf, const char *wnames_out[P9_MAX_PATH_COMP
 /** tx_buf/rx_bufでリクエストを送りpollで完了を待ち、タイムアウト/Rerrorをerr_msgへ整形する */
 static int p9_rpc(os_virtqueue *vq, UINT32 tx_len, UINT32 *out_rx_len, const char *stage,
                    char *err_msg, UINT32 err_msg_cap) {
+#ifndef ISIKIOS_UNIT_TEST
+    asm volatile("cli");
+#endif
     os_virtqueue_submit(vq, (UINT64)(lisp_addr_t)g_p9_tx_buf, tx_len,
                          (UINT64)(lisp_addr_t)g_p9_rx_buf, sizeof(g_p9_rx_buf));
-    if (!os_virtqueue_poll(vq, out_rx_len)) {
+    int polled = os_virtqueue_poll(vq, out_rx_len);
+#ifndef ISIKIOS_UNIT_TEST
+    asm volatile("sti");
+#endif
+    if (!polled) {
         set_err(err_msg, err_msg_cap, stage);
         str_append(err_msg, err_msg_cap, ": virtqueue poll timed out");
         return 0;
@@ -94,8 +105,11 @@ static int p9_rpc(os_virtqueue *vq, UINT32 tx_len, UINT32 *out_rx_len, const cha
     return 1;
 }
 
-int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap,
-                           UINT32 *out_len, char *err_msg, UINT32 err_msg_cap) {
+int os_virtio9p_ensure_session(char *err_msg, UINT32 err_msg_cap) {
+    if (g_session_ready) {
+        return 1;
+    }
+
     os_pci_device pci_dev;
     if (!os_pci_find_virtio_9p(&pci_dev)) {
         set_err(err_msg, err_msg_cap, "virtio-9p PCI device not found (check -device virtio-9p-pci in Makefile)");
@@ -109,19 +123,17 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
         return 0;
     }
 
-    os_virtio_device vdev;
-    vdev.io_base = os_pci_bar0_io_base(pci_dev.bar0_raw);
+    g_vdev.io_base = os_pci_bar0_io_base(pci_dev.bar0_raw);
 
-    os_virtio_reset_and_negotiate(&vdev);
+    os_virtio_reset_and_negotiate(&g_vdev);
 
-    os_virtqueue vq;
-    if (!os_virtqueue_init(&vq, &vdev, 0, g_virtq9p_mem, sizeof(g_virtq9p_mem))) {
+    if (!os_virtqueue_init(&g_vq, &g_vdev, 0, g_virtq9p_mem, sizeof(g_virtq9p_mem))) {
         set_err(err_msg, err_msg_cap,
                 "virtqueue init failed: device queue size exceeds VIRTQ_MAX_SIZE or reserved memory too small");
         return 0;
     }
 
-    os_virtio_set_driver_ok(&vdev);
+    os_virtio_set_driver_ok(&g_vdev);
 
     UINT32 tx_len;
     UINT32 rx_len;
@@ -129,7 +141,7 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
     /* Tversion: セッション確立前なのでtag=NOTAG(0xFFFF)を使う。
        QEMUのvirtio-9pサーバは素の"9P2000"を受け付けないため"9P2000.u"を使う */
     tx_len = os_p9_build_tversion(g_p9_tx_buf, 0xFFFF, P9_MSIZE, "9P2000.u");
-    if (!p9_rpc(&vq, tx_len, &rx_len, "Tversion", err_msg, err_msg_cap)) {
+    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tversion", err_msg, err_msg_cap)) {
         return 0;
     }
     UINT32 negotiated_msize;
@@ -141,13 +153,25 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
 
     /* Tattach: fid=0をroot(aname="")へattachする */
     tx_len = os_p9_build_tattach(g_p9_tx_buf, 0, 0, 0xFFFFFFFF, "root", "", P9_NONUNAME);
-    if (!p9_rpc(&vq, tx_len, &rx_len, "Tattach", err_msg, err_msg_cap)) {
+    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tattach", err_msg, err_msg_cap)) {
         return 0;
     }
     if (!os_p9_parse_rattach(g_p9_rx_buf, rx_len)) {
         set_err(err_msg, err_msg_cap, "Tattach: malformed Rattach response");
         return 0;
     }
+
+    g_session_ready = 1;
+    return 1;
+}
+
+int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    if (!os_virtio9p_ensure_session(err_msg, err_msg_cap)) {
+        return 0;
+    }
+
+    UINT32 tx_len;
+    UINT32 rx_len;
 
     /* Twalk: fid=0からpathの各要素をnewfid=1へwalkする */
     char path_buf[P9_PATH_BUF_SIZE];
@@ -156,7 +180,7 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
     UINT16 nwname = split_path(path_buf, wnames);
 
     tx_len = os_p9_build_twalk(g_p9_tx_buf, 0, 0, 1, wnames, nwname);
-    if (!p9_rpc(&vq, tx_len, &rx_len, "Twalk", err_msg, err_msg_cap)) {
+    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Twalk", err_msg, err_msg_cap)) {
         return 0;
     }
     UINT16 nwqid;
@@ -171,11 +195,51 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
 
     /* Topen: newfid=1を読み込み専用でopenする */
     tx_len = os_p9_build_topen(g_p9_tx_buf, 0, 1, P9_OREAD);
-    if (!p9_rpc(&vq, tx_len, &rx_len, "Topen", err_msg, err_msg_cap)) {
+    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Topen", err_msg, err_msg_cap)) {
         return 0;
     }
     if (!os_p9_parse_ropen(g_p9_rx_buf, rx_len)) {
         set_err(err_msg, err_msg_cap, "Topen: malformed Ropen response");
+        return 0;
+    }
+
+    *out_fid = 1;
+    return 1;
+}
+
+int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
+                            const UINT8 **out_data, UINT32 *out_count,
+                            char *err_msg, UINT32 err_msg_cap) {
+    UINT32 tx_len = os_p9_build_tread(g_p9_tx_buf, 0, fid, offset, want);
+    UINT32 rx_len;
+    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tread", err_msg, err_msg_cap)) {
+        return 0;
+    }
+
+    if (!os_p9_parse_rread(g_p9_rx_buf, rx_len, out_data, out_count)) {
+        set_err(err_msg, err_msg_cap, "Tread: malformed Rread response");
+        return 0;
+    }
+    return 1;
+}
+
+int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
+    UINT32 tx_len = os_p9_build_tclunk(g_p9_tx_buf, 0, fid);
+    UINT32 rx_len;
+    if (!p9_rpc(&g_vq, tx_len, &rx_len, "Tclunk", err_msg, err_msg_cap)) {
+        return 0;
+    }
+    if (!os_p9_parse_rclunk(g_p9_rx_buf, rx_len)) {
+        set_err(err_msg, err_msg_cap, "Tclunk: malformed Rclunk response");
+        return 0;
+    }
+    return 1;
+}
+
+int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap,
+                           UINT32 *out_len, char *err_msg, UINT32 err_msg_cap) {
+    UINT32 fid;
+    if (!os_virtio9p_open(path, &fid, err_msg, err_msg_cap)) {
         return 0;
     }
 
@@ -191,15 +255,10 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
         }
         UINT32 want = (read_chunk < remaining_cap) ? read_chunk : remaining_cap;
 
-        tx_len = os_p9_build_tread(g_p9_tx_buf, 0, 1, offset, want);
-        if (!p9_rpc(&vq, tx_len, &rx_len, "Tread", err_msg, err_msg_cap)) {
-            return 0;
-        }
-
         const UINT8 *data;
         UINT32 count;
-        if (!os_p9_parse_rread(g_p9_rx_buf, rx_len, &data, &count)) {
-            set_err(err_msg, err_msg_cap, "Tread: malformed Rread response");
+        if (!os_virtio9p_read_chunk(fid, offset, want, &data, &count, err_msg, err_msg_cap)) {
+            os_virtio9p_close(fid, 0, 0);
             return 0;
         }
         if (count == 0) {
@@ -211,6 +270,10 @@ int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap
         }
         total += count;
         offset += count;
+    }
+
+    if (!os_virtio9p_close(fid, err_msg, err_msg_cap)) {
+        return 0;
     }
 
     *out_len = total;

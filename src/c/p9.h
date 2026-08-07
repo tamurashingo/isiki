@@ -15,6 +15,8 @@
 #define P9_ROPEN    113
 #define P9_TREAD    116
 #define P9_RREAD    117
+#define P9_TCLUNK   120
+#define P9_RCLUNK   121
 
 /** Topen/Tcreateのmode: 読み込み専用 */
 #define P9_OREAD 0x00
@@ -82,6 +84,15 @@ UINT32 os_p9_build_topen(UINT8 *buf, UINT16 tag, UINT32 fid, UINT8 mode);
 UINT32 os_p9_build_tread(UINT8 *buf, UINT16 tag, UINT32 fid, UINT64 offset, UINT32 count);
 
 /**
+ * Tclunkメッセージを組み立てる
+ * @param buf 書き込み先バッファ
+ * @param tag メッセージタグ
+ * @param fid 解放するfid
+ * @return 書き込んだバイト数
+ */
+UINT32 os_p9_build_tclunk(UINT8 *buf, UINT16 tag, UINT32 fid);
+
+/**
  * Rversionメッセージを解析する
  * @param buf 受信バッファ
  * @param len 受信バイト数
@@ -126,6 +137,14 @@ int os_p9_parse_ropen(const UINT8 *buf, UINT32 len);
  * @return 正しくRreadとして解析できた場合1、そうでなければ0
  */
 int os_p9_parse_rread(const UINT8 *buf, UINT32 len, const UINT8 **out_data, UINT32 *out_count);
+
+/**
+ * Rclunkメッセージを解析する(payloadは無いため妥当性のみ確認する)
+ * @param buf 受信バッファ
+ * @param len 受信バイト数
+ * @return 正しくRclunkとして解析できた場合1、そうでなければ0
+ */
+int os_p9_parse_rclunk(const UINT8 *buf, UINT32 len);
 
 /**
  * 受信メッセージがRerrorかどうかを確認する
