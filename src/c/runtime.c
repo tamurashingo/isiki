@@ -173,6 +173,10 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     return (UINT64)p;
 }
 
+lisp_addr_t os_alloc_raw(UINT64 n) {
+    return os_alloc_bytes(n);
+}
+
 /**
  * s1とs2の先頭size文字を、小文字/大文字の違いを無視して比較する。
  * @param s1 比較対象の文字列

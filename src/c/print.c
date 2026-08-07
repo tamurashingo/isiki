@@ -117,6 +117,8 @@ static void print_value(frame_buffer *fb, lisp_val_t val) {
             UINT64 magic = ((UINT64 *)(val & ~TAG_MASK))[0];
             if (magic == MAGIC_PROCESS) {
                 fb->write_string(fb, "#<PROCESS>");
+            } else if (magic == MAGIC_STREAM) {
+                fb->write_string(fb, "#<STREAM>");
             } else {
                 fb->write_string(fb, "#<FUNCTION>");
             }

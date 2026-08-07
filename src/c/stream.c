@@ -12,6 +12,8 @@ int os_stream_open_9p_file(os_stream_t *stream, const char *path, char *err_msg,
     stream->buf_pos = 0;
     stream->eof = 0;
     stream->error = 0;
+    stream->out_fb = 0;
+    stream->closed = 0;
 
     if (!os_virtio9p_open(path, &stream->fid, err_msg, err_msg_cap)) {
         stream->error = 1;
@@ -20,8 +22,20 @@ int os_stream_open_9p_file(os_stream_t *stream, const char *path, char *err_msg,
     return 1;
 }
 
+void os_stream_open_screen_output(os_stream_t *stream, frame_buffer *fb) {
+    stream->kind = STREAM_OUTPUT_SCREEN;
+    stream->next_offset = 0;
+    stream->buf_data = 0;
+    stream->buf_count = 0;
+    stream->buf_pos = 0;
+    stream->eof = 0;
+    stream->error = 0;
+    stream->out_fb = fb;
+    stream->closed = 0;
+}
+
 int os_stream_read_char(os_stream_t *stream, char *out_ch) {
-    if (stream->eof || stream->error) {
+    if (stream->closed || stream->eof || stream->error) {
         return 0;
     }
 
@@ -46,7 +60,18 @@ int os_stream_read_char(os_stream_t *stream, char *out_ch) {
     return 1;
 }
 
+int os_stream_write_char(os_stream_t *stream, char ch) {
+    if (stream->closed || stream->kind != STREAM_OUTPUT_SCREEN) {
+        return 0;
+    }
+    stream->out_fb->write_char(stream->out_fb, (UINT8)ch);
+    return 1;
+}
+
 void os_stream_close(os_stream_t *stream) {
-    char err_msg[128];
-    os_virtio9p_close(stream->fid, err_msg, sizeof(err_msg));
+    if (stream->kind == STREAM_9P_FILE) {
+        char err_msg[128];
+        os_virtio9p_close(stream->fid, err_msg, sizeof(err_msg));
+    }
+    stream->closed = 1;
 }

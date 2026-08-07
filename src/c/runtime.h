@@ -29,6 +29,8 @@
 #define MAGIC_MACRO                0x4ULL
 /** TAG_INSTANCEのword0に入る、block/return-from/unwind-protectの非局所脱出シグナルであることを示すMAGIC NUMBER */
 #define MAGIC_BLOCK_EXIT           0x5ULL
+/** TAG_INSTANCEのword0に入る、streamオブジェクトであることを示すMAGIC NUMBER */
+#define MAGIC_STREAM               0x6ULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -359,6 +361,14 @@ lisp_val_t primitive_string_to_symbol(lisp_val_t args, lisp_val_t env);
  * @return 新しくinternされたSYMBOL
  */
 lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env);
+
+/**
+ * nバイト(8byte境界に整列)をLispヒープからアロケータ経由で確保する、os_alloc_bytesの公開版。
+ * stream_lisp.cがos_stream_tをLispヒープ上に確保するために使う。
+ * @param n 確保するバイト数
+ * @return 確保したメモリの先頭アドレス
+ */
+lisp_addr_t os_alloc_raw(UINT64 n);
 
 #endif /* _RUNTIME_H_ */
 
