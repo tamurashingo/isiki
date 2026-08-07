@@ -252,5 +252,80 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env);
  */
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env);
 
+/**
+ * 組み込み関数*。argsの全fixnumを乗算する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 積のFIXNUM
+ */
+lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算)。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 除算結果のFIXNUM。0除算の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数<。argsが単調増加(a<b<c<...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数>。argsが単調減少(a>b>c>...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数=。argsがすべて等しいかどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return すべて等しいならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数NUMBERP。第一引数が数値(現状はFIXNUMのみ)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 数値ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数FIXNUMP。第一引数がFIXNUMかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return FIXNUMならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SYMBOLP。第一引数がsymbolかどうかを判定する。
+ * nilはTAG_CONS(自己参照cons)で表現されているが、ISLisp上はsymbolとして扱われるため
+ * val == nil も真と判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return symbolならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CONSP。第一引数がconsかどうかを判定する。
+ * nilは内部表現上TAG_CONSだが、ISLisp上はconsではないため val == nil は偽と判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return consならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env);
+
 #endif /* _RUNTIME_H_ */
 

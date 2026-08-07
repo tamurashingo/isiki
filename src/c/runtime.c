@@ -295,6 +295,15 @@ void os_bootstrap() {
         os_set_function(g_sym_cons, os_make_native_function((lisp_addr_t)(void *)primitive_cons), global_environment);
         os_set_function(os_make_symbol("EQ"), os_make_native_function((lisp_addr_t)(void *)primitive_eq), global_environment);
         os_set_function(os_make_symbol("NULL"), os_make_native_function((lisp_addr_t)(void *)primitive_null), global_environment);
+        os_set_function(os_make_symbol("*"), os_make_native_function((lisp_addr_t)(void *)primitive_multiply), global_environment);
+        os_set_function(os_make_symbol("/"), os_make_native_function((lisp_addr_t)(void *)primitive_divide), global_environment);
+        os_set_function(os_make_symbol("<"), os_make_native_function((lisp_addr_t)(void *)primitive_less_than), global_environment);
+        os_set_function(os_make_symbol(">"), os_make_native_function((lisp_addr_t)(void *)primitive_greater_than), global_environment);
+        os_set_function(os_make_symbol("="), os_make_native_function((lisp_addr_t)(void *)primitive_num_equal), global_environment);
+        os_set_function(os_make_symbol("NUMBERP"), os_make_native_function((lisp_addr_t)(void *)primitive_numberp), global_environment);
+        os_set_function(os_make_symbol("FIXNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnump), global_environment);
+        os_set_function(os_make_symbol("SYMBOLP"), os_make_native_function((lisp_addr_t)(void *)primitive_symbolp), global_environment);
+        os_set_function(os_make_symbol("CONSP"), os_make_native_function((lisp_addr_t)(void *)primitive_consp), global_environment);
     }
 }
 
@@ -727,6 +736,142 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env) {
     return cc_car(args) == nil ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数*。argsの全fixnumを乗算する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 積のFIXNUM
+ */
+lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
+    UINT64 product = 1;
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        product *= cc_car(cur) >> 3;
+    }
+    return os_make_fixnum(product);
+}
+
+/**
+ * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算)。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 除算結果のFIXNUM。0除算の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
+    UINT64 result = cc_car(args) >> 3;
+    for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+        UINT64 divisor = cc_car(rest) >> 3;
+        if (divisor == 0) {
+            return g_sym_eval_error;
+        }
+        result /= divisor;
+    }
+    return os_make_fixnum(result);
+}
+
+/**
+ * 組み込み関数<。argsが単調増加(a<b<c<...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        UINT64 a = cc_car(rest) >> 3;
+        UINT64 b = cc_car(cc_cdr(rest)) >> 3;
+        if (!(a < b)) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数>。argsが単調減少(a>b>c>...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        UINT64 a = cc_car(rest) >> 3;
+        UINT64 b = cc_car(cc_cdr(rest)) >> 3;
+        if (!(a > b)) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数=。argsがすべて等しいかどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return すべて等しいならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        UINT64 a = cc_car(rest) >> 3;
+        UINT64 b = cc_car(cc_cdr(rest)) >> 3;
+        if (a != b) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数NUMBERP。第一引数が数値(現状はFIXNUMのみ)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 数値ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    return (val & TAG_MASK) == TAG_FIXNUM ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数FIXNUMP。第一引数がFIXNUMかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return FIXNUMならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    return (val & TAG_MASK) == TAG_FIXNUM ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数SYMBOLP。第一引数がsymbolかどうかを判定する。
+ * nilはTAG_CONS(自己参照cons)で表現されているが、ISLisp上はsymbolとして扱われるため
+ * val == nil も真と判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return symbolならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if (val == nil) {
+        return g_sym_t;
+    }
+    return (val & TAG_MASK) == TAG_SYMBOL ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数CONSP。第一引数がconsかどうかを判定する。
+ * nilは内部表現上TAG_CONSだが、ISLisp上はconsではないため val == nil は偽と判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return consならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if (val == nil) {
+        return nil;
+    }
+    return (val & TAG_MASK) == TAG_CONS ? g_sym_t : nil;
 }
 
 

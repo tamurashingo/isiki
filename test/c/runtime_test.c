@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <stdarg.h>
 #include "test_assert.h"
 #include "types.h"
 #include "runtime.h"
@@ -176,6 +177,77 @@ void test_os_get_function() {
     assert(v3 == nil, "未定義の関数はnilが返る");
 }
 
+static lisp_val_t make_arg_list(int argc, ...) {
+    lisp_val_t vals[8];
+    va_list ap;
+    va_start(ap, argc);
+    for (int i = 0; i < argc; i++) {
+        vals[i] = os_make_fixnum(va_arg(ap, UINT64));
+    }
+    va_end(ap);
+
+    lisp_val_t list = nil;
+    for (int i = argc - 1; i >= 0; i--) {
+        list = os_make_cons(vals[i], list);
+    }
+    return list;
+}
+
+void test_primitive_multiply() {
+    lisp_val_t r = primitive_multiply(make_arg_list(3, 2, 3, 4), nil);
+    assert(r >> 3 == 24, "(* 2 3 4) は24");
+
+    lisp_val_t r2 = primitive_multiply(make_arg_list(1, 5), nil);
+    assert(r2 >> 3 == 5, "(* 5) は5");
+}
+
+void test_primitive_divide() {
+    lisp_val_t r = primitive_divide(make_arg_list(2, 12, 3), nil);
+    assert(r >> 3 == 4, "(/ 12 3) は4");
+
+    lisp_val_t r2 = primitive_divide(make_arg_list(3, 24, 4, 2), nil);
+    assert(r2 >> 3 == 3, "(/ 24 4 2) は3");
+
+    lisp_val_t r3 = primitive_divide(make_arg_list(2, 5, 0), nil);
+    assert(r3 == g_sym_eval_error, "(/ 5 0) はg_sym_eval_error");
+}
+
+void test_primitive_less_than() {
+    assert(primitive_less_than(make_arg_list(3, 1, 2, 3), nil) == g_sym_t, "(< 1 2 3) はT");
+    assert(primitive_less_than(make_arg_list(3, 1, 3, 2), nil) == nil, "(< 1 3 2) はnil");
+    assert(primitive_less_than(make_arg_list(2, 1, 1), nil) == nil, "(< 1 1) はnil");
+}
+
+void test_primitive_greater_than() {
+    assert(primitive_greater_than(make_arg_list(3, 3, 2, 1), nil) == g_sym_t, "(> 3 2 1) はT");
+    assert(primitive_greater_than(make_arg_list(3, 3, 1, 2), nil) == nil, "(> 3 1 2) はnil");
+}
+
+void test_primitive_num_equal() {
+    assert(primitive_num_equal(make_arg_list(3, 2, 2, 2), nil) == g_sym_t, "(= 2 2 2) はT");
+    assert(primitive_num_equal(make_arg_list(2, 2, 3), nil) == nil, "(= 2 3) はnil");
+}
+
+void test_primitive_numberp_and_fixnump() {
+    assert(primitive_numberp(make_arg_list(1, 42), nil) == g_sym_t, "(numberp 42) はT");
+    assert(primitive_numberp(os_make_cons(os_make_symbol("foo"), nil), nil) == nil, "(numberp 'foo) はnil");
+    assert(primitive_fixnump(make_arg_list(1, 42), nil) == g_sym_t, "(fixnump 42) はT");
+}
+
+void test_primitive_symbolp() {
+    lisp_val_t sym = os_make_symbol("foo");
+    assert(primitive_symbolp(os_make_cons(sym, nil), nil) == g_sym_t, "(symbolp 'foo) はT");
+    assert(primitive_symbolp(os_make_cons(nil, nil), nil) == g_sym_t, "(symbolp nil) はT(nilはISLisp上symbol)");
+    assert(primitive_symbolp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(symbolp 1) はnil");
+}
+
+void test_primitive_consp() {
+    lisp_val_t cons = os_make_cons(os_make_fixnum(1), nil);
+    assert(primitive_consp(os_make_cons(cons, nil), nil) == g_sym_t, "(consp '(1)) はT");
+    assert(primitive_consp(os_make_cons(nil, nil), nil) == nil, "(consp nil) はnil(nilはconsではない)");
+    assert(primitive_consp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(consp 1) はnil");
+}
+
 int main(int argc, char** argv) {
    test_os_make_fixnum();
 
@@ -187,6 +259,14 @@ int main(int argc, char** argv) {
    test_os_make_symbol_prefix_is_not_confused();
    test_os_get_variable();
    test_os_get_function();
+   test_primitive_multiply();
+   test_primitive_divide();
+   test_primitive_less_than();
+   test_primitive_greater_than();
+   test_primitive_num_equal();
+   test_primitive_numberp_and_fixnump();
+   test_primitive_symbolp();
+   test_primitive_consp();
 
    return g_test_failed ? 1 : 0;
 }
