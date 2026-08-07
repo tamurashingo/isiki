@@ -468,6 +468,18 @@
     (make-instance '<simple-error> ':format-string format-string ':format-arguments format-arguments)
     nil))
 
+;;; --- ignore-errors ---
+
+;; bodyの評価中に<error>系のconditionが発生したらそこで中断してnilを返す。
+;; <error>でないconditionはこのスコープでは処理せず、signal-conditionで外側の
+;; handlerに伝播させる(with-handlerのテストにある「型が合わなければ外側に渡す」パターン)。
+(defmacro ignore-errors (&rest body)
+  (let ((block-name (gensym)))
+    `(block ,block-name
+       (with-handler
+           (lambda (c) (if (typep c '<error>) (return-from ,block-name nil) (signal-condition c nil)))
+         ,@body))))
+
 ;;; --- dynamic-let / set-dynamic ---
 
 (defun %dynamic-let-vars (bindings)

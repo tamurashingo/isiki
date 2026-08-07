@@ -257,3 +257,17 @@
 ;; 引数順が逆になっていると(< 5 3)=nilとなり検出できる
 (assert-equal 'yes (case-using #'< 3 ((5) 'yes) (t 'no)))
 (assert-equal 'no (case-using #'< 5 ((3) 'yes) (t 'no)))
+
+;;; --- ignore-errors ---
+
+;; エラーが起きたらnilを返す
+(assert-equal nil (ignore-errors (error "boom")))
+
+;; エラーが無ければ最後のformの値を返す
+(assert-equal 3 (ignore-errors 1 2 3))
+
+;; <error>でないconditionは捕まえず、外側のwith-handlerまで伝播する
+(assert-equal 'outer
+  (block b
+    (with-handler (lambda (c) (return-from b 'outer))
+      (ignore-errors (signal-condition (make-instance '<condition>) nil)))))
