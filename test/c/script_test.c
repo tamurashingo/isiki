@@ -101,6 +101,7 @@ static void setup_heap() {
     assert(heap != NULL, "1MBのヒープ用メモリをmallocで確保できる");
     os_heap_init((UINT64)heap, HEAP_SIZE);
     os_bootstrap();
+    os_register_eval_primitives();
 }
 
 static void push_string(process_t *proc, const char *s) {

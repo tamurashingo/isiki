@@ -24,7 +24,17 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env);
 lisp_val_t primitive_macroexpand_1(lisp_val_t args, lisp_val_t env);
 
 /**
- * eval.cで実装した組み込み関数(macroexpand-1)をglobal_environmentに登録する。
+ * 組み込み関数FUNCALL。第一引数の関数オブジェクトを、残りの評価済み引数で呼び出す。
+ * mapcar等、関数を値として受け取り呼び出す高階関数がLisp側から呼ぶために使う
+ * (Lisp2スコープのため、変数に束縛された関数オブジェクトは(f x)のようには呼べない)。
+ * @param args 評価済みの引数リスト(第一引数は関数オブジェクト、残りはその実引数)
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果
+ */
+lisp_val_t primitive_funcall(lisp_val_t args, lisp_val_t env);
+
+/**
+ * eval.cで実装した組み込み関数(macroexpand-1, funcall)をglobal_environmentに登録する。
  */
 void os_register_eval_primitives(void);
 

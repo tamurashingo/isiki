@@ -421,6 +421,28 @@ void test_primitive_macroexpand_1_returns_form_unchanged_when_not_macro() {
     assert(expanded_atom == atom, "atomはmacroexpand-1でそのまま返る");
 }
 
+void test_primitive_funcall_calls_native_function() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t plus_fn = os_get_function(os_make_symbol("+"), env);
+    lisp_val_t args = os_make_cons(plus_fn,
+                          os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil)));
+    lisp_val_t r = primitive_funcall(args, env);
+    assert(r == os_make_fixnum(3), "(funcall #'+ 1 2)は3");
+}
+
+void test_primitive_funcall_calls_interpreted_function() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t lambda_params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t lambda_body = make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_symbol("y") });
+    lisp_val_t lambda_form = make_call("lambda", 2, (lisp_val_t[]){ lambda_params, lambda_body });
+    lisp_val_t fn = os_eval(lambda_form, env);
+
+    lisp_val_t args = os_make_cons(fn,
+                          os_make_cons(os_make_fixnum(3), os_make_cons(os_make_fixnum(4), nil)));
+    lisp_val_t r = primitive_funcall(args, env);
+    assert(r == os_make_fixnum(7), "(funcall (lambda (x y) (+ x y)) 3 4)は7");
+}
+
 void test_os_eval_quasiquote_plain_list() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
 
@@ -815,6 +837,8 @@ int main(int argc, char** argv) {
     test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit();
     test_primitive_macroexpand_1_expands_macro_call();
     test_primitive_macroexpand_1_returns_form_unchanged_when_not_macro();
+    test_primitive_funcall_calls_native_function();
+    test_primitive_funcall_calls_interpreted_function();
     test_os_eval_function_on_symbol_returns_function_object();
     test_os_eval_function_on_lambda_returns_callable_closure();
     test_os_eval_function_on_undefined_symbol_returns_eval_error();

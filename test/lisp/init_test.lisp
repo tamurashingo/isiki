@@ -84,3 +84,52 @@
 ;; (aref a i1 i2 ...)ならset-arefに展開される
 (assert-equal 42 (let ((a (make-array 3))) (setf (aref a 1) 42) (aref a 1)))
 (assert-equal 7 (let ((a (make-array '(2 3)))) (setf (aref a 1 2) 7) (aref a 1 2)))
+
+;;; --- mapcar / mapc / mapcan ---
+
+(defun %add1 (x) (+ x 1))
+
+(assert-equal 2 (car (mapcar #'%add1 (cons 1 (cons 2 (cons 3 nil))))))
+(assert-equal 3 (car (cdr (mapcar #'%add1 (cons 1 (cons 2 (cons 3 nil)))))))
+(assert-equal 4 (car (cdr (cdr (mapcar #'%add1 (cons 1 (cons 2 (cons 3 nil))))))))
+(assert-equal nil (mapcar #'%add1 nil))
+
+;; mapcはfnを副作用目的で呼ぶ。lambdaがletで束縛したaccを閉じ込め(クロージャ)、
+;; set-arefでaccの内容を書き換えることで、呼び出しごとの副作用を検証する
+(assert-equal 6
+  (let ((acc (make-array 1)))
+    (setf (aref acc 0) 0)
+    (mapc (lambda (x) (setf (aref acc 0) (+ (aref acc 0) x)))
+          (cons 1 (cons 2 (cons 3 nil))))
+    (aref acc 0)))
+
+;; mapcは(副作用の後)元のlist自身を返す
+(assert-equal 1 (car (mapc #'%add1 (cons 1 (cons 2 nil)))))
+
+(defun %dup2 (x) (cons x (cons x nil)))
+
+(assert-equal 1 (car (mapcan #'%dup2 (cons 1 (cons 2 nil)))))
+(assert-equal 1 (car (cdr (mapcan #'%dup2 (cons 1 (cons 2 nil))))))
+(assert-equal 2 (car (cdr (cdr (mapcan #'%dup2 (cons 1 (cons 2 nil)))))))
+(assert-equal 2 (car (cdr (cdr (cdr (mapcan #'%dup2 (cons 1 (cons 2 nil))))))))
+(assert-equal nil (mapcan #'%dup2 nil))
+
+;;; --- member / assoc ---
+
+(assert-equal 2 (car (member 2 (cons 1 (cons 2 (cons 3 nil))))))
+(assert-equal nil (member 4 (cons 1 (cons 2 (cons 3 nil)))))
+
+(assert-equal 2 (cdr (assoc 'b (cons (cons 'a 1) (cons (cons 'b 2) nil)))))
+(assert-equal nil (assoc 'z (cons (cons 'a 1) nil)))
+
+;;; --- append / reverse ---
+
+(assert-equal 1 (car (append (cons 1 nil) (cons 2 nil))))
+(assert-equal 2 (car (cdr (append (cons 1 nil) (cons 2 nil)))))
+(assert-equal 1 (car (append (cons 1 nil))))
+(assert-equal nil (append))
+
+(assert-equal 3 (car (reverse (cons 1 (cons 2 (cons 3 nil))))))
+(assert-equal 2 (car (cdr (reverse (cons 1 (cons 2 (cons 3 nil)))))))
+(assert-equal 1 (car (cdr (cdr (reverse (cons 1 (cons 2 (cons 3 nil))))))))
+(assert-equal nil (reverse nil))
