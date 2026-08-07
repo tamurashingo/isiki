@@ -103,6 +103,20 @@ lisp_val_t g_sym_block;
 lisp_val_t g_sym_return_from;
 /** unwind-protect特殊形式を表すシンボル */
 lisp_val_t g_sym_unwind_protect;
+/** function特殊形式を表すシンボル */
+lisp_val_t g_sym_function;
+/** flet特殊形式を表すシンボル */
+lisp_val_t g_sym_flet;
+/** labels特殊形式を表すシンボル */
+lisp_val_t g_sym_labels;
+/** defvar特殊形式を表すシンボル */
+lisp_val_t g_sym_defvar;
+/** defconstant特殊形式を表すシンボル */
+lisp_val_t g_sym_defconstant;
+/** defdynamic特殊形式を表すシンボル */
+lisp_val_t g_sym_defdynamic;
+/** dynamic特殊形式を表すシンボル */
+lisp_val_t g_sym_dynamic;
 /** 仮引数リストで残りの実引数をリストとしてまとめて受け取ることを示すマーカーシンボル(&rest) */
 lisp_val_t g_sym_rest;
 /** quasiquote(`)を表すシンボル。reader.cが`x`を(QUASIQUOTE x)へ読むために使う */
@@ -125,6 +139,9 @@ lisp_val_t g_sym_eval_error;
 
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 lisp_val_t global_environment;
+
+/** defdynamicで定義された動的変数の値を保持するグローバルなフラットalist(sym . val)。レキシカルなenvの親子関係とは無関係 */
+lisp_val_t g_dynamic_bindings;
 
 /** internされたsymbolを保持できる最大数 */
 #define MAX_SYMBOLS 1024
@@ -250,6 +267,8 @@ void os_bootstrap() {
         nil = tagged;
     }
 
+    g_dynamic_bindings = nil;
+
     // global_environment の作成
     {
        global_environment = os_make_environment(os_make_symbol("GLOBAL-ENV"), nil);
@@ -289,6 +308,13 @@ void os_bootstrap() {
         g_sym_block = os_make_symbol("BLOCK");
         g_sym_return_from = os_make_symbol("RETURN-FROM");
         g_sym_unwind_protect = os_make_symbol("UNWIND-PROTECT");
+        g_sym_function = os_make_symbol("FUNCTION");
+        g_sym_flet = os_make_symbol("FLET");
+        g_sym_labels = os_make_symbol("LABELS");
+        g_sym_defvar = os_make_symbol("DEFVAR");
+        g_sym_defconstant = os_make_symbol("DEFCONSTANT");
+        g_sym_defdynamic = os_make_symbol("DEFDYNAMIC");
+        g_sym_dynamic = os_make_symbol("DYNAMIC");
         g_sym_rest = os_make_symbol("&REST");
         g_sym_quasiquote = os_make_symbol("QUASIQUOTE");
         g_sym_unquote = os_make_symbol("UNQUOTE");
@@ -576,24 +602,87 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
      *     (cons 'name env-symbol)
      *     (cons 'variables nil)
      *     (cons 'functions nil)
-     *     (cons 'parent parent-env)))
+     *     (cons 'parent parent-env)
+     *     (cons 'constants nil)))
+     *
+     * constantsは既存のos_get_variable/os_get_function/os_set_variable/os_set_functionが
+     * 4番目(parent)までしか固定位置参照しないため、末尾に追加するだけで既存コードに影響しない
      */
     lisp_val_t name_symbol = os_make_symbol("name");
     lisp_val_t variables_symbol = os_make_symbol("variables");
     lisp_val_t functions_symbol = os_make_symbol("functions");
     lisp_val_t parent_symbol = os_make_symbol("parent");
+    lisp_val_t constants_symbol = os_make_symbol("constants");
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     lisp_val_t variables_slot = os_make_cons(variables_symbol, nil);
     lisp_val_t functions_slot = os_make_cons(functions_symbol, nil);
     lisp_val_t parent_slot = os_make_cons(parent_symbol, parent_env);
+    lisp_val_t constants_slot = os_make_cons(constants_symbol, nil);
 
-    lisp_val_t list_step3 = os_make_cons(parent_slot, nil);
+    lisp_val_t list_step4 = os_make_cons(constants_slot, nil);
+    lisp_val_t list_step3 = os_make_cons(parent_slot, list_step4);
     lisp_val_t list_step2 = os_make_cons(functions_slot, list_step3);
     lisp_val_t list_step1 = os_make_cons(variables_slot, list_step2);
     lisp_val_t env_obj = os_make_cons(name_slot, list_step1);
 
     return env_obj;
+}
+
+/**
+ * symがenv自身(親は辿らない)のconstantsスロットに登録されているかどうかを判定する。
+ * @param sym 判定するsymbol
+ * @param env 判定対象の環境(このenv自身のスロットのみを見る)
+ * @return 定数として登録されていればnon-zero
+ */
+int os_is_constant(lisp_val_t sym, lisp_val_t env) {
+    lisp_val_t const_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))));
+    lisp_val_t alist = cc_cdr(const_slot);
+    return cc_assoc_eq(sym, alist) != nil;
+}
+
+/**
+ * envのconstantsスロットにsymを定数として登録する(既に登録済みなら何もしない)。
+ * @param sym 登録するsymbol
+ * @param env 登録先の環境
+ */
+void os_mark_constant(lisp_val_t sym, lisp_val_t env) {
+    lisp_val_t const_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))));
+    lisp_addr_t const_slot_addr = const_slot & ~TAG_MASK;
+    lisp_val_t alist = cc_cdr(const_slot);
+
+    if (cc_assoc_eq(sym, alist) != nil) {
+        return;
+    }
+    lisp_val_t new_pair = os_make_cons(sym, g_sym_t);
+    ((lisp_val_t *)const_slot_addr)[1] = os_make_cons(new_pair, alist);
+}
+
+/**
+ * g_dynamic_bindingsからsymの動的変数の値を取得する(レキシカルなenvの親子関係とは無関係)。
+ * @param sym 検索するsymbol
+ * @return 見つかった値。未定義の場合はnil
+ */
+lisp_val_t os_get_dynamic(lisp_val_t sym) {
+    lisp_val_t pair = cc_assoc_eq(sym, g_dynamic_bindings);
+    return (pair != nil) ? cc_cdr(pair) : nil;
+}
+
+/**
+ * g_dynamic_bindingsにsymの動的変数の値としてvalを設定する(既存なら破壊的に上書き、無ければ新規追加)。
+ * @param sym 設定するsymbol
+ * @param val 設定する値
+ * @return val 自身
+ */
+lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val) {
+    lisp_val_t existing_pair = cc_assoc_eq(sym, g_dynamic_bindings);
+    if (existing_pair != nil) {
+        ((lisp_val_t *)(existing_pair & ~TAG_MASK))[1] = val;
+    } else {
+        lisp_val_t new_pair = os_make_cons(sym, val);
+        g_dynamic_bindings = os_make_cons(new_pair, g_dynamic_bindings);
+    }
+    return val;
 }
 
 

@@ -69,6 +69,20 @@ extern lisp_val_t g_sym_block;
 extern lisp_val_t g_sym_return_from;
 /** unwind-protect特殊形式を表すシンボル */
 extern lisp_val_t g_sym_unwind_protect;
+/** function特殊形式を表すシンボル */
+extern lisp_val_t g_sym_function;
+/** flet特殊形式を表すシンボル */
+extern lisp_val_t g_sym_flet;
+/** labels特殊形式を表すシンボル */
+extern lisp_val_t g_sym_labels;
+/** defvar特殊形式を表すシンボル */
+extern lisp_val_t g_sym_defvar;
+/** defconstant特殊形式を表すシンボル */
+extern lisp_val_t g_sym_defconstant;
+/** defdynamic特殊形式を表すシンボル */
+extern lisp_val_t g_sym_defdynamic;
+/** dynamic特殊形式を表すシンボル */
+extern lisp_val_t g_sym_dynamic;
 /** 仮引数リストで残りの実引数をリストとしてまとめて受け取ることを示すマーカーシンボル(&rest) */
 extern lisp_val_t g_sym_rest;
 /** quasiquote(`)を表すシンボル。reader.cが`x`を(QUASIQUOTE x)へ読むために使う */
@@ -91,6 +105,9 @@ extern lisp_val_t g_sym_eval_error;
 
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 extern lisp_val_t global_environment;
+
+/** defdynamicで定義された動的変数の値を保持するグローバルなフラットalist(sym . val)。レキシカルなenvの親子関係とは無関係 */
+extern lisp_val_t g_dynamic_bindings;
 
 /**
  * ヒープをheap_base〜heap_base+heap_sizeで初期化する。
@@ -158,12 +175,43 @@ void os_string_to_cstr(lisp_val_t str, char *out, UINT32 out_cap);
 lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3);
 
 /**
- * parent_envを親とする新しい環境(name/variables/functions/parentの4slotを持つリスト)を作る。
+ * parent_envを親とする新しい環境(name/variables/functions/parent/constantsの5slotを持つリスト)を作る。
  * @param env_symbol 環境の名前を表すsymbol
  * @param parent_env 親環境。ルート環境の場合はnil
  * @return 作成した環境
  */
 lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env);
+
+/**
+ * symがenv自身(親は辿らない)のconstantsスロットに登録されているかどうかを判定する。
+ * defconstantで定義された定数をsetqで上書きできないようにするために使う。
+ * @param sym 判定するsymbol
+ * @param env 判定対象の環境(このenv自身のスロットのみを見る)
+ * @return 定数として登録されていればnon-zero
+ */
+int os_is_constant(lisp_val_t sym, lisp_val_t env);
+
+/**
+ * envのconstantsスロットにsymを定数として登録する(既に登録済みなら何もしない)。
+ * @param sym 登録するsymbol
+ * @param env 登録先の環境
+ */
+void os_mark_constant(lisp_val_t sym, lisp_val_t env);
+
+/**
+ * g_dynamic_bindingsからsymの動的変数の値を取得する(レキシカルなenvの親子関係とは無関係)。
+ * @param sym 検索するsymbol
+ * @return 見つかった値。未定義の場合はnil
+ */
+lisp_val_t os_get_dynamic(lisp_val_t sym);
+
+/**
+ * g_dynamic_bindingsにsymの動的変数の値としてvalを設定する(既存なら破壊的に上書き、無ければ新規追加)。
+ * @param sym 設定するsymbol
+ * @param val 設定する値
+ * @return val 自身
+ */
+lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val);
 
 /**
  * envおよびその親を順に辿り、symの変数の値を取得する。

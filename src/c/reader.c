@@ -268,6 +268,68 @@ static lisp_val_t read_atom(reader_source_t *src) {
     return os_make_symbol(token);
 }
 
+/** 文字名(SPACE/NEWLINE/TAB)の最大長。この長さを超える名前は既知の名前と一致しない */
+#define CHAR_NAME_MAX 16
+
+/**
+ * name(すべて大文字で渡す既知の文字名)とbuf[0..len)を大文字小文字を無視して比較する。
+ * os_make_symbol経由のinterningでは大文字化されてしまい元の大小文字が失われるため、
+ * runtime.cのstrncmpignorecase(static、非公開)の代わりにreader.c内で同じ手法を使う。
+ * @param buf 比較対象のバッファ(大小文字混在のまま)
+ * @param len bufの長さ
+ * @param name 既知の文字名(すべて大文字のNUL終端文字列)
+ * @return bufとnameが大文字小文字を無視して一致すればnon-zero
+ */
+static int char_name_matches(const char *buf, UINT32 len, const char *name) {
+    UINT32 i = 0;
+    for (; name[i] != '\0'; i++) {
+        if (i >= len) {
+            return 0;
+        }
+        char c = buf[i];
+        char upper = (c >= 'a' && c <= 'z') ? (char)(c - 0x20) : c;
+        if (upper != name[i]) {
+            return 0;
+        }
+    }
+    return i == len;
+}
+
+/**
+ * '#\' は呼び出し元で消費済みの前提で、文字リテラル(#\a や #\Space など)の残りを読む。
+ * 1文字目は無条件に読む(delimiterかどうかは見ないため、#\( や #\) のような記号も1文字として扱える)。
+ * 続けてdelimiterでない文字がある限り読み進め、複数文字ならSPACE/NEWLINE/TABの名前として
+ * 大文字小文字を無視して照合する。os_make_symbolは大文字化してしまうため経由しない。
+ * @param src 読み取り対象の文字ソース
+ * @return 読み取ったCHAR。入力が終端していた、または未知の名前の場合はg_sym_read_error
+ */
+static lisp_val_t read_char_literal(reader_source_t *src) {
+    if (!has_more(src)) {
+        return g_sym_read_error;
+    }
+    char buf[CHAR_NAME_MAX];
+    UINT32 len = 0;
+    buf[len++] = advance(src);
+
+    while (len < CHAR_NAME_MAX - 1 && has_more(src) && !is_delimiter(peek(src))) {
+        buf[len++] = advance(src);
+    }
+
+    if (len == 1) {
+        return os_make_char(buf[0]);
+    }
+    if (char_name_matches(buf, len, "SPACE")) {
+        return os_make_char(' ');
+    }
+    if (char_name_matches(buf, len, "NEWLINE")) {
+        return os_make_char('\n');
+    }
+    if (char_name_matches(buf, len, "TAB")) {
+        return os_make_char('\t');
+    }
+    return g_sym_read_error;
+}
+
 /**
  * srcの読取カーソル位置から1つのS式(リスト・文字列・quote・quasiquote・unquote・アトム)を読む。
  * @param src 読み取り対象の文字ソース
@@ -329,6 +391,30 @@ static lisp_val_t read_expr(reader_source_t *src) {
             return g_sym_read_error;
         }
         return os_make_cons(sym, os_make_cons(quoted, nil));
+    }
+    if (c == '#') {
+        advance(src);
+        if (!has_more(src)) {
+            return g_sym_read_error;
+        }
+        char c2 = peek(src);
+        if (c2 == '\'') {
+            advance(src);
+            skip_whitespace(src);
+            if (!has_more(src)) {
+                return g_sym_read_error;
+            }
+            lisp_val_t form = read_expr(src);
+            if (form == g_sym_read_error) {
+                return g_sym_read_error;
+            }
+            return os_make_cons(g_sym_function, os_make_cons(form, nil));
+        }
+        if (c2 == '\\') {
+            advance(src);
+            return read_char_literal(src);
+        }
+        return g_sym_read_error;
     }
 
     return read_atom(src);

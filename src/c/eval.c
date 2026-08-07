@@ -184,12 +184,88 @@ static lisp_val_t eval_if(lisp_val_t args, lisp_val_t env) {
  */
 static lisp_val_t eval_setq(lisp_val_t args, lisp_val_t env) {
     lisp_val_t sym = cc_car(args);
+    if (os_is_constant(sym, env)) {
+        return g_sym_eval_error; // defconstantで定義された定数はsetqで上書きできない
+    }
     lisp_val_t val_form = cc_car(cc_cdr(args));
     lisp_val_t val = os_eval(val_form, env);
     if (is_control_transfer(val)) {
         return val;
     }
     return os_set_variable(sym, val, env);
+}
+
+/**
+ * defvar特殊形式。(defvar name value-form)。current environmentの変数slotに
+ * すでにnameが束縛されていれば何もしない(value-formも評価しない)。
+ * 未束縛の場合のみvalue-formを評価してos_set_variableで登録する。
+ * @param args (name . value-form-rest) value-form-restが空ならvalueはnil
+ * @param env 登録先の環境
+ * @return name(ISLispのdefvarの戻り値規約)
+ */
+static lisp_val_t eval_defvar(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t value_rest = cc_cdr(args);
+
+    lisp_val_t var_slot = cc_car(cc_cdr(env)); // (variables . alist)
+    lisp_val_t existing = cc_assoc_eq(name, cc_cdr(var_slot));
+    if (existing == nil) {
+        lisp_val_t val = (value_rest != nil) ? os_eval(cc_car(value_rest), env) : nil;
+        if (is_control_transfer(val)) {
+            return val;
+        }
+        os_set_variable(name, val, env);
+    }
+    return name;
+}
+
+/**
+ * defconstant特殊形式。(defconstant name value-form)から、value-formを評価してcurrent
+ * environmentの変数slotに登録し、さらにconstantsスロットにも登録してsetqでの上書きを禁止する。
+ * @param args (name value-form)
+ * @param env 登録先の環境
+ * @return name(defvarと同じ戻り値規約)
+ */
+static lisp_val_t eval_defconstant(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t value_form = cc_car(cc_cdr(args));
+    lisp_val_t val = os_eval(value_form, env);
+    if (is_control_transfer(val)) {
+        return val;
+    }
+    os_set_variable(name, val, env);
+    os_mark_constant(name, env);
+    return name;
+}
+
+/**
+ * defdynamic特殊形式。(defdynamic name value-form)のvalue-formを評価し、レキシカルなenvの
+ * 親子関係とは無関係なグローバルなg_dynamic_bindingsにnameの値として登録する。
+ * @param args (name value-form)
+ * @param env value-formの評価に使う環境
+ * @return name(defvarと同じ戻り値規約)
+ */
+static lisp_val_t eval_defdynamic(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t value_form = cc_car(cc_cdr(args));
+    lisp_val_t val = os_eval(value_form, env);
+    if (is_control_transfer(val)) {
+        return val;
+    }
+    os_set_dynamic(name, val);
+    return name;
+}
+
+/**
+ * dynamic特殊形式。(dynamic name)のnameは未評価のシンボルとして扱い(quoteと同様)、
+ * g_dynamic_bindingsからその動的変数の値を取得して返す。
+ * @param args (name)
+ * @param env 未使用
+ * @return nameの動的変数の値。未定義の場合はnil
+ */
+static lisp_val_t eval_dynamic(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_get_dynamic(cc_car(args));
 }
 
 /**
@@ -219,6 +295,73 @@ static lisp_val_t eval_lambda(lisp_val_t args, lisp_val_t env) {
     lisp_val_t params = cc_car(args);
     lisp_val_t body = cc_cdr(args);
     return make_interpreted_function(params, body, env);
+}
+
+/**
+ * function特殊形式。(function name)ならnameをenvから関数として解決して返し、
+ * (function (lambda ...))のような式ならその式自体をos_evalして得た関数オブジェクトを返す。
+ * @param args (name-or-lambda-expr)
+ * @param env 解決・評価に使う環境
+ * @return 関数オブジェクト。nameが未定義の場合はg_sym_eval_error
+ */
+static lisp_val_t eval_function(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t form = cc_car(args);
+    if ((form & TAG_MASK) == TAG_SYMBOL) {
+        lisp_val_t fn = os_get_function(form, env);
+        if (fn == nil) {
+            return g_sym_eval_error; // 未定義の関数
+        }
+        return fn;
+    }
+    return os_eval(form, env);
+}
+
+/**
+ * flet特殊形式。(flet ((name (params...) body...) ...) body...)。bindingsで作られる各関数の
+ * クロージャ環境は外側のenv(new_envではない)にするため、bindings同士は互いを見えない。
+ * @param args (bindings . body)
+ * @param env 外側の環境。かつbindingsで作る各関数のクロージャ環境
+ * @return bodyの最後の評価結果
+ */
+static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t bindings = cc_car(args);
+    lisp_val_t body = cc_cdr(args);
+    lisp_val_t new_env = os_make_environment(os_make_symbol("FLET-ENV"), env);
+
+    for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
+        lisp_val_t binding = cc_car(b);
+        lisp_val_t name = cc_car(binding);
+        lisp_val_t params = cc_car(cc_cdr(binding));
+        lisp_val_t fn_body = cc_cdr(cc_cdr(binding));
+        lisp_val_t fn = make_interpreted_function(params, fn_body, env);
+        os_set_function(name, fn, new_env);
+    }
+
+    return eval_progn(body, new_env);
+}
+
+/**
+ * labels特殊形式。(labels ((name (params...) body...) ...) body...)。bindingsで作られる各関数の
+ * クロージャ環境はnew_env自身にするため、呼び出し時には全員登録済みで相互再帰できる。
+ * @param args (bindings . body)
+ * @param env 外側の環境
+ * @return bodyの最後の評価結果
+ */
+static lisp_val_t eval_labels(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t bindings = cc_car(args);
+    lisp_val_t body = cc_cdr(args);
+    lisp_val_t new_env = os_make_environment(os_make_symbol("LABELS-ENV"), env);
+
+    for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
+        lisp_val_t binding = cc_car(b);
+        lisp_val_t name = cc_car(binding);
+        lisp_val_t params = cc_car(cc_cdr(binding));
+        lisp_val_t fn_body = cc_cdr(cc_cdr(binding));
+        lisp_val_t fn = make_interpreted_function(params, fn_body, new_env);
+        os_set_function(name, fn, new_env);
+    }
+
+    return eval_progn(body, new_env);
 }
 
 /**
@@ -481,6 +624,27 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
         }
         if (op == g_sym_unwind_protect) {
             return eval_unwind_protect(args, env);
+        }
+        if (op == g_sym_function) {
+            return eval_function(args, env);
+        }
+        if (op == g_sym_flet) {
+            return eval_flet(args, env);
+        }
+        if (op == g_sym_labels) {
+            return eval_labels(args, env);
+        }
+        if (op == g_sym_defvar) {
+            return eval_defvar(args, env);
+        }
+        if (op == g_sym_defconstant) {
+            return eval_defconstant(args, env);
+        }
+        if (op == g_sym_defdynamic) {
+            return eval_defdynamic(args, env);
+        }
+        if (op == g_sym_dynamic) {
+            return eval_dynamic(args, env);
         }
         if ((op & TAG_MASK) == TAG_SYMBOL) {
             lisp_val_t fn = os_get_function(op, env);

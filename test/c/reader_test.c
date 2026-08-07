@@ -377,6 +377,66 @@ void test_os_read_multiline_list_with_comment_line() {
     assert(cc_car(cc_cdr(cc_cdr(body))) == os_make_fixnum(1), "本体の3番目は1");
 }
 
+void test_os_read_function_sugar() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#'car");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == os_make_symbol("function"), "#'carのcarはsymbol function");
+    assert(cc_car(cc_cdr(v)) == os_make_symbol("car"), "#'carのcadrはsymbol car");
+    assert(cc_cdr(cc_cdr(v)) == nil, "#'carのcddrはnil");
+}
+
+void test_os_read_char_literal_simple() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#\\a");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_CHAR, "#\\aはTAG_CHARを持つ");
+    assert((v >> 3) == 'a', "#\\aは大文字化されずに小文字'a'として読める");
+}
+
+void test_os_read_char_literal_paren() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#\\(");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_CHAR, "#\\(はTAG_CHARを持つ");
+    assert((v >> 3) == '(', "#\\(は'('自身のCHARとして読める");
+}
+
+void test_os_read_char_literal_space() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#\\Space");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_CHAR, "#\\SpaceはTAG_CHARを持つ");
+    assert((v >> 3) == ' ', "#\\Spaceはスペース文字として読める");
+}
+
+void test_os_read_char_literal_newline() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#\\Newline");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_CHAR, "#\\NewlineはTAG_CHARを持つ");
+    assert((v >> 3) == '\n', "#\\Newlineは改行文字として読める");
+}
+
+void test_os_read_char_literal_unknown_name_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#\\Foo");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "未知の複数文字名#\\Fooはread errorになる");
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -405,6 +465,12 @@ int main(int argc, char** argv) {
     test_os_read_comment_after_expr();
     test_os_read_comment_immediately_after_token();
     test_os_read_multiline_list_with_comment_line();
+    test_os_read_function_sugar();
+    test_os_read_char_literal_simple();
+    test_os_read_char_literal_paren();
+    test_os_read_char_literal_space();
+    test_os_read_char_literal_newline();
+    test_os_read_char_literal_unknown_name_is_read_error();
 
     return g_test_failed ? 1 : 0;
 }
