@@ -480,6 +480,41 @@
            (lambda (c) (if (typep c '<error>) (return-from ,block-name nil) (signal-condition c nil)))
          ,@body))))
 
+;;; --- class / the / assure ---
+
+;; class-nameがtypepでも判定できる組み込み型名なら対応する述語で、それ以外
+;; (ILOSのユーザークラス)ならtypepにフォールバックして判定する。
+;; 既知の制約: stringp/characterpに相当するprimitiveが存在しないため、
+;; <string>/<character>等はここでは対応しない(未対応の型名は常にtypep経由になり、
+;; %find-classできないクラス名ならtypepがnilを返すのでassureは必ずエラーになる)。
+(defun %assure-typep (obj class-name)
+  (case class-name
+    ((<integer>) (fixnump obj))
+    ((<number>) (numberp obj))
+    ((<symbol>) (symbolp obj))
+    ((<cons>) (consp obj))
+    ((<null>) (null obj))
+    (t (typep obj class-name))))
+
+;; (class class-name) : ILOSでdefclassされたクラス名をクラスオブジェクトに変換する。
+;; 既知の制約: <integer>等の組み込み型のクラスオブジェクトは未実装のため対象外。
+(defmacro class (class-name)
+  `(%find-class ',class-name))
+
+;; (the class-name form) : 型を宣言するだけで、実際の型チェックは行わない
+;; (spec上、不一致時の動作は未定義なのでno-opで十分)。
+(defmacro the (class-name form)
+  form)
+
+;; (assure class-name form) : formを評価し、その値がclass-nameの(サブ)クラスの
+;; インスタンスでなければerrorを発生させる。一致すれば評価値をそのまま返す。
+(defmacro assure (class-name form)
+  (let ((v (gensym)))
+    `(let ((,v ,form))
+       (if (%assure-typep ,v ',class-name)
+           ,v
+           (error "assure: value is not of the expected type" ,v)))))
+
 ;;; --- dynamic-let / set-dynamic ---
 
 (defun %dynamic-let-vars (bindings)

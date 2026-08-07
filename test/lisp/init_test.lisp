@@ -271,3 +271,21 @@
   (block b
     (with-handler (lambda (c) (return-from b 'outer))
       (ignore-errors (signal-condition (make-instance '<condition>) nil)))))
+
+;;; --- class / the / assure ---
+
+;; classはILOSでdefclassされたクラス名をクラスオブジェクトに変換する(%find-classと同じ)
+(assert-equal t (eq (class point) (%find-class 'point)))
+
+;; theは型チェックをせず、formの値をそのまま返すno-op
+(assert-equal 5 (the <integer> 5))
+
+;; assureは組み込み型名(<integer>等)なら対応する述語で判定し、一致すれば値を返す
+(assert-equal 10 (assure <integer> 10))
+
+;; 型が一致しなければerror(ignore-errorsで捕まえて確認)
+(assert-equal nil (ignore-errors (assure <integer> "x")))
+
+;; ILOSのユーザークラス名を指定した場合はtypepにフォールバックする
+(assert-equal t (typep (assure point (make-instance 'point)) 'point))
+(assert-equal nil (ignore-errors (assure point 5)))
