@@ -143,11 +143,21 @@ static void print_value(frame_buffer *fb, lisp_val_t val) {
             print_vector(fb, val);
             return;
         case TAG_INSTANCE: {
-            UINT64 magic = ((UINT64 *)(val & ~TAG_MASK))[0];
+            UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+            UINT64 magic = obj[0];
             if (magic == MAGIC_PROCESS) {
                 fb->write_string(fb, "#<PROCESS>");
             } else if (magic == MAGIC_STREAM) {
                 fb->write_string(fb, "#<STREAM>");
+            } else if (magic == MAGIC_CLASS) {
+                fb->write_string(fb, "#<CLASS ");
+                print_value(fb, obj[1]);
+                fb->write_char(fb, '>');
+            } else if (magic == MAGIC_CLASS_INSTANCE) {
+                UINT64 *cls = (UINT64 *)(obj[1] & ~TAG_MASK);
+                fb->write_string(fb, "#<INSTANCE-OF ");
+                print_value(fb, cls[1]);
+                fb->write_char(fb, '>');
             } else {
                 fb->write_string(fb, "#<FUNCTION>");
             }

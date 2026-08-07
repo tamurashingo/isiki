@@ -421,6 +421,44 @@ void test_primitive_length() {
     assert(primitive_length(os_make_cons(array, nil), nil) >> 3 == 6, "(length (make-array '(2 3)))は次元に関わらず全要素数の6");
 }
 
+void test_primitive_make_class_raw_and_accessors() {
+    lisp_val_t name = os_make_symbol("POINT");
+    lisp_val_t supers = nil;
+    lisp_val_t slots = os_make_cons(os_make_symbol("X"), nil);
+
+    lisp_val_t class = primitive_make_class_raw(
+        os_make_cons(name, os_make_cons(supers, os_make_cons(slots, nil))), nil);
+    assert((class & TAG_MASK) == TAG_INSTANCE, "(%%make-class-raw ...)の戻り値はTAG_INSTANCEを持つ");
+
+    UINT64 *obj = (UINT64 *)(class & ~TAG_MASK);
+    assert(obj[0] == MAGIC_CLASS, "word0はMAGIC_CLASS");
+
+    assert(primitive_class_name(os_make_cons(class, nil), nil) == name, "(%%class-name c)は渡したnameをそのまま返す");
+    assert(primitive_class_supers(os_make_cons(class, nil), nil) == supers, "(%%class-supers c)は渡したsupersをそのまま返す");
+    assert(primitive_class_slots(os_make_cons(class, nil), nil) == slots, "(%%class-slots c)は渡したslotsをそのまま返す");
+
+    assert(primitive_classp(os_make_cons(class, nil), nil) == g_sym_t, "(%%classp c)はtを返す");
+    assert(primitive_classp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(%%classp 1)はnilを返す");
+}
+
+void test_primitive_make_instance_raw_and_accessors() {
+    lisp_val_t class = os_make_instance(MAGIC_CLASS, os_make_symbol("POINT"), nil, nil);
+    lisp_val_t slots_vector = primitive_make_array(os_make_cons(os_make_fixnum(1), nil), nil);
+
+    lisp_val_t instance = primitive_make_instance_raw(
+        os_make_cons(class, os_make_cons(slots_vector, nil)), nil);
+    assert((instance & TAG_MASK) == TAG_INSTANCE, "(%%make-instance-raw ...)の戻り値はTAG_INSTANCEを持つ");
+
+    UINT64 *obj = (UINT64 *)(instance & ~TAG_MASK);
+    assert(obj[0] == MAGIC_CLASS_INSTANCE, "word0はMAGIC_CLASS_INSTANCE");
+
+    assert(primitive_instance_class(os_make_cons(instance, nil), nil) == class, "(%%instance-class i)は渡したclassをそのまま返す");
+    assert(primitive_instance_slots(os_make_cons(instance, nil), nil) == slots_vector, "(%%instance-slots i)は渡したslots-vectorをそのまま返す");
+
+    assert(primitive_class_instance_p(os_make_cons(instance, nil), nil) == g_sym_t, "(%%class-instance-p i)はtを返す");
+    assert(primitive_class_instance_p(os_make_cons(class, nil), nil) == nil, "(%%class-instance-p c)(クラス自身)はnilを返す");
+}
+
 int main(int argc, char** argv) {
    test_os_make_fixnum();
 
@@ -456,6 +494,8 @@ int main(int argc, char** argv) {
    test_primitive_string_elt();
    test_primitive_string_elt_out_of_bounds();
    test_primitive_length();
+   test_primitive_make_class_raw_and_accessors();
+   test_primitive_make_instance_raw_and_accessors();
 
    return g_test_failed ? 1 : 0;
 }

@@ -133,3 +133,32 @@
 (assert-equal 2 (car (cdr (reverse (cons 1 (cons 2 (cons 3 nil)))))))
 (assert-equal 1 (car (cdr (cdr (reverse (cons 1 (cons 2 (cons 3 nil))))))))
 (assert-equal nil (reverse nil))
+
+;;; --- ILOS: defclass / make-instance / slot-value / typep / subclassp ---
+
+(defclass point () ((x :initarg :x :initform 0) (y :initarg :y :initform 0)))
+
+;; initargで指定した値がslot-valueで読める
+(assert-equal 1 (slot-value (make-instance 'point ':x 1 ':y 2) 'x))
+(assert-equal 2 (slot-value (make-instance 'point ':x 1 ':y 2) 'y))
+
+;; initargを省略した場合はinitformの値(0)になる
+(assert-equal 0 (slot-value (make-instance 'point) 'x))
+
+;; setf経由でスロットを書き換えられる
+(assert-equal 99
+  (let ((p (make-instance 'point)))
+    (setf (slot-value p 'x) 99)
+    (slot-value p 'x)))
+
+;; 単純継承: 親クラスのスロットも引き継ぐ
+(defclass point3d (point) ((z :initarg :z :initform 0)))
+(assert-equal 1 (slot-value (make-instance 'point3d ':x 1 ':y 2 ':z 3) 'x))
+(assert-equal 3 (slot-value (make-instance 'point3d ':x 1 ':y 2 ':z 3) 'z))
+
+;; typep / subclassp
+(assert-equal t (typep (make-instance 'point3d) 'point3d))
+(assert-equal t (typep (make-instance 'point3d) 'point))
+(assert-equal nil (typep (make-instance 'point) 'point3d))
+(assert-equal t (subclassp (%find-class 'point3d) (%find-class 'point)))
+(assert-equal nil (subclassp (%find-class 'point) (%find-class 'point3d)))

@@ -33,6 +33,10 @@
 #define MAGIC_BLOCK_EXIT           0x5ULL
 /** TAG_INSTANCEのword0に入る、streamオブジェクトであることを示すMAGIC NUMBER */
 #define MAGIC_STREAM               0x6ULL
+/** TAG_INSTANCEのword0に入る、ILOSのクラスオブジェクトであることを示すMAGIC NUMBER。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
+#define MAGIC_CLASS                0x7ULL
+/** TAG_INSTANCEのword0に入る、ILOSのクラスインスタンスであることを示すMAGIC NUMBER。word1=class、word2=slots-vector(TAG_VECTOR)、word3=未使用 */
+#define MAGIC_CLASS_INSTANCE       0x8ULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -486,6 +490,88 @@ lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env);
  * @return 要素数(FIXNUM)
  */
 lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%MAKE-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_CLASS)を確保する。
+ * @param args 評価済みの引数リスト(name symbol, supers クラスオブジェクトのlist, slots スロット記述子のlist)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したクラスオブジェクト
+ */
+lisp_val_t primitive_make_class_raw(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%CLASS-NAME。ILOSクラスオブジェクトのname(symbol)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスオブジェクト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return name(symbol)
+ */
+lisp_val_t primitive_class_name(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%CLASS-SUPERS。ILOSクラスオブジェクトのsuperclasses(クラスオブジェクトのlist)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスオブジェクト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return superclasses(クラスオブジェクトのlist)
+ */
+lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%CLASS-SLOTS。ILOSクラスオブジェクトのslots(スロット記述子のlist、継承分含む)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスオブジェクト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return slots(スロット記述子のlist)
+ */
+lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%CLASSP。第一引数がILOSクラスオブジェクト(MAGIC_CLASS)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return クラスオブジェクトならt、それ以外ならnil
+ */
+lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%MAKE-INSTANCE-RAW。ILOSクラスインスタンス(MAGIC_CLASS_INSTANCE)を確保する。
+ * @param args 評価済みの引数リスト(class クラスオブジェクト, slots-vector TAG_VECTOR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したクラスインスタンス
+ */
+lisp_val_t primitive_make_instance_raw(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%INSTANCE-CLASS。ILOSクラスインスタンスのclass(クラスオブジェクト)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスインスタンス)
+ * @param env 呼び出し時の環境(未使用)
+ * @return class(クラスオブジェクト)
+ */
+lisp_val_t primitive_instance_class(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%INSTANCE-SLOTS。ILOSクラスインスタンスのslots-vector(TAG_VECTOR)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスインスタンス)
+ * @param env 呼び出し時の環境(未使用)
+ * @return slots-vector(TAG_VECTOR)
+ */
+lisp_val_t primitive_instance_slots(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%CLASS-INSTANCE-P。第一引数がILOSクラスインスタンス(MAGIC_CLASS_INSTANCE)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return クラスインスタンスならt、それ以外ならnil
+ */
+lisp_val_t primitive_class_instance_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%SET-DYNAMIC。os_set_dynamicの薄いラッパーで、レキシカルなenvの
+ * 親子関係とは無関係なグローバルの動的変数(defdynamicで定義したもの)を、
+ * 関数呼び出しの内側からでも書き換えられるようにする。
+ * @param args (name value) 評価済みの引数リスト。nameは動的変数名のシンボル
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだvalue
+ */
+lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env);
 
 /**
  * nバイト(8byte境界に整列)をLispヒープからアロケータ経由で確保する、os_alloc_bytesの公開版。

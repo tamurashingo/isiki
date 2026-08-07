@@ -362,6 +362,16 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("CREATE-STRING"), os_make_native_function((lisp_addr_t)(void *)primitive_create_string), global_environment);
         os_set_function(os_make_symbol("STRING-ELT"), os_make_native_function((lisp_addr_t)(void *)primitive_string_elt), global_environment);
         os_set_function(os_make_symbol("LENGTH"), os_make_native_function((lisp_addr_t)(void *)primitive_length), global_environment);
+        os_set_function(os_make_symbol("%%MAKE-CLASS-RAW"), os_make_native_function((lisp_addr_t)(void *)primitive_make_class_raw), global_environment);
+        os_set_function(os_make_symbol("%%CLASS-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_class_name), global_environment);
+        os_set_function(os_make_symbol("%%CLASS-SUPERS"), os_make_native_function((lisp_addr_t)(void *)primitive_class_supers), global_environment);
+        os_set_function(os_make_symbol("%%CLASS-SLOTS"), os_make_native_function((lisp_addr_t)(void *)primitive_class_slots), global_environment);
+        os_set_function(os_make_symbol("%%CLASSP"), os_make_native_function((lisp_addr_t)(void *)primitive_classp), global_environment);
+        os_set_function(os_make_symbol("%%MAKE-INSTANCE-RAW"), os_make_native_function((lisp_addr_t)(void *)primitive_make_instance_raw), global_environment);
+        os_set_function(os_make_symbol("%%INSTANCE-CLASS"), os_make_native_function((lisp_addr_t)(void *)primitive_instance_class), global_environment);
+        os_set_function(os_make_symbol("%%INSTANCE-SLOTS"), os_make_native_function((lisp_addr_t)(void *)primitive_instance_slots), global_environment);
+        os_set_function(os_make_symbol("%%CLASS-INSTANCE-P"), os_make_native_function((lisp_addr_t)(void *)primitive_class_instance_p), global_environment);
+        os_set_function(os_make_symbol("%%SET-DYNAMIC"), os_make_native_function((lisp_addr_t)(void *)primitive_set_dynamic), global_environment);
     }
 }
 
@@ -1298,6 +1308,131 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
         default:
             return g_sym_eval_error;
     }
+}
+
+
+/**
+ * 組み込み関数%%MAKE-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_CLASS)を確保する。
+ * @param args 評価済みの引数リスト(name symbol, supers クラスオブジェクトのlist, slots スロット記述子のlist)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したクラスオブジェクト
+ */
+lisp_val_t primitive_make_class_raw(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t supers = cc_car(cc_cdr(args));
+    lisp_val_t slots = cc_car(cc_cdr(cc_cdr(args)));
+    return os_make_instance(MAGIC_CLASS, name, supers, slots);
+}
+
+/**
+ * 組み込み関数%%CLASS-NAME。ILOSクラスオブジェクトのname(symbol)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスオブジェクト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return name(symbol)
+ */
+lisp_val_t primitive_class_name(lisp_val_t args, lisp_val_t env) {
+    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    return obj[1];
+}
+
+/**
+ * 組み込み関数%%CLASS-SUPERS。ILOSクラスオブジェクトのsuperclasses(クラスオブジェクトのlist)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスオブジェクト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return superclasses(クラスオブジェクトのlist)
+ */
+lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env) {
+    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    return obj[2];
+}
+
+/**
+ * 組み込み関数%%CLASS-SLOTS。ILOSクラスオブジェクトのslots(スロット記述子のlist、継承分含む)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスオブジェクト)
+ * @param env 呼び出し時の環境(未使用)
+ * @return slots(スロット記述子のlist)
+ */
+lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env) {
+    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    return obj[3];
+}
+
+/**
+ * 組み込み関数%%CLASSP。第一引数がILOSクラスオブジェクト(MAGIC_CLASS)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return クラスオブジェクトならt、それ以外ならnil
+ */
+lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return obj[0] == MAGIC_CLASS ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%MAKE-INSTANCE-RAW。ILOSクラスインスタンス(MAGIC_CLASS_INSTANCE)を確保する。
+ * @param args 評価済みの引数リスト(class クラスオブジェクト, slots-vector TAG_VECTOR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したクラスインスタンス
+ */
+lisp_val_t primitive_make_instance_raw(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t class_obj = cc_car(args);
+    lisp_val_t slots_vector = cc_car(cc_cdr(args));
+    return os_make_instance(MAGIC_CLASS_INSTANCE, class_obj, slots_vector, nil);
+}
+
+/**
+ * 組み込み関数%%INSTANCE-CLASS。ILOSクラスインスタンスのclass(クラスオブジェクト)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスインスタンス)
+ * @param env 呼び出し時の環境(未使用)
+ * @return class(クラスオブジェクト)
+ */
+lisp_val_t primitive_instance_class(lisp_val_t args, lisp_val_t env) {
+    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    return obj[1];
+}
+
+/**
+ * 組み込み関数%%INSTANCE-SLOTS。ILOSクラスインスタンスのslots-vector(TAG_VECTOR)を返す。
+ * @param args 評価済みの引数リスト(第一引数はクラスインスタンス)
+ * @param env 呼び出し時の環境(未使用)
+ * @return slots-vector(TAG_VECTOR)
+ */
+lisp_val_t primitive_instance_slots(lisp_val_t args, lisp_val_t env) {
+    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    return obj[2];
+}
+
+/**
+ * 組み込み関数%%CLASS-INSTANCE-P。第一引数がILOSクラスインスタンス(MAGIC_CLASS_INSTANCE)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return クラスインスタンスならt、それ以外ならnil
+ */
+lisp_val_t primitive_class_instance_p(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return obj[0] == MAGIC_CLASS_INSTANCE ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%SET-DYNAMIC。os_set_dynamicの薄いラッパーで、レキシカルなenvの
+ * 親子関係とは無関係なグローバルの動的変数(defdynamicで定義したもの)を、
+ * 関数呼び出しの内側からでも書き換えられるようにする。
+ * @param args (name value) 評価済みの引数リスト。nameは動的変数名のシンボル
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだvalue
+ */
+lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t val = cc_car(cc_cdr(args));
+    return os_set_dynamic(name, val);
 }
 
 

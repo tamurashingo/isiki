@@ -141,7 +141,8 @@
   (cond ((symbolp place) `(setq ,place ,value))
         ((eq (car place) 'car) `(set-car ,(car (cdr place)) ,value))
         ((eq (car place) 'cdr) `(set-cdr ,(car (cdr place)) ,value))
-        ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))))
+        ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))
+        ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))))
 
 ;;; --- mapcar / mapc / mapcan ---
 ;;;
@@ -223,3 +224,143 @@
 ;; listの要素順を反転した新しいリストを返す。
 (defun reverse (list)
   (%reverse-helper list nil))
+
+;;; --- list ---
+
+;; 引数をそのまま並べたリストを返す。&restが評価済みの引数を既にリストとして
+;; 束縛するため、bodyはitemsをそのまま返すだけでよい。
+(defun list (&rest items)
+  items)
+
+;;; --- ILOS (最小実装): defclass / make-instance / slot-value / typep / subclassp ---
+;;;
+;;; 既知の簡略化: defgeneric/defmethod/call-next-methodは実装しない。スロットの
+;;; 継承は単純な連結(同名オーバーライドやMRO計算は行わない)。typepはILOSの
+;;; クラスインスタンスに対する判定のみで、組み込み型は対象外とする。
+
+;; *classes*はdefun(%register-class)の内側から書き換える必要があるため、
+;; defvar+setqではなくdefdynamic+%%set-dynamicを使う。setq(os_set_variable)は
+;; current environment自身にしか書き込めず、関数呼び出しは呼び出しごとに新しい
+;; environmentを作るため、defvar+setqでは%register-classの中でのsetqが
+;; 呼び出し元に見えない(冒頭の既知の制約と同じ理由)。defdynamicはレキシカルな
+;; 環境の親子関係と無関係なグローバルとして値を持つため、この制約を受けない。
+(defdynamic *classes* nil)
+
+(defun %find-class (name)
+  (cdr (assoc name (dynamic *classes*))))
+
+(defun %register-class (name class)
+  (%%set-dynamic '*classes* (cons (cons name class) (dynamic *classes*)))
+  class)
+
+;; plistからkeyに対応する値を探す。見つからなければdefault
+(defun %plist-get (plist key default)
+  (if (null plist)
+      default
+      (if (eq (car plist) key)
+          (car (cdr plist))
+          (%plist-get (cdr (cdr plist)) key default))))
+
+;; (slot :initarg :key :initform expr) を、初期値をfuncallで取り出せる
+;; thunk(引数無しlambda)付きの評価済みフォーム(list 'slot ':key (lambda () expr))
+;; に変換する。defclassのマクロ展開の中で使うため、ここではフォームを組み立てるだけ
+(defun %slot-spec-form (spec)
+  (list 'list (list 'quote (car spec))
+              (list 'quote (%plist-get (cdr spec) ':initarg nil))
+              (list 'lambda nil (%plist-get (cdr spec) ':initform nil))))
+
+(defun %slot-spec-forms (specs)
+  (if (null specs)
+      nil
+      (cons (%slot-spec-form (car specs)) (%slot-spec-forms (cdr specs)))))
+
+(defun %defclass-supers (super-names)
+  (if (null super-names)
+      nil
+      (cons (%find-class (car super-names)) (%defclass-supers (cdr super-names)))))
+
+(defun %merge-superclass-slots (supers)
+  (if (null supers)
+      nil
+      (append (%%class-slots (car supers)) (%merge-superclass-slots (cdr supers)))))
+
+;; (defclass name (super...) ((slot :initarg :key :initform expr) ...) options...)
+;; supers/slot-specsはこの時点では評価しない(マクロなので)。実行時に親クラスを
+;; 解決し、スロットを連結してクラスオブジェクトを作り*classes*に登録する
+(defmacro defclass (name supers slot-specs &rest options)
+  `(let ((%supers (%defclass-supers ',supers)))
+     (%register-class ',name
+       (%%make-class-raw ',name %supers
+         (append (%merge-superclass-slots %supers)
+                 (list ,@(%slot-spec-forms slot-specs)))))))
+
+;; slots(スロット記述子のリスト)の中からslot-nameのインデックス(0起点)を探す
+(defun %slot-index (slot-name slots idx)
+  (if (null slots)
+      nil
+      (if (eq slot-name (car (car slots)))
+          idx
+          (%slot-index slot-name (cdr slots) (+ idx 1)))))
+
+(defun slot-value (instance slot-name)
+  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
+    (if (null idx)
+        'eval-error
+        (aref (%%instance-slots instance) idx))))
+
+(defun set-slot-value (instance slot-name value)
+  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
+    (if (null idx)
+        'eval-error
+        (set-aref (%%instance-slots instance) idx value))))
+
+;; 対応するinitargがinitargs(:key1 val1 :key2 val2 ...)に無ければ
+;; slot-descriptorのinitform-thunkをfuncallして初期値を得る
+(defun %slot-initial-value (slot-descriptor initargs)
+  (let ((initarg-key (car (cdr slot-descriptor)))
+        (thunk (car (cdr (cdr slot-descriptor)))))
+    (if (null initarg-key)
+        (funcall thunk)
+        (let ((found (member initarg-key initargs)))
+          (if found
+              (car (cdr found))
+              (funcall thunk))))))
+
+(defun %slot-initial-values (slots initargs)
+  (if (null slots)
+      nil
+      (cons (%slot-initial-value (car slots) initargs) (%slot-initial-values (cdr slots) initargs))))
+
+(defun %fill-slots (vec values idx)
+  (if (null values)
+      vec
+      (progn (set-aref vec idx (car values))
+             (%fill-slots vec (cdr values) (+ idx 1)))))
+
+;; (make-instance class-designator :key1 val1 :key2 val2 ...)
+;; class-designatorはクラス名(シンボル)またはクラスオブジェクト自身
+(defun make-instance (class-designator &rest initargs)
+  (let* ((class (if (%%classp class-designator) class-designator (%find-class class-designator)))
+         (slots (%%class-slots class))
+         (values (%slot-initial-values slots initargs)))
+    (%%make-instance-raw class (%fill-slots (make-array (length slots)) values 0))))
+
+;; c1がc2自身、またはc2の(推移的な)サブクラスかどうか
+(defun subclassp (c1 c2)
+  (if (eq c1 c2)
+      t
+      (%any-subclassp (%%class-supers c1) c2)))
+
+(defun %any-subclassp (classes c2)
+  (if (null classes)
+      nil
+      (if (subclassp (car classes) c2)
+          t
+          (%any-subclassp (cdr classes) c2))))
+
+;; instanceがclass-designator(クラスオブジェクトまたはクラス名)のインスタンスかどうか
+(defun typep (instance class-designator)
+  (if (%%class-instance-p instance)
+      (subclassp (%%instance-class instance)
+                 (if (%%classp class-designator) class-designator (%find-class class-designator)))
+      nil))
