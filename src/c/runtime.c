@@ -313,6 +313,9 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("FIXNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnump), global_environment);
         os_set_function(os_make_symbol("SYMBOLP"), os_make_native_function((lisp_addr_t)(void *)primitive_symbolp), global_environment);
         os_set_function(os_make_symbol("CONSP"), os_make_native_function((lisp_addr_t)(void *)primitive_consp), global_environment);
+        os_set_function(os_make_symbol("SYMBOL-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_symbol_name), global_environment);
+        os_set_function(os_make_symbol("STRING-TO-SYMBOL"), os_make_native_function((lisp_addr_t)(void *)primitive_string_to_symbol), global_environment);
+        os_set_function(os_make_symbol("GENSYM"), os_make_native_function((lisp_addr_t)(void *)primitive_gensym), global_environment);
     }
 }
 
@@ -881,6 +884,63 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
         return nil;
     }
     return (val & TAG_MASK) == TAG_CONS ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数SYMBOL-NAME。第一引数のsymbolの名前をSTRINGとして返す。
+ * @param args 評価済みの引数リスト(第一引数はSYMBOL)
+ * @param env 呼び出し時の環境(未使用)
+ * @return symbol名のSTRING
+ */
+lisp_val_t primitive_symbol_name(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t sym = cc_car(args);
+    lisp_addr_t addr = sym & ~TAG_MASK;
+    return ((lisp_val_t *)addr)[0];
+}
+
+/**
+ * 組み込み関数STRING-TO-SYMBOL。第一引数のSTRINGをsymbol名としてintern(既存の大文字化ルール)する。
+ * @param args 評価済みの引数リスト(第一引数はSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return internされたSYMBOL
+ */
+lisp_val_t primitive_string_to_symbol(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t str = cc_car(args);
+    char buf[256];
+    os_string_to_cstr(str, buf, sizeof(buf));
+    return os_make_symbol(buf);
+}
+
+/** gensymが生成する名前の連番カウンタ */
+static UINT64 g_gensym_counter = 0;
+
+/**
+ * 組み込み関数GENSYM。呼ぶたびに"G"+連番の名前で新しいsymbolをintern して返す
+ * (真の非intern symbolは未サポート。連番が一巡しない限り重複は起きない)。
+ * @param args 未使用
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新しくinternされたSYMBOL
+ */
+lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
+    UINT64 n = g_gensym_counter++;
+    char buf[24];
+    buf[0] = 'G';
+    int len = 1;
+    if (n == 0) {
+        buf[len++] = '0';
+    } else {
+        char digits[20];
+        int dlen = 0;
+        while (n > 0) {
+            digits[dlen++] = '0' + (char)(n % 10);
+            n /= 10;
+        }
+        while (dlen > 0) {
+            buf[len++] = digits[--dlen];
+        }
+    }
+    buf[len] = '\0';
+    return os_make_symbol(buf);
 }
 
 

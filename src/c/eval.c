@@ -397,6 +397,39 @@ static lisp_val_t eval_unwind_protect(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * 組み込み関数MACROEXPAND-1。formの先頭がマクロとして定義されたsymbolなら1段だけ展開して返し、
+ * そうでなければformをそのまま返す(このインタプリタには多値機構が無いため、
+ * ISLisp仕様上の「展開したか否か」の真偽値は返さない)。
+ * @param args 評価済みの引数リスト(第一引数がformでなければならない)
+ * @param env マクロ定義を解決する環境
+ * @return 1段展開した結果、またはマクロでなければform自身
+ */
+lisp_val_t primitive_macroexpand_1(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t form = cc_car(args);
+    if ((form & TAG_MASK) != TAG_CONS) {
+        return form;
+    }
+    lisp_val_t op = cc_car(form);
+    if ((op & TAG_MASK) != TAG_SYMBOL) {
+        return form;
+    }
+    lisp_val_t fn = os_get_function(op, env);
+    if (fn == nil || !is_macro(fn)) {
+        return form;
+    }
+    return apply_macro(fn, cc_cdr(form));
+}
+
+/**
+ * eval.cで実装した組み込み関数(macroexpand-1)をglobal_environmentに登録する。
+ */
+void os_register_eval_primitives(void) {
+    os_set_function(os_make_symbol("MACROEXPAND-1"),
+                     os_make_native_function((lisp_addr_t)(void *)primitive_macroexpand_1),
+                     global_environment);
+}
+
+/**
  * exp を env のもとで評価する。
  * SYMBOLはenvから値をlookupし、CONSはcarが特殊形式シンボルならその処理を、
  * そうでなければcarを関数、cdrを引数として評価する。

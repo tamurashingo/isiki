@@ -377,6 +377,50 @@ void test_os_eval_defmacro_args_are_not_evaluated_before_expansion() {
     assert(cc_car(v) == os_make_symbol("+"), "マクロ引数は展開前に評価されないので先頭はsymbol +のまま");
 }
 
+void test_primitive_macroexpand_1_expands_macro_call() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    // (defmacro my-if (test then else) `(if ,test ,then ,else))
+    lisp_val_t name = os_make_symbol("my-if");
+    lisp_val_t params = os_make_cons(os_make_symbol("test"),
+                            os_make_cons(os_make_symbol("then"),
+                                os_make_cons(os_make_symbol("else"), nil)));
+    lisp_val_t unquote_test = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("test"), nil));
+    lisp_val_t unquote_then = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("then"), nil));
+    lisp_val_t unquote_else = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("else"), nil));
+    lisp_val_t if_template = os_make_cons(os_make_symbol("if"),
+                                os_make_cons(unquote_test,
+                                    os_make_cons(unquote_then, os_make_cons(unquote_else, nil))));
+    lisp_val_t body = os_make_cons(
+                            os_make_cons(g_sym_quasiquote, os_make_cons(if_template, nil)), nil);
+    lisp_val_t defmacro_form = os_make_cons(os_make_symbol("defmacro"),
+                                    os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defmacro_form, env);
+
+    // (macroexpand-1 '(my-if 1 10 20)) は展開結果(if 1 10 20)を1段だけ返す(評価はしない)
+    lisp_val_t call_args[3] = { os_make_fixnum(1), os_make_fixnum(10), os_make_fixnum(20) };
+    lisp_val_t call_form = make_call("my-if", 3, call_args);
+    lisp_val_t expanded = primitive_macroexpand_1(os_make_cons(call_form, nil), env);
+
+    assert(cc_car(expanded) == os_make_symbol("if"), "(macroexpand-1 '(my-if 1 10 20))の先頭はsymbol if");
+    assert(cc_car(cc_cdr(expanded)) == os_make_fixnum(1), "展開結果の2番目は1");
+    assert(cc_car(cc_cdr(cc_cdr(expanded))) == os_make_fixnum(10), "展開結果の3番目は10");
+    assert(cc_car(cc_cdr(cc_cdr(cc_cdr(expanded)))) == os_make_fixnum(20), "展開結果の4番目は20");
+}
+
+void test_primitive_macroexpand_1_returns_form_unchanged_when_not_macro() {
+    lisp_val_t env = make_arith_env();
+
+    // マクロではない通常の関数呼び出しはそのまま返る(評価はしない)
+    lisp_val_t form = make_call("+", 2, (lisp_val_t[]){ os_make_fixnum(1), os_make_fixnum(2) });
+    lisp_val_t expanded = primitive_macroexpand_1(os_make_cons(form, nil), env);
+    assert(expanded == form, "マクロでないformはmacroexpand-1で変化せずそのまま返る");
+
+    lisp_val_t atom = os_make_fixnum(42);
+    lisp_val_t expanded_atom = primitive_macroexpand_1(os_make_cons(atom, nil), env);
+    assert(expanded_atom == atom, "atomはmacroexpand-1でそのまま返る");
+}
+
 void test_os_eval_quasiquote_plain_list() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
 
@@ -585,6 +629,8 @@ int main(int argc, char** argv) {
     test_os_eval_nested_block_return_from_only_exits_inner();
     test_os_eval_unwind_protect_runs_cleanup_on_normal_return();
     test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit();
+    test_primitive_macroexpand_1_expands_macro_call();
+    test_primitive_macroexpand_1_returns_form_unchanged_when_not_macro();
 
     return g_test_failed ? 1 : 0;
 }

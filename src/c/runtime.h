@@ -335,5 +335,30 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env);
  */
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env);
 
+/**
+ * 組み込み関数SYMBOL-NAME。第一引数のsymbolの名前をSTRINGとして返す。
+ * @param args 評価済みの引数リスト(第一引数はSYMBOL)
+ * @param env 呼び出し時の環境(未使用)
+ * @return symbol名のSTRING
+ */
+lisp_val_t primitive_symbol_name(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING-TO-SYMBOL。第一引数のSTRINGをsymbol名としてintern(既存の大文字化ルール)する。
+ * @param args 評価済みの引数リスト(第一引数はSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return internされたSYMBOL
+ */
+lisp_val_t primitive_string_to_symbol(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数GENSYM。呼ぶたびに"G"+連番の名前で新しいsymbolをintern して返す
+ * (真の非intern symbolは未サポート。連番が一巡しない限り重複は起きない)。
+ * @param args 未使用
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新しくinternされたSYMBOL
+ */
+lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env);
+
 #endif /* _RUNTIME_H_ */
 

@@ -248,6 +248,30 @@ void test_primitive_consp() {
     assert(primitive_consp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(consp 1) はnil");
 }
 
+void test_primitive_symbol_name() {
+    lisp_val_t sym = os_make_symbol("foo");
+    lisp_val_t name = primitive_symbol_name(os_make_cons(sym, nil), nil);
+    assert((name & TAG_MASK) == TAG_STRING, "(symbol-name 'foo)はSTRINGを返す");
+
+    char buf[16];
+    os_string_to_cstr(name, buf, sizeof(buf));
+    assert(strncmp(buf, "FOO", 3) == 0, "(symbol-name 'foo)は大文字化された\"FOO\"を返す");
+}
+
+void test_primitive_string_to_symbol() {
+    lisp_val_t str = os_make_string("bar");
+    lisp_val_t sym = primitive_string_to_symbol(os_make_cons(str, nil), nil);
+    assert((sym & TAG_MASK) == TAG_SYMBOL, "(string-to-symbol \"bar\")はSYMBOLを返す");
+    assert(sym == os_make_symbol("bar"), "(string-to-symbol \"bar\")はos_make_symbol(\"bar\")と同じsymbolになる(interning)");
+}
+
+void test_primitive_gensym() {
+    lisp_val_t g1 = primitive_gensym(nil, nil);
+    lisp_val_t g2 = primitive_gensym(nil, nil);
+    assert((g1 & TAG_MASK) == TAG_SYMBOL, "(gensym)はSYMBOLを返す");
+    assert(g1 != g2, "(gensym)を2回呼ぶと異なるsymbolが返る");
+}
+
 int main(int argc, char** argv) {
    test_os_make_fixnum();
 
@@ -267,6 +291,9 @@ int main(int argc, char** argv) {
    test_primitive_numberp_and_fixnump();
    test_primitive_symbolp();
    test_primitive_consp();
+   test_primitive_symbol_name();
+   test_primitive_string_to_symbol();
+   test_primitive_gensym();
 
    return g_test_failed ? 1 : 0;
 }
