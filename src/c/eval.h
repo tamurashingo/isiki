@@ -45,7 +45,19 @@ lisp_val_t primitive_macroexpand_1(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_funcall(lisp_val_t args, lisp_val_t env);
 
 /**
- * eval.cで実装した組み込み関数(macroexpand-1, funcall)をglobal_environmentに登録する。
+ * 組み込み関数%%APPLY。第一引数の関数オブジェクトを、第二引数(評価済みの引数の
+ * リスト)を展開して呼び出す。FUNCALLは呼び出し側の構文上の引数個数が固定のため、
+ * 実行時に長さが決まるリスト(総称関数dispatchでのメソッド呼び出しなど)を展開して
+ * 渡すことができない。%%APPLYはその用途のための内部primitiveで、仕様上のapply
+ * (先頭に固定引数を並べられる)とは異なり(fn arg-list)の2引数のみを受け付ける。
+ * @param args 評価済みの引数リスト(第一引数は関数オブジェクト、第二引数は実引数のリスト)
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果
+ */
+lisp_val_t primitive_apply(lisp_val_t args, lisp_val_t env);
+
+/**
+ * eval.cで実装した組み込み関数(macroexpand-1, funcall, %%apply)をglobal_environmentに登録する。
  */
 void os_register_eval_primitives(void);
 

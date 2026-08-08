@@ -718,7 +718,20 @@ lisp_val_t primitive_funcall(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * eval.cで実装した組み込み関数(macroexpand-1, funcall)をglobal_environmentに登録する。
+ * 組み込み関数%%APPLY。primitive_funcallとほぼ同じだが、実引数は構文上並べる
+ * のではなく第二引数として渡された(評価済みの)リストをそのまま展開する。
+ * @param args 評価済みの引数リスト((fn arg-list)の2要素)
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果
+ */
+lisp_val_t primitive_apply(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t fn = cc_car(args);
+    lisp_val_t fn_args = cc_car(cc_cdr(args));
+    return apply_function(fn, fn_args, env);
+}
+
+/**
+ * eval.cで実装した組み込み関数(macroexpand-1, funcall, %%apply)をglobal_environmentに登録する。
  */
 void os_register_eval_primitives(void) {
     os_set_function(os_make_symbol("MACROEXPAND-1"),
@@ -726,6 +739,9 @@ void os_register_eval_primitives(void) {
                      global_environment);
     os_set_function(os_make_symbol("FUNCALL"),
                      os_make_native_function((lisp_addr_t)(void *)primitive_funcall),
+                     global_environment);
+    os_set_function(os_make_symbol("%%APPLY"),
+                     os_make_native_function((lisp_addr_t)(void *)primitive_apply),
                      global_environment);
 }
 

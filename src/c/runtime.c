@@ -1195,8 +1195,9 @@ lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数GENERIC-FUNCTION-P。本実装にはdefgeneric/defmethodが存在せず
- * generic function自体を表すオブジェクトが作れないため、常にnilを返す。
+ * 組み込み関数GENERIC-FUNCTION-P。defgeneric(src/lisp/init.lisp)はdispatch用の
+ * 通常のinterpreted functionを生成するだけで、generic functionであることを示す
+ * 専用のタグ付きオブジェクトを作らないため、区別する手段が無く常にnilを返す。
  * @param args 評価済みの引数リスト(未使用)
  * @param env 呼び出し時の環境(未使用)
  * @return 常にnil

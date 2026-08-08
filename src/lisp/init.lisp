@@ -296,9 +296,10 @@
 
 ;;; --- ILOS (最小実装): defclass / make-instance / slot-value / typep / subclassp ---
 ;;;
-;;; 既知の簡略化: defgeneric/defmethod/call-next-methodは実装しない。スロットの
-;;; 継承は単純な連結(同名オーバーライドやMRO計算は行わない)。typepはILOSの
-;;; クラスインスタンスに対する判定のみで、組み込み型は対象外とする。
+;;; 既知の簡略化: スロットの継承は単純な連結(同名オーバーライドやMRO計算は
+;;; 行わない)。typepはILOSのクラスインスタンスに対する判定のみで、組み込み型は
+;;; 対象外とする。defgeneric/defmethod/call-next-method/next-method-pは後段
+;;; (instancepの後)で実装する(単一dispatch・qualifier無しの最小実装)。
 
 ;; *classes*はdefun(%register-class)の内側から書き換える必要があるため、
 ;; defvar+setqではなくdefdynamic+%%set-dynamicを使う。setq(os_set_variable)は
@@ -400,12 +401,16 @@
              (%fill-slots vec (cdr values) (+ idx 1)))))
 
 ;; (make-instance class-designator :key1 val1 :key2 val2 ...)
-;; class-designatorはクラス名(シンボル)またはクラスオブジェクト自身
+;; class-designatorはクラス名(シンボル)またはクラスオブジェクト自身。
+;; スロットの初期化自体はinitialize-object(総称関数、下記)に委譲する。
+;; initialize-objectはmake-instanceより後で定義されるが、この処理系は
+;; 関数本体中のシンボル参照を呼び出し時に解決するインタプリタなので、
+;; テキスト上の定義順は問題にならない(defclass/%find-classと同じ前提)。
 (defun make-instance (class-designator &rest initargs)
   (let* ((class (if (%%classp class-designator) class-designator (%find-class class-designator)))
-         (slots (%%class-slots class))
-         (values (%slot-initial-values slots initargs)))
-    (%%make-instance-raw class (%fill-slots (make-array (length slots)) values 0))))
+         (instance (%%make-instance-raw class (make-array (length (%%class-slots class))))))
+    (initialize-object instance initargs)
+    instance))
 
 ;; c1がc2自身、またはc2の(推移的な)サブクラスかどうか
 (defun subclassp (c1 c2)
@@ -434,6 +439,176 @@
 ;; クラスオブジェクトも受け付ける、緩い実装)にそのまま委譲する既知の簡略化とする。
 (defun instancep (instance class)
   (typep instance class))
+
+;;; --- 総称関数(最小実装): defgeneric / defmethod / call-next-method / next-method-p ---
+;;;
+;;; 既知の簡略化: 単一(第1引数のみ)dispatch。:before/:after/:aroundなどの
+;;; method-qualifierは実装しない(primary methodのみ)。メソッドの特定性順序は
+;;; specializerクラス間のsubclassp比較による簡易な挿入ソートで、真のクラス優先度
+;;; リスト(MRO)計算は行わない(defclassのスロット継承が単純な連結であることと
+;;; 同水準の簡略化)。call-next-method/next-method-pは仕様上`labels`によりレキシカルに
+;;; 束縛されるが、本実装では動的変数によるフレームスタックで代替する。
+
+;; *generic-methods*: alist、gf-name -> methods((specializer . fn)*)。
+;; *classes*/*handlers*と同じ理由でdefdynamic+%%set-dynamicを使う
+(defdynamic *generic-methods* nil)
+
+(defun %find-generic-methods (name)
+  (cdr (assoc name (dynamic *generic-methods*))))
+
+;; specializerが等しいかどうか。nil同士も含めてeqで比較してよい
+;; (クラスオブジェクトはdefclassごとに1つの同一オブジェクトとして扱う)
+(defun %remove-method-with-specializer (specializer methods)
+  (if (null methods)
+      nil
+      (if (eq specializer (car (car methods)))
+          (%remove-method-with-specializer specializer (cdr methods))
+          (cons (car methods) (%remove-method-with-specializer specializer (cdr methods))))))
+
+;; 同じgf-name・同じspecializerの既存メソッドを取り除いた上で新しいメソッドを
+;; 先頭に積んで登録する(defclass/%register-classと同じ「再定義は前に積んでshadow」
+;; パターン)
+(defun %register-method (name specializer fn)
+  (let* ((existing (%find-generic-methods name))
+         (updated (cons (cons specializer fn) (%remove-method-with-specializer specializer existing))))
+    (%%set-dynamic '*generic-methods* (cons (cons name updated) (dynamic *generic-methods*)))
+    name))
+
+;; specializerがnil(無指定)のメソッドは常に適用可能。それ以外はarg0が
+;; ILOSクラスインスタンスであり、そのクラスがspecializerのサブクラス(自身含む)
+;; である場合のみ適用可能
+(defun %method-applicable-p (specializer arg0)
+  (if (null specializer)
+      t
+      (if (%%class-instance-p arg0)
+          (subclassp (%%instance-class arg0) specializer)
+          nil)))
+
+(defun %applicable-methods (name arg0)
+  (%filter-applicable-methods (%find-generic-methods name) arg0))
+
+(defun %filter-applicable-methods (methods arg0)
+  (if (null methods)
+      nil
+      (if (%method-applicable-p (car (car methods)) arg0)
+          (cons (car methods) (%filter-applicable-methods (cdr methods) arg0))
+          (%filter-applicable-methods (cdr methods) arg0))))
+
+;; m1がm2より特定的かどうか。specializerがnilのメソッドは常に最も非特定的
+(defun %more-specific-p (m1 m2)
+  (let ((s1 (car m1)) (s2 (car m2)))
+    (if (null s2)
+        (not (null s1))
+        (if (null s1)
+            nil
+            (subclassp s1 s2)))))
+
+(defun %insert-method-by-specificity (m sorted)
+  (if (null sorted)
+      (list m)
+      (if (%more-specific-p m (car sorted))
+          (cons m sorted)
+          (cons (car sorted) (%insert-method-by-specificity m (cdr sorted))))))
+
+;; 最も特定的なメソッドが先頭になるよう並び替える(挿入ソート)
+(defun %order-methods (methods)
+  (if (null methods)
+      nil
+      (%insert-method-by-specificity (car methods) (%order-methods (cdr methods)))))
+
+;; *next-methods*: call-next-method/next-method-pが参照する、現在呼び出し中の
+;; メソッド呼び出しごとの「残りメソッドリスト+呼び出し引数」のフレームスタック
+;; (内側の呼び出しが先頭)。with-handlerの*handlers*と同じ保存/復元パターン
+(defdynamic *next-methods* nil)
+
+;; orderedの先頭メソッドをargsで呼び出す。呼び出し中はorderedの残り(cdr)と
+;; argsを新しいフレームとして*next-methods*に積み、unwind-protectで必ず復元する。
+;; orderedが空(=適用可能なメソッドが無い/次のメソッドが無い)ならエラーとする
+;; (仕様: 適用可能なメソッドが無い場合、call-next-methodで次が無い場合、いずれもerror)
+(defun %invoke-method-chain (ordered args)
+  (if (null ordered)
+      (error "no applicable method")
+      (let ((saved (dynamic *next-methods*)))
+        (unwind-protect
+            (progn (%%set-dynamic '*next-methods* (cons (cons (cdr ordered) args) saved))
+                   (%%apply (cdr (car ordered)) args))
+          (%%set-dynamic '*next-methods* saved)))))
+
+(defun %generic-call (name args)
+  (%invoke-method-chain (%order-methods (%applicable-methods name (car args))) args))
+
+;; (next-method-p) → boolean: 現在のメソッドの内側でcall-next-methodが呼べるか
+(defun next-method-p ()
+  (if (null (dynamic *next-methods*))
+      nil
+      (if (car (car (dynamic *next-methods*))) t nil)))
+
+;; (call-next-method) → <object>: 元の呼び出し引数のまま次のメソッドを呼ぶ
+(defun call-next-method ()
+  (let ((frame (car (dynamic *next-methods*))))
+    (if (null frame)
+        (error "call-next-method: no next method")
+        (%invoke-method-chain (car frame) (cdr frame)))))
+
+;; (defgeneric name lambda-list option*)
+;; lambda-list/optionsは検証しない(既知の簡略化)。nameを、呼び出し時に
+;; %generic-callへdispatchする通常のdefunとして定義するだけ
+(defmacro defgeneric (name lambda-list &rest options)
+  `(defun ,name (&rest %generic-args) (%generic-call ',name %generic-args)))
+
+;; parameter-profileの先頭要素から(未評価の)specializer class-nameを取り出す。
+;; (var class-name)形式ならclass-name、単純なvarならnil(specializer無し)
+(defun %first-param-specializer (param)
+  (if (consp param) (car (cdr param)) nil))
+
+(defun %first-param-var (param)
+  (if (consp param) (car param) param))
+
+;; 第1引数以外にspecializerが書かれていないか検査する(多重ディスパッチは
+;; 実装しないという制約を、暗黙に無視せず明示的なerrorとして表面化させる)
+(defun %check-no-more-specializers (params)
+  (if (null params)
+      nil
+      (if (consp (car params))
+          (error "defmethod: 第1引数以外へのspecializerは未対応")
+          (%check-no-more-specializers (cdr params)))))
+
+;; lambda-listを、実際にlambdaへ渡せる引数リスト(先頭要素のspecializerを
+;; 取り除いたもの)に変換する
+(defun %method-plain-params (lambda-list)
+  (if (null lambda-list)
+      nil
+      (progn (%check-no-more-specializers (cdr lambda-list))
+             (cons (%first-param-var (car lambda-list)) (cdr lambda-list)))))
+
+;; (defmethod name parameter-profile form*)
+;; 第1パラメータのみ(var class-name)形式のspecializerを許可する(単一dispatch)。
+;; classマクロ(既存、%find-classをラップ)をそのまま再利用してspecializer
+;; クラスオブジェクトを取得する
+(defmacro defmethod (name lambda-list &rest body)
+  (let ((specializer-name (%first-param-specializer (car lambda-list))))
+    `(%register-method ',name
+       ,(if specializer-name (list 'class specializer-name) nil)
+       (lambda ,(%method-plain-params lambda-list) ,@body))))
+
+;; (initialize-object instance initialization-arguments) → <object>
+;; createがインスタンス生成時に呼ぶ総称関数。システム標準のprimary methodは
+;; initargs/initformからスロットを埋める(既存%slot-initial-values/%fill-slotsを
+;; そのまま再利用)。ユーザーはクラスを指定したdefmethodでこれをオーバーライド/
+;; call-next-methodで拡張できる
+(defgeneric initialize-object (instance initargs))
+
+(defmethod initialize-object (instance initargs)
+  (%fill-slots (%%instance-slots instance)
+               (%slot-initial-values (%%class-slots (%%instance-class instance)) initargs)
+               0)
+  instance)
+
+;; (class-of obj) → <class>: objが直接属するクラスを返す。仕様上objは任意の
+;; ISLisp objectを受け付けるが、組み込み型のクラスオブジェクトが未実装のため
+;; (class/assureと同じ既知の制約)、ILOSのクラスインスタンスのみを対象とする
+(defun class-of (obj)
+  (%%instance-class obj))
 
 ;;; --- エラー処理とコンディショナルシステム(最小実装): signal-condition / with-handler / error ---
 ;;;

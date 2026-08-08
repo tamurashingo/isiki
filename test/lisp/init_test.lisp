@@ -163,6 +163,39 @@
 (assert-equal t (subclassp (%find-class 'point3d) (%find-class 'point)))
 (assert-equal nil (subclassp (%find-class 'point) (%find-class 'point3d)))
 
+;;; --- 総称関数: defgeneric / defmethod / call-next-method / next-method-p / class-of ---
+
+;; class-of: インスタンスが直接属するクラスを返す
+(assert-equal t (eq (class-of (make-instance 'point)) (%find-class 'point)))
+(assert-equal t (eq (class-of (make-instance 'point3d)) (%find-class 'point3d)))
+
+;; 特定性順dispatch・call-next-method・next-method-p:
+;; specializer無しのメソッドは常に適用可能(最も非特定的)。point3dに対しては
+;; point3d用メソッドが先にdispatchされ、そちらの中ではnext-method-pがtになり
+;; call-next-methodで非特定的メソッドの結果を取得できる。非特定的メソッド自身の
+;; 中ではnext-method-pはnil(これより後ろのメソッドが無い)
+(defgeneric describe-point (obj))
+(defmethod describe-point (obj) (list 'point-desc (next-method-p)))
+(defmethod describe-point ((obj point3d)) (list '3d-desc (next-method-p) (call-next-method)))
+
+(assert-equal t (equal (list 'point-desc nil) (describe-point (make-instance 'point))))
+(assert-equal t (equal (list '3d-desc t (list 'point-desc nil)) (describe-point (make-instance 'point3d))))
+
+;; call-next-methodの次が無い場合はerrorになる
+(defgeneric %no-next-method-test (obj))
+(defmethod %no-next-method-test (obj) (call-next-method))
+(assert-equal nil (ignore-errors (%no-next-method-test (make-instance 'point))))
+
+;; initialize-object: システム標準のinitarg/initform埋め込みをcall-next-methodで
+;; 呼びつつ、サブクラス独自の初期化(labelスロットの自動計算)を追加できる
+(defclass labeled-point (point) ((label :initarg :label :initform nil)))
+(defmethod initialize-object ((obj labeled-point) initargs)
+  (call-next-method)
+  (set-slot-value obj 'label (list 'auto (slot-value obj 'x))))
+
+(assert-equal 5 (slot-value (make-instance 'labeled-point ':x 5) 'x))
+(assert-equal t (equal (list 'auto 5) (slot-value (make-instance 'labeled-point ':x 5) 'label)))
+
 ;;; --- Condition System: signal-condition / with-handler / error ---
 
 ;; with-handler + block/return-fromでcatchできる
