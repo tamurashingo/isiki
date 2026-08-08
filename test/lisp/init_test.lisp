@@ -134,6 +134,34 @@
 (assert-equal 1 (car (cdr (cdr (reverse (cons 1 (cons 2 (cons 3 nil))))))))
 (assert-equal nil (reverse nil))
 
+;;; --- create-list / nreverse / maplist / mapl / mapcon (§21.3) ---
+
+(assert-equal t (equal (list 17 17 17) (create-list 3 17)))
+(assert-equal t (equal (list nil nil) (create-list 2)))
+(assert-equal t (equal nil (create-list 0)))
+
+(assert-equal t (equal (list 3 2 1) (nreverse (list 1 2 3))))
+(assert-equal nil (nreverse nil))
+
+;; maplistはfnに要素ではなく後続のsublistを渡す
+(assert-equal t (equal (list (list 1 2 3) (list 2 3) (list 3))
+                        (maplist (lambda (x) x) (list 1 2 3))))
+(assert-equal nil (maplist (lambda (x) x) nil))
+
+;; mapl(mapcのsublist版)は副作用目的で呼び、list自身を返す
+(assert-equal 6
+  (let ((acc (make-array 1)))
+    (setf (aref acc 0) 0)
+    (mapl (lambda (x) (setf (aref acc 0) (+ (aref acc 0) (car x))))
+          (list 1 2 3))
+    (aref acc 0)))
+(assert-equal 1 (car (mapl (lambda (x) x) (list 1 2))))
+
+;; mapcon(mapcanのsublist版)。仕様書(§21.3)の例(#'list版)通りの結果になることを確認する
+(assert-equal t (equal (list (list 1 2 3 4) (list 2 3 4) (list 3 4) (list 4))
+                        (mapcon #'list (list 1 2 3 4))))
+(assert-equal nil (mapcon #'list nil))
+
 ;;; --- ILOS: defclass / make-instance / slot-value / typep / subclassp ---
 
 (defclass point () ((x :initarg :x :initform 0) (y :initarg :y :initform 0)))

@@ -295,6 +295,55 @@
 (defun list (&rest items)
   items)
 
+;;; --- create-list / nreverse / maplist / mapl / mapcon (§21.3) ---
+
+(defun %create-list-helper (n elt)
+  (if (= n 0)
+      nil
+      (cons elt (%create-list-helper (- n 1) elt))))
+
+;; 長さnのリストを作る。initial-elementは仕様上省略可(省略時の初期値は
+;; implementation defined)で、本実装では省略時はnilを詰める。
+(defun create-list (n &rest initial-element)
+  (%create-list-helper n (if (null initial-element) nil (car initial-element))))
+
+(defun %nreverse-helper (list prev)
+  (if (null list)
+      prev
+      (let ((next (cdr list)))
+        (set-cdr list prev)
+        (%nreverse-helper next list))))
+
+;; reverseの破壊的版。listを構成するconsのcdrをset-cdrで書き換えて反転する
+;; (新しいconsは確保しない)。
+(defun nreverse (list)
+  (%nreverse-helper list nil))
+
+;; mapcarと同様だが、fnには要素そのものではなく後続のsublist(cdrで縮んでいく
+;; リスト自身)を適用する。
+(defun maplist (fn list)
+  (if (null list)
+      nil
+      (cons (funcall fn list) (maplist fn (cdr list)))))
+
+(defun %mapl-1 (fn list)
+  (if (null list)
+      nil
+      (progn (funcall fn list) (%mapl-1 fn (cdr list)))))
+
+;; maplistと同様にsublistへfnを副作用目的で適用し、list自身を返す(mapcの
+;; sublist版)。
+(defun mapl (fn list)
+  (progn (%mapl-1 fn list) list))
+
+;; maplistと同様にsublistへfnを適用するが、結果はappendで連結する(mapcanの
+;; sublist版)。仕様上はnconcによる破壊的な連結だが、既存のmapcanと同様に
+;; nconcが未実装のためappendで代用する簡略化になっている。
+(defun mapcon (fn list)
+  (if (null list)
+      nil
+      (append (funcall fn list) (mapcon fn (cdr list)))))
+
 ;;; --- ILOS (最小実装): defclass / make-instance / slot-value / typep / subclassp ---
 ;;;
 ;;; 既知の簡略化: スロットの継承は単純な連結(同名オーバーライドやMRO計算は

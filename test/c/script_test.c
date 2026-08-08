@@ -94,7 +94,7 @@ static void setup_buffers() {
     }
 }
 
-#define HEAP_SIZE (1024 * 1024 * 4)
+#define HEAP_SIZE (1024 * 1024 * 8)
 
 static void setup_heap() {
     void *heap = malloc(HEAP_SIZE);
