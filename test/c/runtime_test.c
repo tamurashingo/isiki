@@ -194,6 +194,133 @@ static lisp_val_t make_arg_list(int argc, ...) {
     return list;
 }
 
+// make_arg_listは非負値専用(os_make_fixnum経由)なので、負数やbignumを引数に
+// 渡したいテストではあらかじめ組み立てたlisp_val_tの配列からリストを作る
+static lisp_val_t make_arg_list_vals(int argc, lisp_val_t *vals) {
+    lisp_val_t list = nil;
+    for (int i = argc - 1; i >= 0; i--) {
+        list = os_make_cons(vals[i], list);
+    }
+    return list;
+}
+
+void test_os_make_fixnum_signed() {
+    lisp_val_t neg5 = os_make_fixnum_signed(1, 5);
+    assert((neg5 & TAG_MASK) == TAG_FIXNUM, "os_make_fixnum_signed(1,5)はTAG_FIXNUM");
+    assert(os_fixnum_is_negative(neg5), "os_make_fixnum_signed(1,5)は負");
+    assert(os_fixnum_magnitude(neg5) == 5, "os_make_fixnum_signed(1,5)のマグニチュードは5");
+
+    lisp_val_t zero_neg = os_make_fixnum_signed(1, 0);
+    assert(!os_fixnum_is_negative(zero_neg), "os_make_fixnum_signed(1,0)は0に正規化され符号は負にならない");
+    assert(zero_neg == os_make_fixnum(0), "os_make_fixnum_signed(1,0)はos_make_fixnum(0)と同じ表現になる");
+
+    lisp_val_t max_fixnum = os_make_fixnum(FIXNUM_MAGNITUDE_MASK);
+    assert((max_fixnum & TAG_MASK) == TAG_FIXNUM, "60bit境界値(FIXNUM_MAGNITUDE_MASK)はまだFIXNUM");
+    assert(os_fixnum_magnitude(max_fixnum) == FIXNUM_MAGNITUDE_MASK, "60bit境界値のマグニチュードが一致する");
+}
+
+void test_os_make_integer_promotes_to_bignum() {
+    // 2^60(FIXNUM_MAGNITUDE_MASK+1)は60bitに収まらないのでbignumになる
+    UINT64 limbs_over[2] = {0, 0x10000000ULL};
+    lisp_val_t over = os_make_integer(0, limbs_over, 2);
+    assert((over & TAG_MASK) == TAG_INSTANCE, "60bitを超えるマグニチュードはTAG_INSTANCEになる");
+    UINT64 *obj = (UINT64 *)(over & ~TAG_MASK);
+    assert(obj[0] == MAGIC_BIGNUM, "word0はMAGIC_BIGNUM");
+    assert(obj[1] == 0, "非負なのでword1(sign)は0");
+    assert(obj[2] == 2, "limb countは2");
+    UINT64 *dst = (UINT64 *)obj[3];
+    assert(dst[0] == 0 && dst[1] == 0x10000000ULL, "limb配列の内容がコピーされている");
+
+    // 60bit以内に収まる値は符号があってもFIXNUMに降格される
+    UINT64 limbs_small[1] = {42};
+    lisp_val_t neg_small = os_make_integer(1, limbs_small, 1);
+    assert((neg_small & TAG_MASK) == TAG_FIXNUM, "60bit以内のbignum構築要求はFIXNUMに降格される");
+    assert(os_fixnum_is_negative(neg_small) && os_fixnum_magnitude(neg_small) == 42,
+           "降格されたFIXNUMは符号とマグニチュードを保持する");
+
+    // 値0はsign指定に関わらず常にsign=0に正規化される
+    UINT64 limbs_zero[1] = {0};
+    lisp_val_t zero = os_make_integer(1, limbs_zero, 1);
+    assert(zero == os_make_fixnum(0), "0はsign指定に関わらずos_make_fixnum(0)に正規化される");
+}
+
+void test_primitive_add_signed_and_bignum() {
+    lisp_val_t vals1[2] = {os_make_fixnum_signed(1, 5), os_make_fixnum(3)};
+    lisp_val_t r1 = primitive_add(make_arg_list_vals(2, vals1), nil);
+    assert(os_fixnum_is_negative(r1) && os_fixnum_magnitude(r1) == 2, "(+ -5 3) は-2");
+
+    lisp_val_t vals2[2] = {os_make_fixnum_signed(1, 3), os_make_fixnum_signed(1, 4)};
+    lisp_val_t r2 = primitive_add(make_arg_list_vals(2, vals2), nil);
+    assert(os_fixnum_is_negative(r2) && os_fixnum_magnitude(r2) == 7, "(+ -3 -4) は-7");
+
+    // 60bit境界+1でbignumに昇格する
+    lisp_val_t max_fixnum = os_make_fixnum(FIXNUM_MAGNITUDE_MASK);
+    lisp_val_t vals3[2] = {max_fixnum, os_make_fixnum(1)};
+    lisp_val_t r3 = primitive_add(make_arg_list_vals(2, vals3), nil);
+    assert((r3 & TAG_MASK) == TAG_INSTANCE, "60bit境界を超える加算はbignumになる");
+    UINT64 *obj3 = (UINT64 *)(r3 & ~TAG_MASK);
+    assert(obj3[0] == MAGIC_BIGNUM, "word0はMAGIC_BIGNUM");
+    UINT64 *limbs3 = (UINT64 *)obj3[3];
+    UINT64 magnitude3 = limbs3[0] | (obj3[2] > 1 ? limbs3[1] << 32 : 0);
+    assert(magnitude3 == FIXNUM_MAGNITUDE_MASK + 1, "(+ FIXNUM_MAGNITUDE_MASK 1)のマグニチュードは2^60");
+
+    // bignumから引いて60bit以内に戻れば再びFIXNUMに降格する
+    lisp_val_t vals4[2] = {r3, os_make_fixnum_signed(1, 1)};
+    lisp_val_t r4 = primitive_add(make_arg_list_vals(2, vals4), nil);
+    assert((r4 & TAG_MASK) == TAG_FIXNUM, "bignumから1減らして60bit以内に戻ればFIXNUMに降格する");
+    assert(!os_fixnum_is_negative(r4) && os_fixnum_magnitude(r4) == FIXNUM_MAGNITUDE_MASK,
+           "降格後の値はFIXNUM_MAGNITUDE_MASKと一致する");
+}
+
+void test_primitive_subtract_unary_and_signed() {
+    lisp_val_t vals1[1] = {os_make_fixnum(5)};
+    lisp_val_t r1 = primitive_subtract(make_arg_list_vals(1, vals1), nil);
+    assert(os_fixnum_is_negative(r1) && os_fixnum_magnitude(r1) == 5, "(- 5) は単項マイナスで-5");
+
+    lisp_val_t vals2[1] = {os_make_fixnum_signed(1, 5)};
+    lisp_val_t r2 = primitive_subtract(make_arg_list_vals(1, vals2), nil);
+    assert(!os_fixnum_is_negative(r2) && os_fixnum_magnitude(r2) == 5, "(- -5) は5");
+
+    lisp_val_t vals3[2] = {os_make_fixnum(3), os_make_fixnum(5)};
+    lisp_val_t r3 = primitive_subtract(make_arg_list_vals(2, vals3), nil);
+    assert(os_fixnum_is_negative(r3) && os_fixnum_magnitude(r3) == 2, "(- 3 5) は-2");
+
+    lisp_val_t vals4[3] = {os_make_fixnum(5), os_make_fixnum(3), os_make_fixnum(2)};
+    lisp_val_t r4 = primitive_subtract(make_arg_list_vals(3, vals4), nil);
+    assert(!os_fixnum_is_negative(r4) && os_fixnum_magnitude(r4) == 0, "(- 5 3 2) は0");
+}
+
+void test_primitive_multiply_signed_and_bignum() {
+    lisp_val_t vals1[2] = {os_make_fixnum_signed(1, 2), os_make_fixnum(3)};
+    lisp_val_t r1 = primitive_multiply(make_arg_list_vals(2, vals1), nil);
+    assert(os_fixnum_is_negative(r1) && os_fixnum_magnitude(r1) == 6, "(* -2 3) は-6");
+
+    lisp_val_t vals2[2] = {os_make_fixnum_signed(1, 2), os_make_fixnum_signed(1, 3)};
+    lisp_val_t r2 = primitive_multiply(make_arg_list_vals(2, vals2), nil);
+    assert(!os_fixnum_is_negative(r2) && os_fixnum_magnitude(r2) == 6, "(* -2 -3) は6");
+
+    // 2^30 * 2^31 = 2^61 > FIXNUM_MAGNITUDE_MASKなのでbignumになる
+    lisp_val_t vals3[2] = {os_make_fixnum(1ULL << 30), os_make_fixnum(1ULL << 31)};
+    lisp_val_t r3 = primitive_multiply(make_arg_list_vals(2, vals3), nil);
+    assert((r3 & TAG_MASK) == TAG_INSTANCE, "2^30*2^31は60bitを超えるのでbignumになる");
+    UINT64 *obj3 = (UINT64 *)(r3 & ~TAG_MASK);
+    assert(obj3[0] == MAGIC_BIGNUM, "word0はMAGIC_BIGNUM");
+}
+
+void test_primitive_divide_signed() {
+    lisp_val_t vals1[2] = {os_make_fixnum_signed(1, 12), os_make_fixnum(3)};
+    lisp_val_t r1 = primitive_divide(make_arg_list_vals(2, vals1), nil);
+    assert(os_fixnum_is_negative(r1) && os_fixnum_magnitude(r1) == 4, "(/ -12 3) は-4");
+
+    lisp_val_t vals2[2] = {os_make_fixnum(12), os_make_fixnum_signed(1, 3)};
+    lisp_val_t r2 = primitive_divide(make_arg_list_vals(2, vals2), nil);
+    assert(os_fixnum_is_negative(r2) && os_fixnum_magnitude(r2) == 4, "(/ 12 -3) は-4");
+
+    lisp_val_t vals3[2] = {os_make_fixnum_signed(1, 12), os_make_fixnum_signed(1, 3)};
+    lisp_val_t r3 = primitive_divide(make_arg_list_vals(2, vals3), nil);
+    assert(!os_fixnum_is_negative(r3) && os_fixnum_magnitude(r3) == 4, "(/ -12 -3) は4");
+}
+
 void test_primitive_multiply() {
     lisp_val_t r = primitive_multiply(make_arg_list(3, 2, 3, 4), nil);
     assert(r >> 3 == 24, "(* 2 3 4) は24");
@@ -233,6 +360,45 @@ void test_primitive_numberp_and_fixnump() {
     assert(primitive_numberp(make_arg_list(1, 42), nil) == g_sym_t, "(numberp 42) はT");
     assert(primitive_numberp(os_make_cons(os_make_symbol("foo"), nil), nil) == nil, "(numberp 'foo) はnil");
     assert(primitive_fixnump(make_arg_list(1, 42), nil) == g_sym_t, "(fixnump 42) はT");
+}
+
+void test_primitive_comparisons_signed_and_bignum() {
+    lisp_val_t vals1[2] = {os_make_fixnum_signed(1, 5), os_make_fixnum_signed(1, 3)};
+    assert(primitive_less_than(make_arg_list_vals(2, vals1), nil) == g_sym_t, "(< -5 -3) はT");
+
+    lisp_val_t vals2[2] = {os_make_fixnum_signed(1, 3), os_make_fixnum_signed(1, 5)};
+    assert(primitive_less_than(make_arg_list_vals(2, vals2), nil) == nil, "(< -3 -5) はnil");
+
+    lisp_val_t vals3[2] = {os_make_fixnum_signed(1, 1), os_make_fixnum(0)};
+    assert(primitive_less_than(make_arg_list_vals(2, vals3), nil) == g_sym_t, "(< -1 0) はT");
+
+    // FIXNUM境界値とbignum(2^60)との比較
+    UINT64 limbs[2] = {0, 0x10000000ULL};
+    lisp_val_t bignum_val = os_make_integer(0, limbs, 2);
+    lisp_val_t max_fixnum = os_make_fixnum(FIXNUM_MAGNITUDE_MASK);
+    lisp_val_t vals4[2] = {max_fixnum, bignum_val};
+    assert(primitive_less_than(make_arg_list_vals(2, vals4), nil) == g_sym_t,
+           "(< FIXNUM_MAGNITUDE_MASK 2^60) はT");
+    lisp_val_t vals5[2] = {bignum_val, max_fixnum};
+    assert(primitive_greater_than(make_arg_list_vals(2, vals5), nil) == g_sym_t,
+           "(> 2^60 FIXNUM_MAGNITUDE_MASK) はT");
+
+    lisp_val_t neg_bignum = os_make_integer(1, limbs, 2);
+    lisp_val_t vals6[2] = {neg_bignum, max_fixnum};
+    assert(primitive_less_than(make_arg_list_vals(2, vals6), nil) == g_sym_t,
+           "(< -2^60 FIXNUM_MAGNITUDE_MASK) はT");
+
+    lisp_val_t vals7[2] = {neg_bignum, neg_bignum};
+    assert(primitive_num_equal(make_arg_list_vals(2, vals7), nil) == g_sym_t, "(= -2^60 -2^60) はT");
+}
+
+void test_primitive_bignump() {
+    UINT64 limbs[2] = {0, 0x10000000ULL};
+    lisp_val_t bignum_val = os_make_integer(0, limbs, 2);
+    assert(primitive_bignump(os_make_cons(bignum_val, nil), nil) == g_sym_t, "(bignump 2^60) はT");
+    assert(primitive_bignump(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(bignump 1) はnil");
+    assert(primitive_fixnump(os_make_cons(bignum_val, nil), nil) == nil, "(fixnump 2^60) はnil");
+    assert(primitive_numberp(os_make_cons(bignum_val, nil), nil) == g_sym_t, "(numberp 2^60) はT");
 }
 
 void test_primitive_symbolp() {
@@ -282,6 +448,26 @@ void test_primitive_equal() {
 
     assert(primitive_equal(os_make_cons(os_make_fixnum(1), os_make_cons(os_make_symbol("a"), nil)), nil) == nil,
            "(equal 1 'a) はタグが異なるのでnil");
+}
+
+void test_primitive_eql_and_equal_bignum() {
+    UINT64 limbs_a[2] = {0, 0x10000000ULL};
+    UINT64 limbs_b[2] = {0, 0x10000000ULL};
+    lisp_val_t bignum_a = os_make_integer(0, limbs_a, 2);
+    lisp_val_t bignum_b = os_make_integer(0, limbs_b, 2);
+    assert(bignum_a != bignum_b, "別々に構築したbignumは異なるヒープオブジェクトになる");
+    assert(primitive_eql(os_make_cons(bignum_a, os_make_cons(bignum_b, nil)), nil) == g_sym_t,
+           "(eql 2^60 2^60) は内容が同じならT(異なるオブジェクトでも)");
+
+    UINT64 limbs_c[2] = {1, 0x10000000ULL};
+    lisp_val_t bignum_c = os_make_integer(0, limbs_c, 2);
+    assert(primitive_eql(os_make_cons(bignum_a, os_make_cons(bignum_c, nil)), nil) == nil,
+           "(eql 2^60 (+ 2^60 1)) はnil");
+
+    lisp_val_t list_a = os_make_cons(bignum_a, nil);
+    lisp_val_t list_b = os_make_cons(bignum_b, nil);
+    assert(primitive_equal(os_make_cons(list_a, os_make_cons(list_b, nil)), nil) == g_sym_t,
+           "(equal (list 2^60) (list 2^60)) は内容が同じならT");
 }
 
 void test_primitive_listp() {
@@ -568,16 +754,25 @@ int main(int argc, char** argv) {
    test_os_make_symbol_prefix_is_not_confused();
    test_os_get_variable();
    test_os_get_function();
+   test_os_make_fixnum_signed();
+   test_os_make_integer_promotes_to_bignum();
+   test_primitive_add_signed_and_bignum();
+   test_primitive_subtract_unary_and_signed();
+   test_primitive_multiply_signed_and_bignum();
+   test_primitive_divide_signed();
    test_primitive_multiply();
    test_primitive_divide();
    test_primitive_less_than();
    test_primitive_greater_than();
    test_primitive_num_equal();
+   test_primitive_comparisons_signed_and_bignum();
    test_primitive_numberp_and_fixnump();
+   test_primitive_bignump();
    test_primitive_symbolp();
    test_primitive_consp();
    test_primitive_eql();
    test_primitive_equal();
+   test_primitive_eql_and_equal_bignum();
    test_primitive_listp();
    test_primitive_characterp();
    test_primitive_stringp();

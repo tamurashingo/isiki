@@ -26,6 +26,40 @@ static void print_fixnum(frame_buffer *fb, UINT64 value) {
 }
 
 /**
+ * bignum(MAGIC_BIGNUM)のlimb配列を10進数で出力する。limb配列はmag_divmod_smallで
+ * 破壊的に10で割り続けるため、出力前に別バッファへコピーしておく。
+ * @param fb 出力先のframe buffer
+ * @param val 出力するbignum(TAG_INSTANCE、word0==MAGIC_BIGNUM)
+ */
+static void print_bignum(frame_buffer *fb, lisp_val_t val) {
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    UINT64 sign = obj[1];
+    UINT64 count = obj[2];
+    UINT64 *src = (UINT64 *)obj[3];
+
+    UINT64 *work = (UINT64 *)os_alloc_raw(8 * count);
+    for (UINT64 i = 0; i < count; i++) {
+        work[i] = src[i];
+    }
+
+    if (sign) {
+        fb->write_char(fb, '-');
+    }
+
+    // 1limb(基数2^32)あたり最大10進10桁(log10(2^32) < 9.63)なので10*countで十分
+    char *digits = (char *)os_alloc_raw(10 * count);
+    int len = 0;
+    while (count > 1 || work[0] != 0) {
+        UINT64 rem;
+        count = mag_divmod_small(work, count, 10, &rem);
+        digits[len++] = '0' + (char)rem;
+    }
+    while (len > 0) {
+        fb->write_char(fb, (UINT8)digits[--len]);
+    }
+}
+
+/**
  * STRINGオブジェクトのレイアウト([len(8byte)][chars...])に従ってバイト列を出力する。
  * @param fb 出力先のframe buffer
  * @param str_addr STRINGオブジェクト本体(タグを除いた先頭)のアドレス
@@ -125,7 +159,10 @@ static void print_value(frame_buffer *fb, lisp_val_t val) {
 
     switch (val & TAG_MASK) {
         case TAG_FIXNUM:
-            print_fixnum(fb, val >> 3);
+            if (os_fixnum_is_negative(val)) {
+                fb->write_char(fb, '-');
+            }
+            print_fixnum(fb, os_fixnum_magnitude(val));
             return;
         case TAG_SYMBOL:
             print_symbol(fb, val);
@@ -147,6 +184,8 @@ static void print_value(frame_buffer *fb, lisp_val_t val) {
             UINT64 magic = obj[0];
             if (magic == MAGIC_PROCESS) {
                 fb->write_string(fb, "#<PROCESS>");
+            } else if (magic == MAGIC_BIGNUM) {
+                print_bignum(fb, val);
             } else if (magic == MAGIC_STREAM) {
                 fb->write_string(fb, "#<STREAM>");
             } else if (magic == MAGIC_CLASS) {

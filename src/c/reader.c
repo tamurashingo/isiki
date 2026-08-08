@@ -233,9 +233,17 @@ static lisp_val_t read_string(reader_source_t *src) {
 }
 
 /**
- * 区切り文字までのトークンを読む。数字だけのトークンはfixnum、それ以外はsymbolとして読む。
+ * READER_TOKEN_MAX(128、符号込みなので数字部は最大127桁)のトークンを10進・2進・8進・
+ * 16進のいずれで解釈しても表現しきれるのに十分なlimb数。最も桁効率の良い16進でも
+ * 127桁 = 508bit < 16*32bit = 512bitに収まる(10進なら127桁 < 422bitでさらに余裕がある)。
+ */
+#define READER_INT_LIMBS 16
+
+/**
+ * 区切り文字までのトークンを読む。数字だけ(先頭の'+'/'-'による符号も可)のトークンは整数
+ * (FIXNUMまたはbignum)、それ以外はsymbolとして読む('+'/'-'単体はsymbolのまま残る)。
  * @param src 読み取り対象の文字ソース
- * @return 読み取ったFIXNUMまたはSYMBOL
+ * @return 読み取った整数(FIXNUMまたはbignum)またはSYMBOL
  */
 static lisp_val_t read_atom(reader_source_t *src) {
     char token[READER_TOKEN_MAX];
@@ -249,8 +257,11 @@ static lisp_val_t read_atom(reader_source_t *src) {
     }
     token[len] = '\0';
 
-    int all_digits = (len > 0);
-    for (UINT32 i = 0; i < len; i++) {
+    int negative = (len > 0 && token[0] == '-');
+    int has_sign = negative || (len > 0 && token[0] == '+');
+    UINT32 digit_start = has_sign ? 1 : 0;
+    int all_digits = (len > digit_start);
+    for (UINT32 i = digit_start; i < len; i++) {
         if (!is_digit(token[i])) {
             all_digits = 0;
             break;
@@ -258,14 +269,81 @@ static lisp_val_t read_atom(reader_source_t *src) {
     }
 
     if (all_digits) {
-        UINT64 value = 0;
-        for (UINT32 i = 0; i < len; i++) {
-            value = value * 10 + (UINT64)(token[i] - '0');
+        // 桁を読みながらlimb配列に逐次累積する(60bit以内に収まる値はos_make_integerが
+        // 自動的にFIXNUMへ降格するため、追加のヒープ確保は発生しない)
+        UINT64 limbs[READER_INT_LIMBS];
+        UINT64 count = 1;
+        limbs[0] = 0;
+        for (UINT32 i = digit_start; i < len; i++) {
+            count = mag_mul_small_add_small(limbs, count, 10, (UINT64)(token[i] - '0'));
         }
-        return os_make_fixnum(value);
+        return os_make_integer(negative, limbs, count);
     }
 
     return os_make_symbol(token);
+}
+
+/**
+ * cをradix進数の数字として解釈した値(0〜radix-1)を返す。0〜9はそのまま、
+ * A〜F/a〜fは10〜15として扱う。radixで表現できない数字(例: radix=2に対する'2')や
+ * 数字以外の文字が来た場合は-1を返す。
+ * @param c 判定する文字
+ * @param radix 基数(2/8/16)
+ * @return 0〜radix-1の数字の値。無効な文字なら-1
+ */
+static int digit_value_in_radix(char c, UINT64 radix) {
+    int v;
+    if (c >= '0' && c <= '9') {
+        v = c - '0';
+    } else if (c >= 'A' && c <= 'F') {
+        v = 10 + (c - 'A');
+    } else if (c >= 'a' && c <= 'f') {
+        v = 10 + (c - 'a');
+    } else {
+        return -1;
+    }
+    return (v < (int)radix) ? v : -1;
+}
+
+/**
+ * "#b"/"#o"/"#x"(呼び出し元で"#"とradix文字を消費済み)の残りの符号+数字列を読み、
+ * radix進数の整数(FIXNUMまたはbignum)として組み立てる。符号のみ・数字なし・
+ * radixで表現できない数字を含む場合はg_sym_read_errorを返す。
+ * @param src 読み取り対象の文字ソース
+ * @param radix 基数(2/8/16)
+ * @return 読み取った整数(FIXNUMまたはbignum)。構文エラーの場合はg_sym_read_error
+ */
+static lisp_val_t read_radix_integer(reader_source_t *src, UINT64 radix) {
+    char token[READER_TOKEN_MAX];
+    UINT32 len = 0;
+
+    while (has_more(src) && !is_delimiter(peek(src))) {
+        char c = advance(src);
+        if (len < READER_TOKEN_MAX - 1) {
+            token[len++] = c;
+        }
+    }
+    token[len] = '\0';
+
+    int negative = (len > 0 && token[0] == '-');
+    int has_sign = negative || (len > 0 && token[0] == '+');
+    UINT32 digit_start = has_sign ? 1 : 0;
+
+    if (len <= digit_start) {
+        return g_sym_read_error; // 符号のみ、または数字が1つも無い
+    }
+
+    UINT64 limbs[READER_INT_LIMBS];
+    UINT64 count = 1;
+    limbs[0] = 0;
+    for (UINT32 i = digit_start; i < len; i++) {
+        int v = digit_value_in_radix(token[i], radix);
+        if (v < 0) {
+            return g_sym_read_error;
+        }
+        count = mag_mul_small_add_small(limbs, count, radix, (UINT64)v);
+    }
+    return os_make_integer(negative, limbs, count);
 }
 
 /** 文字名(SPACE/NEWLINE/TAB)の最大長。この長さを超える名前は既知の名前と一致しない */
@@ -413,6 +491,18 @@ static lisp_val_t read_expr(reader_source_t *src) {
         if (c2 == '\\') {
             advance(src);
             return read_char_literal(src);
+        }
+        if (c2 == 'b' || c2 == 'B') {
+            advance(src);
+            return read_radix_integer(src, 2);
+        }
+        if (c2 == 'o' || c2 == 'O') {
+            advance(src);
+            return read_radix_integer(src, 8);
+        }
+        if (c2 == 'x' || c2 == 'X') {
+            advance(src);
+            return read_radix_integer(src, 16);
         }
         return g_sym_read_error;
     }

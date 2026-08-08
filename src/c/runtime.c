@@ -25,9 +25,11 @@
  *
  * ---- タグ別メモリ配置 ----
  *
- * TAG_FIXNUM: 即値、ヒープなし
- *  [ val(61bit) ...................................... ][0 0 0]
- *    61bitで表現できる即値を埋め込む
+ * TAG_FIXNUM: 即値、ヒープなし(符号付き、60bitマグニチュード+1bit符号)
+ *  [s][ magnitude(60bit) .............................. ][0 0 0]
+ *    最上位bit(bit63)が符号(1:負、0は0を含む非負に正規化)、残り60bitがマグニチュード。
+ *    表現範囲は-(2^60-1)〜2^60-1。マグニチュードが60bitを超える場合はMAGIC_BIGNUM
+ *    (TAG_INSTANCE)に昇格する。
  *
  * TAG_CONS: アドレス、ヒープ16byte
  *  [ car-addr(61bit) ................................. ][0 0 1]
@@ -370,6 +372,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("="), os_make_native_function((lisp_addr_t)(void *)primitive_num_equal), global_environment);
         os_set_function(os_make_symbol("NUMBERP"), os_make_native_function((lisp_addr_t)(void *)primitive_numberp), global_environment);
         os_set_function(os_make_symbol("FIXNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnump), global_environment);
+        os_set_function(os_make_symbol("BIGNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_bignump), global_environment);
         os_set_function(os_make_symbol("SYMBOLP"), os_make_native_function((lisp_addr_t)(void *)primitive_symbolp), global_environment);
         os_set_function(os_make_symbol("CONSP"), os_make_native_function((lisp_addr_t)(void *)primitive_consp), global_environment);
         os_set_function(os_make_symbol("EQL"), os_make_native_function((lisp_addr_t)(void *)primitive_eql), global_environment);
@@ -530,13 +533,44 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env) {
 }
 
 /**
- * fixnumオブジェクトを作る(即値、ヒープ確保なし)。
- * @param fixnum 表現する値
+ * 非負のfixnumオブジェクトを作る(即値、ヒープ確保なし、符号は常に0)。
+ * @param fixnum 表現する値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
 lisp_val_t os_make_fixnum(const UINT64 fixnum) {
-    // TODO: 61bitで表現しきれない数の場合はbignumにする
     return (lisp_val_t)(fixnum << 3);
+}
+
+/**
+ * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。
+ * @param negative 0以外を渡すと負数として作る
+ * @param magnitude 絶対値(0〜2^60-1)
+ * @return タグ付けされたFIXNUM
+ */
+lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
+    lisp_val_t val = (lisp_val_t)(magnitude << 3);
+    if (negative && magnitude != 0) {
+        val |= FIXNUM_SIGN_BIT;
+    }
+    return val;
+}
+
+/**
+ * FIXNUMのマグニチュード(絶対値)を取り出す。
+ * @param val タグ付けされたFIXNUM
+ * @return 0〜2^60-1のマグニチュード
+ */
+UINT64 os_fixnum_magnitude(lisp_val_t val) {
+    return (val >> 3) & FIXNUM_MAGNITUDE_MASK;
+}
+
+/**
+ * FIXNUMが負数かどうかを判定する。
+ * @param val タグ付けされたFIXNUM
+ * @return 負数なら0以外、そうでなければ0
+ */
+int os_fixnum_is_negative(lisp_val_t val) {
+    return (val & FIXNUM_SIGN_BIT) != 0;
 }
 
 
@@ -822,6 +856,284 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
 
 
 
+/*
+ * ---- 符号なしマグニチュード(limb配列、基数2^32)の下位ヘルパー ----
+ *
+ * 各limbはUINT64配列の下位32bitのみを使用する。limbs[0]が最下位(リトルエンディアン)。
+ * 正しさ・実装の単純さを速度より優先した素朴な実装(乗算はO(n*m)、除算は1bitずつの
+ * シフト&サブトラクトによる長除算)。
+ */
+
+/**
+ * limbsの末尾(上位側)の0limbを無視した実効長を返す(最低1)。
+ * @param limbs limb配列
+ * @param count limbsの要素数
+ * @return 実効長
+ */
+static UINT64 mag_len(const UINT64 *limbs, UINT64 count) {
+    while (count > 1 && limbs[count - 1] == 0) {
+        count--;
+    }
+    return count;
+}
+
+/**
+ * aとbの大小を比較する(末尾の0limbは無視する)。
+ * @return a<bなら負、a==bなら0、a>bなら正
+ */
+static int mag_compare(const UINT64 *a, UINT64 alen, const UINT64 *b, UINT64 blen) {
+    alen = mag_len(a, alen);
+    blen = mag_len(b, blen);
+    if (alen != blen) {
+        return alen < blen ? -1 : 1;
+    }
+    for (UINT64 i = alen; i > 0; i--) {
+        if (a[i - 1] != b[i - 1]) {
+            return a[i - 1] < b[i - 1] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * out = a + b (符号なし)。outはmax(alen,blen)+1以上の容量を持つこと。
+ * @return outの実効長
+ */
+static UINT64 mag_add(const UINT64 *a, UINT64 alen, const UINT64 *b, UINT64 blen, UINT64 *out) {
+    UINT64 n = alen > blen ? alen : blen;
+    UINT64 carry = 0;
+    for (UINT64 i = 0; i < n; i++) {
+        UINT64 av = i < alen ? a[i] : 0;
+        UINT64 bv = i < blen ? b[i] : 0;
+        UINT64 sum = av + bv + carry;
+        out[i] = sum & 0xFFFFFFFFULL;
+        carry = sum >> 32;
+    }
+    out[n] = carry;
+    return mag_len(out, n + 1);
+}
+
+/**
+ * out = a - b (符号なし、a>=b前提)。outはalen以上の容量を持つこと。
+ * @return outの実効長
+ */
+static UINT64 mag_sub(const UINT64 *a, UINT64 alen, const UINT64 *b, UINT64 blen, UINT64 *out) {
+    UINT64 borrow = 0;
+    for (UINT64 i = 0; i < alen; i++) {
+        UINT64 av = a[i];
+        UINT64 bv = i < blen ? b[i] : 0;
+        UINT64 diff = av - bv - borrow;
+        out[i] = diff & 0xFFFFFFFFULL;
+        borrow = (av < bv + borrow) ? 1 : 0;
+    }
+    return mag_len(out, alen);
+}
+
+/**
+ * out = a * b (符号なし、素朴なO(n*m)乗算)。outはalen+blen以上の容量を持つこと。
+ * @return outの実効長
+ */
+static UINT64 mag_mul(const UINT64 *a, UINT64 alen, const UINT64 *b, UINT64 blen, UINT64 *out) {
+    UINT64 n = alen + blen;
+    for (UINT64 i = 0; i < n; i++) {
+        out[i] = 0;
+    }
+    for (UINT64 i = 0; i < alen; i++) {
+        UINT64 carry = 0;
+        for (UINT64 j = 0; j < blen; j++) {
+            UINT64 prod = a[i] * b[j] + out[i + j] + carry;
+            out[i + j] = prod & 0xFFFFFFFFULL;
+            carry = prod >> 32;
+        }
+        out[i + blen] += carry;
+    }
+    return mag_len(out, n);
+}
+
+/**
+ * aをbで割った商をquot、余りをremに格納する(符号なし、1bitずつのシフト&サブトラクトによる
+ * 素朴な長除算)。bは0でないこと。quot/remはいずれもalen以上の容量を持つこと。
+ * @param quot_len 商の実効長の格納先
+ * @param rem_len 余りの実効長の格納先
+ */
+static void mag_divmod(const UINT64 *a, UINT64 alen, const UINT64 *b, UINT64 blen,
+                        UINT64 *quot, UINT64 *quot_len, UINT64 *rem, UINT64 *rem_len) {
+    alen = mag_len(a, alen);
+    blen = mag_len(b, blen);
+    UINT64 total_bits = alen * 32;
+
+    for (UINT64 i = 0; i < alen; i++) {
+        quot[i] = 0;
+        rem[i] = 0;
+    }
+
+    for (UINT64 bit = total_bits; bit > 0; bit--) {
+        UINT64 idx = bit - 1;
+
+        // rem = rem << 1 (limb間の桁上がりを伝播する)
+        UINT64 carry = 0;
+        for (UINT64 i = 0; i < alen; i++) {
+            UINT64 v = (rem[i] << 1) | carry;
+            carry = (rem[i] >> 31) & 1;
+            rem[i] = v & 0xFFFFFFFFULL;
+        }
+        // remの最下位bitに、aのidxビット目を立てる
+        rem[0] |= (a[idx / 32] >> (idx % 32)) & 1;
+
+        UINT64 rlen = mag_len(rem, alen);
+        if (mag_compare(rem, rlen, b, blen) >= 0) {
+            mag_sub(rem, rlen, b, blen, rem);
+            quot[idx / 32] |= (1ULL << (idx % 32));
+        }
+    }
+
+    *quot_len = mag_len(quot, alen);
+    *rem_len = mag_len(rem, alen);
+}
+
+/**
+ * limbs(count個)を「limbs*mul + add」に置き換える(mul/addは小さい正数を想定、桁上がり分は
+ * limbs[count]以降に書き込む。呼び出し側はその分の容量を確保しておくこと)。
+ * リーダの10進リテラル桁蓄積で使う。
+ * @return 更新後の実効長
+ */
+UINT64 mag_mul_small_add_small(UINT64 *limbs, UINT64 count, UINT64 mul, UINT64 add) {
+    UINT64 carry = add;
+    UINT64 i;
+    for (i = 0; i < count; i++) {
+        UINT64 prod = limbs[i] * mul + carry;
+        limbs[i] = prod & 0xFFFFFFFFULL;
+        carry = prod >> 32;
+    }
+    while (carry != 0) {
+        limbs[i] = carry & 0xFFFFFFFFULL;
+        carry >>= 32;
+        i++;
+    }
+    return mag_len(limbs, i > count ? i : count);
+}
+
+/**
+ * limbs(count個)をdiv(小さい正数)で割った商をlimbsに書き戻し、余りを*remに格納する。
+ * プリンタの10進変換(10で割ったあまりを繰り返し取り出す)で使う。
+ * @return 商の実効長(mag_len適用後)
+ */
+UINT64 mag_divmod_small(UINT64 *limbs, UINT64 count, UINT64 div, UINT64 *rem) {
+    UINT64 r = 0;
+    for (UINT64 i = count; i > 0; i--) {
+        UINT64 cur = (r << 32) | limbs[i - 1];
+        limbs[i - 1] = cur / div;
+        r = cur % div;
+    }
+    *rem = r;
+    return mag_len(limbs, count);
+}
+
+/** FIXNUM/bignumを同じ形で扱うための符号付きマグニチュードのビュー */
+typedef struct {
+    int sign;
+    UINT64 *limbs;
+    UINT64 count;
+    UINT64 fixnum_buf[2]; /* FIXNUM(60bit、最大2limb)を展開する場合の受け皿 */
+} signed_mag_t;
+
+/**
+ * FIXNUMまたはMAGIC_BIGNUMのINSTANCEを符号付きマグニチュードのビューに分解する。
+ * bignumのlimb配列はコピーせずオブジェクト自身の配列を直接指す。
+ */
+static void decompose(lisp_val_t v, signed_mag_t *out) {
+    if ((v & TAG_MASK) == TAG_FIXNUM) {
+        UINT64 magnitude = os_fixnum_magnitude(v);
+        out->sign = os_fixnum_is_negative(v);
+        out->fixnum_buf[0] = magnitude & 0xFFFFFFFFULL;
+        out->fixnum_buf[1] = magnitude >> 32;
+        out->limbs = out->fixnum_buf;
+        out->count = mag_len(out->fixnum_buf, 2);
+    } else {
+        UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+        out->sign = (int)obj[1];
+        out->limbs = (UINT64 *)obj[3];
+        out->count = obj[2];
+    }
+}
+
+/**
+ * 符号付きマグニチュード(limbs, count)から整数オブジェクトを作る。
+ * 正規化後マグニチュードが60bit以内に収まる場合はFIXNUM(即値)に降格し、
+ * それ以外はlimb配列をコピーしてヒープに確保しMAGIC_BIGNUMのINSTANCEを返す。
+ */
+lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
+    count = mag_len(limbs, count);
+    if (count == 1 && limbs[0] == 0) {
+        sign = 0;
+    }
+
+    if (count <= 2) {
+        UINT64 magnitude = limbs[0];
+        if (count == 2) {
+            magnitude |= limbs[1] << 32;
+        }
+        if (magnitude <= FIXNUM_MAGNITUDE_MASK) {
+            return os_make_fixnum_signed(sign, magnitude);
+        }
+    }
+
+    lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
+    UINT64 *dst = (UINT64 *)limb_addr;
+    for (UINT64 i = 0; i < count; i++) {
+        dst[i] = limbs[i];
+    }
+    return os_make_instance(MAGIC_BIGNUM, (UINT64)sign, count, (UINT64)limb_addr);
+}
+
+/**
+ * 2つのMAGIC_BIGNUMオブジェクトのsign+limb内容を比較する(構造上の同値性の判定に使う)。
+ * @return 同値なら0以外、そうでなければ0
+ */
+static int bignum_equal(const UINT64 *obj_a, const UINT64 *obj_b) {
+    if (obj_a[1] != obj_b[1] || obj_a[2] != obj_b[2]) {
+        return 0;
+    }
+    const UINT64 *limbs_a = (const UINT64 *)obj_a[3];
+    const UINT64 *limbs_b = (const UINT64 *)obj_b[3];
+    for (UINT64 i = 0; i < obj_a[2]; i++) {
+        if (limbs_a[i] != limbs_b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/**
+ * 2つの整数(FIXNUM/bignum)の大小を比較する。両方FIXNUMの場合はヒープ確保なしの
+ * 高速パスを使う。
+ * @return a<bなら負、a==bなら0、a>bなら正
+ */
+static int number_compare(lisp_val_t a, lisp_val_t b) {
+    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM) {
+        int neg_a = os_fixnum_is_negative(a);
+        int neg_b = os_fixnum_is_negative(b);
+        if (neg_a != neg_b) {
+            return neg_a ? -1 : 1;
+        }
+        UINT64 mag_a = os_fixnum_magnitude(a);
+        UINT64 mag_b = os_fixnum_magnitude(b);
+        int cmp = mag_a < mag_b ? -1 : (mag_a > mag_b ? 1 : 0);
+        return neg_a ? -cmp : cmp;
+    }
+
+    signed_mag_t ma, mb;
+    decompose(a, &ma);
+    decompose(b, &mb);
+    if (ma.sign != mb.sign) {
+        return ma.sign ? -1 : 1;
+    }
+    int cmp = mag_compare(ma.limbs, ma.count, mb.limbs, mb.count);
+    return ma.sign ? -cmp : cmp;
+}
+
+
+
 /**
  * 組み込み関数CAR。argsの第一引数のcarを返す。
  * @param args 評価済みの引数リスト
@@ -845,32 +1157,137 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数+。argsの全fixnumを合計する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数+。argsの全整数(FIXNUM/bignum、負数も可)を合計する。
+ * 全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの高速パスを使い、
+ * それ以外(負数・bignumが絡む、桁あふれの恐れがある)は符号付きマグニチュードによる
+ * 一般パスにフォールバックする。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 合計値のFIXNUM
+ * @return 合計値の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
+    int fast = 1;
     UINT64 sum = 0;
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        sum += cc_car(cur) >> 3;
+        lisp_val_t v = cc_car(cur);
+        if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+            fast = 0;
+            break;
+        }
+        sum += os_fixnum_magnitude(v);
+        if (sum > FIXNUM_MAGNITUDE_MASK) {
+            fast = 0;
+            break;
+        }
     }
-    return os_make_fixnum(sum);
+    if (fast) {
+        return os_make_fixnum(sum);
+    }
+
+    signed_mag_t acc;
+    UINT64 acc_zero[1] = {0};
+    acc.sign = 0;
+    acc.limbs = acc_zero;
+    acc.count = 1;
+
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        signed_mag_t operand;
+        decompose(cc_car(cur), &operand);
+
+        UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
+        UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 result_len;
+        int result_sign;
+
+        if (acc.sign == operand.sign) {
+            result_len = mag_add(acc.limbs, acc.count, operand.limbs, operand.count, result);
+            result_sign = acc.sign;
+        } else if (mag_compare(acc.limbs, acc.count, operand.limbs, operand.count) >= 0) {
+            result_len = mag_sub(acc.limbs, acc.count, operand.limbs, operand.count, result);
+            result_sign = acc.sign;
+        } else {
+            result_len = mag_sub(operand.limbs, operand.count, acc.limbs, acc.count, result);
+            result_sign = operand.sign;
+        }
+
+        acc.sign = result_sign;
+        acc.limbs = result;
+        acc.count = result_len;
+    }
+
+    return os_make_integer(acc.sign, acc.limbs, acc.count);
 }
 
 /**
- * 組み込み関数-。argsの第一引数から残りを順に減算する(単項の符号反転は未サポート)。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として
+ * 符号を反転する。全オペランドが非負FIXNUMかつ結果が負にならない場合はヒープ確保なしの
+ * 高速パスを使い、それ以外は符号付きマグニチュードによる一般パスにフォールバックする。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 減算結果のFIXNUM
+ * @return 減算結果の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
-    // fixnumは符号無しの表現しか持たないため、単項の符号反転はサポートしない
-    UINT64 result = cc_car(args) >> 3;
-    for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
-        result -= cc_car(rest) >> 3;
+    lisp_val_t first = cc_car(args);
+
+    if (cc_cdr(args) == nil) {
+        // 単項マイナス: 0 - x
+        if ((first & TAG_MASK) == TAG_FIXNUM) {
+            return os_make_fixnum_signed(!os_fixnum_is_negative(first), os_fixnum_magnitude(first));
+        }
+        signed_mag_t operand;
+        decompose(first, &operand);
+        return os_make_integer(!operand.sign, operand.limbs, operand.count);
     }
-    return os_make_fixnum(result);
+
+    int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
+    UINT64 result = fast ? os_fixnum_magnitude(first) : 0;
+    if (fast) {
+        for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+            lisp_val_t v = cc_car(rest);
+            if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+                fast = 0;
+                break;
+            }
+            UINT64 mag = os_fixnum_magnitude(v);
+            if (mag > result) {
+                fast = 0;
+                break;
+            }
+            result -= mag;
+        }
+    }
+    if (fast) {
+        return os_make_fixnum(result);
+    }
+
+    signed_mag_t acc;
+    decompose(first, &acc);
+    for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+        signed_mag_t operand;
+        decompose(cc_car(rest), &operand);
+
+        UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
+        UINT64 *result_buf = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 result_len;
+        int result_sign;
+
+        if (acc.sign != operand.sign) {
+            result_len = mag_add(acc.limbs, acc.count, operand.limbs, operand.count, result_buf);
+            result_sign = acc.sign;
+        } else if (mag_compare(acc.limbs, acc.count, operand.limbs, operand.count) >= 0) {
+            result_len = mag_sub(acc.limbs, acc.count, operand.limbs, operand.count, result_buf);
+            result_sign = acc.sign;
+        } else {
+            result_len = mag_sub(operand.limbs, operand.count, acc.limbs, acc.count, result_buf);
+            result_sign = !acc.sign;
+        }
+
+        acc.sign = result_sign;
+        acc.limbs = result_buf;
+        acc.count = result_len;
+    }
+
+    return os_make_integer(acc.sign, acc.limbs, acc.count);
 }
 
 /**
@@ -908,48 +1325,119 @@ lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数*。argsの全fixnumを乗算する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数*。argsの全整数(FIXNUM/bignum、負数も可)を乗算する。
+ * 全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの高速パスを使い、
+ * それ以外は符号付きマグニチュードによる一般パス(素朴なO(n*m)乗算)にフォールバックする。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 積のFIXNUM
+ * @return 積の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
+    int fast = 1;
     UINT64 product = 1;
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        product *= cc_car(cur) >> 3;
+        lisp_val_t v = cc_car(cur);
+        if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+            fast = 0;
+            break;
+        }
+        UINT64 mag = os_fixnum_magnitude(v);
+        if (mag != 0 && product > FIXNUM_MAGNITUDE_MASK / mag) {
+            fast = 0;
+            break;
+        }
+        product *= mag;
     }
-    return os_make_fixnum(product);
+    if (fast) {
+        return os_make_fixnum(product);
+    }
+
+    signed_mag_t acc;
+    UINT64 acc_one[1] = {1};
+    acc.sign = 0;
+    acc.limbs = acc_one;
+    acc.count = 1;
+
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        signed_mag_t operand;
+        decompose(cc_car(cur), &operand);
+
+        UINT64 cap = acc.count + operand.count;
+        UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 result_len = mag_mul(acc.limbs, acc.count, operand.limbs, operand.count, result);
+
+        acc.sign = (acc.sign != operand.sign);
+        acc.limbs = result;
+        acc.count = result_len;
+    }
+
+    return os_make_integer(acc.sign, acc.limbs, acc.count);
 }
 
 /**
- * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算)。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
+ * 全オペランドが非負FIXNUMの場合はヒープ確保なしの高速パスを使い、それ以外(負数・bignumが
+ * 絡む)は符号付きマグニチュードによる一般パス(1bitずつのシフト&サブトラクトによる
+ * 長除算)にフォールバックする。商の符号は絶対値の商にオペランドの符号のXORを付与して決める。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果のFIXNUM。0除算の場合はg_sym_eval_error
+ * @return 除算結果の整数。0除算の場合はg_sym_eval_error
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
-    UINT64 result = cc_car(args) >> 3;
+    lisp_val_t first = cc_car(args);
+
+    int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
+    UINT64 result = fast ? os_fixnum_magnitude(first) : 0;
+    if (fast) {
+        for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+            lisp_val_t v = cc_car(rest);
+            if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+                fast = 0;
+                break;
+            }
+            UINT64 divisor = os_fixnum_magnitude(v);
+            if (divisor == 0) {
+                return g_sym_eval_error;
+            }
+            result /= divisor;
+        }
+    }
+    if (fast) {
+        return os_make_fixnum(result);
+    }
+
+    signed_mag_t acc;
+    decompose(first, &acc);
     for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
-        UINT64 divisor = cc_car(rest) >> 3;
-        if (divisor == 0) {
+        signed_mag_t operand;
+        decompose(cc_car(rest), &operand);
+
+        if (operand.count == 1 && operand.limbs[0] == 0) {
             return g_sym_eval_error;
         }
-        result /= divisor;
+
+        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        UINT64 quot_len, rem_len;
+        mag_divmod(acc.limbs, acc.count, operand.limbs, operand.count, quot_buf, &quot_len, rem_buf, &rem_len);
+
+        acc.sign = (acc.sign != operand.sign);
+        acc.limbs = quot_buf;
+        acc.count = quot_len;
     }
-    return os_make_fixnum(result);
+
+    return os_make_integer(acc.sign, acc.limbs, acc.count);
 }
 
 /**
  * 組み込み関数<。argsが単調増加(a<b<c<...)かどうかを判定する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 単調増加ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        UINT64 a = cc_car(rest) >> 3;
-        UINT64 b = cc_car(cc_cdr(rest)) >> 3;
-        if (!(a < b)) {
+        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
             return nil;
         }
     }
@@ -958,15 +1446,13 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
 
 /**
  * 組み込み関数>。argsが単調減少(a>b>c>...)かどうかを判定する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 単調減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        UINT64 a = cc_car(rest) >> 3;
-        UINT64 b = cc_car(cc_cdr(rest)) >> 3;
-        if (!(a > b)) {
+        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
             return nil;
         }
     }
@@ -975,15 +1461,13 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
 
 /**
  * 組み込み関数=。argsがすべて等しいかどうかを判定する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return すべて等しいならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        UINT64 a = cc_car(rest) >> 3;
-        UINT64 b = cc_car(cc_cdr(rest)) >> 3;
-        if (a != b) {
+        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
             return nil;
         }
     }
@@ -991,14 +1475,20 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数NUMBERP。第一引数が数値(現状はFIXNUMのみ)かどうかを判定する。
+ * 組み込み関数NUMBERP。第一引数が数値(FIXNUMまたはbignum)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 数値ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
     lisp_val_t val = cc_car(args);
-    return (val & TAG_MASK) == TAG_FIXNUM ? g_sym_t : nil;
+    if ((val & TAG_MASK) == TAG_FIXNUM) {
+        return g_sym_t;
+    }
+    if ((val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_BIGNUM) {
+        return g_sym_t;
+    }
+    return nil;
 }
 
 /**
@@ -1010,6 +1500,20 @@ lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env) {
     lisp_val_t val = cc_car(args);
     return (val & TAG_MASK) == TAG_FIXNUM ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数BIGNUMP。第一引数が60bitを超える整数(bignum、MAGIC_BIGNUMのINSTANCE)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return bignumならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_BIGNUM) {
+        return g_sym_t;
+    }
+    return nil;
 }
 
 /**
@@ -1046,7 +1550,9 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
 /**
  * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。
  * 仕様上eqとの違いは数値・文字の値比較だが、本実装のfixnum/charは即値表現のため
- * 現状ではeqと完全に同じ判定になる(floatが未実装のため差が生じない)。
+ * eqのポインタ比較のままで正しく判定できる。ただしbignumは同じ値でも異なるヒープ
+ * オブジェクトになりうるため、両者がMAGIC_BIGNUMの場合はsign+limb内容を比較する
+ * (floatは未実装のため、それ以外はeqと同じ判定になる)。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 同一ならg_sym_t、そうでなければnil
@@ -1054,7 +1560,17 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_eql(lisp_val_t args, lisp_val_t env) {
     lisp_val_t a = cc_car(args);
     lisp_val_t b = cc_car(cc_cdr(args));
-    return a == b ? g_sym_t : nil;
+    if (a == b) {
+        return g_sym_t;
+    }
+    if ((a & TAG_MASK) == TAG_INSTANCE && (b & TAG_MASK) == TAG_INSTANCE) {
+        UINT64 *obj_a = (UINT64 *)(a & ~TAG_MASK);
+        UINT64 *obj_b = (UINT64 *)(b & ~TAG_MASK);
+        if (obj_a[0] == MAGIC_BIGNUM && obj_b[0] == MAGIC_BIGNUM && bignum_equal(obj_a, obj_b)) {
+            return g_sym_t;
+        }
+    }
+    return nil;
 }
 
 /**
@@ -1125,6 +1641,15 @@ static int values_equal(lisp_val_t a, lisp_val_t b) {
             return 1;
         }
 
+        case TAG_INSTANCE: {
+            UINT64 *obj_a = (UINT64 *)(a & ~TAG_MASK);
+            UINT64 *obj_b = (UINT64 *)(b & ~TAG_MASK);
+            if (obj_a[0] == MAGIC_BIGNUM && obj_b[0] == MAGIC_BIGNUM) {
+                return bignum_equal(obj_a, obj_b);
+            }
+            return 0;
+        }
+
         default:
             return 0;
     }
@@ -1132,6 +1657,8 @@ static int values_equal(lisp_val_t a, lisp_val_t b) {
 
 /**
  * 組み込み関数EQUAL。第一引数と第二引数の構造的な同値性を判定する。
+ * CONS/STRING/VECTORは再帰的に内容を比較し、両者がbignum(MAGIC_BIGNUM)ならsign+limb内容を
+ * 比較し、それ以外はeqと同じ判定にフォールバックする。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 構造的に同値ならg_sym_t、そうでなければnil

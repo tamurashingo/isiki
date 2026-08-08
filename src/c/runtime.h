@@ -20,6 +20,11 @@
 /** 多次元配列(general array)へのアドレス(110) */
 #define TAG_VECTOR   0x6ULL
 
+/** TAG_FIXNUMの値フィールド最上位bit(bit63)。1なら負数を表す(0は常に非負に正規化) */
+#define FIXNUM_SIGN_BIT       0x8000000000000000ULL
+/** TAG_FIXNUMの値フィールドのうちマグニチュードに使う60bit(bit3〜62)分のマスク */
+#define FIXNUM_MAGNITUDE_MASK ((1ULL << 60) - 1)
+
 
 /** TAG_INSTANCEのword0に入る、ネイティブ(C)関数であることを示すMAGIC NUMBER */
 #define MAGIC_FUNCTION_NATIVE      0x1ULL
@@ -41,6 +46,8 @@
 #define MAGIC_CATCH_EXIT           0x9ULL
 /** TAG_INSTANCEのword0に入る、tagbody/goの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(未評価のsymbol) */
 #define MAGIC_GO_EXIT              0xAULL
+/** TAG_INSTANCEのword0に入る、60bitを超える整数(bignum)であることを示すMAGIC NUMBER。word1=sign(0:非負/1:負)、word2=limb数、word3=limb配列(基数2^32、下位32bitのみ使用、limbs[0]が最下位)への生ポインタ */
+#define MAGIC_BIGNUM               0xBULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -144,11 +151,63 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size);
 void os_bootstrap();
 
 /**
- * fixnumオブジェクトを作る(即値、ヒープ確保なし)。
- * @param fixnum 表現する値
+ * 非負のfixnumオブジェクトを作る(即値、ヒープ確保なし、符号は常に0)。
+ * fixnumは0〜2^60-1(60bit)まで表現できる。既存呼び出し側は非負値しか渡さないため
+ * このAPIのまま残す。符号付きの値を作る場合はos_make_fixnum_signedを使う。
+ * @param fixnum 表現する値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
 lisp_val_t os_make_fixnum(const UINT64 fixnum);
+
+/**
+ * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。
+ * magnitudeが0の場合はnegativeの値に関わらず符号は0に正規化される(-0は存在しない)。
+ * @param negative 0以外を渡すと負数として作る
+ * @param magnitude 絶対値(0〜2^60-1)
+ * @return タグ付けされたFIXNUM
+ */
+lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude);
+
+/**
+ * FIXNUMのマグニチュード(絶対値)を取り出す。
+ * @param val タグ付けされたFIXNUM
+ * @return 0〜2^60-1のマグニチュード
+ */
+UINT64 os_fixnum_magnitude(lisp_val_t val);
+
+/**
+ * FIXNUMが負数かどうかを判定する。
+ * @param val タグ付けされたFIXNUM
+ * @return 負数なら0以外、そうでなければ0
+ */
+int os_fixnum_is_negative(lisp_val_t val);
+
+/**
+ * 符号付きマグニチュード(limb配列、基数2^32、limbs[0]が最下位)から整数オブジェクトを作る。
+ * 正規化した結果マグニチュードが60bit(FIXNUM_MAGNITUDE_MASK)以内に収まる場合は
+ * os_make_fixnum_signedで即値化し(ヒープ確保なし)、それ以外はlimb配列をコピーして
+ * ヒープに確保しMAGIC_BIGNUMのTAG_INSTANCEとして返す。
+ * @param sign 0以外なら負数として作る(マグニチュードが0の場合は無視され非負になる)
+ * @param limbs マグニチュードのlimb配列(呼び出し後は内容を保持しなくてよい、コピーされる)
+ * @param count limbsの要素数(先頭の0limbが含まれていても構わない)
+ * @return タグ付けされたFIXNUMまたはMAGIC_BIGNUMのINSTANCE
+ */
+lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count);
+
+/**
+ * limbs(count個、基数2^32、limbs[0]が最下位)を「limbs*mul + add」に置き換える
+ * (mul/addは小さい正数を想定)。桁上がり分はlimbs[count]以降に書き込むため、
+ * 呼び出し側はその分の容量を確保しておくこと。リーダの10進リテラル桁蓄積で使う。
+ * @return 更新後の実効長
+ */
+UINT64 mag_mul_small_add_small(UINT64 *limbs, UINT64 count, UINT64 mul, UINT64 add);
+
+/**
+ * limbs(count個、基数2^32、limbs[0]が最下位)をdiv(小さい正数)で割った商をlimbsに
+ * 書き戻し、余りを*remに格納する。プリンタの10進変換で使う。
+ * @return 商の実効長
+ */
+UINT64 mag_divmod_small(UINT64 *limbs, UINT64 count, UINT64 div, UINT64 *rem);
 
 /**
  * cons cellをヒープに確保する。
@@ -295,18 +354,18 @@ lisp_val_t primitive_car(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数+。argsの全fixnumを合計する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数+。argsの全整数(FIXNUM/bignum、負数も可)を合計する。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 合計値のFIXNUM
+ * @return 合計値の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数-。argsの第一引数から残りを順に減算する(単項の符号反転は未サポート)。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として符号を反転する。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 減算結果のFIXNUM
+ * @return 減算結果の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env);
 
@@ -335,24 +394,24 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数*。argsの全fixnumを乗算する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数*。argsの全整数(FIXNUM/bignum、負数も可)を乗算する。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 積のFIXNUM
+ * @return 積の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算)。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果のFIXNUM。0除算の場合はg_sym_eval_error
+ * @return 除算結果の整数。0除算の場合はg_sym_eval_error
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数<。argsが単調増加(a<b<c<...)かどうかを判定する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 単調増加ならg_sym_t、そうでなければnil
  */
@@ -360,7 +419,7 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数>。argsが単調減少(a>b>c>...)かどうかを判定する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 単調減少ならg_sym_t、そうでなければnil
  */
@@ -368,14 +427,14 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数=。argsがすべて等しいかどうかを判定する。
- * @param args 評価済みの引数リスト(すべてFIXNUM)
+ * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return すべて等しいならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数NUMBERP。第一引数が数値(現状はFIXNUMのみ)かどうかを判定する。
+ * 組み込み関数NUMBERP。第一引数が数値(FIXNUMまたはbignum)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 数値ならg_sym_t、そうでなければnil
@@ -389,6 +448,14 @@ lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env);
  * @return FIXNUMならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数BIGNUMP。第一引数が60bitを超える整数(bignum、MAGIC_BIGNUMのINSTANCE)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return bignumならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数SYMBOLP。第一引数がsymbolかどうかを判定する。
@@ -411,9 +478,10 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。
- * 仕様上eqとの違いは数値(同クラスかつ同値)と文字(同文字)の比較だが、本実装のfixnum/charは
- * いずれも即値表現(同じ論理値なら同じビットパタン)であり、かつ浮動小数点数が未実装のため、
- * 現状ではeqと完全に同じ判定になる(将来floatを追加する際に差が出る想定でeqとは別実装にしている)。
+ * 仕様上eqとの違いは数値(同クラスかつ同値)と文字(同文字)の比較。fixnum/charは即値表現
+ * (同じ論理値なら同じビットパタン)なのでeqのポインタ比較のままで正しく判定できるが、
+ * bignumは同じ値でも異なるヒープオブジェクトになりうるため、両者がMAGIC_BIGNUMの場合は
+ * sign+limb内容を比較する(浮動小数点数は未実装のため、それ以外はeqと同じ判定になる)。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 同一ならg_sym_t、そうでなければnil
@@ -422,7 +490,8 @@ lisp_val_t primitive_eql(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数EQUAL。第一引数と第二引数の構造的な同値性を判定する。
- * CONS/STRING/VECTORは再帰的に内容を比較し、それ以外はeqと同じ判定にフォールバックする。
+ * CONS/STRING/VECTORは再帰的に内容を比較し、両者がbignum(MAGIC_BIGNUM)ならsign+limb内容を
+ * 比較し、それ以外はeqと同じ判定にフォールバックする。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 構造的に同値ならg_sym_t、そうでなければnil

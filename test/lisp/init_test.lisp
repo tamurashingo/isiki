@@ -473,4 +473,63 @@
 ;; instancep(既存のtypepに委譲、known limitation: domain-errorチェックは行わない)
 (assert-equal t (instancep (make-instance 'point3d) (class point3d)))
 (assert-equal t (instancep (make-instance 'point3d) (class point)))
+
+;;; --- number class (§19): 符号付き整数とbignum ---
+
+;; 負のfixnumの四則演算(60bit以内なので即値のまま、assert-equalの生比較でも安全)
+(assert-equal -2 (+ -5 3))
+(assert-equal -7 (+ -3 -4))
+(assert-equal -5 (- 5))
+(assert-equal 5 (- -5))
+(assert-equal -2 (- 3 5))
+(assert-equal 0 (- 5 3 2))
+(assert-equal -6 (* -2 3))
+(assert-equal 6 (* -2 -3))
+(assert-equal -4 (/ -12 3))
+(assert-equal -4 (/ 12 -3))
+(assert-equal 4 (/ -12 -3))
+
+;; bignumは同じ値でも独立に計算すると別オブジェクトになりうるため、raw eqである
+;; assert-equalではなく数値比較の=をtと比較する形でテストする
+;; 1152921504606846976 = 2^60(FIXNUM_MAGNITUDE_MASK=2^60-1を超えるのでbignumになる)
+(assert-equal t (bignump 1152921504606846976))
+(assert-equal nil (fixnump 1152921504606846976))
+(assert-equal t (integerp 1152921504606846976))
+(assert-equal t (numberp 1152921504606846976))
+(assert-equal t (fixnump 1152921504606846975)) ; FIXNUM_MAGNITUDE_MASKはまだFIXNUM
+(assert-equal nil (bignump 1152921504606846975))
+(assert-equal t (integerp 5)) ; FIXNUMもintegerp=T
+
+;; 60bit超えの加算でbignumに昇格し、引き戻すと再度fixnumに降格する
+(assert-equal t (= 1152921504606846976 (+ 1152921504606846975 1)))
+(assert-equal t (bignump (+ 1152921504606846975 1)))
+(assert-equal 1152921504606846975 (- (+ 1152921504606846975 1) 1))
+(assert-equal t (fixnump (- (+ 1152921504606846975 1) 1)))
+
+;; bignumの負数・比較・大小関係
+(assert-equal t (= -1152921504606846976 (- 0 1152921504606846976)))
+(assert-equal t (< 1152921504606846975 1152921504606846976))
+(assert-equal t (> 1152921504606846976 1152921504606846975))
+(assert-equal t (< -1152921504606846976 1152921504606846975))
+
+;; eql/equalはbignumも異なるオブジェクトでも内容が同じならT
+(assert-equal t (eql (+ 1152921504606846976 0) (+ 0 1152921504606846976)))
+(assert-equal nil (eql 1152921504606846976 1152921504606846977))
+(assert-equal t (equal (cons 1152921504606846976 nil) (cons (+ 1152921504606846976 0) nil)))
 (assert-equal nil (instancep (make-instance 'point) (class point3d)))
+
+;;; --- number class (§19): 整数リテラルの符号(+)とradix表記(#b/#o/#x) ---
+
+(assert-equal 42 +42) ; 明示的な'+'付きの整数リテラルも読める
+(assert-equal 10 #b1010) ; 2進数リテラル
+(assert-equal 10 #B1010) ; 大文字の#Bも同様
+(assert-equal 15 #o17) ; 8進数リテラル
+(assert-equal 15 #O17) ; 大文字の#Oも同様
+(assert-equal 255 #xff) ; 16進数リテラル(小文字の桁)
+(assert-equal 255 #XFF) ; 大文字の#X・大文字の桁も同様
+(assert-equal -5 #b-101) ; radixリテラルも符号付き
+(assert-equal 15 #o+17) ; radixリテラルの明示的な'+'
+
+;; 16進数なら15桁でも60bitを超えるのでbignumになる(#x1000000000000000 = 16^15 = 2^60)
+(assert-equal t (bignump #x1000000000000000))
+(assert-equal t (= 1152921504606846976 #x1000000000000000))

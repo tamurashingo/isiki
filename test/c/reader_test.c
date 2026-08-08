@@ -160,6 +160,180 @@ void test_os_read_fixnum() {
     assert(v == os_make_fixnum(42), "\"42\"はfixnum 42として読める");
 }
 
+void test_os_read_negative_fixnum() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "-42");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum_signed(1, 42), "\"-42\"は負のfixnum -42として読める");
+}
+
+void test_os_read_bare_minus_is_symbol() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "-");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_symbol("-"), "\"-\"単体はsymbolとして読める");
+}
+
+void test_os_read_bignum_literal() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    // 2^60 = 1152921504606846976は60bitのFIXNUM_MAGNITUDE_MASKを超えるのでbignumになる
+    push_string(proc, "1152921504606846976");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "60bitを超える整数リテラルはbignumとして読める");
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    assert(obj[0] == MAGIC_BIGNUM, "word0はMAGIC_BIGNUM");
+    assert(obj[1] == 0, "非負なのでsignは0");
+}
+
+void test_os_read_negative_bignum_literal() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "-1152921504606846976");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "60bitを超える負の整数リテラルはbignumとして読める");
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    assert(obj[0] == MAGIC_BIGNUM, "word0はMAGIC_BIGNUM");
+    assert(obj[1] == 1, "負なのでsignは1");
+}
+
+void test_os_read_small_literal_stays_fixnum() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "123456789012345");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_FIXNUM, "60bit以内の整数リテラルはFIXNUMのまま");
+    assert(os_fixnum_magnitude(v) == 123456789012345ULL, "読み取ったマグニチュードが一致する");
+}
+
+void test_os_read_positive_fixnum_with_sign() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "+42");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(42), "明示的な'+'付きの\"+42\"はfixnum 42として読める");
+}
+
+void test_os_read_bare_plus_is_symbol() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "+");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_symbol("+"), "\"+\"単体はsymbolとして読める");
+}
+
+void test_os_read_binary_literal() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#b1010");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(10), "\"#b1010\"は2進数として10で読める");
+}
+
+void test_os_read_binary_literal_uppercase_prefix() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#B1010");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(10), "\"#B1010\"(大文字B)も2進数として10で読める");
+}
+
+void test_os_read_octal_literal() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#o17");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(15), "\"#o17\"は8進数として15で読める");
+}
+
+void test_os_read_octal_literal_uppercase_prefix() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#O17");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(15), "\"#O17\"(大文字O)も8進数として15で読める");
+}
+
+void test_os_read_hex_literal_lowercase_digits() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#xff");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(255), "\"#xff\"(小文字桁)は16進数として255で読める");
+}
+
+void test_os_read_hex_literal_uppercase_prefix_and_digits() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#XFF");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(255), "\"#XFF\"(大文字X・大文字桁)も16進数として255で読める");
+}
+
+void test_os_read_radix_literal_negative() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#b-101");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum_signed(1, 5), "\"#b-101\"は負の2進数として-5で読める");
+}
+
+void test_os_read_radix_literal_explicit_positive_sign() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#o+17");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == os_make_fixnum(15), "\"#o+17\"は明示的な'+'付きでも8進数として15で読める");
+}
+
+void test_os_read_radix_literal_invalid_digit_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#b12");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "2進数の基数で表現できない数字'2'を含む\"#b12\"はread errorになる");
+}
+
+void test_os_read_radix_literal_no_digits_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#b ");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "数字が1つも無い\"#b\"はread errorになる");
+}
+
+void test_os_read_hex_bignum_literal() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    // 16^15 = 2^60は60bitのFIXNUM_MAGNITUDE_MASKを超えるのでbignumになる
+    push_string(proc, "#x1000000000000000");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "60bitを超える16進整数リテラルはbignumとして読める");
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    assert(obj[0] == MAGIC_BIGNUM, "word0はMAGIC_BIGNUM");
+    assert(obj[1] == 0, "非負なのでsignは0");
+}
+
 void test_os_read_symbol() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
@@ -447,6 +621,24 @@ int main(int argc, char** argv) {
     test_os_read_empty();
     test_os_read_whitespace_only();
     test_os_read_fixnum();
+    test_os_read_negative_fixnum();
+    test_os_read_bare_minus_is_symbol();
+    test_os_read_bignum_literal();
+    test_os_read_negative_bignum_literal();
+    test_os_read_small_literal_stays_fixnum();
+    test_os_read_positive_fixnum_with_sign();
+    test_os_read_bare_plus_is_symbol();
+    test_os_read_binary_literal();
+    test_os_read_binary_literal_uppercase_prefix();
+    test_os_read_octal_literal();
+    test_os_read_octal_literal_uppercase_prefix();
+    test_os_read_hex_literal_lowercase_digits();
+    test_os_read_hex_literal_uppercase_prefix_and_digits();
+    test_os_read_radix_literal_negative();
+    test_os_read_radix_literal_explicit_positive_sign();
+    test_os_read_radix_literal_invalid_digit_is_read_error();
+    test_os_read_radix_literal_no_digits_is_read_error();
+    test_os_read_hex_bignum_literal();
     test_os_read_symbol();
     test_os_read_string();
     test_os_read_empty_list();

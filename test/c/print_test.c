@@ -85,6 +85,28 @@ void test_os_print_fixnum_zero() {
     assert(strcmp(captured(), "0") == 0, "fixnum 0は\"0\"と表示される");
 }
 
+void test_os_print_fixnum_negative() {
+    reset_capture();
+    os_print(os_make_fixnum_signed(1, 42), &g_frame_buffer);
+    assert(strcmp(captured(), "-42") == 0, "負のfixnum -42は\"-42\"と表示される");
+}
+
+void test_os_print_bignum_positive() {
+    reset_capture();
+    UINT64 limbs[2] = {0, 0x10000000ULL}; // 2^60 = 1152921504606846976
+    lisp_val_t bignum_val = os_make_integer(0, limbs, 2);
+    os_print(bignum_val, &g_frame_buffer);
+    assert(strcmp(captured(), "1152921504606846976") == 0, "bignum 2^60は\"1152921504606846976\"と表示される");
+}
+
+void test_os_print_bignum_negative() {
+    reset_capture();
+    UINT64 limbs[2] = {0, 0x10000000ULL};
+    lisp_val_t bignum_val = os_make_integer(1, limbs, 2);
+    os_print(bignum_val, &g_frame_buffer);
+    assert(strcmp(captured(), "-1152921504606846976") == 0, "負のbignum -2^60は\"-1152921504606846976\"と表示される");
+}
+
 void test_os_print_symbol() {
     reset_capture();
     os_print(os_make_symbol("foo"), &g_frame_buffer);
@@ -171,6 +193,9 @@ int main(int argc, char** argv) {
 
     test_os_print_fixnum();
     test_os_print_fixnum_zero();
+    test_os_print_fixnum_negative();
+    test_os_print_bignum_positive();
+    test_os_print_bignum_negative();
     test_os_print_symbol();
     test_os_print_string();
     test_os_print_nil();

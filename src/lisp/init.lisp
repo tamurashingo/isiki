@@ -675,6 +675,12 @@
            (lambda (c) (if (typep c '<error>) (return-from ,block-name nil) (signal-condition c nil)))
          ,@body))))
 
+;;; --- integerp (§19: number class) ---
+
+;; FIXNUM(60bit以内)とbignum(60bit超)のいずれかであれば整数とみなす。
+(defun integerp (obj)
+  (or (fixnump obj) (bignump obj)))
+
 ;;; --- class / the / assure ---
 
 ;; class-nameがtypepでも判定できる組み込み型名なら対応する述語で、それ以外
@@ -684,7 +690,7 @@
 ;; %find-classできないクラス名ならtypepがnilを返すのでassureは必ずエラーになる)。
 (defun %assure-typep (obj class-name)
   (case class-name
-    ((<integer>) (fixnump obj))
+    ((<integer>) (integerp obj))
     ((<number>) (numberp obj))
     ((<symbol>) (symbolp obj))
     ((<cons>) (consp obj))
