@@ -434,6 +434,98 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数/=。argsの隣接する要素同士がすべて等しくないかどうかを判定する
+ * (厳密な仕様の「全要素が相異なる」ではなく、既存の</=/>と同様に隣接ペア判定に
+ * 簡略化している点に注意)。
+ * @param args 評価済みの引数リスト(すべて整数)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべて整数)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべて整数)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数MAX。argsのうち最大の要素を返す。
+ * @param args 評価済みの引数リスト(すべて整数、1個以上)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最大の要素
+ */
+lisp_val_t primitive_max(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数MIN。argsのうち最小の要素を返す。
+ * @param args 評価済みの引数リスト(すべて整数、1個以上)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最小の要素
+ */
+lisp_val_t primitive_min(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数ABS。第一引数の絶対値を返す。
+ * @param args 評価済みの引数リスト(整数1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 絶対値の整数
+ */
+lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数DIV。z1をz2で除した「floor除算」の商を返す(切り捨て除算の/とは異なり、
+ * 商は-∞方向へ切り捨てる)。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor除算の商。z2が0の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数MOD。z1をz2で除した「floor除算」の余りを返す(余りの符号は常にz2の符号に
+ * 一致する)。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor除算の余り。z2が0の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数GCD。z1とz2の最大公約数を返す(結果は常に非負)。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最大公約数(非負整数)
+ */
+lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数LCM。z1とz2の最小公倍数を返す(結果は常に非負)。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最小公倍数(非負整数)
+ */
+lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数ISQRT。第一引数の整数平方根floor(sqrt(z))を返す。zが負の場合は定義域エラー。
+ * @param args 評価済みの引数リスト(非負整数1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数NUMBERP。第一引数が数値(FIXNUMまたはbignum)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)

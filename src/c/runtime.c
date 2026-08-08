@@ -370,6 +370,17 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("<"), os_make_native_function((lisp_addr_t)(void *)primitive_less_than), global_environment);
         os_set_function(os_make_symbol(">"), os_make_native_function((lisp_addr_t)(void *)primitive_greater_than), global_environment);
         os_set_function(os_make_symbol("="), os_make_native_function((lisp_addr_t)(void *)primitive_num_equal), global_environment);
+        os_set_function(os_make_symbol("/="), os_make_native_function((lisp_addr_t)(void *)primitive_num_not_equal), global_environment);
+        os_set_function(os_make_symbol(">="), os_make_native_function((lisp_addr_t)(void *)primitive_greater_equal), global_environment);
+        os_set_function(os_make_symbol("<="), os_make_native_function((lisp_addr_t)(void *)primitive_less_equal), global_environment);
+        os_set_function(os_make_symbol("MAX"), os_make_native_function((lisp_addr_t)(void *)primitive_max), global_environment);
+        os_set_function(os_make_symbol("MIN"), os_make_native_function((lisp_addr_t)(void *)primitive_min), global_environment);
+        os_set_function(os_make_symbol("ABS"), os_make_native_function((lisp_addr_t)(void *)primitive_abs), global_environment);
+        os_set_function(os_make_symbol("DIV"), os_make_native_function((lisp_addr_t)(void *)primitive_div), global_environment);
+        os_set_function(os_make_symbol("MOD"), os_make_native_function((lisp_addr_t)(void *)primitive_mod), global_environment);
+        os_set_function(os_make_symbol("GCD"), os_make_native_function((lisp_addr_t)(void *)primitive_gcd), global_environment);
+        os_set_function(os_make_symbol("LCM"), os_make_native_function((lisp_addr_t)(void *)primitive_lcm), global_environment);
+        os_set_function(os_make_symbol("ISQRT"), os_make_native_function((lisp_addr_t)(void *)primitive_isqrt), global_environment);
         os_set_function(os_make_symbol("NUMBERP"), os_make_native_function((lisp_addr_t)(void *)primitive_numberp), global_environment);
         os_set_function(os_make_symbol("FIXNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnump), global_environment);
         os_set_function(os_make_symbol("BIGNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_bignump), global_environment);
@@ -1132,6 +1143,140 @@ static int number_compare(lisp_val_t a, lisp_val_t b) {
     return ma.sign ? -cmp : cmp;
 }
 
+/**
+ * 整数z1をz2で除した「floor除算」の商と余りを求める(ISLisp仕様のdiv/mod。素朴な
+ * 切り捨て除算である/とは異なり、商は-∞方向へ切り捨て、余りの符号は常にz2の符号に一致する)。
+ * 既存のmag_divmod(切り捨て除算)の結果を符号に応じて調整することで実現する。
+ * z1 = (*div_out)*z2 + (*mod_out) となる。
+ * @param div_out 商(floor)の格納先
+ * @param mod_out 余り(符号はz2に一致)の格納先
+ * @param div_by_zero z2が0の場合に1を設定する(このときdiv_out/mod_outは未定義)
+ */
+static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp_val_t *mod_out, int *div_by_zero) {
+    signed_mag_t m1, m2;
+    decompose(z1, &m1);
+    decompose(z2, &m2);
+
+    if (m2.count == 1 && m2.limbs[0] == 0) {
+        *div_by_zero = 1;
+        return;
+    }
+    *div_by_zero = 0;
+
+    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
+    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
+    UINT64 quot_len, rem_len;
+    mag_divmod(m1.limbs, m1.count, m2.limbs, m2.count, quot_buf, &quot_len, rem_buf, &rem_len);
+
+    if (rem_len == 1 && rem_buf[0] == 0) {
+        // 割り切れる: mod=0、divの符号はオペランドの符号のXOR
+        int div_sign = (m1.sign != m2.sign);
+        *div_out = os_make_integer(div_sign, quot_buf, quot_len);
+        *mod_out = os_make_fixnum(0);
+        return;
+    }
+
+    if (m1.sign == m2.sign) {
+        // 同符号: truncate除算とfloor除算が一致する
+        *div_out = os_make_integer(0, quot_buf, quot_len);
+        *mod_out = os_make_integer(m2.sign, rem_buf, rem_len);
+        return;
+    }
+
+    // 異符号: div = -(q_trunc+1)、mod = |z2| - r_trunc (符号はz2に一致)
+    UINT64 one[1] = {1};
+    UINT64 *div_mag_buf = (UINT64 *)os_alloc_bytes(8 * (quot_len + 1));
+    UINT64 div_mag_len = mag_add(quot_buf, quot_len, one, 1, div_mag_buf);
+    *div_out = os_make_integer(1, div_mag_buf, div_mag_len);
+
+    UINT64 *mod_mag_buf = (UINT64 *)os_alloc_bytes(8 * m2.count);
+    UINT64 mod_mag_len = mag_sub(m2.limbs, m2.count, rem_buf, rem_len, mod_mag_buf);
+    *mod_out = os_make_integer(m2.sign, mod_mag_buf, mod_mag_len);
+}
+
+/**
+ * aとbの最大公約数のマグニチュードを求める(符号なし、ユークリッドの互除法。
+ * mag_divmodの繰り返しで実装する)。gcd(0,0)=0、gcd(a,0)=aとなる。
+ * @param out_limbs 結果のlimb配列(新規にヒープ確保したもの)の格納先
+ * @param out_len 結果の実効長の格納先
+ */
+static void mag_gcd(UINT64 *a, UINT64 alen, UINT64 *b, UINT64 blen, UINT64 **out_limbs, UINT64 *out_len) {
+    alen = mag_len(a, alen);
+    blen = mag_len(b, blen);
+
+    UINT64 *cur_a = (UINT64 *)os_alloc_bytes(8 * alen);
+    for (UINT64 i = 0; i < alen; i++) {
+        cur_a[i] = a[i];
+    }
+    UINT64 cur_alen = alen;
+
+    UINT64 *cur_b = (UINT64 *)os_alloc_bytes(8 * blen);
+    for (UINT64 i = 0; i < blen; i++) {
+        cur_b[i] = b[i];
+    }
+    UINT64 cur_blen = blen;
+
+    while (!(cur_blen == 1 && cur_b[0] == 0)) {
+        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * cur_alen);
+        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * cur_alen);
+        UINT64 quot_len, rem_len;
+        mag_divmod(cur_a, cur_alen, cur_b, cur_blen, quot_buf, &quot_len, rem_buf, &rem_len);
+
+        cur_a = cur_b;
+        cur_alen = cur_blen;
+        cur_b = rem_buf;
+        cur_blen = rem_len;
+    }
+
+    *out_limbs = cur_a;
+    *out_len = cur_alen;
+}
+
+/**
+ * nのマグニチュードの整数平方根floor(sqrt(n))を求める(符号なし、ニュートン法。
+ * x=n, y=(x+1)/2 から始め、y<xである限りx=y, y=(x+n/x)/2を繰り返す)。
+ * mag_add/mag_divmod/mag_divmod_small/mag_compareのみで実装し、bignumでも正しく動作する。
+ * @param out_limbs 結果のlimb配列(新規にヒープ確保したもの)の格納先
+ * @param out_len 結果の実効長の格納先
+ */
+static void mag_isqrt(UINT64 *n, UINT64 nlen, UINT64 **out_limbs, UINT64 *out_len) {
+    nlen = mag_len(n, nlen);
+
+    UINT64 *x = (UINT64 *)os_alloc_bytes(8 * nlen);
+    for (UINT64 i = 0; i < nlen; i++) {
+        x[i] = n[i];
+    }
+    UINT64 xlen = nlen;
+
+    UINT64 one[1] = {1};
+    UINT64 dummy_rem;
+
+    UINT64 *xp1 = (UINT64 *)os_alloc_bytes(8 * (xlen + 1));
+    UINT64 xp1_len = mag_add(x, xlen, one, 1, xp1);
+    UINT64 ylen = mag_divmod_small(xp1, xp1_len, 2, &dummy_rem);
+    UINT64 *y = xp1;
+
+    while (mag_compare(y, ylen, x, xlen) < 0) {
+        x = y;
+        xlen = ylen;
+
+        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+        UINT64 quot_len, rem_len;
+        mag_divmod(n, nlen, x, xlen, quot_buf, &quot_len, rem_buf, &rem_len);
+
+        UINT64 cap = (xlen > quot_len ? xlen : quot_len) + 1;
+        UINT64 *sum_buf = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 sum_len = mag_add(x, xlen, quot_buf, quot_len, sum_buf);
+
+        ylen = mag_divmod_small(sum_buf, sum_len, 2, &dummy_rem);
+        y = sum_buf;
+    }
+
+    *out_limbs = x;
+    *out_len = xlen;
+}
+
 
 
 /**
@@ -1472,6 +1617,222 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
         }
     }
     return g_sym_t;
+}
+
+/**
+ * 組み込み関数/=。argsの隣接する要素同士がすべて等しくないかどうかを判定する
+ * (厳密な仕様の「全要素が相異なる」ではなく、既存の</=/>と同様に隣接ペア判定に
+ * 簡略化している点に注意)。
+ * @param args 評価済みの引数リスト(すべて整数)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべて整数)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべて整数)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数MAX。argsのうち最大の要素を返す(number_compareのみ、ヒープ確保なし)。
+ * @param args 評価済みの引数リスト(すべて整数、1個以上)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最大の要素
+ */
+lisp_val_t primitive_max(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t best = cc_car(args);
+    for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+        lisp_val_t v = cc_car(rest);
+        if (number_compare(v, best) > 0) {
+            best = v;
+        }
+    }
+    return best;
+}
+
+/**
+ * 組み込み関数MIN。argsのうち最小の要素を返す(number_compareのみ、ヒープ確保なし)。
+ * @param args 評価済みの引数リスト(すべて整数、1個以上)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最小の要素
+ */
+lisp_val_t primitive_min(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t best = cc_car(args);
+    for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+        lisp_val_t v = cc_car(rest);
+        if (number_compare(v, best) < 0) {
+            best = v;
+        }
+    }
+    return best;
+}
+
+/**
+ * 組み込み関数ABS。第一引数の絶対値を返す。すでに非負の場合はヒープ確保なしで
+ * そのまま返す。
+ * @param args 評価済みの引数リスト(整数1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 絶対値の整数
+ */
+lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_FIXNUM) {
+        if (!os_fixnum_is_negative(val)) {
+            return val;
+        }
+        return os_make_fixnum(os_fixnum_magnitude(val));
+    }
+
+    signed_mag_t m;
+    decompose(val, &m);
+    if (!m.sign) {
+        return val;
+    }
+    return os_make_integer(0, m.limbs, m.count);
+}
+
+/**
+ * 組み込み関数DIV。z1をz2で除した「floor除算」の商を返す(切り捨て除算の/とは異なり、
+ * 商は-∞方向へ切り捨てる)。floor_divmodを参照。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor除算の商。z2が0の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t z1 = cc_car(args);
+    lisp_val_t z2 = cc_car(cc_cdr(args));
+
+    lisp_val_t div_out, mod_out;
+    int div_by_zero;
+    floor_divmod(z1, z2, &div_out, &mod_out, &div_by_zero);
+    if (div_by_zero) {
+        return g_sym_eval_error;
+    }
+    return div_out;
+}
+
+/**
+ * 組み込み関数MOD。z1をz2で除した「floor除算」の余りを返す(余りの符号は常にz2の符号に
+ * 一致する)。floor_divmodを参照。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor除算の余り。z2が0の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t z1 = cc_car(args);
+    lisp_val_t z2 = cc_car(cc_cdr(args));
+
+    lisp_val_t div_out, mod_out;
+    int div_by_zero;
+    floor_divmod(z1, z2, &div_out, &mod_out, &div_by_zero);
+    if (div_by_zero) {
+        return g_sym_eval_error;
+    }
+    return mod_out;
+}
+
+/**
+ * 組み込み関数GCD。z1とz2の最大公約数を返す(結果は常に非負、mag_gcdを参照)。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最大公約数(非負整数)
+ */
+lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env) {
+    signed_mag_t m1, m2;
+    decompose(cc_car(args), &m1);
+    decompose(cc_car(cc_cdr(args)), &m2);
+
+    UINT64 *gcd_limbs;
+    UINT64 gcd_len;
+    mag_gcd(m1.limbs, m1.count, m2.limbs, m2.count, &gcd_limbs, &gcd_len);
+
+    return os_make_integer(0, gcd_limbs, gcd_len);
+}
+
+/**
+ * 組み込み関数LCM。z1とz2の最小公倍数を返す(結果は常に非負。gcd*lcm=|z1*z2|の関係を
+ * 使い、|z1*z2|/gcd(z1,z2)として求める。gcdが0(z1=z2=0の場合のみ)ならlcmも0)。
+ * @param args 評価済みの引数リスト(整数2個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 最小公倍数(非負整数)
+ */
+lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
+    signed_mag_t m1, m2;
+    decompose(cc_car(args), &m1);
+    decompose(cc_car(cc_cdr(args)), &m2);
+
+    UINT64 *gcd_limbs;
+    UINT64 gcd_len;
+    mag_gcd(m1.limbs, m1.count, m2.limbs, m2.count, &gcd_limbs, &gcd_len);
+
+    if (gcd_len == 1 && gcd_limbs[0] == 0) {
+        return os_make_fixnum(0);
+    }
+
+    UINT64 *prod_buf = (UINT64 *)os_alloc_bytes(8 * (m1.count + m2.count));
+    UINT64 prod_len = mag_mul(m1.limbs, m1.count, m2.limbs, m2.count, prod_buf);
+
+    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * prod_len);
+    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * prod_len);
+    UINT64 quot_len, rem_len;
+    mag_divmod(prod_buf, prod_len, gcd_limbs, gcd_len, quot_buf, &quot_len, rem_buf, &rem_len);
+
+    return os_make_integer(0, quot_buf, quot_len);
+}
+
+/**
+ * 組み込み関数ISQRT。第一引数の整数平方根floor(sqrt(z))を返す(ニュートン法、
+ * mag_isqrtを参照)。zが負の場合は定義域エラー。
+ * @param args 評価済みの引数リスト(非負整数1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    signed_mag_t m;
+    decompose(val, &m);
+    if (m.sign) {
+        return g_sym_eval_error;
+    }
+
+    UINT64 *out_limbs;
+    UINT64 out_len;
+    mag_isqrt(m.limbs, m.count, &out_limbs, &out_len);
+
+    return os_make_integer(0, out_limbs, out_len);
 }
 
 /**

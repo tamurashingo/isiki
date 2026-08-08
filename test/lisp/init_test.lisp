@@ -533,3 +533,59 @@
 ;; 16進数なら15桁でも60bitを超えるのでbignumになる(#x1000000000000000 = 16^15 = 2^60)
 (assert-equal t (bignump #x1000000000000000))
 (assert-equal t (= 1152921504606846976 #x1000000000000000))
+
+;;; --- number class (§19): /= ・>= ・<= ・max/min/abs・div/mod・gcd/lcm・isqrt ---
+
+;; /= ・>= ・<= (既存の</>/=と同様、隣接ペアの連鎖判定に一般化している)
+(assert-equal t (/= 1 2 3))
+(assert-equal nil (/= 1 1 2))
+(assert-equal t (>= 3 3 2))
+(assert-equal nil (>= 2 3))
+(assert-equal t (<= 1 1 2))
+(assert-equal nil (<= 3 2))
+
+;; max/min/abs
+(assert-equal 5 (max 1 5 3))
+(assert-equal 1 (min 5 1 3))
+(assert-equal 3 (max -5 3))
+(assert-equal -5 (min -5 3))
+(assert-equal 7 (abs -7))
+(assert-equal 7 (abs 7))
+
+;; div/mod (floor除算。仕様例(§19.4)の8符号パターン)
+(assert-equal 4 (div 12 3))
+(assert-equal 0 (mod 12 3))
+(assert-equal -4 (div 12 -3))
+(assert-equal 0 (mod 12 -3))
+(assert-equal -4 (div -12 3))
+(assert-equal 0 (mod -12 3))
+(assert-equal 4 (div -12 -3))
+(assert-equal 0 (mod -12 -3))
+(assert-equal 4 (div 14 3))
+(assert-equal 2 (mod 14 3))
+(assert-equal -5 (div 14 -3))
+(assert-equal -1 (mod 14 -3))
+(assert-equal -5 (div -14 3))
+(assert-equal 1 (mod -14 3))
+(assert-equal 4 (div -14 -3))
+(assert-equal -2 (mod -14 -3))
+(assert-equal 'eval-error (div 5 0))
+(assert-equal 'eval-error (mod 5 0))
+
+;; gcd/lcm
+(assert-equal 4 (gcd 0 -4))
+(assert-equal 4 (gcd 12 8))
+(assert-equal 0 (gcd 0 0))
+(assert-equal 12 (lcm 4 6))
+(assert-equal 0 (lcm 0 5))
+
+;; isqrt
+(assert-equal 7 (isqrt 49))
+(assert-equal 7 (isqrt 63))
+(assert-equal 0 (isqrt 0))
+(assert-equal 1 (isqrt 1))
+(assert-equal 1 (isqrt 2))
+(assert-equal 'eval-error (isqrt -1))
+;; bignum境界: 1152921504606846975(FIXNUM_MAGNITUDE_MASK)の2乗の平方根が元に戻る
+(assert-equal t (= 1152921504606846975 (isqrt (* 1152921504606846975 1152921504606846975))))
+(assert-equal t (= 1152921504606846975 (isqrt (+ 1 (* 1152921504606846975 1152921504606846975)))))

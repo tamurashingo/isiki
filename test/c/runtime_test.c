@@ -356,6 +356,98 @@ void test_primitive_num_equal() {
     assert(primitive_num_equal(make_arg_list(2, 2, 3), nil) == nil, "(= 2 3) はnil");
 }
 
+void test_primitive_num_not_equal_ge_le() {
+    assert(primitive_num_not_equal(make_arg_list(3, 1, 2, 3), nil) == g_sym_t, "(/= 1 2 3) はT");
+    assert(primitive_num_not_equal(make_arg_list(3, 1, 1, 2), nil) == nil, "(/= 1 1 2) はnil");
+
+    assert(primitive_greater_equal(make_arg_list(3, 3, 3, 2), nil) == g_sym_t, "(>= 3 3 2) はT");
+    assert(primitive_greater_equal(make_arg_list(2, 2, 3), nil) == nil, "(>= 2 3) はnil");
+
+    assert(primitive_less_equal(make_arg_list(3, 1, 1, 2), nil) == g_sym_t, "(<= 1 1 2) はT");
+    assert(primitive_less_equal(make_arg_list(2, 3, 2), nil) == nil, "(<= 3 2) はnil");
+}
+
+void test_primitive_max_min_abs() {
+    assert(primitive_max(make_arg_list(3, 1, 5, 3), nil) >> 3 == 5, "(max 1 5 3) は5");
+    assert(primitive_min(make_arg_list(3, 5, 1, 3), nil) >> 3 == 1, "(min 5 1 3) は1");
+
+    lisp_val_t vals1[2] = {os_make_fixnum_signed(1, 5), os_make_fixnum(3)};
+    assert(primitive_max(make_arg_list_vals(2, vals1), nil) == os_make_fixnum(3), "(max -5 3) は3");
+    assert(primitive_min(make_arg_list_vals(2, vals1), nil) == vals1[0], "(min -5 3) は-5");
+
+    lisp_val_t neg = os_make_fixnum_signed(1, 7);
+    lisp_val_t abs_neg = primitive_abs(os_make_cons(neg, nil), nil);
+    assert(!os_fixnum_is_negative(abs_neg) && os_fixnum_magnitude(abs_neg) == 7, "(abs -7) は7");
+
+    lisp_val_t pos = os_make_fixnum(7);
+    assert(primitive_abs(os_make_cons(pos, nil), nil) == pos, "(abs 7) は7自身をそのまま返す(ヒープ確保なし)");
+}
+
+void test_primitive_div_mod() {
+    // 仕様例(§19.4)の8符号パターンをすべて確認する
+    struct { UINT64 z1_mag; int z1_neg; UINT64 z2_mag; int z2_neg; int div_mag; int div_neg; int mod_mag; int mod_neg; } cases[] = {
+        {12, 0, 3, 0, 4, 0, 0, 0},
+        {12, 0, 3, 1, 4, 1, 0, 0},
+        {12, 1, 3, 0, 4, 1, 0, 0},
+        {12, 1, 3, 1, 4, 0, 0, 0},
+        {14, 0, 3, 0, 4, 0, 2, 0},
+        {14, 0, 3, 1, 5, 1, 1, 1},
+        {14, 1, 3, 0, 5, 1, 1, 0},
+        {14, 1, 3, 1, 4, 0, 2, 1},
+    };
+    for (int i = 0; i < 8; i++) {
+        lisp_val_t vals[2] = {os_make_fixnum_signed(cases[i].z1_neg, cases[i].z1_mag),
+                               os_make_fixnum_signed(cases[i].z2_neg, cases[i].z2_mag)};
+        lisp_val_t d = primitive_div(make_arg_list_vals(2, vals), nil);
+        lisp_val_t m = primitive_mod(make_arg_list_vals(2, vals), nil);
+        assert(os_fixnum_is_negative(d) == (cases[i].div_mag != 0 && cases[i].div_neg) && os_fixnum_magnitude(d) == (UINT64)cases[i].div_mag,
+               "divの符号パターンテスト");
+        assert(os_fixnum_is_negative(m) == (cases[i].mod_mag != 0 && cases[i].mod_neg) && os_fixnum_magnitude(m) == (UINT64)cases[i].mod_mag,
+               "modの符号パターンテスト");
+    }
+
+    lisp_val_t vals_zero[2] = {os_make_fixnum(5), os_make_fixnum(0)};
+    assert(primitive_div(make_arg_list_vals(2, vals_zero), nil) == g_sym_eval_error, "(div 5 0) はg_sym_eval_error");
+    assert(primitive_mod(make_arg_list_vals(2, vals_zero), nil) == g_sym_eval_error, "(mod 5 0) はg_sym_eval_error");
+}
+
+void test_primitive_gcd_lcm() {
+    lisp_val_t vals1[2] = {os_make_fixnum(0), os_make_fixnum_signed(1, 4)};
+    assert(primitive_gcd(make_arg_list_vals(2, vals1), nil) == os_make_fixnum(4), "(gcd 0 -4) は4");
+
+    assert(primitive_gcd(make_arg_list(2, 12, 8), nil) == os_make_fixnum(4), "(gcd 12 8) は4");
+
+    lisp_val_t vals2[2] = {os_make_fixnum(0), os_make_fixnum(0)};
+    assert(primitive_gcd(make_arg_list_vals(2, vals2), nil) == os_make_fixnum(0), "(gcd 0 0) は0");
+
+    assert(primitive_lcm(make_arg_list(2, 4, 6), nil) == os_make_fixnum(12), "(lcm 4 6) は12");
+
+    lisp_val_t vals3[2] = {os_make_fixnum(0), os_make_fixnum(5)};
+    assert(primitive_lcm(make_arg_list_vals(2, vals3), nil) == os_make_fixnum(0), "(lcm 0 5) は0");
+}
+
+void test_primitive_isqrt() {
+    assert(primitive_isqrt(make_arg_list(1, 49), nil) == os_make_fixnum(7), "(isqrt 49) は7");
+    assert(primitive_isqrt(make_arg_list(1, 63), nil) == os_make_fixnum(7), "(isqrt 63) は7");
+    assert(primitive_isqrt(make_arg_list(1, 0), nil) == os_make_fixnum(0), "(isqrt 0) は0");
+    assert(primitive_isqrt(make_arg_list(1, 1), nil) == os_make_fixnum(1), "(isqrt 1) は1");
+    assert(primitive_isqrt(make_arg_list(1, 2), nil) == os_make_fixnum(1), "(isqrt 2) は1");
+
+    lisp_val_t neg1[1] = {os_make_fixnum_signed(1, 1)};
+    assert(primitive_isqrt(make_arg_list_vals(1, neg1), nil) == g_sym_eval_error, "(isqrt -1) はg_sym_eval_error");
+
+    // bignum境界: k = FIXNUM_MAGNITUDE_MASKとしてk*k(bignum)のisqrtがkに戻ることを確認する
+    lisp_val_t k = os_make_fixnum(FIXNUM_MAGNITUDE_MASK);
+    lisp_val_t ksq_vals[2] = {k, k};
+    lisp_val_t ksq = primitive_multiply(make_arg_list_vals(2, ksq_vals), nil);
+    assert((ksq & TAG_MASK) == TAG_INSTANCE, "k*kはbignumになる");
+    assert(primitive_isqrt(os_make_cons(ksq, nil), nil) == k, "(isqrt (k*k)) はk(完全平方数)");
+
+    lisp_val_t ksq_plus1_vals[2] = {ksq, os_make_fixnum(1)};
+    lisp_val_t ksq_plus1 = primitive_add(make_arg_list_vals(2, ksq_plus1_vals), nil);
+    assert(primitive_isqrt(os_make_cons(ksq_plus1, nil), nil) == k, "(isqrt (k*k+1)) もk(floor)");
+}
+
 void test_primitive_numberp_and_fixnump() {
     assert(primitive_numberp(make_arg_list(1, 42), nil) == g_sym_t, "(numberp 42) はT");
     assert(primitive_numberp(os_make_cons(os_make_symbol("foo"), nil), nil) == nil, "(numberp 'foo) はnil");
@@ -766,6 +858,11 @@ int main(int argc, char** argv) {
    test_primitive_greater_than();
    test_primitive_num_equal();
    test_primitive_comparisons_signed_and_bignum();
+   test_primitive_num_not_equal_ge_le();
+   test_primitive_max_min_abs();
+   test_primitive_div_mod();
+   test_primitive_gcd_lcm();
+   test_primitive_isqrt();
    test_primitive_numberp_and_fixnump();
    test_primitive_bignump();
    test_primitive_symbolp();
