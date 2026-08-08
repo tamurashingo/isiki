@@ -345,6 +345,42 @@
 ;; その他の未対応の組み合わせもerrorになる
 (assert-equal nil (ignore-errors (convert 5 <float>)))
 
+;;; --- symbol property list: property / set-property / remove-property ---
+
+;; propertyが無ければ既定値(省略時nil)を返す
+(assert-equal nil (property 'zeus 'daughter))
+(assert-equal 'none (property 'zeus 'daughter 'none))
+
+;; set-propertyで新規作成、propertyで読める。set-propertyはobjを返す
+(assert-equal 'athena (set-property 'athena 'zeus 'daughter))
+(assert-equal 'athena (property 'zeus 'daughter))
+
+;; 既存のpropertyをset-propertyで上書きできる
+(assert-equal 'ares (set-property 'ares 'zeus 'son))
+(set-property 'apollo 'zeus 'son)
+(assert-equal 'apollo (property 'zeus 'son))
+
+;; 他のsymbol/property-nameのpropertyには影響しない
+(assert-equal 'athena (property 'zeus 'daughter))
+(assert-equal nil (property 'hera 'daughter))
+
+;; setf経由でも(property symbol property-name)に書き込める
+(setf (property 'zeus 'wife) 'hera)
+(assert-equal 'hera (property 'zeus 'wife))
+
+;; remove-propertyは取り除いたpropertyの値を返し、以後propertyは既定値に戻る
+(assert-equal 'athena (remove-property 'zeus 'daughter))
+(assert-equal nil (property 'zeus 'daughter))
+
+;; 存在しないpropertyのremove-propertyはnilを返す
+(assert-equal nil (remove-property 'zeus 'daughter))
+
+;; symbol/property-nameがsymbolでなければerror
+(assert-equal nil (ignore-errors (property "zeus" 'daughter)))
+(assert-equal nil (ignore-errors (property 'zeus "daughter")))
+(assert-equal nil (ignore-errors (set-property 'athena "zeus" 'daughter)))
+(assert-equal nil (ignore-errors (remove-property 'zeus "daughter")))
+
 ;;; --- with-standard-input / with-standard-output / with-error-output ---
 
 ;; 束縛前はnil

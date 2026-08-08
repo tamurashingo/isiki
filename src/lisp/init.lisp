@@ -204,7 +204,8 @@
         ((eq (car place) 'car) `(set-car ,(car (cdr place)) ,value))
         ((eq (car place) 'cdr) `(set-cdr ,(car (cdr place)) ,value))
         ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))
-        ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))))
+        ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
+        ((eq (car place) 'property) `(set-property ,value ,@(cdr place)))))
 
 ;;; --- mapcar / mapc / mapcan ---
 ;;;
@@ -738,6 +739,71 @@
 ;; (convert obj class-name) : class-nameは評価しない
 (defmacro convert (obj class-name)
   `(%convert ,obj ',class-name))
+
+;;; --- symbol property list (§18.2): property / set-property / remove-property ---
+;;;
+;;; symbolのC側構造体にproperty list用のフィールドが無いため、*classes*/
+;;; *generic-methods*と同じく外部のdefdynamicグローバルにentryを持つ。
+;;; entryは((symbol . property-name) . value)というconsで、symbol/property-name
+;;; はいずれもinternされているためeqで比較できる(*classes*のキー比較と同じ前提)。
+;;; 再定義(set-property)は既存entryを取り除いた上で新しいentryを前に積む、
+;;; *classes*/*generic-methods*と同じ「shadowパターン」。
+
+(defdynamic *symbol-properties* nil)
+
+;; objがsymbolでなければerror(domain-errorが未実装のため、assure/convertと
+;; 同じ簡略化として通常のerrorで代替する)
+(defun %check-symbol-arg (obj)
+  (if (symbolp obj) obj (error "not a symbol" obj)))
+
+(defun %property-key-eq (entry symbol property-name)
+  (if (eq (car (car entry)) symbol)
+      (eq (cdr (car entry)) property-name)
+      nil))
+
+(defun %find-property-entry (entries symbol property-name)
+  (if (null entries)
+      nil
+      (if (%property-key-eq (car entries) symbol property-name)
+          (car entries)
+          (%find-property-entry (cdr entries) symbol property-name))))
+
+(defun %remove-property-entry (entries symbol property-name)
+  (if (null entries)
+      nil
+      (if (%property-key-eq (car entries) symbol property-name)
+          (%remove-property-entry (cdr entries) symbol property-name)
+          (cons (car entries) (%remove-property-entry (cdr entries) symbol property-name)))))
+
+;; (property symbol property-name [obj]) : symbolのproperty-nameという名前の
+;; propertyの値。無ければobj(既定nil)を返す
+(defun property (symbol property-name &rest default)
+  (%check-symbol-arg symbol)
+  (%check-symbol-arg property-name)
+  (let ((entry (%find-property-entry (dynamic *symbol-properties*) symbol property-name)))
+    (if entry
+        (cdr entry)
+        (if default (car default) nil))))
+
+;; (set-property obj symbol property-name) : symbolにproperty-nameという名前で
+;; objを値とするpropertyを設定する(既存なら上書き、無ければ新規作成)。objを返す
+(defun set-property (obj symbol property-name)
+  (%check-symbol-arg symbol)
+  (%check-symbol-arg property-name)
+  (%%set-dynamic '*symbol-properties*
+    (cons (cons (cons symbol property-name) obj)
+          (%remove-property-entry (dynamic *symbol-properties*) symbol property-name)))
+  obj)
+
+;; (remove-property symbol property-name) : symbolからproperty-nameという名前の
+;; propertyを取り除き、取り除いたpropertyの値(無ければnil)を返す
+(defun remove-property (symbol property-name)
+  (%check-symbol-arg symbol)
+  (%check-symbol-arg property-name)
+  (let ((entry (%find-property-entry (dynamic *symbol-properties*) symbol property-name)))
+    (%%set-dynamic '*symbol-properties*
+      (%remove-property-entry (dynamic *symbol-properties*) symbol property-name))
+    (if entry (cdr entry) nil)))
 
 ;;; --- dynamic-let / set-dynamic ---
 
