@@ -249,6 +249,104 @@ void test_primitive_consp() {
     assert(primitive_consp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(consp 1) はnil");
 }
 
+void test_primitive_eql() {
+    lisp_val_t sym = os_make_symbol("foo");
+    assert(primitive_eql(os_make_cons(os_make_fixnum(42), os_make_cons(os_make_fixnum(42), nil)), nil) == g_sym_t,
+           "(eql 42 42) はT");
+    assert(primitive_eql(os_make_cons(sym, os_make_cons(sym, nil)), nil) == g_sym_t, "(eql 'foo 'foo) はT");
+    assert(primitive_eql(os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil)), nil) == nil,
+           "(eql 1 2) はnil");
+}
+
+void test_primitive_equal() {
+    lisp_val_t list1 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t list2 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t list3 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(3), nil));
+    assert(primitive_equal(os_make_cons(list1, os_make_cons(list2, nil)), nil) == g_sym_t,
+           "(equal '(1 2) '(1 2)) は構造が同じならT(同一オブジェクトでなくても)");
+    assert(primitive_equal(os_make_cons(list1, os_make_cons(list3, nil)), nil) == nil,
+           "(equal '(1 2) '(1 3)) は内容が違うのでnil");
+
+    lisp_val_t str1 = os_make_string("abc");
+    lisp_val_t str2 = os_make_string("abc");
+    lisp_val_t str3 = os_make_string("abd");
+    assert(primitive_equal(os_make_cons(str1, os_make_cons(str2, nil)), nil) == g_sym_t,
+           "(equal \"abc\" \"abc\") は別オブジェクトでも内容が同じならT");
+    assert(primitive_equal(os_make_cons(str1, os_make_cons(str3, nil)), nil) == nil,
+           "(equal \"abc\" \"abd\") は内容が違うのでnil");
+
+    lisp_val_t vec1 = primitive_make_array(os_make_cons(os_make_fixnum(2), nil), nil);
+    lisp_val_t vec2 = primitive_make_array(os_make_cons(os_make_fixnum(2), nil), nil);
+    assert(primitive_equal(os_make_cons(vec1, os_make_cons(vec2, nil)), nil) == g_sym_t,
+           "(equal #(nil nil) #(nil nil)) は要素がすべて同じならT");
+
+    assert(primitive_equal(os_make_cons(os_make_fixnum(1), os_make_cons(os_make_symbol("a"), nil)), nil) == nil,
+           "(equal 1 'a) はタグが異なるのでnil");
+}
+
+void test_primitive_listp() {
+    lisp_val_t cons = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    assert(primitive_listp(os_make_cons(cons, nil), nil) == g_sym_t, "(listp '(1 . 2)) はT(ドットリストも含む)");
+    assert(primitive_listp(os_make_cons(nil, nil), nil) == g_sym_t, "(listp nil) はT");
+    assert(primitive_listp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(listp 1) はnil");
+}
+
+void test_primitive_characterp() {
+    assert(primitive_characterp(os_make_cons(os_make_char('a'), nil), nil) == g_sym_t, "(characterp #\\a) はT");
+    assert(primitive_characterp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(characterp 1) はnil");
+}
+
+void test_primitive_stringp() {
+    assert(primitive_stringp(os_make_cons(os_make_string("abc"), nil), nil) == g_sym_t, "(stringp \"abc\") はT");
+    assert(primitive_stringp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(stringp 1) はnil");
+}
+
+void test_primitive_functionp() {
+    lisp_val_t native_fn = os_make_instance(MAGIC_FUNCTION_NATIVE, 0, 0, 0);
+    lisp_val_t interp_fn = os_make_instance(MAGIC_FUNCTION_INTERPRETED, 0, 0, 0);
+    lisp_val_t macro = os_make_instance(MAGIC_MACRO, 0, 0, 0);
+    assert(primitive_functionp(os_make_cons(native_fn, nil), nil) == g_sym_t, "ネイティブ関数はfunctionp=T");
+    assert(primitive_functionp(os_make_cons(interp_fn, nil), nil) == g_sym_t, "インタプリタ関数はfunctionp=T");
+    assert(primitive_functionp(os_make_cons(macro, nil), nil) == nil, "macroはfunctionp=nil");
+    assert(primitive_functionp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(functionp 1) はnil");
+}
+
+void test_primitive_generic_function_p() {
+    assert(primitive_generic_function_p(os_make_cons(os_make_fixnum(1), nil), nil) == nil,
+           "defgeneric/defmethodが無いため常にnil");
+}
+
+void test_primitive_array_and_vector_predicates() {
+    lisp_val_t vec1d = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
+    lisp_val_t dims2d = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
+    lisp_val_t vec2d = primitive_make_array(os_make_cons(dims2d, nil), nil);
+    lisp_val_t str = os_make_string("abc");
+
+    assert(primitive_basic_array_p(os_make_cons(vec1d, nil), nil) == g_sym_t, "1次元配列はbasic-array-p=T");
+    assert(primitive_basic_array_p(os_make_cons(vec2d, nil), nil) == g_sym_t, "2次元配列はbasic-array-p=T");
+    assert(primitive_basic_array_p(os_make_cons(str, nil), nil) == g_sym_t, "stringはbasic-array-p=T");
+    assert(primitive_basic_array_p(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(basic-array-p 1) はnil");
+
+    assert(primitive_array_star_p(os_make_cons(vec1d, nil), nil) == nil, "rank1の配列はarray*-p=nil");
+    assert(primitive_array_star_p(os_make_cons(vec2d, nil), nil) == g_sym_t, "rank2の配列はarray*-p=T");
+    assert(primitive_array_star_p(os_make_cons(str, nil), nil) == nil, "stringはarray*-p=nil");
+
+    assert(primitive_basic_vector_p(os_make_cons(vec1d, nil), nil) == g_sym_t, "rank1の配列はbasic-vector-p=T");
+    assert(primitive_basic_vector_p(os_make_cons(vec2d, nil), nil) == nil, "rank2の配列はbasic-vector-p=nil");
+    assert(primitive_basic_vector_p(os_make_cons(str, nil), nil) == g_sym_t, "stringはbasic-vector-p=T");
+
+    assert(primitive_general_vector_p(os_make_cons(vec1d, nil), nil) == g_sym_t, "rank1の配列はgeneral-vector-p=T");
+    assert(primitive_general_vector_p(os_make_cons(vec2d, nil), nil) == nil, "rank2の配列はgeneral-vector-p=nil");
+    assert(primitive_general_vector_p(os_make_cons(str, nil), nil) == nil,
+           "stringはbasic-vectorだがgeneral-vector-p=nil");
+}
+
+void test_primitive_streamp() {
+    lisp_val_t stream = os_make_instance(MAGIC_STREAM, 0, 0, 0);
+    assert(primitive_streamp(os_make_cons(stream, nil), nil) == g_sym_t, "streamはstreamp=T");
+    assert(primitive_streamp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(streamp 1) はnil");
+}
+
 void test_primitive_symbol_name() {
     lisp_val_t sym = os_make_symbol("foo");
     lisp_val_t name = primitive_symbol_name(os_make_cons(sym, nil), nil);
@@ -478,6 +576,15 @@ int main(int argc, char** argv) {
    test_primitive_numberp_and_fixnump();
    test_primitive_symbolp();
    test_primitive_consp();
+   test_primitive_eql();
+   test_primitive_equal();
+   test_primitive_listp();
+   test_primitive_characterp();
+   test_primitive_stringp();
+   test_primitive_functionp();
+   test_primitive_generic_function_p();
+   test_primitive_array_and_vector_predicates();
+   test_primitive_streamp();
    test_primitive_symbol_name();
    test_primitive_string_to_symbol();
    test_primitive_gensym();

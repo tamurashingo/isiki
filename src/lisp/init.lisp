@@ -427,6 +427,14 @@
                  (if (%%classp class-designator) class-designator (%find-class class-designator)))
       nil))
 
+;; instanceがclass(クラスオブジェクト)のインスタンスかどうか。
+;; 仕様上instancepはclassを評価済みのクラスオブジェクトとして受け取り(typepの
+;; クラス名designatorとは異なる)、クラスオブジェクトでなければdomain-errorを
+;; 発生させるべきだが、<domain-error>が未実装のため既存のtypep(designatorも
+;; クラスオブジェクトも受け付ける、緩い実装)にそのまま委譲する既知の簡略化とする。
+(defun instancep (instance class)
+  (typep instance class))
+
 ;;; --- エラー処理とコンディショナルシステム(最小実装): signal-condition / with-handler / error ---
 ;;;
 ;;; コンディションはILOSのインスタンスとして表現する(専用のC構造体は増やさない)。

@@ -410,6 +410,112 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。
+ * 仕様上eqとの違いは数値(同クラスかつ同値)と文字(同文字)の比較だが、本実装のfixnum/charは
+ * いずれも即値表現(同じ論理値なら同じビットパタン)であり、かつ浮動小数点数が未実装のため、
+ * 現状ではeqと完全に同じ判定になる(将来floatを追加する際に差が出る想定でeqとは別実装にしている)。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eql(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数EQUAL。第一引数と第二引数の構造的な同値性を判定する。
+ * CONS/STRING/VECTORは再帰的に内容を比較し、それ以外はeqと同じ判定にフォールバックする。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 構造的に同値ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数LISTP。第一引数がlist(nilまたはcons。ドットリストも含む)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return listならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CHARACTERP。第一引数がcharacterかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return characterならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_characterp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRINGP。第一引数がstringかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return stringならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数FUNCTIONP。第一引数が関数(MAGIC_FUNCTION_NATIVEまたはMAGIC_FUNCTION_INTERPRETED)
+ * かどうかを判定する。MAGIC_MACROは関数ではないため偽と判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 関数ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数GENERIC-FUNCTION-P。本実装にはdefgeneric/defmethodが存在せず
+ * generic function自体を表すオブジェクトが作れないため、常にnilを返す。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 常にnil
+ */
+lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数BASIC-ARRAY-P。第一引数がbasic-array(TAG_VECTORまたはTAG_STRING)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return basic-arrayならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数BASIC-ARRAY*-P / GENERAL-ARRAY*-P。第一引数がrank!=1のTAG_VECTORかどうかを
+ * 判定する。本実装では特殊化した配列型(bit-vector等)の区別が無く両クラスの外延が一致するため、
+ * 同じ実体を両方のシンボルに登録して共用する(NULLをNOTとして共用するのと同じパタン)。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return rank!=1のVECTORならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数BASIC-VECTOR-P。第一引数がbasic-vector(rank==1のTAG_VECTORまたはTAG_STRING)
+ * かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return basic-vectorならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_basic_vector_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数GENERAL-VECTOR-P。第一引数がgeneral-vector(rank==1のTAG_VECTOR)かどうかを
+ * 判定する。STRINGはbasic-vectorだがgeneral-vectorではないため除外する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return general-vectorならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_general_vector_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STREAMP。第一引数がstream(MAGIC_STREAM)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return streamならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_streamp(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数SYMBOL-NAME。第一引数のsymbolの名前をSTRINGとして返す。
  * @param args 評価済みの引数リスト(第一引数はSYMBOL)
  * @param env 呼び出し時の環境(未使用)

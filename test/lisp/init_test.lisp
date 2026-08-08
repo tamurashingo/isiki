@@ -346,3 +346,62 @@
       (assert-equal 'open-input-stream (car stream-form))
       (assert-equal (string-to-symbol "foo.lsp") (string-to-symbol (car (cdr stream-form))))))
   (assert-equal 'read (car (car (cdr (cdr expanded))))))
+
+;;; --- 述語 (not / eql / equal / listp / characterp / stringp / functionp /
+;;;     generic-function-p / basic-array-p系 / streamp / instancep) ---
+
+;; notはnullと同じ実体を共用しているので、単に登録名経由で呼べることを確認する
+(assert-equal t (not nil))
+(assert-equal nil (not 1))
+
+;; eqlは現状eqと同じ判定(fixnum/symbolは即値/internされているため)
+(assert-equal t (eql 1 1))
+(assert-equal t (eql 'a 'a))
+(assert-equal nil (eql 1 2))
+
+;; equalは別オブジェクトでも構造的に内容が同じならT
+(assert-equal t (equal (cons 1 (cons 2 nil)) (cons 1 (cons 2 nil))))
+(assert-equal nil (equal (cons 1 (cons 2 nil)) (cons 1 (cons 3 nil))))
+(assert-equal t (equal "aaa" (create-string 3 #\a)))
+(assert-equal nil (equal 1 'a))
+
+(assert-equal t (listp (cons 1 2)))
+(assert-equal t (listp nil))
+(assert-equal nil (listp 1))
+
+(assert-equal t (characterp #\a))
+(assert-equal nil (characterp 1))
+
+(assert-equal t (stringp "abc"))
+(assert-equal nil (stringp 1))
+
+(assert-equal t (functionp #'car))
+(assert-equal nil (functionp 1))
+
+;; defgeneric/defmethodが未実装のため常にnil
+(assert-equal nil (generic-function-p 1))
+
+(assert-equal t (basic-array-p (make-array 3)))
+(assert-equal t (basic-array-p "abc"))
+(assert-equal nil (basic-array-p 1))
+
+(assert-equal nil (basic-array*-p (make-array 3)))
+(assert-equal t (basic-array*-p (make-array '(2 3))))
+(assert-equal nil (general-array*-p (make-array 3)))
+(assert-equal t (general-array*-p (make-array '(2 3))))
+
+(assert-equal t (basic-vector-p (make-array 3)))
+(assert-equal t (basic-vector-p "abc"))
+(assert-equal nil (basic-vector-p (make-array '(2 3))))
+
+(assert-equal t (general-vector-p (make-array 3)))
+(assert-equal nil (general-vector-p "abc"))
+(assert-equal nil (general-vector-p (make-array '(2 3))))
+
+(assert-equal t (streamp (open-output-stream)))
+(assert-equal nil (streamp 1))
+
+;; instancep(既存のtypepに委譲、known limitation: domain-errorチェックは行わない)
+(assert-equal t (instancep (make-instance 'point3d) (class point3d)))
+(assert-equal t (instancep (make-instance 'point3d) (class point)))
+(assert-equal nil (instancep (make-instance 'point) (class point3d)))

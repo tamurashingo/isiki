@@ -372,6 +372,22 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("FIXNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnump), global_environment);
         os_set_function(os_make_symbol("SYMBOLP"), os_make_native_function((lisp_addr_t)(void *)primitive_symbolp), global_environment);
         os_set_function(os_make_symbol("CONSP"), os_make_native_function((lisp_addr_t)(void *)primitive_consp), global_environment);
+        os_set_function(os_make_symbol("EQL"), os_make_native_function((lisp_addr_t)(void *)primitive_eql), global_environment);
+        os_set_function(os_make_symbol("EQUAL"), os_make_native_function((lisp_addr_t)(void *)primitive_equal), global_environment);
+        // NOTはnullと仕様上完全に同一(「objがnilならt、それ以外はnil」)なので実体を共用する
+        os_set_function(os_make_symbol("NOT"), os_make_native_function((lisp_addr_t)(void *)primitive_null), global_environment);
+        os_set_function(os_make_symbol("LISTP"), os_make_native_function((lisp_addr_t)(void *)primitive_listp), global_environment);
+        os_set_function(os_make_symbol("CHARACTERP"), os_make_native_function((lisp_addr_t)(void *)primitive_characterp), global_environment);
+        os_set_function(os_make_symbol("STRINGP"), os_make_native_function((lisp_addr_t)(void *)primitive_stringp), global_environment);
+        os_set_function(os_make_symbol("FUNCTIONP"), os_make_native_function((lisp_addr_t)(void *)primitive_functionp), global_environment);
+        os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
+        os_set_function(os_make_symbol("BASIC-ARRAY-P"), os_make_native_function((lisp_addr_t)(void *)primitive_basic_array_p), global_environment);
+        // basic-array*-pとgeneral-array*-pは本実装では外延が一致するため実体を共用する
+        os_set_function(os_make_symbol("BASIC-ARRAY*-P"), os_make_native_function((lisp_addr_t)(void *)primitive_array_star_p), global_environment);
+        os_set_function(os_make_symbol("GENERAL-ARRAY*-P"), os_make_native_function((lisp_addr_t)(void *)primitive_array_star_p), global_environment);
+        os_set_function(os_make_symbol("BASIC-VECTOR-P"), os_make_native_function((lisp_addr_t)(void *)primitive_basic_vector_p), global_environment);
+        os_set_function(os_make_symbol("GENERAL-VECTOR-P"), os_make_native_function((lisp_addr_t)(void *)primitive_general_vector_p), global_environment);
+        os_set_function(os_make_symbol("STREAMP"), os_make_native_function((lisp_addr_t)(void *)primitive_streamp), global_environment);
         os_set_function(os_make_symbol("SYMBOL-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_symbol_name), global_environment);
         os_set_function(os_make_symbol("STRING-TO-SYMBOL"), os_make_native_function((lisp_addr_t)(void *)primitive_string_to_symbol), global_environment);
         os_set_function(os_make_symbol("GENSYM"), os_make_native_function((lisp_addr_t)(void *)primitive_gensym), global_environment);
@@ -1025,6 +1041,251 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
         return nil;
     }
     return (val & TAG_MASK) == TAG_CONS ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。
+ * 仕様上eqとの違いは数値・文字の値比較だが、本実装のfixnum/charは即値表現のため
+ * 現状ではeqと完全に同じ判定になる(floatが未実装のため差が生じない)。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eql(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t a = cc_car(args);
+    lisp_val_t b = cc_car(cc_cdr(args));
+    return a == b ? g_sym_t : nil;
+}
+
+/**
+ * a と b が構造的に同値かどうかを判定する(primitive_equalの再帰ヘルパー)。
+ * CONS/STRING/VECTORは内容を再帰的に比較し、それ以外(FIXNUM/SYMBOL/CHAR/INSTANCE等)は
+ * タグ一致のうえでa==bを要求する(実質eqと同じ)。
+ * @param a 比較対象1
+ * @param b 比較対象2
+ * @return 同値なら非0
+ */
+static int values_equal(lisp_val_t a, lisp_val_t b) {
+    if (a == b) {
+        return 1;
+    }
+
+    UINT64 tag_a = a & TAG_MASK;
+    UINT64 tag_b = b & TAG_MASK;
+    if (tag_a != tag_b) {
+        return 0;
+    }
+
+    switch (tag_a) {
+        case TAG_CONS:
+            return values_equal(cc_car(a), cc_car(b)) && values_equal(cc_cdr(a), cc_cdr(b));
+
+        case TAG_STRING: {
+            lisp_addr_t addr_a = a & ~TAG_MASK;
+            lisp_addr_t addr_b = b & ~TAG_MASK;
+            UINT64 len_a = ((lisp_val_t *)addr_a)[0];
+            UINT64 len_b = ((lisp_val_t *)addr_b)[0];
+            if (len_a != len_b) {
+                return 0;
+            }
+            UINT8 *bytes_a = (UINT8 *)(addr_a + 8);
+            UINT8 *bytes_b = (UINT8 *)(addr_b + 8);
+            for (UINT64 i = 0; i < len_a; i++) {
+                if (bytes_a[i] != bytes_b[i]) {
+                    return 0;
+                }
+            }
+            return 1;
+        }
+
+        case TAG_VECTOR: {
+            lisp_addr_t addr_a = a & ~TAG_MASK;
+            lisp_addr_t addr_b = b & ~TAG_MASK;
+            lisp_val_t *header_a = (lisp_val_t *)addr_a;
+            lisp_val_t *header_b = (lisp_val_t *)addr_b;
+            UINT64 rank_a = header_a[0];
+            UINT64 rank_b = header_b[0];
+            if (rank_a != rank_b) {
+                return 0;
+            }
+            UINT64 total = 1;
+            for (UINT64 i = 0; i < rank_a; i++) {
+                if (header_a[1 + i] != header_b[1 + i]) {
+                    return 0;
+                }
+                total *= header_a[1 + i];
+            }
+            lisp_val_t *data_a = (lisp_val_t *)(addr_a + 8 * (1 + rank_a));
+            lisp_val_t *data_b = (lisp_val_t *)(addr_b + 8 * (1 + rank_b));
+            for (UINT64 i = 0; i < total; i++) {
+                if (!values_equal(data_a[i], data_b[i])) {
+                    return 0;
+                }
+            }
+            return 1;
+        }
+
+        default:
+            return 0;
+    }
+}
+
+/**
+ * 組み込み関数EQUAL。第一引数と第二引数の構造的な同値性を判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 構造的に同値ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_equal(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t a = cc_car(args);
+    lisp_val_t b = cc_car(cc_cdr(args));
+    return values_equal(a, b) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数LISTP。第一引数がlist(nilまたはcons。ドットリストも含む)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return listならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if (val == nil) {
+        return g_sym_t;
+    }
+    return (val & TAG_MASK) == TAG_CONS ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数CHARACTERP。第一引数がcharacterかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return characterならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_characterp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    return (val & TAG_MASK) == TAG_CHAR ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数STRINGP。第一引数がstringかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return stringならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    return (val & TAG_MASK) == TAG_STRING ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数FUNCTIONP。第一引数が関数(MAGIC_FUNCTION_NATIVEまたはMAGIC_FUNCTION_INTERPRETED)
+ * かどうかを判定する。MAGIC_MACROは関数ではないため偽と判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return 関数ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return (obj[0] == MAGIC_FUNCTION_NATIVE || obj[0] == MAGIC_FUNCTION_INTERPRETED) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数GENERIC-FUNCTION-P。本実装にはdefgeneric/defmethodが存在せず
+ * generic function自体を表すオブジェクトが作れないため、常にnilを返す。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 常にnil
+ */
+lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env) {
+    return nil;
+}
+
+/**
+ * 組み込み関数BASIC-ARRAY-P。第一引数がbasic-array(TAG_VECTORまたはTAG_STRING)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return basic-arrayならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    UINT64 tag = val & TAG_MASK;
+    return (tag == TAG_VECTOR || tag == TAG_STRING) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数BASIC-ARRAY*-P / GENERAL-ARRAY*-P。第一引数がrank!=1のTAG_VECTORかどうかを
+ * 判定する。本実装では特殊化した配列型の区別が無く両クラスの外延が一致するため、
+ * 同じ実体を両方のシンボルに登録して共用する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return rank!=1のVECTORならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_VECTOR) {
+        return nil;
+    }
+    lisp_addr_t addr = val & ~TAG_MASK;
+    UINT64 rank = ((lisp_val_t *)addr)[0];
+    return rank != 1 ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数BASIC-VECTOR-P。第一引数がbasic-vector(rank==1のTAG_VECTORまたはTAG_STRING)
+ * かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return basic-vectorならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_basic_vector_p(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    UINT64 tag = val & TAG_MASK;
+    if (tag == TAG_STRING) {
+        return g_sym_t;
+    }
+    if (tag != TAG_VECTOR) {
+        return nil;
+    }
+    lisp_addr_t addr = val & ~TAG_MASK;
+    UINT64 rank = ((lisp_val_t *)addr)[0];
+    return rank == 1 ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数GENERAL-VECTOR-P。第一引数がgeneral-vector(rank==1のTAG_VECTOR)かどうかを
+ * 判定する。STRINGはbasic-vectorだがgeneral-vectorではないため除外する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return general-vectorならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_general_vector_p(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_VECTOR) {
+        return nil;
+    }
+    lisp_addr_t addr = val & ~TAG_MASK;
+    UINT64 rank = ((lisp_val_t *)addr)[0];
+    return rank == 1 ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数STREAMP。第一引数がstream(MAGIC_STREAM)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return streamならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_streamp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return obj[0] == MAGIC_STREAM ? g_sym_t : nil;
 }
 
 /**
