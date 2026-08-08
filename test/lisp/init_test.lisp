@@ -589,3 +589,21 @@
 ;; bignum境界: 1152921504606846975(FIXNUM_MAGNITUDE_MASK)の2乗の平方根が元に戻る
 (assert-equal t (= 1152921504606846975 (isqrt (* 1152921504606846975 1152921504606846975))))
 (assert-equal t (= 1152921504606846975 (isqrt (+ 1 (* 1152921504606846975 1152921504606846975)))))
+
+;;; --- character class (§20): char= ・char/= ・char< ・char> ・char<= ・char>= ---
+
+(assert-equal t (char= #\a #\a))
+(assert-equal nil (char= #\a #\b))
+(assert-equal nil (char= #\a #\A))
+(assert-equal nil (char/= #\a #\a))
+(assert-equal t (char/= #\a #\b))
+(assert-equal nil (char< #\a #\a))
+(assert-equal t (char< #\a #\b))
+(assert-equal nil (char< #\b #\a))
+(assert-equal t (char> #\b #\a))
+(assert-equal t (char<= #\a #\a))
+(assert-equal t (char>= #\b #\a))
+(assert-equal t (char>= #\a #\a))
+;; 3引数以上の隣接ペア連鎖(既存の数値比較と同じ流儀)
+(assert-equal t (char< #\a #\b #\c))
+(assert-equal nil (char< #\a #\c #\b))

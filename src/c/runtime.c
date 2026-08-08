@@ -392,6 +392,12 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("NOT"), os_make_native_function((lisp_addr_t)(void *)primitive_null), global_environment);
         os_set_function(os_make_symbol("LISTP"), os_make_native_function((lisp_addr_t)(void *)primitive_listp), global_environment);
         os_set_function(os_make_symbol("CHARACTERP"), os_make_native_function((lisp_addr_t)(void *)primitive_characterp), global_environment);
+        os_set_function(os_make_symbol("CHAR="), os_make_native_function((lisp_addr_t)(void *)primitive_char_equal), global_environment);
+        os_set_function(os_make_symbol("CHAR/="), os_make_native_function((lisp_addr_t)(void *)primitive_char_not_equal), global_environment);
+        os_set_function(os_make_symbol("CHAR<"), os_make_native_function((lisp_addr_t)(void *)primitive_char_less_than), global_environment);
+        os_set_function(os_make_symbol("CHAR>"), os_make_native_function((lisp_addr_t)(void *)primitive_char_greater_than), global_environment);
+        os_set_function(os_make_symbol("CHAR<="), os_make_native_function((lisp_addr_t)(void *)primitive_char_less_equal), global_environment);
+        os_set_function(os_make_symbol("CHAR>="), os_make_native_function((lisp_addr_t)(void *)primitive_char_greater_equal), global_environment);
         os_set_function(os_make_symbol("STRINGP"), os_make_native_function((lisp_addr_t)(void *)primitive_stringp), global_environment);
         os_set_function(os_make_symbol("FUNCTIONP"), os_make_native_function((lisp_addr_t)(void *)primitive_functionp), global_environment);
         os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
@@ -2053,6 +2059,109 @@ lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_characterp(lisp_val_t args, lisp_val_t env) {
     lisp_val_t val = cc_car(args);
     return (val & TAG_MASK) == TAG_CHAR ? g_sym_t : nil;
+}
+
+/**
+ * 2つのCHARの大小を比較する(即値の上位ビットを(UINT8)にキャストしてASCIIコード同士を
+ * 比較する。0-9/A-Z/a-zの範囲では仕様(§20)の順序と一致する)。
+ * @return a<bなら負、a==bなら0、a>bなら正
+ */
+static int char_compare(lisp_val_t a, lisp_val_t b) {
+    int code_a = (int)(UINT8)(a >> 3);
+    int code_b = (int)(UINT8)(b >> 3);
+    return code_a - code_b;
+}
+
+/**
+ * 組み込み関数CHAR=。argsがすべて同じ文字かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return すべて等しいならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数CHAR/=。argsの隣接する要素同士がすべて等しくないかどうかを判定する
+ * (厳密な仕様の「全要素が相異なる」ではなく、既存の数値比較の/=と同様に隣接ペア判定に
+ * 簡略化している点に注意)。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_not_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数CHAR<。argsが単調増加(a<b<c<...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_less_than(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数CHAR>。argsが単調減少(a>b>c>...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_greater_than(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数CHAR<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_less_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数CHAR>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_greater_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
 }
 
 /**

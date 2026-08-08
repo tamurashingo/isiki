@@ -574,6 +574,36 @@ void test_primitive_characterp() {
     assert(primitive_characterp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(characterp 1) はnil");
 }
 
+void test_primitive_char_comparisons() {
+    lisp_val_t aa[2] = {os_make_char('a'), os_make_char('a')};
+    lisp_val_t ab[2] = {os_make_char('a'), os_make_char('b')};
+    lisp_val_t ba[2] = {os_make_char('b'), os_make_char('a')};
+    lisp_val_t a_upper_a[2] = {os_make_char('a'), os_make_char('A')};
+
+    assert(primitive_char_equal(make_arg_list_vals(2, aa), nil) == g_sym_t, "(char= #\\a #\\a) はT");
+    assert(primitive_char_equal(make_arg_list_vals(2, ab), nil) == nil, "(char= #\\a #\\b) はnil");
+    assert(primitive_char_equal(make_arg_list_vals(2, a_upper_a), nil) == nil, "(char= #\\a #\\A) はnil(大文字小文字を区別する)");
+
+    assert(primitive_char_not_equal(make_arg_list_vals(2, aa), nil) == nil, "(char/= #\\a #\\a) はnil");
+    assert(primitive_char_not_equal(make_arg_list_vals(2, ab), nil) == g_sym_t, "(char/= #\\a #\\b) はT");
+
+    assert(primitive_char_less_than(make_arg_list_vals(2, aa), nil) == nil, "(char< #\\a #\\a) はnil");
+    assert(primitive_char_less_than(make_arg_list_vals(2, ab), nil) == g_sym_t, "(char< #\\a #\\b) はT");
+    assert(primitive_char_less_than(make_arg_list_vals(2, ba), nil) == nil, "(char< #\\b #\\a) はnil");
+
+    assert(primitive_char_greater_than(make_arg_list_vals(2, ba), nil) == g_sym_t, "(char> #\\b #\\a) はT");
+
+    assert(primitive_char_less_equal(make_arg_list_vals(2, aa), nil) == g_sym_t, "(char<= #\\a #\\a) はT");
+    assert(primitive_char_greater_equal(make_arg_list_vals(2, ba), nil) == g_sym_t, "(char>= #\\b #\\a) はT");
+    assert(primitive_char_greater_equal(make_arg_list_vals(2, aa), nil) == g_sym_t, "(char>= #\\a #\\a) はT");
+
+    // 3引数以上の隣接ペア連鎖
+    lisp_val_t abc[3] = {os_make_char('a'), os_make_char('b'), os_make_char('c')};
+    assert(primitive_char_less_than(make_arg_list_vals(3, abc), nil) == g_sym_t, "(char< #\\a #\\b #\\c) はT");
+    lisp_val_t acb[3] = {os_make_char('a'), os_make_char('c'), os_make_char('b')};
+    assert(primitive_char_less_than(make_arg_list_vals(3, acb), nil) == nil, "(char< #\\a #\\c #\\b) はnil");
+}
+
 void test_primitive_stringp() {
     assert(primitive_stringp(os_make_cons(os_make_string("abc"), nil), nil) == g_sym_t, "(stringp \"abc\") はT");
     assert(primitive_stringp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(stringp 1) はnil");
@@ -872,6 +902,7 @@ int main(int argc, char** argv) {
    test_primitive_eql_and_equal_bignum();
    test_primitive_listp();
    test_primitive_characterp();
+   test_primitive_char_comparisons();
    test_primitive_stringp();
    test_primitive_functionp();
    test_primitive_generic_function_p();

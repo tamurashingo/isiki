@@ -607,6 +607,56 @@ lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_characterp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数CHAR=。argsがすべて同じ文字かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return すべて等しいならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CHAR/=。argsの隣接する要素同士がすべて等しくないかどうかを判定する
+ * (厳密な仕様の「全要素が相異なる」ではなく、既存の数値比較の/=と同様に隣接ペア判定に
+ * 簡略化している点に注意)。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_not_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CHAR<。argsが単調増加(a<b<c<...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_less_than(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CHAR>。argsが単調減少(a>b>c>...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_greater_than(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CHAR<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_less_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CHAR>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてCHAR)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_char_greater_equal(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数STRINGP。第一引数がstringかどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
