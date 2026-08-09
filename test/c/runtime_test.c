@@ -681,14 +681,14 @@ void test_primitive_gensym() {
 
 void test_primitive_make_array_1d() {
     lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
-    assert((array & TAG_MASK) == TAG_VECTOR, "(make-array 3)の戻り値はTAG_VECTORを持つ");
+    assert((array & TAG_MASK) == TAG_INSTANCE, "(make-array 3)の戻り値はTAG_INSTANCEを持つ");
+    assert(((UINT64 *)(array & ~TAG_MASK))[0] == MAGIC_VECTOR, "(make-array 3)の戻り値はMAGIC_VECTORを持つ");
 
-    lisp_addr_t addr = array & ~TAG_MASK;
-    lisp_val_t *header = (lisp_val_t *)addr;
+    lisp_val_t *header = os_vector_header(array);
     assert(header[0] == 1, "1次元配列のrankは1");
     assert(header[1] == 3, "次元のサイズは3");
 
-    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + 1));
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + 1));
     for (int i = 0; i < 3; i++) {
         assert(data[i] == nil, "要素はすべてnilで初期化される");
     }
@@ -697,15 +697,15 @@ void test_primitive_make_array_1d() {
 void test_primitive_make_array_multi_dim() {
     lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
-    assert((array & TAG_MASK) == TAG_VECTOR, "(make-array '(2 3))の戻り値はTAG_VECTORを持つ");
+    assert((array & TAG_MASK) == TAG_INSTANCE, "(make-array '(2 3))の戻り値はTAG_INSTANCEを持つ");
+    assert(((UINT64 *)(array & ~TAG_MASK))[0] == MAGIC_VECTOR, "(make-array '(2 3))の戻り値はMAGIC_VECTORを持つ");
 
-    lisp_addr_t addr = array & ~TAG_MASK;
-    lisp_val_t *header = (lisp_val_t *)addr;
+    lisp_val_t *header = os_vector_header(array);
     assert(header[0] == 2, "2次元配列のrankは2");
     assert(header[1] == 2, "1次元目のサイズは2");
     assert(header[2] == 3, "2次元目のサイズは3");
 
-    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + 2));
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + 2));
     for (int i = 0; i < 6; i++) {
         assert(data[i] == nil, "要素はすべてnilで初期化される");
     }
@@ -748,6 +748,46 @@ void test_primitive_aref_out_of_bounds() {
     lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
     lisp_val_t args = os_make_cons(array, os_make_cons(os_make_fixnum(3), nil));
     assert(primitive_aref(args, nil) == g_sym_eval_error, "(aref a 3)は範囲外なのでg_sym_eval_error");
+}
+
+void test_primitive_vector() {
+    lisp_val_t args = os_make_cons(os_make_symbol("a"),
+        os_make_cons(os_make_symbol("b"), os_make_cons(os_make_symbol("c"), nil)));
+    lisp_val_t vec = primitive_vector(args, nil);
+    assert((vec & TAG_MASK) == TAG_INSTANCE, "(vector 'a 'b 'c)の戻り値はTAG_INSTANCEを持つ");
+    assert(((UINT64 *)(vec & ~TAG_MASK))[0] == MAGIC_VECTOR, "(vector 'a 'b 'c)の戻り値はMAGIC_VECTORを持つ");
+
+    lisp_val_t *header = os_vector_header(vec);
+    assert(header[0] == 1, "(vector 'a 'b 'c)のrankは1");
+    assert(header[1] == 3, "(vector 'a 'b 'c)の長さは3");
+
+    lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil));
+    assert(primitive_aref(aref_args, nil) == os_make_symbol("b"), "(aref (vector 'a 'b 'c) 1)は'b");
+
+    lisp_val_t empty = primitive_vector(nil, nil);
+    assert(primitive_length(os_make_cons(empty, nil), nil) >> 3 == 0, "(vector)は空のvectorを返す");
+}
+
+void test_primitive_create_vector() {
+    lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
+    assert(primitive_length(os_make_cons(vec, nil), nil) >> 3 == 3, "(create-vector 3)の長さは3");
+    lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(0), nil));
+    assert(primitive_aref(aref_args, nil) == nil, "初期値省略時は各要素がnil");
+
+    lisp_val_t vec_filled = primitive_create_vector(
+        os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(99), nil)), nil);
+    lisp_val_t aref_args2 = os_make_cons(vec_filled, os_make_cons(os_make_fixnum(1), nil));
+    assert(primitive_aref(aref_args2, nil) >> 3 == 99, "初期値指定時は各要素がその値で初期化される");
+}
+
+void test_primitive_garef_set_garef() {
+    lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
+    lisp_val_t set_args = os_make_cons(vec,
+        os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(42), nil)));
+    assert(primitive_set_aref(set_args, nil) >> 3 == 42, "set-garefはset-arefと同じ実体で書き込める");
+
+    lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil));
+    assert(primitive_aref(aref_args, nil) >> 3 == 42, "garefはarefと同じ実体で読み込める");
 }
 
 void test_primitive_set_car() {
@@ -916,6 +956,9 @@ int main(int argc, char** argv) {
    test_primitive_array_dimensions();
    test_primitive_aref_reads_back_value();
    test_primitive_aref_out_of_bounds();
+   test_primitive_vector();
+   test_primitive_create_vector();
+   test_primitive_garef_set_garef();
    test_primitive_set_car();
    test_primitive_set_cdr();
    test_primitive_set_aref_out_of_bounds();

@@ -17,8 +17,7 @@
 #define TAG_STRING   0x4ULL
 /** instance(function/process等)へのアドレス(101) */
 #define TAG_INSTANCE 0x5ULL
-/** 多次元配列(general array)へのアドレス(110) */
-#define TAG_VECTOR   0x6ULL
+/* 0x6(110)・0x7(111)は将来のために予約し、割り当てない */
 
 /** TAG_FIXNUMの値フィールド最上位bit(bit63)。1なら負数を表す(0は常に非負に正規化) */
 #define FIXNUM_SIGN_BIT       0x8000000000000000ULL
@@ -40,7 +39,7 @@
 #define MAGIC_STREAM               0x6ULL
 /** TAG_INSTANCEのword0に入る、ILOSのクラスオブジェクトであることを示すMAGIC NUMBER。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
 #define MAGIC_CLASS                0x7ULL
-/** TAG_INSTANCEのword0に入る、ILOSのクラスインスタンスであることを示すMAGIC NUMBER。word1=class、word2=slots-vector(TAG_VECTOR)、word3=未使用 */
+/** TAG_INSTANCEのword0に入る、ILOSのクラスインスタンスであることを示すMAGIC NUMBER。word1=class、word2=slots-vector(MAGIC_VECTOR)、word3=未使用 */
 #define MAGIC_CLASS_INSTANCE       0x8ULL
 /** TAG_INSTANCEのword0に入る、catch/throwの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(evalされた値)、word2=throwされた値 */
 #define MAGIC_CATCH_EXIT           0x9ULL
@@ -48,6 +47,8 @@
 #define MAGIC_GO_EXIT              0xAULL
 /** TAG_INSTANCEのword0に入る、60bitを超える整数(bignum)であることを示すMAGIC NUMBER。word1=sign(0:非負/1:負)、word2=limb数、word3=limb配列(基数2^32、下位32bitのみ使用、limbs[0]が最下位)への生ポインタ */
 #define MAGIC_BIGNUM               0xBULL
+/** TAG_INSTANCEのword0に入る、多次元配列(vector/general array)であることを示すMAGIC NUMBER。word1=配列本体(rank+各次元サイズ+要素データを格納した可変長ブロック)への生ポインタ、word2/word3=未使用 */
+#define MAGIC_VECTOR               0xCULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -683,7 +684,7 @@ lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数BASIC-ARRAY-P。第一引数がbasic-array(TAG_VECTORまたはTAG_STRING)かどうかを判定する。
+ * 組み込み関数BASIC-ARRAY-P。第一引数がbasic-array(MAGIC_VECTORまたはTAG_STRING)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return basic-arrayならg_sym_t、そうでなければnil
@@ -691,7 +692,7 @@ lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数BASIC-ARRAY*-P / GENERAL-ARRAY*-P。第一引数がrank!=1のTAG_VECTORかどうかを
+ * 組み込み関数BASIC-ARRAY*-P / GENERAL-ARRAY*-P。第一引数がrank!=1のMAGIC_VECTORかどうかを
  * 判定する。本実装では特殊化した配列型(bit-vector等)の区別が無く両クラスの外延が一致するため、
  * 同じ実体を両方のシンボルに登録して共用する(NULLをNOTとして共用するのと同じパタン)。
  * @param args 評価済みの引数リスト
@@ -701,7 +702,7 @@ lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数BASIC-VECTOR-P。第一引数がbasic-vector(rank==1のTAG_VECTORまたはTAG_STRING)
+ * 組み込み関数BASIC-VECTOR-P。第一引数がbasic-vector(rank==1のMAGIC_VECTORまたはTAG_STRING)
  * かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -710,7 +711,7 @@ lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_basic_vector_p(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数GENERAL-VECTOR-P。第一引数がgeneral-vector(rank==1のTAG_VECTOR)かどうかを
+ * 組み込み関数GENERAL-VECTOR-P。第一引数がgeneral-vector(rank==1のMAGIC_VECTOR)かどうかを
  * 判定する。STRINGはbasic-vectorだがgeneral-vectorではないため除外する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -801,6 +802,40 @@ lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env);
 
 /**
+ * listの各要素をそのままデータとするrank1のVECTOR(MAGIC_VECTOR)を構築する。
+ * 組み込み関数VECTORとreader.cの`#(...)`リテラルの両方から使う共通コンストラクタ。
+ * @param list 要素を並べたconsリスト
+ * @return 構築したVECTOR
+ */
+lisp_val_t os_make_vector_from_list(lisp_val_t list);
+
+/**
+ * VECTOR(TAG_INSTANCE+MAGIC_VECTOR)から、内部の可変長ブロック(rank+dims+data)の
+ * 先頭へのポインタを取り出す。print.c等、runtime.c外からVECTORの内部表現に
+ * アクセスする必要がある箇所向けの公開版。
+ * @param vec VECTOR
+ * @return ブロック先頭へのポインタ(word0=rank, word[1..rank]=各次元のサイズ, word[rank+1..]=データ)
+ */
+lisp_val_t *os_vector_header(lisp_val_t vec);
+
+/**
+ * 組み込み関数VECTOR。評価済みの引数列をそのまま要素とするrank1のgeneral-vectorを返す。
+ * @param args 評価済みの引数リスト(すべて要素として使う)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 構築したVECTOR
+ */
+lisp_val_t primitive_vector(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CREATE-VECTOR。第一引数の長さ(FIXNUM)のgeneral-vectorを確保する。
+ * 第二引数(省略可)を指定すると全要素をその値で初期化する(省略時はnil)。
+ * @param args 評価済みの引数リスト(第一引数はFIXNUM、第二引数は省略可)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したVECTOR
+ */
+lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数CREATE-STRING。第一引数の長さ(FIXNUM)のSTRINGを確保する。
  * 第二引数(省略可、CHAR)を指定すると全要素をその文字で初期化する(省略時は空白)。
  * @param args 評価済みの引数リスト(第一引数はFIXNUM、第二引数は省略可のCHAR)
@@ -868,7 +903,7 @@ lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数%%MAKE-INSTANCE-RAW。ILOSクラスインスタンス(MAGIC_CLASS_INSTANCE)を確保する。
- * @param args 評価済みの引数リスト(class クラスオブジェクト, slots-vector TAG_VECTOR)
+ * @param args 評価済みの引数リスト(class クラスオブジェクト, slots-vector MAGIC_VECTOR)
  * @param env 呼び出し時の環境(未使用)
  * @return 確保したクラスインスタンス
  */
@@ -883,10 +918,10 @@ lisp_val_t primitive_make_instance_raw(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_instance_class(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数%%INSTANCE-SLOTS。ILOSクラスインスタンスのslots-vector(TAG_VECTOR)を返す。
+ * 組み込み関数%%INSTANCE-SLOTS。ILOSクラスインスタンスのslots-vector(MAGIC_VECTOR)を返す。
  * @param args 評価済みの引数リスト(第一引数はクラスインスタンス)
  * @param env 呼び出し時の環境(未使用)
- * @return slots-vector(TAG_VECTOR)
+ * @return slots-vector(MAGIC_VECTOR)
  */
 lisp_val_t primitive_instance_slots(lisp_val_t args, lisp_val_t env);
 

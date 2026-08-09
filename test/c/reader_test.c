@@ -562,6 +562,37 @@ void test_os_read_function_sugar() {
     assert(cc_cdr(cc_cdr(v)) == nil, "#'carのcddrはnil");
 }
 
+void test_os_read_vector_literal() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#(1 2 3)");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "#(1 2 3)はTAG_INSTANCEを持つ");
+    assert(((UINT64 *)(v & ~TAG_MASK))[0] == MAGIC_VECTOR, "#(1 2 3)はMAGIC_VECTORを持つ");
+
+    lisp_val_t *header = os_vector_header(v);
+    assert(header[0] == 1, "#(1 2 3)のrankは1");
+    assert(header[1] == 3, "#(1 2 3)の長さは3");
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 16);
+    assert(data[0] == os_make_fixnum(1), "#(1 2 3)の1番目は1");
+    assert(data[1] == os_make_fixnum(2), "#(1 2 3)の2番目は2");
+    assert(data[2] == os_make_fixnum(3), "#(1 2 3)の3番目は3");
+}
+
+void test_os_read_empty_vector_literal() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#()");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "#()はTAG_INSTANCEを持つ");
+    assert(((UINT64 *)(v & ~TAG_MASK))[0] == MAGIC_VECTOR, "#()はMAGIC_VECTORを持つ");
+    lisp_val_t *header = os_vector_header(v);
+    assert(header[0] == 1, "#()のrankは1");
+    assert(header[1] == 0, "#()の長さは0");
+}
+
 void test_os_read_char_literal_simple() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
@@ -658,6 +689,8 @@ int main(int argc, char** argv) {
     test_os_read_comment_immediately_after_token();
     test_os_read_multiline_list_with_comment_line();
     test_os_read_function_sugar();
+    test_os_read_vector_literal();
+    test_os_read_empty_vector_literal();
     test_os_read_char_literal_simple();
     test_os_read_char_literal_paren();
     test_os_read_char_literal_space();

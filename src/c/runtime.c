@@ -20,7 +20,7 @@
  * #define TAG_CHAR     0x3ULL   // 011 即値
  * #define TAG_STRING   0x4ULL   // 100 アドレス
  * #define TAG_INSTANCE 0x5ULL   // 101 アドレス
- * #define TAG_VECTOR   0x6ULL   // 110 アドレス
+ *                               // 110 予約
  *                               // 111 予約
  *
  * ---- タグ別メモリ配置 ----
@@ -62,13 +62,12 @@
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
  *    - word2: MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
  *    - word3: MAGIC_FUNCTION_INTERPRETEDの場合: 定義時の環境のアドレス
- *
- * TAG_VECTOR: アドレス、ヒープ可変長(8*(1+rank+total)byte, 8byte境界に整列)
- *  [ vector-addr(61bit) .............................. ][1 1 0]
- *    多次元配列(general array)のアドレスが入っている
- *    - word0:          次元数(rank、タグなしの整数)
- *    - word[1..rank]:  各次元のサイズ(タグなしの整数)
- *    - word[rank+1..]: 要素本体(タグ付きのlisp_val_t、行優先(row-major)順)
+ *             MAGIC_VECTORの場合: word1に多次元配列(general array)本体への生ポインタを
+ *             持つ(ヒープ可変長、8*(1+rank+total)byte、8byte境界に整列)。
+ *             本体のレイアウトは以下の通り:
+ *               - word0:          次元数(rank、タグなしの整数)
+ *               - word[1..rank]:  各次元のサイズ(タグなしの整数)
+ *               - word[rank+1..]: 要素本体(タグ付きのlisp_val_t、行優先(row-major)順)
  *
  */
 
@@ -417,6 +416,12 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("SET-CAR"), os_make_native_function((lisp_addr_t)(void *)primitive_set_car), global_environment);
         os_set_function(os_make_symbol("SET-CDR"), os_make_native_function((lisp_addr_t)(void *)primitive_set_cdr), global_environment);
         os_set_function(os_make_symbol("SET-AREF"), os_make_native_function((lisp_addr_t)(void *)primitive_set_aref), global_environment);
+        os_set_function(os_make_symbol("VECTOR"), os_make_native_function((lisp_addr_t)(void *)primitive_vector), global_environment);
+        os_set_function(os_make_symbol("CREATE-VECTOR"), os_make_native_function((lisp_addr_t)(void *)primitive_create_vector), global_environment);
+        // GAREF/SET-GAREFはgeneral-array限定のaref/set-arefだが、本実装には
+        // 配列のサブタイプが無く外延が一致するため、同じ実体を別シンボル名で共用する
+        os_set_function(os_make_symbol("GAREF"), os_make_native_function((lisp_addr_t)(void *)primitive_aref), global_environment);
+        os_set_function(os_make_symbol("SET-GAREF"), os_make_native_function((lisp_addr_t)(void *)primitive_set_aref), global_environment);
         os_set_function(os_make_symbol("CREATE-STRING"), os_make_native_function((lisp_addr_t)(void *)primitive_create_string), global_environment);
         os_set_function(os_make_symbol("STRING-ELT"), os_make_native_function((lisp_addr_t)(void *)primitive_string_elt), global_environment);
         os_set_function(os_make_symbol("LENGTH"), os_make_native_function((lisp_addr_t)(void *)primitive_length), global_environment);
@@ -1940,6 +1945,12 @@ lisp_val_t primitive_eql(lisp_val_t args, lisp_val_t env) {
     return nil;
 }
 
+// VECTOR(TAG_INSTANCE+MAGIC_VECTOR)からブロック先頭へのポインタを取り出す/valがVECTORか
+// どうかを判定する。定義はprimitive_make_array直前だが、values_equalおよび
+// basic-array-p等の各predicateから先に使うため前方宣言する
+static lisp_val_t *vector_header(lisp_val_t vec);
+static int is_vector(lisp_val_t val);
+
 /**
  * a と b が構造的に同値かどうかを判定する(primitive_equalの再帰ヘルパー)。
  * CONS/STRING/VECTORは内容を再帰的に比較し、それ以外(FIXNUM/SYMBOL/CHAR/INSTANCE等)は
@@ -1981,38 +1992,35 @@ static int values_equal(lisp_val_t a, lisp_val_t b) {
             return 1;
         }
 
-        case TAG_VECTOR: {
-            lisp_addr_t addr_a = a & ~TAG_MASK;
-            lisp_addr_t addr_b = b & ~TAG_MASK;
-            lisp_val_t *header_a = (lisp_val_t *)addr_a;
-            lisp_val_t *header_b = (lisp_val_t *)addr_b;
-            UINT64 rank_a = header_a[0];
-            UINT64 rank_b = header_b[0];
-            if (rank_a != rank_b) {
-                return 0;
-            }
-            UINT64 total = 1;
-            for (UINT64 i = 0; i < rank_a; i++) {
-                if (header_a[1 + i] != header_b[1 + i]) {
-                    return 0;
-                }
-                total *= header_a[1 + i];
-            }
-            lisp_val_t *data_a = (lisp_val_t *)(addr_a + 8 * (1 + rank_a));
-            lisp_val_t *data_b = (lisp_val_t *)(addr_b + 8 * (1 + rank_b));
-            for (UINT64 i = 0; i < total; i++) {
-                if (!values_equal(data_a[i], data_b[i])) {
-                    return 0;
-                }
-            }
-            return 1;
-        }
-
         case TAG_INSTANCE: {
             UINT64 *obj_a = (UINT64 *)(a & ~TAG_MASK);
             UINT64 *obj_b = (UINT64 *)(b & ~TAG_MASK);
             if (obj_a[0] == MAGIC_BIGNUM && obj_b[0] == MAGIC_BIGNUM) {
                 return bignum_equal(obj_a, obj_b);
+            }
+            if (obj_a[0] == MAGIC_VECTOR && obj_b[0] == MAGIC_VECTOR) {
+                lisp_val_t *header_a = vector_header(a);
+                lisp_val_t *header_b = vector_header(b);
+                UINT64 rank_a = header_a[0];
+                UINT64 rank_b = header_b[0];
+                if (rank_a != rank_b) {
+                    return 0;
+                }
+                UINT64 total = 1;
+                for (UINT64 i = 0; i < rank_a; i++) {
+                    if (header_a[1 + i] != header_b[1 + i]) {
+                        return 0;
+                    }
+                    total *= header_a[1 + i];
+                }
+                lisp_val_t *data_a = (lisp_val_t *)((lisp_addr_t)header_a + 8 * (1 + rank_a));
+                lisp_val_t *data_b = (lisp_val_t *)((lisp_addr_t)header_b + 8 * (1 + rank_b));
+                for (UINT64 i = 0; i < total; i++) {
+                    if (!values_equal(data_a[i], data_b[i])) {
+                        return 0;
+                    }
+                }
+                return 1;
             }
             return 0;
         }
@@ -2204,7 +2212,7 @@ lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数BASIC-ARRAY-P。第一引数がbasic-array(TAG_VECTORまたはTAG_STRING)かどうかを判定する。
+ * 組み込み関数BASIC-ARRAY-P。第一引数がbasic-array(MAGIC_VECTORまたはTAG_STRING)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return basic-arrayならg_sym_t、そうでなければnil
@@ -2212,11 +2220,11 @@ lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env) {
     lisp_val_t val = cc_car(args);
     UINT64 tag = val & TAG_MASK;
-    return (tag == TAG_VECTOR || tag == TAG_STRING) ? g_sym_t : nil;
+    return (is_vector(val) || tag == TAG_STRING) ? g_sym_t : nil;
 }
 
 /**
- * 組み込み関数BASIC-ARRAY*-P / GENERAL-ARRAY*-P。第一引数がrank!=1のTAG_VECTORかどうかを
+ * 組み込み関数BASIC-ARRAY*-P / GENERAL-ARRAY*-P。第一引数がrank!=1のMAGIC_VECTORかどうかを
  * 判定する。本実装では特殊化した配列型の区別が無く両クラスの外延が一致するため、
  * 同じ実体を両方のシンボルに登録して共用する。
  * @param args 評価済みの引数リスト
@@ -2225,16 +2233,15 @@ lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env) {
     lisp_val_t val = cc_car(args);
-    if ((val & TAG_MASK) != TAG_VECTOR) {
+    if (!is_vector(val)) {
         return nil;
     }
-    lisp_addr_t addr = val & ~TAG_MASK;
-    UINT64 rank = ((lisp_val_t *)addr)[0];
+    UINT64 rank = vector_header(val)[0];
     return rank != 1 ? g_sym_t : nil;
 }
 
 /**
- * 組み込み関数BASIC-VECTOR-P。第一引数がbasic-vector(rank==1のTAG_VECTORまたはTAG_STRING)
+ * 組み込み関数BASIC-VECTOR-P。第一引数がbasic-vector(rank==1のMAGIC_VECTORまたはTAG_STRING)
  * かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -2242,20 +2249,18 @@ lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_basic_vector_p(lisp_val_t args, lisp_val_t env) {
     lisp_val_t val = cc_car(args);
-    UINT64 tag = val & TAG_MASK;
-    if (tag == TAG_STRING) {
+    if ((val & TAG_MASK) == TAG_STRING) {
         return g_sym_t;
     }
-    if (tag != TAG_VECTOR) {
+    if (!is_vector(val)) {
         return nil;
     }
-    lisp_addr_t addr = val & ~TAG_MASK;
-    UINT64 rank = ((lisp_val_t *)addr)[0];
+    UINT64 rank = vector_header(val)[0];
     return rank == 1 ? g_sym_t : nil;
 }
 
 /**
- * 組み込み関数GENERAL-VECTOR-P。第一引数がgeneral-vector(rank==1のTAG_VECTOR)かどうかを
+ * 組み込み関数GENERAL-VECTOR-P。第一引数がgeneral-vector(rank==1のMAGIC_VECTOR)かどうかを
  * 判定する。STRINGはbasic-vectorだがgeneral-vectorではないため除外する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -2263,11 +2268,10 @@ lisp_val_t primitive_basic_vector_p(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_general_vector_p(lisp_val_t args, lisp_val_t env) {
     lisp_val_t val = cc_car(args);
-    if ((val & TAG_MASK) != TAG_VECTOR) {
+    if (!is_vector(val)) {
         return nil;
     }
-    lisp_addr_t addr = val & ~TAG_MASK;
-    UINT64 rank = ((lisp_val_t *)addr)[0];
+    UINT64 rank = vector_header(val)[0];
     return rank == 1 ? g_sym_t : nil;
 }
 
@@ -2347,6 +2351,100 @@ lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
 #define MAX_ARRAY_RANK 8
 
 /**
+ * rank/dimsから配列本体の可変長ブロック(word0=rank、word[1..rank]=各次元のサイズ、
+ * word[rank+1..]=データ)をヒープに確保し、ヘッダ(rank, dims)だけ書き込む。
+ * データ部の初期化は呼び出し側の責務(make-array/create-vector/vectorで初期化ポリシーが
+ * 異なるため)。
+ * @param rank 次元数
+ * @param dims 各次元のサイズ(rank個)
+ * @return 確保したブロックの先頭アドレス(タグなし)
+ */
+static lisp_addr_t alloc_vector_block(UINT64 rank, const UINT64 *dims) {
+    UINT64 total = 1;
+    for (UINT64 i = 0; i < rank; i++) {
+        total *= dims[i];
+    }
+    lisp_addr_t addr = os_alloc_bytes(8 * (1 + rank + total));
+    lisp_val_t *header = (lisp_val_t *)addr;
+    header[0] = rank;
+    for (UINT64 i = 0; i < rank; i++) {
+        header[1 + i] = dims[i];
+    }
+    return addr;
+}
+
+/**
+ * VECTOR(TAG_INSTANCE+MAGIC_VECTOR)から、内部の可変長ブロック(rank+dims+data)の
+ * 先頭へのポインタを取り出す。
+ * @param vec VECTOR
+ * @return ブロック先頭へのポインタ
+ */
+static lisp_val_t *vector_header(lisp_val_t vec) {
+    UINT64 *obj = (UINT64 *)(vec & ~TAG_MASK);
+    return (lisp_val_t *)obj[1];
+}
+
+/**
+ * valがVECTOR(TAG_INSTANCE+MAGIC_VECTOR)かどうかを判定する。
+ * @param val 判定対象の値
+ * @return VECTORなら非0、そうでなければ0
+ */
+static int is_vector(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_INSTANCE
+        && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_VECTOR;
+}
+
+lisp_val_t *os_vector_header(lisp_val_t vec) {
+    return vector_header(vec);
+}
+
+lisp_val_t os_make_vector_from_list(lisp_val_t list) {
+    UINT64 count = 0;
+    for (lisp_val_t cur = list; cur != nil; cur = cc_cdr(cur)) {
+        count++;
+    }
+    lisp_addr_t addr = alloc_vector_block(1, &count);
+    lisp_val_t *data = (lisp_val_t *)(addr + 16);
+    UINT64 i = 0;
+    for (lisp_val_t cur = list; cur != nil; cur = cc_cdr(cur)) {
+        data[i++] = cc_car(cur);
+    }
+    return os_make_instance(MAGIC_VECTOR, (UINT64)addr, 0, 0);
+}
+
+/**
+ * 組み込み関数VECTOR。評価済みの引数列をそのまま要素とするrank1のgeneral-vectorを返す。
+ * @param args 評価済みの引数リスト(すべて要素として使う)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 構築したVECTOR
+ */
+lisp_val_t primitive_vector(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_vector_from_list(args);
+}
+
+/**
+ * 組み込み関数CREATE-VECTOR。第一引数の長さ(FIXNUM)のgeneral-vectorを確保する。
+ * 第二引数(省略可)を指定すると全要素をその値で初期化する(省略時はnil)。
+ * @param args 評価済みの引数リスト(第一引数はFIXNUM、第二引数は省略可)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したVECTOR
+ */
+lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 count = cc_car(args) >> 3;
+    lisp_val_t rest = cc_cdr(args);
+    lisp_val_t init = (rest != nil) ? cc_car(rest) : nil;
+
+    lisp_addr_t addr = alloc_vector_block(1, &count);
+    lisp_val_t *data = (lisp_val_t *)(addr + 16);
+    for (UINT64 i = 0; i < count; i++) {
+        data[i] = init;
+    }
+    return os_make_instance(MAGIC_VECTOR, (UINT64)addr, 0, 0);
+}
+
+/**
  * 組み込み関数MAKE-ARRAY。第一引数の次元(FIXNUM、またはFIXNUMのリスト)を持つ
  * 多次元配列を確保する。要素はすべてnilで初期化される。
  * @param args 評価済みの引数リスト(第一引数はFIXNUMまたはFIXNUMのリスト)
@@ -2372,18 +2470,13 @@ lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
         total *= dims[i];
     }
 
-    lisp_addr_t addr = os_alloc_bytes(8 * (1 + rank + total));
-    lisp_val_t *header = (lisp_val_t *)addr;
-    header[0] = rank;
-    for (UINT64 i = 0; i < rank; i++) {
-        header[1 + i] = dims[i];
-    }
+    lisp_addr_t addr = alloc_vector_block(rank, dims);
     lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
     for (UINT64 i = 0; i < total; i++) {
         data[i] = nil;
     }
 
-    return (lisp_val_t)(addr | TAG_VECTOR);
+    return os_make_instance(MAGIC_VECTOR, (UINT64)addr, 0, 0);
 }
 
 /**
@@ -2418,8 +2511,7 @@ static UINT64 array_offset(lisp_val_t *header, UINT64 rank, lisp_val_t cur, int 
  */
 lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
     lisp_val_t array = cc_car(args);
-    lisp_addr_t addr = array & ~TAG_MASK;
-    lisp_val_t *header = (lisp_val_t *)addr;
+    lisp_val_t *header = vector_header(array);
     UINT64 rank = header[0];
 
     int out_of_bounds;
@@ -2428,7 +2520,7 @@ lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
         return g_sym_eval_error;
     }
 
-    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
     return data[offset];
 }
 
@@ -2440,8 +2532,7 @@ lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
     lisp_val_t array = cc_car(args);
-    lisp_addr_t addr = array & ~TAG_MASK;
-    lisp_val_t *header = (lisp_val_t *)addr;
+    lisp_val_t *header = vector_header(array);
     UINT64 rank = header[0];
 
     lisp_val_t result = nil;
@@ -2485,8 +2576,7 @@ lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     lisp_val_t array = cc_car(args);
-    lisp_addr_t addr = array & ~TAG_MASK;
-    lisp_val_t *header = (lisp_val_t *)addr;
+    lisp_val_t *header = vector_header(array);
     UINT64 rank = header[0];
 
     int out_of_bounds;
@@ -2502,7 +2592,7 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     }
     lisp_val_t val = cc_car(value_cur);
 
-    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
     data[offset] = val;
     return val;
 }
@@ -2576,9 +2666,11 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
             lisp_addr_t addr = seq & ~TAG_MASK;
             return os_make_fixnum(((lisp_val_t *)addr)[0]);
         }
-        case TAG_VECTOR: {
-            lisp_addr_t addr = seq & ~TAG_MASK;
-            lisp_val_t *header = (lisp_val_t *)addr;
+        case TAG_INSTANCE: {
+            if (!is_vector(seq)) {
+                return g_sym_eval_error;
+            }
+            lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
             UINT64 total = 1;
             for (UINT64 i = 0; i < rank; i++) {
@@ -2655,7 +2747,7 @@ lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env) {
 
 /**
  * 組み込み関数%%MAKE-INSTANCE-RAW。ILOSクラスインスタンス(MAGIC_CLASS_INSTANCE)を確保する。
- * @param args 評価済みの引数リスト(class クラスオブジェクト, slots-vector TAG_VECTOR)
+ * @param args 評価済みの引数リスト(class クラスオブジェクト, slots-vector MAGIC_VECTOR)
  * @param env 呼び出し時の環境(未使用)
  * @return 確保したクラスインスタンス
  */
@@ -2677,10 +2769,10 @@ lisp_val_t primitive_instance_class(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数%%INSTANCE-SLOTS。ILOSクラスインスタンスのslots-vector(TAG_VECTOR)を返す。
+ * 組み込み関数%%INSTANCE-SLOTS。ILOSクラスインスタンスのslots-vector(MAGIC_VECTOR)を返す。
  * @param args 評価済みの引数リスト(第一引数はクラスインスタンス)
  * @param env 呼び出し時の環境(未使用)
- * @return slots-vector(TAG_VECTOR)
+ * @return slots-vector(MAGIC_VECTOR)
  */
 lisp_val_t primitive_instance_slots(lisp_val_t args, lisp_val_t env) {
     UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);

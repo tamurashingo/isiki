@@ -635,3 +635,23 @@
 ;; 3引数以上の隣接ペア連鎖(既存の数値比較と同じ流儀)
 (assert-equal t (char< #\a #\b #\c))
 (assert-equal nil (char< #\a #\c #\b))
+
+;;; --- arrays / vectors (§22, §23): vector / create-vector / garef / set-garef / #(...) ---
+
+(assert-equal t (equal (vector 'a 'b 'c) '#(a b c)))
+(assert-equal t (equal (vector) '#()))
+(assert-equal 3 (length (vector 'a 'b 'c)))
+
+(assert-equal 3 (length (create-vector 3)))
+(assert-equal nil (garef (create-vector 3) 0))
+(assert-equal t (equal (create-vector 3 0) '#(0 0 0)))
+
+;; garef/set-garefはaref/set-arefと同じ実体を共用する(既存のbasic-array*-p等と同様)
+(assert-equal 42 (let ((v (create-vector 3))) (set-garef v 1 42) (garef v 1)))
+(assert-equal 42 (let ((v (create-vector 3))) (set-garef v 1 42) (aref v 1)))
+
+;; #(...)リテラル
+(assert-equal 1 (aref #(1 2 3) 0))
+(assert-equal 3 (aref #(1 2 3) 2))
+(assert-equal 3 (length #(1 2 3)))
+(assert-equal t (equal #(1 2 3) (vector 1 2 3)))

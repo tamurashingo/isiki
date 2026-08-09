@@ -504,6 +504,14 @@ static lisp_val_t read_expr(reader_source_t *src) {
             advance(src);
             return read_radix_integer(src, 16);
         }
+        if (c2 == '(') {
+            advance(src);
+            lisp_val_t list = read_list(src);
+            if (list == g_sym_read_error) {
+                return g_sym_read_error;
+            }
+            return os_make_vector_from_list(list);
+        }
         return g_sym_read_error;
     }
 

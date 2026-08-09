@@ -125,7 +125,7 @@ static void print_list(frame_buffer *fb, lisp_val_t val) {
  * @param val 出力するVECTOR
  */
 static void print_vector(frame_buffer *fb, lisp_val_t val) {
-    lisp_val_t *header = (lisp_val_t *)(val & ~TAG_MASK);
+    lisp_val_t *header = os_vector_header(val);
     UINT64 rank = header[0];
     UINT64 total = 1;
     for (UINT64 i = 0; i < rank; i++) {
@@ -176,9 +176,6 @@ static void print_value(frame_buffer *fb, lisp_val_t val) {
         case TAG_CONS:
             print_list(fb, val);
             return;
-        case TAG_VECTOR:
-            print_vector(fb, val);
-            return;
         case TAG_INSTANCE: {
             UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
             UINT64 magic = obj[0];
@@ -186,6 +183,8 @@ static void print_value(frame_buffer *fb, lisp_val_t val) {
                 fb->write_string(fb, "#<PROCESS>");
             } else if (magic == MAGIC_BIGNUM) {
                 print_bignum(fb, val);
+            } else if (magic == MAGIC_VECTOR) {
+                print_vector(fb, val);
             } else if (magic == MAGIC_STREAM) {
                 fb->write_string(fb, "#<STREAM>");
             } else if (magic == MAGIC_CLASS) {
