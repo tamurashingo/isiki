@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 #include "test_assert.h"
 #include "types.h"
 #include "runtime.h"
@@ -852,6 +853,88 @@ void test_primitive_string_elt_out_of_bounds() {
     assert(r == g_sym_eval_error, "(string-elt \"hi\" 2)は範囲外なのでg_sym_eval_error");
 }
 
+void test_primitive_string_comparisons() {
+    lisp_val_t abcd_abcd[2] = {os_make_string("abcd"), os_make_string("abcd")};
+    lisp_val_t abcd_wxyz[2] = {os_make_string("abcd"), os_make_string("wxyz")};
+    lisp_val_t abcd_abcde[2] = {os_make_string("abcd"), os_make_string("abcde")};
+    lisp_val_t abcde_abcd[2] = {os_make_string("abcde"), os_make_string("abcd")};
+
+    assert(primitive_string_equal(make_arg_list_vals(2, abcd_abcd), nil) == g_sym_t, "(string= \"abcd\" \"abcd\") はT");
+    assert(primitive_string_equal(make_arg_list_vals(2, abcd_wxyz), nil) == nil, "(string= \"abcd\" \"wxyz\") はnil");
+    assert(primitive_string_equal(make_arg_list_vals(2, abcd_abcde), nil) == nil, "(string= \"abcd\" \"abcde\") はnil");
+    assert(primitive_string_equal(make_arg_list_vals(2, abcde_abcd), nil) == nil, "(string= \"abcde\" \"abcd\") はnil");
+
+    assert(primitive_string_not_equal(make_arg_list_vals(2, abcd_wxyz), nil) == g_sym_t, "(string/= \"abcd\" \"wxyz\") はT");
+
+    assert(primitive_string_less_than(make_arg_list_vals(2, abcd_abcd), nil) == nil, "(string< \"abcd\" \"abcd\") はnil");
+    assert(primitive_string_less_than(make_arg_list_vals(2, abcd_wxyz), nil) == g_sym_t, "(string< \"abcd\" \"wxyz\") はT");
+    assert(primitive_string_less_than(make_arg_list_vals(2, abcd_abcde), nil) == g_sym_t, "(string< \"abcd\" \"abcde\") はT(短い方が接頭辞なら小さい)");
+    assert(primitive_string_less_than(make_arg_list_vals(2, abcde_abcd), nil) == nil, "(string< \"abcde\" \"abcd\") はnil");
+
+    assert(primitive_string_less_equal(make_arg_list_vals(2, abcd_abcd), nil) == g_sym_t, "(string<= \"abcd\" \"abcd\") はT");
+    assert(primitive_string_less_equal(make_arg_list_vals(2, abcd_wxyz), nil) == g_sym_t, "(string<= \"abcd\" \"wxyz\") はT");
+    assert(primitive_string_less_equal(make_arg_list_vals(2, abcd_abcde), nil) == g_sym_t, "(string<= \"abcd\" \"abcde\") はT");
+    assert(primitive_string_less_equal(make_arg_list_vals(2, abcde_abcd), nil) == nil, "(string<= \"abcde\" \"abcd\") はnil");
+
+    assert(primitive_string_greater_than(make_arg_list_vals(2, abcd_wxyz), nil) == nil, "(string> \"abcd\" \"wxyz\") はnil");
+    assert(primitive_string_greater_equal(make_arg_list_vals(2, abcd_abcd), nil) == g_sym_t, "(string>= \"abcd\" \"abcd\") はT");
+
+    // 3引数以上の隣接ペア連鎖
+    lisp_val_t abc[3] = {os_make_string("a"), os_make_string("b"), os_make_string("c")};
+    assert(primitive_string_less_than(make_arg_list_vals(3, abc), nil) == g_sym_t, "(string< \"a\" \"b\" \"c\") はT");
+    lisp_val_t acb[3] = {os_make_string("a"), os_make_string("c"), os_make_string("b")};
+    assert(primitive_string_less_than(make_arg_list_vals(3, acb), nil) == nil, "(string< \"a\" \"c\" \"b\") はnil");
+}
+
+void test_primitive_char_index() {
+    lisp_val_t str = os_make_string("abcab");
+    assert(primitive_char_index(os_make_cons(os_make_char('b'), os_make_cons(str, nil)), nil) >> 3 == 1,
+           "(char-index #\\b \"abcab\") は1");
+    assert(primitive_char_index(os_make_cons(os_make_char('B'), os_make_cons(str, nil)), nil) == nil,
+           "(char-index #\\B \"abcab\") はnil(大文字小文字を区別する)");
+    lisp_val_t args_with_start = os_make_cons(os_make_char('b'), os_make_cons(str, os_make_cons(os_make_fixnum(2), nil)));
+    assert(primitive_char_index(args_with_start, nil) >> 3 == 4, "(char-index #\\b \"abcab\" 2) は4");
+    assert(primitive_char_index(os_make_cons(os_make_char('d'), os_make_cons(str, nil)), nil) == nil,
+           "(char-index #\\d \"abcab\") はnil");
+    lisp_val_t args_a_from_4 = os_make_cons(os_make_char('a'), os_make_cons(str, os_make_cons(os_make_fixnum(4), nil)));
+    assert(primitive_char_index(args_a_from_4, nil) == nil, "(char-index #\\a \"abcab\" 4) はnil");
+}
+
+void test_primitive_string_index() {
+    lisp_val_t foobar = os_make_string("foobar");
+    assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(foobar, nil)), nil) >> 3 == 0,
+           "(string-index \"foo\" \"foobar\") は0");
+    assert(primitive_string_index(os_make_cons(os_make_string("bar"), os_make_cons(foobar, nil)), nil) >> 3 == 3,
+           "(string-index \"bar\" \"foobar\") は3");
+    assert(primitive_string_index(os_make_cons(os_make_string("FOO"), os_make_cons(foobar, nil)), nil) == nil,
+           "(string-index \"FOO\" \"foobar\") はnil(大文字小文字を区別する)");
+    lisp_val_t foo_from_1 = os_make_cons(os_make_string("foo"), os_make_cons(foobar, os_make_cons(os_make_fixnum(1), nil)));
+    assert(primitive_string_index(foo_from_1, nil) == nil, "(string-index \"foo\" \"foobar\" 1) はnil");
+    lisp_val_t bar_from_1 = os_make_cons(os_make_string("bar"), os_make_cons(foobar, os_make_cons(os_make_fixnum(1), nil)));
+    assert(primitive_string_index(bar_from_1, nil) >> 3 == 3, "(string-index \"bar\" \"foobar\" 1) は3");
+    assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(os_make_string(""), nil)), nil) == nil,
+           "(string-index \"foo\" \"\") はnil");
+    assert(primitive_string_index(os_make_cons(os_make_string(""), os_make_cons(os_make_string("foo"), nil)), nil) >> 3 == 0,
+           "(string-index \"\" \"foo\") は0(空文字列は即マッチ)");
+}
+
+void test_primitive_string_append() {
+    lisp_val_t r1 = primitive_string_append(os_make_cons(os_make_string("abc"), os_make_cons(os_make_string("def"), nil)), nil);
+    char buf[16];
+    os_string_to_cstr(r1, buf, sizeof(buf));
+    assert(strcmp(buf, "abcdef") == 0, "(string-append \"abc\" \"def\") は\"abcdef\"");
+
+    lisp_val_t r2 = primitive_string_append(
+        os_make_cons(os_make_string("abc"), os_make_cons(os_make_string(""), os_make_cons(os_make_string("def"), nil))), nil);
+    os_string_to_cstr(r2, buf, sizeof(buf));
+    assert(strcmp(buf, "abcdef") == 0, "(string-append \"abc\" \"\" \"def\") は\"abcdef\"");
+
+    lisp_val_t r3 = primitive_string_append(nil, nil);
+    assert((r3 & TAG_MASK) == TAG_STRING, "(string-append)の戻り値はTAG_STRINGを持つ");
+    lisp_val_t *header3 = (lisp_val_t *)(r3 & ~TAG_MASK);
+    assert(header3[0] == 0, "(string-append)は空文字列を返す");
+}
+
 void test_primitive_length() {
     lisp_val_t list = os_make_cons(os_make_fixnum(1),
                         os_make_cons(os_make_fixnum(2),
@@ -966,6 +1049,10 @@ int main(int argc, char** argv) {
    test_primitive_create_string_with_char();
    test_primitive_string_elt();
    test_primitive_string_elt_out_of_bounds();
+   test_primitive_string_comparisons();
+   test_primitive_char_index();
+   test_primitive_string_index();
+   test_primitive_string_append();
    test_primitive_length();
    test_primitive_make_class_raw_and_accessors();
    test_primitive_make_instance_raw_and_accessors();

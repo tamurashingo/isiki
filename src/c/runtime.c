@@ -424,6 +424,15 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("SET-GAREF"), os_make_native_function((lisp_addr_t)(void *)primitive_set_aref), global_environment);
         os_set_function(os_make_symbol("CREATE-STRING"), os_make_native_function((lisp_addr_t)(void *)primitive_create_string), global_environment);
         os_set_function(os_make_symbol("STRING-ELT"), os_make_native_function((lisp_addr_t)(void *)primitive_string_elt), global_environment);
+        os_set_function(os_make_symbol("STRING="), os_make_native_function((lisp_addr_t)(void *)primitive_string_equal), global_environment);
+        os_set_function(os_make_symbol("STRING/="), os_make_native_function((lisp_addr_t)(void *)primitive_string_not_equal), global_environment);
+        os_set_function(os_make_symbol("STRING<"), os_make_native_function((lisp_addr_t)(void *)primitive_string_less_than), global_environment);
+        os_set_function(os_make_symbol("STRING>"), os_make_native_function((lisp_addr_t)(void *)primitive_string_greater_than), global_environment);
+        os_set_function(os_make_symbol("STRING<="), os_make_native_function((lisp_addr_t)(void *)primitive_string_less_equal), global_environment);
+        os_set_function(os_make_symbol("STRING>="), os_make_native_function((lisp_addr_t)(void *)primitive_string_greater_equal), global_environment);
+        os_set_function(os_make_symbol("CHAR-INDEX"), os_make_native_function((lisp_addr_t)(void *)primitive_char_index), global_environment);
+        os_set_function(os_make_symbol("STRING-INDEX"), os_make_native_function((lisp_addr_t)(void *)primitive_string_index), global_environment);
+        os_set_function(os_make_symbol("STRING-APPEND"), os_make_native_function((lisp_addr_t)(void *)primitive_string_append), global_environment);
         os_set_function(os_make_symbol("LENGTH"), os_make_native_function((lisp_addr_t)(void *)primitive_length), global_environment);
         os_set_function(os_make_symbol("%%MAKE-CLASS-RAW"), os_make_native_function((lisp_addr_t)(void *)primitive_make_class_raw), global_environment);
         os_set_function(os_make_symbol("%%CLASS-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_class_name), global_environment);
@@ -2170,6 +2179,213 @@ lisp_val_t primitive_char_greater_equal(lisp_val_t args, lisp_val_t env) {
         }
     }
     return g_sym_t;
+}
+
+/**
+ * 2つのSTRINGを辞書式に比較する(最初に異なるバイト位置での差、全バイト一致なら
+ * 長さの差を返す。これにより「短い方が長い方の真の接頭辞なら短い方が小さい」という
+ * 仕様(§24)のルールも自然に満たされる)。
+ * @return a<bなら負、a==bなら0、a>bなら正
+ */
+static int string_compare(lisp_val_t a, lisp_val_t b) {
+    lisp_addr_t addr_a = a & ~TAG_MASK;
+    lisp_addr_t addr_b = b & ~TAG_MASK;
+    UINT64 len_a = ((lisp_val_t *)addr_a)[0];
+    UINT64 len_b = ((lisp_val_t *)addr_b)[0];
+    UINT8 *bytes_a = (UINT8 *)(addr_a + 8);
+    UINT8 *bytes_b = (UINT8 *)(addr_b + 8);
+    UINT64 min_len = len_a < len_b ? len_a : len_b;
+    for (UINT64 i = 0; i < min_len; i++) {
+        if (bytes_a[i] != bytes_b[i]) {
+            return (int)bytes_a[i] - (int)bytes_b[i];
+        }
+    }
+    return (int)len_a - (int)len_b;
+}
+
+/**
+ * 組み込み関数STRING=。argsがすべて同じ文字列かどうかを判定する。
+ * CHAR=同様、仕様上は2引数だが本実装では隣接ペア連鎖のN項関数として実装する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return すべて等しいならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数STRING/=。argsの隣接する要素同士がすべて等しくないかどうかを判定する
+ * (CHAR/=と同様、隣接ペア判定に簡略化している)。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_not_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数STRING<。argsが単調増加(a<b<c<...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_less_than(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数STRING>。argsが単調減少(a>b>c>...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_greater_than(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数STRING<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_less_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数STRING>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_greater_equal(lisp_val_t args, lisp_val_t env) {
+    for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
+        if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
+            return nil;
+        }
+    }
+    return g_sym_t;
+}
+
+/**
+ * 組み込み関数CHAR-INDEX。第二引数のSTRING中で第一引数のCHARが最初に現れる位置を
+ * 第三引数(省略可、FIXNUM、省略時0)から探して返す。見つからなければnil。
+ * @param args 評価済みの引数リスト(CHAR, STRING, [FIXNUM])
+ * @param env 呼び出し時の環境(未使用)
+ * @return 見つかった位置(FIXNUM)、見つからなければnil
+ */
+lisp_val_t primitive_char_index(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t ch = cc_car(args);
+    lisp_val_t str = cc_car(cc_cdr(args));
+    lisp_val_t rest = cc_cdr(cc_cdr(args));
+    UINT64 start = (rest != nil) ? (UINT64)(cc_car(rest) >> 3) : 0;
+
+    lisp_addr_t addr = str & ~TAG_MASK;
+    UINT64 len = ((lisp_val_t *)addr)[0];
+    UINT8 *bytes = (UINT8 *)(addr + 8);
+    UINT8 target = (UINT8)(ch >> 3);
+    for (UINT64 i = start; i < len; i++) {
+        if (bytes[i] == target) {
+            return os_make_fixnum(i);
+        }
+    }
+    return nil;
+}
+
+/**
+ * 組み込み関数STRING-INDEX。第二引数のSTRING中で第一引数のSTRING(部分文字列)が
+ * 最初に現れる位置を第三引数(省略可、FIXNUM、省略時0)から探して返す。
+ * 見つからなければnil。空文字列は探索開始位置に即マッチする。
+ * @param args 評価済みの引数リスト(STRING(部分文字列), STRING, [FIXNUM])
+ * @param env 呼び出し時の環境(未使用)
+ * @return 見つかった位置(FIXNUM)、見つからなければnil
+ */
+lisp_val_t primitive_string_index(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t sub = cc_car(args);
+    lisp_val_t str = cc_car(cc_cdr(args));
+    lisp_val_t rest = cc_cdr(cc_cdr(args));
+    UINT64 start = (rest != nil) ? (UINT64)(cc_car(rest) >> 3) : 0;
+
+    lisp_addr_t sub_addr = sub & ~TAG_MASK;
+    lisp_addr_t str_addr = str & ~TAG_MASK;
+    UINT64 sub_len = ((lisp_val_t *)sub_addr)[0];
+    UINT64 str_len = ((lisp_val_t *)str_addr)[0];
+    UINT8 *sub_bytes = (UINT8 *)(sub_addr + 8);
+    UINT8 *str_bytes = (UINT8 *)(str_addr + 8);
+
+    if (start > str_len || sub_len > str_len - start) {
+        return nil;
+    }
+    for (UINT64 i = start; i + sub_len <= str_len; i++) {
+        UINT64 j = 0;
+        for (; j < sub_len; j++) {
+            if (str_bytes[i + j] != sub_bytes[j]) {
+                break;
+            }
+        }
+        if (j == sub_len) {
+            return os_make_fixnum(i);
+        }
+    }
+    return nil;
+}
+
+/**
+ * 組み込み関数STRING-APPEND。argsの各STRINGを連結した新しいSTRINGを返す
+ * (引数が無ければ空文字列)。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 連結結果のSTRING
+ */
+lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env) {
+    UINT64 total_len = 0;
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        lisp_addr_t addr = cc_car(cur) & ~TAG_MASK;
+        total_len += ((lisp_val_t *)addr)[0];
+    }
+
+    lisp_addr_t out_addr = os_alloc_bytes(8 + total_len);
+    ((lisp_val_t *)out_addr)[0] = total_len;
+    UINT8 *out_bytes = (UINT8 *)(out_addr + 8);
+    UINT64 offset = 0;
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        lisp_addr_t addr = cc_car(cur) & ~TAG_MASK;
+        UINT64 len = ((lisp_val_t *)addr)[0];
+        UINT8 *bytes = (UINT8 *)(addr + 8);
+        for (UINT64 i = 0; i < len; i++) {
+            out_bytes[offset + i] = bytes[i];
+        }
+        offset += len;
+    }
+    return (lisp_val_t)(out_addr | TAG_STRING);
 }
 
 /**

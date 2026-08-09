@@ -853,6 +853,84 @@ lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数STRING=。argsがすべて同じ文字列かどうかを判定する。
+ * CHAR=同様、仕様上は2引数だが本実装では隣接ペア連鎖のN項関数として実装する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return すべて等しいならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING/=。argsの隣接する要素同士がすべて等しくないかどうかを判定する
+ * (CHAR/=と同様、隣接ペア判定に簡略化している)。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_not_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING<。argsが単調増加(a<b<c<...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_less_than(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING>。argsが単調減少(a>b>c>...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_greater_than(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非減少ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_less_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 単調非増加ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_string_greater_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CHAR-INDEX。第二引数のSTRING中で第一引数のCHARが最初に現れる位置を
+ * 第三引数(省略可、FIXNUM、省略時0)から探して返す。見つからなければnil。
+ * @param args 評価済みの引数リスト(CHAR, STRING, [FIXNUM])
+ * @param env 呼び出し時の環境(未使用)
+ * @return 見つかった位置(FIXNUM)、見つからなければnil
+ */
+lisp_val_t primitive_char_index(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING-INDEX。第二引数のSTRING中で第一引数のSTRING(部分文字列)が
+ * 最初に現れる位置を第三引数(省略可、FIXNUM、省略時0)から探して返す。
+ * 見つからなければnil。空文字列は探索開始位置に即マッチする。
+ * @param args 評価済みの引数リスト(STRING(部分文字列), STRING, [FIXNUM])
+ * @param env 呼び出し時の環境(未使用)
+ * @return 見つかった位置(FIXNUM)、見つからなければnil
+ */
+lisp_val_t primitive_string_index(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数STRING-APPEND。argsの各STRINGを連結した新しいSTRINGを返す
+ * (引数が無ければ空文字列)。
+ * @param args 評価済みの引数リスト(すべてSTRING)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 連結結果のSTRING
+ */
+lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数LENGTH。第一引数のシーケンス(LIST/STRING/VECTOR)の要素数を返す。
  * VECTORの場合は次元に関わらず全要素数(各次元のサイズの積)を返す。
  * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR)
