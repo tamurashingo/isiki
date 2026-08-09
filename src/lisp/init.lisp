@@ -204,6 +204,7 @@
         ((eq (car place) 'car) `(set-car ,(car (cdr place)) ,value))
         ((eq (car place) 'cdr) `(set-cdr ,(car (cdr place)) ,value))
         ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))
+        ((eq (car place) 'elt) `(set-elt ,value ,@(cdr place)))
         ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
         ((eq (car place) 'property) `(set-property ,value ,@(cdr place)))))
 
@@ -343,6 +344,42 @@
   (if (null list)
       nil
       (append (funcall fn list) (mapcon fn (cdr list)))))
+
+;;; --- map-into ---
+;;;
+;;; destinationとsequences(0個以上)のうち最も短い長さだけ、左から
+;;; (function (elt seq1 i) (elt seq2 i) ...)の結果をdestinationのi番目に破壊的に
+;;; 書き込み、destinationを返す。sequencesが可変長なので、mapcar等のfuncall経由
+;;; ではなく%%apply(eval.c側の組み込み関数、実引数リストをそのまま展開して呼ぶ)
+;;; を使う。
+
+;; seqsの中で最も短い長さを返す(destinationも含めてこのリストに渡される)。
+(defun %map-into-min-length (seqs)
+  (if (null (cdr seqs))
+      (length (car seqs))
+      (let ((rest-min (%map-into-min-length (cdr seqs))))
+        (if (< (length (car seqs)) rest-min)
+            (length (car seqs))
+            rest-min))))
+
+;; sequences群のindex番目の要素を並べたリストを作る(%%applyの実引数リストにする)。
+(defun %map-into-args-at (index sequences)
+  (if (null sequences)
+      nil
+      (cons (elt (car sequences) index)
+            (%map-into-args-at index (cdr sequences)))))
+
+(defun %map-into-loop (destination function sequences index limit)
+  (if (>= index limit)
+      destination
+      (progn
+        (set-elt (%%apply function (%map-into-args-at index sequences))
+                 destination index)
+        (%map-into-loop destination function sequences (+ index 1) limit))))
+
+(defun map-into (destination function &rest sequences)
+  (%map-into-loop destination function sequences 0
+                   (%map-into-min-length (cons destination sequences))))
 
 ;;; --- ILOS (最小実装): defclass / make-instance / slot-value / typep / subclassp ---
 ;;;

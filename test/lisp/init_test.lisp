@@ -697,3 +697,41 @@
 (assert-equal t (string= "abc" (string-append "" "abc")))
 (assert-equal t (string= "abcdef" (string-append "abc" "" "def")))
 (assert-equal t (string= "" (string-append)))
+
+;;; --- sequence functions (§25): elt / set-elt / subseq / map-into ---
+
+(assert-equal 'c (elt '(a b c) 2))
+(assert-equal 'b (elt (vector 'a 'b 'c) 1))
+(assert-equal #\a (elt "abc" 0))
+
+(assert-equal t (string= "xxOxx" (let ((string (create-string 5 #\x))) (setf (elt string 2) #\O) string)))
+(assert-equal t (equal '(1 99 3) (let ((list (list 1 2 3))) (setf (elt list 1) 99) list)))
+(assert-equal 42 (let ((v (create-vector 3))) (setf (elt v 1) 42) (elt v 1)))
+
+(assert-equal t (string= "bcd" (subseq "abcdef" 1 4)))
+(assert-equal t (equal '(b c d) (subseq '(a b c d e f) 1 4)))
+(assert-equal t (equal (subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) #(b c d)))
+
+(assert-equal t
+  (equal '(11 12 13 14)
+    (let ((a (list 1 2 3 4)) (b (list 10 10 10 10)))
+      (map-into a #'+ a b))))
+(assert-equal t
+  (equal '(10 10 10 10)
+    (let ((a (list 1 2 3 4)) (b (list 10 10 10 10)))
+      (map-into a #'+ a b)
+      b)))
+;; kが最短(3要素)なので、aの4番目の要素は書き換えられない
+;; (readerがドット対記法をサポートしないため、期待値は`cons`で組み立てる)
+(assert-equal t
+  (equal (list (cons 'one 11) (cons 'two 12) (cons 'three 13) 14)
+    (let ((a (list 11 12 13 14)) (k '(one two three)))
+      (map-into a #'cons k a))))
+;; sequence*を指定しない場合は、functionを引数無しでdestinationの長さの回数呼ぶ
+;; (lambdaのクロージャからsetqで外側の変数を書き換えられないため、
+;;  カウンタはvectorの要素として持ちset-elt/eltで更新する)
+(assert-equal t
+  (equal '(2 4 6 8)
+    (let ((a (list 1 2 3 4)) (counter (create-vector 1)))
+      (setf (elt counter 0) 0)
+      (map-into a (lambda () (setf (elt counter 0) (+ (elt counter 0) 2)))))))

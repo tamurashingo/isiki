@@ -434,6 +434,9 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("STRING-INDEX"), os_make_native_function((lisp_addr_t)(void *)primitive_string_index), global_environment);
         os_set_function(os_make_symbol("STRING-APPEND"), os_make_native_function((lisp_addr_t)(void *)primitive_string_append), global_environment);
         os_set_function(os_make_symbol("LENGTH"), os_make_native_function((lisp_addr_t)(void *)primitive_length), global_environment);
+        os_set_function(os_make_symbol("ELT"), os_make_native_function((lisp_addr_t)(void *)primitive_elt), global_environment);
+        os_set_function(os_make_symbol("SET-ELT"), os_make_native_function((lisp_addr_t)(void *)primitive_set_elt), global_environment);
+        os_set_function(os_make_symbol("SUBSEQ"), os_make_native_function((lisp_addr_t)(void *)primitive_subseq), global_environment);
         os_set_function(os_make_symbol("%%MAKE-CLASS-RAW"), os_make_native_function((lisp_addr_t)(void *)primitive_make_class_raw), global_environment);
         os_set_function(os_make_symbol("%%CLASS-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_class_name), global_environment);
         os_set_function(os_make_symbol("%%CLASS-SUPERS"), os_make_native_function((lisp_addr_t)(void *)primitive_class_supers), global_environment);
@@ -2893,6 +2896,184 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
                 total *= header[1 + i];
             }
             return os_make_fixnum(total);
+        }
+        default:
+            return g_sym_eval_error;
+    }
+}
+
+/**
+ * 組み込み関数ELT。第一引数のシーケンス(LIST/STRING/VECTOR)の第二引数(0起算)
+ * 番目の要素を返す。VECTORの場合は次元に関わらずdata部を1次元配列とみなす
+ * (LENGTHと同じ簡略化方針)。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t seq = cc_car(args);
+    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
+
+    switch (seq & TAG_MASK) {
+        case TAG_CONS: {
+            lisp_val_t cur = seq;
+            for (UINT64 i = 0; i < idx && cur != nil; i++) {
+                cur = cc_cdr(cur);
+            }
+            if (cur == nil) {
+                return g_sym_eval_error;
+            }
+            return cc_car(cur);
+        }
+        case TAG_STRING: {
+            lisp_addr_t addr = seq & ~TAG_MASK;
+            UINT64 len = ((lisp_val_t *)addr)[0];
+            if (idx >= len) {
+                return g_sym_eval_error;
+            }
+            UINT8 *bytes = (UINT8 *)(addr + 8);
+            return os_make_char((char)bytes[idx]);
+        }
+        case TAG_INSTANCE: {
+            if (!is_vector(seq)) {
+                return g_sym_eval_error;
+            }
+            lisp_val_t *header = vector_header(seq);
+            UINT64 rank = header[0];
+            UINT64 total = 1;
+            for (UINT64 i = 0; i < rank; i++) {
+                total *= header[1 + i];
+            }
+            if (idx >= total) {
+                return g_sym_eval_error;
+            }
+            lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
+            return data[idx];
+        }
+        default:
+            return g_sym_eval_error;
+    }
+}
+
+/**
+ * 組み込み関数SET-ELT。第二引数のシーケンス(LIST/STRING/VECTOR)の第三引数(0起算)
+ * 番目の要素を第一引数で破壊的に書き換える。仕様上set-eltは「新しい値が最初」
+ * という引数順である点に注意(SET-AREF/SET-CAR/SET-CDRとは逆順)。
+ * @param args 評価済みの引数リスト(第一引数は新しい値、第二引数はLIST/STRING/VECTOR、
+ *             第三引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t obj = cc_car(args);
+    lisp_val_t seq = cc_car(cc_cdr(args));
+    UINT64 idx = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+
+    switch (seq & TAG_MASK) {
+        case TAG_CONS: {
+            lisp_val_t cur = seq;
+            for (UINT64 i = 0; i < idx && cur != nil; i++) {
+                cur = cc_cdr(cur);
+            }
+            if (cur == nil) {
+                return g_sym_eval_error;
+            }
+            cc_set_car(cur, obj);
+            return obj;
+        }
+        case TAG_STRING: {
+            lisp_addr_t addr = seq & ~TAG_MASK;
+            UINT64 len = ((lisp_val_t *)addr)[0];
+            if (idx >= len) {
+                return g_sym_eval_error;
+            }
+            UINT8 *bytes = (UINT8 *)(addr + 8);
+            bytes[idx] = (UINT8)(obj >> 3);
+            return obj;
+        }
+        case TAG_INSTANCE: {
+            if (!is_vector(seq)) {
+                return g_sym_eval_error;
+            }
+            lisp_val_t *header = vector_header(seq);
+            UINT64 rank = header[0];
+            UINT64 total = 1;
+            for (UINT64 i = 0; i < rank; i++) {
+                total *= header[1 + i];
+            }
+            if (idx >= total) {
+                return g_sym_eval_error;
+            }
+            lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
+            data[idx] = obj;
+            return obj;
+        }
+        default:
+            return g_sym_eval_error;
+    }
+}
+
+/**
+ * 組み込み関数SUBSEQ。第一引数のシーケンス(LIST/STRING/VECTOR)の[z1, z2)の
+ * 範囲を要素とする、同じクラスの新規シーケンスを返す。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二・第三引数は
+ *             FIXNUM(z1, z2))
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新規に確保したシーケンス(元と同じクラス)
+ */
+lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t seq = cc_car(args);
+    UINT64 z1 = cc_car(cc_cdr(args)) >> 3;
+    UINT64 z2 = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+    UINT64 out_len = z2 - z1;
+
+    switch (seq & TAG_MASK) {
+        case TAG_CONS: {
+            lisp_val_t cur = seq;
+            for (UINT64 i = 0; i < z1; i++) {
+                cur = cc_cdr(cur);
+            }
+            lisp_val_t result = nil;
+            lisp_val_t prev = nil;
+            for (UINT64 i = 0; i < out_len; i++) {
+                lisp_val_t cell = os_make_cons(cc_car(cur), nil);
+                if (prev == nil) {
+                    result = cell;
+                } else {
+                    cc_set_cdr(prev, cell);
+                }
+                prev = cell;
+                cur = cc_cdr(cur);
+            }
+            return result;
+        }
+        case TAG_STRING: {
+            lisp_addr_t addr = seq & ~TAG_MASK;
+            UINT8 *bytes = (UINT8 *)(addr + 8);
+            lisp_addr_t out_addr = os_alloc_bytes(8 + out_len);
+            ((lisp_val_t *)out_addr)[0] = out_len;
+            UINT8 *out_bytes = (UINT8 *)(out_addr + 8);
+            for (UINT64 i = 0; i < out_len; i++) {
+                out_bytes[i] = bytes[z1 + i];
+            }
+            return (lisp_val_t)(out_addr | TAG_STRING);
+        }
+        case TAG_INSTANCE: {
+            if (!is_vector(seq)) {
+                return g_sym_eval_error;
+            }
+            lisp_val_t *header = vector_header(seq);
+            UINT64 rank = header[0];
+            lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
+            lisp_addr_t out_addr = alloc_vector_block(1, &out_len);
+            lisp_val_t *out_data = (lisp_val_t *)(out_addr + 16);
+            for (UINT64 i = 0; i < out_len; i++) {
+                out_data[i] = data[z1 + i];
+            }
+            return os_make_instance(MAGIC_VECTOR, (UINT64)out_addr, 0, 0);
         }
         default:
             return g_sym_eval_error;

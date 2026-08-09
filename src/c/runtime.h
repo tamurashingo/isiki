@@ -940,6 +940,36 @@ lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数ELT。第一引数のシーケンス(LIST/STRING/VECTOR)の第二引数(0起算)
+ * 番目の要素を返す。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SET-ELT。第二引数のシーケンス(LIST/STRING/VECTOR)の第三引数(0起算)
+ * 番目の要素を第一引数で破壊的に書き換える。仕様上「新しい値が最初」という引数順
+ * である点に注意(SET-AREF/SET-CAR/SET-CDRとは逆順)。
+ * @param args 評価済みの引数リスト(第一引数は新しい値、第二引数はLIST/STRING/VECTOR、
+ *             第三引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SUBSEQ。第一引数のシーケンス(LIST/STRING/VECTOR)の[z1, z2)の
+ * 範囲を要素とする、同じクラスの新規シーケンスを返す。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二・第三引数は
+ *             FIXNUM(z1, z2))
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新規に確保したシーケンス(元と同じクラス)
+ */
+lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数%%MAKE-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_CLASS)を確保する。
  * @param args 評価済みの引数リスト(name symbol, supers クラスオブジェクトのlist, slots スロット記述子のlist)
  * @param env 呼び出し時の環境(未使用)

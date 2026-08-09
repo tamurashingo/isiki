@@ -950,6 +950,92 @@ void test_primitive_length() {
     assert(primitive_length(os_make_cons(array, nil), nil) >> 3 == 6, "(length (make-array '(2 3)))は次元に関わらず全要素数の6");
 }
 
+void test_primitive_elt() {
+    lisp_val_t list = os_make_cons(os_make_symbol("A"),
+                        os_make_cons(os_make_symbol("B"),
+                          os_make_cons(os_make_symbol("C"), nil)));
+    assert(primitive_elt(os_make_cons(list, os_make_cons(os_make_fixnum(2), nil)), nil) == os_make_symbol("C"),
+           "(elt '(a b c) 2) はc");
+
+    lisp_val_t vec_args = os_make_cons(os_make_symbol("A"),
+                            os_make_cons(os_make_symbol("B"),
+                              os_make_cons(os_make_symbol("C"), nil)));
+    lisp_val_t vec = primitive_vector(vec_args, nil);
+    assert(primitive_elt(os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)), nil) == os_make_symbol("B"),
+           "(elt (vector 'a 'b 'c) 1) はb");
+
+    lisp_val_t str = os_make_string("abc");
+    assert(primitive_elt(os_make_cons(str, os_make_cons(os_make_fixnum(0), nil)), nil) == os_make_char('a'),
+           "(elt \"abc\" 0) は#\\a");
+
+    assert(primitive_elt(os_make_cons(list, os_make_cons(os_make_fixnum(5), nil)), nil) == g_sym_eval_error,
+           "(elt '(a b c) 5) は範囲外なのでg_sym_eval_error");
+    assert(primitive_elt(os_make_cons(str, os_make_cons(os_make_fixnum(5), nil)), nil) == g_sym_eval_error,
+           "(elt \"abc\" 5) は範囲外なのでg_sym_eval_error");
+    assert(primitive_elt(os_make_cons(vec, os_make_cons(os_make_fixnum(5), nil)), nil) == g_sym_eval_error,
+           "(elt (vector 'a 'b 'c) 5) は範囲外なのでg_sym_eval_error");
+}
+
+void test_primitive_set_elt() {
+    lisp_val_t str = primitive_create_string(os_make_cons(os_make_fixnum(5), os_make_cons(os_make_char('x'), nil)), nil);
+    lisp_val_t set_str_args = os_make_cons(os_make_char('O'), os_make_cons(str, os_make_cons(os_make_fixnum(2), nil)));
+    assert(primitive_set_elt(set_str_args, nil) == os_make_char('O'), "(set-elt #\\O string 2) は書き込んだ#\\Oを返す");
+    char buf[8];
+    os_string_to_cstr(str, buf, sizeof(buf));
+    assert(strcmp(buf, "xxOxx") == 0, "set-eltで書き換えた後のstringは\"xxOxx\"");
+
+    lisp_val_t list = os_make_cons(os_make_fixnum(1),
+                        os_make_cons(os_make_fixnum(2),
+                          os_make_cons(os_make_fixnum(3), nil)));
+    lisp_val_t set_list_args = os_make_cons(os_make_fixnum(99), os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)));
+    assert(primitive_set_elt(set_list_args, nil) >> 3 == 99, "(set-elt 99 list 1) は書き込んだ99を返す");
+    assert(primitive_elt(os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)), nil) >> 3 == 99,
+           "set-eltで書き換えた後のlistの1番目は99");
+
+    lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
+    lisp_val_t set_vec_args = os_make_cons(os_make_fixnum(42), os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)));
+    assert(primitive_set_elt(set_vec_args, nil) >> 3 == 42, "(set-elt 42 vec 1) は書き込んだ42を返す");
+    assert(primitive_elt(os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)), nil) >> 3 == 42,
+           "set-eltで書き換えた後のvecの1番目は42");
+
+    lisp_val_t out_of_range_args = os_make_cons(os_make_fixnum(1), os_make_cons(list, os_make_cons(os_make_fixnum(5), nil)));
+    assert(primitive_set_elt(out_of_range_args, nil) == g_sym_eval_error, "(set-elt 1 list 5) は範囲外なのでg_sym_eval_error");
+}
+
+void test_primitive_subseq() {
+    lisp_val_t str_result = primitive_subseq(
+        os_make_cons(os_make_string("abcdef"), os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(4), nil))), nil);
+    char buf[8];
+    os_string_to_cstr(str_result, buf, sizeof(buf));
+    assert(strcmp(buf, "bcd") == 0, "(subseq \"abcdef\" 1 4) は\"bcd\"");
+
+    lisp_val_t list = os_make_cons(os_make_symbol("A"),
+                        os_make_cons(os_make_symbol("B"),
+                          os_make_cons(os_make_symbol("C"),
+                            os_make_cons(os_make_symbol("D"),
+                              os_make_cons(os_make_symbol("E"),
+                                os_make_cons(os_make_symbol("F"), nil))))));
+    lisp_val_t list_result = primitive_subseq(
+        os_make_cons(list, os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(4), nil))), nil);
+    assert(primitive_elt(os_make_cons(list_result, os_make_cons(os_make_fixnum(0), nil)), nil) == os_make_symbol("B"),
+           "(subseq '(a b c d e f) 1 4) の0番目はb");
+    assert(primitive_elt(os_make_cons(list_result, os_make_cons(os_make_fixnum(1), nil)), nil) == os_make_symbol("C"),
+           "(subseq '(a b c d e f) 1 4) の1番目はc");
+    assert(primitive_elt(os_make_cons(list_result, os_make_cons(os_make_fixnum(2), nil)), nil) == os_make_symbol("D"),
+           "(subseq '(a b c d e f) 1 4) の2番目はd");
+    assert(primitive_length(os_make_cons(list_result, nil), nil) >> 3 == 3, "(subseq '(a b c d e f) 1 4) の長さは3");
+
+    lisp_val_t vec = primitive_vector(list, nil);
+    lisp_val_t vec_result = primitive_subseq(
+        os_make_cons(vec, os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(4), nil))), nil);
+    assert((vec_result & TAG_MASK) == TAG_INSTANCE, "(subseq (vector ...) 1 4) の戻り値はTAG_INSTANCEを持つ(VECTOR)");
+    assert(primitive_length(os_make_cons(vec_result, nil), nil) >> 3 == 3, "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の長さは3");
+    assert(primitive_elt(os_make_cons(vec_result, os_make_cons(os_make_fixnum(0), nil)), nil) == os_make_symbol("B"),
+           "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の0番目はb");
+    assert(primitive_elt(os_make_cons(vec_result, os_make_cons(os_make_fixnum(2), nil)), nil) == os_make_symbol("D"),
+           "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の2番目はd");
+}
+
 void test_primitive_make_class_raw_and_accessors() {
     lisp_val_t name = os_make_symbol("POINT");
     lisp_val_t supers = nil;
@@ -1054,6 +1140,9 @@ int main(int argc, char** argv) {
    test_primitive_string_index();
    test_primitive_string_append();
    test_primitive_length();
+   test_primitive_elt();
+   test_primitive_set_elt();
+   test_primitive_subseq();
    test_primitive_make_class_raw_and_accessors();
    test_primitive_make_instance_raw_and_accessors();
 
