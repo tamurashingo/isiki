@@ -10,6 +10,7 @@
 #include "reader.h"
 #include "eval.h"
 #include "stream_lisp.h"
+#include "format.h"
 
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
@@ -117,11 +118,11 @@ static void setup_buffers() {
     }
 }
 
-#define HEAP_SIZE (1024 * 1024 * 8)
+#define HEAP_SIZE (1024 * 1024 * 64)
 
 static void setup_heap() {
     void *heap = malloc(HEAP_SIZE);
-    assert(heap != NULL, "4MBのヒープ用メモリをmallocで確保できる");
+    assert(heap != NULL, "32MBのヒープ用メモリをmallocで確保できる");
     os_heap_init((UINT64)heap, HEAP_SIZE);
     os_bootstrap();
     os_register_eval_primitives();
@@ -239,6 +240,7 @@ int main(int argc, char** argv) {
                      os_make_native_function((lisp_addr_t)(void *)primitive_assert_equal),
                      global_environment);
     os_register_streams();
+    os_register_format();
 
     lisp_val_t env = os_make_environment(os_make_symbol("SCRIPT-TEST-ENV"), global_environment);
 

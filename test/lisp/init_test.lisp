@@ -265,6 +265,102 @@
   (block %top-level
     (%abort-top-level 42)))
 
+;;; --- Condition System: クラス階層(§29) ---
+
+;; subclasspは(%find-classと同じ)クラスオブジェクトを引数に取る(クラス名symbolは不可)
+(assert-equal t (subclassp (class <serious-condition>) (class <condition>)))
+(assert-equal t (subclassp (class <error>) (class <serious-condition>)))
+(assert-equal t (subclassp (class <storage-exhausted>) (class <serious-condition>)))
+(assert-equal t (subclassp (class <arithmetic-error>) (class <error>)))
+(assert-equal t (subclassp (class <division-by-zero>) (class <arithmetic-error>)))
+(assert-equal t (subclassp (class <floating-point-overflow>) (class <arithmetic-error>)))
+(assert-equal t (subclassp (class <floating-point-underflow>) (class <arithmetic-error>)))
+(assert-equal t (subclassp (class <control-error>) (class <error>)))
+(assert-equal t (subclassp (class <parse-error>) (class <error>)))
+(assert-equal t (subclassp (class <program-error>) (class <error>)))
+(assert-equal t (subclassp (class <domain-error>) (class <program-error>)))
+(assert-equal t (subclassp (class <undefined-entity>) (class <program-error>)))
+(assert-equal t (subclassp (class <unbound-variable>) (class <undefined-entity>)))
+(assert-equal t (subclassp (class <undefined-function>) (class <undefined-entity>)))
+(assert-equal t (subclassp (class <simple-error>) (class <error>)))
+(assert-equal t (subclassp (class <stream-error>) (class <error>)))
+(assert-equal t (subclassp (class <end-of-stream>) (class <stream-error>)))
+
+;;; --- Condition System: アクセサ(§29.3) ---
+
+;; 正常系: 対応するクラスのインスタンスならinitargで渡した値が返る
+(assert-equal '/
+  (arithmetic-error-operation (make-instance '<arithmetic-error> ':operation '/ ':operands (list 1 0))))
+(assert-equal t
+  (equal (list 1 0) (arithmetic-error-operands (make-instance '<arithmetic-error> ':operation '/ ':operands (list 1 0)))))
+(assert-equal 5
+  (domain-error-object (make-instance '<domain-error> ':object 5 ':expected-class '<integer>)))
+(assert-equal '<integer>
+  (domain-error-expected-class (make-instance '<domain-error> ':object 5 ':expected-class '<integer>)))
+(assert-equal (string-to-symbol "abc")
+  (string-to-symbol (parse-error-string (make-instance '<parse-error> ':string "abc" ':expected-class '<integer>))))
+(assert-equal (string-to-symbol "msg")
+  (string-to-symbol (simple-error-format-string (make-instance '<simple-error> ':format-string "msg" ':format-arguments nil))))
+(assert-equal 'strm
+  (stream-error-stream (make-instance '<stream-error> ':stream 'strm)))
+(assert-equal 'foo
+  (undefined-entity-name (make-instance '<undefined-entity> ':name 'foo ':namespace 'variable)))
+(assert-equal 'variable
+  (undefined-entity-namespace (make-instance '<undefined-entity> ':name 'foo ':namespace 'variable)))
+
+;; 異常系: 型が合わないアクセサ呼び出しは<domain-error>をsignalする(ignore-errorsで捕まえられる)
+(assert-equal nil (ignore-errors (arithmetic-error-operation 5)))
+(assert-equal nil (ignore-errors (domain-error-object "not a condition")))
+(assert-equal nil (ignore-errors (simple-error-format-string (make-instance '<condition>))))
+
+;; %check-condition-classがsignalする<domain-error>の内容自体も確認できる
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (arithmetic-error-operation 5))))
+(assert-equal 5
+  (block b
+    (with-handler (lambda (c) (return-from b (domain-error-object c)))
+      (arithmetic-error-operation 5))))
+
+;;; --- Condition System: cerror / condition-continuable / continue-condition ---
+
+;; ハンドラがcontinue-conditionを呼ばず普通に返ると、その結果がcerrorの戻り値になる
+;; (continuableに渡された「continue-stringをformatした文字列」がそのまま返る)
+(assert-equal (string-to-symbol "retry? y")
+  (block b
+    (with-handler (lambda (c) (return-from b (string-to-symbol (condition-continuable c))))
+      (cerror "retry? ~A" "bad value: ~A" "y"))))
+
+;; ハンドラがcontinue-conditionでvalueを渡すと、それがcerrorの呼び出し元での
+;; signal-conditionの戻り値になる(= cerror自体の戻り値になる)
+(assert-equal 'resumed
+  (with-handler (lambda (c) (continue-condition c 'resumed))
+    (cerror "retry" "bad value")))
+
+;; valueを省略した場合はnilが返る
+(assert-equal nil
+  (with-handler (lambda (c) (continue-condition c))
+    (cerror "retry" "bad value")))
+
+;;; --- Condition System: report-condition ---
+
+(assert-equal (string-to-symbol "msg 1 2")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<simple-error> ':format-string "msg ~A ~A" ':format-arguments (list 1 2)) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+(assert-equal (string-to-symbol "undefined variable: x")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<undefined-entity> ':name 'x ':namespace 'variable) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+;; デフォルトメソッド(<simple-error>等の特化メソッドが無いクラス)はクラス名を出力する
+(assert-equal (string-to-symbol "<CONTROL-ERROR>")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<control-error>) s)
+    (string-to-symbol (get-output-stream-string s))))
+
 ;;; --- dynamic-let / set-dynamic ---
 
 (defdynamic *dl-test* 1)

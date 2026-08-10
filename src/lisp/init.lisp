@@ -568,6 +568,52 @@
 (defun instancep (instance class)
   (typep instance class))
 
+;;; --- integerp (§19: number class) ---
+
+;; FIXNUM(60bit以内)とbignum(60bit超)のいずれかであれば整数とみなす。
+(defun integerp (obj)
+  (or (fixnump obj) (bignump obj)))
+
+;;; --- class / the / assure ---
+;;;
+;;; defgeneric/defmethod(下記の総称関数セクション)がspecializerの解決に
+;;; `class`マクロを使うため、このセクションは総称関数セクションより前に
+;;; 置く必要がある(macroは定義前に使うと未定義関数呼び出しとして扱われ、
+;;; defmethodのspecializer計算がすべて失敗する)。
+
+;; class-nameがtypepでも判定できる組み込み型名なら対応する述語で、それ以外
+;; (ILOSのユーザークラス)ならtypepにフォールバックして判定する。
+;; 既知の制約: stringp/characterpに相当するprimitiveが存在しないため、
+;; <string>/<character>等はここでは対応しない(未対応の型名は常にtypep経由になり、
+;; %find-classできないクラス名ならtypepがnilを返すのでassureは必ずエラーになる)。
+(defun %assure-typep (obj class-name)
+  (case class-name
+    ((<integer>) (integerp obj))
+    ((<number>) (numberp obj))
+    ((<symbol>) (symbolp obj))
+    ((<cons>) (consp obj))
+    ((<null>) (null obj))
+    (t (typep obj class-name))))
+
+;; (class class-name) : ILOSでdefclassされたクラス名をクラスオブジェクトに変換する。
+;; 既知の制約: <integer>等の組み込み型のクラスオブジェクトは未実装のため対象外。
+(defmacro class (class-name)
+  `(%find-class ',class-name))
+
+;; (the class-name form) : 型を宣言するだけで、実際の型チェックは行わない
+;; (spec上、不一致時の動作は未定義なのでno-opで十分)。
+(defmacro the (class-name form)
+  form)
+
+;; (assure class-name form) : formを評価し、その値がclass-nameの(サブ)クラスの
+;; インスタンスでなければerrorを発生させる。一致すれば評価値をそのまま返す。
+(defmacro assure (class-name form)
+  (let ((v (gensym)))
+    `(let ((,v ,form))
+       (if (%assure-typep ,v ',class-name)
+           ,v
+           (error "assure: value is not of the expected type" ,v)))))
+
 ;;; --- 総称関数(最小実装): defgeneric / defmethod / call-next-method / next-method-p ---
 ;;;
 ;;; 既知の簡略化: 単一(第1引数のみ)dispatch。:before/:after/:aroundなどの
@@ -738,17 +784,49 @@
 (defun class-of (obj)
   (%%instance-class obj))
 
-;;; --- エラー処理とコンディショナルシステム(最小実装): signal-condition / with-handler / error ---
+;;; --- エラー処理とコンディションシステム(§29): signal-condition / with-handler / error / クラス階層 ---
 ;;;
 ;;; コンディションはILOSのインスタンスとして表現する(専用のC構造体は増やさない)。
-;;; 既知の簡略化: report-condition等の総称関数によるメッセージ整形は実装しない。
-;;; format-string/format-argumentsスロットに素材を保持するのみ。
+;;; <condition>はISLisp仕様には存在しない実装独自の基底クラス(spec上のルートは
+;;; <serious-condition>だが、既存テストが(make-instance '<condition>)を直接使っているため
+;;; 後方互換性のために<serious-condition>の親としてそのまま残す)。それ以外のクラス階層は
+;;; spec図(tmp/islisp-spec.txt 994-1010行)通り。
+;;; 既知のスコープ限定: C側のエラー発生箇所(ゼロ除算・未束縛変数・未定義関数・
+;;; ストリームエラー等)を実際にこれらのconditionクラスへ繋ぎ直すことは対象外
+;;; (C primitiveから評価器を呼び戻す仕組みが現状無いため)。<floating-point-overflow>/
+;;; <floating-point-underflow>は浮動小数点数自体が未実装のため発生源を持たない。
 
-(defclass <condition> () ())
-(defclass <error> (<condition>) ())
+(defclass <condition> ()
+  ((%continuable :initform nil)
+   (%continue-tag :initform nil)))
+(defclass <serious-condition> (<condition>) ())
+(defclass <error> (<serious-condition>) ())
+(defclass <arithmetic-error> (<error>)
+  ((operation :initarg :operation :initform nil)
+   (operands :initarg :operands :initform nil)))
+(defclass <division-by-zero> (<arithmetic-error>) ())
+(defclass <floating-point-overflow> (<arithmetic-error>) ())
+(defclass <floating-point-underflow> (<arithmetic-error>) ())
+(defclass <control-error> (<error>) ())
+(defclass <parse-error> (<error>)
+  ((string :initarg :string :initform nil)
+   (expected-class :initarg :expected-class :initform nil)))
+(defclass <program-error> (<error>) ())
+(defclass <domain-error> (<program-error>)
+  ((object :initarg :object :initform nil)
+   (expected-class :initarg :expected-class :initform nil)))
+(defclass <undefined-entity> (<program-error>)
+  ((name :initarg :name :initform nil)
+   (namespace :initarg :namespace :initform nil)))
+(defclass <unbound-variable> (<undefined-entity>) ())
+(defclass <undefined-function> (<undefined-entity>) ())
 (defclass <simple-error> (<error>)
   ((format-string :initarg :format-string :initform nil)
    (format-arguments :initarg :format-arguments :initform nil)))
+(defclass <stream-error> (<error>)
+  ((stream :initarg :stream :initform nil)))
+(defclass <end-of-stream> (<stream-error>) ())
+(defclass <storage-exhausted> (<serious-condition>) ())
 
 ;; *handlers*はwith-handlerの動的スコープの間だけpush/popする、有効なhandler-functionの
 ;; リスト(内側が先頭)。*classes*と同じ理由でdefdynamic+%%set-dynamicを使う(冒頭の
@@ -772,23 +850,138 @@
 
 ;; *handlers*の先頭(最も内側)のhandler-functionを、一時的に自分自身を取り除いた状態で
 ;; 呼び出す(ハンドラ内でのsignal-conditionが次の外側のハンドラに渡るようにするため)。
-;; 呼び出し後は*handlers*を元に戻す。continuableでないconditionでハンドラが
+;; 呼び出し後は*handlers*を元に戻す(unwind-protectでどの脱出経路でも保証する)。
+;; continuableな呼び出しはconditionに%continuable/%continue-tagを記録した上でcatchで
+;; 包み、continue-conditionからのthrowで指定した値を返して呼び出し元(signal-conditionの
+;; 呼び出し元)へ復帰できるようにする。continuableでないconditionでハンドラが
 ;; (非局所脱出せず)普通に返ってきた場合は、仕様上はエラーだがトップレベルへのabortに
 ;; フォールバックする。
 (defun signal-condition (condition continuable)
   (let ((handlers (dynamic *handlers*)))
     (if (null handlers)
         (if continuable nil (%abort-top-level condition))
-        (progn
-          (%%set-dynamic '*handlers* (cdr handlers))
-          (let ((result (funcall (car handlers) condition)))
-            (%%set-dynamic '*handlers* handlers)
-            (if continuable result (%abort-top-level condition)))))))
+        (let ((tag (gensym)))
+          (set-slot-value condition '%continuable continuable)
+          (set-slot-value condition '%continue-tag tag)
+          (catch tag
+            (unwind-protect
+                (progn
+                  (%%set-dynamic '*handlers* (cdr handlers))
+                  (let ((result (funcall (car handlers) condition)))
+                    (if continuable result (%abort-top-level condition))))
+              (%%set-dynamic '*handlers* handlers)))))))
+
+;; (condition-continuable condition) → <object> : signal-conditionが記録した
+;; continuable引数(nil/t/継続用文字列)をそのまま返す。
+(defun condition-continuable (condition)
+  (slot-value condition '%continuable))
+
+;; (continue-condition condition [value]) : conditionを今まさにsignalしている
+;; signal-conditionの呼び出しへ、catchタグを介してvalue(既定nil)を返して復帰する。
+(defun continue-condition (condition &rest value)
+  (throw (slot-value condition '%continue-tag) (if value (car value) nil)))
 
 (defun error (format-string &rest format-arguments)
   (signal-condition
     (make-instance '<simple-error> ':format-string format-string ':format-arguments format-arguments)
     nil))
+
+;; (cerror continue-string error-string obj*) → <object> : spec 6966-6980行の等価定義通り、
+;; continue-stringとerror-stringのいずれもobj*でformatする素材として<simple-error>に積み、
+;; continuableには「continue-stringをformatした文字列」を渡す(signal-conditionが正常return
+;; した場合、あるいはハンドラがcontinue-conditionでvalueを渡した場合、その値がcerrorの
+;; 戻り値になる)。
+(defun cerror (continue-string error-string &rest objs)
+  (signal-condition
+    (make-instance '<simple-error> ':format-string error-string ':format-arguments objs)
+    (let ((str (create-string-output-stream)))
+      (%%apply #'format (cons str (cons continue-string objs)))
+      (get-output-stream-string str))))
+
+;;; --- condition accessors (§29.3) ---
+;;;
+;;; 各アクセサは対象クラスでなければ<domain-error>をsignalする(spec 7080-7081行等、
+;;; 各データ表の「An error shall be signaled if X is not a condition of class <X>
+;;; (error-id. domain-error)」という要求に対応)。
+
+;; objがclass-nameのインスタンスならそのまま返し、そうでなければ<domain-error>をsignalする。
+(defun %check-condition-class (obj class-name)
+  (if (typep obj class-name)
+      obj
+      (signal-condition
+        (make-instance '<domain-error> ':object obj ':expected-class (%find-class class-name))
+        nil)))
+
+(defun arithmetic-error-operation (condition)
+  (slot-value (%check-condition-class condition '<arithmetic-error>) 'operation))
+
+(defun arithmetic-error-operands (condition)
+  (slot-value (%check-condition-class condition '<arithmetic-error>) 'operands))
+
+(defun domain-error-object (condition)
+  (slot-value (%check-condition-class condition '<domain-error>) 'object))
+
+(defun domain-error-expected-class (condition)
+  (slot-value (%check-condition-class condition '<domain-error>) 'expected-class))
+
+(defun parse-error-string (condition)
+  (slot-value (%check-condition-class condition '<parse-error>) 'string))
+
+(defun parse-error-expected-class (condition)
+  (slot-value (%check-condition-class condition '<parse-error>) 'expected-class))
+
+(defun simple-error-format-string (condition)
+  (slot-value (%check-condition-class condition '<simple-error>) 'format-string))
+
+(defun simple-error-format-arguments (condition)
+  (slot-value (%check-condition-class condition '<simple-error>) 'format-arguments))
+
+(defun stream-error-stream (condition)
+  (slot-value (%check-condition-class condition '<stream-error>) 'stream))
+
+(defun undefined-entity-name (condition)
+  (slot-value (%check-condition-class condition '<undefined-entity>) 'name))
+
+(defun undefined-entity-namespace (condition)
+  (slot-value (%check-condition-class condition '<undefined-entity>) 'namespace))
+
+;;; --- report-condition (§29.2) ---
+;;;
+;;; defgeneric/defmethod(既存のinitialize-objectと同じ機構、単一dispatch・
+;;; subclasspベースの特定度順ソート)を再利用する。<condition>へのデフォルトメソッドは
+;;; クラス名のみ出力し、データを持つクラスには具体的なメッセージを出す特化メソッドを
+;;; 追加する。
+
+(defgeneric report-condition (condition stream))
+
+(defmethod report-condition ((condition <condition>) stream)
+  (format stream "~A" (%%class-name (class-of condition)))
+  condition)
+
+(defmethod report-condition ((condition <simple-error>) stream)
+  (%%apply #'format (cons stream (cons (slot-value condition 'format-string)
+                                        (slot-value condition 'format-arguments))))
+  condition)
+
+(defmethod report-condition ((condition <arithmetic-error>) stream)
+  (format stream "arithmetic error: ~A ~A" (slot-value condition 'operation) (slot-value condition 'operands))
+  condition)
+
+(defmethod report-condition ((condition <domain-error>) stream)
+  (format stream "~A is not of expected class ~A" (slot-value condition 'object) (slot-value condition 'expected-class))
+  condition)
+
+(defmethod report-condition ((condition <parse-error>) stream)
+  (format stream "cannot parse ~A as ~A" (slot-value condition 'string) (slot-value condition 'expected-class))
+  condition)
+
+(defmethod report-condition ((condition <stream-error>) stream)
+  (format stream "stream error on ~A" (slot-value condition 'stream))
+  condition)
+
+(defmethod report-condition ((condition <undefined-entity>) stream)
+  (format stream "undefined ~A: ~A" (slot-value condition 'namespace) (slot-value condition 'name))
+  condition)
 
 ;;; --- ignore-errors ---
 
@@ -801,47 +994,6 @@
        (with-handler
            (lambda (c) (if (typep c '<error>) (return-from ,block-name nil) (signal-condition c nil)))
          ,@body))))
-
-;;; --- integerp (§19: number class) ---
-
-;; FIXNUM(60bit以内)とbignum(60bit超)のいずれかであれば整数とみなす。
-(defun integerp (obj)
-  (or (fixnump obj) (bignump obj)))
-
-;;; --- class / the / assure ---
-
-;; class-nameがtypepでも判定できる組み込み型名なら対応する述語で、それ以外
-;; (ILOSのユーザークラス)ならtypepにフォールバックして判定する。
-;; 既知の制約: stringp/characterpに相当するprimitiveが存在しないため、
-;; <string>/<character>等はここでは対応しない(未対応の型名は常にtypep経由になり、
-;; %find-classできないクラス名ならtypepがnilを返すのでassureは必ずエラーになる)。
-(defun %assure-typep (obj class-name)
-  (case class-name
-    ((<integer>) (integerp obj))
-    ((<number>) (numberp obj))
-    ((<symbol>) (symbolp obj))
-    ((<cons>) (consp obj))
-    ((<null>) (null obj))
-    (t (typep obj class-name))))
-
-;; (class class-name) : ILOSでdefclassされたクラス名をクラスオブジェクトに変換する。
-;; 既知の制約: <integer>等の組み込み型のクラスオブジェクトは未実装のため対象外。
-(defmacro class (class-name)
-  `(%find-class ',class-name))
-
-;; (the class-name form) : 型を宣言するだけで、実際の型チェックは行わない
-;; (spec上、不一致時の動作は未定義なのでno-opで十分)。
-(defmacro the (class-name form)
-  form)
-
-;; (assure class-name form) : formを評価し、その値がclass-nameの(サブ)クラスの
-;; インスタンスでなければerrorを発生させる。一致すれば評価値をそのまま返す。
-(defmacro assure (class-name form)
-  (let ((v (gensym)))
-    `(let ((,v ,form))
-       (if (%assure-typep ,v ',class-name)
-           ,v
-           (error "assure: value is not of the expected type" ,v)))))
 
 ;;; --- convert ---
 ;;;
