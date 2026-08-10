@@ -11,6 +11,7 @@
 #include "eval.h"
 #include "stream_lisp.h"
 #include "format.h"
+#include "clock.h"
 
 
 /**
@@ -50,9 +51,18 @@ static void kernel_show_information(frame_buffer *fb) {
  * @param heap_base Lispヒープの先頭アドレス
  * @param heap_size Lispヒープのサイズ(バイト)
  */
-void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pixels_per_scanline, UINT64 heap_base, UINT64 heap_size) {
+/** kernel_mainに渡されたboot_epoch_secondsを保持する(kernel_get_boot_epoch_secondsで読める) */
+static UINT64 g_boot_epoch_seconds = 0;
+
+UINT64 kernel_get_boot_epoch_seconds(void) {
+    return g_boot_epoch_seconds;
+}
+
+void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pixels_per_scanline, UINT64 heap_base, UINT64 heap_size, UINT64 boot_epoch_seconds) {
 
     asm volatile ("cli");
+
+    g_boot_epoch_seconds = boot_epoch_seconds;
 
     os_heap_init(heap_base, heap_size);
     os_bootstrap();
@@ -61,6 +71,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_eval_primitives();
     os_register_streams();
     os_register_format();
+    os_register_clock();
 
     frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);

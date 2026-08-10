@@ -126,6 +126,13 @@ void init_idt(void);
 void init_pit(void);
 
 /**
+ * c_timer_switchが呼ばれた(PIT割り込みが発生した)回数を返す。
+ * PITは約100Hzなので1tick = 1/100秒として扱う
+ * @return 起動後のtick数
+ */
+uint64_t get_tick_counter(void);
+
+/**
  * IRQ0(PIT)のマスクを解除し、タイマー割り込みによるプリエンプションを開始する。
  * *RUN-QUEUE* と PCB がすべて構築された後に呼ぶこと。
  */

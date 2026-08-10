@@ -75,6 +75,28 @@ typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(
     void **Interface
 );
 
+typedef struct {
+    UINT16 Year;
+    UINT8  Month;
+    UINT8  Day;
+    UINT8  Hour;
+    UINT8  Minute;
+    UINT8  Second;
+    UINT8  Pad1;
+    UINT32 Nanosecond;
+    INT16  TimeZone;
+    UINT8  Daylight;
+    UINT8  Pad2;
+} EFI_TIME;
+
+typedef EFI_STATUS (EFIAPI *EFI_GET_TIME)(EFI_TIME *Time, void *Capabilities);
+
+// GetTimeはHdrの直後の最初のフィールドなので、後続のSetTime等は使わないため省略する
+typedef struct _EFI_RUNTIME_SERVICES {
+    EFI_TABLE_HEADER Hdr;
+    EFI_GET_TIME GetTime;
+} EFI_RUNTIME_SERVICES;
+
 
 typedef struct _EFI_BOOT_SERVICES {
     EFI_TABLE_HEADER Hdr;
@@ -204,6 +226,31 @@ static EFI_GUID gEfiGraphicsOutputProtocolGuid = {
 char memory_map_buffer[1024 * 256];
 
 
+/**
+ * EFI_TIMEをUniversal Time Format(1900-01-01T00:00:00からの経過秒数)へ変換する。
+ * TimeZone/Daylightは無視し、ファームウェアの時刻をそのままUTCとして扱う
+ * (起動時に1回しか呼ばれないため、閏年判定式より読みやすさを優先した年ループ実装)
+ */
+static int is_leap_year(UINT16 year) {
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+static UINT64 efi_time_to_universal_seconds(EFI_TIME *t) {
+    static const UINT16 days_in_month[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    UINT64 days = 0;
+    for (UINT16 y = 1900; y < t->Year; y++) {
+        days += is_leap_year(y) ? 366 : 365;
+    }
+    for (UINT8 m = 1; m < t->Month; m++) {
+        days += days_in_month[m - 1];
+        if (m == 2 && is_leap_year(t->Year)) {
+            days += 1;
+        }
+    }
+    days += t->Day - 1;
+    return days * 86400ULL + (UINT64)t->Hour * 3600ULL + (UINT64)t->Minute * 60ULL + (UINT64)t->Second;
+}
+
 void UINT64ToHexStr(UINT64 val, CHAR16 *str) {
     char hex[] = "0123456789ABCDEF";
     for (int i = 15; i >= 0; i--) {
@@ -305,6 +352,16 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     UINT32 fb_height = gop->Mode->Info->VerticalResolution;
     UINT32 fb_pixels_per_scanline = gop->Mode->Info->PixelPerScanLine;
 
+    // 起動時点のUTCをget-universal-time用に取得する。GetTimeに失敗した場合は
+    // 0(=1900-01-01)のままとする(条件系へのエラー通知はスコープ外)
+    EFI_RUNTIME_SERVICES *runtime_services = (EFI_RUNTIME_SERVICES *)SystemTable->RuntimeServices;
+    EFI_TIME boot_time;
+    UINT64 boot_epoch_seconds = 0;
+    status = runtime_services->GetTime(&boot_time, (void *)0);
+    if (status == 0) {
+        boot_epoch_seconds = efi_time_to_universal_seconds(&boot_time);
+    }
+
     memory_map_size = sizeof(memory_map_buffer);
     status = SystemTable->BootServices->GetMemoryMap(
         &memory_map_size, memory_map, &map_key, &descriptor_size, &descriptor_version
@@ -328,7 +385,7 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     }
 
 
-    kernel_main(fb_base, fb_width, fb_height, fb_pixels_per_scanline, heap_start, max_free_size);
+    kernel_main(fb_base, fb_width, fb_height, fb_pixels_per_scanline, heap_start, max_free_size, boot_epoch_seconds);
 
     return 0;
 }

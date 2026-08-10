@@ -1162,3 +1162,6 @@
 
 (defmacro with-error-output (stream-form &rest body)
   `(dynamic-let ((*error-output* ,stream-form)) ,@body))
+
+;;; --- miscellaneous (§30) ---
+(defun identity (obj) obj)

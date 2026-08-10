@@ -309,8 +309,16 @@ asm(
     "    iretq\n"
 );
 
+/** PIT tick数のカウンタ。get-internal-real-time/get-universal-time等の基礎になる */
+static UINT64 g_tick_counter = 0;
+
+UINT64 get_tick_counter(void) {
+    return g_tick_counter;
+}
+
 UINT64 __attribute__((sysv_abi)) c_timer_switch(UINT64 current_rsp) {
     outb(0x20, 0x20); // EOI を先に返す
+    g_tick_counter++;
 
     lisp_val_t current_cell = os_get_variable(g_sym_current_process, global_environment);
     lisp_val_t next_cell;
