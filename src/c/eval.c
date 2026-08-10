@@ -178,7 +178,10 @@ static lisp_val_t eval_if(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * setq特殊形式。(setq sym val-form)のval-formを評価し、current environmentのvariablesスロットにのみ書き込む。
+ * setq特殊形式。(setq sym val-form)のval-formを評価し、envから親を辿って見つかった
+ * 既存のsym束縛を上書きする(os_setq_variable)。クロージャ経由で外側のスコープの
+ * 変数を書き換えられるようにするため、current environmentのvariablesスロットだけを
+ * 見るos_set_variableとは異なる。
  * @param args (sym val-form)
  * @param env 評価・書き込み対象の環境
  * @return 書き込んだ値
@@ -193,7 +196,7 @@ static lisp_val_t eval_setq(lisp_val_t args, lisp_val_t env) {
     if (is_control_transfer(val)) {
         return val;
     }
-    return os_set_variable(sym, val, env);
+    return os_setq_variable(sym, val, env);
 }
 
 /**

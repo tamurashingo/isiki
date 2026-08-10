@@ -4,8 +4,11 @@
 
 (assert-equal 3 (let ((a 1) (b 2)) (+ a b)))
 
-;; letのbodyでのsetqは、そのletの変数だけに閉じて働く(新しいenvironmentに束縛されるため)
+;; letのbodyでのsetqは、そのletの変数を書き換える
 (assert-equal 10 (let ((x 5)) (setq x 10) x))
+
+;; lambdaクロージャ内からのsetqは、レキシカルスコープ上に見えている外側の変数を書き換える
+(assert-equal 99 (let ((x 0)) (let ((f (lambda () (setq x 99)))) (funcall f) x)))
 
 ;;; --- let* ---
 
@@ -989,8 +992,6 @@
     (let ((a (list 11 12 13 14)) (k '(one two three)))
       (map-into a #'cons k a))))
 ;; sequence*を指定しない場合は、functionを引数無しでdestinationの長さの回数呼ぶ
-;; (lambdaのクロージャからsetqで外側の変数を書き換えられないため、
-;;  カウンタはvectorの要素として持ちset-elt/eltで更新する)
 (assert-equal t
   (equal '(2 4 6 8)
     (let ((a (list 1 2 3 4)) (counter (create-vector 1)))

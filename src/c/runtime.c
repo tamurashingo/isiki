@@ -812,15 +812,34 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
 }
 
 /**
- * symがenv自身(親は辿らない)のconstantsスロットに登録されているかどうかを判定する。
+ * symがenvまたはその親のいずれかのconstantsスロットに登録されているかどうかを判定する。
+ * os_setq_variableが親を辿って書き込み先を探すため、ネストしたクロージャ内からの
+ * setqが外側スコープのdefconstant定数を素通りして書き換えてしまわないよう、
+ * os_get_variable/os_setq_variableと同じ親チェーン探索にしている。
  * @param sym 判定するsymbol
- * @param env 判定対象の環境(このenv自身のスロットのみを見る)
+ * @param env 判定を開始する環境
  * @return 定数として登録されていればnon-zero
  */
 int os_is_constant(lisp_val_t sym, lisp_val_t env) {
-    lisp_val_t const_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))));
-    lisp_val_t alist = cc_cdr(const_slot);
-    return cc_assoc_eq(sym, alist) != nil;
+    lisp_val_t current_env = env;
+
+    while (current_env != nil) {
+        lisp_val_t const_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(current_env)))));
+        lisp_val_t alist = cc_cdr(const_slot);
+
+        if (cc_assoc_eq(sym, alist) != nil) {
+            return 1;
+        }
+
+        lisp_val_t cell1 = cc_cdr(current_env);
+        lisp_val_t cell2 = cc_cdr(cell1);
+        lisp_val_t cell3 = cc_cdr(cell2);
+        lisp_val_t par_slot = cc_car(cell3);
+
+        current_env = cc_cdr(par_slot);
+    }
+
+    return 0;
 }
 
 /**
@@ -948,6 +967,43 @@ lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
     }
 
     return val;
+}
+
+
+/**
+ * envから親を順に辿り、既存のsym変数束縛を探して見つかったframeで破壊的に上書きする(setq用)。
+ * os_set_variableがcurrent frameだけを見て「新規に束縛を定義する」のに対し、setqは
+ * レキシカルスコープ上に見えている既存の変数を更新する必要があるため、os_get_variableと
+ * 同じ親チェーン探索でどのframeに実体があるかを見つけてから書き換える。
+ * どのframeにも見つからない場合(未束縛変数へのsetq)は、os_set_variableと同じく
+ * envにローカル新規追加する。
+ * @param sym 設定するsymbol
+ * @param val 設定する値
+ * @param env 探索を開始する環境
+ * @return val 自身
+ */
+lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
+    lisp_val_t current_env = env;
+
+    while (current_env != nil) {
+        lisp_val_t va_slot = cc_car(cc_cdr(current_env));
+        lisp_val_t alist = cc_cdr(va_slot);
+        lisp_val_t pair = cc_assoc_eq(sym, alist);
+
+        if (pair != nil) {
+            ((lisp_val_t *)(pair & ~TAG_MASK))[1] = val;
+            return val;
+        }
+
+        lisp_val_t cell1 = cc_cdr(current_env);
+        lisp_val_t cell2 = cc_cdr(cell1);
+        lisp_val_t cell3 = cc_cdr(cell2);
+        lisp_val_t par_slot = cc_car(cell3);
+
+        current_env = cc_cdr(par_slot);
+    }
+
+    return os_set_variable(sym, val, env);
 }
 
 

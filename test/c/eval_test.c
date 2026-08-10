@@ -215,7 +215,7 @@ void test_os_eval_progn() {
     assert(empty == nil, "(progn)はnilになる");
 }
 
-void test_os_eval_setq_writes_current_env_only() {
+void test_os_eval_setq_walks_parent_env_to_existing_binding() {
     lisp_val_t base_env = os_make_environment(os_make_symbol("BASE-ENV"), nil);
     lisp_val_t current_env = os_make_environment(os_make_symbol("CURRENT-ENV"), base_env);
     os_set_variable(os_make_symbol("x"), os_make_fixnum(1), base_env);
@@ -225,10 +225,40 @@ void test_os_eval_setq_writes_current_env_only() {
     assert(v == os_make_fixnum(99), "(setq x 99)はセットした値99を返す");
 
     lisp_val_t current_x = os_get_variable(os_make_symbol("x"), current_env);
-    assert(current_x == os_make_fixnum(99), "current_envのxは99に上書きされる");
+    assert(current_x == os_make_fixnum(99), "current_envから見えるxは99に上書きされる");
 
     lisp_val_t base_x = os_get_variable(os_make_symbol("x"), base_env);
-    assert(base_x == os_make_fixnum(1), "base_env自身のxは書き換わらない");
+    assert(base_x == os_make_fixnum(99), "xの実体はbase_env側にあるので、base_env自身のxも99に書き換わる"
+        "(current_envに新しいシャドウ束縛を作るのではなく、既存の束縛を見つけて書き換える)");
+}
+
+void test_os_eval_setq_defines_locally_when_unbound_anywhere() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    lisp_val_t args[2] = { os_make_symbol("z"), os_make_fixnum(42) };
+    lisp_val_t v = os_eval(make_call("setq", 2, args), env);
+    assert(v == os_make_fixnum(42), "(setq z 42)はセットした値42を返す");
+
+    lisp_val_t z = os_get_variable(os_make_symbol("z"), env);
+    assert(z == os_make_fixnum(42), "どの親envにも束縛が無いsetqは、呼び出し時のenv自身にローカル新規定義する");
+}
+
+void test_os_eval_closure_setq_mutates_outer_variable() {
+    // (let ((x 0)) (let ((f (lambda () (setq x 99)))) (funcall f) x)) が99を返すべき、という
+    // ユーザー報告のバグ再現(修正前はfの呼び出しで新しいframeにxがシャドウされ0のまま変わらなかった)
+    lisp_val_t outer_env = os_make_environment(os_make_symbol("OUTER-ENV"), nil);
+    os_set_variable(os_make_symbol("x"), os_make_fixnum(0), outer_env);
+
+    lisp_val_t setq_args[2] = { os_make_symbol("x"), os_make_fixnum(99) };
+    lisp_val_t setq_form = make_call("setq", 2, setq_args);
+    lisp_val_t lambda_form = os_make_cons(os_make_symbol("lambda"), os_make_cons(nil, os_make_cons(setq_form, nil)));
+    lisp_val_t f = os_eval(lambda_form, outer_env); // fのclosure_envはouter_env
+
+    lisp_val_t funcall_args = os_make_cons(f, nil);
+    primitive_funcall(funcall_args, outer_env);
+
+    lisp_val_t x = os_get_variable(os_make_symbol("x"), outer_env);
+    assert(x == os_make_fixnum(99), "クロージャ内からのsetqは、定義時のenv(outer_env)にある外側のxを実際に書き換える");
 }
 
 void test_os_eval_defun() {
@@ -931,7 +961,7 @@ void test_os_eval_defvar_second_call_is_ignored() {
     assert(os_get_variable(name, env) == os_make_fixnum(1), "既に束縛済みの場合、2回目のdefvarは無視され元の値1が残る");
 }
 
-void test_os_eval_defconstant_blocks_setq_but_only_in_its_own_env() {
+void test_os_eval_defconstant_blocks_setq_in_its_own_env() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
     lisp_val_t name = os_make_symbol("x");
 
@@ -951,6 +981,22 @@ void test_os_eval_defconstant_blocks_setq_but_only_in_its_own_env() {
     lisp_val_t other_v = os_eval(setq_form, other_env);
     assert(other_v == os_make_fixnum(2), "別環境の同名変数xは定数ではないので通常通りsetqできる");
     assert(os_get_variable(name, other_env) == os_make_fixnum(2), "別環境のxは2に書き換わる");
+}
+
+void test_os_eval_defconstant_blocks_setq_from_nested_child_env() {
+    // os_setq_variableが親envを辿って書き込み先を探すようになったため、
+    // ネストした子env(クロージャのcall-env相当)からのsetqでも、親envのdefconstant定数を
+    // 素通りして書き換えてしまわないことを確認する(os_is_constantの親チェーン探索の検証)
+    lisp_val_t base_env = os_make_environment(os_make_symbol("BASE-ENV"), nil);
+    lisp_val_t name = os_make_symbol("x");
+    lisp_val_t defconstant_form = os_make_cons(os_make_symbol("defconstant"), os_make_cons(name, os_make_cons(os_make_fixnum(1), nil)));
+    os_eval(defconstant_form, base_env);
+
+    lisp_val_t nested_env = os_make_environment(os_make_symbol("NESTED-ENV"), base_env);
+    lisp_val_t setq_form = os_make_cons(os_make_symbol("setq"), os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    lisp_val_t v = os_eval(setq_form, nested_env);
+    assert(v == g_sym_eval_error, "親envで定義されたdefconstant定数へのsetqは、ネストした子envからでもeval-errorになる");
+    assert(os_get_variable(name, base_env) == os_make_fixnum(1), "定数の値は書き換わらず1のまま");
 }
 
 void test_os_eval_defdynamic_and_dynamic_bypass_lexical_env() {
@@ -1034,7 +1080,9 @@ int main(int argc, char** argv) {
     test_os_eval_quote();
     test_os_eval_if();
     test_os_eval_progn();
-    test_os_eval_setq_writes_current_env_only();
+    test_os_eval_setq_walks_parent_env_to_existing_binding();
+    test_os_eval_setq_defines_locally_when_unbound_anywhere();
+    test_os_eval_closure_setq_mutates_outer_variable();
     test_os_eval_defun();
     test_os_eval_defun_multi_form_body();
     test_os_eval_defun_recursion();
@@ -1073,7 +1121,8 @@ int main(int argc, char** argv) {
     test_os_eval_flet_body_can_call_both_bound_functions();
     test_os_eval_labels_mutual_recursion();
     test_os_eval_defvar_second_call_is_ignored();
-    test_os_eval_defconstant_blocks_setq_but_only_in_its_own_env();
+    test_os_eval_defconstant_blocks_setq_in_its_own_env();
+    test_os_eval_defconstant_blocks_setq_from_nested_child_env();
     test_os_eval_defdynamic_and_dynamic_bypass_lexical_env();
     test_os_eval_defglobal_reevaluates_and_allows_setq();
     test_os_eval_top_level_catches_return_from_to_top_level_block();

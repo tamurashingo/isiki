@@ -288,10 +288,12 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3);
 lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env);
 
 /**
- * symがenv自身(親は辿らない)のconstantsスロットに登録されているかどうかを判定する。
+ * symがenvまたはその親のいずれかのconstantsスロットに登録されているかどうかを判定する。
  * defconstantで定義された定数をsetqで上書きできないようにするために使う。
+ * os_setq_variableが親を辿って書き込み先を探すため、ネストしたクロージャからの
+ * setqも外側スコープの定数保護を素通りしないよう同じ親チェーン探索にしている。
  * @param sym 判定するsymbol
- * @param env 判定対象の環境(このenv自身のスロットのみを見る)
+ * @param env 判定を開始する環境
  * @return 定数として登録されていればnon-zero
  */
 int os_is_constant(lisp_val_t sym, lisp_val_t env);
@@ -334,6 +336,16 @@ lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env);
  * @return val 自身
  */
 lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
+
+/**
+ * envから親を順に辿り、既存のsym変数束縛を探して見つかったframeで破壊的に上書きする(setq用)。
+ * どのframeにも見つからない場合は、os_set_variableと同じくenvにローカル新規追加する。
+ * @param sym 設定するsymbol
+ * @param val 設定する値
+ * @param env 探索を開始する環境
+ * @return val 自身
+ */
+lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 
 /**
  * envおよびその親を順に辿り、symの関数定義を取得する。
