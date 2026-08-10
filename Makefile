@@ -15,28 +15,28 @@ OBJ = $(patsubst $(SRCDIR)/%.c,$(TMPDIR)/%.o,$(SRC))
 TESTDIR = test/c
 TEST_COMMON_SRC = $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c
 
-TEST_SRC_RUNTIME = $(TEST_COMMON_SRC) $(TESTDIR)/runtime_test.c
+TEST_SRC_RUNTIME = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/runtime_test.c
 TEST_BIN_RUNTIME = $(TMPDIR)/runtime_test
 
-TEST_SRC_LISP = $(TEST_COMMON_SRC) $(TESTDIR)/lisp_test.c
+TEST_SRC_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/lisp_test.c
 TEST_BIN_LISP = $(TMPDIR)/lisp_test
 
-TEST_SRC_PROCESS = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(TESTDIR)/process_test.c
+TEST_SRC_PROCESS = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/process_test.c
 TEST_BIN_PROCESS = $(TMPDIR)/process_test
 
-TEST_SRC_READER = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/reader_test.c
+TEST_SRC_READER = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/eval.c $(TESTDIR)/reader_test.c
 TEST_BIN_READER = $(TMPDIR)/reader_test
 
-TEST_SRC_EVAL = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(TESTDIR)/eval_test.c
+TEST_SRC_EVAL = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/eval_test.c
 TEST_BIN_EVAL = $(TMPDIR)/eval_test
 
-TEST_SRC_PRINT = $(TEST_COMMON_SRC) $(SRCDIR)/print.c $(TESTDIR)/print_test.c
+TEST_SRC_PRINT = $(TEST_COMMON_SRC) $(SRCDIR)/print.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/print_test.c
 TEST_BIN_PRINT = $(TMPDIR)/print_test
 
 TEST_SRC_REPL = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(TESTDIR)/repl_test.c
 TEST_BIN_REPL = $(TMPDIR)/repl_test
 
-TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/subprimitive.c $(TESTDIR)/subprimitive_test.c
+TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/subprimitive.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/subprimitive_test.c
 TEST_BIN_SUBPRIMITIVE = $(TMPDIR)/subprimitive_test
 
 TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(TESTDIR)/script_test.c
@@ -48,15 +48,15 @@ TEST_BIN_STREAM = $(TMPDIR)/stream_test
 TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
 TEST_BIN_LOAD = $(TMPDIR)/load_test
 
-TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(TESTDIR)/stream_lisp_test.c
+TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/eval.c $(TESTDIR)/stream_lisp_test.c
 TEST_BIN_STREAM_LISP = $(TMPDIR)/stream_lisp_test
 
-TEST_SRC_FORMAT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(TESTDIR)/format_test.c
+TEST_SRC_FORMAT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/eval.c $(TESTDIR)/format_test.c
 TEST_BIN_FORMAT = $(TMPDIR)/format_test
 
 # interrupt.c/kernel.cはリンクせず、clock_test.cがget_tick_counter/
 # kernel_get_boot_epoch_secondsをテスト用固定値で置き換える
-TEST_SRC_CLOCK = $(TEST_COMMON_SRC) $(SRCDIR)/clock.c $(TESTDIR)/clock_test.c
+TEST_SRC_CLOCK = $(TEST_COMMON_SRC) $(SRCDIR)/clock.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/clock_test.c
 TEST_BIN_CLOCK = $(TMPDIR)/clock_test
 
 TEST_SRC_P9 = $(SRCDIR)/p9.c $(TESTDIR)/p9_test.c
@@ -79,7 +79,7 @@ image:
 build: $(SRC) $(HDR)
 	mkdir -p esp_dir/EFI/BOOT
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
-		-nostdlib -mno-red-zone -mgeneral-regs-only -O1 -shared \
+		-nostdlib -mno-red-zone -O1 -shared \
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
@@ -96,7 +96,7 @@ $(TMPDIR):
 $(TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(TMPDIR)
 	mkdir -p $(dir $@)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
-		-nostdlib -mno-red-zone -mgeneral-regs-only -O1 -c \
+		-nostdlib -mno-red-zone -O1 -c \
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
@@ -108,47 +108,47 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_RUNTIME) $(TEST_SRC_RUNTIME)
+		-o $(TEST_BIN_RUNTIME) $(TEST_SRC_RUNTIME) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_LISP) $(TEST_SRC_LISP)
+		-o $(TEST_BIN_LISP) $(TEST_SRC_LISP) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_PROCESS) $(TEST_SRC_PROCESS)
+		-o $(TEST_BIN_PROCESS) $(TEST_SRC_PROCESS) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_READER) $(TEST_SRC_READER)
+		-o $(TEST_BIN_READER) $(TEST_SRC_READER) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_EVAL) $(TEST_SRC_EVAL)
+		-o $(TEST_BIN_EVAL) $(TEST_SRC_EVAL) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_PRINT) $(TEST_SRC_PRINT)
+		-o $(TEST_BIN_PRINT) $(TEST_SRC_PRINT) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_REPL) $(TEST_SRC_REPL)
+		-o $(TEST_BIN_REPL) $(TEST_SRC_REPL) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_SUBPRIMITIVE) $(TEST_SRC_SUBPRIMITIVE)
+		-o $(TEST_BIN_SUBPRIMITIVE) $(TEST_SRC_SUBPRIMITIVE) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_SCRIPT) $(TEST_SRC_SCRIPT)
+		-o $(TEST_BIN_SCRIPT) $(TEST_SRC_SCRIPT) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
@@ -158,22 +158,22 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_LOAD) $(TEST_SRC_LOAD)
+		-o $(TEST_BIN_LOAD) $(TEST_SRC_LOAD) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_STREAM_LISP) $(TEST_SRC_STREAM_LISP)
+		-o $(TEST_BIN_STREAM_LISP) $(TEST_SRC_STREAM_LISP) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_FORMAT) $(TEST_SRC_FORMAT)
+		-o $(TEST_BIN_FORMAT) $(TEST_SRC_FORMAT) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
-		-o $(TEST_BIN_CLOCK) $(TEST_SRC_CLOCK)
+		-o $(TEST_BIN_CLOCK) $(TEST_SRC_CLOCK) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \

@@ -93,6 +93,14 @@ void switch_active_frame_buffer(UINT32 index) {
 void enable_timer_irq(void) {
 }
 
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
 void os_repl_step(process_t *proc) {
     (void)proc;
 }

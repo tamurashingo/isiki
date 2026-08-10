@@ -71,6 +71,122 @@ static void print_bignum(os_char_sink_t *sink, lisp_val_t val) {
 }
 
 /**
+ * doubleをISLisp §19.2相当の10進表記でsinkへ出力する(strtod/printf系が無い前提の
+ * 手書き実装)。符号・0を特別扱いした後、1<=|x|/10^e<10となる10進指数eを求め、
+ * 仮数から有効17桁(doubleを可逆変換できる最大桁数)を上位から順に取り出し、
+ * 末尾の0を(小数点以下最低1桁を残して)取り除く。指数の大小で固定小数点表記
+ * ("123.456")かE表記("1.23456E20")かを切り替える。
+ * @param sink 出力先のシンク
+ * @param value 出力するdouble値
+ */
+void os_print_double_to_sink(os_char_sink_t *sink, double value) {
+    if (value != value) {
+        sink_write_string(sink, "NAN");
+        return;
+    }
+
+    int negative = 0;
+    if (value < 0.0) {
+        negative = 1;
+        value = -value;
+    }
+    if (negative) {
+        sink_write_char(sink, '-');
+    }
+
+    if (value == 0.0) {
+        sink_write_string(sink, "0.0");
+        return;
+    }
+
+    // value == +infになるケース(±1.7976931348623157E308を超える等)はinfとして扱う
+    double check_inf = value * 10.0;
+    if (check_inf == value && value > 1.0) {
+        sink_write_string(sink, "INF");
+        return;
+    }
+
+    int exp10 = 0;
+    while (value >= 10.0) {
+        value /= 10.0;
+        exp10++;
+    }
+    while (value < 1.0) {
+        value *= 10.0;
+        exp10--;
+    }
+
+    #define FLOAT_SIG_DIGITS 17
+    char digits[FLOAT_SIG_DIGITS];
+    double m = value;
+    for (int i = 0; i < FLOAT_SIG_DIGITS; i++) {
+        int digit = (int)m;
+        if (digit > 9) {
+            digit = 9; // 浮動小数点誤差で10になるのを防ぐ
+        }
+        digits[i] = (char)('0' + digit);
+        m = (m - digit) * 10.0;
+    }
+
+    int ndigits = FLOAT_SIG_DIGITS;
+    while (ndigits > 1 && digits[ndigits - 1] == '0') {
+        ndigits--;
+    }
+
+    if (exp10 >= -3 && exp10 < FLOAT_SIG_DIGITS) {
+        // 固定小数点表記
+        if (exp10 >= 0) {
+            for (int i = 0; i <= exp10; i++) {
+                sink_write_char(sink, (UINT8)((i < ndigits) ? digits[i] : '0'));
+            }
+            sink_write_char(sink, '.');
+            if (exp10 + 1 >= ndigits) {
+                sink_write_char(sink, '0');
+            } else {
+                for (int i = exp10 + 1; i < ndigits; i++) {
+                    sink_write_char(sink, (UINT8)digits[i]);
+                }
+            }
+        } else {
+            sink_write_string(sink, "0.");
+            for (int i = 0; i < -exp10 - 1; i++) {
+                sink_write_char(sink, '0');
+            }
+            for (int i = 0; i < ndigits; i++) {
+                sink_write_char(sink, (UINT8)digits[i]);
+            }
+        }
+    } else {
+        // E表記
+        sink_write_char(sink, (UINT8)digits[0]);
+        sink_write_char(sink, '.');
+        if (ndigits == 1) {
+            sink_write_char(sink, '0');
+        } else {
+            for (int i = 1; i < ndigits; i++) {
+                sink_write_char(sink, (UINT8)digits[i]);
+            }
+        }
+        sink_write_char(sink, 'E');
+        if (exp10 < 0) {
+            sink_write_char(sink, '-');
+            exp10 = -exp10;
+        }
+        print_fixnum(sink, (UINT64)exp10);
+    }
+    #undef FLOAT_SIG_DIGITS
+}
+
+/**
+ * MAGIC_FLOATのINSTANCEをdoubleへ戻してprint_doubleで出力する。
+ * @param sink 出力先のシンク
+ * @param val 出力するfloat(TAG_INSTANCE、word0==MAGIC_FLOAT)
+ */
+static void print_float(os_char_sink_t *sink, lisp_val_t val) {
+    os_print_double_to_sink(sink, os_float_value(val));
+}
+
+/**
  * STRINGオブジェクトのレイアウト([len(8byte)][chars...])に従ってバイト列を出力する。
  * @param sink 出力先のシンク
  * @param str_addr STRINGオブジェクト本体(タグを除いた先頭)のアドレス
@@ -205,6 +321,8 @@ static void print_value(os_char_sink_t *sink, lisp_val_t val, int escaped) {
                 print_bignum(sink, val);
             } else if (magic == MAGIC_VECTOR) {
                 print_vector(sink, val, escaped);
+            } else if (magic == MAGIC_FLOAT) {
+                print_float(sink, val);
             } else if (magic == MAGIC_STREAM) {
                 sink_write_string(sink, "#<STREAM>");
             } else if (magic == MAGIC_CLASS) {

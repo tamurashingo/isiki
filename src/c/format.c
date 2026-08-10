@@ -55,11 +55,9 @@ static void format_integer_write(os_char_sink_t *sink, lisp_val_t integer, int r
     }
 }
 
-/** floatは未実装のため、fixnumの値を「整数+".0"」として出力する近似実装 */
+/** floatをprint.cのos_print_double_to_sinkと同じロジックで10進表記にして出力する */
 static void format_float_write(os_char_sink_t *sink, lisp_val_t obj) {
-    format_integer_write(sink, obj, 10);
-    sink->write_char(sink->ctx, '.');
-    sink->write_char(sink->ctx, '0');
+    os_print_double_to_sink(sink, os_float_value(obj));
 }
 
 lisp_val_t cc_format_char(lisp_val_t args, lisp_val_t env) {

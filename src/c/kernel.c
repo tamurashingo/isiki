@@ -81,6 +81,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     fb->clear_screen(fb);
     fb->draw_cursor(fb);
 
+    init_fpu();
     init_gdt();
     init_pic();
     init_pit();

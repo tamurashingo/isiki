@@ -24,6 +24,15 @@ typedef struct {
 void os_print_to_sink(lisp_val_t val, os_char_sink_t *sink, int escaped);
 
 /**
+ * doubleをISLisp §19.2相当の10進表記でsinkへ出力する(strtod/printf系が無い前提の
+ * 手書き実装)。print_value(TAG_INSTANCE/MAGIC_FLOAT)とformat.cのformat-float/~Gが
+ * 同じ変換ロジックを共有するために公開する。
+ * @param sink 出力先のシンク
+ * @param value 出力するdouble値
+ */
+void os_print_double_to_sink(os_char_sink_t *sink, double value);
+
+/**
  * val を TAG に応じて fb に表示する(prin1相当、escaped=1でos_print_to_sinkを呼ぶ薄いラッパー)。
  * 表示した val 自身を返す(REPLでの `(print (eval (read)))` 的な合成のため)。
  * @param val 表示するLisp値

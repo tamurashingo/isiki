@@ -60,7 +60,10 @@ static lisp_val_t spawn(UINT32 proc_index) {
         stack_top -= 8;
     }
 
-    UINT64 frame_base = stack_top - 160;  // 15レジスタ(120B) + IRETQフレーム(40B)
+    // 15レジスタ(120B) + IRETQフレーム(40B)。frame_baseはasm_timer_handlerがGPR15個を
+    // push/popし終えた時点のrsp(=current_rsp=saved_rsp)と同じ意味の位置
+    UINT64 frame_base = stack_top - 160;
+
     UINT64 *regs = (UINT64 *)frame_base;
     for (UINT64 i = 0; i < 15; i++) {
         regs[i] = 0;
@@ -70,6 +73,16 @@ static lisp_val_t spawn(UINT32 proc_index) {
     // (rax,rbx,rcx,rdx,rbp,rdi,rsi,r8,r9,r10,r11,r12,r13,r14,r15 の順でpushされるので、
     //  最後にpushされたr15が最も低位のアドレスに来る)
     regs[9] = proc_index; // rdi
+
+    // asm_timer_handlerのFXSAVE/FXRSTORはframe_base(=current_rsp)から528byte下に
+    // 確保した領域を(rsp+15)&-16でマスクして16byte境界のアドレスを求める。
+    // 初回起動時にfxrstorが読む内容をここで同じ式で計算し、init_fpuのデフォルト状態で
+    // 初期化する(MXCSR等を0埋めのままにするとSIMD例外が全解禁され、通常のfloat演算でトラップする)
+    UINT8 *fxsave_area = (UINT8 *)(((frame_base - 528 + 15) & ~0xFULL));
+    const UINT8 *fpu_default = (const UINT8 *)get_fpu_default_state();
+    for (UINT64 i = 0; i < 512; i++) {
+        fxsave_area[i] = fpu_default[i];
+    }
 
     UINT64 *iretq_frame = (UINT64 *)(stack_top - 40);
     iretq_frame[0] = (UINT64)(void *)process_trampoline_c; // RIP

@@ -860,3 +860,23 @@ lisp_val_t os_eval_top_level(lisp_val_t form, lisp_val_t env) {
         os_make_cons(g_sym_top_level_block, os_make_cons(form, nil)));
     return os_eval(wrapped, env);
 }
+
+/**
+ * apply_functionをruntime.c/reader.cのCプリミティブから呼べるように公開するラッパー。
+ * @param fn 呼び出す関数オブジェクト
+ * @param evaluated_args 評価済みの引数リスト
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果。関数オブジェクトでない場合はg_sym_eval_error
+ */
+lisp_val_t os_apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_t env) {
+    return apply_function(fn, evaluated_args, env);
+}
+
+/**
+ * is_control_transferをruntime.c/reader.cのCプリミティブから呼べるように公開するラッパー。
+ * @param v 判定対象の値
+ * @return 非局所脱出シグナルならnon-zero
+ */
+int os_is_control_transfer(lisp_val_t v) {
+    return is_control_transfer(v);
+}

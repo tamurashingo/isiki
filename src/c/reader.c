@@ -1,6 +1,7 @@
 #include "reader.h"
 #include "runtime.h"
 #include "framebuffer.h"
+#include "eval.h"
 
 /** 数値/シンボルトークンや文字列リテラルを組み立てる際の作業バッファの上限 */
 #define READER_TOKEN_MAX 128
@@ -101,6 +102,28 @@ static char stream_source_advance(void *raw_ctx) {
     stream_source_fill(ctx);
     ctx->has_lookahead = 0;
     return ctx->lookahead;
+}
+
+/** C文字列バッファ(NUL終端不要、lenで長さを持つ)に対するreader_sourceコンテキスト。os_parse_numberが使う。 */
+typedef struct {
+    const char *buf;
+    UINT64 len;
+    UINT64 pos;
+} string_source_ctx_t;
+
+static char string_source_peek(void *raw_ctx) {
+    string_source_ctx_t *ctx = (string_source_ctx_t *)raw_ctx;
+    return ctx->buf[ctx->pos];
+}
+
+static char string_source_advance(void *raw_ctx) {
+    string_source_ctx_t *ctx = (string_source_ctx_t *)raw_ctx;
+    return ctx->buf[ctx->pos++];
+}
+
+static int string_source_has_more(void *raw_ctx) {
+    string_source_ctx_t *ctx = (string_source_ctx_t *)raw_ctx;
+    return ctx->pos < ctx->len;
 }
 
 /**
@@ -240,10 +263,117 @@ static lisp_val_t read_string(reader_source_t *src) {
 #define READER_INT_LIMBS 16
 
 /**
+ * c が浮動小数点リテラルの構成要素として許される文字('0'-'9', '.', 'e'/'E', '+'/'-')かどうかを返す。
+ * read_atomがトークン全体を整数/float/symbolのいずれとして扱うか判定する粗いフィルタに使う。
+ * @param c 判定する文字
+ * @return floatリテラルの構成要素として許される文字なら非0、そうでなければ0
+ */
+static int is_float_token_char(char c) {
+    return is_digit(c) || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-';
+}
+
+/**
+ * token[digit_start..len)をISLisp §19.2のfloat構文([s]dd...d.dd...d、
+ * [s]dd...d.dd...dE[s]dd...d、[s]dd...dE[s]dd...dのいずれか)として解析する。
+ * token[0..digit_start)の符号は解析済み(negativeへ反映済み)の前提。strtodが無い環境のため、
+ * 桁を読みながらmantissaへ逐次累積し、小数部桁数と指数部を最後にまとめて10のべきとして
+ * 掛け/割りする手書きの変換を行う。
+ * @param token トークン全体(NUL終端)
+ * @param len tokenの長さ
+ * @param digit_start 数字部の開始位置(符号が無ければ0、あれば1)
+ * @param negative tokenの符号が'-'だったかどうか
+ * @return 解析したfloat値。ISLisp §19.2の構文に一致しない場合はg_sym_read_error
+ */
+static lisp_val_t parse_float_token(const char *token, UINT32 len, UINT32 digit_start, int negative) {
+    UINT32 i = digit_start;
+
+    UINT32 int_start = i;
+    while (i < len && is_digit(token[i])) {
+        i++;
+    }
+    UINT32 int_end = i;
+    UINT32 int_len = int_end - int_start;
+
+    double mantissa = 0.0;
+    int frac_len = 0;
+    int has_dot = 0;
+
+    if (i < len && token[i] == '.') {
+        has_dot = 1;
+        i++;
+        UINT32 frac_start = i;
+        while (i < len && is_digit(token[i])) {
+            i++;
+        }
+        UINT32 frac_end = i;
+        frac_len = (int)(frac_end - frac_start);
+        if (int_len == 0 || frac_len == 0) {
+            return g_sym_read_error; // 小数点の前後どちらかに桁が無い
+        }
+        for (UINT32 j = int_start; j < int_end; j++) {
+            mantissa = mantissa * 10.0 + (double)(token[j] - '0');
+        }
+        for (UINT32 j = frac_start; j < frac_end; j++) {
+            mantissa = mantissa * 10.0 + (double)(token[j] - '0');
+        }
+    } else {
+        if (int_len == 0) {
+            return g_sym_read_error; // 数字が1つも無い
+        }
+        for (UINT32 j = int_start; j < int_end; j++) {
+            mantissa = mantissa * 10.0 + (double)(token[j] - '0');
+        }
+    }
+
+    int has_exp = 0;
+    int exp_negative = 0;
+    int exponent = 0;
+
+    if (i < len && (token[i] == 'e' || token[i] == 'E')) {
+        has_exp = 1;
+        i++;
+        if (i < len && (token[i] == '+' || token[i] == '-')) {
+            exp_negative = (token[i] == '-');
+            i++;
+        }
+        UINT32 exp_start = i;
+        while (i < len && is_digit(token[i])) {
+            i++;
+        }
+        if (i == exp_start) {
+            return g_sym_read_error; // 指数部の桁が無い
+        }
+        for (UINT32 j = exp_start; j < i; j++) {
+            exponent = exponent * 10 + (token[j] - '0');
+        }
+    }
+
+    if (i != len || (!has_dot && !has_exp)) {
+        return g_sym_read_error; // 末尾に余分な文字がある、または小数点も指数部も無い
+    }
+
+    int total_exp = (has_exp ? (exp_negative ? -exponent : exponent) : 0) - frac_len;
+    double value = mantissa;
+    if (total_exp > 0) {
+        for (int k = 0; k < total_exp; k++) {
+            value *= 10.0;
+        }
+    } else {
+        for (int k = 0; k < -total_exp; k++) {
+            value /= 10.0;
+        }
+    }
+
+    return os_make_float(negative ? -value : value);
+}
+
+/**
  * 区切り文字までのトークンを読む。数字だけ(先頭の'+'/'-'による符号も可)のトークンは整数
- * (FIXNUMまたはbignum)、それ以外はsymbolとして読む('+'/'-'単体はsymbolのまま残る)。
+ * (FIXNUMまたはbignum)、ISLisp §19.2のfloat構文に一致するトークンはfloatとして読む
+ * (構文に近いが一致しない場合はg_sym_read_error)。それ以外はsymbolとして読む
+ * ('+'/'-'/'1+'/'1-'はISLisp仕様上括弧無しで書けるシンボル名としてsymbolのまま残る)。
  * @param src 読み取り対象の文字ソース
- * @return 読み取った整数(FIXNUMまたはbignum)またはSYMBOL
+ * @return 読み取った整数(FIXNUMまたはbignum)、float、SYMBOL、または構文エラーの場合はg_sym_read_error
  */
 static lisp_val_t read_atom(reader_source_t *src) {
     char token[READER_TOKEN_MAX];
@@ -278,6 +408,27 @@ static lisp_val_t read_atom(reader_source_t *src) {
             count = mag_mul_small_add_small(limbs, count, 10, (UINT64)(token[i] - '0'));
         }
         return os_make_integer(negative, limbs, count);
+    }
+
+    if (len == 2 && token[0] == '1' && (token[1] == '+' || token[1] == '-')) {
+        // ISLisp仕様(§7)で括弧無しに書ける名前として明示的に許可されているシンボル
+        return os_make_symbol(token);
+    }
+
+    int has_digit = 0;
+    int float_chars = (len > digit_start);
+    for (UINT32 i = digit_start; i < len; i++) {
+        char c = token[i];
+        if (!is_float_token_char(c)) {
+            float_chars = 0;
+            break;
+        }
+        if (is_digit(c)) {
+            has_digit = 1;
+        }
+    }
+    if (float_chars && has_digit) {
+        return parse_float_token(token, len, digit_start, negative);
     }
 
     return os_make_symbol(token);
@@ -569,4 +720,55 @@ lisp_val_t os_read_stream(os_stream_t *stream) {
     }
 
     return read_expr(&src);
+}
+
+/**
+ * valが数値(fixnum/bignum/float)かどうかを、runtime.hが公開するタグ/MAGIC定数を使って判定する。
+ * is_bignum/is_floatはruntime.cのstaticヘルパーで参照できないため、ここで同等の判定を行う。
+ * @param val 判定対象の値
+ * @return 数値なら非0、そうでなければ0
+ */
+static int is_number_result(lisp_val_t val) {
+    if ((val & TAG_MASK) == TAG_FIXNUM) {
+        return 1;
+    }
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return 0;
+    }
+    UINT64 magic = ((UINT64 *)(val & ~TAG_MASK))[0];
+    return magic == MAGIC_BIGNUM || magic == MAGIC_FLOAT;
+}
+
+lisp_val_t os_parse_number(lisp_val_t str, lisp_val_t env) {
+    char buf[READER_TOKEN_MAX];
+    os_string_to_cstr(str, buf, sizeof(buf));
+    UINT64 len = 0;
+    while (buf[len]) {
+        len++;
+    }
+
+    string_source_ctx_t str_ctx;
+    str_ctx.buf = buf;
+    str_ctx.len = len;
+    str_ctx.pos = 0;
+
+    reader_source_t src;
+    src.peek = string_source_peek;
+    src.advance = string_source_advance;
+    src.has_more = string_source_has_more;
+    src.ctx = &str_ctx;
+
+    lisp_val_t result = has_more(&src) ? read_expr(&src) : g_sym_read_error;
+
+    if (result != g_sym_read_error && !has_more(&src) && is_number_result(result)) {
+        return result;
+    }
+
+    lisp_val_t number_class = os_resolve_class(g_sym_class_number, env);
+    if (number_class == g_sym_eval_error || os_is_control_transfer(number_class)) {
+        return number_class;
+    }
+    lisp_val_t initargs = os_make_cons(g_sym_kw_string, os_make_cons(str,
+        os_make_cons(g_sym_kw_expected_class, os_make_cons(number_class, nil))));
+    return os_signal_condition(g_sym_class_parse_error, initargs, env);
 }

@@ -25,6 +25,18 @@ lisp_val_t os_read(process_t *proc);
 lisp_val_t os_read_stream(os_stream_t *stream);
 
 /**
+ * strを1つの数値トークンとして読み取る(read_exprと同じ数値字句を受け付ける: 10進整数/浮動小数点数、
+ * #b/#o/#x の基数付き整数)。文字列全体を消費しかつ結果が数値(fixnum/bignum/float)であれば
+ * その値を返す。そうでなければ<parse-error>をsignalする(:string に元の文字列、
+ * :expected-class に(%find-class '<number>))。
+ * @param str 解析対象のSTRING
+ * @param env 呼び出し時の環境(<parse-error>のsignal-conditionに使う)
+ * @return 解析された数値。解析失敗時はos_signal_conditionの戻り値
+ *         (通常はハンドラ経由でトップレベルへabortするため到達しない。init.lisp未ロード時はg_sym_eval_error)
+ */
+lisp_val_t os_parse_number(lisp_val_t str, lisp_val_t env);
+
+/**
  * proc の入力バッファが尽きた際に、次の行の入力(Enterによるready確定)を待つ。
  * カーネル実行時は割り込み経由でバッファが進み ready が立つまでブロックする(interrupt.cで定義)。
  * ユニットテストでは実際の割り込みが発生しないため、テストファイル側でこの関数を差し替える。

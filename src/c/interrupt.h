@@ -54,9 +54,6 @@ struct idt_ptr {
     uint64_t base;
 } __attribute__((packed));
 
-/** 割り込みハンドラの引数型として使う前方宣言のみの構造体 */
-struct interrupt_frame;
-
 /**
  * I/Oポートへ1バイト出力する
  * @param port 出力先のポート番号
@@ -112,6 +109,16 @@ typedef struct {
     uint64_t rip, cs, rflags, rsp, ss;
 } ExceptionContext;
 
+
+/** CR0/CR4のFPU/SSE関連ビットを設定し、fninit+ldmxcsrでFPU/SSE状態を初期化する */
+void init_fpu(void);
+
+/**
+ * init_fpuが起動時にfxsaveした、FPU/SSEのデフォルト初期状態(512byte, 16byte境界)を返す。
+ * spawn()が各プロセスの偽フレームのFXSAVE領域をこの内容で初期化するために使う
+ * @return 512byteのFXSAVE形式バッファへのポインタ
+ */
+const void *get_fpu_default_state(void);
 
 /** GDTを構築し、lgdt/lretqでコード・データセグメントを切り替える */
 void init_gdt(void);

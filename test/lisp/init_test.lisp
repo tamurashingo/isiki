@@ -751,6 +751,134 @@
 (assert-equal t (= 1152921504606846975 (isqrt (* 1152921504606846975 1152921504606846975))))
 (assert-equal t (= 1152921504606846975 (isqrt (+ 1 (* 1152921504606846975 1152921504606846975)))))
 
+;;; --- number class (§19): sqrt/log/exp/sin/cos/tan/atan/atan2・双曲線関数・floor系 ---
+;;; ・parse-number・quotient/reciprocal/expt・*pi*・domain-error(sqrt/log/asin/acos) ---
+
+;; 許容誤差付きの数値比較(floatは合成の丸め誤差があるため、bit一致ではなく比較する)
+(defun %approx= (a b)
+  (< (abs (- a b)) 0.000000001))
+
+;; sqrt: 完全平方数は整数、それ以外はfloat
+(assert-equal 2 (sqrt 4))
+(assert-equal t (%approx= 1.4142135623730951 (sqrt 2)))
+
+;; log(自然対数)/exp
+(assert-equal t (%approx= 1.0 (log 2.718281828459045)))
+(assert-equal t (%approx= 2.302585092994046 (log 10)))
+(assert-equal t (%approx= 2.718281828459045 (exp 1)))
+(assert-equal t (%approx= 1.0 (exp 0)))
+
+;; sin/cos/tan/atan/atan2
+(assert-equal t (%approx= 0.0 (sin 0)))
+(assert-equal t (%approx= 1.0 (cos 0)))
+(assert-equal t (%approx= 0.0 (tan 0)))
+(assert-equal t (%approx= 0.7853981633974483 (atan 1)))
+(assert-equal t (%approx= 0.0 (atan2 0 1)))
+(assert-equal t (%approx= 0.7853981633974483 (atan2 1 1)))
+
+;; sinh/cosh/tanh/atanh(spec例: (sinh 1) => 1.1752011936438014)
+(assert-equal t (%approx= 1.1752011936438014 (sinh 1)))
+(assert-equal t (%approx= 1.5430806348152437 (cosh 1)))
+(assert-equal t (%approx= 0.7615941559557649 (tanh 1)))
+(assert-equal t (%approx= 0.5493061443340548 (atanh 0.5)))
+
+;; *pi*
+(assert-equal t (%approx= 3.141592653589793 *pi*))
+
+;; floor/ceiling/truncate/round(仕様例の符号パターン)
+(assert-equal 3 (floor 3.4))
+(assert-equal -4 (floor -3.4))
+(assert-equal 4 (ceiling 3.4))
+(assert-equal -3 (ceiling -3.4))
+(assert-equal 3 (truncate 3.4))
+(assert-equal -3 (truncate -3.4))
+(assert-equal 4 (round 3.5))
+(assert-equal 2 (round 2.5))
+(assert-equal 5 (floor 5))
+
+;; quotient/reciprocal(spec 4342-4362行の例)
+(assert-equal 4 (quotient 12 3))
+(assert-equal t (%approx= 0.16666666666666666 (quotient 2 3 4)))
+(assert-equal 1 (reciprocal 1))
+(assert-equal t (%approx= 0.25 (reciprocal 4)))
+
+;; expt(spec 4474-4484行の例を全て確認)
+(assert-equal 8 (expt 2 3))
+(assert-equal 10000 (expt -100 2))
+(assert-equal t (%approx= 0.0625 (expt 4 -2)))
+(assert-equal t (%approx= 0.25 (expt 0.5 2)))
+(assert-equal 1 (expt 5 0))
+(assert-equal t (%approx= 1.0 (expt 5.0 0)))
+(assert-equal t (%approx= -4.0 (expt -0.25 -1)))
+(assert-equal t (%approx= 10.0 (expt 100 0.5)))
+(assert-equal t (%approx= 0.001 (expt 100 -1.5)))
+(assert-equal t (%approx= 1.0 (expt 3.0 0.0)))
+(assert-equal nil (ignore-errors (expt 0 -1)))
+(assert-equal nil (ignore-errors (expt 0.0 0.0)))
+
+;; parse-number(spec 4178-4193/7213-7214行)
+(assert-equal t (%approx= 123.34 (parse-number "123.34")))
+(assert-equal 64206 (parse-number "#XFACE"))
+(assert-equal 42 (parse-number "42"))
+
+;; parse-numberが数値として読めない文字列に対して<parse-error>をsignalする
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<parse-error>)))
+      (parse-number "abc"))))
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (string= "abc" (parse-error-string c))))
+      (parse-number "abc"))))
+
+;; domain-error: sqrtに負の数を渡す(型は合っているが値が違う、ユーザー明示指示の1ケース目)
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (sqrt -1))))
+(assert-equal -1
+  (block b
+    (with-handler (lambda (c) (return-from b (domain-error-object c)))
+      (sqrt -1))))
+
+;; domain-error: logに0以下の数値を渡す(2ケース目)
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (log 0))))
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (log -5))))
+
+;; domain-error: asin/acosの定義域-1.0〜1.0の範囲外(3ケース目)
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (asin 2))))
+(assert-equal 2
+  (block b
+    (with-handler (lambda (c) (return-from b (domain-error-object c)))
+      (asin 2))))
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (acos -2))))
+;; 範囲内の値ではdomain-errorが起きないこと(境界値-1.0/1.0も含む)
+(assert-equal t (%approx= 0.0 (asin 0)))
+(assert-equal t (%approx= 1.5707963267948966 (asin 1.0)))
+(assert-equal t (%approx= -1.5707963267948966 (asin -1.0)))
+
+;; atanhのdomain-errorはlogとの合成の副産物(|x| >= 1でlogの引数が0以下になり伝播する)
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (atanh 1))))
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (atanh -2))))
+
 ;;; --- character class (§20): char= ・char/= ・char< ・char> ・char<= ・char>= ---
 
 (assert-equal t (char= #\a #\a))

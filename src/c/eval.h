@@ -61,4 +61,24 @@ lisp_val_t primitive_apply(lisp_val_t args, lisp_val_t env);
  */
 void os_register_eval_primitives(void);
 
+/**
+ * ネイティブ関数/インタプリタ関数(TAG_INSTANCE, MAGIC_FUNCTION_NATIVE/MAGIC_FUNCTION_INTERPRETED)を
+ * 評価済み引数で呼び出す。runtime.c/reader.cのCプリミティブがLisp側の関数(make-instance/
+ * signal-condition等)を呼び戻すために使う。
+ * @param fn 呼び出す関数オブジェクト
+ * @param evaluated_args 評価済みの引数リスト
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果。関数オブジェクトでない場合はg_sym_eval_error
+ */
+lisp_val_t os_apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_t env);
+
+/**
+ * vがblock/return-from/unwind-protect/catch/throw/tagbody/goの非局所脱出シグナルかどうかを判定する。
+ * os_apply_function経由でLisp側の関数を呼んだ結果、非局所脱出やsignal-conditionの伝播が
+ * 起きていないかをCプリミティブ側でチェックするために使う。
+ * @param v 判定対象の値
+ * @return 非局所脱出シグナルならnon-zero
+ */
+int os_is_control_transfer(lisp_val_t v);
+
 #endif /* _EVAL_H_ */

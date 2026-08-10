@@ -87,6 +87,14 @@ void switch_active_frame_buffer(UINT32 index) {
 void enable_timer_irq(void) {
 }
 
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
 void os_repl_step(process_t *proc) {
     (void)proc;
 }
@@ -141,10 +149,14 @@ void test_format_char_writes_char_directly() {
     assert_stream_content(stream, "Z", "format-charは文字をそのまま書き込む");
 }
 
-void test_format_float_approximates_as_integer_dot_zero() {
+void test_format_float_writes_decimal_notation() {
     lisp_val_t stream = make_out_stream();
-    cc_format_float(os_make_cons(stream, os_make_cons(os_make_fixnum(3), nil)), nil);
-    assert_stream_content(stream, "3.0", "format-floatはfixnumを整数+\".0\"として近似出力する");
+    cc_format_float(os_make_cons(stream, os_make_cons(os_make_float(3.0), nil)), nil);
+    assert_stream_content(stream, "3.0", "format-floatはfloatを10進表記で出力する");
+
+    lisp_val_t stream2 = make_out_stream();
+    cc_format_float(os_make_cons(stream2, os_make_cons(os_make_float(-2.5), nil)), nil);
+    assert_stream_content(stream2, "-2.5", "format-floatは負のfloatも出力する");
 }
 
 void test_format_integer_supports_various_radixes() {
@@ -264,7 +276,7 @@ int main(int argc, char **argv) {
     setup_buffers();
 
     test_format_char_writes_char_directly();
-    test_format_float_approximates_as_integer_dot_zero();
+    test_format_float_writes_decimal_notation();
     test_format_integer_supports_various_radixes();
     test_format_object_escape_p_controls_quoting();
     test_format_fresh_line_only_when_not_at_column_zero();

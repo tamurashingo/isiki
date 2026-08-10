@@ -1165,3 +1165,92 @@
 
 ;;; --- miscellaneous (§30) ---
 (defun identity (obj) obj)
+
+;;; --- number class (§19) float ---
+;;; IEEE754 binary64のDBL_MAX/-DBL_MAX相当。reader.cのfloatリテラル構文(§19.2)を
+;;; そのまま使って表現する(quotient/exp/log等の未実装超越関数と違い、
+;;; 定数の束縛だけなのでCコードの追加は不要)。
+(defconstant *most-positive-float* 1.7976931348623157E308)
+(defconstant *most-negative-float* -1.7976931348623157E308)
+
+;;; --- number class (§19) quotient/reciprocal/expt/三角・双曲線関数/*pi* ---
+;;; sqrt/log/exp/sin/cos/atan2/floor/ceiling/truncate/round/parse-numberは
+;;; 生FPU命令が必要なためCプリミティブ(runtime.c)として実装済み。ここではそれらを
+;;; 組み合わせて仕様の残り関数をLisp側で合成する。
+
+;; quotientはspec 4342-4362行の通り「両方整数かつ割り切れれば整数、そうでなければ
+;; float」という/とは異なる型変換規則を持つ。3引数以上は左から逐次適用する(divisorが
+;; 複数ある場合の仕様の定義通り)。
+(defun %quotient2 (dividend divisor)
+  (if (and (or (fixnump dividend) (bignump dividend))
+           (or (fixnump divisor) (bignump divisor))
+           (= (mod dividend divisor) 0))
+      (div dividend divisor)
+      (/ (float dividend) (float divisor))))
+
+(defun quotient (dividend &rest divisors)
+  (if divisors
+      (%%apply #'quotient (cons (%quotient2 dividend (car divisors)) (cdr divisors)))
+      dividend))
+
+(defun reciprocal (x) (quotient 1 x))
+
+;; x1^x2(x2が非負整数)を*による繰り返し二乗法で計算する。x1の型(整数/float)は
+;; そのまま結果の型に伝わる(floatp baseなら1.0、それ以外は1を基底値とする)。
+;; x1が負でもlogを経由しないため、負の底×整数指数(spec例: (expt -100 2) => 10000、
+;; (expt -0.25 -1) => -4.0)を正しく扱える。
+(defun %expt-integer (base power)
+  (if (= power 0)
+      (if (floatp base) 1.0 1)
+      (if (= (mod power 2) 0)
+          (let ((half (%expt-integer base (quotient power 2))))
+            (* half half))
+          (* base (%expt-integer base (- power 1))))))
+
+;; x1=0絡みの特殊ケース(spec 4464-4484行)はerrorで処理する。x2が整数(fixnum/bignum)
+;; なら底の符号を問わず%expt-integer(負指数はreciprocalで反転)で正確に計算し、
+;; それ以外(x2が非整数float)はexp/logの合成とする(この場合のみx1<0はerror)。
+(defun expt (x1 x2)
+  (cond
+    ((= x1 0)
+     (cond
+       ((and (numberp x2) (< x2 0)) (error "expt: 0 to a negative power ~S" x2))
+       ((and (floatp x2) (= x2 0.0)) (error "expt: 0 to a float power of 0.0"))
+       (t (if (floatp x2) 0.0 0))))
+    ((or (fixnump x2) (bignump x2))
+     (if (>= x2 0)
+         (%expt-integer x1 x2)
+         (reciprocal (%expt-integer x1 (- x2)))))
+    ((< x1 0)
+     (error "expt: negative base ~S with non-integer power ~S" x1 x2))
+    (t (exp (* (float x2) (log (float x1)))))))
+
+(defun tan (x) (/ (sin x) (cos x)))
+
+;; atanの1引数版はspecの参考実装通り(atan2 x 1)
+(defun atan (x) (atan2 x 1))
+
+;; asin/acosの定義域チェック。型はnumberpで合っているが値が-1.0〜1.0の範囲外という
+;; ユーザー明示指示の3ケース目に対応するdomain-error
+(defun %check-unit-range (x)
+  (if (and (numberp x) (<= -1.0 x 1.0))
+      x
+      (signal-condition
+        (make-instance '<domain-error> ':object x ':expected-class (%find-class '<number>))
+        nil)))
+
+(defun asin (x) (let ((v (%check-unit-range x))) (atan2 v (sqrt (- 1 (* v v))))))
+(defun acos (x) (let ((v (%check-unit-range x))) (atan2 (sqrt (- 1 (* v v))) v)))
+
+(defun sinh (x) (/ (- (exp x) (exp (- x))) 2))
+(defun cosh (x) (/ (+ (exp x) (exp (- x))) 2))
+(defun tanh (x) (/ (sinh x) (cosh x)))
+
+;; |x| >= 1のときlogの引数(1+x または 1-x)が0以下になり、logのdomain-errorが
+;; そのまま伝播する(spec 4658-4669行が要求するatanhのdomain-errorを合成の副産物で満たす)
+(defun atanh (x) (* 0.5 (- (log (+ 1 x)) (log (- 1 x)))))
+
+;; spec 4505行「*pi* → <float> named constant」の通り、通常の変数参照(*pi*)で
+;; 読める必要があるためdefdynamicではなくdefconstantを使う(defdynamicの値は
+;; (dynamic name)経由でしか読めず、bareなシンボル参照は未定義変数アクセスになる)
+(defconstant *pi* 3.141592653589793)

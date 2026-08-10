@@ -89,6 +89,14 @@ void switch_active_frame_buffer(UINT32 index) {
 void enable_timer_irq(void) {
 }
 
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
 void os_repl_step(process_t *proc) {
     (void)proc;
 }
@@ -355,6 +363,65 @@ void test_os_read_hex_bignum_literal() {
     UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
     assert(obj[0] == MAGIC_BIGNUM, "word0はMAGIC_BIGNUM");
     assert(obj[1] == 0, "非負なのでsignは0");
+}
+
+void test_os_read_float_literal_simple() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "1.5");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "\"1.5\"はfloatとして読める");
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    assert(obj[0] == MAGIC_FLOAT, "word0はMAGIC_FLOAT");
+    assert(os_float_value(v) == 1.5, "読み取った値は1.5");
+}
+
+void test_os_read_float_literal_negative_with_exponent() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "-2.0E10");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "\"-2.0E10\"はfloatとして読める");
+    assert(os_float_value(v) == -2.0e10, "読み取った値は-2.0E10");
+}
+
+void test_os_read_float_literal_exponent_only() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "3E5");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_INSTANCE, "\"3E5\"は小数点無し・指数のみでもfloatとして読める");
+    assert(os_float_value(v) == 3e5, "読み取った値は3E5=300000.0");
+}
+
+void test_os_read_float_literal_trailing_dot_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "1.");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "小数点の後に桁が無い\"1.\"はread errorになる");
+}
+
+void test_os_read_float_literal_leading_dot_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, ".5");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "小数点の前に桁が無い\".5\"はread errorになる");
+}
+
+void test_os_read_float_literal_bare_exponent_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "E5");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "仮数部が無い\"E5\"はread errorになる");
 }
 
 void test_os_read_symbol() {
@@ -693,6 +760,12 @@ int main(int argc, char** argv) {
     test_os_read_radix_literal_invalid_digit_is_read_error();
     test_os_read_radix_literal_no_digits_is_read_error();
     test_os_read_hex_bignum_literal();
+    test_os_read_float_literal_simple();
+    test_os_read_float_literal_negative_with_exponent();
+    test_os_read_float_literal_exponent_only();
+    test_os_read_float_literal_trailing_dot_is_read_error();
+    test_os_read_float_literal_leading_dot_is_read_error();
+    test_os_read_float_literal_bare_exponent_is_read_error();
     test_os_read_symbol();
     test_os_read_string();
     test_os_read_empty_list();

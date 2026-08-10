@@ -1,11 +1,68 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 #include "test_assert.h"
 #include "types.h"
 #include "runtime.h"
 #include "framebuffer.h"
 #include "lisp.h"
+#include "process.h"
+#include "reader.h"
+
+// reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
+// 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
+// ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)perm;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)data;
+    (void)count;
+    (void)out_written;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
+                            const UINT8 **out_data, UINT32 *out_count,
+                            char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)want;
+    (void)out_data;
+    (void)out_count;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
 
 // runtime.c が参照する g_frame_buffer のダミー実装。
 // テスト環境では実画面がないため、write_string は何もしない
@@ -20,6 +77,12 @@ static frame_buffer g_frame_buffer = {
 
 frame_buffer* get_active_frame_buffer(void) {
     return &g_frame_buffer;
+}
+
+// reader.c の os_read が参照するが、runtime_test.c では実際の割り込みが発生しないため
+// 何もしないダミー実装を用意する(load_test.c等の既存テストと同じパターン)
+void os_wait_for_more_input(process_t *proc) {
+    (void)proc;
 }
 
 #define HEAP_SIZE (1024 * 1024)
@@ -205,6 +268,11 @@ static lisp_val_t make_arg_list_vals(int argc, lisp_val_t *vals) {
     return list;
 }
 
+// is_floatはruntime.c内のstatic関数のため、テストからはMAGIC_FLOATを直接見て判定する
+static int test_is_float(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT;
+}
+
 void test_os_make_fixnum_signed() {
     lisp_val_t neg5 = os_make_fixnum_signed(1, 5);
     assert((neg5 & TAG_MASK) == TAG_FIXNUM, "os_make_fixnum_signed(1,5)はTAG_FIXNUM");
@@ -320,6 +388,30 @@ void test_primitive_divide_signed() {
     lisp_val_t vals3[2] = {os_make_fixnum_signed(1, 12), os_make_fixnum_signed(1, 3)};
     lisp_val_t r3 = primitive_divide(make_arg_list_vals(2, vals3), nil);
     assert(!os_fixnum_is_negative(r3) && os_fixnum_magnitude(r3) == 4, "(/ -12 -3) は4");
+}
+
+void test_primitive_arithmetic_with_float() {
+    lisp_val_t vals1[2] = {os_make_fixnum(1), os_make_float(2.5)};
+    lisp_val_t r1 = primitive_add(make_arg_list_vals(2, vals1), nil);
+    assert(test_is_float(r1) && os_float_value(r1) == 3.5, "(+ 1 2.5) はfloatの3.5");
+
+    lisp_val_t vals2[2] = {os_make_float(5.5), os_make_fixnum(2)};
+    lisp_val_t r2 = primitive_subtract(make_arg_list_vals(2, vals2), nil);
+    assert(test_is_float(r2) && os_float_value(r2) == 3.5, "(- 5.5 2) はfloatの3.5");
+
+    lisp_val_t vals3[2] = {os_make_fixnum(2), os_make_float(1.5)};
+    lisp_val_t r3 = primitive_multiply(make_arg_list_vals(2, vals3), nil);
+    assert(test_is_float(r3) && os_float_value(r3) == 3.0, "(* 2 1.5) はfloatの3.0");
+
+    lisp_val_t vals4[2] = {os_make_float(5.0), os_make_fixnum(2)};
+    lisp_val_t r4 = primitive_divide(make_arg_list_vals(2, vals4), nil);
+    assert(test_is_float(r4) && os_float_value(r4) == 2.5, "(/ 5.0 2) はfloatの2.5");
+
+    lisp_val_t vals5[2] = {os_make_fixnum(1), os_make_float(1.5)};
+    assert(primitive_less_than(make_arg_list_vals(2, vals5), nil) == g_sym_t, "(< 1 1.5) はT");
+
+    lisp_val_t vals6[2] = {os_make_fixnum(2), os_make_float(2.0)};
+    assert(primitive_num_equal(make_arg_list_vals(2, vals6), nil) == g_sym_t, "(= 2 2.0) はT");
 }
 
 void test_primitive_multiply() {
@@ -494,6 +586,130 @@ void test_primitive_bignump() {
     assert(primitive_numberp(os_make_cons(bignum_val, nil), nil) == g_sym_t, "(numberp 2^60) はT");
 }
 
+void test_primitive_floatp_and_float() {
+    assert(primitive_floatp(os_make_cons(os_make_float(1.5), nil), nil) == g_sym_t, "(floatp 1.5) はT");
+    assert(primitive_floatp(os_make_cons(os_make_fixnum(1), nil), nil) == nil, "(floatp 1) はnil");
+
+    lisp_val_t r1 = primitive_float(os_make_cons(os_make_fixnum(3), nil), nil);
+    assert(test_is_float(r1) && os_float_value(r1) == 3.0, "(float 3) はfloatの3.0");
+
+    lisp_val_t r2 = primitive_float(os_make_cons(os_make_fixnum_signed(1, 3), nil), nil);
+    assert(test_is_float(r2) && os_float_value(r2) == -3.0, "(float -3) はfloatの-3.0");
+
+    lisp_val_t already_float = os_make_float(1.5);
+    lisp_val_t r3 = primitive_float(os_make_cons(already_float, nil), nil);
+    assert(r3 == already_float, "既にfloatならfloatはそのまま同じ値を返す");
+
+    UINT64 limbs[2] = {0, 0x10000000ULL}; // 2^60
+    lisp_val_t bignum_val = os_make_integer(0, limbs, 2);
+    lisp_val_t r4 = primitive_float(os_make_cons(bignum_val, nil), nil);
+    assert(test_is_float(r4) && os_float_value(r4) == 1152921504606846976.0, "(float 2^60) はbignumをdoubleへ変換したfloat");
+}
+
+static int approx_equal(double a, double b, double eps) {
+    return fabs(a - b) < eps;
+}
+
+void test_primitive_sqrt() {
+    assert(primitive_sqrt(make_arg_list(1, 4), nil) == os_make_fixnum(2), "(sqrt 4) は完全平方数なので整数の2");
+    assert(primitive_sqrt(make_arg_list(1, 0), nil) == os_make_fixnum(0), "(sqrt 0) は0");
+
+    lisp_val_t r1 = primitive_sqrt(make_arg_list(1, 2), nil);
+    assert(test_is_float(r1) && approx_equal(os_float_value(r1), 1.4142135623730951, 1e-12), "(sqrt 2) は非完全平方数なのでfloat");
+
+    // bignum完全平方数: k = FIXNUM_MAGNITUDE_MASKとしてk*k(bignum)のsqrtがkに戻る
+    lisp_val_t k = os_make_fixnum(FIXNUM_MAGNITUDE_MASK);
+    lisp_val_t ksq_vals[2] = {k, k};
+    lisp_val_t ksq = primitive_multiply(make_arg_list_vals(2, ksq_vals), nil);
+    assert(primitive_sqrt(os_make_cons(ksq, nil), nil) == k, "(sqrt (k*k)) はk(bignumの完全平方数)");
+
+    lisp_val_t r2 = primitive_sqrt(os_make_cons(os_make_float(9.0), nil), nil);
+    assert(test_is_float(r2) && os_float_value(r2) == 3.0, "(sqrt 9.0) はfloat入力でもfloatの3.0");
+
+    // 型は数値で合っているが値が負(fixnum)。init.lisp未ロードなのでg_sym_eval_errorへフォールバック
+    lisp_val_t neg1[1] = {os_make_fixnum_signed(1, 1)};
+    assert(primitive_sqrt(make_arg_list_vals(1, neg1), nil) == g_sym_eval_error, "(sqrt -1) はdomain-error相当、init.lisp未ロード時はg_sym_eval_error");
+
+    // 型は数値で合っているが値が負(float)
+    lisp_val_t r3 = primitive_sqrt(os_make_cons(os_make_float(-4.0), nil), nil);
+    assert(r3 == g_sym_eval_error, "(sqrt -4.0) もg_sym_eval_error");
+}
+
+void test_primitive_log() {
+    lisp_val_t r1 = primitive_log(os_make_cons(os_make_float(2.718281828459045), nil), nil);
+    assert(test_is_float(r1) && approx_equal(os_float_value(r1), 1.0, 1e-9), "(log e) は~1.0");
+
+    lisp_val_t r2 = primitive_log(make_arg_list(1, 10), nil);
+    assert(test_is_float(r2) && approx_equal(os_float_value(r2), 2.302585092994046, 1e-9), "(log 10) は~2.302585092994046");
+
+    // 型は数値で合っているが値が0以下。init.lisp未ロードなのでg_sym_eval_errorへフォールバック
+    assert(primitive_log(make_arg_list(1, 0), nil) == g_sym_eval_error, "(log 0) はg_sym_eval_error");
+
+    lisp_val_t neg5[1] = {os_make_fixnum_signed(1, 5)};
+    assert(primitive_log(make_arg_list_vals(1, neg5), nil) == g_sym_eval_error, "(log -5) もg_sym_eval_error");
+}
+
+void test_primitive_exp_sin_cos_atan2() {
+    lisp_val_t r1 = primitive_exp(make_arg_list(1, 0), nil);
+    assert(test_is_float(r1) && os_float_value(r1) == 1.0, "(exp 0) は1.0");
+
+    lisp_val_t r2 = primitive_exp(make_arg_list(1, 1), nil);
+    assert(test_is_float(r2) && approx_equal(os_float_value(r2), 2.718281828459045, 1e-9), "(exp 1) は~e");
+
+    lisp_val_t r3 = primitive_sin(make_arg_list(1, 0), nil);
+    assert(test_is_float(r3) && os_float_value(r3) == 0.0, "(sin 0) は0.0");
+
+    lisp_val_t r4 = primitive_cos(make_arg_list(1, 0), nil);
+    assert(test_is_float(r4) && os_float_value(r4) == 1.0, "(cos 0) は1.0");
+
+    lisp_val_t r5 = primitive_atan2(make_arg_list(2, 0, 1), nil);
+    assert(test_is_float(r5) && os_float_value(r5) == 0.0, "(atan2 0 1) は0.0");
+
+    lisp_val_t r6 = primitive_atan2(make_arg_list(2, 1, 1), nil);
+    assert(test_is_float(r6) && approx_equal(os_float_value(r6), 0.7853981633974483, 1e-9), "(atan2 1 1) は~pi/4");
+}
+
+void test_primitive_floor_ceiling_truncate_round() {
+    lisp_val_t f34 = os_make_float(3.4);
+    lisp_val_t fneg34 = os_make_float(-3.4);
+    lisp_val_t f35 = os_make_float(3.5);
+    lisp_val_t f25 = os_make_float(2.5);
+    lisp_val_t fneg35 = os_make_float(-3.5);
+
+    assert(primitive_floor(os_make_cons(f34, nil), nil) == os_make_fixnum(3), "(floor 3.4) は3");
+    assert(primitive_floor(os_make_cons(fneg34, nil), nil) == os_make_fixnum_signed(1, 4), "(floor -3.4) は-4");
+    assert(primitive_floor(make_arg_list(1, 5), nil) == os_make_fixnum(5), "(floor 5) はfixnumのまま高速パス");
+
+    assert(primitive_ceiling(os_make_cons(f34, nil), nil) == os_make_fixnum(4), "(ceiling 3.4) は4");
+    assert(primitive_ceiling(os_make_cons(fneg34, nil), nil) == os_make_fixnum_signed(1, 3), "(ceiling -3.4) は-3");
+
+    assert(primitive_truncate(os_make_cons(f34, nil), nil) == os_make_fixnum(3), "(truncate 3.4) は3");
+    assert(primitive_truncate(os_make_cons(fneg34, nil), nil) == os_make_fixnum_signed(1, 3), "(truncate -3.4) は-3");
+
+    assert(primitive_round(os_make_cons(f35, nil), nil) == os_make_fixnum(4), "(round 3.5) はties-to-evenで4");
+    assert(primitive_round(os_make_cons(f25, nil), nil) == os_make_fixnum(2), "(round 2.5) はties-to-evenで2");
+    assert(primitive_round(os_make_cons(fneg35, nil), nil) == os_make_fixnum_signed(1, 4), "(round -3.5) はties-to-evenで-4");
+}
+
+void test_primitive_parse_number() {
+    lisp_val_t r1 = primitive_parse_number(os_make_cons(os_make_string("123.34"), nil), nil);
+    assert(test_is_float(r1) && approx_equal(os_float_value(r1), 123.34, 1e-9), "(parse-number \"123.34\") は123.34");
+
+    lisp_val_t r2 = primitive_parse_number(os_make_cons(os_make_string("#XFACE"), nil), nil);
+    assert(r2 == os_make_fixnum(64206), "(parse-number \"#XFACE\") は64206");
+
+    lisp_val_t r3 = primitive_parse_number(os_make_cons(os_make_string("42"), nil), nil);
+    assert(r3 == os_make_fixnum(42), "(parse-number \"42\") は42");
+
+    // 数値として読めない文字列。init.lisp未ロードなのでg_sym_eval_errorへフォールバック
+    lisp_val_t r4 = primitive_parse_number(os_make_cons(os_make_string("abc"), nil), nil);
+    assert(r4 == g_sym_eval_error, "(parse-number \"abc\") はg_sym_eval_error");
+
+    // 末尾に余分な文字が残る場合も数値として読めなかったものとして扱う
+    lisp_val_t r5 = primitive_parse_number(os_make_cons(os_make_string("123abc"), nil), nil);
+    assert(r5 == g_sym_eval_error, "(parse-number \"123abc\") もg_sym_eval_error");
+}
+
 void test_primitive_symbolp() {
     lisp_val_t sym = os_make_symbol("foo");
     assert(primitive_symbolp(os_make_cons(sym, nil), nil) == g_sym_t, "(symbolp 'foo) はT");
@@ -515,6 +731,15 @@ void test_primitive_eql() {
     assert(primitive_eql(os_make_cons(sym, os_make_cons(sym, nil)), nil) == g_sym_t, "(eql 'foo 'foo) はT");
     assert(primitive_eql(os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil)), nil) == nil,
            "(eql 1 2) はnil");
+}
+
+void test_primitive_eql_float() {
+    assert(primitive_eql(os_make_cons(os_make_float(1.5), os_make_cons(os_make_float(1.5), nil)), nil) == g_sym_t,
+           "(eql 1.5 1.5) はT");
+    assert(primitive_eql(os_make_cons(os_make_float(1.5), os_make_cons(os_make_float(2.5), nil)), nil) == nil,
+           "(eql 1.5 2.5) はnil");
+    assert(primitive_eql(os_make_cons(os_make_float(1.0), os_make_cons(os_make_fixnum(1), nil)), nil) == nil,
+           "(eql 1.0 1) はnil(型が異なるので不一致)");
 }
 
 void test_primitive_equal() {
@@ -1091,6 +1316,7 @@ int main(int argc, char** argv) {
    test_primitive_subtract_unary_and_signed();
    test_primitive_multiply_signed_and_bignum();
    test_primitive_divide_signed();
+   test_primitive_arithmetic_with_float();
    test_primitive_multiply();
    test_primitive_divide();
    test_primitive_less_than();
@@ -1104,9 +1330,16 @@ int main(int argc, char** argv) {
    test_primitive_isqrt();
    test_primitive_numberp_and_fixnump();
    test_primitive_bignump();
+   test_primitive_floatp_and_float();
+   test_primitive_sqrt();
+   test_primitive_log();
+   test_primitive_exp_sin_cos_atan2();
+   test_primitive_floor_ceiling_truncate_round();
+   test_primitive_parse_number();
    test_primitive_symbolp();
    test_primitive_consp();
    test_primitive_eql();
+   test_primitive_eql_float();
    test_primitive_equal();
    test_primitive_eql_and_equal_bignum();
    test_primitive_listp();

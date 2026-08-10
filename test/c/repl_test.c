@@ -112,6 +112,14 @@ void switch_active_frame_buffer(UINT32 index) {
 void enable_timer_irq(void) {
 }
 
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
 // os_print/reader.c のプロンプトは proc->stdout_buffer 経由で書かれるようになったため、
 // 各プロセスのバッファも capture_write_char/capture_write_string を使うようにし、
 // 従来通り captured() で検証できるようにする

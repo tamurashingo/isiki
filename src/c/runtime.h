@@ -49,6 +49,8 @@
 #define MAGIC_BIGNUM               0xBULL
 /** TAG_INSTANCEのword0に入る、多次元配列(vector/general array)であることを示すMAGIC NUMBER。word1=配列本体(rank+各次元サイズ+要素データを格納した可変長ブロック)への生ポインタ、word2/word3=未使用 */
 #define MAGIC_VECTOR               0xCULL
+/** TAG_INSTANCEのword0に入る、ISLispのfloat(IEEE754 binary64)であることを示すMAGIC NUMBER。word1=doubleのビットパターン、word2/word3=未使用 */
+#define MAGIC_FLOAT                0xDULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -134,6 +136,25 @@ extern lisp_val_t g_sym_throw;
 extern lisp_val_t g_sym_tagbody;
 /** go特殊形式を表すシンボル */
 extern lisp_val_t g_sym_go;
+
+/** init.lisp の make-instance 関数を表すシンボル(os_signal_conditionがC→Lisp呼び出しに使う) */
+extern lisp_val_t g_sym_make_instance;
+/** init.lisp の signal-condition 関数を表すシンボル(os_signal_conditionがC→Lisp呼び出しに使う) */
+extern lisp_val_t g_sym_signal_condition;
+/** init.lisp の %find-class 関数を表すシンボル(signal_domain_errorが expected-class 解決に使う) */
+extern lisp_val_t g_sym_percent_find_class;
+/** <domain-error> クラスを表すシンボル */
+extern lisp_val_t g_sym_class_domain_error;
+/** <parse-error> クラスを表すシンボル */
+extern lisp_val_t g_sym_class_parse_error;
+/** <number> クラスを表すシンボル */
+extern lisp_val_t g_sym_class_number;
+/** :object キーワードを表すシンボル(<domain-error>の初期化引数) */
+extern lisp_val_t g_sym_kw_object;
+/** :expected-class キーワードを表すシンボル(<domain-error>/<parse-error>の初期化引数) */
+extern lisp_val_t g_sym_kw_expected_class;
+/** :string キーワードを表すシンボル(<parse-error>の初期化引数) */
+extern lisp_val_t g_sym_kw_string;
 
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 extern lisp_val_t global_environment;
@@ -337,6 +358,30 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE
  */
 lisp_val_t os_make_native_function(lisp_addr_t fnptr);
+
+/**
+ * init.lisp の (make-instance class-sym . initargs) と (signal-condition condition nil) を
+ * この順にosApplyFunction経由で呼び出す。sqrt/log(domain-error)やparse-number(parse-error)のように、
+ * 生FPU命令やCの文字列走査が必要なため純Lispでは書けないが、条件の発火自体は既存のILOS/
+ * コンディションシステム(init.lisp)にそのまま委ねたいプリミティブが使う。
+ * @param class_sym signalするコンディションのクラスを表すシンボル(例: g_sym_class_domain_error)
+ * @param initargs make-instanceに渡す評価済みの初期化引数リスト(:key val :key val ...)
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値(通常はハンドラ経由でトップレベルへabortするため到達しない)。
+ *         init.lisp未ロードでmake-instance/signal-conditionが未定義の場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env);
+
+/**
+ * init.lisp の (%find-class class-name-sym) をosApplyFunction経由で呼び出し、クラスオブジェクトを
+ * 得る。signal_domain_error(runtime.c)やos_parse_number(reader.c)がdomain-error/parse-errorの
+ * :expected-classスロット値を組み立てるために使う共通ヘルパー。
+ * @param class_name_sym 解決したいクラスを表すシンボル(例: g_sym_class_number)
+ * @param env 呼び出し時の環境
+ * @return 解決されたクラスオブジェクト。init.lisp未ロードで%find-classが未定義の場合はg_sym_eval_error。
+ *         %find-class自体が非局所脱出/シグナルを返した場合はそれをそのまま返す
+ */
+lisp_val_t os_resolve_class(lisp_val_t class_name_sym, lisp_val_t env);
 
 /**
  * 組み込み関数CAR。argsの第一引数のcarを返す。
@@ -549,6 +594,137 @@ lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env);
  * @return bignumならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env);
+
+/**
+ * doubleの値をMAGIC_FLOATのINSTANCEとしてヒープに確保する。word1にdoubleの
+ * ビットパターンをそのまま格納し、word2/word3は未使用。
+ * @param value 格納するdouble値
+ * @return MAGIC_FLOATのINSTANCE
+ */
+lisp_val_t os_make_float(double value);
+
+/**
+ * MAGIC_FLOATのINSTANCEからword1のビットパターンを読み出し、doubleへ戻す。
+ * @param val MAGIC_FLOATのINSTANCE(タグ付きlisp_val_t)
+ * @return 格納されているdouble値
+ */
+double os_float_value(lisp_val_t val);
+
+/**
+ * bignum(MAGIC_BIGNUMのINSTANCE)をdoubleへ変換する。limb配列を上位から
+ * result = result * 4294967296.0 + limb で積算し、最後に符号を適用する
+ * (精度はdoubleの53bit仮数部に切り詰められる)。
+ * @param val MAGIC_BIGNUMのINSTANCE(タグ付きlisp_val_t)
+ * @return doubleへ変換した値
+ */
+double bignum_to_double(lisp_val_t val);
+
+/**
+ * 組み込み関数FLOATP。第一引数がfloat(MAGIC_FLOATのINSTANCE)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SQRT。第一引数の平方根を返す。完全平方の整数はそのまま整数、
+ * それ以外はfloatで返す。負数はdomain-error。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(signal_domain_error経由でinit.lispのsignal-conditionを呼ぶ)
+ * @return 平方根。負数が渡された場合はsignal_domain_errorの戻り値
+ */
+lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数LOG。第一引数の自然対数を返す。0以下はdomain-error。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(signal_domain_error経由でinit.lispのsignal-conditionを呼ぶ)
+ * @return xの自然対数。0以下が渡された場合はsignal_domain_errorの戻り値
+ */
+lisp_val_t primitive_log(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数EXP。第一引数を指数とするe(自然対数の底)の累乗を返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return e^x
+ */
+lisp_val_t primitive_exp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数SIN。第一引数(ラジアン)の正弦を返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return sin(x)
+ */
+lisp_val_t primitive_sin(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数COS。第一引数(ラジアン)の余弦を返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return cos(x)
+ */
+lisp_val_t primitive_cos(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数ATAN2。(atan2 y x) で atan(y/x) を、xの符号を使って正しい象限で返す。
+ * 定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値2個、第一引数がy、第二引数がx)
+ * @param env 呼び出し時の環境(未使用)
+ * @return atan2(y, x)
+ */
+lisp_val_t primitive_atan2(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数FLOOR。第一引数以下の最大の整数を返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor(x)
+ */
+lisp_val_t primitive_floor(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数CEILING。第一引数以上の最小の整数を返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return ceiling(x)
+ */
+lisp_val_t primitive_ceiling(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数TRUNCATE。第一引数の小数部を切り捨てた整数を返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return truncate(x)
+ */
+lisp_val_t primitive_truncate(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数ROUND。第一引数を最も近い整数に丸める(ties-to-even)。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return round(x)
+ */
+lisp_val_t primitive_round(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数PARSE-NUMBER。第一引数のSTRINGを数値として読み取る。数値の字句として
+ * 解釈できない場合は<parse-error>をsignalする。
+ * @param args 評価済みの引数リスト(第一引数はSTRING)
+ * @param env 呼び出し時の環境(<parse-error>のsignal-conditionに使う)
+ * @return 解析された数値
+ */
+lisp_val_t primitive_parse_number(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数SYMBOLP。第一引数がsymbolかどうかを判定する。

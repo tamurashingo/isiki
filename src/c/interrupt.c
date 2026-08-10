@@ -239,14 +239,72 @@ void c_keyboard_handler(uint8_t scancode) {
     process_stdin_push(current, (UINT8)c);
 }
 
+/** asm_keyboard_handlerから呼ばれるC本体。scancodeを読んでc_keyboard_handlerへ渡し、最後にEOIを送る */
+void __attribute__((sysv_abi)) c_keyboard_isr(void);
+
 /**
- * キーボード割り込み(IRQ1)のエントリポイント。scancodeを読んでc_keyboard_handlerへ渡し、
- * 最後にEOIを送る。GCC自動生成のprologue/epilogueで十分なので__attribute__((interrupt))を使う
- * @param frame 未使用(GCCが要求する引数)
+ * キーボード割り込み(IRQ1)のエントリポイント。__attribute__((interrupt))は使わない:
+ * SSE/FPUを有効化した状態では、GCCが__attribute__((interrupt))関数向けにFXSAVE/FXRSTOR相当の
+ * コードを生成できず("sorry, unimplemented: SSE instructions aren't allowed in an interrupt
+ * service routine")、-mgeneral-regs-only無しではビルドできないため、asm_gpf_handler/
+ * asm_timer_handlerと同じ手書きasmで実装する。IRQ1はCPUがエラーコードを積まない外部割り込み
+ * なので、push $vectorは不要で、15汎用レジスタのみをpush/popする。プロセス切り替えを
+ * 行わない(呼び出し元のコンテキストへそのままiretqで戻る)点がasm_timer_handlerと異なるため、
+ * c呼び出し前後でのrsp退避にはrbxをスクラッチに使う(asm_timer_handlerと同じ理由で、
+ * fxsave/fxrstorは16byte境界を要求するがGPR push前のrspの境界は保証されないため、
+ * push後のrsp(常にrbxへ保存)を基準に(rsp-528+15)&-16でマスクして動的に求める)
  */
-__attribute__((interrupt))
-void asm_keyboard_handler(struct interrupt_frame *frame) {
-    (void)frame; // unused
+void asm_keyboard_handler(void);
+asm(
+    ".global asm_keyboard_handler\n"
+    "asm_keyboard_handler:\n"
+    "    push %rax\n"
+    "    push %rbx\n"
+    "    push %rcx\n"
+    "    push %rdx\n"
+    "    push %rbp\n"
+    "    push %rdi\n"
+    "    push %rsi\n"
+    "    push %r8\n"
+    "    push %r9\n"
+    "    push %r10\n"
+    "    push %r11\n"
+    "    push %r12\n"
+    "    push %r13\n"
+    "    push %r14\n"
+    "    push %r15\n"
+    "    mov %rsp, %rbx\n"
+    "    sub $528, %rsp\n"
+    "    mov %rsp, %rax\n"
+    "    add $15, %rax\n"
+    "    and $-16, %rax\n"
+    "    fxsave (%rax)\n"
+    "    and $-16, %rsp\n"
+    "    call c_keyboard_isr\n"
+    "    mov %rbx, %rsp\n"
+    "    lea -528(%rbx), %rax\n"
+    "    add $15, %rax\n"
+    "    and $-16, %rax\n"
+    "    fxrstor (%rax)\n"
+    "    pop %r15\n"
+    "    pop %r14\n"
+    "    pop %r13\n"
+    "    pop %r12\n"
+    "    pop %r11\n"
+    "    pop %r10\n"
+    "    pop %r9\n"
+    "    pop %r8\n"
+    "    pop %rsi\n"
+    "    pop %rdi\n"
+    "    pop %rbp\n"
+    "    pop %rdx\n"
+    "    pop %rcx\n"
+    "    pop %rbx\n"
+    "    pop %rax\n"
+    "    iretq\n"
+);
+
+void __attribute__((sysv_abi)) c_keyboard_isr(void) {
     uint8_t scancode = inb(0x60);
     c_keyboard_handler(scancode);
     outb(0x20, 0x20); // EOI
@@ -269,6 +327,14 @@ void asm_timer_handler(void);
  * @return 次に実行するプロセスのsaved_rsp
  */
 UINT64 __attribute__((sysv_abi)) c_timer_switch(UINT64 current_rsp);
+// GPR15個のpush/popの外側でFXSAVE/FXRSTORによりFPU/SSEレジスタ(x87/xmm0-15/MXCSR)も
+// 保存・復元する。fxsave/fxrstorは対象アドレスが16byte境界であることを要求するが、
+// 割り込み発生時のrsp(=IRETQフレームのすぐ上)は「実行中のプロセスがどの命令の直後で
+// 中断されたか」に依存し、16byte境界とは限らない(callの直後はmod16==8になる等)。
+// そのため「GPR15個をpushし終えたrsp(=current_rsp、PCBのsaved_rspと同じ意味)」を
+// 基準に、そこから528byte(512byte本体+16byteの余裕)下を確保し、実行時に
+// (rsp+15)&-16 でマスクして16byte境界を動的に求める。current_rspの値さえ分かれば
+// save/restoreどちらも同じ式で同じアドレスを再現できるため、追加のPCB状態は不要
 asm(
     ".global asm_timer_handler\n"
     "asm_timer_handler:\n"
@@ -288,9 +354,19 @@ asm(
     "    push %r14\n"
     "    push %r15\n"
     "    mov %rsp, %rdi\n"
+    "    sub $528, %rsp\n"
+    "    mov %rsp, %rax\n"
+    "    add $15, %rax\n"
+    "    and $-16, %rax\n"
+    "    fxsave (%rax)\n"
     "    and $-16, %rsp\n"
     "    call c_timer_switch\n"
-    "    mov %rax, %rsp\n"
+    "    mov %rax, %rdi\n"
+    "    lea -528(%rdi), %rax\n"
+    "    add $15, %rax\n"
+    "    and $-16, %rax\n"
+    "    fxrstor (%rax)\n"
+    "    mov %rdi, %rsp\n"
     "    pop %r15\n"
     "    pop %r14\n"
     "    pop %r13\n"
@@ -422,6 +498,37 @@ void init_pic(void) {
     outb(0x21, 0x01); outb(0xA1, 0x01); // ICW4: 8086モード
     outb(0x21, 0xFD); // マスク: IRQ1(キーボード)のみ許可
     outb(0xA1, 0xFF); // スレーブは全マスク
+}
+
+/** init_fpuがfxsaveしたFPU/SSEのデフォルト初期状態(512byte)。spawn()が各プロセスの
+ * 偽フレームのFXSAVE領域をこの内容で初期化するために参照する */
+static UINT8 g_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fpu_default_state;
+}
+
+/**
+ * CR0/CR4のFPU/SSE関連ビットを設定し、fninit+ldmxcsrでFPU/SSE状態を初期化する。
+ * 以後どのC関数もx87/SSE命令(double演算等)を使えるようになる。
+ * x86-64はSSE2/FXSRを仕様上必ず備えるため、CPUIDによる機能検出は行わない
+ */
+void init_fpu(void) {
+    uint64_t cr0, cr4;
+    asm volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1ULL << 2);               // EM=0 (x87/SSEをソフトウェアエミュレーションしない)
+    cr0 |= (1ULL << 1) | (1ULL << 5);  // MP=1, NE=1(ネイティブ#MFレポート)
+    asm volatile ("mov %0, %%cr0" : : "r"(cr0));
+
+    asm volatile ("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 9) | (1ULL << 10); // OSFXSR=1, OSXMMEXCPT=1
+    asm volatile ("mov %0, %%cr4" : : "r"(cr4));
+
+    asm volatile ("fninit");
+    uint32_t default_mxcsr = 0x1F80;   // 全SIMD例外マスク、round-to-nearest
+    asm volatile ("ldmxcsr %0" : : "m"(default_mxcsr));
+
+    asm volatile ("fxsave %0" : "=m"(g_fpu_default_state));
 }
 
 /** IDTを構築し、GPF/PF/タイマー/キーボードの各ハンドラを登録してlidt/stiする */

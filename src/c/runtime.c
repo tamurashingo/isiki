@@ -2,6 +2,14 @@
 #include "runtime.h"
 #include "framebuffer.h"
 #include "lisp.h"
+#include "eval.h"
+#include "reader.h"
+#ifdef ISIKIOS_UNIT_TEST
+/* ネイティブ(x86_64以外を含む)ホストでのユニットテストではx87/SSE2インラインアセンブラが
+   使えないため、libmの対応する関数で計算する。実機(x86_64 UEFI, ISIKIOS_UNIT_TEST未定義)
+   では下のasm実装のみが使われる。 */
+#include <math.h>
+#endif
 
 /*
  * ---- タグ付きポインタによるLispオブジェクトの表現 ----
@@ -159,6 +167,25 @@ lisp_val_t g_sym_tagbody;
 /** go特殊形式を表すシンボル */
 lisp_val_t g_sym_go;
 
+/** init.lisp の make-instance 関数を表すシンボル(os_signal_conditionがC→Lisp呼び出しに使う) */
+lisp_val_t g_sym_make_instance;
+/** init.lisp の signal-condition 関数を表すシンボル(os_signal_conditionがC→Lisp呼び出しに使う) */
+lisp_val_t g_sym_signal_condition;
+/** init.lisp の %find-class 関数を表すシンボル(signal_domain_errorが expected-class 解決に使う) */
+lisp_val_t g_sym_percent_find_class;
+/** <domain-error> クラスを表すシンボル */
+lisp_val_t g_sym_class_domain_error;
+/** <parse-error> クラスを表すシンボル */
+lisp_val_t g_sym_class_parse_error;
+/** <number> クラスを表すシンボル */
+lisp_val_t g_sym_class_number;
+/** :object キーワードを表すシンボル(<domain-error>の初期化引数) */
+lisp_val_t g_sym_kw_object;
+/** :expected-class キーワードを表すシンボル(<domain-error>/<parse-error>の初期化引数) */
+lisp_val_t g_sym_kw_expected_class;
+/** :string キーワードを表すシンボル(<parse-error>の初期化引数) */
+lisp_val_t g_sym_kw_string;
+
 /** ルートの環境(全プロセスの環境が最終的にこれを親として辿る) */
 lisp_val_t global_environment;
 
@@ -194,7 +221,7 @@ static UINT8 *g_to_end;
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
     UINT64 aligned = (n + 7) & ~7ULL;
 #ifndef ISIKIOS_UNIT_TEST
-    asm volatile ("cli");
+    __asm__ __volatile__ ("cli");
 #endif
     UINT8 *p = g_from_ptr;
     if (p +aligned > g_from_end) {
@@ -207,7 +234,7 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     }
     g_from_ptr = p + aligned;
 #ifndef ISIKIOS_UNIT_TEST
-    asm volatile ("sti");
+    __asm__ __volatile__ ("sti");
 #endif
     return (UINT64)p;
 }
@@ -356,6 +383,16 @@ void os_bootstrap() {
         g_sym_tagbody = os_make_symbol("TAGBODY");
         g_sym_go = os_make_symbol("GO");
 
+        g_sym_make_instance = os_make_symbol("MAKE-INSTANCE");
+        g_sym_signal_condition = os_make_symbol("SIGNAL-CONDITION");
+        g_sym_percent_find_class = os_make_symbol("%FIND-CLASS");
+        g_sym_class_domain_error = os_make_symbol("<DOMAIN-ERROR>");
+        g_sym_class_parse_error = os_make_symbol("<PARSE-ERROR>");
+        g_sym_class_number = os_make_symbol("<NUMBER>");
+        g_sym_kw_object = os_make_symbol(":OBJECT");
+        g_sym_kw_expected_class = os_make_symbol(":EXPECTED-CLASS");
+        g_sym_kw_string = os_make_symbol(":STRING");
+
 
         os_set_function(g_sym_car, os_make_native_function((lisp_addr_t)(void *)primitive_car), global_environment);
         os_set_function(g_sym_cdr, os_make_native_function((lisp_addr_t)(void *)primitive_cdr), global_environment);
@@ -383,6 +420,19 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("NUMBERP"), os_make_native_function((lisp_addr_t)(void *)primitive_numberp), global_environment);
         os_set_function(os_make_symbol("FIXNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnump), global_environment);
         os_set_function(os_make_symbol("BIGNUMP"), os_make_native_function((lisp_addr_t)(void *)primitive_bignump), global_environment);
+        os_set_function(os_make_symbol("FLOATP"), os_make_native_function((lisp_addr_t)(void *)primitive_floatp), global_environment);
+        os_set_function(os_make_symbol("FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_float), global_environment);
+        os_set_function(os_make_symbol("SQRT"), os_make_native_function((lisp_addr_t)(void *)primitive_sqrt), global_environment);
+        os_set_function(os_make_symbol("LOG"), os_make_native_function((lisp_addr_t)(void *)primitive_log), global_environment);
+        os_set_function(os_make_symbol("EXP"), os_make_native_function((lisp_addr_t)(void *)primitive_exp), global_environment);
+        os_set_function(os_make_symbol("SIN"), os_make_native_function((lisp_addr_t)(void *)primitive_sin), global_environment);
+        os_set_function(os_make_symbol("COS"), os_make_native_function((lisp_addr_t)(void *)primitive_cos), global_environment);
+        os_set_function(os_make_symbol("ATAN2"), os_make_native_function((lisp_addr_t)(void *)primitive_atan2), global_environment);
+        os_set_function(os_make_symbol("FLOOR"), os_make_native_function((lisp_addr_t)(void *)primitive_floor), global_environment);
+        os_set_function(os_make_symbol("CEILING"), os_make_native_function((lisp_addr_t)(void *)primitive_ceiling), global_environment);
+        os_set_function(os_make_symbol("TRUNCATE"), os_make_native_function((lisp_addr_t)(void *)primitive_truncate), global_environment);
+        os_set_function(os_make_symbol("ROUND"), os_make_native_function((lisp_addr_t)(void *)primitive_round), global_environment);
+        os_set_function(os_make_symbol("PARSE-NUMBER"), os_make_native_function((lisp_addr_t)(void *)primitive_parse_number), global_environment);
         os_set_function(os_make_symbol("SYMBOLP"), os_make_native_function((lisp_addr_t)(void *)primitive_symbolp), global_environment);
         os_set_function(os_make_symbol("CONSP"), os_make_native_function((lisp_addr_t)(void *)primitive_consp), global_environment);
         os_set_function(os_make_symbol("EQL"), os_make_native_function((lisp_addr_t)(void *)primitive_eql), global_environment);
@@ -827,6 +877,50 @@ lisp_val_t os_make_native_function(UINT64 fnptr) {
     return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, nil, nil);
 }
 
+lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
+    lisp_val_t make_instance_fn = os_get_function(g_sym_make_instance, env);
+    lisp_val_t signal_condition_fn = os_get_function(g_sym_signal_condition, env);
+    if (make_instance_fn == nil || signal_condition_fn == nil) {
+        // init.lisp未ロード(make-instance/signal-conditionが未定義)時のフォールバック
+        return g_sym_eval_error;
+    }
+
+    lisp_val_t condition = os_apply_function(make_instance_fn, os_make_cons(class_sym, initargs), env);
+    if (os_is_control_transfer(condition)) {
+        return condition;
+    }
+
+    lisp_val_t signal_args = os_make_cons(condition, os_make_cons(nil, nil));
+    return os_apply_function(signal_condition_fn, signal_args, env);
+}
+
+lisp_val_t os_resolve_class(lisp_val_t class_name_sym, lisp_val_t env) {
+    lisp_val_t find_class_fn = os_get_function(g_sym_percent_find_class, env);
+    if (find_class_fn == nil) {
+        return g_sym_eval_error;
+    }
+    return os_apply_function(find_class_fn, os_make_cons(class_name_sym, nil), env);
+}
+
+/**
+ * offending_objectを<domain-error>(:object offending-object :expected-class (%find-class '<number>))
+ * としてsignalする。sqrt/logのように「型は合っているが値が定義域外」の場合に使う。
+ * @param offending_object domain-errorの原因になった値
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値(通常はハンドラ経由でトップレベルへabortするため到達しない)。
+ *         init.lisp未ロードの場合はg_sym_eval_error
+ */
+static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t env) {
+    lisp_val_t number_class = os_resolve_class(g_sym_class_number, env);
+    if (number_class == g_sym_eval_error || os_is_control_transfer(number_class)) {
+        return number_class;
+    }
+
+    lisp_val_t initargs = os_make_cons(g_sym_kw_object, os_make_cons(offending_object,
+        os_make_cons(g_sym_kw_expected_class, os_make_cons(number_class, nil))));
+    return os_signal_condition(g_sym_class_domain_error, initargs, env);
+}
+
 
 /**
  * envの変数slotにsymの値としてvalを設定する(既存なら破壊的に上書き、無ければ新規追加)。
@@ -1138,12 +1232,81 @@ static int bignum_equal(const UINT64 *obj_a, const UINT64 *obj_b) {
     return 1;
 }
 
+/** valがfloat(MAGIC_FLOATのINSTANCE)かどうかを判定する */
+static int is_float(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT;
+}
+
+/** valがbignum(MAGIC_BIGNUMのINSTANCE)かどうかを判定する */
+static int is_bignum(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_BIGNUM;
+}
+
+lisp_val_t os_make_float(double value) {
+    union { double d; UINT64 u; } conv;
+    conv.d = value;
+    return os_make_instance(MAGIC_FLOAT, conv.u, 0, 0);
+}
+
+double os_float_value(lisp_val_t val) {
+    union { double d; UINT64 u; } conv;
+    conv.u = ((UINT64 *)(val & ~TAG_MASK))[1];
+    return conv.d;
+}
+
+double bignum_to_double(lisp_val_t val) {
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    int sign = (int)obj[1];
+    UINT64 count = obj[2];
+    UINT64 *limbs = (UINT64 *)obj[3];
+    double result = 0.0;
+    for (UINT64 i = count; i > 0; i--) {
+        result = result * 4294967296.0 + (double)limbs[i - 1];
+    }
+    return sign ? -result : result;
+}
+
+/**
+ * argsの中にfloat(MAGIC_FLOATのINSTANCE)が1つでも含まれるかどうかを判定する。
+ * 四則演算プリミティブが整数専用の高速/一般パスとfloatパスのどちらを使うかを
+ * 振り分けるために使う。
+ */
+static int any_float(lisp_val_t args) {
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        if (is_float(cc_car(cur))) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * 数値(FIXNUM/bignum/float)をdoubleへ変換する。float同士の演算・比較の前に
+ * オペランドをdoubleへ揃えるために使う。
+ */
+static double to_double(lisp_val_t v) {
+    if (is_float(v)) {
+        return os_float_value(v);
+    }
+    if (is_bignum(v)) {
+        return bignum_to_double(v);
+    }
+    double mag = (double)os_fixnum_magnitude(v);
+    return os_fixnum_is_negative(v) ? -mag : mag;
+}
+
 /**
  * 2つの整数(FIXNUM/bignum)の大小を比較する。両方FIXNUMの場合はヒープ確保なしの
- * 高速パスを使う。
+ * 高速パスを使う。いずれかがfloatの場合は両方をdoubleへ変換して比較する。
  * @return a<bなら負、a==bなら0、a>bなら正
  */
 static int number_compare(lisp_val_t a, lisp_val_t b) {
+    if (is_float(a) || is_float(b)) {
+        double da = to_double(a);
+        double db = to_double(b);
+        return da < db ? -1 : (da > db ? 1 : 0);
+    }
+
     if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM) {
         int neg_a = os_fixnum_is_negative(a);
         int neg_b = os_fixnum_is_negative(b);
@@ -1325,15 +1488,24 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数+。argsの全整数(FIXNUM/bignum、負数も可)を合計する。
- * 全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの高速パスを使い、
- * それ以外(負数・bignumが絡む、桁あふれの恐れがある)は符号付きマグニチュードによる
- * 一般パスにフォールバックする。
- * @param args 評価済みの引数リスト(すべて整数)
+ * 組み込み関数+。argsの全数値(FIXNUM/bignum/float、負数も可)を合計する。
+ * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して合計する。
+ * それ以外で全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの
+ * 高速パスを使い、それ以外(負数・bignumが絡む、桁あふれの恐れがある)は符号付き
+ * マグニチュードによる一般パスにフォールバックする。
+ * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 合計値の整数(60bit以内ならFIXNUM、それを超えるならbignum)
+ * @return 合計値の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
+    if (any_float(args)) {
+        double sum = 0.0;
+        for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+            sum += to_double(cc_car(cur));
+        }
+        return os_make_float(sum);
+    }
+
     int fast = 1;
     UINT64 sum = 0;
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
@@ -1388,14 +1560,26 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
 
 /**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として
- * 符号を反転する。全オペランドが非負FIXNUMかつ結果が負にならない場合はヒープ確保なしの
+ * 符号を反転する。floatが1つでも含まれる場合は全オペランドをdoubleへ変換して減算する。
+ * それ以外で全オペランドが非負FIXNUMかつ結果が負にならない場合はヒープ確保なしの
  * 高速パスを使い、それ以外は符号付きマグニチュードによる一般パスにフォールバックする。
- * @param args 評価済みの引数リスト(すべて整数)
+ * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 減算結果の整数(60bit以内ならFIXNUM、それを超えるならbignum)
+ * @return 減算結果の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     lisp_val_t first = cc_car(args);
+
+    if (any_float(args)) {
+        double result = to_double(first);
+        if (cc_cdr(args) == nil) {
+            return os_make_float(-result);
+        }
+        for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+            result -= to_double(cc_car(rest));
+        }
+        return os_make_float(result);
+    }
 
     if (cc_cdr(args) == nil) {
         // 単項マイナス: 0 - x
@@ -1493,14 +1677,23 @@ lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数*。argsの全整数(FIXNUM/bignum、負数も可)を乗算する。
- * 全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの高速パスを使い、
+ * 組み込み関数*。argsの全数値(FIXNUM/bignum/float、負数も可)を乗算する。
+ * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して乗算する。
+ * それ以外で全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの高速パスを使い、
  * それ以外は符号付きマグニチュードによる一般パス(素朴なO(n*m)乗算)にフォールバックする。
- * @param args 評価済みの引数リスト(すべて整数)
+ * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 積の整数(60bit以内ならFIXNUM、それを超えるならbignum)
+ * @return 積の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
+    if (any_float(args)) {
+        double product = 1.0;
+        for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+            product *= to_double(cc_car(cur));
+        }
+        return os_make_float(product);
+    }
+
     int fast = 1;
     UINT64 product = 1;
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
@@ -1544,15 +1737,25 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
 
 /**
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
- * 全オペランドが非負FIXNUMの場合はヒープ確保なしの高速パスを使い、それ以外(負数・bignumが
- * 絡む)は符号付きマグニチュードによる一般パス(1bitずつのシフト&サブトラクトによる
- * 長除算)にフォールバックする。商の符号は絶対値の商にオペランドの符号のXORを付与して決める。
- * @param args 評価済みの引数リスト(すべて整数)
+ * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して除算する
+ * (0除算はIEEE754の挙動どおり+inf/-inf/nanを返す。domain-error未実装のための簡略化)。
+ * それ以外で全オペランドが非負FIXNUMの場合はヒープ確保なしの高速パスを使い、それ以外
+ * (負数・bignumが絡む)は符号付きマグニチュードによる一般パス(1bitずつのシフト&サブトラクトに
+ * よる長除算)にフォールバックする。商の符号は絶対値の商にオペランドの符号のXORを付与して決める。
+ * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果の整数。0除算の場合はg_sym_eval_error
+ * @return 除算結果の数値。floatが絡まず0除算の場合はg_sym_eval_error
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
     lisp_val_t first = cc_car(args);
+
+    if (any_float(args)) {
+        double result = to_double(first);
+        for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+            result /= to_double(cc_car(rest));
+        }
+        return os_make_float(result);
+    }
 
     int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
     UINT64 result = fast ? os_fixnum_magnitude(first) : 0;
@@ -1859,7 +2062,434 @@ lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数NUMBERP。第一引数が数値(FIXNUMまたはbignum)かどうかを判定する。
+ * doubleの平方根を返す。実機(ISIKIOS_UNIT_TEST未定義)ではSSE2のsqrtsd命令、
+ * ネイティブユニットテストではlibmのsqrtを使う。
+ * @param d 平方根を求めるdouble(非負であること)
+ * @return sqrt(d)
+ */
+static double sqrt_fpu(double d) {
+#ifndef ISIKIOS_UNIT_TEST
+    double result;
+    __asm__ __volatile__ ("sqrtsd %1, %0" : "=x"(result) : "x"(d));
+    return result;
+#else
+    return sqrt(d);
+#endif
+}
+
+/**
+ * 組み込み関数SQRT。第一引数の平方根を返す。整数(FIXNUM/bignum)で完全平方数の場合は
+ * mag_isqrtの結果をそのまま整数として返し(例: (sqrt 4) => 2)、それ以外はsqrt_fpuで
+ * doubleの平方根を計算してfloatとして返す。負数はdomain-error
+ * (「型は合っているが値が定義域外」、spec上sqrtは非負数のみを受け付ける)。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(signal_domain_error経由でinit.lispのsignal-conditionを呼ぶ)
+ * @return 平方根。負数が渡された場合はsignal_domain_errorの戻り値
+ */
+lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+
+    if (is_float(val)) {
+        double d = os_float_value(val);
+        if (d < 0.0) {
+            return signal_domain_error(val, env);
+        }
+        return os_make_float(sqrt_fpu(d));
+    }
+
+    signed_mag_t m;
+    decompose(val, &m);
+    if (m.sign) {
+        return signal_domain_error(val, env);
+    }
+
+    UINT64 *out_limbs;
+    UINT64 out_len;
+    mag_isqrt(m.limbs, m.count, &out_limbs, &out_len);
+
+    UINT64 *sq_buf = (UINT64 *)os_alloc_bytes(8 * out_len * 2);
+    UINT64 sq_len = mag_mul(out_limbs, out_len, out_limbs, out_len, sq_buf);
+    if (mag_compare(sq_buf, sq_len, m.limbs, m.count) == 0) {
+        return os_make_integer(0, out_limbs, out_len);
+    }
+
+    return os_make_float(sqrt_fpu(to_double(val)));
+}
+
+/**
+ * xの自然対数を返す。実機ではx87のfyl2xでlog2(x)を求めln(2)倍して自然対数へ変換し、
+ * ネイティブユニットテストではlibmのlogを使う。
+ * @param x 対数を求めるdouble(正であること)
+ * @return log(x)
+ */
+static double log_fpu(double x) {
+#ifndef ISIKIOS_UNIT_TEST
+    double log2x;
+    __asm__ __volatile__ (
+        "fld1\n"
+        "fldl %1\n"
+        "fyl2x\n"
+        "fstpl %0\n"
+        : "=m"(log2x)
+        : "m"(x)
+    );
+    return log2x * 0.6931471805599453;
+#else
+    return log(x);
+#endif
+}
+
+/**
+ * 組み込み関数LOG。第一引数の自然対数を返す(log_fpu)。0以下はdomain-error
+ * (「型は合っているが値が定義域外」、spec上logは正の数のみを受け付ける)。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(signal_domain_error経由でinit.lispのsignal-conditionを呼ぶ)
+ * @return xの自然対数。0以下が渡された場合はsignal_domain_errorの戻り値
+ */
+lisp_val_t primitive_log(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    double x = to_double(val);
+    if (x <= 0.0) {
+        return signal_domain_error(val, env);
+    }
+    return os_make_float(log_fpu(x));
+}
+
+/**
+ * 自然対数の底eのx乗を返す。実機ではx87のf2xm1は引数域[-1,1]でしか2^x-1を正しく
+ * 計算できないため、y=x*log2(e)を最も近い整数n(frndint)と小数部f=y-n(|f|<=0.5)に
+ * 分割し、2^f=f2xm1(f)+1をfscaleでn桁シフトしてexp(x)=2^y=2^f*2^nを求める。
+ * ネイティブユニットテストではlibmのexpを使う。
+ * @param x 指数
+ * @return e^x
+ */
+static double exp_fpu(double x) {
+#ifndef ISIKIOS_UNIT_TEST
+    double y;
+    __asm__ __volatile__ (
+        "fldl %1\n"
+        "fldl2e\n"
+        "fmulp\n"
+        "fstpl %0\n"
+        : "=m"(y)
+        : "m"(x)
+    );
+
+    double n;
+    __asm__ __volatile__ (
+        "fldl %1\n"
+        "frndint\n"
+        "fstpl %0\n"
+        : "=m"(n)
+        : "m"(y)
+    );
+
+    double f = y - n;
+
+    double pow2f;
+    __asm__ __volatile__ (
+        "fldl %1\n"
+        "f2xm1\n"
+        "fld1\n"
+        "faddp\n"
+        "fstpl %0\n"
+        : "=m"(pow2f)
+        : "m"(f)
+    );
+
+    double result;
+    __asm__ __volatile__ (
+        "fldl %1\n"
+        "fldl %2\n"
+        "fscale\n"
+        "fstpl %0\n"
+        "fstp %%st(0)\n"
+        : "=m"(result)
+        : "m"(n), "m"(pow2f)
+    );
+
+    return result;
+#else
+    return exp(x);
+#endif
+}
+
+/**
+ * 組み込み関数EXP。第一引数を指数とする自然対数の底eの累乗を返す(exp_fpu)。
+ * 定義域制約は無い(数値でなければ挙動は未定義)。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return e^x
+ */
+lisp_val_t primitive_exp(lisp_val_t args, lisp_val_t env) {
+    return os_make_float(exp_fpu(to_double(cc_car(args))));
+}
+
+/**
+ * xの正弦(ラジアン)を返す。実機ではx87のfsin命令、ネイティブユニットテストでは
+ * libmのsinを使う。fsinは引数が大きいほど周期還元の精度が落ちる既知の制限があり、
+ * 大きな引数の精度検証は未対応(documents/isiki-os.mdの既存の注記を参照)。
+ * @param x ラジアン
+ * @return sin(x)
+ */
+static double sin_fpu(double x) {
+#ifndef ISIKIOS_UNIT_TEST
+    double result;
+    __asm__ __volatile__ (
+        "fldl %1\n"
+        "fsin\n"
+        "fstpl %0\n"
+        : "=m"(result)
+        : "m"(x)
+    );
+    return result;
+#else
+    return sin(x);
+#endif
+}
+
+/**
+ * 組み込み関数SIN。第一引数(ラジアン)の正弦を返す(sin_fpu)。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return sin(x)
+ */
+lisp_val_t primitive_sin(lisp_val_t args, lisp_val_t env) {
+    return os_make_float(sin_fpu(to_double(cc_car(args))));
+}
+
+/**
+ * xの余弦(ラジアン)を返す。実機ではx87のfcos命令、ネイティブユニットテストでは
+ * libmのcosを使う。SINと同じく大きな引数の精度は未対応。
+ * @param x ラジアン
+ * @return cos(x)
+ */
+static double cos_fpu(double x) {
+#ifndef ISIKIOS_UNIT_TEST
+    double result;
+    __asm__ __volatile__ (
+        "fldl %1\n"
+        "fcos\n"
+        "fstpl %0\n"
+        : "=m"(result)
+        : "m"(x)
+    );
+    return result;
+#else
+    return cos(x);
+#endif
+}
+
+/**
+ * 組み込み関数COS。第一引数(ラジアン)の余弦を返す(cos_fpu)。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return cos(x)
+ */
+lisp_val_t primitive_cos(lisp_val_t args, lisp_val_t env) {
+    return os_make_float(cos_fpu(to_double(cc_car(args))));
+}
+
+/**
+ * atan(y/x)を、xの符号を使って正しい象限で返す。実機ではx87のfpatan
+ * (ST(1):=atan(ST(1)/ST(0))を計算してpop)を使うため、先にy、次にxをpushする
+ * (ST(0)=x, ST(1)=y)。ネイティブユニットテストではlibmのatan2を使う。
+ * @param y 分子
+ * @param x 分母
+ * @return atan2(y, x)
+ */
+static double atan2_fpu(double y, double x) {
+#ifndef ISIKIOS_UNIT_TEST
+    double result;
+    __asm__ __volatile__ (
+        "fldl %2\n"
+        "fldl %1\n"
+        "fpatan\n"
+        "fstpl %0\n"
+        : "=m"(result)
+        : "m"(x), "m"(y)
+    );
+    return result;
+#else
+    return atan2(y, x);
+#endif
+}
+
+/**
+ * 組み込み関数ATAN2。(atan2 y x) で atan(y/x) を、xの符号を使って正しい象限で
+ * 返す(atan2_fpu)。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値2個、第一引数がy、第二引数がx)
+ * @param env 呼び出し時の環境(未使用)
+ * @return atan2(y, x)
+ */
+lisp_val_t primitive_atan2(lisp_val_t args, lisp_val_t env) {
+    double y = to_double(cc_car(args));
+    double x = to_double(cc_car(cc_cdr(args)));
+    return os_make_float(atan2_fpu(y, x));
+}
+
+/**
+ * 整数値(小数部が無い)のdoubleを、IEEE754のsign/exponent/mantissaを分解して
+ * fixnum/bignumへ変換する。round_via_x87(frndint)の結果を整数化するために使う。
+ * 0.0/-0.0はどちらもFIXNUM 0とする。有限の整数値であることを前提とし(NaN/無限大は
+ * 未対応)、significand(53bit、暗黙の先頭1bit込み)を2^shift倍する形で復元する
+ * (shift>0は左シフト、mag_mul_small_add_smallによる2倍の繰り返しで実現。shift<=0は
+ * 右シフトで、整数値である以上下位ビットは必ず0なので切り捨てなしに割り切れる)。
+ * @param d 変換対象のdouble(整数値であること)
+ * @return dと数値として等しいfixnum/bignum
+ */
+static lisp_val_t double_to_integer(double d) {
+    if (d == 0.0) {
+        return os_make_fixnum(0);
+    }
+
+    union { double d; UINT64 u; } conv;
+    conv.d = d;
+    UINT64 bits = conv.u;
+
+    int sign = (int)(bits >> 63);
+    UINT64 exp_field = (bits >> 52) & 0x7FFULL;
+    UINT64 mantissa = bits & 0xFFFFFFFFFFFFFULL;
+    UINT64 significand = mantissa | (1ULL << 52);
+    int actual_exp = (int)exp_field - 1023;
+    int shift = actual_exp - 52; // |d| == significand * 2^shift
+
+    if (shift <= 0) {
+        UINT64 val = significand >> (-shift);
+        UINT64 limbs[2] = { val & 0xFFFFFFFFULL, val >> 32 };
+        return os_make_integer(sign, limbs, 2);
+    }
+
+    UINT64 capacity = (UINT64)((64 + shift + 31) / 32) + 1;
+    UINT64 *limbs = (UINT64 *)os_alloc_bytes(8 * capacity);
+    limbs[0] = significand & 0xFFFFFFFFULL;
+    limbs[1] = significand >> 32;
+    for (UINT64 i = 2; i < capacity; i++) {
+        limbs[i] = 0;
+    }
+    UINT64 len = 2;
+    for (int i = 0; i < shift; i++) {
+        len = mag_mul_small_add_small(limbs, len, 2, 0);
+    }
+    return os_make_integer(sign, limbs, len);
+}
+
+/**
+ * x87のFPU制御ワードの丸めモードビット(RC、ビット[11:10])を一時的にrc_bitsへ
+ * 変更した上でfrndintを実行し、制御ワードを元に戻す。rc_bits: 00=round-nearest
+ * (ties-to-even)、01=round-down(floor)、10=round-up(ceiling)、11=truncate。
+ * ネイティブユニットテストではlibmのfloor/ceil/trunc/nearbyint(デフォルトの
+ * round-to-nearest-evenモード下)で同じ丸め規則を再現する。
+ * @param x 丸め対象のdouble
+ * @param rc_bits FPU制御ワードのRCフィールドに設定する2bit値
+ * @return 丸めた結果のdouble(整数値)
+ */
+static double round_via_x87(double x, UINT16 rc_bits) {
+#ifndef ISIKIOS_UNIT_TEST
+    UINT16 old_cw;
+    UINT16 new_cw;
+    double result;
+
+    __asm__ __volatile__ ("fnstcw %0" : "=m"(old_cw));
+    new_cw = (UINT16)((old_cw & ~0x0C00) | (rc_bits << 10));
+    __asm__ __volatile__ ("fldcw %0" : : "m"(new_cw));
+
+    __asm__ __volatile__ (
+        "fldl %1\n"
+        "frndint\n"
+        "fstpl %0\n"
+        : "=m"(result)
+        : "m"(x)
+    );
+
+    __asm__ __volatile__ ("fldcw %0" : : "m"(old_cw));
+
+    return result;
+#else
+    switch (rc_bits) {
+        case 0x1: return floor(x);
+        case 0x2: return ceil(x);
+        case 0x3: return trunc(x);
+        default: return nearbyint(x);
+    }
+#endif
+}
+
+/**
+ * 組み込み関数FLOOR。第一引数以下の最大の整数を返す(-∞方向の丸め)。すでに
+ * FIXNUM/bignumならFPUを経由せずそのまま返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floor(x)
+ */
+lisp_val_t primitive_floor(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if (!is_float(val)) {
+        return val;
+    }
+    return double_to_integer(round_via_x87(os_float_value(val), 0x1));
+}
+
+/**
+ * 組み込み関数CEILING。第一引数以上の最小の整数を返す(+∞方向の丸め)。すでに
+ * FIXNUM/bignumならFPUを経由せずそのまま返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return ceiling(x)
+ */
+lisp_val_t primitive_ceiling(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if (!is_float(val)) {
+        return val;
+    }
+    return double_to_integer(round_via_x87(os_float_value(val), 0x2));
+}
+
+/**
+ * 組み込み関数TRUNCATE。第一引数の小数部を切り捨てた整数を返す(0方向の丸め)。
+ * すでにFIXNUM/bignumならFPUを経由せずそのまま返す。定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return truncate(x)
+ */
+lisp_val_t primitive_truncate(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if (!is_float(val)) {
+        return val;
+    }
+    return double_to_integer(round_via_x87(os_float_value(val), 0x3));
+}
+
+/**
+ * 組み込み関数ROUND。第一引数を最も近い整数に丸める(ties-to-even、spec通り
+ * 中間値は偶数側)。すでにFIXNUM/bignumならFPUを経由せずそのまま返す。
+ * 定義域制約は無い。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return round(x)
+ */
+lisp_val_t primitive_round(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if (!is_float(val)) {
+        return val;
+    }
+    return double_to_integer(round_via_x87(os_float_value(val), 0x0));
+}
+
+/**
+ * 組み込み関数PARSE-NUMBER。第一引数のSTRINGを数値として読み取る(os_parse_number、reader.c)。
+ * 文字列が数値の字句として解釈できない場合は<parse-error>をsignalする。
+ * @param args 評価済みの引数リスト(第一引数はSTRING)
+ * @param env 呼び出し時の環境(<parse-error>のsignal-conditionに使う)
+ * @return 解析された数値
+ */
+lisp_val_t primitive_parse_number(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t str = cc_car(args);
+    return os_parse_number(str, env);
+}
+
+/**
+ * 組み込み関数NUMBERP。第一引数が数値(FIXNUM、bignum、float)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 数値ならg_sym_t、そうでなければnil
@@ -1869,8 +2499,11 @@ lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
     if ((val & TAG_MASK) == TAG_FIXNUM) {
         return g_sym_t;
     }
-    if ((val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_BIGNUM) {
-        return g_sym_t;
+    if ((val & TAG_MASK) == TAG_INSTANCE) {
+        UINT64 magic = ((UINT64 *)(val & ~TAG_MASK))[0];
+        if (magic == MAGIC_BIGNUM || magic == MAGIC_FLOAT) {
+            return g_sym_t;
+        }
     }
     return nil;
 }
@@ -1898,6 +2531,33 @@ lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env) {
         return g_sym_t;
     }
     return nil;
+}
+
+/**
+ * 組み込み関数FLOATP。第一引数がfloat(MAGIC_FLOATのINSTANCE)かどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env) {
+    return is_float(cc_car(args)) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t x = cc_car(args);
+    if (is_float(x)) {
+        return x;
+    }
+    if ((x & TAG_MASK) == TAG_FIXNUM || is_bignum(x)) {
+        return os_make_float(to_double(x));
+    }
+    return g_sym_eval_error;
 }
 
 /**
@@ -1935,8 +2595,9 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
  * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。
  * 仕様上eqとの違いは数値・文字の値比較だが、本実装のfixnum/charは即値表現のため
  * eqのポインタ比較のままで正しく判定できる。ただしbignumは同じ値でも異なるヒープ
- * オブジェクトになりうるため、両者がMAGIC_BIGNUMの場合はsign+limb内容を比較する
- * (floatは未実装のため、それ以外はeqと同じ判定になる)。
+ * オブジェクトになりうるため、両者がMAGIC_BIGNUMの場合はsign+limb内容を比較する。
+ * floatも同じ値でも異なるヒープオブジェクトになりうるため、両者がMAGIC_FLOATの場合は
+ * word1のビットパターン(doubleの値)を比較する(それ以外はeqと同じ判定になる)。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return 同一ならg_sym_t、そうでなければnil
@@ -1951,6 +2612,9 @@ lisp_val_t primitive_eql(lisp_val_t args, lisp_val_t env) {
         UINT64 *obj_a = (UINT64 *)(a & ~TAG_MASK);
         UINT64 *obj_b = (UINT64 *)(b & ~TAG_MASK);
         if (obj_a[0] == MAGIC_BIGNUM && obj_b[0] == MAGIC_BIGNUM && bignum_equal(obj_a, obj_b)) {
+            return g_sym_t;
+        }
+        if (obj_a[0] == MAGIC_FLOAT && obj_b[0] == MAGIC_FLOAT && obj_a[1] == obj_b[1]) {
             return g_sym_t;
         }
     }
