@@ -113,6 +113,8 @@ extern lisp_val_t g_sym_quasiquote;
 extern lisp_val_t g_sym_unquote;
 /** unquote-splicing(,@)を表すシンボル。reader.cが,@xを(UNQUOTE-SPLICING x)へ読むために使う */
 extern lisp_val_t g_sym_unquote_splicing;
+/** dotted pair記法の'.'を表すシンボル。reader.cのread_listが単独トークンの'.'を検出するために使う */
+extern lisp_val_t g_sym_dot;
 /** car関数を表すシンボル */
 extern lisp_val_t g_sym_car;
 /** cdr関数を表すシンボル */

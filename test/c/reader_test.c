@@ -469,6 +469,75 @@ void test_os_read_list() {
     assert(cc_cdr(cc_cdr(cc_cdr(v))) == nil, "リストの終端はnil");
 }
 
+void test_os_read_dotted_pair() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "(one . 11)");
+
+    lisp_val_t v = os_read(proc);
+    assert((v & TAG_MASK) == TAG_CONS, "(one . 11)はTAG_CONSを持つ");
+    assert(cc_car(v) == os_make_symbol("one"), "(one . 11)のcarはsymbol one");
+    assert(cc_cdr(v) == os_make_fixnum(11), "(one . 11)のcdrはfixnum 11(2要素目のCONSではない)");
+}
+
+void test_os_read_dotted_pair_with_multiple_leading_elements() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "(1 2 . 3)");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == os_make_fixnum(1), "(1 2 . 3)の1番目は1");
+    assert(cc_car(cc_cdr(v)) == os_make_fixnum(2), "(1 2 . 3)の2番目は2");
+    assert(cc_cdr(cc_cdr(v)) == os_make_fixnum(3), "(1 2 . 3)のcddrはfixnum 3(nilで終端しない)");
+}
+
+void test_os_read_dot_inside_float_token_is_not_dotted_pair() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "(1 2.5)");
+
+    lisp_val_t v = os_read(proc);
+    assert(cc_car(v) == os_make_fixnum(1), "(1 2.5)の1番目は1");
+    assert((v & TAG_MASK) == TAG_CONS, "(1 2.5)はTAG_CONSを持つ");
+    assert(cc_cdr(cc_cdr(v)) == nil, "(1 2.5)は2.5をfloatトークンとして読み、dotted pairにならない");
+}
+
+void test_os_read_leading_dot_in_list_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "(. 1)");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "リスト先頭の単独'.'は構文エラー");
+}
+
+void test_os_read_dotted_pair_missing_cdr_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "(1 .)");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "'.'の後に式が無ければ構文エラー");
+}
+
+void test_os_read_dotted_pair_extra_element_after_cdr_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "(1 . 2 3)");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "dotted pairのcdrの後に余分な式があれば構文エラー");
+}
+
+void test_os_read_vector_literal_with_dot_is_read_error() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    push_string(proc, "#(1 . 2)");
+
+    lisp_val_t v = os_read(proc);
+    assert(v == g_sym_read_error, "ベクタリテラルにdotted pair記法は使えず構文エラーになる");
+}
+
 void test_os_read_quote() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
@@ -770,6 +839,13 @@ int main(int argc, char** argv) {
     test_os_read_string();
     test_os_read_empty_list();
     test_os_read_list();
+    test_os_read_dotted_pair();
+    test_os_read_dotted_pair_with_multiple_leading_elements();
+    test_os_read_dot_inside_float_token_is_not_dotted_pair();
+    test_os_read_leading_dot_in_list_is_read_error();
+    test_os_read_dotted_pair_missing_cdr_is_read_error();
+    test_os_read_dotted_pair_extra_element_after_cdr_is_read_error();
+    test_os_read_vector_literal_with_dot_is_read_error();
     test_os_read_quote();
     test_os_read_quasiquote();
     test_os_read_unquote();

@@ -143,6 +143,8 @@ lisp_val_t g_sym_quasiquote;
 lisp_val_t g_sym_unquote;
 /** unquote-splicing(,@)を表すシンボル。reader.cが,@xを(UNQUOTE-SPLICING x)へ読むために使う */
 lisp_val_t g_sym_unquote_splicing;
+/** dotted pair記法の'.'を表すシンボル。reader.cのread_listが単独トークンの'.'を検出するために使う */
+lisp_val_t g_sym_dot;
 /** car関数を表すシンボル */
 lisp_val_t g_sym_car;
 /** cdr関数を表すシンボル */
@@ -369,6 +371,7 @@ void os_bootstrap() {
         g_sym_quasiquote = os_make_symbol("QUASIQUOTE");
         g_sym_unquote = os_make_symbol("UNQUOTE");
         g_sym_unquote_splicing = os_make_symbol("UNQUOTE-SPLICING");
+        g_sym_dot = os_make_symbol(".");
         g_sym_car = os_make_symbol("CAR");
         g_sym_cdr = os_make_symbol("CDR");
         g_sym_cons = os_make_symbol("CONS");

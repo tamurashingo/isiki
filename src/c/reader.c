@@ -2,6 +2,7 @@
 #include "runtime.h"
 #include "framebuffer.h"
 #include "eval.h"
+#include "lisp.h"
 
 /** 数値/シンボルトークンや文字列リテラルを組み立てる際の作業バッファの上限 */
 #define READER_TOKEN_MAX 128
@@ -205,6 +206,69 @@ static void skip_whitespace(reader_source_t *src) {
 static lisp_val_t read_expr(reader_source_t *src);
 
 /**
+ * v が nil で終端する正規のリスト(dotted pairを含まない)かどうかを返す。
+ * ベクタリテラル#(...)はdotted pair記法を許さないため、read_listの結果を
+ * os_make_vector_from_listへ渡す前にこれで検証する(cc_cdrはTAG_CONS以外への
+ * 呼び出しをチェックしないため、dotted pairをそのまま渡すと未定義動作になる)。
+ * @param v 判定対象の値
+ * @return 正規のリストなら非0、そうでなければ0
+ */
+static int is_proper_list(lisp_val_t v) {
+    while (v != nil) {
+        if ((v & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        v = cc_cdr(v);
+    }
+    return 1;
+}
+
+/**
+ * read_listの2番目以降の要素を読む。単独トークンの'.'(g_sym_dotとして読まれる)が来たら
+ * dotted pair記法として、直後の1式をcdrに据え、その後は閉じ括弧のみを許可する。
+ * @param src 読み取り対象の文字ソース
+ * @return 読み取った残りのリスト(またはdotted pairのcdr)。構文エラーの場合はg_sym_read_error
+ */
+static lisp_val_t read_list_rest(reader_source_t *src) {
+    skip_whitespace(src);
+    if (!has_more(src)) {
+        return g_sym_read_error; // 閉じ括弧が無いまま入力が終端した
+    }
+    if (peek(src) == ')') {
+        advance(src);
+        return nil;
+    }
+
+    lisp_val_t elem = read_expr(src);
+    if (elem == g_sym_read_error) {
+        return g_sym_read_error;
+    }
+
+    if (elem == g_sym_dot) {
+        skip_whitespace(src);
+        if (!has_more(src)) {
+            return g_sym_read_error;
+        }
+        lisp_val_t cdr = read_expr(src);
+        if (cdr == g_sym_read_error) {
+            return g_sym_read_error;
+        }
+        skip_whitespace(src);
+        if (!has_more(src) || peek(src) != ')') {
+            return g_sym_read_error; // dotted pairのcdrの後は閉じ括弧以外許可しない
+        }
+        advance(src);
+        return cdr;
+    }
+
+    lisp_val_t rest = read_list_rest(src);
+    if (rest == g_sym_read_error) {
+        return g_sym_read_error;
+    }
+    return os_make_cons(elem, rest);
+}
+
+/**
  * '(' は呼び出し元で消費済みの前提で、閉じ括弧までのS式を読みリストとして組み立てる。
  * @param src 読み取り対象の文字ソース
  * @return 読み取ったリスト。構文エラーの場合はg_sym_read_error
@@ -223,7 +287,10 @@ static lisp_val_t read_list(reader_source_t *src) {
     if (car == g_sym_read_error) {
         return g_sym_read_error;
     }
-    lisp_val_t cdr = read_list(src);
+    if (car == g_sym_dot) {
+        return g_sym_read_error; // リスト先頭の単独'.'は構文エラー
+    }
+    lisp_val_t cdr = read_list_rest(src);
     if (cdr == g_sym_read_error) {
         return g_sym_read_error;
     }
@@ -660,6 +727,9 @@ static lisp_val_t read_expr(reader_source_t *src) {
             lisp_val_t list = read_list(src);
             if (list == g_sym_read_error) {
                 return g_sym_read_error;
+            }
+            if (!is_proper_list(list)) {
+                return g_sym_read_error; // ベクタリテラルにdotted pair記法は使えない
             }
             return os_make_vector_from_list(list);
         }
