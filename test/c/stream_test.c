@@ -1,8 +1,15 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "test_assert.h"
 #include "types.h"
 #include "stream.h"
+
+// stream.cはos_alloc_raw(runtime.c)を参照するが、このテストはruntime.cをリンクしない
+// (stream.cのみを対象とするため)。mallocへの薄い委譲で置き換える
+lisp_addr_t os_alloc_raw(UINT64 n) {
+    return (lisp_addr_t)malloc(n);
+}
 
 // virtio9p.c/p9.c/drivers/*.c はリンクしない(9Pプロトコルの実通信は
 // stream.c の責務ではないため)。os_virtio9p_open/read_chunk/close を
@@ -45,8 +52,9 @@ static void reset_fake_state(void) {
     g_fake_read_fail_after = -1;
 }
 
-int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
     (void)path;
+    (void)mode;
     if (g_fake_open_fail) {
         if (err_msg != 0 && err_msg_cap > 0) {
             snprintf(err_msg, err_msg_cap, "fake open failure");
@@ -54,6 +62,27 @@ int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 er
         return 0;
     }
     *out_fid = 1;
+    return 1;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)perm;
+    (void)mode;
+    (void)err_msg;
+    (void)err_msg_cap;
+    *out_fid = 1;
+    return 1;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)data;
+    (void)err_msg;
+    (void)err_msg_cap;
+    *out_written = count;
     return 1;
 }
 

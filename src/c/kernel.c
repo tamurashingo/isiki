@@ -10,6 +10,7 @@
 #include "load.h"
 #include "eval.h"
 #include "stream_lisp.h"
+#include "format.h"
 
 
 /**
@@ -59,6 +60,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_load();
     os_register_eval_primitives();
     os_register_streams();
+    os_register_format();
 
     frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);

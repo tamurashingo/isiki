@@ -444,6 +444,43 @@
       (assert-equal (string-to-symbol "foo.lsp") (string-to-symbol (car (cdr stream-form))))))
   (assert-equal 'read (car (car (cdr (cdr expanded))))))
 
+;;; --- open-input-file ---
+
+;; open-input-streamの別名であることをmacroexpand-1相当(defunなのでここでは
+;; funcallの展開結果ではなく、実際に9Pが失敗する環境でも同じ結果(g_sym_eval_error
+;; 相当のシンボル)を返すことで確認する。
+(assert-equal (open-input-stream "foo.lsp") (open-input-file "foo.lsp"))
+
+;;; --- with-open-output-stream / with-open-output-file ---
+
+(assert-equal 42 (with-open-output-stream (s (open-output-stream)) 42))
+(assert-equal t (with-open-output-stream (s (open-output-stream)) (if s t nil)))
+
+;; このテスト環境では9Pの実ファイルアクセスをモックしていないため、
+;; with-open-input-fileと同様にmacroexpand-1で展開結果の形だけを確認する。
+(let ((expanded (macroexpand-1 '(with-open-output-file (s "foo.lsp") (write-char #\a s)))))
+  (assert-equal 'with-open-output-stream (car expanded))
+  (let ((binding (car (cdr expanded))))
+    (assert-equal 's (car binding))
+    (let ((stream-form (car (cdr binding))))
+      (assert-equal 'open-output-file (car stream-form))
+      (assert-equal (string-to-symbol "foo.lsp") (string-to-symbol (car (cdr stream-form))))))
+  (assert-equal 'write-char (car (car (cdr (cdr expanded))))))
+
+;;; --- with-open-io-stream / with-open-io-file ---
+
+(assert-equal 42 (with-open-io-stream (s (open-output-stream)) 42))
+(assert-equal t (with-open-io-stream (s (open-output-stream)) (if s t nil)))
+
+(let ((expanded (macroexpand-1 '(with-open-io-file (s "foo.lsp") (read s)))))
+  (assert-equal 'with-open-io-stream (car expanded))
+  (let ((binding (car (cdr expanded))))
+    (assert-equal 's (car binding))
+    (let ((stream-form (car (cdr binding))))
+      (assert-equal 'open-io-file (car stream-form))
+      (assert-equal (string-to-symbol "foo.lsp") (string-to-symbol (car (cdr stream-form))))))
+  (assert-equal 'read (car (car (cdr (cdr expanded))))))
+
 ;;; --- 述語 (not / eql / equal / listp / characterp / stringp / functionp /
 ;;;     generic-function-p / basic-array-p系 / streamp / instancep) ---
 

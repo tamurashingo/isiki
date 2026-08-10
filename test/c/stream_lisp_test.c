@@ -32,8 +32,9 @@ static void reset_fake_state(void) {
     g_fake_open_fail = 0;
 }
 
-int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
     (void)path;
+    (void)mode;
     if (g_fake_open_fail) {
         if (err_msg != 0 && err_msg_cap > 0) {
             snprintf(err_msg, err_msg_cap, "fake open failure");
@@ -41,6 +42,27 @@ int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 er
         return 0;
     }
     *out_fid = 1;
+    return 1;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)perm;
+    (void)mode;
+    (void)err_msg;
+    (void)err_msg_cap;
+    *out_fid = 1;
+    return 1;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)data;
+    (void)err_msg;
+    (void)err_msg_cap;
+    *out_written = count;
     return 1;
 }
 
@@ -223,6 +245,164 @@ void test_read_parses_sexpr_from_stream() {
     cc_close(args, nil);
 }
 
+void test_open_stream_p_input_stream_p_output_stream_p() {
+    reset_fake_state();
+    set_fake_data("hi");
+
+    lisp_val_t in_stream = cc_open_input_stream(os_make_cons(os_make_string("fake/path"), nil), nil);
+    lisp_val_t out_stream = cc_open_output_stream(nil, nil);
+
+    assert(cc_open_stream_p(os_make_cons(in_stream, nil), nil) == g_sym_t, "open直後のstreamはopen-stream-pが真");
+    assert(cc_input_stream_p(os_make_cons(in_stream, nil), nil) == g_sym_t, "9P入力streamはinput-stream-pが真");
+    assert(cc_output_stream_p(os_make_cons(in_stream, nil), nil) == nil, "9P入力streamはoutput-stream-pが偽");
+    assert(cc_input_stream_p(os_make_cons(out_stream, nil), nil) == nil, "画面出力streamはinput-stream-pが偽");
+    assert(cc_output_stream_p(os_make_cons(out_stream, nil), nil) == g_sym_t, "画面出力streamはoutput-stream-pが真");
+
+    cc_close(os_make_cons(in_stream, nil), nil);
+    assert(cc_open_stream_p(os_make_cons(in_stream, nil), nil) == nil, "close後はopen-stream-pが偽になる");
+}
+
+void test_open_output_file_and_io_file_use_open_then_create_fallback() {
+    reset_fake_state();
+
+    lisp_val_t stream1 = cc_open_output_file(os_make_cons(os_make_string("fake/existing"), nil), nil);
+    assert((stream1 & TAG_MASK) == TAG_INSTANCE, "既存ファイルへのopen-output-fileはSTREAMを返す");
+    cc_close(os_make_cons(stream1, nil), nil);
+
+    g_fake_open_fail = 1; // open失敗→createへフォールバック(os_virtio9p_createは常に成功するフェイク)
+    lisp_val_t stream2 = cc_open_output_file(os_make_cons(os_make_string("fake/new"), nil), nil);
+    assert((stream2 & TAG_MASK) == TAG_INSTANCE, "新規ファイルへのopen-output-fileはcreateにフォールバックしてSTREAMを返す");
+    cc_close(os_make_cons(stream2, nil), nil);
+
+    lisp_val_t stream3 = cc_open_io_file(os_make_cons(os_make_string("fake/new-io"), nil), nil);
+    assert((stream3 & TAG_MASK) == TAG_INSTANCE, "open-io-fileも同様にcreateへフォールバックしてSTREAMを返す");
+    cc_close(os_make_cons(stream3, nil), nil);
+
+    reset_fake_state();
+}
+
+void test_finish_output_flushes_and_returns_nil() {
+    reset_fake_state();
+
+    lisp_val_t stream = cc_open_output_file(os_make_cons(os_make_string("fake/path"), nil), nil);
+    lisp_val_t args = os_make_cons(stream, nil);
+    cc_write_char(os_make_cons(os_make_char('A'), os_make_cons(stream, nil)), nil);
+
+    lisp_val_t result = cc_finish_output(args, nil);
+    assert(result == nil, "finish-outputはnilを返す");
+
+    cc_close(args, nil);
+}
+
+void test_string_input_stream_reads_content() {
+    lisp_val_t stream = cc_create_string_input_stream(os_make_cons(os_make_string("ab"), nil), nil);
+    lisp_val_t args = os_make_cons(stream, nil);
+
+    assert(cc_read_char(args, nil) == os_make_char('a'), "string-input-streamの1文字目'a'が読める");
+    assert(cc_read_char(args, nil) == os_make_char('b'), "string-input-streamの2文字目'b'が読める");
+    assert(cc_read_char(args, nil) == nil, "string-input-streamの末尾はEOFでnil");
+}
+
+void test_string_output_stream_accumulates_and_resets() {
+    lisp_val_t stream = cc_create_string_output_stream(nil, nil);
+    lisp_val_t args = os_make_cons(stream, nil);
+
+    cc_write_char(os_make_cons(os_make_char('x'), os_make_cons(stream, nil)), nil);
+    cc_write_char(os_make_cons(os_make_char('y'), os_make_cons(stream, nil)), nil);
+
+    lisp_val_t s1 = cc_get_output_stream_string(args, nil);
+    char buf1[8];
+    os_string_to_cstr(s1, buf1, sizeof(buf1));
+    assert(strcmp(buf1, "xy") == 0, "get-output-stream-stringは書き込まれた内容を返す");
+
+    lisp_val_t s2 = cc_get_output_stream_string(args, nil);
+    char buf2[8];
+    os_string_to_cstr(s2, buf2, sizeof(buf2));
+    assert(strcmp(buf2, "") == 0, "get-output-stream-stringは呼ぶたびに内部バッファをリセットする");
+}
+
+void test_preview_char_does_not_advance_cursor() {
+    lisp_val_t stream = cc_create_string_input_stream(os_make_cons(os_make_string("ab"), nil), nil);
+    lisp_val_t args = os_make_cons(stream, nil);
+
+    assert(cc_preview_char(args, nil) == os_make_char('a'), "preview-charは先頭文字を返す");
+    assert(cc_preview_char(args, nil) == os_make_char('a'), "preview-charを連続で呼んでも同じ文字が返る(カーソルは進まない)");
+    assert(cc_read_char(args, nil) == os_make_char('a'), "read-charはpreview-charされた文字を消費する");
+    assert(cc_read_char(args, nil) == os_make_char('b'), "続く2文字目'b'を読める");
+}
+
+void test_read_line_reads_up_to_newline() {
+    lisp_val_t stream = cc_create_string_input_stream(os_make_cons(os_make_string("foo\nbar"), nil), nil);
+    lisp_val_t args = os_make_cons(stream, nil);
+
+    lisp_val_t line1 = cc_read_line(args, nil);
+    char buf1[16];
+    os_string_to_cstr(line1, buf1, sizeof(buf1));
+    assert(strcmp(buf1, "foo") == 0, "read-lineは改行を含まない1行目'foo'を返す");
+
+    lisp_val_t line2 = cc_read_line(args, nil);
+    char buf2[16];
+    os_string_to_cstr(line2, buf2, sizeof(buf2));
+    assert(strcmp(buf2, "bar") == 0, "read-lineは末尾改行の無い2行目'bar'も返す");
+
+    assert(cc_read_line(args, nil) == nil, "read-lineは即EOFでnilを返す");
+}
+
+void test_stream_ready_p_is_always_true() {
+    lisp_val_t stream = cc_create_string_input_stream(os_make_cons(os_make_string(""), nil), nil);
+    assert(cc_stream_ready_p(os_make_cons(stream, nil), nil) == g_sym_t, "stream-ready-pは常にtrueのスタブ");
+}
+
+void test_read_byte_and_write_byte_wrap_char_ops() {
+    lisp_val_t in_stream = cc_create_string_input_stream(os_make_cons(os_make_string("A"), nil), nil);
+    lisp_val_t byte_val = cc_read_byte(os_make_cons(in_stream, nil), nil);
+    assert(byte_val == os_make_fixnum(65), "read-byteは文字コードのFIXNUMを返す('A'=65)");
+    assert(cc_read_byte(os_make_cons(in_stream, nil), nil) == nil, "read-byteもEOFでnilを返す");
+
+    lisp_val_t out_stream = cc_create_string_output_stream(nil, nil);
+    lisp_val_t args = os_make_cons(os_make_fixnum(66), os_make_cons(out_stream, nil));
+    lisp_val_t written = cc_write_byte(args, nil);
+    assert(written == os_make_fixnum(66), "write-byteは書き込んだ値自身を返す");
+
+    lisp_val_t s = cc_get_output_stream_string(os_make_cons(out_stream, nil), nil);
+    char buf[4];
+    os_string_to_cstr(s, buf, sizeof(buf));
+    assert(strcmp(buf, "B") == 0, "write-byteで書き込んだ66('B')が文字として反映される");
+}
+
+void test_probe_file_reflects_open_success() {
+    reset_fake_state();
+    assert(cc_probe_file(os_make_cons(os_make_string("fake/exists"), nil), nil) == g_sym_t,
+           "openできるパスはprobe-fileが真");
+
+    g_fake_open_fail = 1;
+    assert(cc_probe_file(os_make_cons(os_make_string("fake/missing"), nil), nil) == nil,
+           "openできないパスはprobe-fileが偽");
+    reset_fake_state();
+}
+
+void test_file_position_and_set_file_position_on_string_stream() {
+    lisp_val_t stream = cc_create_string_input_stream(os_make_cons(os_make_string("abc"), nil), nil);
+    lisp_val_t args = os_make_cons(stream, nil);
+
+    assert(cc_file_position(args, nil) == os_make_fixnum(0), "読み込み前のfile-positionは0");
+    cc_read_char(args, nil);
+    assert(cc_file_position(args, nil) == os_make_fixnum(1), "1文字読んだ後のfile-positionは1");
+
+    lisp_val_t set_args = os_make_cons(stream, os_make_cons(os_make_fixnum(0), nil));
+    lisp_val_t result = cc_set_file_position(set_args, nil);
+    assert(result == os_make_fixnum(0), "set-file-positionは設定した値を返す");
+    assert(cc_read_char(args, nil) == os_make_char('a'), "set-file-positionで巻き戻した後は先頭から読める");
+}
+
+void test_file_length_counts_bytes_by_reading_whole_file() {
+    reset_fake_state();
+    set_fake_data("hello");
+
+    lisp_val_t result = cc_file_length(os_make_cons(os_make_string("fake/path"), nil), nil);
+    assert(result == os_make_fixnum(5), "file-lengthは全部読み切ったバイト数を返す");
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -235,6 +415,18 @@ int main(int argc, char **argv) {
     test_open_input_stream_open_failure_returns_eval_error();
     test_close_then_read_char_returns_nil();
     test_read_parses_sexpr_from_stream();
+    test_open_stream_p_input_stream_p_output_stream_p();
+    test_open_output_file_and_io_file_use_open_then_create_fallback();
+    test_finish_output_flushes_and_returns_nil();
+    test_string_input_stream_reads_content();
+    test_string_output_stream_accumulates_and_resets();
+    test_preview_char_does_not_advance_cursor();
+    test_read_line_reads_up_to_newline();
+    test_stream_ready_p_is_always_true();
+    test_read_byte_and_write_byte_wrap_char_ops();
+    test_probe_file_reflects_open_success();
+    test_file_position_and_set_file_position_on_string_stream();
+    test_file_length_counts_bytes_by_reading_whole_file();
 
     return g_test_failed ? 1 : 0;
 }

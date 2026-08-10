@@ -194,6 +194,47 @@
   `(with-open-input-stream (,(car binding) (open-input-stream ,(car (cdr binding))))
      ,@body))
 
+;; open-input-streamと同じ実装をファイル読み込み用の別名として提供する
+;; (ISLisp仕様上はopen-input-fileが正式名で、open-input-streamはより一般的な
+;; 入力ストリームを開く関数だが、本実装では9Pファイルopenのみをサポートするため
+;; 実質的に同じ動作になる)。
+(defun open-input-file (filename)
+  (open-input-stream filename))
+
+;;; --- with-open-output-stream / with-open-output-file ---
+
+;; with-open-input-streamの出力版。streamの生成式を評価してnameに束縛し、
+;; bodyの実行後は必ずcloseする(unwind-protectでbodyの異常終了時も保証)。
+(defmacro with-open-output-stream (binding &rest body)
+  `(let ((,(car binding) ,(car (cdr binding))))
+     (unwind-protect
+         (progn ,@body)
+       (close ,(car binding)))))
+
+;; (with-open-output-file (name filename [element-class]) body...) :
+;; filenameをopen-output-fileで開き(無ければ新規作成)、nameに束縛してbodyを
+;; 評価し、抜けたら必ずcloseする。element-classはwith-open-input-fileと同様の
+;; 理由で無視する。
+(defmacro with-open-output-file (binding &rest body)
+  `(with-open-output-stream (,(car binding) (open-output-file ,(car (cdr binding))))
+     ,@body))
+
+;;; --- with-open-io-stream / with-open-io-file ---
+
+;; with-open-output-streamと同型の入出力両用版。
+(defmacro with-open-io-stream (binding &rest body)
+  `(let ((,(car binding) ,(car (cdr binding))))
+     (unwind-protect
+         (progn ,@body)
+       (close ,(car binding)))))
+
+;; (with-open-io-file (name filename [element-class]) body...) :
+;; filenameをopen-io-fileで開き(無ければ新規作成)、nameに束縛してbodyを評価し、
+;; 抜けたら必ずcloseする。
+(defmacro with-open-io-file (binding &rest body)
+  `(with-open-io-stream (,(car binding) (open-io-file ,(car (cdr binding))))
+     ,@body))
+
 ;;; --- setf ---
 
 ;; (setf place value) を place の形に応じて setq/set-car/set-cdr/set-arefに展開する。

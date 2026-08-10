@@ -14,15 +14,30 @@ int os_virtio9p_ensure_session(char *err_msg, UINT32 err_msg_cap);
 
 /**
  * 9Pエクスポートルートから見た相対パスのファイルをwalk+openし、fidを得る。
- * 内部でos_virtio9p_ensure_sessionを呼ぶ。fidは常に1つだけ使用するため、
- * 使い終わったら必ずos_virtio9p_closeで解放してから次のopenを呼ぶこと。
+ * 内部でos_virtio9p_ensure_sessionを呼ぶ。fidは呼ぶたびに新規に割り当てられる
+ * (使い終わったらos_virtio9p_closeで解放すること。同時に複数openしてよい)。
  * @param path 9Pエクスポートルートから見た相対パス(例: "src/lisp/init.lisp")
+ * @param mode P9_OREAD/P9_OWRITE/P9_ORDWR。P9_OTRUNCを重ねてよい
  * @param out_fid 得られたfidを格納する先
  * @param err_msg 失敗時にエラー内容(NUL終端文字列)を格納する先
  * @param err_msg_cap err_msgの容量
  * @return 成功時1、失敗時0
  */
-int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap);
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap);
+
+/**
+ * 9Pエクスポートルートから見た相対パスに新規ファイルを作成し、openした状態のfidを得る。
+ * パスの末尾要素をファイル名、それ以前を親ディレクトリのパスとして扱う。
+ * 内部でos_virtio9p_ensure_sessionを呼ぶ。
+ * @param path 9Pエクスポートルートから見た相対パス(例: "tmp/new.txt")
+ * @param perm 作成する際のUnixパーミッション(例: 0644)
+ * @param mode P9_OWRITE/P9_ORDWR
+ * @param out_fid 得られたfidを格納する先
+ * @param err_msg 失敗時にエラー内容(NUL終端文字列)を格納する先
+ * @param err_msg_cap err_msgの容量
+ * @return 成功時1、失敗時0
+ */
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap);
 
 /**
  * fidに対し、offsetからwantバイトを1回のTreadで読み込む。
@@ -40,6 +55,20 @@ int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 er
 int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
                             const UINT8 **out_data, UINT32 *out_count,
                             char *err_msg, UINT32 err_msg_cap);
+
+/**
+ * fidに対し、offsetからdata[0..count)を1回のTwriteで書き込む。
+ * @param fid os_virtio9p_open/createで得たfid
+ * @param offset 書き込み開始オフセット
+ * @param data 書き込むバイト列
+ * @param count dataのバイト数
+ * @param out_written 実際に書き込めたバイト数を格納する先
+ * @param err_msg 失敗時にエラー内容(NUL終端文字列)を格納する先
+ * @param err_msg_cap err_msgの容量
+ * @return 成功時1、失敗時0
+ */
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap);
 
 /**
  * os_virtio9p_openで得たfidをTclunkで解放する。

@@ -2,16 +2,27 @@
 #include "lisp.h"
 #include "framebuffer.h"
 
-static void print_value(frame_buffer *fb, lisp_val_t val);
+static void print_value(os_char_sink_t *sink, lisp_val_t val, int escaped);
+
+static void sink_write_char(os_char_sink_t *sink, UINT8 c) {
+    sink->write_char(sink->ctx, c);
+}
+
+static void sink_write_string(os_char_sink_t *sink, const char *s) {
+    while (*s != '\0') {
+        sink_write_char(sink, (UINT8)*s);
+        s++;
+    }
+}
 
 /**
  * UINT64を10進数の数字列にして出力する(標準ライブラリのitoa等は使えないため自前実装)。
- * @param fb 出力先のframe buffer
+ * @param sink 出力先のシンク
  * @param value 出力する値
  */
-static void print_fixnum(frame_buffer *fb, UINT64 value) {
+static void print_fixnum(os_char_sink_t *sink, UINT64 value) {
     if (value == 0) {
-        fb->write_char(fb, '0');
+        sink_write_char(sink, '0');
         return;
     }
     char digits[20]; // UINT64の最大10進桁数
@@ -21,17 +32,17 @@ static void print_fixnum(frame_buffer *fb, UINT64 value) {
         value /= 10;
     }
     while (len > 0) {
-        fb->write_char(fb, (UINT8)digits[--len]);
+        sink_write_char(sink, (UINT8)digits[--len]);
     }
 }
 
 /**
  * bignum(MAGIC_BIGNUM)のlimb配列を10進数で出力する。limb配列はmag_divmod_smallで
  * 破壊的に10で割り続けるため、出力前に別バッファへコピーしておく。
- * @param fb 出力先のframe buffer
+ * @param sink 出力先のシンク
  * @param val 出力するbignum(TAG_INSTANCE、word0==MAGIC_BIGNUM)
  */
-static void print_bignum(frame_buffer *fb, lisp_val_t val) {
+static void print_bignum(os_char_sink_t *sink, lisp_val_t val) {
     UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
     UINT64 sign = obj[1];
     UINT64 count = obj[2];
@@ -43,7 +54,7 @@ static void print_bignum(frame_buffer *fb, lisp_val_t val) {
     }
 
     if (sign) {
-        fb->write_char(fb, '-');
+        sink_write_char(sink, '-');
     }
 
     // 1limb(基数2^32)あたり最大10進10桁(log10(2^32) < 9.63)なので10*countで十分
@@ -55,76 +66,84 @@ static void print_bignum(frame_buffer *fb, lisp_val_t val) {
         digits[len++] = '0' + (char)rem;
     }
     while (len > 0) {
-        fb->write_char(fb, (UINT8)digits[--len]);
+        sink_write_char(sink, (UINT8)digits[--len]);
     }
 }
 
 /**
  * STRINGオブジェクトのレイアウト([len(8byte)][chars...])に従ってバイト列を出力する。
- * @param fb 出力先のframe buffer
+ * @param sink 出力先のシンク
  * @param str_addr STRINGオブジェクト本体(タグを除いた先頭)のアドレス
  */
-static void print_bytes(frame_buffer *fb, lisp_addr_t str_addr) {
+static void print_bytes(os_char_sink_t *sink, lisp_addr_t str_addr) {
     UINT64 len = ((UINT64 *)str_addr)[0];
     const char *bytes = (const char *)(str_addr + 8);
     for (UINT64 i = 0; i < len; i++) {
-        fb->write_char(fb, (UINT8)bytes[i]);
+        sink_write_char(sink, (UINT8)bytes[i]);
     }
 }
 
 /**
  * SYMBOLの名前を出力する。
- * @param fb 出力先のframe buffer
+ * @param sink 出力先のシンク
  * @param val 出力するSYMBOL
  */
-static void print_symbol(frame_buffer *fb, lisp_val_t val) {
+static void print_symbol(os_char_sink_t *sink, lisp_val_t val) {
     lisp_val_t name_str = ((lisp_val_t *)(val & ~TAG_MASK))[0];
-    print_bytes(fb, name_str & ~TAG_MASK);
+    print_bytes(sink, name_str & ~TAG_MASK);
 }
 
 /**
- * STRINGをダブルクオートで囲んで出力する。
- * @param fb 出力先のframe buffer
+ * STRINGを出力する。escapedが真ならダブルクオートで囲む(prin1相当)、
+ * 偽なら内容のみをそのまま出力する(princ相当)。
+ * @param sink 出力先のシンク
  * @param val 出力するSTRING
+ * @param escaped ダブルクオートで囲むかどうか
  */
-static void print_string(frame_buffer *fb, lisp_val_t val) {
-    fb->write_char(fb, '"');
-    print_bytes(fb, val & ~TAG_MASK);
-    fb->write_char(fb, '"');
+static void print_string(os_char_sink_t *sink, lisp_val_t val, int escaped) {
+    if (escaped) {
+        sink_write_char(sink, '"');
+    }
+    print_bytes(sink, val & ~TAG_MASK);
+    if (escaped) {
+        sink_write_char(sink, '"');
+    }
 }
 
 /**
  * CONSのリストを"(a b c)"形式で出力する。nilで終端しない場合はドット対記法で表示する。
- * @param fb 出力先のframe buffer
+ * @param sink 出力先のシンク
  * @param val 出力するCONS
+ * @param escaped 要素の出力にprin1/princどちらの規則を使うか
  */
-static void print_list(frame_buffer *fb, lisp_val_t val) {
-    fb->write_char(fb, '(');
+static void print_list(os_char_sink_t *sink, lisp_val_t val, int escaped) {
+    sink_write_char(sink, '(');
     lisp_val_t current = val;
     int first = 1;
     while (current != nil && (current & TAG_MASK) == TAG_CONS) {
         if (!first) {
-            fb->write_char(fb, ' ');
+            sink_write_char(sink, ' ');
         }
         first = 0;
-        print_value(fb, cc_car(current));
+        print_value(sink, cc_car(current), escaped);
         current = cc_cdr(current);
     }
     if (current != nil) {
         // 末尾がnilで終わらないconsはドット対記法で表示する
-        fb->write_string(fb, " . ");
-        print_value(fb, current);
+        sink_write_string(sink, " . ");
+        print_value(sink, current, escaped);
     }
-    fb->write_char(fb, ')');
+    sink_write_char(sink, ')');
 }
 
 /**
  * VECTORを"#(a b c)"形式で出力する。多次元の場合も次元の区切りは付けず、
  * 要素本体をrow-major順にフラットに並べて表示する。
- * @param fb 出力先のframe buffer
+ * @param sink 出力先のシンク
  * @param val 出力するVECTOR
+ * @param escaped 要素の出力にprin1/princどちらの規則を使うか
  */
-static void print_vector(frame_buffer *fb, lisp_val_t val) {
+static void print_vector(os_char_sink_t *sink, lisp_val_t val, int escaped) {
     lisp_val_t *header = os_vector_header(val);
     UINT64 rank = header[0];
     UINT64 total = 1;
@@ -133,85 +152,89 @@ static void print_vector(frame_buffer *fb, lisp_val_t val) {
     }
     lisp_val_t *data = header + 1 + rank;
 
-    fb->write_char(fb, '#');
-    fb->write_char(fb, '(');
+    sink_write_char(sink, '#');
+    sink_write_char(sink, '(');
     for (UINT64 i = 0; i < total; i++) {
         if (i != 0) {
-            fb->write_char(fb, ' ');
+            sink_write_char(sink, ' ');
         }
-        print_value(fb, data[i]);
+        print_value(sink, data[i], escaped);
     }
-    fb->write_char(fb, ')');
+    sink_write_char(sink, ')');
 }
 
 /**
- * valをTAGに応じて出力する(os_printの実処理本体)。
- * @param fb 出力先のframe buffer
+ * valをTAGに応じて出力する(os_print_to_sinkの実処理本体)。
+ * @param sink 出力先のシンク
  * @param val 出力するLisp値
+ * @param escaped STRINGをprin1相当(ダブルクオート付き)で出力するかprinc相当で出力するか
  */
-static void print_value(frame_buffer *fb, lisp_val_t val) {
+static void print_value(os_char_sink_t *sink, lisp_val_t val, int escaped) {
     if (val == nil) {
         // NILはcar/cdrが自分自身を指す循環consのため、専用処理せず
         // TAG_CONSの分岐に入ると無限再帰するので先に判定する
-        fb->write_string(fb, "NIL");
+        sink_write_string(sink, "NIL");
         return;
     }
 
     switch (val & TAG_MASK) {
         case TAG_FIXNUM:
             if (os_fixnum_is_negative(val)) {
-                fb->write_char(fb, '-');
+                sink_write_char(sink, '-');
             }
-            print_fixnum(fb, os_fixnum_magnitude(val));
+            print_fixnum(sink, os_fixnum_magnitude(val));
             return;
         case TAG_SYMBOL:
-            print_symbol(fb, val);
+            print_symbol(sink, val);
             return;
         case TAG_STRING:
-            print_string(fb, val);
+            print_string(sink, val, escaped);
             return;
         case TAG_CHAR:
-            fb->write_char(fb, (UINT8)(val >> 3));
+            sink_write_char(sink, (UINT8)(val >> 3));
             return;
         case TAG_CONS:
-            print_list(fb, val);
+            print_list(sink, val, escaped);
             return;
         case TAG_INSTANCE: {
             UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
             UINT64 magic = obj[0];
             if (magic == MAGIC_PROCESS) {
-                fb->write_string(fb, "#<PROCESS>");
+                sink_write_string(sink, "#<PROCESS>");
             } else if (magic == MAGIC_BIGNUM) {
-                print_bignum(fb, val);
+                print_bignum(sink, val);
             } else if (magic == MAGIC_VECTOR) {
-                print_vector(fb, val);
+                print_vector(sink, val, escaped);
             } else if (magic == MAGIC_STREAM) {
-                fb->write_string(fb, "#<STREAM>");
+                sink_write_string(sink, "#<STREAM>");
             } else if (magic == MAGIC_CLASS) {
-                fb->write_string(fb, "#<CLASS ");
-                print_value(fb, obj[1]);
-                fb->write_char(fb, '>');
+                sink_write_string(sink, "#<CLASS ");
+                print_value(sink, obj[1], escaped);
+                sink_write_char(sink, '>');
             } else if (magic == MAGIC_CLASS_INSTANCE) {
                 UINT64 *cls = (UINT64 *)(obj[1] & ~TAG_MASK);
-                fb->write_string(fb, "#<INSTANCE-OF ");
-                print_value(fb, cls[1]);
-                fb->write_char(fb, '>');
+                sink_write_string(sink, "#<INSTANCE-OF ");
+                print_value(sink, cls[1], escaped);
+                sink_write_char(sink, '>');
             } else {
-                fb->write_string(fb, "#<FUNCTION>");
+                sink_write_string(sink, "#<FUNCTION>");
             }
             return;
         }
     }
 }
 
-/**
- * val を TAG に応じて fb に表示する。
- * 表示した val 自身を返す(REPLでの `(print (eval (read)))` 的な合成のため)。
- * @param val 表示するLisp値
- * @param fb 表示先のframe buffer
- * @return val 自身
- */
+void os_print_to_sink(lisp_val_t val, os_char_sink_t *sink, int escaped) {
+    print_value(sink, val, escaped);
+}
+
+static void frame_buffer_sink_write_char(void *ctx, UINT8 c) {
+    frame_buffer *fb = (frame_buffer *)ctx;
+    fb->write_char(fb, c);
+}
+
 lisp_val_t os_print(lisp_val_t val, frame_buffer *fb) {
-    print_value(fb, val);
+    os_char_sink_t sink = { .ctx = fb, .write_char = frame_buffer_sink_write_char };
+    print_value(&sink, val, 1);
     return val;
 }
