@@ -19,6 +19,12 @@ static UINT8 g_fake_data[FAKE_DATA_MAX];
 static UINT32 g_fake_data_len = 0;
 static int g_fake_open_fail = 0;
 
+// os_virtio9p_write_chunkへ渡された内容を検証用に記録する
+static UINT8 g_fake_write_data[FAKE_DATA_MAX];
+static UINT32 g_fake_write_len = 0;
+static UINT32 g_fake_write_fid = 0;
+static UINT64 g_fake_write_offset = 0;
+
 static void set_fake_data(const char *s) {
     UINT32 n = 0;
     while (s[n] != '\0' && n < FAKE_DATA_MAX) {
@@ -30,6 +36,9 @@ static void set_fake_data(const char *s) {
 
 static void reset_fake_state(void) {
     g_fake_open_fail = 0;
+    g_fake_write_len = 0;
+    g_fake_write_fid = 0;
+    g_fake_write_offset = 0;
 }
 
 int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
@@ -57,11 +66,13 @@ int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fi
 
 int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
                              UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
-    (void)fid;
-    (void)offset;
-    (void)data;
     (void)err_msg;
     (void)err_msg_cap;
+    g_fake_write_fid = fid;
+    g_fake_write_offset = offset;
+    for (UINT32 i = 0; i < count && g_fake_write_len < FAKE_DATA_MAX; i++) {
+        g_fake_write_data[g_fake_write_len++] = data[i];
+    }
     *out_written = count;
     return 1;
 }
@@ -295,9 +306,15 @@ void test_finish_output_flushes_and_returns_nil() {
     lisp_val_t stream = cc_open_output_file(os_make_cons(os_make_string("fake/path"), nil), nil);
     lisp_val_t args = os_make_cons(stream, nil);
     cc_write_char(os_make_cons(os_make_char('A'), os_make_cons(stream, nil)), nil);
+    cc_write_char(os_make_cons(os_make_char('B'), os_make_cons(stream, nil)), nil);
+
+    assert(g_fake_write_len == 0, "finish-output前はos_virtio9p_write_chunkが呼ばれない");
 
     lisp_val_t result = cc_finish_output(args, nil);
     assert(result == nil, "finish-outputはnilを返す");
+    assert(g_fake_write_len == 2 && g_fake_write_data[0] == 'A' && g_fake_write_data[1] == 'B',
+           "finish-outputのflushで書き込んだ'A''B'がos_virtio9p_write_chunkへそのまま渡る");
+    assert(g_fake_write_offset == 0, "1回目の書き込みはoffset 0から始まる");
 
     cc_close(args, nil);
 }
