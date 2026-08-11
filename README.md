@@ -79,9 +79,9 @@ ISLisp には Common Lisp のような動的な package システムがなく、
 
 ## 開発のロードマップ
 - [x] UEFIブートおよびGOP（Graphics Output Protocol）によるコンソール出力の確立
-- [ ] `%%` レイヤー（物理I/O、生ポインタ・タグメモリ制御）の実装
-- [ ] ISLisp準拠のコアランタイム・GCの移植
-- [ ] ベアメタル上でのREPLの起動および自己ブートストラップ環境の構築
+- [x] `%%` レイヤー（物理I/O、生ポインタ・タグメモリ制御）の実装
+- [x] ISLisp準拠のコアランタイム・GCの移植
+- [x] ベアメタル上でのREPLの起動および自己ブートストラップ環境の構築
 
 
 
@@ -129,6 +129,7 @@ see [LICENSE](./assets/fonts/LICENSE)
 - Streamを抽象化し、`(load "path")` で9P経由のLispファイルをread→evalできる
 - Transport Layerを関数ポインタインタフェースで分離し、VirtIOの実装を `transport_virtio_9p` としてカプセル化
 - 起動時にVirtIO-9pデバイスの検出結果を画面に表示
+- ISLisp準拠のLispを実装
 
-![screenshot](./documents/images/version_0_0_4.png)
+![screenshot](./documents/images/version_0_0_5.png)
 
