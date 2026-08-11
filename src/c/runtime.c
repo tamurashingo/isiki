@@ -491,10 +491,13 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("SET-ELT"), os_make_native_function((lisp_addr_t)(void *)primitive_set_elt), global_environment);
         os_set_function(os_make_symbol("SUBSEQ"), os_make_native_function((lisp_addr_t)(void *)primitive_subseq), global_environment);
         os_set_function(os_make_symbol("%%MAKE-CLASS-RAW"), os_make_native_function((lisp_addr_t)(void *)primitive_make_class_raw), global_environment);
+        os_set_function(os_make_symbol("%%MAKE-BUILTIN-CLASS-RAW"), os_make_native_function((lisp_addr_t)(void *)primitive_make_builtin_class_raw), global_environment);
         os_set_function(os_make_symbol("%%CLASS-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_class_name), global_environment);
         os_set_function(os_make_symbol("%%CLASS-SUPERS"), os_make_native_function((lisp_addr_t)(void *)primitive_class_supers), global_environment);
         os_set_function(os_make_symbol("%%CLASS-SLOTS"), os_make_native_function((lisp_addr_t)(void *)primitive_class_slots), global_environment);
         os_set_function(os_make_symbol("%%CLASSP"), os_make_native_function((lisp_addr_t)(void *)primitive_classp), global_environment);
+        os_set_function(os_make_symbol("%%BUILTIN-CLASSP"), os_make_native_function((lisp_addr_t)(void *)primitive_builtin_classp), global_environment);
+        os_set_function(os_make_symbol("%%STANDARD-CLASSP"), os_make_native_function((lisp_addr_t)(void *)primitive_standard_classp), global_environment);
         os_set_function(os_make_symbol("%%MAKE-INSTANCE-RAW"), os_make_native_function((lisp_addr_t)(void *)primitive_make_instance_raw), global_environment);
         os_set_function(os_make_symbol("%%INSTANCE-CLASS"), os_make_native_function((lisp_addr_t)(void *)primitive_instance_class), global_environment);
         os_set_function(os_make_symbol("%%INSTANCE-SLOTS"), os_make_native_function((lisp_addr_t)(void *)primitive_instance_slots), global_environment);
@@ -3805,7 +3808,7 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
 
 
 /**
- * 組み込み関数%%MAKE-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_CLASS)を確保する。
+ * 組み込み関数%%MAKE-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_STANDARD_CLASS)を確保する。
  * @param args 評価済みの引数リスト(name symbol, supers クラスオブジェクトのlist, slots スロット記述子のlist)
  * @param env 呼び出し時の環境(未使用)
  * @return 確保したクラスオブジェクト
@@ -3814,7 +3817,20 @@ lisp_val_t primitive_make_class_raw(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t supers = cc_car(cc_cdr(args));
     lisp_val_t slots = cc_car(cc_cdr(cc_cdr(args)));
-    return os_make_instance(MAGIC_CLASS, name, supers, slots);
+    return os_make_instance(MAGIC_STANDARD_CLASS, name, supers, slots);
+}
+
+/**
+ * 組み込み関数%%MAKE-BUILTIN-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_BUILTIN_CLASS)を確保する。
+ * @param args 評価済みの引数リスト(name symbol, supers クラスオブジェクトのlist, slots スロット記述子のlist)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したクラスオブジェクト
+ */
+lisp_val_t primitive_make_builtin_class_raw(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t supers = cc_car(cc_cdr(args));
+    lisp_val_t slots = cc_car(cc_cdr(cc_cdr(args)));
+    return os_make_instance(MAGIC_BUILTIN_CLASS, name, supers, slots);
 }
 
 /**
@@ -3851,7 +3867,7 @@ lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数%%CLASSP。第一引数がILOSクラスオブジェクト(MAGIC_CLASS)かどうかを判定する。
+ * 組み込み関数%%CLASSP。第一引数がILOSクラスオブジェクト(MAGIC_BUILTIN_CLASSまたはMAGIC_STANDARD_CLASS)かどうかを判定する。
  * @param args 評価済みの引数リスト(第一引数は任意の値)
  * @param env 呼び出し時の環境(未使用)
  * @return クラスオブジェクトならt、それ以外ならnil
@@ -3862,7 +3878,37 @@ lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env) {
         return nil;
     }
     UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
-    return obj[0] == MAGIC_CLASS ? g_sym_t : nil;
+    return (obj[0] == MAGIC_BUILTIN_CLASS || obj[0] == MAGIC_STANDARD_CLASS) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%BUILTIN-CLASSP。第一引数がILOSの組み込みクラスオブジェクト(MAGIC_BUILTIN_CLASS)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 組み込みクラスオブジェクトならt、それ以外ならnil
+ */
+lisp_val_t primitive_builtin_classp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return obj[0] == MAGIC_BUILTIN_CLASS ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%STANDARD-CLASSP。第一引数がILOSの標準クラスオブジェクト(MAGIC_STANDARD_CLASS)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 標準クラスオブジェクトならt、それ以外ならnil
+ */
+lisp_val_t primitive_standard_classp(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return obj[0] == MAGIC_STANDARD_CLASS ? g_sym_t : nil;
 }
 
 /**

@@ -325,7 +325,7 @@ static void print_value(os_char_sink_t *sink, lisp_val_t val, int escaped) {
                 print_float(sink, val);
             } else if (magic == MAGIC_STREAM) {
                 sink_write_string(sink, "#<STREAM>");
-            } else if (magic == MAGIC_CLASS) {
+            } else if (magic == MAGIC_BUILTIN_CLASS || magic == MAGIC_STANDARD_CLASS) {
                 sink_write_string(sink, "#<CLASS ");
                 print_value(sink, obj[1], escaped);
                 sink_write_char(sink, '>');

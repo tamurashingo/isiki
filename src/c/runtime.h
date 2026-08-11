@@ -37,8 +37,6 @@
 #define MAGIC_BLOCK_EXIT           0x5ULL
 /** TAG_INSTANCEのword0に入る、streamオブジェクトであることを示すMAGIC NUMBER */
 #define MAGIC_STREAM               0x6ULL
-/** TAG_INSTANCEのword0に入る、ILOSのクラスオブジェクトであることを示すMAGIC NUMBER。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
-#define MAGIC_CLASS                0x7ULL
 /** TAG_INSTANCEのword0に入る、ILOSのクラスインスタンスであることを示すMAGIC NUMBER。word1=class、word2=slots-vector(MAGIC_VECTOR)、word3=未使用 */
 #define MAGIC_CLASS_INSTANCE       0x8ULL
 /** TAG_INSTANCEのword0に入る、catch/throwの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(evalされた値)、word2=throwされた値 */
@@ -51,6 +49,10 @@
 #define MAGIC_VECTOR               0xCULL
 /** TAG_INSTANCEのword0に入る、ISLispのfloat(IEEE754 binary64)であることを示すMAGIC NUMBER。word1=doubleのビットパターン、word2/word3=未使用 */
 #define MAGIC_FLOAT                0xDULL
+/** TAG_INSTANCEのword0に入る、ILOSの組み込み(built-in)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<built-in-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
+#define MAGIC_BUILTIN_CLASS        0xEULL
+/** TAG_INSTANCEのword0に入る、ILOSの標準(standard)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<standard-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
+#define MAGIC_STANDARD_CLASS       0xFULL
 
 /** NIL */
 extern lisp_val_t nil;
@@ -1160,12 +1162,20 @@ lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数%%MAKE-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_CLASS)を確保する。
+ * 組み込み関数%%MAKE-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_STANDARD_CLASS)を確保する。
  * @param args 評価済みの引数リスト(name symbol, supers クラスオブジェクトのlist, slots スロット記述子のlist)
  * @param env 呼び出し時の環境(未使用)
  * @return 確保したクラスオブジェクト
  */
 lisp_val_t primitive_make_class_raw(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%MAKE-BUILTIN-CLASS-RAW。ILOSクラスオブジェクト(MAGIC_BUILTIN_CLASS)を確保する。
+ * @param args 評価済みの引数リスト(name symbol, supers クラスオブジェクトのlist, slots スロット記述子のlist)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 確保したクラスオブジェクト
+ */
+lisp_val_t primitive_make_builtin_class_raw(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数%%CLASS-NAME。ILOSクラスオブジェクトのname(symbol)を返す。
@@ -1192,12 +1202,28 @@ lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数%%CLASSP。第一引数がILOSクラスオブジェクト(MAGIC_CLASS)かどうかを判定する。
+ * 組み込み関数%%CLASSP。第一引数がILOSクラスオブジェクト(MAGIC_BUILTIN_CLASSまたはMAGIC_STANDARD_CLASS)かどうかを判定する。
  * @param args 評価済みの引数リスト(第一引数は任意の値)
  * @param env 呼び出し時の環境(未使用)
  * @return クラスオブジェクトならt、それ以外ならnil
  */
 lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%BUILTIN-CLASSP。第一引数がILOSの組み込みクラスオブジェクト(MAGIC_BUILTIN_CLASS)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 組み込みクラスオブジェクトならt、それ以外ならnil
+ */
+lisp_val_t primitive_builtin_classp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%STANDARD-CLASSP。第一引数がILOSの標準クラスオブジェクト(MAGIC_STANDARD_CLASS)かどうかを判定する。
+ * @param args 評価済みの引数リスト(第一引数は任意の値)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 標準クラスオブジェクトならt、それ以外ならnil
+ */
+lisp_val_t primitive_standard_classp(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数%%MAKE-INSTANCE-RAW。ILOSクラスインスタンス(MAGIC_CLASS_INSTANCE)を確保する。

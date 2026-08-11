@@ -444,6 +444,45 @@
   (%%set-dynamic '*classes* (cons (cons name class) (dynamic *classes*)))
   class)
 
+;; super-nameのリストを、対応する登録済みクラスオブジェクトのリストに変換する。
+;; defclass由来(%defclass-supers)と、直後のpredefinedクラスbootstrapの両方から
+;; 使う共通の下請け関数(bootstrap側は<object>のようにsupersが本当に空のクラスも
+;; 扱うため、空リストへのフォールバックはここでは行わない)
+(defun %resolve-supers (super-names)
+  (if (null super-names)
+      nil
+      (cons (%find-class (car super-names)) (%resolve-supers (cdr super-names)))))
+
+;; ISLisp仕様Figure 1のクラス継承木に従い、条件階層以外のpredefinedクラス
+;; (<object>とその子)を%%MAKE-BUILTIN-CLASS-RAW(メタクラスは<built-in-class>)で
+;; 登録する。supersが未登録だと%find-classがnilを返してしまうため、
+;; 親クラスが先に登録済みになる順序で呼ぶ必要がある
+(defun %register-builtin-class (name super-names)
+  (%register-class name (%%make-builtin-class-raw name (%resolve-supers super-names) nil)))
+
+(%register-builtin-class '<object> nil)
+(%register-builtin-class '<basic-array> '(<object>))
+(%register-builtin-class '<basic-array*> '(<basic-array>))
+(%register-builtin-class '<general-array*> '(<basic-array*>))
+(%register-builtin-class '<basic-vector> '(<basic-array>))
+(%register-builtin-class '<general-vector> '(<basic-vector>))
+(%register-builtin-class '<string> '(<basic-vector>))
+(%register-builtin-class '<built-in-class> '(<object>))
+(%register-builtin-class '<character> '(<object>))
+(%register-builtin-class '<function> '(<object>))
+(%register-builtin-class '<generic-function> '(<function>))
+(%register-builtin-class '<standard-generic-function> '(<generic-function>))
+(%register-builtin-class '<list> '(<object>))
+(%register-builtin-class '<cons> '(<list>))
+(%register-builtin-class '<symbol> '(<object>))
+(%register-builtin-class '<null> '(<list> <symbol>))
+(%register-builtin-class '<number> '(<object>))
+(%register-builtin-class '<integer> '(<number>))
+(%register-builtin-class '<float> '(<number>))
+(%register-builtin-class '<standard-class> '(<object>))
+(%register-builtin-class '<standard-object> '(<object>))
+(%register-builtin-class '<stream> '(<object>))
+
 ;; plistからkeyに対応する値を探す。見つからなければdefault
 (defun %plist-get (plist key default)
   (if (null plist)
@@ -465,10 +504,14 @@
       nil
       (cons (%slot-spec-form (car specs)) (%slot-spec-forms (cdr specs)))))
 
+;; supersを指定しないdefclassは仕様上<standard-object>を暗黙に継承する
+;; (「A standard class defined with no direct superclasses is guaranteed to
+;; be disjoint from all of the classes in the figure, except for the classes
+;; named <standard-object> and <object>」)
 (defun %defclass-supers (super-names)
   (if (null super-names)
-      nil
-      (cons (%find-class (car super-names)) (%defclass-supers (cdr super-names)))))
+      (list (%find-class '<standard-object>))
+      (%resolve-supers super-names)))
 
 (defun %merge-superclass-slots (supers)
   (if (null supers)
@@ -553,12 +596,12 @@
           t
           (%any-subclassp (cdr classes) c2))))
 
-;; instanceがclass-designator(クラスオブジェクトまたはクラス名)のインスタンスかどうか
+;; instanceがclass-designator(クラスオブジェクトまたはクラス名)のインスタンスかどうか。
+;; class-ofが組み込み型も含めて汎用化されたので、ILOSインスタンス以外の値でも
+;; 正しく判定できる
 (defun typep (instance class-designator)
-  (if (%%class-instance-p instance)
-      (subclassp (%%instance-class instance)
-                 (if (%%classp class-designator) class-designator (%find-class class-designator)))
-      nil))
+  (subclassp (class-of instance)
+             (if (%%classp class-designator) class-designator (%find-class class-designator))))
 
 ;; instanceがclass(クラスオブジェクト)のインスタンスかどうか。
 ;; 仕様上instancepはclassを評価済みのクラスオブジェクトとして受け取り(typepの
@@ -581,19 +624,9 @@
 ;;; 置く必要がある(macroは定義前に使うと未定義関数呼び出しとして扱われ、
 ;;; defmethodのspecializer計算がすべて失敗する)。
 
-;; class-nameがtypepでも判定できる組み込み型名なら対応する述語で、それ以外
-;; (ILOSのユーザークラス)ならtypepにフォールバックして判定する。
-;; 既知の制約: stringp/characterpに相当するprimitiveが存在しないため、
-;; <string>/<character>等はここでは対応しない(未対応の型名は常にtypep経由になり、
-;; %find-classできないクラス名ならtypepがnilを返すのでassureは必ずエラーになる)。
+;; typepが組み込み型も含めて汎用化されたので、そのまま委譲するだけで良い
 (defun %assure-typep (obj class-name)
-  (case class-name
-    ((<integer>) (integerp obj))
-    ((<number>) (numberp obj))
-    ((<symbol>) (symbolp obj))
-    ((<cons>) (consp obj))
-    ((<null>) (null obj))
-    (t (typep obj class-name))))
+  (typep obj class-name))
 
 ;; (class class-name) : ILOSでdefclassされたクラス名をクラスオブジェクトに変換する。
 ;; 既知の制約: <integer>等の組み込み型のクラスオブジェクトは未実装のため対象外。
@@ -648,15 +681,13 @@
     (%%set-dynamic '*generic-methods* (cons (cons name updated) (dynamic *generic-methods*)))
     name))
 
-;; specializerがnil(無指定)のメソッドは常に適用可能。それ以外はarg0が
-;; ILOSクラスインスタンスであり、そのクラスがspecializerのサブクラス(自身含む)
-;; である場合のみ適用可能
+;; specializerがnil(無指定)のメソッドは常に適用可能。それ以外はarg0のクラス
+;; (class-of、組み込み型も含む)がspecializerのサブクラス(自身含む)である場合のみ
+;; 適用可能
 (defun %method-applicable-p (specializer arg0)
   (if (null specializer)
       t
-      (if (%%class-instance-p arg0)
-          (subclassp (%%instance-class arg0) specializer)
-          nil)))
+      (subclassp (class-of arg0) specializer)))
 
 (defun %applicable-methods (name arg0)
   (%filter-applicable-methods (%find-generic-methods name) arg0))
@@ -778,11 +809,28 @@
                0)
   instance)
 
-;; (class-of obj) → <class>: objが直接属するクラスを返す。仕様上objは任意の
-;; ISLisp objectを受け付けるが、組み込み型のクラスオブジェクトが未実装のため
-;; (class/assureと同じ既知の制約)、ILOSのクラスインスタンスのみを対象とする
+;; (class-of obj) → <class>: objが直接属するクラスを返す。ILOSのクラスインスタンス
+;; だけでなく、クラスオブジェクト自身(メタクラス判定)や組み込み型の値も対象とする。
+;; nilはcar/cdr循環consとしてconsp/symbolp両方にマッチしうる内部表現のため、
+;; consp/symbolpより先に判定する必要がある
 (defun class-of (obj)
-  (%%instance-class obj))
+  (cond
+    ((%%class-instance-p obj) (%%instance-class obj))
+    ((%%standard-classp obj) (%find-class '<standard-class>))
+    ((%%builtin-classp obj) (%find-class '<built-in-class>))
+    ((null obj) (%find-class '<null>))
+    ((consp obj) (%find-class '<cons>))
+    ((symbolp obj) (%find-class '<symbol>))
+    ((characterp obj) (%find-class '<character>))
+    ((stringp obj) (%find-class '<string>))
+    ((general-vector-p obj) (%find-class '<general-vector>))
+    ((general-array*-p obj) (%find-class '<general-array*>))
+    ((floatp obj) (%find-class '<float>))
+    ((integerp obj) (%find-class '<integer>))
+    ((numberp obj) (%find-class '<number>))
+    ((functionp obj) (%find-class '<function>))
+    ((streamp obj) (%find-class '<stream>))
+    (t (%find-class '<object>))))
 
 ;;; --- エラー処理とコンディションシステム(§29): signal-condition / with-handler / error / クラス階層 ---
 ;;;

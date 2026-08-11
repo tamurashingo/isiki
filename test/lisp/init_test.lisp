@@ -194,11 +194,33 @@
 (assert-equal t (subclassp (%find-class 'point3d) (%find-class 'point)))
 (assert-equal nil (subclassp (%find-class 'point) (%find-class 'point3d)))
 
+;; typep: ILOSインスタンス以外の組み込み型の値もclass-of経由で正しく判定できる
+(assert-equal t (typep 5 '<integer>))
+(assert-equal nil (typep 5 '<float>))
+(assert-equal t (typep "abc" '<string>))
+(assert-equal t (typep nil '<null>))
+
+;; subclassp: <null>は<list>と<symbol>の両方を(直接の)スーパークラスに持つ
+(assert-equal t (subclassp (%find-class '<null>) (%find-class '<symbol>)))
+(assert-equal t (subclassp (%find-class '<null>) (%find-class '<list>)))
+(assert-equal t (subclassp (%find-class '<integer>) (%find-class '<number>)))
+
 ;;; --- 総称関数: defgeneric / defmethod / call-next-method / next-method-p / class-of ---
 
 ;; class-of: インスタンスが直接属するクラスを返す
 (assert-equal t (eq (class-of (make-instance 'point)) (%find-class 'point)))
 (assert-equal t (eq (class-of (make-instance 'point3d)) (%find-class 'point3d)))
+
+;; class-of: 組み込み型の値からも対応するpredefinedクラスを返す
+(assert-equal t (eq (class-of 5) (%find-class '<integer>)))
+(assert-equal t (eq (class-of nil) (%find-class '<null>)))
+
+;; defmethodのspecializerを組み込み型にした場合、非適合な引数には適用されない
+;; (%method-applicable-pが組み込み型を正しく判定できることの回帰テスト)
+(defgeneric %builtin-specializer-test (obj))
+(defmethod %builtin-specializer-test ((obj <integer>)) 'is-integer)
+(assert-equal 'is-integer (%builtin-specializer-test 5))
+(assert-equal nil (ignore-errors (%builtin-specializer-test "not an integer")))
 
 ;; 特定性順dispatch・call-next-method・next-method-p:
 ;; specializer無しのメソッドは常に適用可能(最も非特定的)。point3dに対しては
@@ -288,6 +310,10 @@
 (assert-equal t (subclassp (class <simple-error>) (class <error>)))
 (assert-equal t (subclassp (class <stream-error>) (class <error>)))
 (assert-equal t (subclassp (class <end-of-stream>) (class <stream-error>)))
+
+;; <condition>はsupersを指定しないdefclassなので、暗黙に<standard-object>経由で
+;; <object>に接続される(仕様のdisjointネス規定と整合)
+(assert-equal t (subclassp (class <condition>) (class <object>)))
 
 ;;; --- Condition System: アクセサ(§29.3) ---
 
