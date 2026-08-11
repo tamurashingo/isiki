@@ -143,34 +143,54 @@
       nil
       (cons (%for-next (car bindings)) (%for-nexts (cdr bindings)))))
 
+(defun %for-let-bindings (bindings)
+  (if (null bindings)
+      nil
+      (cons (list (car (car bindings)) (car (cdr (car bindings))))
+            (%for-let-bindings (cdr bindings)))))
+
+;; list-exprが指す一時リストからvar群へ順にcar/cdrで取り出してsetqする式を作る。
+;; nextの式群は先に(list ...)としてまとめて評価されるため、do構文同様、
+;; 各step式は「更新前」の値を参照でき、複数変数の同時更新が成立する。
+(defun %for-setqs (bindings list-expr)
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car (car bindings)) (car ,list-expr))
+            (%for-setqs (cdr bindings) `(cdr ,list-expr)))))
+
 ;; (for ((var1 init1 [step1]) ...) (test result...) body...) を、
-;; var群を仮引数として引き渡しながら再帰する名前付きループ関数に展開する。
-;; bodyの中のsetqはループ関数自身の仮引数(=var群)に対しては正しく働き、
-;; 次のイテレーションの引数(step式)にもその変更が反映される。
+;; varをletで束縛したのちtagbody/goによる繰り返しとsetqによる更新に展開する。
+;; (旧実装はループ本体ごとにgensymで名前付きdefunを作っていたが、マクロは
+;; 評価されるたびに毎回展開され直すため、forの外側にさらにforが入る多重ループでは
+;; 1周ごとにgensymシンボルが恒久的に増え続け、symbol table exhaustedを起こしていた。
+;; tagbody/goのタグはこのformの中だけで解決される局所的な識別子であり、
+;; またgo/tagbody/if/progn/setqはいずれもマクロではなく特殊形式なので、
+;; 固定のシンボルを使い回しても新規シンボルは一切生成されない。)
+;; tagbodyは自身の最後の式の値を返さず常にnilを返すため、testが成立したときの
+;; result部の値は(return-from nil ...)で明示的にblockの脱出値として返す必要がある。
 ;; block nilで囲むことで、body中の(return-from nil 値)による早期脱出もできる。
 (defmacro for (bindings test-and-result &rest body)
-  (let ((loop-name (gensym)))
-    `(block nil
-       (defun ,loop-name ,(%for-vars bindings)
-         (if ,(car test-and-result)
-             (progn ,@(cdr test-and-result))
-             (progn
-               ,@body
-               (,loop-name ,@(%for-nexts bindings)))))
-       (,loop-name ,@(%for-inits bindings)))))
+  `(let ,(%for-let-bindings bindings)
+     (block nil
+       (tagbody
+        %for-loop
+        (if ,(car test-and-result)
+            (return-from nil (progn ,@(cdr test-and-result)))
+            (progn
+              ,@body
+              (let ((%for-next-values (list ,@(%for-nexts bindings))))
+                ,@(%for-setqs bindings '%for-next-values))
+              (go %for-loop)))))))
 
-;; whileは仮引数を持たないループ関数として展開する(状態を持ち越す変数の宣言が
-;; 構文上ないため)。testやbody内でのsetqはループ関数自身のその1回の呼び出しの
-;; 中だけで有効で、次のイテレーションには持ち越されない(上記の既知の制約)。
-;; ループを終わらせるにはtestがnilになるか、body中でreturn-fromを使う。
+;; while同様にtagbody/goで展開する。ループを終わらせるにはtestがnilになるか、
+;; body中でreturn-fromを使う。
 (defmacro while (test &rest body)
-  (let ((loop-name (gensym)))
-    `(block nil
-       (defun ,loop-name ()
-         (if ,test
-             (progn ,@body (,loop-name))
-             nil))
-       (,loop-name))))
+  `(block nil
+     (tagbody
+      %while-loop
+      (if ,test
+          (progn ,@body (go %while-loop))
+          nil))))
 
 ;;; --- with-open-input-stream ---
 
