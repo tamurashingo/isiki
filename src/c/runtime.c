@@ -195,7 +195,7 @@ lisp_val_t global_environment;
 lisp_val_t g_dynamic_bindings;
 
 /** internされたsymbolを保持できる最大数 */
-#define MAX_SYMBOLS 1024
+#define MAX_SYMBOLS 8192
 /** internされたsymbol一覧(os_make_symbolでの重複チェック用) */
 static lisp_val_t g_symbol_table[MAX_SYMBOLS];
 /** g_symbol_tableに登録済みのsymbol数 */
@@ -685,6 +685,15 @@ lisp_val_t os_make_cons(const lisp_val_t car, const lisp_val_t cdr) {
  * @return タグ付けされたSYMBOL
  */
 lisp_val_t os_make_symbol(const char *name) {
+    // シンボルNILは仕様上、空リストを表すnilセンチネル自身と同一のオブジェクトである
+    // べき(Lisp1.5以来の伝統/ISLisp仕様の<null>クラスの二重継承と同様の考え方)。
+    // 新規にTAG_SYMBOLを作ってしまうと、'nilやreaderが生成するNILシンボルがnil
+    // センチネル(not/null/eq等がpointer比較する対象)と一致せず、(not 'nil)等が
+    // 誤った結果を返す原因になるため、ここで吸収してnil自身を返す。
+    if (strncmpignorecase("NIL", name, 3) == 0 && name[3] == '\0') {
+        return nil;
+    }
+
     for (int i = 0; i < g_symbol_count; i++) {
         lisp_val_t sym = g_symbol_table[i];
         lisp_addr_t sym_addr = sym & ~TAG_MASK;
@@ -708,9 +717,16 @@ lisp_val_t os_make_symbol(const char *name) {
     sym[3] = nil;      // reserved
     lisp_val_t tagged = (lisp_val_t)(addr | TAG_SYMBOL);
 
-    if (g_symbol_count < MAX_SYMBOLS) {
-        g_symbol_table[g_symbol_count++] = tagged;
+    if (g_symbol_count >= MAX_SYMBOLS) {
+        // g_symbol_tableに登録できないままtaggedを返すと、以後同名のsymbolをinternする
+        // 度に別オブジェクトが生成され続け、eq比較が壊れる(内部で検出しづらい)ため、
+        // os_alloc_bytesのメモリ枯渇時と同様に即時停止する。
+        frame_buffer *fb = get_active_frame_buffer();
+        fb->write_string(fb, "symbol table exhausted...");
+        for (;;) {
+        }
     }
+    g_symbol_table[g_symbol_count++] = tagged;
 
     return tagged;
 }
@@ -3471,12 +3487,26 @@ lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
 
 /**
  * 組み込み関数ARRAY-DIMENSIONS。第一引数の配列の各次元のサイズをリストで返す。
- * @param args 評価済みの引数リスト(第一引数はVECTOR)
+ * STRINGはrank1のbasic-arrayとして扱い、その長さを単一要素のリストで返す
+ * (STRINGはVECTORと異なるヒープレイアウトのため、vector_headerに渡すと
+ * 別のフィールドをrank/dimsとして誤読し、暴走したループでクラッシュする)。
+ * @param args 評価済みの引数リスト(第一引数はVECTORまたはSTRING)
  * @param env 呼び出し時の環境(未使用)
  * @return 各次元のサイズ(FIXNUM)のリスト
  */
 lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
     lisp_val_t array = cc_car(args);
+
+    if ((array & TAG_MASK) == TAG_STRING) {
+        lisp_addr_t addr = array & ~TAG_MASK;
+        UINT64 len = ((lisp_val_t *)addr)[0];
+        return os_make_cons(os_make_fixnum(len), nil);
+    }
+
+    if (!is_vector(array)) {
+        return g_sym_eval_error;
+    }
+
     lisp_val_t *header = vector_header(array);
     UINT64 rank = header[0];
 

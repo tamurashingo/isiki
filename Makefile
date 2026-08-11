@@ -9,63 +9,63 @@ HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-TMPDIR = tmp
-OBJ = $(patsubst $(SRCDIR)/%.c,$(TMPDIR)/%.o,$(SRC))
+BUILD_TMPDIR = tmp
+OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
 
 TESTDIR = test/c
 TEST_COMMON_SRC = $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c
 
 TEST_SRC_RUNTIME = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/runtime_test.c
-TEST_BIN_RUNTIME = $(TMPDIR)/runtime_test
+TEST_BIN_RUNTIME = $(BUILD_TMPDIR)/runtime_test
 
 TEST_SRC_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/lisp_test.c
-TEST_BIN_LISP = $(TMPDIR)/lisp_test
+TEST_BIN_LISP = $(BUILD_TMPDIR)/lisp_test
 
 TEST_SRC_PROCESS = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/process_test.c
-TEST_BIN_PROCESS = $(TMPDIR)/process_test
+TEST_BIN_PROCESS = $(BUILD_TMPDIR)/process_test
 
 TEST_SRC_READER = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/eval.c $(TESTDIR)/reader_test.c
-TEST_BIN_READER = $(TMPDIR)/reader_test
+TEST_BIN_READER = $(BUILD_TMPDIR)/reader_test
 
 TEST_SRC_EVAL = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/eval_test.c
-TEST_BIN_EVAL = $(TMPDIR)/eval_test
+TEST_BIN_EVAL = $(BUILD_TMPDIR)/eval_test
 
 TEST_SRC_PRINT = $(TEST_COMMON_SRC) $(SRCDIR)/print.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/print_test.c
-TEST_BIN_PRINT = $(TMPDIR)/print_test
+TEST_BIN_PRINT = $(BUILD_TMPDIR)/print_test
 
 TEST_SRC_REPL = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(TESTDIR)/repl_test.c
-TEST_BIN_REPL = $(TMPDIR)/repl_test
+TEST_BIN_REPL = $(BUILD_TMPDIR)/repl_test
 
 TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/subprimitive.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/subprimitive_test.c
-TEST_BIN_SUBPRIMITIVE = $(TMPDIR)/subprimitive_test
+TEST_BIN_SUBPRIMITIVE = $(BUILD_TMPDIR)/subprimitive_test
 
 TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(TESTDIR)/script_test.c
-TEST_BIN_SCRIPT = $(TMPDIR)/script_test
+TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
-TEST_BIN_STREAM = $(TMPDIR)/stream_test
+TEST_BIN_STREAM = $(BUILD_TMPDIR)/stream_test
 
 TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
-TEST_BIN_LOAD = $(TMPDIR)/load_test
+TEST_BIN_LOAD = $(BUILD_TMPDIR)/load_test
 
 TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/eval.c $(TESTDIR)/stream_lisp_test.c
-TEST_BIN_STREAM_LISP = $(TMPDIR)/stream_lisp_test
+TEST_BIN_STREAM_LISP = $(BUILD_TMPDIR)/stream_lisp_test
 
 TEST_SRC_FORMAT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/eval.c $(TESTDIR)/format_test.c
-TEST_BIN_FORMAT = $(TMPDIR)/format_test
+TEST_BIN_FORMAT = $(BUILD_TMPDIR)/format_test
 
 # interrupt.c/kernel.cはリンクせず、clock_test.cがget_tick_counter/
 # kernel_get_boot_epoch_secondsをテスト用固定値で置き換える
 TEST_SRC_CLOCK = $(TEST_COMMON_SRC) $(SRCDIR)/clock.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/clock_test.c
-TEST_BIN_CLOCK = $(TMPDIR)/clock_test
+TEST_BIN_CLOCK = $(BUILD_TMPDIR)/clock_test
 
 TEST_SRC_P9 = $(SRCDIR)/p9.c $(TESTDIR)/p9_test.c
-TEST_BIN_P9 = $(TMPDIR)/p9_test
+TEST_BIN_P9 = $(BUILD_TMPDIR)/p9_test
 
 # virtio9p_test.cが独自にos_transport_virtio9p_instance()をfake定義するため、
 # 本物のtransport_virtio9p.cはリンクしない
 TEST_SRC_VIRTIO9P = $(SRCDIR)/p9.c $(SRCDIR)/virtio9p.c $(TESTDIR)/virtio9p_test.c
-TEST_BIN_VIRTIO9P = $(TMPDIR)/virtio9p_test
+TEST_BIN_VIRTIO9P = $(BUILD_TMPDIR)/virtio9p_test
 
 
 .PHONY: all setup image transpile build compile run test clean
@@ -90,10 +90,10 @@ build: $(SRC) $(HDR)
 # ファイル単体のコンパイルチェック用。リンクは行わず、生成した .o は tmp/ に捨てる
 compile: $(OBJ)
 
-$(TMPDIR):
-	mkdir -p $(TMPDIR)
+$(BUILD_TMPDIR):
+	mkdir -p $(BUILD_TMPDIR)
 
-$(TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(TMPDIR)
+$(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 	mkdir -p $(dir $@)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
 		-nostdlib -mno-red-zone -O1 -c \
@@ -103,7 +103,7 @@ $(TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(TMPDIR)
 		-o $@ $<
 
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(HDR) | $(TMPDIR)
+test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
@@ -202,7 +202,7 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_VIRTIO9P) -v "$(PWD)":/workspace isiki-builder
 
 clean:
-	rm -rf esp_dir $(TMPDIR)
+	rm -rf esp_dir $(BUILD_TMPDIR)
 
 run:
 	qemu-system-x86_64 \
@@ -219,4 +219,5 @@ debug:
 		-drive format=raw,file=fat:rw:./esp_dir \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		-monitor stdio -serial null \
 		-d cpu_reset,int -D qemu.log

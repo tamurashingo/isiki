@@ -97,6 +97,23 @@
 (assert-equal 4 (car (cdr (cdr (mapcar #'%add1 (cons 1 (cons 2 (cons 3 nil))))))))
 (assert-equal nil (mapcar #'%add1 nil))
 
+;; mapcarは複数のリストを受け取り、対応する位置の要素をまとめて関数に渡せる
+(assert-equal t
+  (equal '((a . 1) (b . 2) (c . 3))
+    (mapcar #'cons '(a b c) '(1 2 3))))
+
+;; 最短のリストが尽きた時点で終了し、他のリストの余った要素は無視する
+(assert-equal t
+  (equal '((a . 1) (b . 2))
+    (mapcar #'cons '(a b) '(1 2 3))))
+
+;;; --- apply ---
+
+;; 個々のobjを構文上並べた引数と末尾のlist引数の要素を連結して関数を呼び出す
+(assert-equal 10 (apply #'+ 1 2 '(3 4)))
+(assert-equal 10 (apply #'+ '(1 2 3 4)))
+(assert-equal 4 (apply (if (< 1 2) (function max) (function min)) 1 2 (list 3 4)))
+
 ;; mapcはfnを副作用目的で呼ぶ。lambdaがletで束縛したaccを閉じ込め(クロージャ)、
 ;; set-arefでaccの内容を書き換えることで、呼び出しごとの副作用を検証する
 (assert-equal 6

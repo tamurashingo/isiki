@@ -249,18 +249,61 @@
         ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
         ((eq (car place) 'property) `(set-property ,value ,@(cdr place)))))
 
+;;; --- apply (§9) ---
+;;;
+;;; %%apply(eval.c側の組み込み関数。fnと評価済みの引数リストの2つを取り、
+;;; リストの内容をfnの実引数として展開して呼び出す)を、構文上並べたobj*と
+;;; 末尾のlist引数を1本の引数リストに組み立てた上で呼ぶだけのLisp合成関数。
+
+;; objsの最後の要素(list引数)以外を、その手前にconsで連結していく。
+(defun %apply-args (objs)
+  (if (null (cdr objs))
+      (car objs)
+      (cons (car objs) (%apply-args (cdr objs)))))
+
+;; fnを、obj*を個別の引数として、末尾のlistの要素をさらに展開した引数列で呼び出す。
+(defun apply (fn &rest objs)
+  (%%apply fn (%apply-args objs)))
+
 ;;; --- mapcar / mapc / mapcan ---
 ;;;
 ;;; いずれもfnを評価済みの値として受け取り、関数呼び出しの形はLisp2スコープの
 ;;; 制約で(f x)のようには書けない(fが変数に束縛された関数値の場合、それは
 ;;; 関数namespaceではなく変数namespaceにあるため)。そのため、funcall(eval.c側の
-;;; 組み込み関数)を介してfnを呼び出す。単一のリストのみを受け取る簡略版とする。
+;;; 組み込み関数)を介してfnを呼び出す。mapcarのみ複数リストに対応し、
+;;; mapc/mapcanは単一のリストのみを受け取る簡略版のままとする。
 
-;; listの各要素にfnを適用した結果を集めたリストを返す。
-(defun mapcar (fn list)
-  (if (null list)
+;; list-of-listsの各要素(サブリスト)のcarを集めたリストを返す。
+(defun %lists-car (lists)
+  (if (null lists)
       nil
-      (cons (funcall fn (car list)) (mapcar fn (cdr list)))))
+      (cons (car (car lists)) (%lists-car (cdr lists)))))
+
+;; list-of-listsの各要素(サブリスト)のcdrを集めたリストを返す。
+(defun %lists-cdr (lists)
+  (if (null lists)
+      nil
+      (cons (cdr (car lists)) (%lists-cdr (cdr lists)))))
+
+;; list-of-listsの中に、空リストになっているものが1つでもあればtを返す。
+(defun %lists-some-null (lists)
+  (if (null lists)
+      nil
+      (if (null (car lists))
+          t
+          (%lists-some-null (cdr lists)))))
+
+;; listsの対応する位置の要素をまとめてfnに渡し(%%apply経由)、結果を集めたリストを
+;; 返す。最短のリストが尽きた時点で終了し、他のリストの余った要素は無視する。
+(defun %mapcar-lists (fn lists)
+  (if (or (null lists) (%lists-some-null lists))
+      nil
+      (cons (%%apply fn (%lists-car lists))
+            (%mapcar-lists fn (%lists-cdr lists)))))
+
+;; listの各要素にfnを適用した結果を集めたリストを返す(1つ以上のリストを受け取れる)。
+(defun mapcar (fn &rest lists)
+  (%mapcar-lists fn lists))
 
 (defun %mapc-1 (fn list)
   (if (null list)

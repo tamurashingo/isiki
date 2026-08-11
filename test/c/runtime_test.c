@@ -947,6 +947,14 @@ void test_primitive_array_dimensions() {
     assert(cc_cdr(cc_cdr(result)) == nil, "(array-dimensions a)の終端はnil");
 }
 
+void test_primitive_array_dimensions_on_string() {
+    lisp_val_t str = os_make_string("foo");
+
+    lisp_val_t result = primitive_array_dimensions(os_make_cons(str, nil), nil);
+    assert(cc_car(result) >> 3 == 3, "(array-dimensions \"foo\")の1番目は3");
+    assert(cc_cdr(result) == nil, "(array-dimensions \"foo\")の終端はnil");
+}
+
 void test_primitive_aref_reads_back_value() {
     lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
@@ -1380,6 +1388,7 @@ int main(int argc, char** argv) {
    test_primitive_make_array_1d();
    test_primitive_make_array_multi_dim();
    test_primitive_array_dimensions();
+   test_primitive_array_dimensions_on_string();
    test_primitive_aref_reads_back_value();
    test_primitive_aref_out_of_bounds();
    test_primitive_vector();
