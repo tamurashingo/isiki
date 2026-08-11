@@ -26,6 +26,16 @@ lisp_val_t cc_cdr(lisp_val_t obj) {
 }
 
 /**
+ * cons cell の car を破壊的に書き換える。
+ * @param obj 書き換え対象の cons cell
+ * @param val 新しい car の値
+ */
+void cc_set_car(lisp_val_t obj, lisp_val_t val) {
+    // TODO: TAG_CONS であることのチェックを入れる
+    ((lisp_val_t *)(obj & ~TAG_MASK))[0] = val;
+}
+
+/**
  * cons cell の cdr を破壊的に書き換える。
  * @param obj 書き換え対象の cons cell
  * @param val 新しい cdr の値

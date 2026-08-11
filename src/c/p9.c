@@ -145,6 +145,34 @@ UINT32 os_p9_build_tclunk(UINT8 *buf, UINT16 tag, UINT32 fid) {
     return pos;
 }
 
+UINT32 os_p9_build_twrite(UINT8 *buf, UINT16 tag, UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count) {
+    UINT32 pos = P9_HEADER_SIZE;
+    p9_put_u32(buf, &pos, fid);
+    p9_put_u64(buf, &pos, offset);
+    p9_put_u32(buf, &pos, count);
+    for (UINT32 i = 0; i < count; i++) {
+        buf[pos + i] = data[i];
+    }
+    pos += count;
+    p9_write_header(buf, pos, P9_TWRITE, tag);
+    return pos;
+}
+
+UINT32 os_p9_build_tcreate(UINT8 *buf, UINT16 tag, UINT32 fid, const char *name, UINT32 perm, UINT8 mode) {
+    UINT32 pos = P9_HEADER_SIZE;
+    p9_put_u32(buf, &pos, fid);
+    p9_put_string(buf, &pos, name);
+    p9_put_u32(buf, &pos, perm);
+    p9_put_u8(buf, &pos, mode);
+    /* 9P2000.u拡張フィールド: extension[s](symlink/device等の特殊ファイル用。通常ファイル作成では空文字列。
+       セッションは"9P2000.u"で確立しているため、この session実際のサーバ(QEMU)はTcreateにこのフィールドが
+       付くことを前提にパースする。欠けるとsizeフィールドと実際に必要なパース長が食い違い、
+       実機のvirtio-9pサーバ相手にのみ失敗する(fake transportのテストでは検出できない) */
+    p9_put_string(buf, &pos, "");
+    p9_write_header(buf, pos, P9_TCREATE, tag);
+    return pos;
+}
+
 static int p9_check_min_len(UINT32 len, UINT32 required) {
     return len >= required;
 }
@@ -222,6 +250,29 @@ int os_p9_parse_rclunk(const UINT8 *buf, UINT32 len) {
     UINT32 pos = 4;
     UINT8 type = p9_get_u8(buf, &pos);
     return type == P9_RCLUNK;
+}
+
+int os_p9_parse_rwrite(const UINT8 *buf, UINT32 len, UINT32 *out_count) {
+    if (!p9_check_min_len(len, P9_HEADER_SIZE + 4)) {
+        return 0;
+    }
+    UINT32 pos = 4;
+    UINT8 type = p9_get_u8(buf, &pos);
+    if (type != P9_RWRITE) {
+        return 0;
+    }
+    pos = P9_HEADER_SIZE;
+    *out_count = p9_get_u32(buf, &pos);
+    return 1;
+}
+
+int os_p9_parse_rcreate(const UINT8 *buf, UINT32 len) {
+    if (!p9_check_min_len(len, P9_HEADER_SIZE + P9_QID_SIZE + 4)) {
+        return 0;
+    }
+    UINT32 pos = 4;
+    UINT8 type = p9_get_u8(buf, &pos);
+    return type == P9_RCREATE;
 }
 
 int os_p9_check_error(const UINT8 *buf, UINT32 len, char *errbuf, UINT32 errbuf_cap) {

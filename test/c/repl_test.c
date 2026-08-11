@@ -11,9 +11,32 @@
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
 // ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
-int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
     (void)path;
+    (void)mode;
     (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)perm;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)data;
+    (void)count;
+    (void)out_written;
     (void)err_msg;
     (void)err_msg_cap;
     return 0;
@@ -87,6 +110,14 @@ void switch_active_frame_buffer(UINT32 index) {
 // ハードウェア割り込みに依存する部分はこのテストの対象外なので、
 // リンクを通すためだけに置く
 void enable_timer_irq(void) {
+}
+
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
 }
 
 // os_print/reader.c のプロンプトは proc->stdout_buffer 経由で書かれるようになったため、

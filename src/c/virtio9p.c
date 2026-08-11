@@ -16,6 +16,10 @@ static UINT8 g_p9_rx_buf[P9_MSIZE] __attribute__((aligned(4096)));
 /** Tversion/Tattachによる9Pプロトコルレベルのセッション確立が済んでいるか */
 static int g_session_ready = 0;
 
+/** 次にopen/createで割り当てるfid。fid=0はroot(Tattach)専用のため1から始める。
+    解放済みfidの再利用は行わない(os_alloc_bytes等と同じbump方式) */
+static UINT32 g_next_fid = 1;
+
 static UINT32 str_len(const char *s) {
     UINT32 n = 0;
     while (s[n] != '\0') {
@@ -142,21 +146,22 @@ int os_virtio9p_ensure_session(char *err_msg, UINT32 err_msg_cap) {
     return 1;
 }
 
-int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
     if (!os_virtio9p_ensure_session(err_msg, err_msg_cap)) {
         return 0;
     }
 
     UINT32 tx_len;
     UINT32 rx_len;
+    UINT32 newfid = g_next_fid++;
 
-    /* Twalk: fid=0からpathの各要素をnewfid=1へwalkする */
+    /* Twalk: fid=0からpathの各要素をnewfidへwalkする */
     char path_buf[P9_PATH_BUF_SIZE];
     str_copy(path_buf, sizeof(path_buf), path);
     const char *wnames[P9_MAX_PATH_COMPONENTS];
     UINT16 nwname = split_path(path_buf, wnames);
 
-    tx_len = os_p9_build_twalk(g_p9_tx_buf, 0, 0, 1, wnames, nwname);
+    tx_len = os_p9_build_twalk(g_p9_tx_buf, 0, 0, newfid, wnames, nwname);
     if (!p9_rpc(tx_len, &rx_len, "Twalk", err_msg, err_msg_cap)) {
         return 0;
     }
@@ -170,8 +175,8 @@ int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 er
         return 0;
     }
 
-    /* Topen: newfid=1を読み込み専用でopenする */
-    tx_len = os_p9_build_topen(g_p9_tx_buf, 0, 1, P9_OREAD);
+    /* Topen: newfidをmodeでopenする */
+    tx_len = os_p9_build_topen(g_p9_tx_buf, 0, newfid, mode);
     if (!p9_rpc(tx_len, &rx_len, "Topen", err_msg, err_msg_cap)) {
         return 0;
     }
@@ -180,7 +185,57 @@ int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 er
         return 0;
     }
 
-    *out_fid = 1;
+    *out_fid = newfid;
+    return 1;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    if (!os_virtio9p_ensure_session(err_msg, err_msg_cap)) {
+        return 0;
+    }
+
+    UINT32 tx_len;
+    UINT32 rx_len;
+    UINT32 newfid = g_next_fid++;
+
+    /* Twalk: fid=0からpathの親要素(末尾のファイル名を除く)だけをnewfidへwalkする。
+       親要素が無い(ルート直下に作る)場合はnwname=0でfid=0をnewfidへクローンする */
+    char path_buf[P9_PATH_BUF_SIZE];
+    str_copy(path_buf, sizeof(path_buf), path);
+    const char *wnames[P9_MAX_PATH_COMPONENTS];
+    UINT16 ncomponents = split_path(path_buf, wnames);
+    if (ncomponents == 0) {
+        set_err(err_msg, err_msg_cap, "Tcreate: empty path");
+        return 0;
+    }
+    UINT16 nparent = (UINT16)(ncomponents - 1);
+    const char *filename = wnames[nparent];
+
+    tx_len = os_p9_build_twalk(g_p9_tx_buf, 0, 0, newfid, wnames, nparent);
+    if (!p9_rpc(tx_len, &rx_len, "Twalk", err_msg, err_msg_cap)) {
+        return 0;
+    }
+    UINT16 nwqid;
+    if (!os_p9_parse_rwalk(g_p9_rx_buf, rx_len, &nwqid)) {
+        set_err(err_msg, err_msg_cap, "Twalk: malformed Rwalk response");
+        return 0;
+    }
+    if (nwqid != nparent) {
+        set_err(err_msg, err_msg_cap, "Twalk: parent directory not found (partial walk, check -fsdev path=)");
+        return 0;
+    }
+
+    /* Tcreate: newfidが指すディレクトリにfilenameを作成する。成功後newfidは新規ファイルを指す */
+    tx_len = os_p9_build_tcreate(g_p9_tx_buf, 0, newfid, filename, perm, mode);
+    if (!p9_rpc(tx_len, &rx_len, "Tcreate", err_msg, err_msg_cap)) {
+        return 0;
+    }
+    if (!os_p9_parse_rcreate(g_p9_rx_buf, rx_len)) {
+        set_err(err_msg, err_msg_cap, "Tcreate: malformed Rcreate response");
+        return 0;
+    }
+
+    *out_fid = newfid;
     return 1;
 }
 
@@ -195,6 +250,21 @@ int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
 
     if (!os_p9_parse_rread(g_p9_rx_buf, rx_len, out_data, out_count)) {
         set_err(err_msg, err_msg_cap, "Tread: malformed Rread response");
+        return 0;
+    }
+    return 1;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    UINT32 tx_len = os_p9_build_twrite(g_p9_tx_buf, 0, fid, offset, data, count);
+    UINT32 rx_len;
+    if (!p9_rpc(tx_len, &rx_len, "Twrite", err_msg, err_msg_cap)) {
+        return 0;
+    }
+
+    if (!os_p9_parse_rwrite(g_p9_rx_buf, rx_len, out_written)) {
+        set_err(err_msg, err_msg_cap, "Twrite: malformed Rwrite response");
         return 0;
     }
     return 1;
@@ -216,7 +286,7 @@ int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
 int os_virtio9p_load_file(const char *path, UINT8 *result_buf, UINT32 result_cap,
                            UINT32 *out_len, char *err_msg, UINT32 err_msg_cap) {
     UINT32 fid;
-    if (!os_virtio9p_open(path, &fid, err_msg, err_msg_cap)) {
+    if (!os_virtio9p_open(path, P9_OREAD, &fid, err_msg, err_msg_cap)) {
         return 0;
     }
 

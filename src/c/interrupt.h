@@ -54,9 +54,6 @@ struct idt_ptr {
     uint64_t base;
 } __attribute__((packed));
 
-/** 割り込みハンドラの引数型として使う前方宣言のみの構造体 */
-struct interrupt_frame;
-
 /**
  * I/Oポートへ1バイト出力する
  * @param port 出力先のポート番号
@@ -113,6 +110,16 @@ typedef struct {
 } ExceptionContext;
 
 
+/** CR0/CR4のFPU/SSE関連ビットを設定し、fninit+ldmxcsrでFPU/SSE状態を初期化する */
+void init_fpu(void);
+
+/**
+ * init_fpuが起動時にfxsaveした、FPU/SSEのデフォルト初期状態(512byte, 16byte境界)を返す。
+ * spawn()が各プロセスの偽フレームのFXSAVE領域をこの内容で初期化するために使う
+ * @return 512byteのFXSAVE形式バッファへのポインタ
+ */
+const void *get_fpu_default_state(void);
+
 /** GDTを構築し、lgdt/lretqでコード・データセグメントを切り替える */
 void init_gdt(void);
 
@@ -124,6 +131,13 @@ void init_idt(void);
 
 /** PITをチャンネル0・lobyte/hibyte・モード3で約100Hzに設定する */
 void init_pit(void);
+
+/**
+ * c_timer_switchが呼ばれた(PIT割り込みが発生した)回数を返す。
+ * PITは約100Hzなので1tick = 1/100秒として扱う
+ * @return 起動後のtick数
+ */
+uint64_t get_tick_counter(void);
 
 /**
  * IRQ0(PIT)のマスクを解除し、タイマー割り込みによるプリエンプションを開始する。

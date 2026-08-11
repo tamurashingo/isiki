@@ -13,13 +13,23 @@
 #define P9_RWALK    111
 #define P9_TOPEN    112
 #define P9_ROPEN    113
+#define P9_TCREATE  114
+#define P9_RCREATE  115
 #define P9_TREAD    116
 #define P9_RREAD    117
+#define P9_TWRITE   118
+#define P9_RWRITE   119
 #define P9_TCLUNK   120
 #define P9_RCLUNK   121
 
 /** Topen/Tcreateのmode: 読み込み専用 */
 #define P9_OREAD 0x00
+/** Topen/Tcreateのmode: 書き込み専用 */
+#define P9_OWRITE 0x01
+/** Topen/Tcreateのmode: 読み書き両方 */
+#define P9_ORDWR 0x02
+/** Topenのmodeに重ねるビット: openと同時にファイルを空にする(truncate) */
+#define P9_OTRUNC 0x10
 
 /** 9P2000.uのn_uname: 数値uidを使わないことを示す特別値 */
 #define P9_NONUNAME 0xFFFFFFFFu
@@ -84,6 +94,31 @@ UINT32 os_p9_build_topen(UINT8 *buf, UINT16 tag, UINT32 fid, UINT8 mode);
 UINT32 os_p9_build_tread(UINT8 *buf, UINT16 tag, UINT32 fid, UINT64 offset, UINT32 count);
 
 /**
+ * Twriteメッセージを組み立てる
+ * @param buf 書き込み先バッファ
+ * @param tag メッセージタグ
+ * @param fid writeするfid
+ * @param offset 書き込み開始オフセット
+ * @param data 書き込むバイト列
+ * @param count dataのバイト数
+ * @return 書き込んだバイト数(size フィールドと一致)
+ */
+UINT32 os_p9_build_twrite(UINT8 *buf, UINT16 tag, UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count);
+
+/**
+ * Tcreateメッセージを組み立てる。成功時、fidはwalk済みの親ディレクトリから
+ * 新規作成・open済みのファイルを指すようになる(9P標準仕様の挙動)。
+ * @param buf 書き込み先バッファ
+ * @param tag メッセージタグ
+ * @param fid 作成先ディレクトリを指すfid(呼び出し後は新規ファイルを指す)
+ * @param name 作成するファイル名(パス区切りを含まない単一要素)
+ * @param perm 作成する際のUnixパーミッション(例: 0644)
+ * @param mode P9_OWRITE/P9_ORDWR等
+ * @return 書き込んだバイト数
+ */
+UINT32 os_p9_build_tcreate(UINT8 *buf, UINT16 tag, UINT32 fid, const char *name, UINT32 perm, UINT8 mode);
+
+/**
  * Tclunkメッセージを組み立てる
  * @param buf 書き込み先バッファ
  * @param tag メッセージタグ
@@ -145,6 +180,23 @@ int os_p9_parse_rread(const UINT8 *buf, UINT32 len, const UINT8 **out_data, UINT
  * @return 正しくRclunkとして解析できた場合1、そうでなければ0
  */
 int os_p9_parse_rclunk(const UINT8 *buf, UINT32 len);
+
+/**
+ * Rwriteメッセージを解析する
+ * @param buf 受信バッファ
+ * @param len 受信バイト数
+ * @param out_count 実際に書き込めたバイト数を格納する先
+ * @return 正しくRwriteとして解析できた場合1、そうでなければ0
+ */
+int os_p9_parse_rwrite(const UINT8 *buf, UINT32 len, UINT32 *out_count);
+
+/**
+ * Rcreateメッセージを解析する(qid/iounitの内容は今回使わないため妥当性のみ確認する)
+ * @param buf 受信バッファ
+ * @param len 受信バイト数
+ * @return 正しくRcreateとして解析できた場合1、そうでなければ0
+ */
+int os_p9_parse_rcreate(const UINT8 *buf, UINT32 len);
 
 /**
  * 受信メッセージがRerrorかどうかを確認する

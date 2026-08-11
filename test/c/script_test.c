@@ -9,13 +9,38 @@
 #include "process.h"
 #include "reader.h"
 #include "eval.h"
+#include "stream_lisp.h"
+#include "format.h"
 
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
 // ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
-int os_virtio9p_open(const char *path, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
     (void)path;
+    (void)mode;
     (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)perm;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)data;
+    (void)count;
+    (void)out_written;
     (void)err_msg;
     (void)err_msg_cap;
     return 0;
@@ -68,6 +93,14 @@ void switch_active_frame_buffer(UINT32 index) {
 void enable_timer_irq(void) {
 }
 
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
 void os_repl_step(process_t *proc) {
     (void)proc;
 }
@@ -93,13 +126,14 @@ static void setup_buffers() {
     }
 }
 
-#define HEAP_SIZE (1024 * 1024)
+#define HEAP_SIZE (1024 * 1024 * 64)
 
 static void setup_heap() {
     void *heap = malloc(HEAP_SIZE);
-    assert(heap != NULL, "1MBのヒープ用メモリをmallocで確保できる");
+    assert(heap != NULL, "32MBのヒープ用メモリをmallocで確保できる");
     os_heap_init((UINT64)heap, HEAP_SIZE);
     os_bootstrap();
+    os_register_eval_primitives();
 }
 
 static void push_string(process_t *proc, const char *s) {
@@ -110,27 +144,44 @@ static void push_string(process_t *proc, const char *s) {
 }
 
 // reader.c が参照する os_wait_for_more_input のダミー実装。
-// テストでは実際のキー割り込みが発生しないため、あらかじめ queue_next_line で
-// 積んでおいた「次の行」をこの場で注入することで、ファイル全体(256byte超)を
-// 1行ずつ読ませる(reader_test.cと同じ仕組み)
-#define NEXT_LINES_MAX 64
-static const char *g_next_lines[NEXT_LINES_MAX];
-static UINT32 g_next_line_count = 0;
-static UINT32 g_next_line_index = 0;
+// テストでは実際のキー割り込みが発生しないため、run_lisp_file が開いた
+// ファイルから「呼ばれた時点で」次の1行だけを読んで注入する。ファイル全体を
+// 先読みしないので、ファイルサイズ・行数に上限がない(reader_test.cは
+// 短い文字列を手書きで積むだけなので、この仕組みの対象外)。
+#define SCRIPT_LINE_MAX 256
+static FILE *g_script_fp = NULL;
 
-static void queue_next_line(const char *line) {
-    g_next_lines[g_next_line_count++] = line;
-}
-
-static void clear_next_lines() {
-    g_next_line_count = 0;
-    g_next_line_index = 0;
+// g_script_fp から空行を読み飛ばして次の1行を buf に格納する。
+// 空行を注入するとos_wait_for_more_inputが何も追加できず、os_readが誤って
+// 「入力なし」と判定してしまうため空行はスキップする。
+// 各行には末尾の'\n'を必ず付け直す: reader.c の';'コメント読み飛ばしは
+// 行末を'\n'で判定するため、'\n'を落とすとコメント行が次の行を
+// 読み込むまで終端せず、後続の行がコメントとして無言で読み飛ばされてしまう。
+static int fetch_next_nonblank_line(char *buf, size_t bufsize) {
+    while (g_script_fp != NULL && fgets(buf, (int)bufsize, g_script_fp) != NULL) {
+        size_t len = strlen(buf);
+        if (len == 0 || buf[len - 1] != '\n') {
+            if (len < bufsize - 1) {
+                buf[len] = '\n';
+                buf[len + 1] = '\0';
+                len++;
+            }
+        }
+        if (len > 1 || (len == 1 && buf[0] != '\n')) {
+            return 1;
+        }
+        // 空行だったので読み直す
+    }
+    return 0;
 }
 
 void os_wait_for_more_input(process_t *proc) {
-    if (g_next_line_index < g_next_line_count) {
-        push_string(proc, g_next_lines[g_next_line_index]);
-        g_next_line_index++;
+    char line[SCRIPT_LINE_MAX];
+    if (fetch_next_nonblank_line(line, sizeof(line))) {
+        push_string(proc, line);
+    } else if (g_script_fp != NULL) {
+        fclose(g_script_fp);
+        g_script_fp = NULL;
     }
 }
 
@@ -148,66 +199,23 @@ static lisp_val_t primitive_assert_equal(lisp_val_t args, lisp_val_t env) {
     return actual;
 }
 
-#define SCRIPT_BUF_SIZE 4096
-static char g_script_buf[SCRIPT_BUF_SIZE];
-
-// queue_script_lines が各行を退避させておくための領域。g_script_buf を直接
-// 指すのではなく行ごとにコピーを持つのは、queue_next_line で積んだ行は
-// os_wait_for_more_input によって「後で」消費されるため。
-#define SCRIPT_LINE_MAX 256
-static char g_line_storage[NEXT_LINES_MAX][SCRIPT_LINE_MAX];
-
-// path の内容を改行で分割し、空行を除いて1行目はpush_string、残りはqueue_next_lineに積む。
-// 空行を注入するとos_wait_for_more_inputが何も追加できず、os_readが誤って
-// 「入力なし」と判定してしまうため空行はスキップする。
-// 各行には末尾の'\n'を必ず付け直して積む: reader.c の';'コメント読み飛ばしは
-// 行末を'\n'で判定するため、'\n'を落として積むとコメント行が次の行を
-// 読み込むまで終端せず、後続の行がコメントとして無言で読み飛ばされてしまう。
-static void queue_script_lines(process_t *proc, char *buf) {
-    char *line_start = buf;
-    int pushed_first = 0;
-    UINT32 stored = 0;
-    for (char *p = buf; ; p++) {
-        if (*p == '\n' || *p == '\0') {
-            int end = (*p == '\0');
-            size_t line_len = (size_t)(p - line_start);
-            if (line_len > 0 && stored < NEXT_LINES_MAX) {
-                size_t copy_len = line_len < SCRIPT_LINE_MAX - 2 ? line_len : SCRIPT_LINE_MAX - 2;
-                char *dest = g_line_storage[stored++];
-                memcpy(dest, line_start, copy_len);
-                dest[copy_len] = '\n';
-                dest[copy_len + 1] = '\0';
-                if (!pushed_first) {
-                    push_string(proc, dest);
-                    pushed_first = 1;
-                } else {
-                    queue_next_line(dest);
-                }
-            }
-            if (end) {
-                break;
-            }
-            line_start = p + 1;
-        }
-    }
-}
-
 // path のLispソースを先頭から順にos_read/os_evalし、envを育てながら実行する。
+// ファイルは一度に読み込まず、os_wait_for_more_inputから1行ずつ消費される。
 // 構文エラー(read error)が出た場合はテスト失敗として即座に打ち切る
 static void run_lisp_file(process_t *proc, lisp_val_t env, const char *path) {
-    clear_next_lines();
-
-    FILE *fp = fopen(path, "r");
-    assert(fp != NULL, "スクリプトファイルを開ける");
-    if (fp == NULL) {
+    g_script_fp = fopen(path, "r");
+    assert(g_script_fp != NULL, "スクリプトファイルを開ける");
+    if (g_script_fp == NULL) {
         return;
     }
 
-    size_t len = fread(g_script_buf, 1, SCRIPT_BUF_SIZE - 1, fp);
-    fclose(fp);
-    g_script_buf[len] = '\0';
-
-    queue_script_lines(proc, g_script_buf);
+    char first_line[SCRIPT_LINE_MAX];
+    if (!fetch_next_nonblank_line(first_line, sizeof(first_line))) {
+        fclose(g_script_fp);
+        g_script_fp = NULL;
+        return; // 空ファイル: 何も評価しない
+    }
+    push_string(proc, first_line);
 
     for (;;) {
         lisp_val_t form = os_read(proc);
@@ -219,6 +227,11 @@ static void run_lisp_file(process_t *proc, lisp_val_t env, const char *path) {
             break;
         }
         os_eval(form, env);
+    }
+
+    if (g_script_fp != NULL) {
+        fclose(g_script_fp);
+        g_script_fp = NULL;
     }
 }
 
@@ -234,12 +247,19 @@ int main(int argc, char** argv) {
     os_set_function(os_make_symbol("assert-equal"),
                      os_make_native_function((lisp_addr_t)(void *)primitive_assert_equal),
                      global_environment);
+    os_register_streams();
+    os_register_format();
 
     lisp_val_t env = os_make_environment(os_make_symbol("SCRIPT-TEST-ENV"), global_environment);
 
     run_lisp_file(proc, env, "test/lisp/square_test.lisp");
     run_lisp_file(proc, env, "test/lisp/rest_test.lisp");
     run_lisp_file(proc, env, "test/lisp/defmacro_test.lisp");
+
+    lisp_val_t init_env = os_make_environment(os_make_symbol("INIT-TEST-ENV"), global_environment);
+
+    run_lisp_file(proc, init_env, "src/lisp/init.lisp");
+    run_lisp_file(proc, init_env, "test/lisp/init_test.lisp");
 
     return g_test_failed ? 1 : 0;
 }

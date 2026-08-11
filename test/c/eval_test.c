@@ -5,6 +5,68 @@
 #include "framebuffer.h"
 #include "eval.h"
 #include "lisp.h"
+#include "process.h"
+#include "reader.h"
+
+// reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
+// 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
+// ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)perm;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)data;
+    (void)count;
+    (void)out_written;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
+                            const UINT8 **out_data, UINT32 *out_count,
+                            char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)want;
+    (void)out_data;
+    (void)out_count;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+// reader.c の os_read が参照するが、このテストでは実際の割り込みが発生しないため
+// 何もしないダミー実装を用意する
+void os_wait_for_more_input(process_t *proc) {
+    (void)proc;
+}
 
 // runtime.c が参照する get_active_frame_buffer のダミー実装。
 // テスト環境では実画面がないため、write_string は何もしない
@@ -153,7 +215,7 @@ void test_os_eval_progn() {
     assert(empty == nil, "(progn)はnilになる");
 }
 
-void test_os_eval_setq_writes_current_env_only() {
+void test_os_eval_setq_walks_parent_env_to_existing_binding() {
     lisp_val_t base_env = os_make_environment(os_make_symbol("BASE-ENV"), nil);
     lisp_val_t current_env = os_make_environment(os_make_symbol("CURRENT-ENV"), base_env);
     os_set_variable(os_make_symbol("x"), os_make_fixnum(1), base_env);
@@ -163,10 +225,40 @@ void test_os_eval_setq_writes_current_env_only() {
     assert(v == os_make_fixnum(99), "(setq x 99)はセットした値99を返す");
 
     lisp_val_t current_x = os_get_variable(os_make_symbol("x"), current_env);
-    assert(current_x == os_make_fixnum(99), "current_envのxは99に上書きされる");
+    assert(current_x == os_make_fixnum(99), "current_envから見えるxは99に上書きされる");
 
     lisp_val_t base_x = os_get_variable(os_make_symbol("x"), base_env);
-    assert(base_x == os_make_fixnum(1), "base_env自身のxは書き換わらない");
+    assert(base_x == os_make_fixnum(99), "xの実体はbase_env側にあるので、base_env自身のxも99に書き換わる"
+        "(current_envに新しいシャドウ束縛を作るのではなく、既存の束縛を見つけて書き換える)");
+}
+
+void test_os_eval_setq_defines_locally_when_unbound_anywhere() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    lisp_val_t args[2] = { os_make_symbol("z"), os_make_fixnum(42) };
+    lisp_val_t v = os_eval(make_call("setq", 2, args), env);
+    assert(v == os_make_fixnum(42), "(setq z 42)はセットした値42を返す");
+
+    lisp_val_t z = os_get_variable(os_make_symbol("z"), env);
+    assert(z == os_make_fixnum(42), "どの親envにも束縛が無いsetqは、呼び出し時のenv自身にローカル新規定義する");
+}
+
+void test_os_eval_closure_setq_mutates_outer_variable() {
+    // (let ((x 0)) (let ((f (lambda () (setq x 99)))) (funcall f) x)) が99を返すべき、という
+    // ユーザー報告のバグ再現(修正前はfの呼び出しで新しいframeにxがシャドウされ0のまま変わらなかった)
+    lisp_val_t outer_env = os_make_environment(os_make_symbol("OUTER-ENV"), nil);
+    os_set_variable(os_make_symbol("x"), os_make_fixnum(0), outer_env);
+
+    lisp_val_t setq_args[2] = { os_make_symbol("x"), os_make_fixnum(99) };
+    lisp_val_t setq_form = make_call("setq", 2, setq_args);
+    lisp_val_t lambda_form = os_make_cons(os_make_symbol("lambda"), os_make_cons(nil, os_make_cons(setq_form, nil)));
+    lisp_val_t f = os_eval(lambda_form, outer_env); // fのclosure_envはouter_env
+
+    lisp_val_t funcall_args = os_make_cons(f, nil);
+    primitive_funcall(funcall_args, outer_env);
+
+    lisp_val_t x = os_get_variable(os_make_symbol("x"), outer_env);
+    assert(x == os_make_fixnum(99), "クロージャ内からのsetqは、定義時のenv(outer_env)にある外側のxを実際に書き換える");
 }
 
 void test_os_eval_defun() {
@@ -377,6 +469,94 @@ void test_os_eval_defmacro_args_are_not_evaluated_before_expansion() {
     assert(cc_car(v) == os_make_symbol("+"), "マクロ引数は展開前に評価されないので先頭はsymbol +のまま");
 }
 
+void test_primitive_macroexpand_1_expands_macro_call() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    // (defmacro my-if (test then else) `(if ,test ,then ,else))
+    lisp_val_t name = os_make_symbol("my-if");
+    lisp_val_t params = os_make_cons(os_make_symbol("test"),
+                            os_make_cons(os_make_symbol("then"),
+                                os_make_cons(os_make_symbol("else"), nil)));
+    lisp_val_t unquote_test = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("test"), nil));
+    lisp_val_t unquote_then = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("then"), nil));
+    lisp_val_t unquote_else = os_make_cons(g_sym_unquote, os_make_cons(os_make_symbol("else"), nil));
+    lisp_val_t if_template = os_make_cons(os_make_symbol("if"),
+                                os_make_cons(unquote_test,
+                                    os_make_cons(unquote_then, os_make_cons(unquote_else, nil))));
+    lisp_val_t body = os_make_cons(
+                            os_make_cons(g_sym_quasiquote, os_make_cons(if_template, nil)), nil);
+    lisp_val_t defmacro_form = os_make_cons(os_make_symbol("defmacro"),
+                                    os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defmacro_form, env);
+
+    // (macroexpand-1 '(my-if 1 10 20)) は展開結果(if 1 10 20)を1段だけ返す(評価はしない)
+    lisp_val_t call_args[3] = { os_make_fixnum(1), os_make_fixnum(10), os_make_fixnum(20) };
+    lisp_val_t call_form = make_call("my-if", 3, call_args);
+    lisp_val_t expanded = primitive_macroexpand_1(os_make_cons(call_form, nil), env);
+
+    assert(cc_car(expanded) == os_make_symbol("if"), "(macroexpand-1 '(my-if 1 10 20))の先頭はsymbol if");
+    assert(cc_car(cc_cdr(expanded)) == os_make_fixnum(1), "展開結果の2番目は1");
+    assert(cc_car(cc_cdr(cc_cdr(expanded))) == os_make_fixnum(10), "展開結果の3番目は10");
+    assert(cc_car(cc_cdr(cc_cdr(cc_cdr(expanded)))) == os_make_fixnum(20), "展開結果の4番目は20");
+}
+
+void test_primitive_macroexpand_1_returns_form_unchanged_when_not_macro() {
+    lisp_val_t env = make_arith_env();
+
+    // マクロではない通常の関数呼び出しはそのまま返る(評価はしない)
+    lisp_val_t form = make_call("+", 2, (lisp_val_t[]){ os_make_fixnum(1), os_make_fixnum(2) });
+    lisp_val_t expanded = primitive_macroexpand_1(os_make_cons(form, nil), env);
+    assert(expanded == form, "マクロでないformはmacroexpand-1で変化せずそのまま返る");
+
+    lisp_val_t atom = os_make_fixnum(42);
+    lisp_val_t expanded_atom = primitive_macroexpand_1(os_make_cons(atom, nil), env);
+    assert(expanded_atom == atom, "atomはmacroexpand-1でそのまま返る");
+}
+
+void test_primitive_funcall_calls_native_function() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t plus_fn = os_get_function(os_make_symbol("+"), env);
+    lisp_val_t args = os_make_cons(plus_fn,
+                          os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil)));
+    lisp_val_t r = primitive_funcall(args, env);
+    assert(r == os_make_fixnum(3), "(funcall #'+ 1 2)は3");
+}
+
+void test_primitive_funcall_calls_interpreted_function() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t lambda_params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t lambda_body = make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_symbol("y") });
+    lisp_val_t lambda_form = make_call("lambda", 2, (lisp_val_t[]){ lambda_params, lambda_body });
+    lisp_val_t fn = os_eval(lambda_form, env);
+
+    lisp_val_t args = os_make_cons(fn,
+                          os_make_cons(os_make_fixnum(3), os_make_cons(os_make_fixnum(4), nil)));
+    lisp_val_t r = primitive_funcall(args, env);
+    assert(r == os_make_fixnum(7), "(funcall (lambda (x y) (+ x y)) 3 4)は7");
+}
+
+void test_primitive_apply_calls_native_function_with_list() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t plus_fn = os_get_function(os_make_symbol("+"), env);
+    lisp_val_t arg_list = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t args = os_make_cons(plus_fn, os_make_cons(arg_list, nil));
+    lisp_val_t r = primitive_apply(args, env);
+    assert(r == os_make_fixnum(3), "(%%apply #'+ '(1 2))は3");
+}
+
+void test_primitive_apply_calls_interpreted_function_with_list() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t lambda_params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t lambda_body = make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_symbol("y") });
+    lisp_val_t lambda_form = make_call("lambda", 2, (lisp_val_t[]){ lambda_params, lambda_body });
+    lisp_val_t fn = os_eval(lambda_form, env);
+
+    lisp_val_t arg_list = os_make_cons(os_make_fixnum(3), os_make_cons(os_make_fixnum(4), nil));
+    lisp_val_t args = os_make_cons(fn, os_make_cons(arg_list, nil));
+    lisp_val_t r = primitive_apply(args, env);
+    assert(r == os_make_fixnum(7), "(%%apply (lambda (x y) (+ x y)) '(3 4))は7");
+}
+
 void test_os_eval_quasiquote_plain_list() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
 
@@ -457,6 +637,432 @@ void test_os_eval_null() {
     assert(v2 == nil, "(null 1)はnilになる");
 }
 
+void test_os_eval_block_return_from_immediate_exit() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t name = os_make_symbol("done");
+
+    // (block done 1 (return-from done 2) 3) : return-fromで即脱出し、3は評価されず結果は2
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    lisp_val_t body = os_make_cons(os_make_fixnum(1),
+                            os_make_cons(return_form, os_make_cons(os_make_fixnum(3), nil)));
+    lisp_val_t form = os_make_cons(os_make_symbol("block"), os_make_cons(name, body));
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == os_make_fixnum(2), "(block done 1 (return-from done 2) 3)はreturn-fromで即脱出し2になる");
+}
+
+void test_os_eval_return_from_crosses_function_call() {
+    lisp_val_t env = make_arith_env();
+    lisp_val_t outer = os_make_symbol("outer");
+
+    // (defun inner () (return-from outer 42))
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(outer, os_make_cons(os_make_fixnum(42), nil)));
+    lisp_val_t inner_body = os_make_cons(return_form, nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(os_make_symbol("inner"), os_make_cons(nil, inner_body)));
+    os_eval(defun_form, env);
+
+    // (block outer (inner) 99) : innerの中のreturn-fromがouterまで関数呼び出しを飛び越えて届く
+    lisp_val_t block_body = os_make_cons(make_call("inner", 0, NULL), os_make_cons(os_make_fixnum(99), nil));
+    lisp_val_t block_form = os_make_cons(os_make_symbol("block"), os_make_cons(outer, block_body));
+
+    lisp_val_t v = os_eval(block_form, env);
+    assert(v == os_make_fixnum(42), "innerで呼んだreturn-fromが関数呼び出しをまたいでouterまで届き42になる");
+}
+
+void test_os_eval_nested_block_return_from_only_exits_inner() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t inner_name = os_make_symbol("inner");
+    lisp_val_t outer_name = os_make_symbol("outer2");
+
+    // (block outer2 (block inner (return-from inner 1) 2) 3)
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(inner_name, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t inner_body = os_make_cons(return_form, os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t inner_block = os_make_cons(os_make_symbol("block"), os_make_cons(inner_name, inner_body));
+
+    lisp_val_t outer_body = os_make_cons(inner_block, os_make_cons(os_make_fixnum(3), nil));
+    lisp_val_t outer_block = os_make_cons(os_make_symbol("block"), os_make_cons(outer_name, outer_body));
+
+    lisp_val_t v = os_eval(outer_block, env);
+    assert(v == os_make_fixnum(3), "innerへのreturn-fromはinnerだけを抜け、outerは残りの3まで評価される");
+}
+
+void test_os_eval_unwind_protect_runs_cleanup_on_normal_return() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t flag = os_make_symbol("flag");
+    os_set_variable(flag, os_make_fixnum(0), env);
+
+    // (unwind-protect 1 (setq flag 99))
+    lisp_val_t setq_flag = os_make_cons(os_make_symbol("setq"),
+                                os_make_cons(flag, os_make_cons(os_make_fixnum(99), nil)));
+    lisp_val_t form = os_make_cons(os_make_symbol("unwind-protect"),
+                            os_make_cons(os_make_fixnum(1), os_make_cons(setq_flag, nil)));
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == os_make_fixnum(1), "(unwind-protect 1 (setq flag 99))は保護対象の結果1を返す");
+    assert(os_get_variable(flag, env) == os_make_fixnum(99), "cleanupのsetqは通常時も実行される");
+}
+
+void test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t flag = os_make_symbol("flag");
+    os_set_variable(flag, os_make_fixnum(0), env);
+    lisp_val_t done = os_make_symbol("done");
+
+    // (block done (unwind-protect (return-from done 1) (setq flag 100)) 2)
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(done, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t setq_flag = os_make_cons(os_make_symbol("setq"),
+                                os_make_cons(flag, os_make_cons(os_make_fixnum(100), nil)));
+    lisp_val_t unwind_form = os_make_cons(os_make_symbol("unwind-protect"),
+                                os_make_cons(return_form, os_make_cons(setq_flag, nil)));
+    lisp_val_t block_body = os_make_cons(unwind_form, os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t block_form = os_make_cons(os_make_symbol("block"), os_make_cons(done, block_body));
+
+    lisp_val_t v = os_eval(block_form, env);
+    assert(v == os_make_fixnum(1), "return-fromでの脱出時もunwind-protectの結果はblockまで正しく伝播し1になる");
+    assert(os_get_variable(flag, env) == os_make_fixnum(100), "return-fromで脱出する際もcleanupは必ず実行される");
+}
+
+void test_os_eval_catch_throw_basic() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t quoted_tag = os_make_cons(g_sym_quote, os_make_cons(os_make_symbol("tag"), nil));
+
+    // (catch 'tag (throw 'tag 42)) : throwで渡した42をcatchが捕捉して返す
+    lisp_val_t throw_form = os_make_cons(os_make_symbol("throw"),
+                                os_make_cons(quoted_tag, os_make_cons(os_make_fixnum(42), nil)));
+    lisp_val_t catch_form = os_make_cons(os_make_symbol("catch"),
+                                os_make_cons(quoted_tag, os_make_cons(throw_form, nil)));
+
+    lisp_val_t v = os_eval(catch_form, env);
+    assert(v == os_make_fixnum(42), "(catch 'tag (throw 'tag 42))はthrowの42を捕捉して返す");
+}
+
+void test_os_eval_catch_throw_mismatched_tag_propagates_to_outer_catch() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t quoted_outer = os_make_cons(g_sym_quote, os_make_cons(os_make_symbol("outer"), nil));
+    lisp_val_t quoted_inner = os_make_cons(g_sym_quote, os_make_cons(os_make_symbol("inner"), nil));
+
+    // (catch 'outer (catch 'inner (throw 'outer 99))) :
+    // innerのタグと不一致のthrowはinnerを素通りしてouterまで伝播し99になる
+    lisp_val_t throw_outer = os_make_cons(os_make_symbol("throw"),
+                                  os_make_cons(quoted_outer, os_make_cons(os_make_fixnum(99), nil)));
+    lisp_val_t inner_catch = os_make_cons(os_make_symbol("catch"),
+                                  os_make_cons(quoted_inner, os_make_cons(throw_outer, nil)));
+    lisp_val_t outer_catch = os_make_cons(os_make_symbol("catch"),
+                                  os_make_cons(quoted_outer, os_make_cons(inner_catch, nil)));
+
+    lisp_val_t v = os_eval(outer_catch, env);
+    assert(v == os_make_fixnum(99), "タグが一致しないthrowはinner catchを素通りしouter catchが99を捕捉する");
+}
+
+void test_os_eval_tagbody_go_forward_jump_skips_form() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t flag = os_make_symbol("flag");
+    os_set_variable(flag, os_make_fixnum(0), env);
+
+    // (tagbody (go skip) (setq flag 99) skip) : goで先へ飛び、setqは実行されずflagは0のまま
+    lisp_val_t skip_tag = os_make_symbol("skip");
+    lisp_val_t go_skip = os_make_cons(os_make_symbol("go"), os_make_cons(skip_tag, nil));
+    lisp_val_t setq_flag = os_make_cons(os_make_symbol("setq"),
+                                os_make_cons(flag, os_make_cons(os_make_fixnum(99), nil)));
+    lisp_val_t body = os_make_cons(go_skip, os_make_cons(setq_flag, os_make_cons(skip_tag, nil)));
+    lisp_val_t form = os_make_cons(os_make_symbol("tagbody"), body);
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == nil, "tagbodyは常にnilを返す");
+    assert(os_get_variable(flag, env) == os_make_fixnum(0), "goで前方ジャンプしたためsetqは実行されずflagは0のまま");
+}
+
+void test_os_eval_tagbody_go_backward_jump_loops_until_end_tag() {
+    lisp_val_t env = make_arith_env();
+    os_set_function(os_make_symbol("eq"), os_make_native_function((lisp_addr_t)(void *)primitive_eq), env);
+    lisp_val_t sum = os_make_symbol("sum");
+    lisp_val_t i = os_make_symbol("i");
+    os_set_variable(sum, os_make_fixnum(0), env);
+    os_set_variable(i, os_make_fixnum(1), env);
+
+    // (tagbody
+    //   loop
+    //   (if (eq i 6) (go end) nil)
+    //   (setq sum (+ sum i))
+    //   (setq i (+ i 1))
+    //   (go loop)
+    //   end)
+    // : i=1..5の間backward-goでloopし、sum=1+2+3+4+5=15になる。
+    // endはbody末尾のタグ(直後に何も無い)で、goで到達したときに正常終了することも確認する。
+    lisp_val_t loop_tag = os_make_symbol("loop");
+    lisp_val_t end_tag = os_make_symbol("end");
+
+    lisp_val_t eq_test = make_call("eq", 2, (lisp_val_t[]){ i, os_make_fixnum(6) });
+    lisp_val_t go_end = os_make_cons(os_make_symbol("go"), os_make_cons(end_tag, nil));
+    lisp_val_t if_form = make_call("if", 3, (lisp_val_t[]){ eq_test, go_end, nil });
+
+    lisp_val_t setq_sum = os_make_cons(os_make_symbol("setq"),
+                              os_make_cons(sum, os_make_cons(make_call("+", 2, (lisp_val_t[]){ sum, i }), nil)));
+    lisp_val_t setq_i = os_make_cons(os_make_symbol("setq"),
+                              os_make_cons(i, os_make_cons(make_call("+", 2, (lisp_val_t[]){ i, os_make_fixnum(1) }), nil)));
+    lisp_val_t go_loop = os_make_cons(os_make_symbol("go"), os_make_cons(loop_tag, nil));
+
+    lisp_val_t body = os_make_cons(loop_tag,
+                          os_make_cons(if_form,
+                              os_make_cons(setq_sum,
+                                  os_make_cons(setq_i,
+                                      os_make_cons(go_loop,
+                                          os_make_cons(end_tag, nil))))));
+    lisp_val_t form = os_make_cons(os_make_symbol("tagbody"), body);
+
+    lisp_val_t v = os_eval(form, env);
+    assert(v == nil, "tagbodyは常にnilを返す");
+    assert(os_get_variable(sum, env) == os_make_fixnum(15), "backward-goによるループでsumは1+2+3+4+5=15になる");
+}
+
+void test_os_eval_function_on_symbol_returns_function_object() {
+    lisp_val_t env = make_arith_env();
+
+    // (function +) は環境中の関数+のオブジェクトそのものを返す
+    lisp_val_t plus_fn = os_get_function(os_make_symbol("+"), env);
+    lisp_val_t form = os_make_cons(os_make_symbol("function"), os_make_cons(os_make_symbol("+"), nil));
+    lisp_val_t v = os_eval(form, env);
+    assert(v == plus_fn, "(function +)は+の関数オブジェクトと一致する");
+}
+
+void test_os_eval_function_on_lambda_returns_callable_closure() {
+    lisp_val_t env = make_arith_env();
+
+    // (function (lambda (x) (+ x 1))) はクロージャとして呼び出せる
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t plus_args[2] = { os_make_symbol("x"), os_make_fixnum(1) };
+    lisp_val_t body = os_make_cons(make_call("+", 2, plus_args), nil);
+    lisp_val_t lambda_form = os_make_cons(os_make_symbol("lambda"), os_make_cons(params, body));
+    lisp_val_t form = os_make_cons(os_make_symbol("function"), os_make_cons(lambda_form, nil));
+
+    lisp_val_t fn = os_eval(form, env);
+
+    lisp_val_t caller_env = os_make_environment(os_make_symbol("CALLER-ENV"), nil);
+    os_set_function(os_make_symbol("f"), fn, caller_env);
+    lisp_val_t v = os_eval(make_call("f", 1, (lisp_val_t[]){ os_make_fixnum(5) }), caller_env);
+    assert(v == os_make_fixnum(6), "(function (lambda (x) (+ x 1)))は呼び出せるクロージャになり6を返す");
+}
+
+void test_os_eval_function_on_undefined_symbol_returns_eval_error() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t form = os_make_cons(os_make_symbol("function"), os_make_cons(os_make_symbol("undefined-fn"), nil));
+    lisp_val_t v = os_eval(form, env);
+    assert(v == g_sym_eval_error, "(function undefined-fn)は未定義なのでeval-errorになる");
+}
+
+static lisp_val_t make_flet_binding(const char *name, lisp_val_t params, lisp_val_t body) {
+    return os_make_cons(os_make_symbol(name), os_make_cons(params, body));
+}
+
+void test_os_eval_flet_siblings_cannot_call_each_other() {
+    lisp_val_t env = make_arith_env();
+
+    // (flet ((f (x) (+ x 1)) (g (x) (f x))) (g 5)) : gの本体からfを呼ぼうとするが
+    // fletの兄弟関数は互いに見えないため未定義関数エラーになる
+    lisp_val_t f_params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t f_body = os_make_cons(make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_fixnum(1) }), nil);
+    lisp_val_t f_binding = make_flet_binding("f", f_params, f_body);
+
+    lisp_val_t g_params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t g_body = os_make_cons(make_call("f", 1, (lisp_val_t[]){ os_make_symbol("x") }), nil);
+    lisp_val_t g_binding = make_flet_binding("g", g_params, g_body);
+
+    lisp_val_t bindings = os_make_cons(f_binding, os_make_cons(g_binding, nil));
+    lisp_val_t flet_body = os_make_cons(make_call("g", 1, (lisp_val_t[]){ os_make_fixnum(5) }), nil);
+    lisp_val_t flet_form = os_make_cons(os_make_symbol("flet"), os_make_cons(bindings, flet_body));
+
+    lisp_val_t v = os_eval(flet_form, env);
+    assert(v == g_sym_eval_error, "fletの兄弟関数は互いに見えないのでgからfの呼び出しはeval-errorになる");
+}
+
+void test_os_eval_flet_outer_scope_still_visible() {
+    lisp_val_t env = make_arith_env();
+    os_set_variable(os_make_symbol("y"), os_make_fixnum(100), env);
+
+    // (flet ((f (x) (+ x y))) (f 1)) : fletの本体(f)から外側の変数yと関数+が見える
+    lisp_val_t f_params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t f_body = os_make_cons(make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_symbol("y") }), nil);
+    lisp_val_t f_binding = make_flet_binding("f", f_params, f_body);
+    lisp_val_t bindings = os_make_cons(f_binding, nil);
+    lisp_val_t flet_body = os_make_cons(make_call("f", 1, (lisp_val_t[]){ os_make_fixnum(1) }), nil);
+    lisp_val_t flet_form = os_make_cons(os_make_symbol("flet"), os_make_cons(bindings, flet_body));
+
+    lisp_val_t v = os_eval(flet_form, env);
+    assert(v == os_make_fixnum(101), "fletのクロージャは外側の変数yを見えるので1+100=101になる");
+}
+
+void test_os_eval_flet_body_can_call_both_bound_functions() {
+    lisp_val_t env = make_arith_env();
+
+    // (flet ((f (x) (+ x 1)) (g (x) (+ x 2))) (+ (f 1) (g 1))) : bodyからは両方呼べる
+    lisp_val_t f_params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t f_body = os_make_cons(make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_fixnum(1) }), nil);
+    lisp_val_t f_binding = make_flet_binding("f", f_params, f_body);
+
+    lisp_val_t g_params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t g_body = os_make_cons(make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_fixnum(2) }), nil);
+    lisp_val_t g_binding = make_flet_binding("g", g_params, g_body);
+
+    lisp_val_t bindings = os_make_cons(f_binding, os_make_cons(g_binding, nil));
+    lisp_val_t call_f = make_call("f", 1, (lisp_val_t[]){ os_make_fixnum(1) });
+    lisp_val_t call_g = make_call("g", 1, (lisp_val_t[]){ os_make_fixnum(1) });
+    lisp_val_t flet_body = os_make_cons(make_call("+", 2, (lisp_val_t[]){ call_f, call_g }), nil);
+    lisp_val_t flet_form = os_make_cons(os_make_symbol("flet"), os_make_cons(bindings, flet_body));
+
+    lisp_val_t v = os_eval(flet_form, env);
+    assert(v == os_make_fixnum(5), "flet本体からは両方の関数f,gが呼べて(1+1)+(1+2)=5になる");
+}
+
+void test_os_eval_labels_mutual_recursion() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    os_set_function(os_make_symbol("-"), os_make_native_function((lisp_addr_t)(void *)primitive_subtract), env);
+    os_set_function(os_make_symbol("eq"), os_make_native_function((lisp_addr_t)(void *)primitive_eq), env);
+
+    // (labels ((my-even (n) (if (eq n 0) t (my-odd (- n 1))))
+    //          (my-odd (n) (if (eq n 0) nil (my-even (- n 1)))))
+    //   (my-even 10))
+    lisp_val_t even_params = os_make_cons(os_make_symbol("n"), nil);
+    lisp_val_t even_test = make_call("eq", 2, (lisp_val_t[]){ os_make_symbol("n"), os_make_fixnum(0) });
+    lisp_val_t even_rec = make_call("my-odd", 1, (lisp_val_t[]){ make_call("-", 2, (lisp_val_t[]){ os_make_symbol("n"), os_make_fixnum(1) }) });
+    lisp_val_t even_then = os_make_cons(g_sym_quote, os_make_cons(g_sym_t, nil));
+    lisp_val_t even_if = make_call("if", 3, (lisp_val_t[]){ even_test, even_then, even_rec });
+    lisp_val_t even_binding = make_flet_binding("my-even", even_params, os_make_cons(even_if, nil));
+
+    lisp_val_t odd_params = os_make_cons(os_make_symbol("n"), nil);
+    lisp_val_t odd_test = make_call("eq", 2, (lisp_val_t[]){ os_make_symbol("n"), os_make_fixnum(0) });
+    lisp_val_t odd_rec = make_call("my-even", 1, (lisp_val_t[]){ make_call("-", 2, (lisp_val_t[]){ os_make_symbol("n"), os_make_fixnum(1) }) });
+    lisp_val_t odd_if = make_call("if", 3, (lisp_val_t[]){ odd_test, nil, odd_rec });
+    lisp_val_t odd_binding = make_flet_binding("my-odd", odd_params, os_make_cons(odd_if, nil));
+
+    lisp_val_t bindings = os_make_cons(even_binding, os_make_cons(odd_binding, nil));
+    lisp_val_t labels_body = os_make_cons(make_call("my-even", 1, (lisp_val_t[]){ os_make_fixnum(10) }), nil);
+    lisp_val_t labels_form = os_make_cons(os_make_symbol("labels"), os_make_cons(bindings, labels_body));
+
+    lisp_val_t v = os_eval(labels_form, env);
+    assert(v == g_sym_t, "labelsの相互再帰でmy-even 10はTになる");
+}
+
+void test_os_eval_defvar_second_call_is_ignored() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t name = os_make_symbol("x");
+
+    lisp_val_t defvar_form1 = os_make_cons(os_make_symbol("defvar"), os_make_cons(name, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t v1 = os_eval(defvar_form1, env);
+    assert(v1 == name, "defvarの戻り値は変数名x");
+    assert(os_get_variable(name, env) == os_make_fixnum(1), "初回のdefvarで値1がセットされる");
+
+    lisp_val_t defvar_form2 = os_make_cons(os_make_symbol("defvar"), os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    os_eval(defvar_form2, env);
+    assert(os_get_variable(name, env) == os_make_fixnum(1), "既に束縛済みの場合、2回目のdefvarは無視され元の値1が残る");
+}
+
+void test_os_eval_defconstant_blocks_setq_in_its_own_env() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t name = os_make_symbol("x");
+
+    lisp_val_t defconstant_form = os_make_cons(os_make_symbol("defconstant"), os_make_cons(name, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t defined = os_eval(defconstant_form, env);
+    assert(defined == name, "defconstantの戻り値は定数名x");
+    assert(os_get_variable(name, env) == os_make_fixnum(1), "defconstantで値1がセットされる");
+
+    lisp_val_t setq_form = os_make_cons(os_make_symbol("setq"), os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    lisp_val_t v = os_eval(setq_form, env);
+    assert(v == g_sym_eval_error, "定数へのsetqはeval-errorになる");
+    assert(os_get_variable(name, env) == os_make_fixnum(1), "定数へのsetqは失敗するので値1のまま変わらない");
+
+    // 別環境の同名変数は定数ではないので通常通りsetqできる
+    lisp_val_t other_env = os_make_environment(os_make_symbol("OTHER-ENV"), nil);
+    os_set_variable(name, os_make_fixnum(10), other_env);
+    lisp_val_t other_v = os_eval(setq_form, other_env);
+    assert(other_v == os_make_fixnum(2), "別環境の同名変数xは定数ではないので通常通りsetqできる");
+    assert(os_get_variable(name, other_env) == os_make_fixnum(2), "別環境のxは2に書き換わる");
+}
+
+void test_os_eval_defconstant_blocks_setq_from_nested_child_env() {
+    // os_setq_variableが親envを辿って書き込み先を探すようになったため、
+    // ネストした子env(クロージャのcall-env相当)からのsetqでも、親envのdefconstant定数を
+    // 素通りして書き換えてしまわないことを確認する(os_is_constantの親チェーン探索の検証)
+    lisp_val_t base_env = os_make_environment(os_make_symbol("BASE-ENV"), nil);
+    lisp_val_t name = os_make_symbol("x");
+    lisp_val_t defconstant_form = os_make_cons(os_make_symbol("defconstant"), os_make_cons(name, os_make_cons(os_make_fixnum(1), nil)));
+    os_eval(defconstant_form, base_env);
+
+    lisp_val_t nested_env = os_make_environment(os_make_symbol("NESTED-ENV"), base_env);
+    lisp_val_t setq_form = os_make_cons(os_make_symbol("setq"), os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    lisp_val_t v = os_eval(setq_form, nested_env);
+    assert(v == g_sym_eval_error, "親envで定義されたdefconstant定数へのsetqは、ネストした子envからでもeval-errorになる");
+    assert(os_get_variable(name, base_env) == os_make_fixnum(1), "定数の値は書き換わらず1のまま");
+}
+
+void test_os_eval_defdynamic_and_dynamic_bypass_lexical_env() {
+    lisp_val_t name = os_make_symbol("*x*");
+    lisp_val_t defdynamic_form = os_make_cons(os_make_symbol("defdynamic"), os_make_cons(name, os_make_cons(os_make_fixnum(10), nil)));
+
+    lisp_val_t env1 = os_make_environment(os_make_symbol("ENV1"), nil);
+    lisp_val_t defined = os_eval(defdynamic_form, env1);
+    assert(defined == name, "defdynamicの戻り値は変数名*x*");
+
+    // env1とは無関係のenv2から(dynamic *x*)しても同じ値10が見える
+    lisp_val_t env2 = os_make_environment(os_make_symbol("ENV2"), nil);
+    lisp_val_t dynamic_form = os_make_cons(os_make_symbol("dynamic"), os_make_cons(name, nil));
+    lisp_val_t v = os_eval(dynamic_form, env2);
+    assert(v == os_make_fixnum(10), "定義に使ったenv1と無関係なenv2からもdynamicで同じ値10が見える(レキシカルenvを経由しない)");
+
+    // env2から(defdynamic *x* 20)で上書きすると、env1側からも新しい値が見える
+    lisp_val_t redefine_form = os_make_cons(os_make_symbol("defdynamic"), os_make_cons(name, os_make_cons(os_make_fixnum(20), nil)));
+    os_eval(redefine_form, env2);
+    lisp_val_t v2 = os_eval(dynamic_form, env1);
+    assert(v2 == os_make_fixnum(20), "動的変数はグローバルなので、どの環境から更新しても他の環境から新しい値20が見える");
+}
+
+void test_os_eval_defglobal_reevaluates_and_allows_setq() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+    lisp_val_t name = os_make_symbol("x");
+
+    lisp_val_t defglobal_form1 = os_make_cons(os_make_symbol("defglobal"), os_make_cons(name, os_make_cons(os_make_fixnum(1), nil)));
+    lisp_val_t v1 = os_eval(defglobal_form1, env);
+    assert(v1 == name, "defglobalの戻り値は変数名x");
+    assert(os_get_variable(name, env) == os_make_fixnum(1), "初回のdefglobalで値1がセットされる");
+
+    // defvarと異なり、既に束縛済みでも2回目のdefglobalはvalue-formを再評価して上書きする
+    lisp_val_t defglobal_form2 = os_make_cons(os_make_symbol("defglobal"), os_make_cons(name, os_make_cons(os_make_fixnum(2), nil)));
+    os_eval(defglobal_form2, env);
+    assert(os_get_variable(name, env) == os_make_fixnum(2), "2回目のdefglobalで値2に上書きされる");
+
+    // defconstantと異なり、defglobalで定義した変数はsetqで書き換えられる
+    lisp_val_t setq_form = os_make_cons(os_make_symbol("setq"), os_make_cons(name, os_make_cons(os_make_fixnum(3), nil)));
+    lisp_val_t v = os_eval(setq_form, env);
+    assert(v == os_make_fixnum(3), "defglobalの変数はsetqで書き換えられる");
+    assert(os_get_variable(name, env) == os_make_fixnum(3), "setq後の値は3になる");
+}
+
+void test_os_eval_top_level_catches_return_from_to_top_level_block() {
+    lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
+
+    // (return-from %TOP-LEVEL 99) : os_eval_top_levelが張るblock %TOP-LEVELにcatchされ99になる
+    lisp_val_t return_form = os_make_cons(os_make_symbol("return-from"),
+                                  os_make_cons(g_sym_top_level_block, os_make_cons(os_make_fixnum(99), nil)));
+
+    lisp_val_t v = os_eval_top_level(return_form, env);
+    assert(v == os_make_fixnum(99), "os_eval_top_levelはトップレベルへのreturn-fromをcatchして99を返す(生のMAGIC_BLOCK_EXITが漏れない)");
+}
+
+void test_os_eval_top_level_passes_through_normal_form() {
+    lisp_val_t env = make_arith_env();
+
+    // (+ 1 2) : 通常のフォームはそのまま3を返す
+    lisp_val_t args[2] = { os_make_fixnum(1), os_make_fixnum(2) };
+    lisp_val_t form = make_call("+", 2, args);
+
+    lisp_val_t v = os_eval_top_level(form, env);
+    assert(v == os_make_fixnum(3), "os_eval_top_levelは通常のフォームをそのまま評価して3を返す");
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -474,7 +1080,9 @@ int main(int argc, char** argv) {
     test_os_eval_quote();
     test_os_eval_if();
     test_os_eval_progn();
-    test_os_eval_setq_writes_current_env_only();
+    test_os_eval_setq_walks_parent_env_to_existing_binding();
+    test_os_eval_setq_defines_locally_when_unbound_anywhere();
+    test_os_eval_closure_setq_mutates_outer_variable();
     test_os_eval_defun();
     test_os_eval_defun_multi_form_body();
     test_os_eval_defun_recursion();
@@ -490,6 +1098,35 @@ int main(int argc, char** argv) {
     test_os_eval_quasiquote_plain_list();
     test_os_eval_quasiquote_unquote();
     test_os_eval_quasiquote_unquote_splicing();
+    test_os_eval_block_return_from_immediate_exit();
+    test_os_eval_return_from_crosses_function_call();
+    test_os_eval_nested_block_return_from_only_exits_inner();
+    test_os_eval_unwind_protect_runs_cleanup_on_normal_return();
+    test_os_eval_unwind_protect_runs_cleanup_on_non_local_exit();
+    test_os_eval_catch_throw_basic();
+    test_os_eval_catch_throw_mismatched_tag_propagates_to_outer_catch();
+    test_os_eval_tagbody_go_forward_jump_skips_form();
+    test_os_eval_tagbody_go_backward_jump_loops_until_end_tag();
+    test_primitive_macroexpand_1_expands_macro_call();
+    test_primitive_macroexpand_1_returns_form_unchanged_when_not_macro();
+    test_primitive_funcall_calls_native_function();
+    test_primitive_funcall_calls_interpreted_function();
+    test_primitive_apply_calls_native_function_with_list();
+    test_primitive_apply_calls_interpreted_function_with_list();
+    test_os_eval_function_on_symbol_returns_function_object();
+    test_os_eval_function_on_lambda_returns_callable_closure();
+    test_os_eval_function_on_undefined_symbol_returns_eval_error();
+    test_os_eval_flet_siblings_cannot_call_each_other();
+    test_os_eval_flet_outer_scope_still_visible();
+    test_os_eval_flet_body_can_call_both_bound_functions();
+    test_os_eval_labels_mutual_recursion();
+    test_os_eval_defvar_second_call_is_ignored();
+    test_os_eval_defconstant_blocks_setq_in_its_own_env();
+    test_os_eval_defconstant_blocks_setq_from_nested_child_env();
+    test_os_eval_defdynamic_and_dynamic_bypass_lexical_env();
+    test_os_eval_defglobal_reevaluates_and_allows_setq();
+    test_os_eval_top_level_catches_return_from_to_top_level_block();
+    test_os_eval_top_level_passes_through_normal_form();
 
     return g_test_failed ? 1 : 0;
 }

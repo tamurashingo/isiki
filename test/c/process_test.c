@@ -4,6 +4,67 @@
 #include "runtime.h"
 #include "lisp.h"
 #include "process.h"
+#include "reader.h"
+
+// reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
+// 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
+// ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
+int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)path;
+    (void)perm;
+    (void)mode;
+    (void)out_fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_write_chunk(UINT32 fid, UINT64 offset, const UINT8 *data, UINT32 count,
+                             UINT32 *out_written, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)data;
+    (void)count;
+    (void)out_written;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_read_chunk(UINT32 fid, UINT64 offset, UINT32 want,
+                            const UINT8 **out_data, UINT32 *out_count,
+                            char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)offset;
+    (void)want;
+    (void)out_data;
+    (void)out_count;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
+    (void)fid;
+    (void)err_msg;
+    (void)err_msg_cap;
+    return 0;
+}
+
+// reader.c の os_read が参照するが、このテストでは実際の割り込みが発生しないため
+// 何もしないダミー実装を用意する
+void os_wait_for_more_input(process_t *proc) {
+    (void)proc;
+}
 
 // process.c が参照する switch_active_frame_buffer のダミー実装。
 // テスト環境では実画面がないため、呼ばれたindexを記録するだけにする
@@ -32,6 +93,14 @@ frame_buffer* get_active_frame_buffer(void) {
 // interrupt.c/repl.cの関数のダミー実装。ハードウェア割り込みやREPLの実行に
 // 依存する部分はユニットテストの対象外なので、リンクを通すためだけに置く
 void enable_timer_irq(void) {
+}
+
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
 }
 
 void os_repl_step(process_t *proc) {
