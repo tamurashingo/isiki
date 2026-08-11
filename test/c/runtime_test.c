@@ -1341,6 +1341,113 @@ void test_primitive_make_instance_raw_and_accessors() {
     assert(primitive_class_instance_p(os_make_cons(class, nil), nil) == nil, "(%%class-instance-p c)(クラス自身)はnilを返す");
 }
 
+void test_gc_cons_survives_and_relocates() {
+    // symをos_gc_collect()を挟んで直接使うと、sym自身がFrom空間の古いアドレスのまま
+    // 更新されない(rootとして登録していないローカル変数はGCが書き換えてくれない)ため、
+    // 以後の検索はGC後にos_make_symbolで同名をintern済みsymbolを取り直す必要がある
+    // (これはGCが安全なのはセーフポイントに限られるという設計そのものの反映であり、
+    // os_repl_stepが毎回formを読み直して新しいsymbolを得る動作と対応する)
+    lisp_val_t sym = os_make_symbol("GC-TEST-CONS");
+    lisp_val_t car = os_make_fixnum(111);
+    lisp_val_t cdr = os_make_fixnum(222);
+    lisp_val_t cons = os_make_cons(car, cdr);
+    os_set_variable(sym, cons, global_environment);
+    lisp_addr_t addr_before = cons & ~TAG_MASK;
+
+    os_gc_collect();
+
+    lisp_val_t after = os_get_variable(os_make_symbol("GC-TEST-CONS"), global_environment);
+    assert((after & TAG_MASK) == TAG_CONS, "GCを跨いでもconsのタグはTAG_CONSのまま");
+    assert((after & ~TAG_MASK) != addr_before, "global_environmentから参照されるconsはGCでTo空間の新しいアドレスへ再配置される");
+    assert(cc_car(after) == car, "GCを跨いでもconsのcar(fixnum)の値は保たれる");
+    assert(cc_cdr(after) == cdr, "GCを跨いでもconsのcdr(fixnum)の値は保たれる");
+}
+
+void test_gc_symbol_survives_via_symbol_table() {
+    lisp_val_t sym = os_make_symbol("GC-TEST-SYMBOL");
+    lisp_addr_t addr_before = sym & ~TAG_MASK;
+
+    os_gc_collect();
+
+    lisp_val_t sym_after = os_make_symbol("GC-TEST-SYMBOL");
+    assert((sym_after & TAG_MASK) == TAG_SYMBOL, "GCを跨いでもsymbolのタグはTAG_SYMBOLのまま");
+    assert((sym_after & ~TAG_MASK) != addr_before, "g_symbol_tableに登録済みのsymbolはGCでTo空間の新しいアドレスへ再配置される");
+
+    char buf[16];
+    os_string_to_cstr(primitive_symbol_name(os_make_cons(sym_after, nil), nil), buf, sizeof(buf));
+    assert(strncmp(buf, "GC-TEST-SYMBOL", 14) == 0, "GCを跨いでもsymbol名の内容は保たれる");
+}
+
+void test_gc_string_with_forward_tag_colliding_length_is_not_misdetected() {
+    // 長さ6の文字列はword0(=6)の下位3bitがTAG_FORWARD(6)と一致してしまう。
+    // gc_copy_valueがTo空間の範囲外であることを見て誤検知を回避できているかを確認する
+    lisp_val_t sym = os_make_symbol("GC-TEST-STRING-LEN6");
+    lisp_val_t str = os_make_string("abcdef");
+    UINT64 *header = (UINT64 *)(str & ~TAG_MASK);
+    assert((header[0] & TAG_MASK) == TAG_FORWARD, "長さ6の文字列はword0の下位3bitがTAG_FORWARDと一致する(前提条件)");
+    os_set_variable(sym, str, global_environment);
+    lisp_addr_t addr_before = str & ~TAG_MASK;
+
+    os_gc_collect();
+
+    // symはGC前のFrom空間アドレスのままなので、検索にはGC後に取り直したsymbolを使う
+    lisp_val_t after = os_get_variable(os_make_symbol("GC-TEST-STRING-LEN6"), global_environment);
+    assert((after & TAG_MASK) == TAG_STRING, "誤検知が起きてもGC後のタグはTAG_STRINGのまま");
+    assert((after & ~TAG_MASK) != addr_before, "誤検知が起きても文字列はTo空間へ再配置される");
+
+    char buf[16];
+    os_string_to_cstr(after, buf, sizeof(buf));
+    assert(strncmp(buf, "abcdef", 6) == 0, "誤検知が起きても文字列の内容は破壊されず保たれる");
+}
+
+void test_gc_instance_survives() {
+    lisp_val_t sym = os_make_symbol("GC-TEST-FLOAT-INSTANCE");
+    lisp_val_t f = os_make_float(3.5);
+    os_set_variable(sym, f, global_environment);
+    lisp_addr_t addr_before = f & ~TAG_MASK;
+
+    os_gc_collect();
+
+    // symはGC前のFrom空間アドレスのままなので、検索にはGC後に取り直したsymbolを使う
+    lisp_val_t after = os_get_variable(os_make_symbol("GC-TEST-FLOAT-INSTANCE"), global_environment);
+    assert((after & TAG_MASK) == TAG_INSTANCE, "GCを跨いでもfloat instanceのタグはTAG_INSTANCEのまま");
+    assert((after & ~TAG_MASK) != addr_before, "instanceはGCでTo空間の新しいアドレスへ再配置される");
+    assert(os_float_value(after) == 3.5, "GCを跨いでもfloatの値は保たれる");
+}
+
+void test_gc_circular_cons_list_does_not_hang() {
+    lisp_val_t sym = os_make_symbol("GC-TEST-CIRCULAR-LIST");
+    lisp_val_t head = os_make_cons(os_make_fixnum(1), nil);
+    lisp_val_t second = os_make_cons(os_make_fixnum(2), head); // headを自己参照させて循環させる
+    cc_set_cdr(head, second);
+    os_set_variable(sym, head, global_environment);
+
+    os_gc_collect(); // 循環参照があってもワークキュー方式のため無限ループ/クラッシュしない
+
+    // symはGC前のFrom空間アドレスのままなので、検索にはGC後に取り直したsymbolを使う
+    lisp_val_t after_head = os_get_variable(os_make_symbol("GC-TEST-CIRCULAR-LIST"), global_environment);
+    assert(cc_car(after_head) == os_make_fixnum(1), "GC後も循環リストの先頭要素の値は保たれる");
+    lisp_val_t after_second = cc_cdr(after_head);
+    assert(cc_car(after_second) == os_make_fixnum(2), "GC後も循環リストの2番目の要素の値は保たれる");
+    assert(cc_cdr(after_second) == after_head, "GC後も循環リストの循環構造(2番目のcdrが先頭を指す)は保たれる");
+}
+
+void test_gc_reclaims_unreferenced_garbage() {
+    os_gc_collect(); // まず一度回収し、以降の使用率比較の基準を揃える
+    double ratio_baseline = os_heap_used_ratio();
+
+    // どこにも束縛せず、ローカル変数にも残さない大量のconsを生成してFrom空間を消費させる
+    for (int i = 0; i < 5000; i++) {
+        os_make_cons(os_make_fixnum(i), os_make_fixnum(i + 1));
+    }
+    double ratio_before_gc = os_heap_used_ratio();
+    assert(ratio_before_gc > ratio_baseline, "参照されないconsを大量に作るとFrom空間の使用率が上がる");
+
+    os_gc_collect();
+    double ratio_after_gc = os_heap_used_ratio();
+    assert(ratio_after_gc < ratio_before_gc, "参照されなくなったconsはGCで回収され、使用率が下がる");
+}
+
 int main(int argc, char** argv) {
    test_os_make_fixnum();
 
@@ -1422,6 +1529,13 @@ int main(int argc, char** argv) {
    test_primitive_make_class_raw_and_accessors();
    test_primitive_make_builtin_class_raw_and_metaclass_predicates();
    test_primitive_make_instance_raw_and_accessors();
+
+   test_gc_cons_survives_and_relocates();
+   test_gc_symbol_survives_via_symbol_table();
+   test_gc_string_with_forward_tag_colliding_length_is_not_misdetected();
+   test_gc_instance_survives();
+   test_gc_circular_cons_list_does_not_hang();
+   test_gc_reclaims_unreferenced_garbage();
 
    return g_test_failed ? 1 : 0;
 }

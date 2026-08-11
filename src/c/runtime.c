@@ -4,6 +4,7 @@
 #include "lisp.h"
 #include "eval.h"
 #include "reader.h"
+#include "stream.h"
 #ifdef ISIKIOS_UNIT_TEST
 /* ネイティブ(x86_64以外を含む)ホストでのユニットテストではx87/SSE2インラインアセンブラが
    使えないため、libmの対応する関数で計算する。実機(x86_64 UEFI, ISIKIOS_UNIT_TEST未定義)
@@ -21,15 +22,15 @@
  * ヒープ確保は常に8byte境界になるため、確保したアドレスの下位3bitは常に0となり、
  * そこにタグを詰め込む。
  *
- * #define TAG_MASK     0x7ULL
- * #define TAG_FIXNUM   0x0ULL   // 000 即値
- * #define TAG_CONS     0x1ULL   // 001 アドレス
- * #define TAG_SYMBOL   0x2ULL   // 010 アドレス
- * #define TAG_CHAR     0x3ULL   // 011 即値
- * #define TAG_STRING   0x4ULL   // 100 アドレス
- * #define TAG_INSTANCE 0x5ULL   // 101 アドレス
- *                               // 110 予約
- *                               // 111 予約
+ * #define TAG_MASK        0x7ULL
+ * #define TAG_FIXNUM      0x0ULL // 000 即値
+ * #define TAG_CONS        0x1ULL // 001 アドレス
+ * #define TAG_SYMBOL      0x2ULL // 010 アドレス
+ * #define TAG_CHAR        0x3ULL // 011 即値
+ * #define TAG_STRING      0x4ULL // 100 アドレス
+ * #define TAG_INSTANCE    0x5ULL // 101 アドレス
+ * #define TAG_FORWARD     0x6ULL // 110 アドレス
+ * #define TAG_RAW_POINTER 0x7ULL // 111 アドレス
  *
  * ---- タグ別メモリ配置 ----
  *
@@ -80,6 +81,18 @@
  *               - word0:          次元数(rank、タグなしの整数)
  *               - word[1..rank]:  各次元のサイズ(タグなしの整数)
  *               - word[rank+1..]: 要素本体(タグ付きのlisp_val_t、行優先(row-major)順)
+ *
+ * TAG_FORWARD: アドレス、ヒープ(コピー元のサイズ)
+ *  [ forward-addr(61bit) ............................. ][1 1 0]
+ *    From空間からTo空間へコピー済みのオブジェクト
+ *    移動先アドレス | TAG_FORWARD で上書きする
+ *
+ * TAG_RAW_POINTER: アドレス、即値
+ *  [ raw-addr(61bit) ................................. ][1 1 1]
+ *    Lispから生の64bitアドレス(c構造体・MMIOレジスタ等)を安全に持てるようにするためのタグ。
+ *    中身は「タグを外した生アドレス」そのもので、fixnumのようなシフトエンコードは行わない。
+ *    GCはfixnum(0)・char(3)と同様にこのタグを即値として素通しスキャンしない。
+ *
  *
  */
 
@@ -220,6 +233,12 @@ static UINT8 *g_to_ptr;
 static UINT8 *g_to_end;
 
 /**
+ * nil(自己参照するconsセル)専用の固定領域。From/To空間のどちらにも属さず、GCの
+ * コピー/スワップの対象にならない(g_symbol_table等と同じ静的配列パターン)。
+ */
+static UINT8 g_nil_cell[16] __attribute__((aligned(8)));
+
+/**
  * From空間からnバイト(8byte境界に整列)を割り当てる。枯渇した場合は停止する。
  * @param n 割り当てるバイト数
  * @return 割り当てたメモリの先頭アドレス
@@ -310,11 +329,409 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     g_to_ptr     = g_to_start;
 }
 
+double os_heap_used_ratio(void) {
+    UINT64 total = (UINT64)(g_from_end - g_from_start);
+    if (total == 0) {
+        return 0.0;
+    }
+    UINT64 used = (UINT64)(g_from_ptr - g_from_start);
+    return (double)used / (double)total;
+}
+
+/* ============================== GC (Cheney方式コピーGC) ============================== */
+
+/**
+ * lisp_val_t型の変数へのポインタを、GCが毎回のos_gc_collectで書き換えるルート集合に
+ * 登録する(idempotent: 同じポインタを複数回登録しても1回分の登録として扱う)。
+ * initialize_processes等、同じアドレスを何度も渡してくる呼び出し元があるため、
+ * 単純な追加だけだとテーブルがすぐ枯渇する。
+ */
+#define GC_MAX_EXTRA_ROOTS 8
+static lisp_val_t *g_gc_extra_roots[GC_MAX_EXTRA_ROOTS];
+static UINT64 g_gc_extra_root_count = 0;
+
+void os_gc_register_root(lisp_val_t *root_ptr) {
+    for (UINT64 i = 0; i < g_gc_extra_root_count; i++) {
+        if (g_gc_extra_roots[i] == root_ptr) {
+            return;
+        }
+    }
+    if (g_gc_extra_root_count >= GC_MAX_EXTRA_ROOTS) {
+        frame_buffer *fb = get_active_frame_buffer();
+        fb->write_string(fb, "gc: extra root table exhausted...");
+        for (;;) {
+        }
+    }
+    g_gc_extra_roots[g_gc_extra_root_count++] = root_ptr;
+}
+
+/**
+ * コピー済み(To空間へ転送済み)だがまだフィールドを転送していないオブジェクトのFIFOキュー
+ * (gray list)。conの再帰的コピー(depth-first)はcdr連鎖でCスタックを溢れさせる危険が
+ * あるため、コピー自体は再帰せずここへ積み、後段のgc_scan_queueがbreadth-firstに消費する。
+ */
+#define GC_QUEUE_CAPACITY 65536
+static lisp_val_t g_gc_queue[GC_QUEUE_CAPACITY];
+static UINT64 g_gc_queue_head;
+static UINT64 g_gc_queue_tail;
+
+static void gc_queue_push(lisp_val_t tagged) {
+    if (g_gc_queue_tail - g_gc_queue_head >= GC_QUEUE_CAPACITY) {
+        frame_buffer *fb = get_active_frame_buffer();
+        fb->write_string(fb, "gc: work queue exhausted...");
+        for (;;) {
+        }
+    }
+    g_gc_queue[g_gc_queue_tail % GC_QUEUE_CAPACITY] = tagged;
+    g_gc_queue_tail++;
+}
+
+static int gc_queue_pop(lisp_val_t *out) {
+    if (g_gc_queue_head == g_gc_queue_tail) {
+        return 0;
+    }
+    *out = g_gc_queue[g_gc_queue_head % GC_QUEUE_CAPACITY];
+    g_gc_queue_head++;
+    return 1;
+}
+
+/** To空間にsizeバイトを確保して返す(枯渇時は診断メッセージを表示して停止する) */
+static UINT8 *gc_to_alloc(UINT64 size) {
+    UINT64 aligned = (size + 7) & ~7ULL;
+    UINT8 *dst = g_to_ptr;
+    if (dst + aligned > g_to_end) {
+        frame_buffer *fb = get_active_frame_buffer();
+        fb->write_string(fb, "gc: to-space exhausted...");
+        for (;;) {
+        }
+    }
+    g_to_ptr = dst + aligned;
+    return dst;
+}
+
+/**
+ * objをFrom空間からTo空間へコピー(既に転送済みならその転送先)して返す。
+ * fixnum/char/TAG_RAW_POINTERは即値としてそのまま返し、nilも何よりも先に素通しする。
+ * @param obj コピー対象の値
+ * @return To空間上の(同じ意味を持つ)値
+ */
+static lisp_val_t gc_copy_value(lisp_val_t obj) {
+    if (obj == nil) {
+        return obj;
+    }
+
+    UINT64 tag = obj & TAG_MASK;
+    if (tag == TAG_FIXNUM || tag == TAG_CHAR || tag == TAG_RAW_POINTER) {
+        return obj;
+    }
+
+    lisp_addr_t addr = obj & ~TAG_MASK;
+    UINT64 *words = (UINT64 *)addr;
+    UINT64 word0 = words[0];
+
+    if ((word0 & TAG_MASK) == TAG_FORWARD) {
+        UINT8 *fwd_addr = (UINT8 *)(lisp_addr_t)(word0 & ~TAG_MASK);
+        // Stringのword0は生の整数長であり、たまたま下位3bitが0x6(TAG_FORWARD)と一致した
+        // だけの誤検知の可能性がある。転送先は必ずTo空間内のアドレスになるはずなので、
+        // 範囲外なら転送済みではないとみなし、下のcopy_freshへ進む
+        if (fwd_addr >= g_to_start && fwd_addr < g_to_ptr) {
+            return (lisp_val_t)((lisp_addr_t)fwd_addr | tag);
+        }
+    }
+
+    UINT64 size;
+    switch (tag) {
+        case TAG_CONS:     size = 16; break;
+        case TAG_SYMBOL:   size = 32; break;
+        case TAG_STRING:   size = 8 + word0; break;
+        case TAG_INSTANCE: size = 32; break;
+        default:           size = 0; break;
+    }
+
+    UINT8 *dst = gc_to_alloc(size);
+    UINT8 *src = (UINT8 *)addr;
+    for (UINT64 i = 0; i < size; i++) {
+        dst[i] = src[i];
+    }
+
+    // 古いFrom空間側のword0を転送先アドレス+TAG_FORWARDで上書きする
+    // (Stringの場合はここでword0=生の整数長が上書きされるのが必須の副作用)
+    words[0] = (UINT64)((lisp_addr_t)dst | TAG_FORWARD);
+
+    lisp_val_t new_obj = (lisp_val_t)((lisp_addr_t)dst | tag);
+    gc_queue_push(new_obj); // 子要素の転送はここでは行わず、gc_scan_queueに委ねる(非再帰)
+    return new_obj;
+}
+
+/** MAGIC_BIGNUM(word3=limb配列への生ポインタ、中身はLisp値を含まない生の32bit値の配列)を再配置する */
+static void gc_relocate_bignum(UINT64 *words) {
+    UINT64 count = words[2];
+    UINT8 *dst = gc_to_alloc(8 * count);
+    UINT8 *src = (UINT8 *)words[3];
+    for (UINT64 i = 0; i < 8 * count; i++) {
+        dst[i] = src[i];
+    }
+    words[3] = (UINT64)dst;
+}
+
+/**
+ * MAGIC_VECTORの配列本体ブロック(word0=rank、word[1..rank]=各次元サイズ、
+ * word[rank+1..]=要素データ)を再配置する。要素データはLisp値なのでgc_copy_valueで転送する。
+ */
+static void gc_relocate_vector_block(UINT64 *words) {
+    UINT64 *old_header = (UINT64 *)words[1];
+    UINT64 rank = old_header[0];
+    UINT64 total = 1;
+    for (UINT64 i = 0; i < rank; i++) {
+        total *= old_header[1 + i];
+    }
+    UINT64 size = 8 * (1 + rank + total);
+
+    UINT8 *dst = gc_to_alloc(size);
+    UINT8 *src = (UINT8 *)old_header;
+    for (UINT64 i = 0; i < size; i++) {
+        dst[i] = src[i];
+    }
+
+    lisp_val_t *new_data = (lisp_val_t *)(dst + 8 * (1 + rank));
+    for (UINT64 i = 0; i < total; i++) {
+        new_data[i] = gc_copy_value(new_data[i]);
+    }
+
+    words[1] = (UINT64)dst;
+}
+
+/**
+ * MAGIC_STREAM(word1=os_stream_tへの生ポインタ)を再配置する。buf_data(9P受信バッファ)/
+ * out_fb(frame buffer)は常にLispヒープ外の静的領域を指すため素通しし、str_buf
+ * (STREAM_STRING_INPUT/OUTPUTのみヒープ上)だけ追加で再配置する。
+ */
+static void gc_relocate_stream(UINT64 *words) {
+    os_stream_t *old_stream = (os_stream_t *)words[1];
+    UINT8 *dst = gc_to_alloc(sizeof(os_stream_t));
+    UINT8 *src = (UINT8 *)old_stream;
+    for (UINT64 i = 0; i < sizeof(os_stream_t); i++) {
+        dst[i] = src[i];
+    }
+
+    os_stream_t *new_stream = (os_stream_t *)dst;
+    if (new_stream->kind == STREAM_STRING_INPUT || new_stream->kind == STREAM_STRING_OUTPUT) {
+        UINT8 *buf_dst = gc_to_alloc(new_stream->str_cap);
+        UINT8 *buf_src = (UINT8 *)new_stream->str_buf;
+        for (UINT64 i = 0; i < new_stream->str_cap; i++) {
+            buf_dst[i] = buf_src[i];
+        }
+        new_stream->str_buf = buf_dst;
+    }
+
+    words[1] = (UINT64)new_stream;
+}
+
+/**
+ * TAG_INSTANCE(words[0]=magic)のword1〜word3を、magicごとの規則に従って
+ * To空間上のコピーへ転送する。
+ */
+static void gc_scan_instance(UINT64 *words) {
+    UINT64 magic = words[0];
+
+    switch (magic) {
+        case MAGIC_FUNCTION_NATIVE:
+            // word1はCコード領域への生の関数ポインタ(Lispヒープ外)。素通し
+            break;
+
+        case MAGIC_FUNCTION_INTERPRETED:
+        case MAGIC_MACRO:
+            words[1] = gc_copy_value(words[1]); // params
+            words[2] = gc_copy_value(words[2]); // body
+            words[3] = gc_copy_value(words[3]); // closure env
+            break;
+
+        case MAGIC_PROCESS:
+            words[1] = gc_copy_value(words[1]); // fixnum(process index)
+            // word2(saved_rsp)は生アドレス(process.cの静的スタック領域、Lispヒープ外)。素通し
+            words[3] = gc_copy_value(words[3]); // state symbol
+            break;
+
+        case MAGIC_BLOCK_EXIT:
+            words[1] = gc_copy_value(words[1]); // block名symbol
+            words[2] = gc_copy_value(words[2]); // 戻り値
+            break;
+
+        case MAGIC_STREAM:
+            gc_relocate_stream(words);
+            break;
+
+        case MAGIC_CLASS_INSTANCE:
+            words[1] = gc_copy_value(words[1]); // class
+            words[2] = gc_copy_value(words[2]); // slots-vector
+            break;
+
+        case MAGIC_CATCH_EXIT:
+            words[1] = gc_copy_value(words[1]); // tag
+            words[2] = gc_copy_value(words[2]); // throwされた値
+            break;
+
+        case MAGIC_GO_EXIT:
+            words[1] = gc_copy_value(words[1]); // tag symbol
+            break;
+
+        case MAGIC_BIGNUM:
+            // word1(sign)/word2(limb数)は生のint。word3(limb配列)のみ再配置する
+            gc_relocate_bignum(words);
+            break;
+
+        case MAGIC_VECTOR:
+            gc_relocate_vector_block(words);
+            break;
+
+        case MAGIC_FLOAT:
+            // word1はdoubleのビットパターン(生の64bit値)。素通し
+            break;
+
+        case MAGIC_BUILTIN_CLASS:
+        case MAGIC_STANDARD_CLASS:
+            words[1] = gc_copy_value(words[1]); // name symbol
+            words[2] = gc_copy_value(words[2]); // superclasses list
+            words[3] = gc_copy_value(words[3]); // slots list
+            break;
+
+        default:
+            break;
+    }
+}
+
+/**
+ * ワークキューを空になるまで消費し、To空間へコピーされたオブジェクトのフィールドを
+ * 転送する。gc_copy_valueは子要素をここへ積むだけで再帰しないため、breadth-firstに
+ * 進み、長いcons連鎖でもCスタックを消費しない。
+ */
+static void gc_scan_queue(void) {
+    lisp_val_t tagged;
+    while (gc_queue_pop(&tagged)) {
+        UINT64 tag = tagged & TAG_MASK;
+        UINT64 *words = (UINT64 *)(tagged & ~TAG_MASK);
+
+        switch (tag) {
+            case TAG_CONS:
+                words[0] = gc_copy_value(words[0]);
+                words[1] = gc_copy_value(words[1]);
+                break;
+
+            case TAG_SYMBOL:
+                // word0=name string。word1(gensymフラグ)/word2/word3(未使用)は常に
+                // nilまたはfixnumなのでgc_copy_valueに通しても素通しされるだけで安全
+                words[0] = gc_copy_value(words[0]);
+                words[1] = gc_copy_value(words[1]);
+                words[2] = gc_copy_value(words[2]);
+                words[3] = gc_copy_value(words[3]);
+                break;
+
+            case TAG_STRING:
+                // 文字データのみでLisp値を指すフィールドが無いため何もしない
+                break;
+
+            case TAG_INSTANCE:
+                gc_scan_instance(words);
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+/**
+ * Cheney方式のコピーGCを1回実行する。global_environment・g_dynamic_bindings・
+ * g_symbol_table・キャッシュ済みg_sym_*・os_gc_register_rootで登録されたrootを
+ * ルートとして生存オブジェクトをTo空間へコピーし、完了後にFrom/To空間を入れ替える。
+ * トップレベルform間のセーフポイントからのみ呼び出すこと。
+ */
+void os_gc_collect(void) {
+    g_to_ptr = g_to_start;
+    g_gc_queue_head = 0;
+    g_gc_queue_tail = 0;
+
+    global_environment = gc_copy_value(global_environment);
+    g_dynamic_bindings = gc_copy_value(g_dynamic_bindings);
+
+    for (int i = 0; i < g_symbol_count; i++) {
+        g_symbol_table[i] = gc_copy_value(g_symbol_table[i]);
+    }
+
+    g_sym_t = gc_copy_value(g_sym_t);
+    g_sym_process_ready = gc_copy_value(g_sym_process_ready);
+    g_sym_process_running = gc_copy_value(g_sym_process_running);
+    g_sym_process_dead = gc_copy_value(g_sym_process_dead);
+    g_sym_run_queue = gc_copy_value(g_sym_run_queue);
+    g_sym_current_process = gc_copy_value(g_sym_current_process);
+    g_sym_quote = gc_copy_value(g_sym_quote);
+    g_sym_if = gc_copy_value(g_sym_if);
+    g_sym_progn = gc_copy_value(g_sym_progn);
+    g_sym_setq = gc_copy_value(g_sym_setq);
+    g_sym_defun = gc_copy_value(g_sym_defun);
+    g_sym_lambda = gc_copy_value(g_sym_lambda);
+    g_sym_defmacro = gc_copy_value(g_sym_defmacro);
+    g_sym_block = gc_copy_value(g_sym_block);
+    g_sym_return_from = gc_copy_value(g_sym_return_from);
+    g_sym_unwind_protect = gc_copy_value(g_sym_unwind_protect);
+    g_sym_function = gc_copy_value(g_sym_function);
+    g_sym_flet = gc_copy_value(g_sym_flet);
+    g_sym_labels = gc_copy_value(g_sym_labels);
+    g_sym_defvar = gc_copy_value(g_sym_defvar);
+    g_sym_defconstant = gc_copy_value(g_sym_defconstant);
+    g_sym_defdynamic = gc_copy_value(g_sym_defdynamic);
+    g_sym_defglobal = gc_copy_value(g_sym_defglobal);
+    g_sym_dynamic = gc_copy_value(g_sym_dynamic);
+    g_sym_rest = gc_copy_value(g_sym_rest);
+    g_sym_quasiquote = gc_copy_value(g_sym_quasiquote);
+    g_sym_unquote = gc_copy_value(g_sym_unquote);
+    g_sym_unquote_splicing = gc_copy_value(g_sym_unquote_splicing);
+    g_sym_dot = gc_copy_value(g_sym_dot);
+    g_sym_car = gc_copy_value(g_sym_car);
+    g_sym_cdr = gc_copy_value(g_sym_cdr);
+    g_sym_cons = gc_copy_value(g_sym_cons);
+    g_sym_read_error = gc_copy_value(g_sym_read_error);
+    g_sym_eval_error = gc_copy_value(g_sym_eval_error);
+    g_sym_top_level_block = gc_copy_value(g_sym_top_level_block);
+    g_sym_catch = gc_copy_value(g_sym_catch);
+    g_sym_throw = gc_copy_value(g_sym_throw);
+    g_sym_tagbody = gc_copy_value(g_sym_tagbody);
+    g_sym_go = gc_copy_value(g_sym_go);
+    g_sym_make_instance = gc_copy_value(g_sym_make_instance);
+    g_sym_signal_condition = gc_copy_value(g_sym_signal_condition);
+    g_sym_percent_find_class = gc_copy_value(g_sym_percent_find_class);
+    g_sym_class_domain_error = gc_copy_value(g_sym_class_domain_error);
+    g_sym_class_parse_error = gc_copy_value(g_sym_class_parse_error);
+    g_sym_class_number = gc_copy_value(g_sym_class_number);
+    g_sym_kw_object = gc_copy_value(g_sym_kw_object);
+    g_sym_kw_expected_class = gc_copy_value(g_sym_kw_expected_class);
+    g_sym_kw_string = gc_copy_value(g_sym_kw_string);
+
+    for (UINT64 i = 0; i < g_gc_extra_root_count; i++) {
+        *g_gc_extra_roots[i] = gc_copy_value(*g_gc_extra_roots[i]);
+    }
+
+    gc_scan_queue();
+
+    UINT8 *new_from_start = g_to_start;
+    UINT8 *new_from_end = g_to_end;
+    UINT8 *new_from_ptr = g_to_ptr;
+    UINT8 *new_to_start = g_from_start;
+    UINT8 *new_to_end = g_from_end;
+
+    g_from_start = new_from_start;
+    g_from_end = new_from_end;
+    g_from_ptr = new_from_ptr;
+    g_to_start = new_to_start;
+    g_to_end = new_to_end;
+    g_to_ptr = g_to_start;
+}
+
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
 void os_bootstrap() {
-    // NIL の作成
+    // NIL の作成。From/To空間どちらにも属さない専用の固定領域(g_nil_cell)を使う
     {
-        lisp_addr_t addr = os_alloc_bytes(16);
+        lisp_addr_t addr = (lisp_addr_t)g_nil_cell;
         lisp_val_t tagged = (lisp_val_t)(addr | TAG_CONS);
         lisp_val_t *cell = (lisp_val_t *)addr;
         cell[0] = tagged;

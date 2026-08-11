@@ -17,7 +17,10 @@
 #define TAG_STRING   0x4ULL
 /** instance(function/process等)へのアドレス(101) */
 #define TAG_INSTANCE 0x5ULL
-/* 0x6(110)・0x7(111)は将来のために予約し、割り当てない */
+/** GCが転送済みオブジェクトの新しい位置を指すために使う、転送先アドレス(110)。ヒープ上のオブジェクトのword0にのみ現れる */
+#define TAG_FORWARD  0x6ULL
+/** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等)。fixnum/charと同様の即値として扱い、GCは素通しする(111) */
+#define TAG_RAW_POINTER 0x7ULL
 
 /** TAG_FIXNUMの値フィールド最上位bit(bit63)。1なら負数を表す(0は常に非負に正規化) */
 #define FIXNUM_SIGN_BIT       0x8000000000000000ULL
@@ -175,6 +178,29 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size);
 
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
 void os_bootstrap();
+
+/**
+ * From空間の使用率を返す(0.0〜1.0)。os_gc_collectを呼ぶべきかどうかの閾値判定に使う。
+ * @return 使用中バイト数 / From空間全体のバイト数
+ */
+double os_heap_used_ratio(void);
+
+/**
+ * Cheney方式のコピーGCを1回実行する。global_environment・g_dynamic_bindings・
+ * g_symbol_table・キャッシュ済みg_sym_*・各プロセスのenvをルートとして生存オブジェクトを
+ * To空間へコピーし、From/To空間を入れ替える。トップレベルform間のセーフポイントからのみ
+ * 呼び出すこと(eval中の任意地点から呼ぶとCスタック上の未追跡なlisp_val_tルートを破壊する)。
+ */
+void os_gc_collect(void);
+
+/**
+ * lisp_val_t型の変数へのポインタを、os_gc_collectが毎回書き換えるルート集合に登録する
+ * (idempotent: 同じポインタを複数回登録しても1回分の登録として扱われる)。
+ * process.cのように、GCの走査対象になる変数(各プロセスのenv等)をruntime.cの
+ * static変数として持てない箇所から使う。
+ * @param root_ptr 登録するroot変数へのポインタ
+ */
+void os_gc_register_root(lisp_val_t *root_ptr);
 
 /**
  * 非負のfixnumオブジェクトを作る(即値、ヒープ確保なし、符号は常に0)。

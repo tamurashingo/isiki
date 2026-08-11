@@ -5,6 +5,9 @@
 #include "print.h"
 #include "framebuffer.h"
 
+/** From空間の使用率がこれを超えたら、次のセーフポイントでGCを起動する */
+#define GC_TRIGGER_HEAP_RATIO 0.8
+
 /**
  * proc に対して READ→EVAL→PRINT を1サイクル実行する。
  * proc の環境(env)は初回呼び出し時に global_environment の子環境として遅延生成される。
@@ -28,4 +31,11 @@ void os_repl_step(process_t *proc) {
 
     os_print(result, proc->stdout_buffer);
     proc->stdout_buffer->write_char(proc->stdout_buffer, '\n');
+
+    // ここ(os_eval_top_levelの呼び出しの間、次のos_readより前)がGCを安全に起動できる
+    // セーフポイント: form/resultはもう参照されず、proc->envはos_gc_register_root経由で
+    // 正しく書き換えられる。他にlisp_val_tを保持したCスタックフレームは存在しない
+    if (os_heap_used_ratio() > GC_TRIGGER_HEAP_RATIO) {
+        os_gc_collect();
+    }
 }
