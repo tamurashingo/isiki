@@ -46,11 +46,15 @@
  *    - word0: car
  *    - word1: cdr
  *
- * TAG_SYMBOL: アドレス、ヒープ8Byte
+ * TAG_SYMBOL: アドレス、ヒープ32Byte
  *  [ sym-addr(61bit) ................................. ][0 1 0]
- *    symbol用に確保した8byteへのアドレスが入っている
+ *    symbol用に確保した32byteへのアドレスが入っている
  *    - word0: 名前のstringへのポインタ(STRINGオブジェクト)
  *             symbol の値や関数は環境(environment)から取得する
+ *    - word1: gensymフラグ。nilなら通常のinterned symbol(g_symbol_tableに登録済み)、
+ *             非nilならos_make_uninterned_symbolが作ったgensym由来のsymbolであることを
+ *             示す(将来のGCでgensym symbolだけを回収対象にする際の判定に使う想定)
+ *    - word2, word3: 未使用(予約)
  *
  * TAG_CHAR: 即値、ヒープなし
  *  [ val(61bit) ...................................... ][0 1 1]
@@ -712,9 +716,9 @@ lisp_val_t os_make_symbol(const char *name) {
     lisp_addr_t addr = os_alloc_bytes(32);
     lisp_val_t *sym = (lisp_val_t *)addr;
     sym[0] = name_str; // string へのポインタ
-    sym[1] = nil;      // value
-    sym[2] = nil;      // function
-    sym[3] = nil;      // reserved
+    sym[1] = nil;      // gensymフラグ(nil=通常のinterned symbol)
+    sym[2] = nil;      // 未使用(予約)
+    sym[3] = nil;      // 未使用(予約)
     lisp_val_t tagged = (lisp_val_t)(addr | TAG_SYMBOL);
 
     if (g_symbol_count >= MAX_SYMBOLS) {
@@ -729,6 +733,49 @@ lisp_val_t os_make_symbol(const char *name) {
     g_symbol_table[g_symbol_count++] = tagged;
 
     return tagged;
+}
+
+
+/**
+ * name(大文字化される)の新しいsymbolを、名前の重複チェックもg_symbol_tableへの
+ * 登録もせずに作る。gensymが作るsymbolはeqによるアドレス比較でのみ使われ、
+ * 名前から再度探し出す必要が無いため、g_symbol_tableに恒久的に残す理由がない
+ * (登録してしまうと、ガベージコレクションの無いこの実装ではMAX_SYMBOLSの上限を
+ * 際限なく消費してしまう)。word1に非nilのgensymフラグを立てることで、
+ * os_make_symbolが作る通常のinterned symbolと区別できるようにしておく。
+ * @param name symbol名
+ * @return タグ付けされたSYMBOL(g_symbol_tableには登録されない)
+ */
+lisp_val_t os_make_uninterned_symbol(const char *name) {
+    lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
+    lisp_addr_t addr = os_alloc_bytes(32);
+    lisp_val_t *sym = (lisp_val_t *)addr;
+    sym[0] = name_str;          // string へのポインタ
+    sym[1] = os_make_fixnum(1); // gensymフラグ(非nil)
+    sym[2] = nil;                // 未使用(予約)
+    sym[3] = nil;                // 未使用(予約)
+    return (lisp_val_t)(addr | TAG_SYMBOL);
+}
+
+
+/**
+ * symがos_make_uninterned_symbol(gensym)で作られたsymbolかどうかを判定する。
+ * @param sym 判定するSYMBOL
+ * @return gensym由来なら0以外、通常のinterned symbolなら0
+ */
+int os_symbol_is_gensym(lisp_val_t sym) {
+    lisp_addr_t addr = sym & ~TAG_MASK;
+    return ((lisp_val_t *)addr)[1] != nil;
+}
+
+
+/**
+ * g_symbol_tableに現在登録済みのinterned symbol数を返す(テスト・診断用)。
+ * os_make_uninterned_symbol(gensym)が作るsymbolはここに含まれない。
+ * @return 登録済みsymbol数
+ */
+int os_symbol_table_count(void) {
+    return g_symbol_count;
 }
 
 
@@ -3280,11 +3327,13 @@ lisp_val_t primitive_string_to_symbol(lisp_val_t args, lisp_val_t env) {
 static UINT64 g_gensym_counter = 0;
 
 /**
- * 組み込み関数GENSYM。呼ぶたびに"G"+連番の名前で新しいsymbolをintern して返す
- * (真の非intern symbolは未サポート。連番が一巡しない限り重複は起きない)。
+ * 組み込み関数GENSYM。呼ぶたびに"G"+連番の名前で新しいuninterned symbol
+ * (os_make_uninterned_symbol)を作って返す。eqによるアドレス比較でのみ使われる
+ * ことを前提に、g_symbol_tableへの登録は行わない(連番が一巡しない限り
+ * 名前の重複自体は起きない)。
  * @param args 未使用
  * @param env 呼び出し時の環境(未使用)
- * @return 新しくinternされたSYMBOL
+ * @return 新しく作られたuninterned SYMBOL
  */
 lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
     UINT64 n = g_gensym_counter++;
@@ -3305,7 +3354,7 @@ lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
         }
     }
     buf[len] = '\0';
-    return os_make_symbol(buf);
+    return os_make_uninterned_symbol(buf);
 }
 
 /** dimensions引数として一度に受け付けられる最大次元数(rank)。reader.cのREADER_TOKEN_MAX等と同種の固定長バッファ上限 */

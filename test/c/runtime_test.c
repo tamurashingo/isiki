@@ -903,6 +903,16 @@ void test_primitive_gensym() {
     lisp_val_t g2 = primitive_gensym(nil, nil);
     assert((g1 & TAG_MASK) == TAG_SYMBOL, "(gensym)はSYMBOLを返す");
     assert(g1 != g2, "(gensym)を2回呼ぶと異なるsymbolが返る");
+    assert(os_symbol_is_gensym(g1) != 0, "(gensym)が作るsymbolはgensymフラグが立っている");
+
+    lisp_val_t normal_sym = os_make_symbol("SOME-NORMAL-SYMBOL-FOR-GENSYM-TEST");
+    assert(os_symbol_is_gensym(normal_sym) == 0, "os_make_symbolが作る通常のsymbolはgensymフラグが立っていない");
+
+    int count_before = os_symbol_table_count();
+    primitive_gensym(nil, nil);
+    primitive_gensym(nil, nil);
+    int count_after = os_symbol_table_count();
+    assert(count_before == count_after, "(gensym)を呼んでもg_symbol_tableの登録数は増えない");
 }
 
 void test_primitive_make_array_1d() {

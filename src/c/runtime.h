@@ -251,6 +251,28 @@ lisp_val_t os_make_cons(const lisp_val_t car, const lisp_val_t cdr);
 lisp_val_t os_make_symbol(const char *name);
 
 /**
+ * name(大文字化される)の新しいsymbolを、名前の重複チェックもg_symbol_tableへの
+ * 登録もせずに作る(gensym用)。word1に非nilのgensymフラグが立つ。
+ * @param name symbol名
+ * @return タグ付けされたSYMBOL(g_symbol_tableには登録されない)
+ */
+lisp_val_t os_make_uninterned_symbol(const char *name);
+
+/**
+ * symがos_make_uninterned_symbol(gensym)で作られたsymbolかどうかを判定する。
+ * @param sym 判定するSYMBOL
+ * @return gensym由来なら0以外、通常のinterned symbolなら0
+ */
+int os_symbol_is_gensym(lisp_val_t sym);
+
+/**
+ * g_symbol_tableに現在登録済みのinterned symbol数を返す(テスト・診断用)。
+ * os_make_uninterned_symbol(gensym)が作るsymbolはここに含まれない。
+ * @return 登録済みsymbol数
+ */
+int os_symbol_table_count(void);
+
+/**
  * charオブジェクトを作る(即値、ヒープ確保なし)。
  * @param c 表現する文字
  * @return タグ付けされたCHAR
@@ -936,11 +958,11 @@ lisp_val_t primitive_symbol_name(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_string_to_symbol(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数GENSYM。呼ぶたびに"G"+連番の名前で新しいsymbolをintern して返す
- * (真の非intern symbolは未サポート。連番が一巡しない限り重複は起きない)。
+ * 組み込み関数GENSYM。呼ぶたびに"G"+連番の名前で新しいuninterned symbol
+ * (os_make_uninterned_symbol)を作って返す。g_symbol_tableへの登録は行わない。
  * @param args 未使用
  * @param env 呼び出し時の環境(未使用)
- * @return 新しくinternされたSYMBOL
+ * @return 新しく作られたuninterned SYMBOL
  */
 lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env);
 
