@@ -1,0 +1,20 @@
+;; マンデルブロ集合の描画
+(defun mandelbrot ()
+  (with-standard-output (open-output-stream)
+    (for ((y -1.0 (+ y 0.05)))
+         ((> y 1.0) t)
+      (for ((x -2.0 (+ x 0.03)))
+           ((> x 0.5) (format-char (standard-output) #\newline))
+        (let ((zr 0.0) (zi 0.0) (i 0) (hit nil))
+          (for () ((or (> i 30) hit) nil)
+            (let ((zr2 (* zr zr))
+                  (zi2 (* zi zi)))
+              (if (> (+ zr2 zi2) 4.0)
+                  (setq hit t)
+                  (progn
+                    (setq zi (+ (* 2.0 zr zi) y))
+                    (setq zr (+ (- zr2 zi2) x))
+                    (setq i (+ i 1))))))
+          (format-char (standard-output)
+                       (if hit #\space #\*)))))))
+
