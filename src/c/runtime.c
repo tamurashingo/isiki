@@ -249,12 +249,16 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     __asm__ __volatile__ ("cli");
 #endif
     UINT8 *p = g_from_ptr;
-    if (p +aligned > g_from_end) {
-        // From空間が枯渇
-        // TODO: GCを呼ぶ
-        frame_buffer *fb = get_active_frame_buffer();
-        fb->write_string(fb, "out of memory...");
-        for (;;) {
+    if (p + aligned > g_from_end) {
+        // From空間が枯渇。GCを1回走らせて空きを作れるか試す
+        os_gc_collect();
+        p = g_from_ptr;
+        if (p + aligned > g_from_end) {
+            // GC後もなお不足している場合は本当の枯渇として停止する
+            frame_buffer *fb = get_active_frame_buffer();
+            fb->write_string(fb, "out of memory...");
+            for (;;) {
+            }
         }
     }
     g_from_ptr = p + aligned;
@@ -336,6 +340,13 @@ double os_heap_used_ratio(void) {
     }
     UINT64 used = (UINT64)(g_from_ptr - g_from_start);
     return (double)used / (double)total;
+}
+
+/** os_gc_collectが呼ばれた延べ回数。テストが「計算中に実際にGCが発火したか」を確認するために使う */
+static UINT64 g_gc_collect_count = 0;
+
+UINT64 os_gc_collect_count(void) {
+    return g_gc_collect_count;
 }
 
 /* ============================== GC (Cheney方式コピーGC) ============================== */
@@ -581,7 +592,12 @@ static void gc_scan_instance(UINT64 *words) {
             break;
 
         case MAGIC_VECTOR:
-            gc_relocate_vector_block(words);
+            // word1==0はまだ本体ブロックを持たないプレースホルダ(確保直後にラップして
+            // GC_PROTECTし、その後で本体ブロックを確保する構築中の状態)。再配置対象が
+            // 存在しないのでそのまま素通しする
+            if (words[1] != 0) {
+                gc_relocate_vector_block(words);
+            }
             break;
 
         case MAGIC_FLOAT:
@@ -642,11 +658,12 @@ static void gc_scan_queue(void) {
 
 /**
  * Cheney方式のコピーGCを1回実行する。global_environment・g_dynamic_bindings・
- * g_symbol_table・キャッシュ済みg_sym_*・os_gc_register_rootで登録されたrootを
- * ルートとして生存オブジェクトをTo空間へコピーし、完了後にFrom/To空間を入れ替える。
- * トップレベルform間のセーフポイントからのみ呼び出すこと。
+ * g_symbol_table・キャッシュ済みg_sym_*・os_gc_register_rootで登録されたroot・
+ * 全プロセスのshadow stack(GC_PROTECTされたCローカル変数)をルートとして
+ * 生存オブジェクトをTo空間へコピーし、完了後にFrom/To空間を入れ替える。
  */
 void os_gc_collect(void) {
+    g_gc_collect_count++;
     g_to_ptr = g_to_start;
     g_gc_queue_head = 0;
     g_gc_queue_tail = 0;
@@ -709,6 +726,15 @@ void os_gc_collect(void) {
 
     for (UINT64 i = 0; i < g_gc_extra_root_count; i++) {
         *g_gc_extra_roots[i] = gc_copy_value(*g_gc_extra_roots[i]);
+    }
+
+    // 全プロセスのshadow stack(GC_PROTECTされたCローカル変数)をスキャンする。
+    // プリエンプティブなプロセス切替により、実行中でない他プロセスもCスタックの
+    // 途中(evalの再帰の中)で停止しているだけなので、自プロセスだけでなく全プロセスを辿る
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        for (gc_rootnode *node = get_process(i)->gc_roots; node != 0; node = node->next) {
+            *node->var_ptr = gc_copy_value(*node->var_ptr);
+        }
     }
 
     gc_scan_queue();
@@ -1091,7 +1117,9 @@ int os_fixnum_is_negative(lisp_val_t val) {
  * @param cdr cdrに入れる値
  * @return タグ付けされたCONS
  */
-lisp_val_t os_make_cons(const lisp_val_t car, const lisp_val_t cdr) {
+lisp_val_t os_make_cons(lisp_val_t car, lisp_val_t cdr) {
+    GC_PROTECT(car);
+    GC_PROTECT(cdr);
     lisp_addr_t cons_addr = os_alloc_bytes(16);
     lisp_val_t *cell = (lisp_val_t *)cons_addr;
     cell[0] = car;
@@ -1130,6 +1158,7 @@ lisp_val_t os_make_symbol(const char *name) {
    }
 
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
+    GC_PROTECT(name_str);
     lisp_addr_t addr = os_alloc_bytes(32);
     lisp_val_t *sym = (lisp_val_t *)addr;
     sym[0] = name_str; // string へのポインタ
@@ -1165,6 +1194,7 @@ lisp_val_t os_make_symbol(const char *name) {
  */
 lisp_val_t os_make_uninterned_symbol(const char *name) {
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
+    GC_PROTECT(name_str);
     lisp_addr_t addr = os_alloc_bytes(32);
     lisp_val_t *sym = (lisp_val_t *)addr;
     sym[0] = name_str;          // string へのポインタ
@@ -1193,6 +1223,23 @@ int os_symbol_is_gensym(lisp_val_t sym) {
  */
 int os_symbol_table_count(void) {
     return g_symbol_count;
+}
+
+/**
+ * g_symbol_table・global_environment・g_dynamic_bindings・追加GC rootを初期状態に戻す
+ * (テスト専用)。本体はos_heap_init/os_bootstrapを起動時に1回しか呼ばないため
+ * 不要だが、1プロセス内でヒープを何度も再確保して起動し直すユニットテストでは、
+ * これらのstatic変数がヒープの再確保をまたいで残ってしまう。特にg_symbol_tableが
+ * 残っていると、os_make_symbolの重複チェックが以前の(既に破棄された)ヒープ上の
+ * symbolをそのまま返してしまい、新しいヒープのFrom/To空間の外を指すstaleな参照が
+ * GCのルートに混入する。os_heap_initの直後に呼ぶことで、各テストが真に独立した
+ * クリーンな状態からブートストラップできるようにする。
+ */
+void os_reset_runtime_state_for_test(void) {
+    g_symbol_count = 0;
+    global_environment = nil;
+    g_dynamic_bindings = nil;
+    g_gc_extra_root_count = 0;
 }
 
 
@@ -1241,6 +1288,12 @@ void os_string_to_cstr(lisp_val_t str, char *out, UINT32 out_cap) {
  * @return タグ付けされたINSTANCE
  */
 lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
+    // w1/w2/w3はUINT64だが、呼び出し元によっては実体がタグ付きのlisp_val_t(生存中の
+    // ヒープオブジェクトへの参照)であることがある。os_alloc_bytesがOOM時にos_gc_collect
+    // を発火させうるため、GCで再配置されても追随できるよう確保前にGC_PROTECTする
+    GC_PROTECT(w1);
+    GC_PROTECT(w2);
+    GC_PROTECT(w3);
     lisp_addr_t addr = os_alloc_bytes(32);
     UINT64 *obj = (UINT64 *)addr;
     obj[0] = magic;
@@ -1262,6 +1315,8 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
  */
 lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     // TODO: env_name が TAG_SYMBOL のチェック
+    GC_PROTECT(env_symbol);
+    GC_PROTECT(parent_env);
 
 
     /*-
@@ -1277,15 +1332,24 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
      * 4番目(parent)までしか固定位置参照しないため、末尾に追加するだけで既存コードに影響しない
      */
     lisp_val_t name_symbol = os_make_symbol("name");
+    GC_PROTECT(name_symbol);
     lisp_val_t variables_symbol = os_make_symbol("variables");
+    GC_PROTECT(variables_symbol);
     lisp_val_t functions_symbol = os_make_symbol("functions");
+    GC_PROTECT(functions_symbol);
     lisp_val_t parent_symbol = os_make_symbol("parent");
+    GC_PROTECT(parent_symbol);
     lisp_val_t constants_symbol = os_make_symbol("constants");
+    GC_PROTECT(constants_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
+    GC_PROTECT(name_slot);
     lisp_val_t variables_slot = os_make_cons(variables_symbol, nil);
+    GC_PROTECT(variables_slot);
     lisp_val_t functions_slot = os_make_cons(functions_symbol, nil);
+    GC_PROTECT(functions_slot);
     lisp_val_t parent_slot = os_make_cons(parent_symbol, parent_env);
+    GC_PROTECT(parent_slot);
     lisp_val_t constants_slot = os_make_cons(constants_symbol, nil);
 
     lisp_val_t list_step4 = os_make_cons(constants_slot, nil);
@@ -1335,13 +1399,17 @@ int os_is_constant(lisp_val_t sym, lisp_val_t env) {
  */
 void os_mark_constant(lisp_val_t sym, lisp_val_t env) {
     lisp_val_t const_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))));
-    lisp_addr_t const_slot_addr = const_slot & ~TAG_MASK;
+    GC_PROTECT(const_slot);
     lisp_val_t alist = cc_cdr(const_slot);
+    GC_PROTECT(alist);
 
     if (cc_assoc_eq(sym, alist) != nil) {
         return;
     }
     lisp_val_t new_pair = os_make_cons(sym, g_sym_t);
+    // os_make_consでGCが発火しconst_slotが移動している可能性があるため、
+    // 書き込み先アドレスはconst_slot(GC_PROTECT済み)から今読み直す
+    lisp_addr_t const_slot_addr = const_slot & ~TAG_MASK;
     ((lisp_val_t *)const_slot_addr)[1] = os_make_cons(new_pair, alist);
 }
 
@@ -1383,8 +1451,10 @@ lisp_val_t os_make_native_function(UINT64 fnptr) {
 }
 
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
+    GC_PROTECT(env);
     lisp_val_t make_instance_fn = os_get_function(g_sym_make_instance, env);
     lisp_val_t signal_condition_fn = os_get_function(g_sym_signal_condition, env);
+    GC_PROTECT(signal_condition_fn);
     if (make_instance_fn == nil || signal_condition_fn == nil) {
         // init.lisp未ロード(make-instance/signal-conditionが未定義)時のフォールバック
         return g_sym_eval_error;
@@ -1416,6 +1486,8 @@ lisp_val_t os_resolve_class(lisp_val_t class_name_sym, lisp_val_t env) {
  *         init.lisp未ロードの場合はg_sym_eval_error
  */
 static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t env) {
+    GC_PROTECT(offending_object);
+    GC_PROTECT(env);
     lisp_val_t number_class = os_resolve_class(g_sym_class_number, env);
     if (number_class == g_sym_eval_error || os_is_control_transfer(number_class)) {
         return number_class;
@@ -1435,11 +1507,14 @@ static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t en
  * @return val 自身
  */
 lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
+    // 新規追加パスではos_make_cons後にvalをreturnで読み直すため保護する
+    GC_PROTECT(val);
     // current environment の (variables . alist) のペアを取り出す(cadr)
     lisp_val_t var_slot = cc_car(cc_cdr(env));
-    lisp_addr_t var_slot_addr = var_slot & ~TAG_MASK;
+    GC_PROTECT(var_slot);
 
     lisp_val_t alist = cc_cdr(var_slot); // cdr (alist)
+    GC_PROTECT(alist);
     lisp_val_t existing_pair = cc_assoc_eq(sym, alist);
 
     if (existing_pair != nil) {
@@ -1448,6 +1523,9 @@ lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
     } else {
         // 新規追加
         lisp_val_t new_pair = os_make_cons(sym, val);
+        // os_make_consでGCが発火しvar_slotが移動している可能性があるため、
+        // 書き込み先アドレスはvar_slot(GC_PROTECT済み)から今読み直す
+        lisp_addr_t var_slot_addr = var_slot & ~TAG_MASK;
         // (push new-pair alist)
         ((lisp_val_t *)var_slot_addr)[1] = os_make_cons(new_pair, alist);
     }
@@ -1501,14 +1579,17 @@ lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
  * @return fn_obj 自身
  */
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
+    // 新規追加パスではos_make_cons後にfn_objをreturnで読み直すため保護する
+    GC_PROTECT(fn_obj);
     // current environment から (functions . alist) のペアを取り出すため、 cddr を取る
     lisp_val_t next_cell = cc_cdr(cc_cdr(env));
 
     // (functions . alist) のペアを取り出す
     lisp_val_t func_slot = cc_car(next_cell);
-    lisp_addr_t func_slot_addr = func_slot & ~TAG_MASK;
+    GC_PROTECT(func_slot);
 
     lisp_val_t alist = cc_cdr(func_slot); // cdr (alist)
+    GC_PROTECT(alist);
     lisp_val_t existing_pair = cc_assoc_eq(sym, alist);
 
     if (existing_pair != nil) {
@@ -1517,6 +1598,9 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
     } else {
         // 新規追加
         lisp_val_t new_pair = os_make_cons(sym, fn_obj);
+        // os_make_consでGCが発火しfunc_slotが移動している可能性があるため、
+        // 書き込み先アドレスはfunc_slot(GC_PROTECT済み)から今読み直す
+        lisp_addr_t func_slot_addr = func_slot & ~TAG_MASK;
         // (push new-pair alist)
         ((lisp_val_t *)func_slot_addr)[1] = os_make_cons(new_pair, alist);
     }
@@ -1748,12 +1832,21 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
         }
     }
 
+    // 先にcount=0のプレースホルダでMAGIC_BIGNUMをラップしGC_PROTECTしてからlimbバッファを
+    // 確保する。プレースホルダはgc_relocate_bignumがword2(count)==0なら何もコピーしないため
+    // 安全であり、書き込みはword3(limb配列アドレス)→word2(count)の順に行うことで、
+    // 「countだけ確定してaddrが未確定」という危険な中間状態を作らない
+    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
+    GC_PROTECT(bignum);
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
         dst[i] = limbs[i];
     }
-    return os_make_instance(MAGIC_BIGNUM, (UINT64)sign, count, (UINT64)limb_addr);
+    UINT64 *words = (UINT64 *)(bignum & ~TAG_MASK);
+    words[3] = (UINT64)limb_addr;
+    words[2] = count;
+    return bignum;
 }
 
 /**
@@ -1881,6 +1974,8 @@ static int number_compare(lisp_val_t a, lisp_val_t b) {
  * @param div_by_zero z2が0の場合に1を設定する(このときdiv_out/mod_outは未定義)
  */
 static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp_val_t *mod_out, int *div_by_zero) {
+    GC_PROTECT(z1);
+    GC_PROTECT(z2);
     signed_mag_t m1, m2;
     decompose(z1, &m1);
     decompose(z2, &m2);
@@ -1893,33 +1988,57 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
 
     UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
     UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
+    // os_alloc_bytesを2回挟んだのでm1/m2のlimbsを再取得してから使う
+    decompose(z1, &m1);
+    decompose(z2, &m2);
     UINT64 quot_len, rem_len;
     mag_divmod(m1.limbs, m1.count, m2.limbs, m2.count, quot_buf, &quot_len, rem_buf, &rem_len);
+    int m1_sign = m1.sign;
+    int m2_sign = m2.sign;
 
     if (rem_len == 1 && rem_buf[0] == 0) {
-        // 割り切れる: mod=0、divの符号はオペランドの符号のXOR
-        int div_sign = (m1.sign != m2.sign);
+        // 割り切れる: mod=0、divの符号はオペランドの符号のXOR(quot_bufはmag_divmod直後で未確保区間なので安全)
+        int div_sign = (m1_sign != m2_sign);
         *div_out = os_make_integer(div_sign, quot_buf, quot_len);
         *mod_out = os_make_fixnum(0);
         return;
     }
 
-    if (m1.sign == m2.sign) {
+    // quot_buf/rem_bufは以降のアロケーションを挟むと追従しない生バッファなので、
+    // 直後にMAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
+    lisp_val_t quot_wrapped = os_make_integer(0, quot_buf, quot_len);
+    GC_PROTECT(quot_wrapped);
+    lisp_val_t rem_wrapped = os_make_integer(0, rem_buf, rem_len);
+    GC_PROTECT(rem_wrapped);
+
+    if (m1_sign == m2_sign) {
         // 同符号: truncate除算とfloor除算が一致する
-        *div_out = os_make_integer(0, quot_buf, quot_len);
-        *mod_out = os_make_integer(m2.sign, rem_buf, rem_len);
+        signed_mag_t mq, mr;
+        decompose(quot_wrapped, &mq);
+        *div_out = os_make_integer(0, mq.limbs, mq.count);
+        decompose(rem_wrapped, &mr);
+        *mod_out = os_make_integer(m2_sign, mr.limbs, mr.count);
         return;
     }
 
     // 異符号: div = -(q_trunc+1)、mod = |z2| - r_trunc (符号はz2に一致)
     UINT64 one[1] = {1};
-    UINT64 *div_mag_buf = (UINT64 *)os_alloc_bytes(8 * (quot_len + 1));
-    UINT64 div_mag_len = mag_add(quot_buf, quot_len, one, 1, div_mag_buf);
-    *div_out = os_make_integer(1, div_mag_buf, div_mag_len);
+    signed_mag_t mq;
+    decompose(quot_wrapped, &mq);
+    UINT64 *div_mag_buf = (UINT64 *)os_alloc_bytes(8 * (mq.count + 1));
+    decompose(quot_wrapped, &mq);
+    UINT64 div_mag_len = mag_add(mq.limbs, mq.count, one, 1, div_mag_buf);
+    lisp_val_t div_result = os_make_integer(1, div_mag_buf, div_mag_len);
+    GC_PROTECT(div_result);
 
+    decompose(z2, &m2);
     UINT64 *mod_mag_buf = (UINT64 *)os_alloc_bytes(8 * m2.count);
-    UINT64 mod_mag_len = mag_sub(m2.limbs, m2.count, rem_buf, rem_len, mod_mag_buf);
-    *mod_out = os_make_integer(m2.sign, mod_mag_buf, mod_mag_len);
+    decompose(z2, &m2);
+    signed_mag_t mr;
+    decompose(rem_wrapped, &mr);
+    UINT64 mod_mag_len = mag_sub(m2.limbs, m2.count, mr.limbs, mr.count, mod_mag_buf);
+    *mod_out = os_make_integer(m2_sign, mod_mag_buf, mod_mag_len);
+    *div_out = div_result;
 }
 
 /**
@@ -1928,36 +2047,51 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
  * @param out_limbs 結果のlimb配列(新規にヒープ確保したもの)の格納先
  * @param out_len 結果の実効長の格納先
  */
-static void mag_gcd(UINT64 *a, UINT64 alen, UINT64 *b, UINT64 blen, UINT64 **out_limbs, UINT64 *out_len) {
-    alen = mag_len(a, alen);
-    blen = mag_len(b, blen);
+static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
+    // cur_a/cur_bはイテレーションを跨いで生き続ける必要があるため、生バッファのまま
+    // 保持せず、確保直後にMAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
+    GC_PROTECT(a_val);
+    GC_PROTECT(b_val);
+    signed_mag_t ma, mb;
+    decompose(a_val, &ma);
+    decompose(b_val, &mb);
 
-    UINT64 *cur_a = (UINT64 *)os_alloc_bytes(8 * alen);
-    for (UINT64 i = 0; i < alen; i++) {
-        cur_a[i] = a[i];
+    UINT64 *cur_a_buf = (UINT64 *)os_alloc_bytes(8 * ma.count);
+    decompose(a_val, &ma);
+    for (UINT64 i = 0; i < ma.count; i++) {
+        cur_a_buf[i] = ma.limbs[i];
     }
-    UINT64 cur_alen = alen;
+    lisp_val_t cur_a = os_make_integer(0, cur_a_buf, ma.count);
+    GC_PROTECT(cur_a);
 
-    UINT64 *cur_b = (UINT64 *)os_alloc_bytes(8 * blen);
-    for (UINT64 i = 0; i < blen; i++) {
-        cur_b[i] = b[i];
+    decompose(b_val, &mb);
+    UINT64 *cur_b_buf = (UINT64 *)os_alloc_bytes(8 * mb.count);
+    decompose(b_val, &mb);
+    for (UINT64 i = 0; i < mb.count; i++) {
+        cur_b_buf[i] = mb.limbs[i];
     }
-    UINT64 cur_blen = blen;
+    lisp_val_t cur_b = os_make_integer(0, cur_b_buf, mb.count);
+    GC_PROTECT(cur_b);
 
-    while (!(cur_blen == 1 && cur_b[0] == 0)) {
-        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * cur_alen);
-        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * cur_alen);
+    signed_mag_t mcb;
+    decompose(cur_b, &mcb);
+    while (!(mcb.count == 1 && mcb.limbs[0] == 0)) {
+        signed_mag_t mca;
+        decompose(cur_a, &mca);
+        decompose(cur_b, &mcb);
+        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * mca.count);
+        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * mca.count);
+        decompose(cur_a, &mca);
+        decompose(cur_b, &mcb);
         UINT64 quot_len, rem_len;
-        mag_divmod(cur_a, cur_alen, cur_b, cur_blen, quot_buf, &quot_len, rem_buf, &rem_len);
+        mag_divmod(mca.limbs, mca.count, mcb.limbs, mcb.count, quot_buf, &quot_len, rem_buf, &rem_len);
 
         cur_a = cur_b;
-        cur_alen = cur_blen;
-        cur_b = rem_buf;
-        cur_blen = rem_len;
+        cur_b = os_make_integer(0, rem_buf, rem_len);
+        decompose(cur_b, &mcb);
     }
 
-    *out_limbs = cur_a;
-    *out_len = cur_alen;
+    return cur_a;
 }
 
 /**
@@ -1967,42 +2101,63 @@ static void mag_gcd(UINT64 *a, UINT64 alen, UINT64 *b, UINT64 blen, UINT64 **out
  * @param out_limbs 結果のlimb配列(新規にヒープ確保したもの)の格納先
  * @param out_len 結果の実効長の格納先
  */
-static void mag_isqrt(UINT64 *n, UINT64 nlen, UINT64 **out_limbs, UINT64 *out_len) {
-    nlen = mag_len(n, nlen);
+static lisp_val_t mag_isqrt(lisp_val_t n_val) {
+    // x/yはイテレーションを跨いで生き続ける必要があるため、生バッファのまま保持せず、
+    // 確保直後にMAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
+    GC_PROTECT(n_val);
+    signed_mag_t mn;
+    decompose(n_val, &mn);
+    UINT64 nlen = mn.count;
 
-    UINT64 *x = (UINT64 *)os_alloc_bytes(8 * nlen);
+    UINT64 *x_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+    decompose(n_val, &mn);
     for (UINT64 i = 0; i < nlen; i++) {
-        x[i] = n[i];
+        x_buf[i] = mn.limbs[i];
     }
-    UINT64 xlen = nlen;
+    lisp_val_t x = os_make_integer(0, x_buf, nlen);
+    GC_PROTECT(x);
 
     UINT64 one[1] = {1};
     UINT64 dummy_rem;
 
-    UINT64 *xp1 = (UINT64 *)os_alloc_bytes(8 * (xlen + 1));
-    UINT64 xp1_len = mag_add(x, xlen, one, 1, xp1);
-    UINT64 ylen = mag_divmod_small(xp1, xp1_len, 2, &dummy_rem);
-    UINT64 *y = xp1;
+    signed_mag_t mx;
+    decompose(x, &mx);
+    UINT64 *xp1_buf = (UINT64 *)os_alloc_bytes(8 * (mx.count + 1));
+    decompose(x, &mx);
+    UINT64 xp1_len = mag_add(mx.limbs, mx.count, one, 1, xp1_buf);
+    UINT64 ylen = mag_divmod_small(xp1_buf, xp1_len, 2, &dummy_rem);
+    lisp_val_t y = os_make_integer(0, xp1_buf, ylen);
+    GC_PROTECT(y);
 
-    while (mag_compare(y, ylen, x, xlen) < 0) {
+    signed_mag_t my_mag, mx_mag;
+    decompose(y, &my_mag);
+    decompose(x, &mx_mag);
+    while (mag_compare(my_mag.limbs, my_mag.count, mx_mag.limbs, mx_mag.count) < 0) {
         x = y;
-        xlen = ylen;
 
+        decompose(n_val, &mn);
+        decompose(x, &mx_mag);
         UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
         UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+        decompose(n_val, &mn);
+        decompose(x, &mx_mag);
         UINT64 quot_len, rem_len;
-        mag_divmod(n, nlen, x, xlen, quot_buf, &quot_len, rem_buf, &rem_len);
+        mag_divmod(mn.limbs, mn.count, mx_mag.limbs, mx_mag.count, quot_buf, &quot_len, rem_buf, &rem_len);
 
-        UINT64 cap = (xlen > quot_len ? xlen : quot_len) + 1;
+        decompose(x, &mx_mag);
+        UINT64 cap = (mx_mag.count > quot_len ? mx_mag.count : quot_len) + 1;
         UINT64 *sum_buf = (UINT64 *)os_alloc_bytes(8 * cap);
-        UINT64 sum_len = mag_add(x, xlen, quot_buf, quot_len, sum_buf);
+        decompose(x, &mx_mag);
+        UINT64 sum_len = mag_add(mx_mag.limbs, mx_mag.count, quot_buf, quot_len, sum_buf);
 
         ylen = mag_divmod_small(sum_buf, sum_len, 2, &dummy_rem);
-        y = sum_buf;
+        y = os_make_integer(0, sum_buf, ylen);
+
+        decompose(y, &my_mag);
+        decompose(x, &mx_mag);
     }
 
-    *out_limbs = x;
-    *out_len = xlen;
+    return x;
 }
 
 
@@ -2066,18 +2221,26 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
         return os_make_fixnum(sum);
     }
 
-    signed_mag_t acc;
-    UINT64 acc_zero[1] = {0};
-    acc.sign = 0;
-    acc.limbs = acc_zero;
-    acc.count = 1;
+    // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
+    // アドレスをGCに追跡させる必要がある
+    lisp_val_t cur = args;
+    GC_PROTECT(cur);
 
-    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+    // accはイテレーションを跨いで生き続ける生バッファを持たせず、確保直後に
+    // MAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
+    lisp_val_t acc_val = os_make_fixnum(0);
+    GC_PROTECT(acc_val);
+    signed_mag_t acc;
+
+    for (; cur != nil; cur = cc_cdr(cur)) {
         signed_mag_t operand;
         decompose(cc_car(cur), &operand);
+        decompose(acc_val, &acc);
 
         UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
         UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        decompose(cc_car(cur), &operand);
+        decompose(acc_val, &acc);
         UINT64 result_len;
         int result_sign;
 
@@ -2092,12 +2255,10 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
             result_sign = operand.sign;
         }
 
-        acc.sign = result_sign;
-        acc.limbs = result;
-        acc.count = result_len;
+        acc_val = os_make_integer(result_sign, result, result_len);
     }
 
-    return os_make_integer(acc.sign, acc.limbs, acc.count);
+    return acc_val;
 }
 
 /**
@@ -2154,14 +2315,26 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
         return os_make_fixnum(result);
     }
 
+    // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
+    // アドレスをGCに追跡させる必要がある
+    lisp_val_t rest = cc_cdr(args);
+    GC_PROTECT(rest);
+
+    // accはイテレーションを跨いで生き続ける生バッファを持たせず、確保直後に
+    // MAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
+    lisp_val_t acc_val = first;
+    GC_PROTECT(acc_val);
     signed_mag_t acc;
-    decompose(first, &acc);
-    for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+
+    for (; rest != nil; rest = cc_cdr(rest)) {
         signed_mag_t operand;
         decompose(cc_car(rest), &operand);
+        decompose(acc_val, &acc);
 
         UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
         UINT64 *result_buf = (UINT64 *)os_alloc_bytes(8 * cap);
+        decompose(cc_car(rest), &operand);
+        decompose(acc_val, &acc);
         UINT64 result_len;
         int result_sign;
 
@@ -2176,12 +2349,10 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
             result_sign = !acc.sign;
         }
 
-        acc.sign = result_sign;
-        acc.limbs = result_buf;
-        acc.count = result_len;
+        acc_val = os_make_integer(result_sign, result_buf, result_len);
     }
 
-    return os_make_integer(acc.sign, acc.limbs, acc.count);
+    return acc_val;
 }
 
 /**
@@ -2255,26 +2426,33 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
         return os_make_fixnum(product);
     }
 
-    signed_mag_t acc;
-    UINT64 acc_one[1] = {1};
-    acc.sign = 0;
-    acc.limbs = acc_one;
-    acc.count = 1;
+    // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
+    // アドレスをGCに追跡させる必要がある
+    lisp_val_t cur = args;
+    GC_PROTECT(cur);
 
-    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+    // accはイテレーションを跨いで生き続ける生バッファを持たせず、確保直後に
+    // MAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
+    lisp_val_t acc_val = os_make_fixnum(1);
+    GC_PROTECT(acc_val);
+    signed_mag_t acc;
+
+    for (; cur != nil; cur = cc_cdr(cur)) {
         signed_mag_t operand;
         decompose(cc_car(cur), &operand);
+        decompose(acc_val, &acc);
 
         UINT64 cap = acc.count + operand.count;
         UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        decompose(cc_car(cur), &operand);
+        decompose(acc_val, &acc);
         UINT64 result_len = mag_mul(acc.limbs, acc.count, operand.limbs, operand.count, result);
 
-        acc.sign = (acc.sign != operand.sign);
-        acc.limbs = result;
-        acc.count = result_len;
+        int result_sign = (acc.sign != operand.sign);
+        acc_val = os_make_integer(result_sign, result, result_len);
     }
 
-    return os_make_integer(acc.sign, acc.limbs, acc.count);
+    return acc_val;
 }
 
 /**
@@ -2319,9 +2497,18 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
         return os_make_fixnum(result);
     }
 
+    // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
+    // アドレスをGCに追跡させる必要がある
+    lisp_val_t rest = cc_cdr(args);
+    GC_PROTECT(rest);
+
+    // accはイテレーションを跨いで生き続ける生バッファを持たせず、確保直後に
+    // MAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
+    lisp_val_t acc_val = first;
+    GC_PROTECT(acc_val);
     signed_mag_t acc;
-    decompose(first, &acc);
-    for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
+
+    for (; rest != nil; rest = cc_cdr(rest)) {
         signed_mag_t operand;
         decompose(cc_car(rest), &operand);
 
@@ -2329,17 +2516,20 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
             return g_sym_eval_error;
         }
 
+        decompose(acc_val, &acc);
         UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        decompose(acc_val, &acc);
         UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        decompose(cc_car(rest), &operand);
+        decompose(acc_val, &acc);
         UINT64 quot_len, rem_len;
         mag_divmod(acc.limbs, acc.count, operand.limbs, operand.count, quot_buf, &quot_len, rem_buf, &rem_len);
 
-        acc.sign = (acc.sign != operand.sign);
-        acc.limbs = quot_buf;
-        acc.count = quot_len;
+        int result_sign = (acc.sign != operand.sign);
+        acc_val = os_make_integer(result_sign, quot_buf, quot_len);
     }
 
-    return os_make_integer(acc.sign, acc.limbs, acc.count);
+    return acc_val;
 }
 
 /**
@@ -2539,15 +2729,9 @@ lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
  * @return 最大公約数(非負整数)
  */
 lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env) {
-    signed_mag_t m1, m2;
-    decompose(cc_car(args), &m1);
-    decompose(cc_car(cc_cdr(args)), &m2);
-
-    UINT64 *gcd_limbs;
-    UINT64 gcd_len;
-    mag_gcd(m1.limbs, m1.count, m2.limbs, m2.count, &gcd_limbs, &gcd_len);
-
-    return os_make_integer(0, gcd_limbs, gcd_len);
+    lisp_val_t z1 = cc_car(args);
+    lisp_val_t z2 = cc_car(cc_cdr(args));
+    return mag_gcd(z1, z2);
 }
 
 /**
@@ -2558,25 +2742,40 @@ lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env) {
  * @return 最小公倍数(非負整数)
  */
 lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
-    signed_mag_t m1, m2;
-    decompose(cc_car(args), &m1);
-    decompose(cc_car(cc_cdr(args)), &m2);
+    lisp_val_t z1 = cc_car(args);
+    lisp_val_t z2 = cc_car(cc_cdr(args));
+    GC_PROTECT(z1);
+    GC_PROTECT(z2);
 
-    UINT64 *gcd_limbs;
-    UINT64 gcd_len;
-    mag_gcd(m1.limbs, m1.count, m2.limbs, m2.count, &gcd_limbs, &gcd_len);
+    lisp_val_t gcd_val = mag_gcd(z1, z2);
+    GC_PROTECT(gcd_val);
 
-    if (gcd_len == 1 && gcd_limbs[0] == 0) {
+    signed_mag_t mg;
+    decompose(gcd_val, &mg);
+    if (mg.count == 1 && mg.limbs[0] == 0) {
         return os_make_fixnum(0);
     }
 
+    signed_mag_t m1, m2;
+    decompose(z1, &m1);
+    decompose(z2, &m2);
     UINT64 *prod_buf = (UINT64 *)os_alloc_bytes(8 * (m1.count + m2.count));
+    decompose(z1, &m1);
+    decompose(z2, &m2);
     UINT64 prod_len = mag_mul(m1.limbs, m1.count, m2.limbs, m2.count, prod_buf);
+    // prod_bufはこの後さらにアロケーションを挟むので確保直後に包んでGC_PROTECTする
+    lisp_val_t prod_val = os_make_integer(0, prod_buf, prod_len);
+    GC_PROTECT(prod_val);
 
-    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * prod_len);
-    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * prod_len);
+    signed_mag_t mp;
+    decompose(prod_val, &mp);
+    decompose(gcd_val, &mg);
+    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * mp.count);
+    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * mp.count);
+    decompose(prod_val, &mp);
+    decompose(gcd_val, &mg);
     UINT64 quot_len, rem_len;
-    mag_divmod(prod_buf, prod_len, gcd_limbs, gcd_len, quot_buf, &quot_len, rem_buf, &rem_len);
+    mag_divmod(mp.limbs, mp.count, mg.limbs, mg.count, quot_buf, &quot_len, rem_buf, &rem_len);
 
     return os_make_integer(0, quot_buf, quot_len);
 }
@@ -2596,11 +2795,7 @@ lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env) {
         return g_sym_eval_error;
     }
 
-    UINT64 *out_limbs;
-    UINT64 out_len;
-    mag_isqrt(m.limbs, m.count, &out_limbs, &out_len);
-
-    return os_make_integer(0, out_limbs, out_len);
+    return mag_isqrt(val);
 }
 
 /**
@@ -2639,20 +2834,25 @@ lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
         return os_make_float(sqrt_fpu(d));
     }
 
+    GC_PROTECT(val);
     signed_mag_t m;
     decompose(val, &m);
     if (m.sign) {
         return signal_domain_error(val, env);
     }
 
-    UINT64 *out_limbs;
-    UINT64 out_len;
-    mag_isqrt(m.limbs, m.count, &out_limbs, &out_len);
+    lisp_val_t root = mag_isqrt(val);
+    GC_PROTECT(root);
 
-    UINT64 *sq_buf = (UINT64 *)os_alloc_bytes(8 * out_len * 2);
-    UINT64 sq_len = mag_mul(out_limbs, out_len, out_limbs, out_len, sq_buf);
+    signed_mag_t mr;
+    decompose(root, &mr);
+    UINT64 *sq_buf = (UINT64 *)os_alloc_bytes(8 * mr.count * 2);
+    decompose(root, &mr);
+    UINT64 sq_len = mag_mul(mr.limbs, mr.count, mr.limbs, mr.count, sq_buf);
+
+    decompose(val, &m);
     if (mag_compare(sq_buf, sq_len, m.limbs, m.count) == 0) {
-        return os_make_integer(0, out_limbs, out_len);
+        return root;
     }
 
     return os_make_float(sqrt_fpu(to_double(val)));
@@ -3575,6 +3775,7 @@ lisp_val_t primitive_string_index(lisp_val_t args, lisp_val_t env) {
  * @return 連結結果のSTRING
  */
 lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env) {
+    GC_PROTECT(args);
     UINT64 total_len = 0;
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
         lisp_addr_t addr = cc_car(cur) & ~TAG_MASK;
@@ -3826,17 +4027,25 @@ lisp_val_t *os_vector_header(lisp_val_t vec) {
 }
 
 lisp_val_t os_make_vector_from_list(lisp_val_t list) {
+    GC_PROTECT(list);
     UINT64 count = 0;
     for (lisp_val_t cur = list; cur != nil; cur = cc_cdr(cur)) {
         count++;
     }
+    // まずword1=0のプレースホルダでVECTORをラップしGC_PROTECTしてから本体ブロックを
+    // 確保する。本体ブロック確保中にGCが発火してもラップ済みのVECTOR自身は根から
+    // 再配置されるため安全であり、ブロックへの書き込みが終わるまでアロケーションを
+    // 挟まないことで、ブロックがどのタグ付き値からも到達不能な期間を作らない
+    lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
+    GC_PROTECT(vec);
     lisp_addr_t addr = alloc_vector_block(1, &count);
     lisp_val_t *data = (lisp_val_t *)(addr + 16);
     UINT64 i = 0;
     for (lisp_val_t cur = list; cur != nil; cur = cc_cdr(cur)) {
         data[i++] = cc_car(cur);
     }
-    return os_make_instance(MAGIC_VECTOR, (UINT64)addr, 0, 0);
+    ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
+    return vec;
 }
 
 /**
@@ -3862,13 +4071,17 @@ lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
     UINT64 count = cc_car(args) >> 3;
     lisp_val_t rest = cc_cdr(args);
     lisp_val_t init = (rest != nil) ? cc_car(rest) : nil;
+    GC_PROTECT(init);
 
+    lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
+    GC_PROTECT(vec);
     lisp_addr_t addr = alloc_vector_block(1, &count);
     lisp_val_t *data = (lisp_val_t *)(addr + 16);
     for (UINT64 i = 0; i < count; i++) {
         data[i] = init;
     }
-    return os_make_instance(MAGIC_VECTOR, (UINT64)addr, 0, 0);
+    ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
+    return vec;
 }
 
 /**
@@ -3897,13 +4110,16 @@ lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
         total *= dims[i];
     }
 
+    lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
+    GC_PROTECT(vec);
     lisp_addr_t addr = alloc_vector_block(rank, dims);
     lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
     for (UINT64 i = 0; i < total; i++) {
         data[i] = nil;
     }
 
-    return os_make_instance(MAGIC_VECTOR, (UINT64)addr, 0, 0);
+    ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
+    return vec;
 }
 
 /**
@@ -3962,6 +4178,7 @@ lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
     lisp_val_t array = cc_car(args);
+    GC_PROTECT(array);
 
     if ((array & TAG_MASK) == TAG_STRING) {
         lisp_addr_t addr = array & ~TAG_MASK;
@@ -3977,7 +4194,9 @@ lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
     UINT64 rank = header[0];
 
     lisp_val_t result = nil;
+    GC_PROTECT(result);
     for (UINT64 i = rank; i > 0; i--) {
+        header = vector_header(array);
         result = os_make_cons(os_make_fixnum(header[i]), result);
     }
     return result;
@@ -4255,11 +4474,14 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
     switch (seq & TAG_MASK) {
         case TAG_CONS: {
             lisp_val_t cur = seq;
+            GC_PROTECT(cur);
             for (UINT64 i = 0; i < z1; i++) {
                 cur = cc_cdr(cur);
             }
             lisp_val_t result = nil;
             lisp_val_t prev = nil;
+            GC_PROTECT(result);
+            GC_PROTECT(prev);
             for (UINT64 i = 0; i < out_len; i++) {
                 lisp_val_t cell = os_make_cons(cc_car(cur), nil);
                 if (prev == nil) {
@@ -4273,9 +4495,10 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
             return result;
         }
         case TAG_STRING: {
+            GC_PROTECT(seq);
+            lisp_addr_t out_addr = os_alloc_bytes(8 + out_len);
             lisp_addr_t addr = seq & ~TAG_MASK;
             UINT8 *bytes = (UINT8 *)(addr + 8);
-            lisp_addr_t out_addr = os_alloc_bytes(8 + out_len);
             ((lisp_val_t *)out_addr)[0] = out_len;
             UINT8 *out_bytes = (UINT8 *)(out_addr + 8);
             for (UINT64 i = 0; i < out_len; i++) {
@@ -4287,15 +4510,20 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
             if (!is_vector(seq)) {
                 return g_sym_eval_error;
             }
+            GC_PROTECT(seq);
+            lisp_val_t out_vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
+            GC_PROTECT(out_vec);
+            lisp_addr_t out_addr = alloc_vector_block(1, &out_len);
+            // out_addr確保後はseqから再度header/dataを取り直す(GCでseqが再配置された可能性がある)
             lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
             lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
-            lisp_addr_t out_addr = alloc_vector_block(1, &out_len);
             lisp_val_t *out_data = (lisp_val_t *)(out_addr + 16);
             for (UINT64 i = 0; i < out_len; i++) {
                 out_data[i] = data[z1 + i];
             }
-            return os_make_instance(MAGIC_VECTOR, (UINT64)out_addr, 0, 0);
+            ((UINT64 *)(out_vec & ~TAG_MASK))[1] = (UINT64)out_addr;
+            return out_vec;
         }
         default:
             return g_sym_eval_error;

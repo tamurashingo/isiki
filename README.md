@@ -131,5 +131,5 @@ see [LICENSE](./assets/fonts/LICENSE)
 - 起動時にVirtIO-9pデバイスの検出結果を画面に表示
 - ISLisp準拠のLispを実装
 
-![screenshot](./documents/images/version_0_0_5.png)
+![screenshot](./documents/images/version_0_0_6.png)
 

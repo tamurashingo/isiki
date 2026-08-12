@@ -79,6 +79,30 @@ frame_buffer* get_active_frame_buffer(void) {
     return &g_frame_buffer;
 }
 
+// process.c が参照する switch_active_frame_buffer のダミー実装。
+// このテストでは process の切替えは行わないため、何もしない
+void switch_active_frame_buffer(UINT32 index) {
+    (void)index;
+}
+
+// process.c(process_scheduler_start/process_trampoline_c)が参照する
+// interrupt.c/repl.cの関数のダミー実装。ハードウェア割り込みやREPLの実行に
+// 依存する部分はこのテストの対象外なので、リンクを通すためだけに置く
+void enable_timer_irq(void) {
+}
+
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
+void os_repl_step(process_t *proc) {
+    (void)proc;
+}
+
 // reader.c の os_read が参照するが、runtime_test.c では実際の割り込みが発生しないため
 // 何もしないダミー実装を用意する(load_test.c等の既存テストと同じパターン)
 void os_wait_for_more_input(process_t *proc) {
@@ -1448,6 +1472,184 @@ void test_gc_reclaims_unreferenced_garbage() {
     assert(ratio_after_gc < ratio_before_gc, "参照されなくなったconsはGCで回収され、使用率が下がる");
 }
 
+// ============================== os_alloc_bytesのOOM時にos_gc_collectが実際に
+// 発火するケースの検証 ==============================
+// 以降のテストは意図的に小さいヒープを使い、計算の途中でos_alloc_bytesがOOMを検出して
+// os_gc_collectを呼ぶ状況を実際に作り、GCが発火しても結果が正しいことを確認する
+// (documents/isiki-os.mdの「今後の課題」チェックリストに対応する検証)。
+// setup_small_heapはos_reset_runtime_state_for_testでglobal_environment/symbol table等の
+// 全状態をリセットするため、このセクションのテストはmain()の最後にまとめて実行する。
+
+#define SMALL_HEAP_SIZE (64 * 1024)
+
+static void setup_small_heap(void) {
+    void *heap = malloc(SMALL_HEAP_SIZE);
+    assert(heap != NULL, "GC発火テスト用の小さいヒープをmallocで確保できる");
+    os_heap_init((UINT64)heap, SMALL_HEAP_SIZE);
+    os_reset_runtime_state_for_test();
+    os_bootstrap();
+}
+
+void test_gc_fires_during_bignum_addition_and_result_is_correct() {
+    setup_small_heap();
+
+    // bignumのlimbは32bit単位(UINT64のスロットに32bit値を1つ格納する、base 2^32)。
+    // 各項は2^(32*24)-1(24limbの全bit立て)。80項の総和は25limbのbignumになる
+    UINT64 term_limbs[24];
+    for (int i = 0; i < 24; i++) {
+        term_limbs[i] = 0xFFFFFFFFULL;
+    }
+    lisp_val_t term = os_make_integer(0, term_limbs, 24);
+    GC_PROTECT(term);
+
+    lisp_val_t args = nil;
+    GC_PROTECT(args);
+    for (int i = 0; i < 80; i++) {
+        args = os_make_cons(term, args);
+    }
+
+    UINT64 gc_count_before = os_gc_collect_count();
+    lisp_val_t result = primitive_add(args, nil);
+    UINT64 gc_count_after = os_gc_collect_count();
+    assert(gc_count_after > gc_count_before,
+           "64KBの小さいヒープで24limb×80項のbignum加算を行うと、計算の途中で実際にos_gc_collectが発火する");
+
+    // Pythonで事前計算した((2^(32*24)-1) * 80)の期待値(25limb、32bit単位)
+    UINT64 expected_limbs[25] = {
+        0xffffffb0ULL, 0xffffffffULL, 0xffffffffULL, 0xffffffffULL,
+        0xffffffffULL, 0xffffffffULL, 0xffffffffULL, 0xffffffffULL,
+        0xffffffffULL, 0xffffffffULL, 0xffffffffULL, 0xffffffffULL,
+        0xffffffffULL, 0xffffffffULL, 0xffffffffULL, 0xffffffffULL,
+        0xffffffffULL, 0xffffffffULL, 0xffffffffULL, 0xffffffffULL,
+        0xffffffffULL, 0xffffffffULL, 0xffffffffULL, 0xffffffffULL,
+        0x0000004fULL
+    };
+    lisp_val_t expected = os_make_integer(0, expected_limbs, 25);
+    assert(primitive_num_equal(os_make_cons(result, os_make_cons(expected, nil)), nil) == g_sym_t,
+           "GC発火を挟んでも24limb×80項のbignum加算の結果は正しい");
+}
+
+void test_gc_fires_during_gcd_and_isqrt_and_results_are_correct() {
+    setup_small_heap();
+
+    // 連続する2つのフィボナッチ数(fib(600), fib(601))。互いに素(gcd=1)であり、
+    // ユークリッドの互除法(mag_gcd)が多数回イテレーションする典型的な入力になる
+    // (bignumのlimbは32bit単位。base 2^32でのlittle-endian表現)
+    UINT64 a_limbs[13] = {
+        0xcd62b020ULL, 0x1248e07eULL, 0xcf00478dULL, 0x312be5a8ULL, 0x99e1dfc1ULL, 0x934a4cc4ULL,
+        0xbd946c67ULL, 0x33de6b20ULL, 0x44d1de10ULL, 0xcd7e1dd4ULL, 0xb54f58f7ULL, 0x4da336b7ULL,
+        0xa70e38bcULL
+    };
+    UINT64 b_limbs[14] = {
+        0x32c9ba91ULL, 0xb696f95bULL, 0xc2fd6bf8ULL, 0xa2b6cbd2ULL, 0xa345e1daULL, 0xe0322ba5ULL,
+        0xb4501669ULL, 0xcc00edbaULL, 0x48d27415ULL, 0xa0dcc8f1ULL, 0x200eb5d0ULL, 0x7b2b4a8fULL,
+        0x0e4d333dULL, 0x00000001ULL
+    };
+    lisp_val_t a = os_make_integer(0, a_limbs, 13);
+    GC_PROTECT(a);
+    lisp_val_t b = os_make_integer(0, b_limbs, 14);
+    GC_PROTECT(b);
+
+    UINT64 gc_count_before = os_gc_collect_count();
+    lisp_val_t gcd_result = primitive_gcd(os_make_cons(a, os_make_cons(b, nil)), nil);
+    UINT64 gc_count_after = os_gc_collect_count();
+    assert(gc_count_after > gc_count_before,
+           "小さいヒープで連続するフィボナッチ数のgcdを計算すると、mag_gcdのループ中に実際にos_gc_collectが発火する");
+    assert(gcd_result == os_make_fixnum(1), "連続するフィボナッチ数のgcdは1");
+
+    // Q = 2^100 + 12345678901234567890、Q2 = Q*Qの完全平方数でmag_isqrtを検証する
+    // (bignumのlimbは32bit単位)
+    UINT64 q_limbs[4] = { 0xeb1f0ad2ULL, 0xab54a98cULL, 0x00000000ULL, 0x00000010ULL };
+    UINT64 q2_limbs[7] = {
+        0x2b511444ULL, 0xa3ff1b51ULL, 0xf6e120d4ULL, 0xd68b90c1ULL, 0x6a95319dULL, 0x00000015ULL,
+        0x00000100ULL
+    };
+    lisp_val_t q = os_make_integer(0, q_limbs, 4);
+    GC_PROTECT(q);
+    lisp_val_t q2 = os_make_integer(0, q2_limbs, 7);
+    GC_PROTECT(q2);
+
+    UINT64 gc_count_before2 = os_gc_collect_count();
+    lisp_val_t isqrt_result = primitive_isqrt(os_make_cons(q2, nil), nil);
+    UINT64 gc_count_after2 = os_gc_collect_count();
+    assert(gc_count_after2 > gc_count_before2,
+           "小さいヒープでbignumのisqrtを計算すると、mag_isqrtのループ中に実際にos_gc_collectが発火する");
+    assert(primitive_num_equal(os_make_cons(isqrt_result, os_make_cons(q, nil)), nil) == g_sym_t,
+           "GC発火を挟んでもisqrt(Q^2)はQに戻る(bignumの完全平方数)");
+}
+
+void test_gc_fires_during_vector_construction_and_elements_are_preserved() {
+    setup_small_heap();
+
+    #define GC_VECTOR_TEST_N 750
+    UINT64 gc_count_before = os_gc_collect_count();
+
+    // listはvec構築後は不要になる。検証ループの分の空きを確保するため、
+    // GC_PROTECT(list)のスコープをこのブロック内に限定し、vec構築後は
+    // listがGCのルートから外れるようにする
+    lisp_val_t vec = nil;
+    GC_PROTECT(vec);
+    {
+        lisp_val_t list = nil;
+        GC_PROTECT(list);
+        for (int i = 0; i < GC_VECTOR_TEST_N; i++) {
+            // 到達不能な使い捨てのconsを混ぜてガベージを作り、GCが実際に回収する対象がある状態にする
+            os_make_cons(os_make_fixnum((UINT64)i), nil);
+            list = os_make_cons(os_make_fixnum((UINT64)i), list);
+        }
+        // consで逆順に積んだので、listの先頭からはN-1, N-2, ..., 0の順になる
+        vec = primitive_vector(list, nil);
+    }
+    UINT64 gc_count_after = os_gc_collect_count();
+    assert(gc_count_after > gc_count_before,
+           "小さいヒープで使い捨てのconsを混ぜながら長いリストからvectorを構築すると、構築の途中で実際にos_gc_collectが発火する");
+
+    lisp_val_t *header = os_vector_header(vec);
+    assert(header[1] == GC_VECTOR_TEST_N, "GC発火を挟んでも構築したvectorの長さはNのまま");
+
+    for (int i = 0; i < GC_VECTOR_TEST_N; i++) {
+        lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum((UINT64)i), nil));
+        UINT64 expected = (UINT64)(GC_VECTOR_TEST_N - 1 - i);
+        assert(primitive_aref(aref_args, nil) == os_make_fixnum(expected),
+               "GC発火を挟んでもvectorの各要素はリストの内容通りに保持される");
+    }
+    #undef GC_VECTOR_TEST_N
+}
+
+void test_gc_fires_during_string_append_and_result_is_correct() {
+    setup_small_heap();
+
+    #define GC_STRING_TEST_N 450
+    UINT64 gc_count_before = os_gc_collect_count();
+
+    lisp_val_t list = nil;
+    GC_PROTECT(list);
+    for (int i = 0; i < GC_STRING_TEST_N; i++) {
+        char piece[2] = { (char)('0' + (i % 10)), '\0' };
+        // 到達不能な使い捨てのstring+consを混ぜてガベージを作り、GCが実際に回収する対象がある状態にする
+        os_make_cons(os_make_string(piece), nil);
+        lisp_val_t s = os_make_string(piece);
+        list = os_make_cons(s, list);
+    }
+    // consで逆順に積んだので、連結結果は生成順(0,1,2,...)を逆にした数字の並びになる
+
+    lisp_val_t result = primitive_string_append(list, nil);
+    UINT64 gc_count_after = os_gc_collect_count();
+    assert(gc_count_after > gc_count_before,
+           "小さいヒープで使い捨てのstringを混ぜながら多数の文字列を連結すると、入力構築を含めた計算の途中で実際にos_gc_collectが発火する");
+
+    char expected[GC_STRING_TEST_N + 1];
+    for (int i = 0; i < GC_STRING_TEST_N; i++) {
+        expected[i] = (char)('0' + ((GC_STRING_TEST_N - 1 - i) % 10));
+    }
+    expected[GC_STRING_TEST_N] = '\0';
+
+    char buf[GC_STRING_TEST_N + 1];
+    os_string_to_cstr(result, buf, sizeof(buf));
+    assert(strcmp(buf, expected) == 0, "GC発火を挟んでもprimitive_string_appendの連結結果は正しい");
+    #undef GC_STRING_TEST_N
+}
+
 int main(int argc, char** argv) {
    test_os_make_fixnum();
 
@@ -1536,6 +1738,11 @@ int main(int argc, char** argv) {
    test_gc_instance_survives();
    test_gc_circular_cons_list_does_not_hang();
    test_gc_reclaims_unreferenced_garbage();
+
+   test_gc_fires_during_bignum_addition_and_result_is_correct();
+   test_gc_fires_during_gcd_and_isqrt_and_results_are_correct();
+   test_gc_fires_during_vector_construction_and_elements_are_preserved();
+   test_gc_fires_during_string_append_and_result_is_correct();
 
    return g_test_failed ? 1 : 0;
 }

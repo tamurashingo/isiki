@@ -84,6 +84,30 @@ frame_buffer* get_active_frame_buffer(void) {
     return &g_frame_buffer;
 }
 
+// process.c が参照する switch_active_frame_buffer のダミー実装。
+// このテストでは process の切替えは行わないため、何もしない
+void switch_active_frame_buffer(UINT32 index) {
+    (void)index;
+}
+
+// process.c(process_scheduler_start/process_trampoline_c)が参照する
+// interrupt.c/repl.cの関数のダミー実装。ハードウェア割り込みやREPLの実行に
+// 依存する部分はこのテストの対象外なので、リンクを通すためだけに置く
+void enable_timer_irq(void) {
+}
+
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
+void os_repl_step(process_t *proc) {
+    (void)proc;
+}
+
 // interrupt.c/kernel.cはリンクしないため、clock.cが参照する
 // get_tick_counter/kernel_get_boot_epoch_secondsをテスト用固定値で置き換える
 static UINT64 g_fake_tick_counter = 350;
