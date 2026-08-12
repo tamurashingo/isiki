@@ -29,6 +29,7 @@ static lisp_val_t eval_args(lisp_val_t args, lisp_val_t env) {
         return nil;
     }
     lisp_val_t head = os_eval(cc_car(args), env);
+    GC_PROTECT(head);
     if (is_control_transfer(head)) {
         return head;
     }
@@ -49,7 +50,10 @@ static lisp_val_t eval_args(lisp_val_t args, lisp_val_t env) {
  */
 static lisp_val_t eval_progn(lisp_val_t body, lisp_val_t env) {
     lisp_val_t result = nil;
-    for (lisp_val_t rest = body; rest != nil; rest = cc_cdr(rest)) {
+    lisp_val_t rest = body;
+    GC_PROTECT(rest);
+    GC_PROTECT(env);
+    for (; rest != nil; rest = cc_cdr(rest)) {
         result = os_eval(cc_car(rest), env);
         if (is_control_transfer(result)) {
             return result;
@@ -66,6 +70,9 @@ static lisp_val_t eval_progn(lisp_val_t body, lisp_val_t env) {
  * @return MAGIC_FUNCTION_INTERPRETEDのINSTANCE
  */
 static lisp_val_t make_interpreted_function(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+    GC_PROTECT(params);
+    GC_PROTECT(body);
+    GC_PROTECT(env);
     return os_make_instance(MAGIC_FUNCTION_INTERPRETED, params, body, env);
 }
 
@@ -113,6 +120,10 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         lisp_val_t params = obj[1];
         lisp_val_t body = obj[2];
         lisp_val_t closure_env = obj[3];
+        GC_PROTECT(params);
+        GC_PROTECT(evaluated_args);
+        GC_PROTECT(closure_env);
+        GC_PROTECT(body);
         lisp_val_t call_env = os_make_environment(os_make_symbol("CALL-ENV"), closure_env);
         bind_params(params, evaluated_args, call_env);
         return eval_progn(body, call_env);
@@ -131,6 +142,8 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
  */
 static lisp_val_t eval_form(lisp_val_t op, lisp_val_t args, lisp_val_t env) {
     lisp_val_t fn = ((op & TAG_MASK) == TAG_SYMBOL) ? os_get_function(op, env) : os_eval(op, env);
+    GC_PROTECT(fn);
+    GC_PROTECT(env);
     if (fn == nil) {
         return g_sym_eval_error; // 未定義の関数
     }
@@ -163,6 +176,9 @@ static lisp_val_t eval_if(lisp_val_t args, lisp_val_t env) {
     lisp_val_t test = cc_car(args);
     lisp_val_t then_form = cc_car(cc_cdr(args));
     lisp_val_t else_rest = cc_cdr(cc_cdr(args));
+    GC_PROTECT(then_form);
+    GC_PROTECT(else_rest);
+    GC_PROTECT(env);
 
     lisp_val_t test_result = os_eval(test, env);
     if (is_control_transfer(test_result)) {
@@ -188,6 +204,8 @@ static lisp_val_t eval_if(lisp_val_t args, lisp_val_t env) {
  */
 static lisp_val_t eval_setq(lisp_val_t args, lisp_val_t env) {
     lisp_val_t sym = cc_car(args);
+    GC_PROTECT(sym);
+    GC_PROTECT(env);
     if (os_is_constant(sym, env)) {
         return g_sym_eval_error; // defconstantで定義された定数はsetqで上書きできない
     }
@@ -210,6 +228,8 @@ static lisp_val_t eval_setq(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_defvar(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t value_rest = cc_cdr(args);
+    GC_PROTECT(name);
+    GC_PROTECT(env);
 
     lisp_val_t var_slot = cc_car(cc_cdr(env)); // (variables . alist)
     lisp_val_t existing = cc_assoc_eq(name, cc_cdr(var_slot));
@@ -233,6 +253,8 @@ static lisp_val_t eval_defvar(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_defconstant(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t value_form = cc_car(cc_cdr(args));
+    GC_PROTECT(name);
+    GC_PROTECT(env);
     lisp_val_t val = os_eval(value_form, env);
     if (is_control_transfer(val)) {
         return val;
@@ -251,6 +273,7 @@ static lisp_val_t eval_defconstant(lisp_val_t args, lisp_val_t env) {
  */
 static lisp_val_t eval_defdynamic(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
+    GC_PROTECT(name);
     lisp_val_t value_form = cc_car(cc_cdr(args));
     lisp_val_t val = os_eval(value_form, env);
     if (is_control_transfer(val)) {
@@ -273,6 +296,8 @@ static lisp_val_t eval_defdynamic(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_defglobal(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t value_form = cc_car(cc_cdr(args));
+    GC_PROTECT(name);
+    GC_PROTECT(env);
     lisp_val_t val = os_eval(value_form, env);
     if (is_control_transfer(val)) {
         return val;
@@ -304,6 +329,8 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t params = cc_car(cc_cdr(args));
     lisp_val_t body = cc_cdr(cc_cdr(args));
+    GC_PROTECT(name);
+    GC_PROTECT(env);
 
     lisp_val_t fn = make_interpreted_function(params, body, env);
     os_set_function(name, fn, env);
@@ -351,7 +378,10 @@ static lisp_val_t eval_function(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
     lisp_val_t bindings = cc_car(args);
     lisp_val_t body = cc_cdr(args);
+    GC_PROTECT(bindings);
+    GC_PROTECT(body);
     lisp_val_t new_env = os_make_environment(os_make_symbol("FLET-ENV"), env);
+    GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
         lisp_val_t binding = cc_car(b);
@@ -375,7 +405,10 @@ static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_labels(lisp_val_t args, lisp_val_t env) {
     lisp_val_t bindings = cc_car(args);
     lisp_val_t body = cc_cdr(args);
+    GC_PROTECT(bindings);
+    GC_PROTECT(body);
     lisp_val_t new_env = os_make_environment(os_make_symbol("LABELS-ENV"), env);
+    GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
         lisp_val_t binding = cc_car(b);
@@ -399,6 +432,9 @@ static lisp_val_t eval_labels(lisp_val_t args, lisp_val_t env) {
  * @return MAGIC_MACROのINSTANCE
  */
 static lisp_val_t make_macro(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+    GC_PROTECT(params);
+    GC_PROTECT(body);
+    GC_PROTECT(env);
     return os_make_instance(MAGIC_MACRO, params, body, env);
 }
 
@@ -413,6 +449,8 @@ static lisp_val_t eval_defmacro(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t params = cc_car(cc_cdr(args));
     lisp_val_t body = cc_cdr(cc_cdr(args));
+    GC_PROTECT(name);
+    GC_PROTECT(env);
 
     lisp_val_t macro = make_macro(params, body, env);
     os_set_function(name, macro, env);
@@ -444,7 +482,11 @@ static lisp_val_t apply_macro(lisp_val_t macro, lisp_val_t args) {
     lisp_val_t params = obj[1];
     lisp_val_t body = obj[2];
     lisp_val_t closure_env = obj[3];
+    GC_PROTECT(params);
+    GC_PROTECT(args);
+    GC_PROTECT(body);
     lisp_val_t call_env = os_make_environment(os_make_symbol("MACRO-ENV"), closure_env);
+    GC_PROTECT(call_env);
     bind_params(params, args, call_env);
     return eval_progn(body, call_env);
 }
@@ -461,6 +503,8 @@ static lisp_val_t qq_append(lisp_val_t list, lisp_val_t tail) {
     if (list == nil) {
         return tail;
     }
+    GC_PROTECT(list);
+    GC_PROTECT(tail);
     return os_make_cons(cc_car(list), qq_append(cc_cdr(list), tail));
 }
 
@@ -475,8 +519,11 @@ static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env) {
     if (form == nil || (form & TAG_MASK) != TAG_CONS) {
         return form; // atom/nilは評価せずそのまま
     }
+    GC_PROTECT(form);
+    GC_PROTECT(env);
 
     lisp_val_t elem = cc_car(form);
+    GC_PROTECT(elem);
 
     if (elem == g_sym_unquote) {
         // (unquote x): xを評価してその場に差し込む
@@ -489,11 +536,14 @@ static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env) {
     if ((elem & TAG_MASK) == TAG_CONS && cc_car(elem) == g_sym_unquote_splicing) {
         // リストの要素が(unquote-splicing x): xを評価し、その要素を残りに継ぎ足す
         lisp_val_t spliced = os_eval(cc_car(cc_cdr(elem)), env);
+        GC_PROTECT(spliced);
         lisp_val_t rest = qq_expand(cc_cdr(form), env);
+        GC_PROTECT(rest);
         return qq_append(spliced, rest);
     }
 
     lisp_val_t head = qq_expand(elem, env);
+    GC_PROTECT(head);
     lisp_val_t tail = qq_expand(cc_cdr(form), env);
     return os_make_cons(head, tail);
 }
@@ -518,6 +568,7 @@ static lisp_val_t eval_quasiquote(lisp_val_t args, lisp_val_t env) {
  */
 static lisp_val_t eval_block(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
+    GC_PROTECT(name);
     lisp_val_t body = cc_cdr(args);
     lisp_val_t result = eval_progn(body, env);
     if (is_control_transfer(result)) {
@@ -539,8 +590,10 @@ static lisp_val_t eval_block(lisp_val_t args, lisp_val_t env) {
  */
 static lisp_val_t eval_return_from(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
+    GC_PROTECT(name);
     lisp_val_t value_rest = cc_cdr(args);
     lisp_val_t val = (value_rest != nil) ? os_eval(cc_car(value_rest), env) : nil;
+    GC_PROTECT(val);
     if (is_control_transfer(val)) {
         return val;
     }
@@ -559,7 +612,10 @@ static lisp_val_t eval_return_from(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_unwind_protect(lisp_val_t args, lisp_val_t env) {
     lisp_val_t protected_form = cc_car(args);
     lisp_val_t cleanup_forms = cc_cdr(args);
+    GC_PROTECT(cleanup_forms);
+    GC_PROTECT(env);
     lisp_val_t result = os_eval(protected_form, env);
+    GC_PROTECT(result);
     eval_progn(cleanup_forms, env);
     return result;
 }
@@ -576,10 +632,13 @@ static lisp_val_t eval_unwind_protect(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_catch(lisp_val_t args, lisp_val_t env) {
     lisp_val_t tag_form = cc_car(args);
     lisp_val_t body = cc_cdr(args);
+    GC_PROTECT(body);
+    GC_PROTECT(env);
     lisp_val_t tag = os_eval(tag_form, env);
     if (is_control_transfer(tag)) {
         return tag;
     }
+    GC_PROTECT(tag);
     lisp_val_t result = eval_progn(body, env);
     if ((result & TAG_MASK) == TAG_INSTANCE) {
         UINT64 *obj = (UINT64 *)(result & ~TAG_MASK);
@@ -606,7 +665,9 @@ static lisp_val_t eval_throw(lisp_val_t args, lisp_val_t env) {
     if (is_control_transfer(tag)) {
         return tag;
     }
+    GC_PROTECT(tag);
     lisp_val_t result = os_eval(result_form, env);
+    GC_PROTECT(result);
     if (is_control_transfer(result)) {
         return result;
     }
@@ -637,7 +698,10 @@ static int is_tagbody_tag(lisp_val_t elem) {
  * @return 常にnil。捕捉されないgoが起きた場合はその脱出シグナル
  */
 static lisp_val_t eval_tagbody(lisp_val_t args, lisp_val_t env) {
+    GC_PROTECT(args);
+    GC_PROTECT(env);
     lisp_val_t pos = args;
+    GC_PROTECT(pos);
     while (pos != nil) {
         lisp_val_t elem = cc_car(pos);
         if (is_tagbody_tag(elem)) {
@@ -679,6 +743,7 @@ static lisp_val_t eval_tagbody(lisp_val_t args, lisp_val_t env) {
 static lisp_val_t eval_go(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t tag = cc_car(args);
+    GC_PROTECT(tag);
     return os_make_instance(MAGIC_GO_EXIT, tag, nil, nil);
 }
 
@@ -768,6 +833,8 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
     if (tag == TAG_CONS) {
         lisp_val_t op = cc_car(exp);
         lisp_val_t args = cc_cdr(exp);
+        GC_PROTECT(args);
+        GC_PROTECT(env);
         if (op == g_sym_quote) {
             return eval_quote(args, env);
         }
@@ -841,6 +908,7 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
             lisp_val_t fn = os_get_function(op, env);
             if (fn != nil && is_macro(fn)) {
                 lisp_val_t expanded = apply_macro(fn, args);
+                GC_PROTECT(expanded);
                 return os_eval(expanded, env);
             }
         }

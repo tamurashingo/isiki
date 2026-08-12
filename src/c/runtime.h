@@ -2,6 +2,7 @@
 #define _RUNTIME_H_
 
 #include "types.h"
+#include "process.h"
 
 /** タグ位置(下位3bit)を取り出すマスク */
 #define TAG_MASK     0x7ULL
@@ -187,11 +188,20 @@ double os_heap_used_ratio(void);
 
 /**
  * Cheney方式のコピーGCを1回実行する。global_environment・g_dynamic_bindings・
- * g_symbol_table・キャッシュ済みg_sym_*・各プロセスのenvをルートとして生存オブジェクトを
- * To空間へコピーし、From/To空間を入れ替える。トップレベルform間のセーフポイントからのみ
- * 呼び出すこと(eval中の任意地点から呼ぶとCスタック上の未追跡なlisp_val_tルートを破壊する)。
+ * g_symbol_table・キャッシュ済みg_sym_*・各プロセスのenv・全プロセスのshadow stack
+ * (GC_PROTECTされたCローカル変数)をルートとして生存オブジェクトをTo空間へコピーし、
+ * From/To空間を入れ替える。eval.c/runtime.cのアロケーションを行う関数はGC_PROTECT、
+ * および生バッファの「確保直後に包む」規律(documents/isiki-os.md参照)によりいずれの
+ * 呼び出しからの発火にも対応しているため、os_alloc_bytesのOOM時にも安全に呼び出せる。
  */
 void os_gc_collect(void);
+
+/**
+ * os_gc_collectが呼ばれた延べ回数を返す。GC発火自体を直接観測する手段がないテストコードが、
+ * 「計算の途中で実際にGCが起動したか」を確認するために使う(本体のロジックでは使用しない)。
+ * @return os_gc_collectの呼び出し回数の累積
+ */
+UINT64 os_gc_collect_count(void);
 
 /**
  * lisp_val_t型の変数へのポインタを、os_gc_collectが毎回書き換えるルート集合に登録する
@@ -201,6 +211,27 @@ void os_gc_collect(void);
  * @param root_ptr 登録するroot変数へのポインタ
  */
 void os_gc_register_root(lisp_val_t *root_ptr);
+
+/**
+ * GC_PROTECTされたローカル変数のcleanup(スコープ脱出時)ハンドラ。
+ * 現在のプロセスのshadow stack先頭を、このノードのnextに巻き戻す。
+ * GC_PROTECTマクロ内でのみ使う。
+ */
+static inline void gc_unprotect_node(gc_rootnode *node) {
+    get_current_process()->gc_roots = node->next;
+}
+
+/**
+ * var(lisp_val_t型のローカル変数/パラメータ)を現在のプロセスのshadow stackの
+ * 先頭に繋ぎ、GCのルート集合に加える。スコープを抜ける際(どのreturn文経由でも)
+ * __attribute__((cleanup(...)))により自動的にshadow stackから外れるため、
+ * 対応するGC_UNPROTECTの呼び出しは不要。varは登録前に有効なlisp_val_t(nil等)で
+ * 初期化しておくこと。
+ */
+#define GC_PROTECT(var) \
+    gc_rootnode _gcnode_##var __attribute__((cleanup(gc_unprotect_node))) = \
+        { (lisp_val_t *)&(var), get_current_process()->gc_roots }; \
+    get_current_process()->gc_roots = &_gcnode_##var
 
 /**
  * 非負のfixnumオブジェクトを作る(即値、ヒープ確保なし、符号は常に0)。
@@ -297,6 +328,14 @@ int os_symbol_is_gensym(lisp_val_t sym);
  * @return 登録済みsymbol数
  */
 int os_symbol_table_count(void);
+
+/**
+ * g_symbol_table・global_environment・g_dynamic_bindings・追加GC rootを初期状態に戻す
+ * (テスト専用)。1プロセス内でos_heap_init/os_bootstrapを複数回呼び直すユニットテストが、
+ * 前回のヒープ世代の状態を持ち込まずに真っ白な状態からブートストラップし直すために使う。
+ * os_heap_initの直後、os_bootstrapを呼ぶ前に呼ぶこと。
+ */
+void os_reset_runtime_state_for_test(void);
 
 /**
  * charオブジェクトを作る(即値、ヒープ確保なし)。

@@ -145,6 +145,7 @@ void initialize_processes(frame_buffer *buffers) {
         proc->ready = 0;
         proc->env = 0;
         os_gc_register_root(&proc->env);
+        proc->gc_roots = 0;
     }
 
     g_current_process_index = 0;

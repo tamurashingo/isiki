@@ -37,6 +37,9 @@ typedef struct _process {
 
     /** このプロセスのLisp環境(global_environmentの子環境)。0は未初期化を表す */
     lisp_val_t env;
+
+    /** このプロセスのshadow stackの先頭(GC_PROTECTで保護中のCローカル変数のリスト) */
+    gc_rootnode *gc_roots;
 } process_t;
 
 /**

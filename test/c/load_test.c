@@ -11,8 +11,9 @@
 #include "eval.h"
 #include "load.h"
 
-// stream.c/reader.c/load.c は process.c/virtio9p.c/p9.c/drivers/*.c をリンクしない。
+// stream.c/reader.c/load.c は virtio9p.c/p9.c/drivers/*.c をリンクしない。
 // cc_load/os_read_stream/os_stream_* が参照する外部シンボルだけダミー実装を置く。
+// (process.cはeval.c/runtime.cのGC_PROTECTが参照するget_current_process/get_processのためリンクする)
 
 #define FAKE_DATA_MAX 512
 static UINT8 g_fake_data[FAKE_DATA_MAX];
@@ -108,6 +109,30 @@ frame_buffer* get_active_frame_buffer(void) {
     return &g_active_frame_buffer;
 }
 
+// process.c が参照する switch_active_frame_buffer のダミー実装。
+// このテストでは process の切替えは行わないため、何もしない
+void switch_active_frame_buffer(UINT32 index) {
+    (void)index;
+}
+
+// process.c(process_scheduler_start/process_trampoline_c)が参照する
+// interrupt.c/repl.cの関数のダミー実装。ハードウェア割り込みやREPLの実行に
+// 依存する部分はこのテストの対象外なので、リンクを通すためだけに置く
+void enable_timer_irq(void) {
+}
+
+// process.c(spawn)が参照するinterrupt.cのget_fpu_default_stateのダミー実装。
+// FXSAVE領域の初期値はこのテストの対象外なので、ゼロ埋めの512byteバッファを返すだけにする
+static UINT8 g_fake_fpu_default_state[512] __attribute__((aligned(16)));
+
+const void *get_fpu_default_state(void) {
+    return g_fake_fpu_default_state;
+}
+
+void os_repl_step(process_t *proc) {
+    (void)proc;
+}
+
 // reader.c(process用reader_source)が参照するダミー実装。
 // load_testはos_read_stream経由のみを使うため実際には呼ばれない
 void os_wait_for_more_input(process_t *proc) {
@@ -139,12 +164,6 @@ static frame_buffer g_proc_frame_buffer = {
     .write_string = capture_write_string,
 };
 
-static process_t g_process;
-
-process_t* get_current_process(void) {
-    return &g_process;
-}
-
 static void reset_capture(void) {
     g_capture_len = 0;
 }
@@ -160,8 +179,9 @@ static void setup_heap(void) {
 }
 
 static void setup_process(void) {
-    memset(&g_process, 0, sizeof(g_process));
-    g_process.stdout_buffer = &g_proc_frame_buffer;
+    process_t *proc = get_process(0);
+    memset(proc, 0, sizeof(*proc));
+    proc->stdout_buffer = &g_proc_frame_buffer;
 }
 
 static lisp_val_t call_load(const char *path) {
