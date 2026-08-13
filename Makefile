@@ -3,8 +3,8 @@ PWD = $(shell pwd)
 
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c
-HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c
+HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -15,48 +15,48 @@ OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
 TESTDIR = test/c
 TEST_COMMON_SRC = $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c
 
-TEST_SRC_RUNTIME = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/runtime_test.c
+TEST_SRC_RUNTIME = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/runtime_test.c
 TEST_BIN_RUNTIME = $(BUILD_TMPDIR)/runtime_test
 
-TEST_SRC_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/lisp_test.c
+TEST_SRC_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/lisp_test.c
 TEST_BIN_LISP = $(BUILD_TMPDIR)/lisp_test
 
-TEST_SRC_PROCESS = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/process_test.c
+TEST_SRC_PROCESS = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/process_test.c
 TEST_BIN_PROCESS = $(BUILD_TMPDIR)/process_test
 
-TEST_SRC_READER = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/eval.c $(TESTDIR)/reader_test.c
+TEST_SRC_READER = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(TESTDIR)/reader_test.c
 TEST_BIN_READER = $(BUILD_TMPDIR)/reader_test
 
-TEST_SRC_EVAL = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/eval_test.c
+TEST_SRC_EVAL = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/eval_test.c
 TEST_BIN_EVAL = $(BUILD_TMPDIR)/eval_test
 
-TEST_SRC_PRINT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/print.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/print_test.c
+TEST_SRC_PRINT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/print.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/print_test.c
 TEST_BIN_PRINT = $(BUILD_TMPDIR)/print_test
 
-TEST_SRC_REPL = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(TESTDIR)/repl_test.c
+TEST_SRC_REPL = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(TESTDIR)/repl_test.c
 TEST_BIN_REPL = $(BUILD_TMPDIR)/repl_test
 
-TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/subprimitive.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/subprimitive_test.c
+TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/subprimitive.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/subprimitive_test.c
 TEST_BIN_SUBPRIMITIVE = $(BUILD_TMPDIR)/subprimitive_test
 
-TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(TESTDIR)/script_test.c
+TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(TESTDIR)/script_test.c
 TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
 TEST_BIN_STREAM = $(BUILD_TMPDIR)/stream_test
 
-TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
+TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
 TEST_BIN_LOAD = $(BUILD_TMPDIR)/load_test
 
-TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/eval.c $(TESTDIR)/stream_lisp_test.c
+TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(TESTDIR)/stream_lisp_test.c
 TEST_BIN_STREAM_LISP = $(BUILD_TMPDIR)/stream_lisp_test
 
-TEST_SRC_FORMAT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/eval.c $(TESTDIR)/format_test.c
+TEST_SRC_FORMAT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(TESTDIR)/format_test.c
 TEST_BIN_FORMAT = $(BUILD_TMPDIR)/format_test
 
 # interrupt.c/kernel.cはリンクせず、clock_test.cがget_tick_counter/
 # kernel_get_boot_epoch_secondsをテスト用固定値で置き換える
-TEST_SRC_CLOCK = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/clock.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/clock_test.c
+TEST_SRC_CLOCK = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/clock.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/clock_test.c
 TEST_BIN_CLOCK = $(BUILD_TMPDIR)/clock_test
 
 TEST_SRC_P9 = $(SRCDIR)/p9.c $(TESTDIR)/p9_test.c

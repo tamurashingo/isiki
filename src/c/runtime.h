@@ -458,9 +458,16 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すC関数のアドレス
- * @return MAGIC_FUNCTION_NATIVEのINSTANCE
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)
  */
 lisp_val_t os_make_native_function(lisp_addr_t fnptr);
+
+/**
+ * fnptrをza.cがコンパイルしたネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
+ * @param fnptr 呼び出すJITコンパイル済み機械語のアドレス
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
 
 /**
  * init.lisp の (make-instance class-sym . initargs) と (signal-condition condition nil) を
@@ -509,6 +516,14 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env);
  * @return 合計値の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_addを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return 合計値の整数(60bit以内ならFIXNUM、それを超えるならbignum)
+ */
+lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として符号を反転する。

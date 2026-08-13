@@ -73,7 +73,9 @@
  *    - word0: このinstanceの種別を表わすMAGIC NUMBER
  *    - word1: MAGIC_FUNCTION_NATIVEの場合: cの関数のアドレス
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
- *    - word2: MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
+ *    - word2: MAGIC_FUNCTION_NATIVEの場合: fixnum 1(za.cがコンパイルした関数)またはNIL(組み込みprimitive)。
+ *             GCで移動しない即値(fixnum/nil)のみを許すことで、word1と同様に素通しできる
+ *             MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
  *    - word3: MAGIC_FUNCTION_INTERPRETEDの場合: 定義時の環境のアドレス
  *             MAGIC_VECTORの場合: word1に多次元配列(general array)本体への生ポインタを
  *             持つ(ヒープ可変長、8*(1+rank+total)byte、8byte境界に整列)。
@@ -1444,10 +1446,21 @@ lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val) {
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すC関数のアドレス
- * @return MAGIC_FUNCTION_NATIVEのINSTANCE
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)
  */
 lisp_val_t os_make_native_function(UINT64 fnptr) {
     return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, nil, nil);
+}
+
+/**
+ * fnptrをza.cがコンパイルしたネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
+ * os_make_native_functionとの違いはword2にfixnum 1を立てる点のみで、印字時にコンパイル済みと
+ * 組み込みprimitiveを区別するために使う。
+ * @param fnptr 呼び出すJITコンパイル済み機械語のアドレス
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function(UINT64 fnptr) {
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(1), nil);
 }
 
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
@@ -2259,6 +2272,21 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
     }
 
     return acc_val;
+}
+
+/**
+ * primitive_addを2引数固定で呼ぶためのラッパー。JITコンパイルされたコードから
+ * 呼ばれることを想定し、引数aとbは呼び出し直後にGC_PROTECTしてからconsリストへ
+ * 組み立てるため、この呼び出し中にGCが走ってもa/bが失われることはない。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return primitive_addと同じ規則で計算した合計値
+ */
+lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_add(args, global_environment);
 }
 
 /**

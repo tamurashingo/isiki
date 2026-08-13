@@ -1,5 +1,6 @@
 #include "eval.h"
 #include "lisp.h"
+#include "za.h"
 
 /**
  * vがblock/return-from/unwind-protect/catch/throw/tagbody/goの非局所脱出シグナル
@@ -332,7 +333,10 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(name);
     GC_PROTECT(env);
 
-    lisp_val_t fn = make_interpreted_function(params, body, env);
+    lisp_val_t fn = za_try_compile_defun(params, body);
+    if (fn == nil) {
+        fn = make_interpreted_function(params, body, env);
+    }
     os_set_function(name, fn, env);
     return name;
 }

@@ -310,7 +310,23 @@ void test_os_print_native_function() {
     reset_capture();
     lisp_val_t fn = os_make_native_function((lisp_addr_t)(void *)primitive_car);
     os_print(fn, &g_frame_buffer);
-    assert(strcmp(captured(), "#<FUNCTION>") == 0, "ネイティブ関数は\"#<FUNCTION>\"と表示される");
+    assert(strcmp(captured(), "#<FUNCTION-BUILTIN>") == 0, "組み込みnative関数は\"#<FUNCTION-BUILTIN>\"と表示される");
+}
+
+void test_os_print_jit_function() {
+    reset_capture();
+    lisp_val_t fn = os_make_jit_function((lisp_addr_t)(void *)primitive_car);
+    os_print(fn, &g_frame_buffer);
+    assert(strcmp(captured(), "#<FUNCTION-COMPILED>") == 0, "za.cがコンパイルしたnative関数は\"#<FUNCTION-COMPILED>\"と表示される");
+}
+
+void test_os_print_interpreted_function() {
+    reset_capture();
+    lisp_val_t params = os_make_cons(os_make_symbol("X"), nil);
+    lisp_val_t body = os_make_cons(os_make_symbol("X"), nil);
+    lisp_val_t fn = os_make_instance(MAGIC_FUNCTION_INTERPRETED, params, body, nil);
+    os_print(fn, &g_frame_buffer);
+    assert(strcmp(captured(), "#<FUNCTION-INTERPRETED>") == 0, "インタプリタ関数は\"#<FUNCTION-INTERPRETED>\"と表示される");
 }
 
 int main(int argc, char** argv) {
@@ -341,6 +357,8 @@ int main(int argc, char** argv) {
     test_os_print_vector_1d();
     test_os_print_vector_multi_dim();
     test_os_print_native_function();
+    test_os_print_jit_function();
+    test_os_print_interpreted_function();
 
     return g_test_failed ? 1 : 0;
 }

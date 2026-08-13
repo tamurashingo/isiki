@@ -334,6 +334,10 @@ static void print_value(os_char_sink_t *sink, lisp_val_t val, int escaped) {
                 sink_write_string(sink, "#<INSTANCE-OF ");
                 print_value(sink, cls[1], escaped);
                 sink_write_char(sink, '>');
+            } else if (magic == MAGIC_FUNCTION_NATIVE) {
+                sink_write_string(sink, obj[2] != nil ? "#<FUNCTION-COMPILED>" : "#<FUNCTION-BUILTIN>");
+            } else if (magic == MAGIC_FUNCTION_INTERPRETED) {
+                sink_write_string(sink, "#<FUNCTION-INTERPRETED>");
             } else {
                 sink_write_string(sink, "#<FUNCTION>");
             }
