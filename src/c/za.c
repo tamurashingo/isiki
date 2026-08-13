@@ -53,10 +53,81 @@ static void jit_add_rsp_imm8(UINT8 imm8) { jit_emit8(0x48); jit_emit8(0x83); jit
 static void jit_call_r11(void) { jit_emit8(0x41); jit_emit8(0xFF); jit_emit8(0xD3); }
 static void jit_ret(void) { jit_emit8(0xC3); }
 
-// mov rbx, rcx (evaluated_argsの先頭を呼び出し中保持するレジスタへ退避)
-static void jit_mov_rbx_rcx(void) { jit_emit8(0x48); jit_emit8(0x89); jit_emit8(0xCB); }
-// mov rcx, rbx (argsの先頭からcc_car/cc_cdrを辿り直す準備)
-static void jit_mov_rcx_rbx(void) { jit_emit8(0x48); jit_emit8(0x89); jit_emit8(0xD9); }
+/** 汎用レジスタ番号(ModRM/REXの拡張ビットの元になるindex。rax=0始まりでr15=15まで) */
+enum {
+    ZA_REG_RAX = 0, ZA_REG_RCX = 1, ZA_REG_RDX = 2, ZA_REG_RBX = 3,
+    ZA_REG_RSP = 4, ZA_REG_RBP = 5, ZA_REG_RSI = 6, ZA_REG_RDI = 7,
+    ZA_REG_R8 = 8, ZA_REG_R9 = 9, ZA_REG_R10 = 10, ZA_REG_R11 = 11,
+    ZA_REG_R12 = 12, ZA_REG_R13 = 13, ZA_REG_R14 = 14, ZA_REG_R15 = 15
+};
+
+/** mov dst, src (64bitレジスタ間、"mov r/m64, r64"opcode0x89でエンコード) */
+static void jit_mov_reg_reg(UINT8 dst, UINT8 src) {
+    UINT8 rex = (UINT8)(0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x89);
+    jit_emit8((UINT8)(0xC0 | ((src & 7) << 3) | (dst & 7)));
+}
+
+/** movabs reg, imm64 (任意レジスタ版。既存のjit_movabs_rax/r11の一般化) */
+static void jit_movabs_reg(UINT8 reg, UINT64 imm) {
+    UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8((UINT8)(0xB8 | (reg & 7)));
+    jit_emit64(imm);
+}
+
+/** and reg, imm8 (符号拡張、"and r/m64, imm8"opcode0x83 /4でエンコード) */
+static void jit_and_reg_imm8(UINT8 reg, UINT8 imm8) {
+    UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x83);
+    jit_emit8((UINT8)(0xC0 | (4 << 3) | (reg & 7)));
+    jit_emit8(imm8);
+}
+
+/** jmp reg (レジスタ間接ジャンプ、"jmp r/m64"opcode0xFF /4でエンコード) */
+static void jit_jmp_reg(UINT8 reg) {
+    if ((reg >> 3) & 1) {
+        jit_emit8(0x41);
+    }
+    jit_emit8(0xFF);
+    jit_emit8((UINT8)(0xE0 | (reg & 7)));
+}
+
+/**
+ * [rsp+disp32]をオペランドとする64bit命令(mov store/load, lea)の共通エンコーダ。
+ * baseは常にrsp固定なのでSIBはscale=00,index=100(無し),base=100(rsp)の0x24で固定。
+ * @param opcode 0x8B=mov reg,[rsp+disp32] / 0x89=mov [rsp+disp32],reg / 0x8D=lea reg,[rsp+disp32]
+ */
+static void jit_emit_rsp_disp32(UINT8 opcode, UINT8 reg, INT32 disp32) {
+    UINT8 rex = (UINT8)(0x48 | (((reg >> 3) & 1) << 2));
+    jit_emit8(rex);
+    jit_emit8(opcode);
+    jit_emit8((UINT8)(0x80 | ((reg & 7) << 3) | 0x04));
+    jit_emit8(0x24);
+    jit_emit32((UINT32)disp32);
+}
+
+static void jit_lea_reg_rsp(UINT8 reg, INT32 disp32) { jit_emit_rsp_disp32(0x8D, reg, disp32); }
+static void jit_mov_reg_from_rsp(UINT8 reg, INT32 disp32) { jit_emit_rsp_disp32(0x8B, reg, disp32); }
+static void jit_mov_rsp_from_reg(UINT8 reg, INT32 disp32) { jit_emit_rsp_disp32(0x89, reg, disp32); }
+
+/**
+ * mov reg, [base+disp8] (64bit読み出し)。トランポリンがobj[0]/obj[1]をr10経由で
+ * 読むためだけに使う(disp8=0/8のみ、baseはrsp/r12以外を前提としSIBは出さない)。
+ */
+static void jit_mov_reg_from_mem_disp8(UINT8 dst, UINT8 base, UINT8 disp8) {
+    UINT8 rex = (UINT8)(0x48 | (((dst >> 3) & 1) << 2) | ((base >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x8B);
+    jit_emit8((UINT8)(0x40 | ((dst & 7) << 3) | (base & 7)));
+    jit_emit8(disp8);
+}
+
+static void jit_sub_rsp_imm32(UINT32 imm32) { jit_emit8(0x48); jit_emit8(0x81); jit_emit8(0xEC); jit_emit32(imm32); }
+static void jit_add_rsp_imm32(UINT32 imm32) { jit_emit8(0x48); jit_emit8(0x81); jit_emit8(0xC4); jit_emit32(imm32); }
+
 // mov rcx, rax (呼び出し結果を次呼び出しのMS ABI第1引数へ)
 static void jit_mov_rcx_rax(void) { jit_emit8(0x48); jit_emit8(0x89); jit_emit8(0xC1); }
 // mov rdx, rax (第2オペランドの値をMS ABI第2引数へ)
@@ -89,21 +160,43 @@ static UINT64 jit_emit_jmp_rel32_placeholder(void) {
     return offset;
 }
 
+/** jne rel32のプレースホルダを出力する。使い方はjit_emit_je_rel32_placeholderと同様 */
+static UINT64 jit_emit_jne_rel32_placeholder(void) {
+    jit_emit8(0x0F);
+    jit_emit8(0x85);
+    UINT64 offset = g_jit_used;
+    jit_emit32(0);
+    return offset;
+}
+
 /**
- * patch_offsetにある4バイトのrel32フィールドへ、現在のg_jit_used(=着地点)までの
+ * patch_offsetにある4バイトのrel32フィールドへ、target_offset(着地点)までの
  * 相対距離を書き込む。オーバーフロー済み、またはpatch_offsetがバッファ範囲外の場合は
  * 何もしない(呼び出し元がg_jit_overflow経由で失敗を検出しロールバックする)。
  */
-static void jit_patch_rel32(UINT64 patch_offset) {
+static void jit_patch_rel32_target(UINT64 patch_offset, UINT64 target_offset) {
     if (g_jit_overflow || patch_offset + 4 > JIT_CODE_SIZE) {
         return;
     }
-    INT64 rel = (INT64)g_jit_used - (INT64)(patch_offset + 4);
+    INT64 rel = (INT64)target_offset - (INT64)(patch_offset + 4);
     UINT32 rel32 = (UINT32)rel;
     g_jit_code[patch_offset] = (UINT8)(rel32);
     g_jit_code[patch_offset + 1] = (UINT8)(rel32 >> 8);
     g_jit_code[patch_offset + 2] = (UINT8)(rel32 >> 16);
     g_jit_code[patch_offset + 3] = (UINT8)(rel32 >> 24);
+}
+
+/** 直前に出力したプレースホルダ(je/jmp/jne)を、現在位置(=着地点)へ向けてpatchする */
+static void jit_patch_rel32(UINT64 patch_offset) {
+    jit_patch_rel32_target(patch_offset, g_jit_used);
+}
+
+/** patch_offsetのプレースホルダを、g_jit_code内の別の(すでに確定した)地点target_offsetへ
+ * 向けてpatchする。共有トランポリンスタブのような、今回のコンパイルより前に確定済みの
+ * 位置へジャンプする際に使う。 */
+static void jit_emit_jmp_to(UINT64 target_offset) {
+    UINT64 patch = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32_target(patch, target_offset);
 }
 
 /**
@@ -208,27 +301,6 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
     return 0;
 }
 
-/**
- * オペランド1個の値をraxへ計算する機械語を出力する。paramsへの参照であれば
- * rbxに退避済みのevaluated_args先頭からcc_cdrをparam_index回・cc_carを1回呼ぶ。
- * この間アロケーションは発生しないため、まだ辿っていないリストの残りが
- * GCで無効化される心配はない。
- */
-static void za_emit_operand(const za_operand_t *op) {
-    if (op->is_literal) {
-        jit_movabs_rax(op->literal);
-        return;
-    }
-    jit_mov_rcx_rbx();
-    for (UINT64 i = 0; i < op->param_index; i++) {
-        jit_movabs_r11((UINT64)(void *)cc_cdr);
-        jit_call_r11();
-        jit_mov_rcx_rax();
-    }
-    jit_movabs_r11((UINT64)(void *)cc_car);
-    jit_call_r11();
-}
-
 /** za_compile_expr/za_try_compile_defunが + - * < = を認識するためのシンボル束。
  * za_try_compile_defunで1度だけos_make_symbolして組み立てる。 */
 typedef struct {
@@ -238,6 +310,148 @@ typedef struct {
     lisp_val_t lt;
     lisp_val_t eq;
 } za_syms_t;
+
+/**
+ * GC_PROTECTと同じ仕組み(shadow stackへのgc_rootnodeの連結)を、JIT生成コードから
+ * `movabs r11, <addr>; call r11`で呼び出すための最小ヘルパー3つ。呼び出しの引数評価
+ * (os_make_cons等でヒープ確保する)の間、レジスタ/ネイティブスタック上の値はGCに
+ * 追跡されないため、za_try_compile_defunがフレーム上に確保する値スロット+
+ * gc_rootnodeを明示的にこの3つでリンク/アンリンクする。
+ */
+
+/** 現在のshadow stackの先頭(呼び出し前のgc_roots)を返す。何もリンクしない。 */
+static gc_rootnode *za_gc_current_head(void) {
+    return get_current_process()->gc_roots;
+}
+
+/** node->var_ptr = var_ptr として、shadow stackの先頭にnodeを繋ぐ(GC_PROTECTのpush相当) */
+static void za_gc_link(gc_rootnode *node, lisp_val_t *var_ptr) {
+    node->var_ptr = var_ptr;
+    node->next = get_current_process()->gc_roots;
+    get_current_process()->gc_roots = node;
+}
+
+/** gc_rootsをsaved_headへ復元する(GC_PROTECTのpop相当。複数連続linkした分もまとめて外れる) */
+static void za_gc_unlink(gc_rootnode *saved_head) {
+    get_current_process()->gc_roots = saved_head;
+}
+
+/**
+ * za_try_compile_defunが確保する追加フレームのレイアウト(すべてrsp相対オフセット)。
+ * env用は関数本体の実行中ずっとリンクしたまま(プロローグでリンク、エピローグ/
+ * 末尾呼び出し脱出直前でアンリンク)。fn/acc/引数用は呼び出しサイトごとに一時的に
+ * リンク/アンリンクする(このプロジェクトのグラマー制約により呼び出しは常に1つずつ
+ * しか実行中にならないため、呼び出しサイトが複数あっても同じスロットを使い回せる)。
+ */
+#define ZA_OFF_ENV_SAVED_HEAD  0    /* env/args link前のgc_roots(関数終了時に復元する) */
+#define ZA_OFF_CALL_SAVED_HEAD 8    /* 呼び出しサイトごとのfn/acc/引数link前のgc_roots */
+#define ZA_OFF_ENV_VAL         16
+#define ZA_OFF_ENV_NODE        24   /* 16バイト(var_ptr+next) */
+#define ZA_OFF_ARGS_VAL        40   /* 元のevaluated_args(param参照がcc_car/cc_cdrで辿る先頭) */
+#define ZA_OFF_ARGS_NODE       48
+#define ZA_OFF_FN_VAL          64
+#define ZA_OFF_FN_NODE         72
+#define ZA_OFF_ACC_VAL         88
+#define ZA_OFF_ACC_NODE        96
+#define ZA_OFF_ARG_BASE        112
+#define ZA_ARG_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
+/* ZA_OFF_ARG_BASE + ZA_MAX_OPERANDS*ZA_ARG_SLOT_SIZE(=496) は既に16バイト境界 */
+#define ZA_FRAME_EXTRA         496
+/* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
+#define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
+
+static UINT32 za_arg_val_off(UINT64 i) { return ZA_OFF_ARG_BASE + (UINT32)i * ZA_ARG_SLOT_SIZE; }
+static UINT32 za_arg_node_off(UINT64 i) { return za_arg_val_off(i) + 8; }
+
+/** [rsp+off]の値をregへ読み出す */
+static void za_load_slot(UINT8 reg, UINT32 off) { jit_mov_reg_from_rsp(reg, (INT32)off); }
+/** regの値を[rsp+off]へ書き込む */
+static void za_store_slot(UINT8 reg, UINT32 off) { jit_mov_rsp_from_reg(reg, (INT32)off); }
+/** [rsp+off]のアドレスをregへ計算する(lea) */
+static void za_addr_of_slot(UINT8 reg, UINT32 off) { jit_lea_reg_rsp(reg, (INT32)off); }
+
+/** value_off番地の値をvar_ptr、node_off番地をgc_rootnodeとしてshadow stackへリンクする
+ * (za_gc_linkの呼び出し。rcx=&node, rdx=&value)。 */
+static void za_emit_gc_link_slot(UINT32 value_off, UINT32 node_off) {
+    za_addr_of_slot(ZA_REG_RCX, node_off);
+    za_addr_of_slot(ZA_REG_RDX, value_off);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_link);
+    jit_call_r11();
+}
+
+/**
+ * オペランド1個の値をraxへ計算する機械語を出力する。paramsへの参照であれば
+ * ARGS_VALスロット(プロローグでリンク済みの元のevaluated_args先頭)から毎回読み直し、
+ * cc_cdrをparam_index回・cc_carを1回呼ぶ。呼び出しコード生成(za_compile_call)が
+ * os_make_cons等でヒープ確保する間にこの先頭が移動する可能性があるため、レジスタに
+ * 生ポインタとしてキャッシュせず、リンク済みスロットから都度読み直す。
+ */
+static void za_emit_operand(const za_operand_t *op) {
+    if (op->is_literal) {
+        jit_movabs_rax(op->literal);
+        return;
+    }
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
+    for (UINT64 i = 0; i < op->param_index; i++) {
+        jit_movabs_r11((UINT64)(void *)cc_cdr);
+        jit_call_r11();
+        jit_mov_rcx_rax();
+    }
+    jit_movabs_r11((UINT64)(void *)cc_car);
+    jit_call_r11();
+}
+
+static UINT64 g_za_trampoline_offset = 0;
+static int g_za_trampoline_ready = 0;
+
+/**
+ * 全JIT関数の末尾呼び出しサイトが共有する小さなトランポリンスタブをg_jit_codeへ
+ * 一度だけ書き込み、そのオフセットを返す(2回目以降は書き込まずキャッシュ済みの
+ * オフセットを返す)。呼び出し規約(スタブ独自): rcx=evaluated_args, rdx=env,
+ * r8=fn(タグ付きINSTANCE)。呼び出し元はここへjmpする前に自分のフレームを完全に
+ * 畳んでおくこと(呼び出し元のレジスタ/フレームはここでは一切保存しない)。
+ * このスタブ自体は毎回のza_try_compile_defun呼び出しの冒頭、コンパイル対象の
+ * 関数用にg_jit_usedを記録する(=ロールバック時に巻き戻る)より前に確定させる
+ * ことで、コンパイル失敗によるロールバックでスタブ自体が失われないようにする。
+ */
+static UINT64 za_ensure_trampoline(void) {
+    if (g_za_trampoline_ready) {
+        return g_za_trampoline_offset;
+    }
+    UINT64 offset = g_jit_used;
+
+    // r10 = fn(r8)からTAG_INSTANCEを外した生アドレス
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_R8);
+    jit_and_reg_imm8(ZA_REG_R10, 0xF8); // ~TAG_MASK(0x7)
+
+    // rax = obj[0] (magic)。MAGIC_FUNCTION_NATIVEでなければfallbackへ
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 0);
+    jit_movabs_reg(ZA_REG_R11, MAGIC_FUNCTION_NATIVE);
+    jit_cmp_rax_r11();
+    UINT64 jne_patch = jit_emit_jne_rel32_placeholder();
+
+    // native高速path: r11 = obj[1](生の関数アドレス)へ末尾jmp。rcx=args,rdx=envは
+    // 呼び出し規約上すでに正しい位置にあるので、そのままneue関数の入口へ飛べる。
+    jit_mov_reg_from_mem_disp8(ZA_REG_R11, ZA_REG_R10, 8);
+    jit_jmp_reg(ZA_REG_R11);
+
+    jit_patch_rel32(jne_patch);
+    // fallback: os_apply_function(fn, evaluated_args, env)はrcx=fn,rdx=args,r8=envの
+    // 順。入ってきた時点でrcx=args,rdx=env,r8=fnなので3点をローテートする。
+    jit_mov_reg_reg(ZA_REG_R9, ZA_REG_RCX);
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R8);
+    jit_mov_reg_reg(ZA_REG_R8, ZA_REG_RDX);
+    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_R9);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_function);
+    jit_jmp_reg(ZA_REG_R11);
+
+    if (g_jit_overflow) {
+        return 0;
+    }
+    g_za_trampoline_offset = offset;
+    g_za_trampoline_ready = 1;
+    return offset;
+}
 
 /**
  * 「(op operand operand...)」(オペランド2個以上、ZA_MAX_OPERANDS以下)を検証しつつ、
@@ -362,18 +576,70 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
 }
 
 /**
+ * head(必ずTAG_SYMBOL)が一般呼び出しとして扱えない特殊形式のシンボルかどうかを判定する。
+ * eval.cのos_eval特殊形式ディスパッチ表と同じ集合(quote・if・+・-・*・<・=はza_compile_expr側で
+ * 先に個別に処理済みなのでここには含めない)。
+ */
+static int za_is_excluded_special_form(lisp_val_t head) {
+    return head == g_sym_quote || head == g_sym_progn || head == g_sym_setq ||
+           head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
+           head == g_sym_quasiquote || head == g_sym_block || head == g_sym_return_from ||
+           head == g_sym_unwind_protect || head == g_sym_function || head == g_sym_flet ||
+           head == g_sym_labels || head == g_sym_defvar || head == g_sym_defconstant ||
+           head == g_sym_defdynamic || head == g_sym_defglobal || head == g_sym_dynamic ||
+           head == g_sym_catch || head == g_sym_throw || head == g_sym_tagbody || head == g_sym_go;
+}
+
+/**
+ * symの名前をg_jit_code内にNUL終端バイト列として埋め込み、そのオフセットを返す
+ * (直前にjmpで飛び越えるので、書き込んだバイト列自体は命令として実行されない)。
+ * 呼び出し側はこのアドレスをos_make_symbolへ毎回渡して現在のタグ付きシンボルポインタを
+ * 再解決する。symのタグ付きポインタ自体をmovabsで埋め込んでしまうと、コンパイル後に
+ * 実行されるGCでシンボルオブジェクトが移動した際、生成済み機械語が古いアドレスを
+ * 指し続けてしまい安全ではないため(os_make_symbolの重複チェックループと同じ内部表現
+ * <word0=名前文字列、文字列は長さ8バイト+本体>を前提に直接読む)。
+ */
+static UINT64 za_emit_symbol_name(lisp_val_t sym) {
+    lisp_addr_t sym_addr = sym & ~TAG_MASK;
+    lisp_val_t str_obj = ((lisp_val_t *)sym_addr)[0];
+    lisp_addr_t str_addr = str_obj & ~TAG_MASK;
+    UINT64 len = ((UINT64 *)str_addr)[0];
+    const char *bytes = (const char *)(str_addr + 8);
+
+    UINT64 jmp_patch = jit_emit_jmp_rel32_placeholder();
+    UINT64 str_offset = g_jit_used;
+    for (UINT64 i = 0; i < len; i++) {
+        jit_emit8((UINT8)bytes[i]);
+    }
+    jit_emit8(0);
+    jit_patch_rel32(jmp_patch);
+    return str_offset;
+}
+
+static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
+                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset);
+
+/**
  * formを評価してraxに結果を残す機械語を出力する。対応するグラマーは
  * 「fixnumリテラル / params固定引数への参照 / (+ leaf leaf...) / (- leaf) /
  * (- leaf leaf...) / (* leaf leaf...) / (< leaf leaf) / (= leaf leaf) /
- * (if test then else?)」(if・+/-/*のtest/then/else/operandそれぞれの位置には
- * 再帰的に上記のいずれかを許容する。ただし+/-/*のoperandはleaf限定のまま、
- * それらの中にifを直接書くことはできない。</、=はちょうど2オペランドのみ対応)。
+ * (if test then else?) / (fn-sym arg arg...)」(if・+/-/*のtest/then/else/operand
+ * それぞれの位置には再帰的に上記のいずれかを許容する。ただし+/-/*のoperand、および
+ * 一般呼び出しの引数(allow_call=0)はleaf/算術/比較/if限定のまま、それらの中に
+ * さらに一般呼び出しを直接書くことはできない。</、=はちょうど2オペランドのみ対応)。
  * formおよびifのtest/then/elseは、上記のいずれにも分類する前にza_macroexpandで
  * fixpointまで展開する(andのようにif木へ完全展開されるマクロはこれで透過的に
- * コンパイル対象になる。+/-/*のoperand位置はleaf限定のままなので展開を挟まない)。
+ * コンパイル対象になる。+/-/*のoperand位置・呼び出しの引数位置はleaf/算術/比較/if
+ * 限定のままなので展開を挟まない)。
+ * @param allow_call この位置で一般呼び出しを許容するか(body直下・ifのthen/elseのみ1、
+ * ifのtestと呼び出しの引数位置は0)
+ * @param is_tail この位置が末尾位置かどうか(body直下・ifのthen/else<ifが末尾の場合>で
+ * 呼び出し側から継承。ifのtestと呼び出しの引数位置は常に0)
+ * @param trampoline_offset 末尾呼び出しが共有トランポリンへjmpする際の着地先オフセット
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
  */
-static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms, lisp_val_t env) {
+static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                            lisp_val_t env, int allow_call, int is_tail, UINT64 trampoline_offset) {
     form = za_macroexpand(form, env);
 
     za_operand_t leaf;
@@ -431,14 +697,14 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
             has_else = 1;
         }
 
-        if (!za_compile_expr(test_form, params, fixed_count, syms, env)) {
+        if (!za_compile_expr(test_form, params, fixed_count, syms, env, 0, 0, trampoline_offset)) {
             return 0;
         }
         jit_movabs_r11(nil);
         jit_cmp_rax_r11();
         UINT64 je_patch = jit_emit_je_rel32_placeholder();
 
-        if (!za_compile_expr(then_form, params, fixed_count, syms, env)) {
+        if (!za_compile_expr(then_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset)) {
             return 0;
         }
         // then分岐の実行後は必ずelse/nilフォールバック側を飛び越える(elseが無い場合も
@@ -448,7 +714,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
 
         jit_patch_rel32(je_patch);
         if (has_else) {
-            if (!za_compile_expr(else_form, params, fixed_count, syms, env)) {
+            if (!za_compile_expr(else_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset)) {
                 return 0;
             }
         } else {
@@ -457,7 +723,117 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         jit_patch_rel32(jmp_patch);
         return 1;
     }
-    return 0;
+
+    // 一般呼び出し: headがシンボルで、除外リストの特殊形式でなければ関数呼び出しとして
+    // 扱う。引数位置・ifのtest位置(allow_call=0)からここに来た場合はネスト呼び出しに
+    // なるのでコンパイルを断念する(+/-/*のoperandがleaf限定なのと同じ形の制約)。
+    if (!allow_call) {
+        return 0;
+    }
+    if ((head & TAG_MASK) != TAG_SYMBOL || za_is_excluded_special_form(head)) {
+        return 0;
+    }
+    return za_compile_call(form, head, params, fixed_count, syms, env, is_tail, trampoline_offset);
+}
+
+/**
+ * 一般呼び出し「(fn_sym arg arg...)」をコンパイルする(呼び出しごとに以下の順で
+ * 機械語を出力する)。
+ *   1. 呼び出し前のgc_rootsをCALL_SAVED_HEADスロットへ保存する。
+ *   2. 引数を左から順にza_compile_expr(allow_call=0, is_tail=0)で評価し、対応する
+ *      引数スロットへ書き込み、その都度linkする。
+ *   3. os_make_symbolでfn_symの名前から現在のタグ付きシンボルポインタを再解決し、
+ *      os_get_function(sym, env)をfnスロットへ書き込み、linkする(envはENV_VALスロット
+ *      から読み直す)。
+ *   4. accスロットをnilで初期化しlinkした後、引数スロットを右から左へ
+ *      os_make_cons(argslot[i], accslot)で辿ってconsし、その都度accスロットを書き換える。
+ *   5. CALL_SAVED_HEADでfn/acc/引数のリンクをまとめて外す。
+ *   6. 非末尾ならos_apply_function(fn, evaluated_args, env)を通常のcallで呼ぶ。末尾なら
+ *      envのリンクも外し、自分のフレームを完全に畳んだ上で共有トランポリンへjmpする。
+ * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
+ */
+static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
+                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset) {
+    lisp_val_t arg_forms[ZA_MAX_OPERANDS];
+    UINT64 argc = 0;
+    for (lisp_val_t rest = cc_cdr(form); rest != nil; rest = cc_cdr(rest)) {
+        if ((rest & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        if (argc >= ZA_MAX_OPERANDS) {
+            return 0;
+        }
+        arg_forms[argc++] = cc_car(rest);
+    }
+
+    // 1. 呼び出し前のgc_rootsを保存する。
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, ZA_OFF_CALL_SAVED_HEAD);
+
+    // 2. 引数を左から順に評価し、引数スロットへ書き込み、linkする。
+    for (UINT64 i = 0; i < argc; i++) {
+        if (!za_compile_expr(arg_forms[i], params, fixed_count, syms, env, 0, 0, trampoline_offset)) {
+            return 0;
+        }
+        za_store_slot(ZA_REG_RAX, za_arg_val_off(i));
+        za_emit_gc_link_slot(za_arg_val_off(i), za_arg_node_off(i));
+    }
+
+    // 3. os_get_function(fn_sym, env)をfnスロットへ書き込み、linkする。
+    UINT64 name_off = za_emit_symbol_name(fn_sym);
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, ZA_OFF_FN_VAL);
+    za_emit_gc_link_slot(ZA_OFF_FN_VAL, ZA_OFF_FN_NODE);
+
+    // 4. accスロットをnilで初期化しlinkした後、右から左へos_make_consでfoldする。
+    jit_movabs_rax(nil);
+    za_store_slot(ZA_REG_RAX, ZA_OFF_ACC_VAL);
+    za_emit_gc_link_slot(ZA_OFF_ACC_VAL, ZA_OFF_ACC_NODE);
+    for (UINT64 i = argc; i > 0; i--) {
+        za_load_slot(ZA_REG_RCX, za_arg_val_off(i - 1));
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ACC_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_cons);
+        jit_call_r11();
+        za_store_slot(ZA_REG_RAX, ZA_OFF_ACC_VAL);
+    }
+
+    // 5. fn/acc/引数のリンクをまとめて外す。
+    za_load_slot(ZA_REG_RCX, ZA_OFF_CALL_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+
+    if (!is_tail) {
+        // 6a. 非末尾: os_apply_function(fn, evaluated_args, env)を通常のcallで呼ぶ。
+        za_load_slot(ZA_REG_RCX, ZA_OFF_FN_VAL);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ACC_VAL);
+        za_load_slot(ZA_REG_R8, ZA_OFF_ENV_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_function);
+        jit_call_r11();
+        return 1;
+    }
+
+    // 6b. 末尾: envのリンクも外す。
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+
+    // トランポリンの呼び出し規約(rcx=evaluated_args, rdx=env, r8=fn)に沿って、
+    // フレームを解体する前に値スロットからレジスタへ読み出しておく。
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ACC_VAL);
+    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+    za_load_slot(ZA_REG_R8, ZA_OFF_FN_VAL);
+    jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+    jit_pop_r13();
+    jit_pop_rbx();
+    jit_emit_jmp_to(trampoline_offset);
+    return 1;
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
@@ -485,22 +861,44 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     syms.lt = os_make_symbol("<");
     syms.eq = os_make_symbol("=");
 
-    UINT64 entry = g_jit_used;
     g_jit_overflow = 0;
+    // トランポリンは全JIT関数で共有するため、今回のコンパイル対象用にentryを記録する
+    // より前に確定させる(コンパイル失敗時のg_jit_used巻き戻しでスタブ自体が失われない
+    // ようにするため)。
+    UINT64 trampoline_offset = za_ensure_trampoline();
+    if (g_jit_overflow) {
+        return nil;
+    }
 
-    // プロローグ: rbx/r13を退避し、MS x64呼び出し規約に沿ってシャドウスペースを確保する
+    UINT64 entry = g_jit_used;
+
+    // プロローグ: rbx/r13を退避し、MS x64呼び出し規約のシャドウスペース+拡張3用の
+    // フレーム(env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
     jit_push_rbx();
     jit_push_r13();
-    jit_sub_rsp_imm8(0x28);
-    jit_mov_rbx_rcx();
+    jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+    za_store_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
+    za_store_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, ZA_OFF_ENV_SAVED_HEAD);
+    za_emit_gc_link_slot(ZA_OFF_ENV_VAL, ZA_OFF_ENV_NODE);
+    za_emit_gc_link_slot(ZA_OFF_ARGS_VAL, ZA_OFF_ARGS_NODE);
 
-    if (!za_compile_expr(form, params, fixed_count, &syms, env)) {
+    if (!za_compile_expr(form, params, fixed_count, &syms, env, 1, 1, trampoline_offset)) {
         g_jit_used = entry;
         return nil;
     }
 
-    // エピローグ
-    jit_add_rsp_imm8(0x28);
+    // エピローグ(末尾呼び出しでトランポリンへjmpせずここへ流れ落ちた場合のみ通る経路)。
+    // za_gc_unlinkの呼び出し自体がrcxを使うため、本体の結果(rax)は先にr13へ退避してから
+    // 呼び、戻ってから復元する。
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    jit_add_rsp_imm32(ZA_FRAME_TOTAL);
     jit_pop_r13();
     jit_pop_rbx();
     jit_ret();
