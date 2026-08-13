@@ -333,7 +333,7 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(name);
     GC_PROTECT(env);
 
-    lisp_val_t fn = za_try_compile_defun(params, body);
+    lisp_val_t fn = za_try_compile_defun(params, body, env);
     if (fn == nil) {
         fn = make_interpreted_function(params, body, env);
     }

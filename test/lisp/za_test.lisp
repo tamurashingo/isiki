@@ -119,3 +119,54 @@
 (assert-equal nil (%%za-compiled-p (function isiki-za-test-bad2)))
 (assert-equal 9 (isiki-za-test-bad2 10 5))
 (assert-equal 8 (isiki-za-test-bad2 10 nil))
+
+;;; --- 拡張2: 制御構文(マクロ展開を前提とする) ---
+;;
+;; cond/let/let*/while/for/and/or/caseはCの特殊形式ではなくすべてinit.lispのdefmacroで
+;; 定義されたマクロで、展開結果はif/progn/setq/tagbody/go/lambdaの組み合わせになる。
+;; zaはbodyそのもの、およびifのtest/then/elseの位置でmacroexpand-1相当をfixpointまで
+;; 適用してから検証・コード生成する。andはif木へ完全展開されるためこれでコンパイル
+;; できるようになるが、let/or/condはlambda即時呼び出しやprognへ展開されるため、
+;; 拡張3(関数呼び出し)・拡張4(クロージャ)完了までは非対応としてインタプリタへ
+;; フォールバックする(結果自体は正しい)。
+
+;; (and x y) : 2引数のandは(if x y nil)へ展開されるのでzaでコンパイルされる
+(defun isiki-za-test-and2 (x y) (and x y))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-and2)))
+(assert-equal 2 (isiki-za-test-and2 1 2))
+(assert-equal nil (isiki-za-test-and2 nil 2))
+(assert-equal nil (isiki-za-test-and2 1 nil))
+
+;; (and x y z) : 3引数のandも入れ子のifへ完全展開されるのでzaでコンパイルされる
+(defun isiki-za-test-and3 (x y z) (and x y z))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-and3)))
+(assert-equal 3 (isiki-za-test-and3 1 2 3))
+(assert-equal nil (isiki-za-test-and3 1 nil 3))
+
+;; ifのtest位置にandを書いても展開されてzaでコンパイルされる
+(defun isiki-za-test-if-and (x y) (if (and x y) 1 2))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-if-and)))
+(assert-equal 1 (isiki-za-test-if-and 1 1))
+(assert-equal 2 (isiki-za-test-if-and 1 nil))
+
+;; letが展開する即時lambda呼び出しは、拡張3・拡張4が完了するまで非対応でフォールバックする
+;; (結果自体はインタプリタ経由で正しい)
+(defun isiki-za-test-let-fallback (x)
+  (let ((y 1))
+    (+ x y)))
+(assert-equal nil (%%za-compiled-p (function isiki-za-test-let-fallback)))
+(assert-equal 11 (isiki-za-test-let-fallback 10))
+
+;; orはgensymの一時変数をletで束縛する形に展開されるため同様にフォールバックする
+(defun isiki-za-test-or-fallback (x y) (or x y))
+(assert-equal nil (%%za-compiled-p (function isiki-za-test-or-fallback)))
+(assert-equal 1 (isiki-za-test-or-fallback 1 2))
+(assert-equal 2 (isiki-za-test-or-fallback nil 2))
+
+;; condはprognを含む形に展開されるため同様にフォールバックする
+(defun isiki-za-test-cond-fallback (x)
+  (cond (x 1)
+        (t 2)))
+(assert-equal nil (%%za-compiled-p (function isiki-za-test-cond-fallback)))
+(assert-equal 1 (isiki-za-test-cond-fallback t))
+(assert-equal 2 (isiki-za-test-cond-fallback nil))

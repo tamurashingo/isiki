@@ -1,6 +1,7 @@
 #include "types.h"
 #include "lisp.h"
 #include "runtime.h"
+#include "eval.h"
 #include "za.h"
 
 #if defined(__x86_64__)
@@ -338,18 +339,55 @@ static int za_compile_compare(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
 }
 
 /**
+ * formの先頭がマクロ呼び出しである間、macroexpand-1相当(primitive_macroexpand_1)を
+ * fixpointまで繰り返し適用する。cond/let/and/or等はすべてinit.lispのdefmacroで
+ * 実装されており、Cの特殊形式としてzaが直接認識する対象ではないため、za_compile_expr
+ * が式を評価する位置(bodyそのもの、およびifのtest/then/else)に立つたびにここを通す。
+ * 展開後もza未対応の構文(prognやlambda即時呼び出し等)が残る場合は、za_compile_expr側が
+ * 通常通りheadを認識できず0を返すことでフォールバックする(このマクロ展開自体は
+ * 常に何らかのformを返すので失敗しない)。
+ * @param form 展開対象のフォーム
+ * @param env マクロ定義を解決する環境(defunの定義時環境)
+ * @return マクロでなくなるまで展開した後のフォーム
+ */
+static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
+    for (;;) {
+        lisp_val_t wrapped = os_make_cons(form, nil);
+        lisp_val_t expanded = primitive_macroexpand_1(wrapped, env);
+        if (expanded == form) {
+            return form;
+        }
+        form = expanded;
+    }
+}
+
+/**
  * formを評価してraxに結果を残す機械語を出力する。対応するグラマーは
  * 「fixnumリテラル / params固定引数への参照 / (+ leaf leaf...) / (- leaf) /
  * (- leaf leaf...) / (* leaf leaf...) / (< leaf leaf) / (= leaf leaf) /
  * (if test then else?)」(if・+/-/*のtest/then/else/operandそれぞれの位置には
  * 再帰的に上記のいずれかを許容する。ただし+/-/*のoperandはleaf限定のまま、
  * それらの中にifを直接書くことはできない。</、=はちょうど2オペランドのみ対応)。
+ * formおよびifのtest/then/elseは、上記のいずれにも分類する前にza_macroexpandで
+ * fixpointまで展開する(andのようにif木へ完全展開されるマクロはこれで透過的に
+ * コンパイル対象になる。+/-/*のoperand位置はleaf限定のままなので展開を挟まない)。
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
  */
-static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms) {
+static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms, lisp_val_t env) {
+    form = za_macroexpand(form, env);
+
     za_operand_t leaf;
     if (za_classify_operand(form, params, fixed_count, &leaf)) {
         za_emit_operand(&leaf);
+        return 1;
+    }
+    // nilはTAG_CONS(g_nil_cellへの自己参照)なのでza_classify_operandには分類されず、
+    // 次のTAG_CONSチェックだけでは素通りしてcc_car(nil)=nilをheadとして誤って評価継続
+    // してしまう。andの展開結果(if x y nil)のようにexpr位置に直接nilリテラルが現れる
+    // ケースをここで先に捕まえる。+/-/*のオペランド(za_classify_operand)側はleaf限定の
+    // 仕様を保つためnilを追加しない。
+    if (form == nil) {
+        jit_movabs_rax(nil);
         return 1;
     }
     if ((form & TAG_MASK) != TAG_CONS) {
@@ -393,14 +431,14 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
             has_else = 1;
         }
 
-        if (!za_compile_expr(test_form, params, fixed_count, syms)) {
+        if (!za_compile_expr(test_form, params, fixed_count, syms, env)) {
             return 0;
         }
         jit_movabs_r11(nil);
         jit_cmp_rax_r11();
         UINT64 je_patch = jit_emit_je_rel32_placeholder();
 
-        if (!za_compile_expr(then_form, params, fixed_count, syms)) {
+        if (!za_compile_expr(then_form, params, fixed_count, syms, env)) {
             return 0;
         }
         // then分岐の実行後は必ずelse/nilフォールバック側を飛び越える(elseが無い場合も
@@ -410,7 +448,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
 
         jit_patch_rel32(je_patch);
         if (has_else) {
-            if (!za_compile_expr(else_form, params, fixed_count, syms)) {
+            if (!za_compile_expr(else_form, params, fixed_count, syms, env)) {
                 return 0;
             }
         } else {
@@ -422,7 +460,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     return 0;
 }
 
-lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body) {
+lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
 #ifdef ISIKIOS_UNIT_TEST
     // za.cが出力する機械語は実機ビルド(mingw-gcc, MS x64 ABI, 実行可能メモリ)を前提と
     // しており、ネイティブgccでビルドするユニットテストではABI/メモリ保護が異なるため
@@ -456,7 +494,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body) {
     jit_sub_rsp_imm8(0x28);
     jit_mov_rbx_rcx();
 
-    if (!za_compile_expr(form, params, fixed_count, &syms)) {
+    if (!za_compile_expr(form, params, fixed_count, &syms, env)) {
         g_jit_used = entry;
         return nil;
     }
@@ -479,9 +517,10 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body) {
 
 #else /* !defined(__x86_64__) */
 
-lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body) {
+lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
     (void)params;
     (void)body;
+    (void)env;
     return nil;
 }
 
