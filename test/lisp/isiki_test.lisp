@@ -21,7 +21,7 @@
 ;;     限らないため、assert-equalではなく許容誤差付きの assert-float-close を使う
 ;;
 
-(defglobal *isiki-test-stream* (open-output-stream))
+(defglobal *isiki-test-stream* (open-output-file "test-results.txt"))
 (defglobal *isiki-test-pass* 0)
 (defglobal *isiki-test-fail* 0)
 
@@ -927,3 +927,4 @@ line2"))
 ;;; --- 最終レポート ---
 
 (isiki-test-report)
+(close *isiki-test-stream*)

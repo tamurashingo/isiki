@@ -12,6 +12,7 @@
 #include "stream_lisp.h"
 #include "format.h"
 #include "clock.h"
+#include "stream.h"
 
 
 /**
@@ -58,7 +59,7 @@ UINT64 kernel_get_boot_epoch_seconds(void) {
     return g_boot_epoch_seconds;
 }
 
-void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pixels_per_scanline, UINT64 heap_base, UINT64 heap_size, UINT64 boot_epoch_seconds) {
+void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pixels_per_scanline, UINT64 heap_base, UINT64 heap_size, UINT64 boot_epoch_seconds, void (*power_off)(void)) {
 
     asm volatile ("cli");
 
@@ -86,6 +87,16 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     init_pic();
     init_pit();
     init_idt();
+
+    // リポジトリルートに.qemu-test-triggerがあれば、テスト用のLispファイルを
+    // 自動loadしてから電源を切る(make test-qemuからの全自動実行用)
+    os_stream_t trigger_probe;
+    char trigger_err[64];
+    if (os_stream_open_9p_file(&trigger_probe, ".qemu-test-trigger", trigger_err, sizeof(trigger_err))) {
+        os_stream_close(&trigger_probe);
+        cc_load(os_make_cons(os_make_string("test/lisp/qemu_boot_test.lisp"), nil), global_environment);
+        power_off();
+    }
 
     kernel_show_information(fb);
 

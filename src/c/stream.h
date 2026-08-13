@@ -17,8 +17,10 @@ typedef enum {
 /**
  * 9Pのバイト列をバッファリングしながら1文字ずつ切り出す、文字列バッファ、または
  * 画面へ1文字ずつ書き出すためのストリーム。buf_data/buf_count/buf_posは
- * os_virtio9p_read_chunkが返す受信バッファ(呼び出しごとに上書きされる)への参照であり、
- * コピーは保持しない。
+ * os_virtio9p_read_chunkが返す受信バッファ(呼び出しごとに上書きされる共有バッファ)
+ * からstream自身にコピーした内容を保持する。複数の9pストリームを跨いで読み込みが
+ * 交互に発生しても(例: あるファイルのload中に別ファイルをloadする)、他方のTreadで
+ * 共有バッファが上書きされて読み込み内容が壊れないようにするため。
  */
 typedef struct {
     stream_kind_t kind;
@@ -27,8 +29,8 @@ typedef struct {
     UINT32 fid;
     UINT64 next_offset;
 
-    /* --- STREAM_9P_FILE_READ/IOの読み込み用バッファ(コピー無し参照) --- */
-    const UINT8 *buf_data;
+    /* --- STREAM_9P_FILE_READ/IOの読み込み用バッファ(stream自身にコピーを保持) --- */
+    UINT8 buf_data[1024];
     UINT32 buf_count;
     UINT32 buf_pos;
 

@@ -1,6 +1,10 @@
 
 PWD = $(shell pwd)
 
+# OVMFのcode pflashイメージ。Homebrew版qemuでの既定値。CI等では
+# `make test-qemu OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd` のように上書きする
+OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
+
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
 SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c
@@ -68,7 +72,7 @@ TEST_SRC_VIRTIO9P = $(SRCDIR)/p9.c $(SRCDIR)/virtio9p.c $(TESTDIR)/virtio9p_test
 TEST_BIN_VIRTIO9P = $(BUILD_TMPDIR)/virtio9p_test
 
 
-.PHONY: all setup image transpile build compile run test clean
+.PHONY: all setup image transpile build compile run test test-qemu clean
 
 all: build
 
@@ -207,7 +211,7 @@ clean:
 run:
 	qemu-system-x86_64 \
 		-m 256M \
-		-drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
@@ -215,9 +219,28 @@ run:
 debug:
 	qemu-system-x86_64 \
 		-m 256M \
-		-drive if=pflash,format=raw,readonly=on,file=/opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-monitor stdio -serial null \
 		-d cpu_reset,int -D qemu.log
+
+# isiki_test.lispをQEMU上で全自動実行し、test-results.txtの結果でpass/failを判定する。
+# .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
+# ResetSystemでQEMUを電源断する
+test-qemu: build
+	rm -f .qemu-test-trigger test-results.txt
+	touch .qemu-test-trigger
+	qemu-system-x86_64 \
+		-m 256M \
+		-display none \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive format=raw,file=fat:rw:./esp_dir \
+		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
+		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		-no-reboot
+	rm -f .qemu-test-trigger
+	test -f test-results.txt
+	cat test-results.txt
+	grep -q " 0 failed" test-results.txt

@@ -515,9 +515,10 @@ static void gc_relocate_vector_block(UINT64 *words) {
 }
 
 /**
- * MAGIC_STREAM(word1=os_stream_tへの生ポインタ)を再配置する。buf_data(9P受信バッファ)/
- * out_fb(frame buffer)は常にLispヒープ外の静的領域を指すため素通しし、str_buf
- * (STREAM_STRING_INPUT/OUTPUTのみヒープ上)だけ追加で再配置する。
+ * MAGIC_STREAM(word1=os_stream_tへの生ポインタ)を再配置する。buf_dataはos_stream_t
+ * 本体に埋め込まれた配列なので構造体ごとコピーすれば移動する。out_fb(frame buffer)は
+ * 常にLispヒープ外の静的領域を指すため素通しし、str_buf(STREAM_STRING_INPUT/OUTPUT
+ * のみヒープ上)だけ追加で再配置する。
  */
 static void gc_relocate_stream(UINT64 *words) {
     os_stream_t *old_stream = (os_stream_t *)words[1];

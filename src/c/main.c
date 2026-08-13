@@ -91,10 +91,34 @@ typedef struct {
 
 typedef EFI_STATUS (EFIAPI *EFI_GET_TIME)(EFI_TIME *Time, void *Capabilities);
 
-// GetTimeはHdrの直後の最初のフィールドなので、後続のSetTime等は使わないため省略する
+typedef enum {
+    EfiResetCold,
+    EfiResetWarm,
+    EfiResetShutdown,
+    EfiResetPlatformSpecific
+} EFI_RESET_TYPE;
+
+typedef void (EFIAPI *EFI_RESET_SYSTEM)(
+    EFI_RESET_TYPE ResetType,
+    EFI_STATUS ResetStatus,
+    UINTN DataSize,
+    void *ResetData
+);
+
+// GetTimeとResetSystemの間のフィールドは使わないためvoid *で埋めている
 typedef struct _EFI_RUNTIME_SERVICES {
     EFI_TABLE_HEADER Hdr;
     EFI_GET_TIME GetTime;
+    void *SetTime;
+    void *GetWakeupTime;
+    void *SetWakeupTime;
+    void *SetVirtualAddressMap;
+    void *ConvertPointer;
+    void *GetVariable;
+    void *GetNextVariableName;
+    void *SetVariable;
+    void *GetNextHighMonotonicCount;
+    EFI_RESET_SYSTEM ResetSystem;
 } EFI_RUNTIME_SERVICES;
 
 
@@ -262,6 +286,15 @@ void UINT64ToHexStr(UINT64 val, CHAR16 *str) {
     str[18] = L'\0';
 }
 
+static EFI_RUNTIME_SERVICES *g_runtime_services;
+
+/** kernel_mainへ渡す電源断関数。ResetSystemはランタイムサービスなのでExitBootServices後も呼べる */
+static void firmware_power_off(void) {
+    g_runtime_services->ResetSystem(EfiResetShutdown, 0, 0, (void *)0);
+    for (;;) {
+    }
+}
+
 EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     // clear screen
     SystemTable->ConOut->ClearScreen(SystemTable->ConOut);
@@ -355,6 +388,7 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     // 起動時点のUTCをget-universal-time用に取得する。GetTimeに失敗した場合は
     // 0(=1900-01-01)のままとする(条件系へのエラー通知はスコープ外)
     EFI_RUNTIME_SERVICES *runtime_services = (EFI_RUNTIME_SERVICES *)SystemTable->RuntimeServices;
+    g_runtime_services = runtime_services;
     EFI_TIME boot_time;
     UINT64 boot_epoch_seconds = 0;
     status = runtime_services->GetTime(&boot_time, (void *)0);
@@ -385,7 +419,7 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     }
 
 
-    kernel_main(fb_base, fb_width, fb_height, fb_pixels_per_scanline, heap_start, max_free_size, boot_epoch_seconds);
+    kernel_main(fb_base, fb_width, fb_height, fb_pixels_per_scanline, heap_start, max_free_size, boot_epoch_seconds, firmware_power_off);
 
     return 0;
 }

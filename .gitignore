@@ -2,4 +2,6 @@ esp_dir/
 tmp/
 .DS_Store
 *.swp
+.qemu-test-trigger
+test-results.txt
 

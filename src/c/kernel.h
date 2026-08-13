@@ -14,8 +14,10 @@
  * @param heap_size Lispヒープのサイズ(バイト)
  * @param boot_epoch_seconds UEFI GetTimeで取得した起動時点のUTC
  *        (Universal Time Format: 1900-01-01からの経過秒数。GetTime失敗時は0)
+ * @param power_off リポジトリルートに.qemu-test-triggerがある場合、テスト実行後に
+ *        呼び出してQEMUの電源を切る関数(戻ってこない)
  */
-void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pixels_per_scanline, UINT64 heap_base, UINT64 heap_size, UINT64 boot_epoch_seconds);
+void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pixels_per_scanline, UINT64 heap_base, UINT64 heap_size, UINT64 boot_epoch_seconds, void (*power_off)(void));
 
 /**
  * kernel_mainに渡されたboot_epoch_secondsを返す
