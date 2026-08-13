@@ -116,11 +116,14 @@ static void setup_heap() {
     os_bootstrap();
 }
 
-// テスト用に + と - だけを登録した環境を作る
+// テスト用に + - * < = だけを登録した環境を作る
 static lisp_val_t make_arith_env() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
     os_set_function(os_make_symbol("+"), os_make_native_function((lisp_addr_t)(void *)primitive_add), env);
     os_set_function(os_make_symbol("-"), os_make_native_function((lisp_addr_t)(void *)primitive_subtract), env);
+    os_set_function(os_make_symbol("*"), os_make_native_function((lisp_addr_t)(void *)primitive_multiply), env);
+    os_set_function(os_make_symbol("<"), os_make_native_function((lisp_addr_t)(void *)primitive_less_than), env);
+    os_set_function(os_make_symbol("="), os_make_native_function((lisp_addr_t)(void *)primitive_num_equal), env);
     return env;
 }
 
@@ -437,6 +440,495 @@ void test_os_eval_defun_rest_param_with_leading_fixed_params() {
     assert(cc_car(v) == os_make_fixnum(1), "(first-and-rest 1 2 3)のfirstは1");
     assert(cc_car(cc_cdr(v)) == os_make_fixnum(2), "(first-and-rest 1 2 3)のrestの1番目は2");
     assert(cc_car(cc_cdr(cc_cdr(v))) == os_make_fixnum(3), "(first-and-rest 1 2 3)のrestの2番目は3");
+}
+
+// defunがzaでx86-64機械語へコンパイルされたか(MAGIC_FUNCTION_NATIVEでword2がfixnum)、
+// インタプリタにフォールバックしたか(MAGIC_FUNCTION_INTERPRETED)を判定する
+static int za_is_compiled(lisp_val_t fn) {
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    return obj[0] == MAGIC_FUNCTION_NATIVE && obj[2] != nil;
+}
+
+static int za_is_interpreted(lisp_val_t fn) {
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    return obj[0] == MAGIC_FUNCTION_INTERPRETED;
+}
+
+void test_za_compiles_nary_plus() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun add3 (x y z) (+ x y z))
+    lisp_val_t name = os_make_symbol("add3");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"),
+                            os_make_cons(os_make_symbol("y"), os_make_cons(os_make_symbol("z"), nil)));
+    lisp_val_t plus_args[3] = { os_make_symbol("x"), os_make_symbol("y"), os_make_symbol("z") };
+    lisp_val_t body = os_make_cons(make_call("+", 3, plus_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+    // za_try_compile_defunの実機械語コンパイルはx86-64ホストでのみ行われる(za.c参照)。
+    // このユニットテストはホストネイティブなgccでビルドされるため、ARM等の
+    // 非x86-64環境ではここは常にインタプリタへフォールバックし判定できない。
+    // 実際のコンパイル成功はmake build+QEMUで確認する
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "オペランド3個の(+ x y z)はzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t call_args[3] = { os_make_fixnum(1), os_make_fixnum(2), os_make_fixnum(3) };
+    lisp_val_t v = os_eval(make_call("add3", 3, call_args), env);
+    assert(v == os_make_fixnum(6), "(add3 1 2 3)は1+2+3=6になる");
+}
+
+void test_za_compiles_rest_param_when_unreferenced() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun add-fixed (x &rest y) (+ x 1)) : &restはあるがbodyから参照しない
+    lisp_val_t name = os_make_symbol("add-fixed");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"),
+                            os_make_cons(g_sym_rest, os_make_cons(os_make_symbol("y"), nil)));
+    lisp_val_t plus_args[2] = { os_make_symbol("x"), os_make_fixnum(1) };
+    lisp_val_t body = os_make_cons(make_call("+", 2, plus_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "&restを含むがbodyから参照しないparamsはzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t call_args[3] = { os_make_fixnum(10), os_make_fixnum(20), os_make_fixnum(30) };
+    lisp_val_t v = os_eval(make_call("add-fixed", 3, call_args), env);
+    assert(v == os_make_fixnum(11), "(add-fixed 10 20 30)はrest分を無視して10+1=11になる");
+}
+
+void test_za_falls_back_when_rest_param_referenced_in_body() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun bad-rest (x &rest y) (+ x y)) : rest引数名yを+のオペランドに使っている
+    lisp_val_t name = os_make_symbol("bad-rest");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"),
+                            os_make_cons(g_sym_rest, os_make_cons(os_make_symbol("y"), nil)));
+    lisp_val_t plus_args[2] = { os_make_symbol("x"), os_make_symbol("y") };
+    lisp_val_t body = os_make_cons(make_call("+", 2, plus_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+    assert(za_is_interpreted(fn), "rest引数名を+のオペランドに使うとzaはコンパイルを諦めインタプリタにフォールバックする");
+}
+
+void test_za_falls_back_when_operand_count_exceeds_max() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun add17 (x) (+ x x x ... x)) : xを17個並べてザのオペランド上限(16個)を超える
+    lisp_val_t name = os_make_symbol("add17");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t plus_args[17];
+    for (int i = 0; i < 17; i++) {
+        plus_args[i] = os_make_symbol("x");
+    }
+    lisp_val_t body = os_make_cons(make_call("+", 17, plus_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+    assert(za_is_interpreted(fn), "オペランドが17個(上限16個超え)だとzaはコンパイルを諦めインタプリタにフォールバックする");
+
+    lisp_val_t call_args[1] = { os_make_fixnum(1) };
+    lisp_val_t v = os_eval(make_call("add17", 1, call_args), env);
+    assert(v == os_make_fixnum(17), "(add17 1)はインタプリタ経由でも1が17個足されて17になる");
+}
+
+// (if test then else)の未評価フォームを組み立てる。elseはnilを渡すと省略する
+static lisp_val_t make_if(lisp_val_t test, lisp_val_t then, lisp_val_t els, int has_else) {
+    lisp_val_t tail = has_else ? os_make_cons(els, nil) : nil;
+    return os_make_cons(g_sym_if, os_make_cons(test, os_make_cons(then, tail)));
+}
+
+void test_za_compiles_if_with_else() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun pick (x) (if x 1 2))
+    lisp_val_t name = os_make_symbol("pick");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t if_form = make_if(os_make_symbol("x"), os_make_fixnum(1), os_make_fixnum(2), 1);
+    lisp_val_t body = os_make_cons(if_form, nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "(if x 1 2)はzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v_zero = os_eval(make_call("pick", 1, (lisp_val_t[]){ os_make_fixnum(0) }), env);
+    assert(v_zero == os_make_fixnum(1), "(pick 0)はfixnum 0も真なのでthen側の1になる");
+
+    lisp_val_t v_nil = os_eval(make_call("pick", 1, (lisp_val_t[]){ nil }), env);
+    assert(v_nil == os_make_fixnum(2), "(pick nil)はnilが偽なのでelse側の2になる");
+}
+
+void test_za_compiles_if_without_else() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun pick-noelse (x) (if x 1))
+    lisp_val_t name = os_make_symbol("pick-noelse");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t if_form = make_if(os_make_symbol("x"), os_make_fixnum(1), nil, 0);
+    lisp_val_t body = os_make_cons(if_form, nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "elseを省略した(if x 1)もzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v_true = os_eval(make_call("pick-noelse", 1, (lisp_val_t[]){ os_make_fixnum(5) }), env);
+    assert(v_true == os_make_fixnum(1), "(pick-noelse 5)はthen側の1になる");
+
+    lisp_val_t v_nil = os_eval(make_call("pick-noelse", 1, (lisp_val_t[]){ nil }), env);
+    assert(v_nil == nil, "elseを省略した(pick-noelse nil)はnilになる");
+}
+
+void test_za_compiles_nested_if() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun pick2 (x y) (if x (if y 1 2) 3))
+    lisp_val_t name = os_make_symbol("pick2");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t inner_if = make_if(os_make_symbol("y"), os_make_fixnum(1), os_make_fixnum(2), 1);
+    lisp_val_t outer_if = make_if(os_make_symbol("x"), inner_if, os_make_fixnum(3), 1);
+    lisp_val_t body = os_make_cons(outer_if, nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "入れ子のifもzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v1 = os_eval(make_call("pick2", 2, (lisp_val_t[]){ os_make_fixnum(1), os_make_fixnum(1) }), env);
+    assert(v1 == os_make_fixnum(1), "(pick2 1 1)はx,yとも真なので1になる");
+
+    lisp_val_t v2 = os_eval(make_call("pick2", 2, (lisp_val_t[]){ os_make_fixnum(1), nil }), env);
+    assert(v2 == os_make_fixnum(2), "(pick2 1 nil)はxが真yが偽なので2になる");
+
+    lisp_val_t v3 = os_eval(make_call("pick2", 2, (lisp_val_t[]){ nil, os_make_fixnum(1) }), env);
+    assert(v3 == os_make_fixnum(3), "(pick2 nil 1)はxが偽なので外側のelse3になる");
+}
+
+void test_za_compiles_plus_inside_if_branch() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun addif (x y) (if x (+ x y) 0))
+    lisp_val_t name = os_make_symbol("addif");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t plus_form = make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_symbol("y") });
+    lisp_val_t if_form = make_if(os_make_symbol("x"), plus_form, os_make_fixnum(0), 1);
+    lisp_val_t body = os_make_cons(if_form, nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "分岐内で(+ x y)を使う(if x (+ x y) 0)もzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v_true = os_eval(make_call("addif", 2, (lisp_val_t[]){ os_make_fixnum(3), os_make_fixnum(4) }), env);
+    assert(v_true == os_make_fixnum(7), "(addif 3 4)はxが真なので3+4=7になる");
+
+    lisp_val_t v_false = os_eval(make_call("addif", 2, (lisp_val_t[]){ nil, os_make_fixnum(4) }), env);
+    assert(v_false == os_make_fixnum(0), "(addif nil 4)はxが偽なので0になる");
+}
+
+void test_za_falls_back_when_if_is_plus_operand() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun bad (x y) (+ x (if y 1 2))) : +のオペランドの位置にifを直接書いている
+    lisp_val_t name = os_make_symbol("bad");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t if_form = make_if(os_make_symbol("y"), os_make_fixnum(1), os_make_fixnum(2), 1);
+    lisp_val_t body = os_make_cons(make_call("+", 2, (lisp_val_t[]){ os_make_symbol("x"), if_form }), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+    assert(za_is_interpreted(fn), "+のオペランドに直接ifを書くとzaはコンパイルを諦めインタプリタにフォールバックする");
+
+    lisp_val_t v_true = os_eval(make_call("bad", 2, (lisp_val_t[]){ os_make_fixnum(3), os_make_fixnum(5) }), env);
+    assert(v_true == os_make_fixnum(4), "(bad 3 5)はインタプリタ経由でもyが真なので3+1=4になる");
+
+    lisp_val_t v_false = os_eval(make_call("bad", 2, (lisp_val_t[]){ os_make_fixnum(3), nil }), env);
+    assert(v_false == os_make_fixnum(5), "(bad 3 nil)はインタプリタ経由でもyが偽なので3+2=5になる");
+}
+
+void test_za_compiles_minus_two_operands() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun sub (x y) (- x y))
+    lisp_val_t name = os_make_symbol("sub");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t minus_args[2] = { os_make_symbol("x"), os_make_symbol("y") };
+    lisp_val_t body = os_make_cons(make_call("-", 2, minus_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "オペランド2個の(- x y)はzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v = os_eval(make_call("sub", 2, (lisp_val_t[]){ os_make_fixnum(10), os_make_fixnum(3) }), env);
+    assert(v == os_make_fixnum(7), "(sub 10 3)は10-3=7になる");
+}
+
+void test_za_compiles_minus_unary() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun neg (x) (- x))
+    lisp_val_t name = os_make_symbol("neg");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t minus_args[1] = { os_make_symbol("x") };
+    lisp_val_t body = os_make_cons(make_call("-", 1, minus_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "単項マイナスの(- x)もzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v5 = os_eval(make_call("neg", 1, (lisp_val_t[]){ os_make_fixnum(5) }), env);
+    assert(v5 == os_make_fixnum_signed(1, 5), "(neg 5)は-5になる");
+
+    lisp_val_t v0 = os_eval(make_call("neg", 1, (lisp_val_t[]){ os_make_fixnum(0) }), env);
+    assert(v0 == os_make_fixnum(0), "(neg 0)は0になる");
+}
+
+void test_za_compiles_nary_minus() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun sub3 (x y z) (- x y z))
+    lisp_val_t name = os_make_symbol("sub3");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"),
+                            os_make_cons(os_make_symbol("y"), os_make_cons(os_make_symbol("z"), nil)));
+    lisp_val_t minus_args[3] = { os_make_symbol("x"), os_make_symbol("y"), os_make_symbol("z") };
+    lisp_val_t body = os_make_cons(make_call("-", 3, minus_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "オペランド3個の(- x y z)はzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v = os_eval(make_call("sub3", 3,
+                        (lisp_val_t[]){ os_make_fixnum(10), os_make_fixnum(3), os_make_fixnum(2) }), env);
+    assert(v == os_make_fixnum(5), "(sub3 10 3 2)は10-3-2=5になる");
+}
+
+void test_za_compiles_star() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun mul3 (x y z) (* x y z))
+    lisp_val_t name = os_make_symbol("mul3");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"),
+                            os_make_cons(os_make_symbol("y"), os_make_cons(os_make_symbol("z"), nil)));
+    lisp_val_t star_args[3] = { os_make_symbol("x"), os_make_symbol("y"), os_make_symbol("z") };
+    lisp_val_t body = os_make_cons(make_call("*", 3, star_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "オペランド3個の(* x y z)はzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v = os_eval(make_call("mul3", 3,
+                        (lisp_val_t[]){ os_make_fixnum(2), os_make_fixnum(3), os_make_fixnum(4) }), env);
+    assert(v == os_make_fixnum(24), "(mul3 2 3 4)は2*3*4=24になる");
+}
+
+void test_za_falls_back_when_star_has_one_operand() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun ident (x) (* x)) : オペランド1個の*はzaでは非対応
+    lisp_val_t name = os_make_symbol("ident");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), nil);
+    lisp_val_t star_args[1] = { os_make_symbol("x") };
+    lisp_val_t body = os_make_cons(make_call("*", 1, star_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+    assert(za_is_interpreted(fn), "オペランド1個の(* x)はzaがコンパイルを諦めインタプリタにフォールバックする");
+
+    lisp_val_t v = os_eval(make_call("ident", 1, (lisp_val_t[]){ os_make_fixnum(9) }), env);
+    assert(v == os_make_fixnum(9), "(ident 9)はインタプリタ経由でも9になる");
+}
+
+void test_za_compiles_less_than() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun lt (x y) (< x y))
+    lisp_val_t name = os_make_symbol("lt");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t lt_args[2] = { os_make_symbol("x"), os_make_symbol("y") };
+    lisp_val_t body = os_make_cons(make_call("<", 2, lt_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "ちょうど2オペランドの(< x y)はzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v_true = os_eval(make_call("lt", 2, (lisp_val_t[]){ os_make_fixnum(1), os_make_fixnum(2) }), env);
+    assert(v_true == g_sym_t, "(lt 1 2)は1<2なのでg_sym_tになる");
+
+    lisp_val_t v_false = os_eval(make_call("lt", 2, (lisp_val_t[]){ os_make_fixnum(2), os_make_fixnum(1) }), env);
+    assert(v_false == nil, "(lt 2 1)は2<1が偽なのでnilになる");
+}
+
+void test_za_compiles_num_equal() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun numeq (x y) (= x y))
+    lisp_val_t name = os_make_symbol("numeq");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t eq_args[2] = { os_make_symbol("x"), os_make_symbol("y") };
+    lisp_val_t body = os_make_cons(make_call("=", 2, eq_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "ちょうど2オペランドの(= x y)はzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v_true = os_eval(make_call("numeq", 2, (lisp_val_t[]){ os_make_fixnum(3), os_make_fixnum(3) }), env);
+    assert(v_true == g_sym_t, "(numeq 3 3)は3=3なのでg_sym_tになる");
+
+    lisp_val_t v_false = os_eval(make_call("numeq", 2, (lisp_val_t[]){ os_make_fixnum(3), os_make_fixnum(4) }), env);
+    assert(v_false == nil, "(numeq 3 4)は3=4が偽なのでnilになる");
+}
+
+void test_za_falls_back_when_less_than_has_three_operands() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun lt3 (x y z) (< x y z)) : 3個以上の連鎖比較はzaでは非対応
+    lisp_val_t name = os_make_symbol("lt3");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"),
+                            os_make_cons(os_make_symbol("y"), os_make_cons(os_make_symbol("z"), nil)));
+    lisp_val_t lt_args[3] = { os_make_symbol("x"), os_make_symbol("y"), os_make_symbol("z") };
+    lisp_val_t body = os_make_cons(make_call("<", 3, lt_args), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+    assert(za_is_interpreted(fn), "オペランド3個の(< x y z)はzaがコンパイルを諦めインタプリタにフォールバックする");
+
+    lisp_val_t v_true = os_eval(make_call("lt3", 3,
+                        (lisp_val_t[]){ os_make_fixnum(1), os_make_fixnum(2), os_make_fixnum(3) }), env);
+    assert(v_true == g_sym_t, "(lt3 1 2 3)はインタプリタ経由でも1<2<3が真なのでg_sym_tになる");
+
+    lisp_val_t v_false = os_eval(make_call("lt3", 3,
+                        (lisp_val_t[]){ os_make_fixnum(1), os_make_fixnum(3), os_make_fixnum(2) }), env);
+    assert(v_false == nil, "(lt3 1 3 2)はインタプリタ経由でも1<3<2が偽なのでnilになる");
+}
+
+void test_za_compiles_minus_star_inside_if_branch() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun calc (x y) (if (< x y) (- y x) (* x y)))
+    lisp_val_t name = os_make_symbol("calc");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t test_form = make_call("<", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_symbol("y") });
+    lisp_val_t then_form = make_call("-", 2, (lisp_val_t[]){ os_make_symbol("y"), os_make_symbol("x") });
+    lisp_val_t else_form = make_call("*", 2, (lisp_val_t[]){ os_make_symbol("x"), os_make_symbol("y") });
+    lisp_val_t if_form = make_if(test_form, then_form, else_form, 1);
+    lisp_val_t body = os_make_cons(if_form, nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+#if defined(__x86_64__)
+    assert(za_is_compiled(fn), "if内で</-/*を組み合わせたcalcもzaでコンパイルされる");
+#else
+    (void)fn;
+#endif
+
+    lisp_val_t v1 = os_eval(make_call("calc", 2, (lisp_val_t[]){ os_make_fixnum(3), os_make_fixnum(5) }), env);
+    assert(v1 == os_make_fixnum(2), "(calc 3 5)は3<5なので5-3=2になる");
+
+    lisp_val_t v2 = os_eval(make_call("calc", 2, (lisp_val_t[]){ os_make_fixnum(5), os_make_fixnum(3) }), env);
+    assert(v2 == os_make_fixnum(15), "(calc 5 3)は5<3が偽なので5*3=15になる");
+}
+
+void test_za_falls_back_when_if_is_minus_operand() {
+    lisp_val_t env = make_arith_env();
+
+    // (defun bad2 (x y) (- x (if y 1 2))) : -のオペランドの位置にifを直接書いている
+    lisp_val_t name = os_make_symbol("bad2");
+    lisp_val_t params = os_make_cons(os_make_symbol("x"), os_make_cons(os_make_symbol("y"), nil));
+    lisp_val_t if_form = make_if(os_make_symbol("y"), os_make_fixnum(1), os_make_fixnum(2), 1);
+    lisp_val_t body = os_make_cons(make_call("-", 2, (lisp_val_t[]){ os_make_symbol("x"), if_form }), nil);
+    lisp_val_t defun_form = os_make_cons(os_make_symbol("defun"),
+                                os_make_cons(name, os_make_cons(params, body)));
+    os_eval(defun_form, env);
+
+    lisp_val_t fn = os_get_function(name, env);
+    assert(za_is_interpreted(fn), "-のオペランドに直接ifを書くとzaはコンパイルを諦めインタプリタにフォールバックする");
+
+    lisp_val_t v_true = os_eval(make_call("bad2", 2, (lisp_val_t[]){ os_make_fixnum(10), os_make_fixnum(5) }), env);
+    assert(v_true == os_make_fixnum(9), "(bad2 10 5)はインタプリタ経由でもyが真なので10-1=9になる");
+
+    lisp_val_t v_false = os_eval(make_call("bad2", 2, (lisp_val_t[]){ os_make_fixnum(10), nil }), env);
+    assert(v_false == os_make_fixnum(8), "(bad2 10 nil)はインタプリタ経由でもyが偽なので10-2=8になる");
 }
 
 void test_os_eval_defmacro_expands_and_evaluates() {
@@ -1114,6 +1606,25 @@ int main(int argc, char** argv) {
     test_os_eval_lambda_closes_over_defining_env();
     test_os_eval_defun_rest_param_collects_remaining_args();
     test_os_eval_defun_rest_param_with_leading_fixed_params();
+    test_za_compiles_nary_plus();
+    test_za_compiles_rest_param_when_unreferenced();
+    test_za_falls_back_when_rest_param_referenced_in_body();
+    test_za_falls_back_when_operand_count_exceeds_max();
+    test_za_compiles_if_with_else();
+    test_za_compiles_if_without_else();
+    test_za_compiles_nested_if();
+    test_za_compiles_plus_inside_if_branch();
+    test_za_falls_back_when_if_is_plus_operand();
+    test_za_compiles_minus_two_operands();
+    test_za_compiles_minus_unary();
+    test_za_compiles_nary_minus();
+    test_za_compiles_star();
+    test_za_falls_back_when_star_has_one_operand();
+    test_za_compiles_less_than();
+    test_za_compiles_num_equal();
+    test_za_falls_back_when_less_than_has_three_operands();
+    test_za_compiles_minus_star_inside_if_branch();
+    test_za_falls_back_when_if_is_minus_operand();
     test_os_eval_defmacro_expands_and_evaluates();
     test_os_eval_defmacro_args_are_not_evaluated_before_expansion();
     test_os_eval_cons();

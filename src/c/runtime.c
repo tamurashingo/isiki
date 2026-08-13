@@ -2290,6 +2290,20 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
 }
 
 /**
+ * primitive_subtractを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return primitive_subtractと同じ規則で計算したa-b
+ */
+lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_subtract(args, global_environment);
+}
+
+/**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として
  * 符号を反転する。floatが1つでも含まれる場合は全オペランドをdoubleへ変換して減算する。
  * それ以外で全オペランドが非負FIXNUMかつ結果が負にならない場合はヒープ確保なしの
@@ -2484,6 +2498,20 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_multiplyを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return primitive_multiplyと同じ規則で計算したa*b
+ */
+lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_multiply(args, global_environment);
+}
+
+/**
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
  * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して除算する
  * (0除算はIEEE754の挙動どおり+inf/-inf/nanを返す。domain-error未実装のための簡略化)。
@@ -2576,6 +2604,20 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_less_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a<bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_less_than(args, global_environment);
+}
+
+/**
  * 組み込み関数>。argsが単調減少(a>b>c>...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -2603,6 +2645,20 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
         }
     }
     return g_sym_t;
+}
+
+/**
+ * primitive_num_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_num_equal(args, global_environment);
 }
 
 /**
