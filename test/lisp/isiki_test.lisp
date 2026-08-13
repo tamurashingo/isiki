@@ -44,7 +44,7 @@
                    ',form %isiki-actual %isiki-expected)))))
 
 (defun isiki-test-report ()
-  (format *isiki-test-stream* "~%==== isiki_test.lisp: ~D passed, ~D failed ====~%"
+  (format *isiki-test-stream* "~%==== isiki tests: ~D passed, ~D failed ====~%"
           *isiki-test-pass* *isiki-test-fail*))
 
 
@@ -923,8 +923,3 @@ line2"))
 ;; cf. p.122 (identity '(a b c)) の例。値を変更。
 (assert-equal 5 (identity 5))
 (assert-equal 'a (identity 'a))
-
-;;; --- 最終レポート ---
-
-(isiki-test-report)
-(close *isiki-test-stream*)

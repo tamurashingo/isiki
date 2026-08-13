@@ -902,6 +902,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("CHAR>="), os_make_native_function((lisp_addr_t)(void *)primitive_char_greater_equal), global_environment);
         os_set_function(os_make_symbol("STRINGP"), os_make_native_function((lisp_addr_t)(void *)primitive_stringp), global_environment);
         os_set_function(os_make_symbol("FUNCTIONP"), os_make_native_function((lisp_addr_t)(void *)primitive_functionp), global_environment);
+        os_set_function(os_make_symbol("%%ZA-COMPILED-P"), os_make_native_function((lisp_addr_t)(void *)primitive_za_compiled_p), global_environment);
         os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
         os_set_function(os_make_symbol("BASIC-ARRAY-P"), os_make_native_function((lisp_addr_t)(void *)primitive_basic_array_p), global_environment);
         // basic-array*-pとgeneral-array*-pは本実装では外延が一致するため実体を共用する
@@ -3908,6 +3909,23 @@ lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env) {
     }
     UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
     return (obj[0] == MAGIC_FUNCTION_NATIVE || obj[0] == MAGIC_FUNCTION_INTERPRETED) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%ZA-COMPILED-P。第一引数がza.cによって機械語へJITコンパイルされた関数
+ * (MAGIC_FUNCTION_NATIVEでword2がfixnum)かどうかを判定する。テスト用の内部primitiveの
+ * ため%%を付ける(ISLisp仕様外)。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return JITコンパイル済みならg_sym_t、インタプリタ実行(またはそれ以外)ならnil
+ */
+lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return (obj[0] == MAGIC_FUNCTION_NATIVE && obj[2] != nil) ? g_sym_t : nil;
 }
 
 /**

@@ -1005,6 +1005,16 @@ lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数%%ZA-COMPILED-P。第一引数がza.cによって機械語へJITコンパイルされた関数
+ * (MAGIC_FUNCTION_NATIVEでword2がfixnum)かどうかを判定する。テスト用の内部primitiveの
+ * ため%%を付ける(ISLisp仕様外)。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return JITコンパイル済みならg_sym_t、インタプリタ実行(またはそれ以外)ならnil
+ */
+lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数GENERIC-FUNCTION-P。本実装にはdefgeneric/defmethodが存在せず
  * generic function自体を表すオブジェクトが作れないため、常にnilを返す。
  * @param args 評価済みの引数リスト(未使用)

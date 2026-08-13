@@ -403,26 +403,34 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         if (!za_compile_expr(then_form, params, fixed_count, syms)) {
             return 0;
         }
-        UINT64 jmp_patch = 0;
-        if (has_else) {
-            jmp_patch = jit_emit_jmp_rel32_placeholder();
-        }
+        // then分岐の実行後は必ずelse/nilフォールバック側を飛び越える(elseが無い場合も
+        // このjmpが無いと直後のjit_movabs_rax(nil)にそのまま流れ落ち、thenの結果が
+        // 無条件にnilで上書きされてしまう)
+        UINT64 jmp_patch = jit_emit_jmp_rel32_placeholder();
 
         jit_patch_rel32(je_patch);
         if (has_else) {
             if (!za_compile_expr(else_form, params, fixed_count, syms)) {
                 return 0;
             }
-            jit_patch_rel32(jmp_patch);
         } else {
             jit_movabs_rax(nil);
         }
+        jit_patch_rel32(jmp_patch);
         return 1;
     }
     return 0;
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body) {
+#ifdef ISIKIOS_UNIT_TEST
+    // za.cが出力する機械語は実機ビルド(mingw-gcc, MS x64 ABI, 実行可能メモリ)を前提と
+    // しており、ネイティブgccでビルドするユニットテストではABI/メモリ保護が異なるため
+    // 常にインタプリタへフォールバックする。コンパイル結果の検証はtest/lisp/za_test.lisp
+    // (make test-qemu)で実機上で行う。
+    return nil;
+#endif
+
     UINT64 fixed_count;
     if (!za_validate_params(params, &fixed_count)) {
         return nil;
