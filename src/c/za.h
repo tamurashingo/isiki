@@ -16,6 +16,10 @@
  *         | (* leaf leaf...)   ※ オペランド2個以上
  *         | (< leaf leaf)      ※ ちょうど2オペランドのみ(3個以上の連鎖比較は非対応)
  *         | (= leaf leaf)      ※ 同上
+ *         | (car leaf) | (cdr leaf)              ※ 非allocating(cc_car/cc_cdrを直接呼ぶ)
+ *         | (atom leaf) | (null leaf)             ※ 非allocating
+ *         | (eq leaf leaf)                        ※ 非allocating(ポインタ同一性比較)
+ *         | (cons leaf leaf)                      ※ ヒープ確保を伴う(os_make_consを1回呼ぶ)
  *         | (if expr expr expr?)  ※ test/then/elseは再帰的にexprを許容、elseは省略可
  *         | (fn-sym callarg callarg...)  ※ 一般呼び出し。fn-symはquote・if・+・-・*・<・=や
  *           progn/setq/defun/lambda/defmacro/quasiquote/block/return-from/

@@ -301,14 +301,19 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
     return 0;
 }
 
-/** za_compile_expr/za_try_compile_defunが + - * < = を認識するためのシンボル束。
- * za_try_compile_defunで1度だけos_make_symbolして組み立てる。 */
+/** za_compile_expr/za_try_compile_defunが + - * < = eq null atom を認識するための
+ * シンボル束。za_try_compile_defunで1度だけos_make_symbolして組み立てる。
+ * car/cdr/consは永続グローバルシンボル(g_sym_car/g_sym_cdr/g_sym_cons)を直接使うため
+ * ここには含めない。 */
 typedef struct {
     lisp_val_t plus;
     lisp_val_t minus;
     lisp_val_t star;
     lisp_val_t lt;
-    lisp_val_t eq;
+    lisp_val_t eq;      /* "=" (数値の等値比較) */
+    lisp_val_t eqp;     /* "EQ" (ポインタ同一性比較) */
+    lisp_val_t nullsym; /* "NULL" */
+    lisp_val_t atom;    /* "ATOM" */
 } za_syms_t;
 
 /**
@@ -518,13 +523,36 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
 }
 
 /**
- * 「(op operand operand)」(ちょうど2オペランド)を検証しつつ、2引数ラッパー
- * (primitive_less_than2/primitive_num_equal2)を呼んでraxへ真値シンボル/nilを
- * 残す機械語を出力する。オペランドはleaf限定。3個以上の連鎖比較・1個以下は
- * 今回は非対応(フォールバックする)。
+ * 「(op leaf)」(ちょうど1オペランド)を検証しつつ、1引数ラッパー(cc_car/cc_cdr/
+ * primitive_null1/primitive_atom1)を呼んでraxへ結果を残す機械語を出力する。
+ * オペランドはleaf限定。
  * @return 対応できれば1、できなければ0
  */
-static int za_compile_compare(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, void *wrapper_fn) {
+static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, void *wrapper_fn) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
+        return 0;
+    }
+    za_operand_t op0;
+    if (!za_classify_operand(cc_car(rest), params, fixed_count, &op0)) {
+        return 0;
+    }
+    za_emit_operand(&op0);
+    jit_mov_rcx_rax();
+    jit_movabs_r11((UINT64)wrapper_fn);
+    jit_call_r11();
+    return 1;
+}
+
+/**
+ * 「(op operand operand)」(ちょうど2オペランド)を検証しつつ、2引数関数(wrapper_fn、
+ * rcx=第一オペランド, rdx=第二オペランド)を呼んでraxへ結果を残す機械語を出力する。
+ * オペランドはleaf限定。比較(primitive_less_than2/primitive_num_equal2/
+ * primitive_eq2)に限らず、2引数を取る任意の関数(os_make_cons等)に使える汎用の形。
+ * 3個以上の連鎖・1個以下は今回は非対応(フォールバックする)。
+ * @return 対応できれば1、できなければ0
+ */
+static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, void *wrapper_fn) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -670,10 +698,28 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         return za_compile_fold(form, params, fixed_count, (void *)primitive_multiply2);
     }
     if (head == syms->lt) {
-        return za_compile_compare(form, params, fixed_count, (void *)primitive_less_than2);
+        return za_compile_binary(form, params, fixed_count, (void *)primitive_less_than2);
     }
     if (head == syms->eq) {
-        return za_compile_compare(form, params, fixed_count, (void *)primitive_num_equal2);
+        return za_compile_binary(form, params, fixed_count, (void *)primitive_num_equal2);
+    }
+    if (head == g_sym_car) {
+        return za_compile_unary(form, params, fixed_count, (void *)cc_car);
+    }
+    if (head == g_sym_cdr) {
+        return za_compile_unary(form, params, fixed_count, (void *)cc_cdr);
+    }
+    if (head == syms->nullsym) {
+        return za_compile_unary(form, params, fixed_count, (void *)primitive_null1);
+    }
+    if (head == syms->atom) {
+        return za_compile_unary(form, params, fixed_count, (void *)primitive_atom1);
+    }
+    if (head == syms->eqp) {
+        return za_compile_binary(form, params, fixed_count, (void *)primitive_eq2);
+    }
+    if (head == g_sym_cons) {
+        return za_compile_binary(form, params, fixed_count, (void *)os_make_cons);
     }
     if (head == g_sym_if) {
         lisp_val_t rest = cc_cdr(form);
@@ -860,6 +906,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     syms.star = os_make_symbol("*");
     syms.lt = os_make_symbol("<");
     syms.eq = os_make_symbol("=");
+    syms.eqp = os_make_symbol("EQ");
+    syms.nullsym = os_make_symbol("NULL");
+    syms.atom = os_make_symbol("ATOM");
 
     g_jit_overflow = 0;
     // トランポリンは全JIT関数で共有するため、今回のコンパイル対象用にentryを記録する

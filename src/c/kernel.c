@@ -59,6 +59,15 @@ UINT64 kernel_get_boot_epoch_seconds(void) {
     return g_boot_epoch_seconds;
 }
 
+/** os_set_qemu_test_mode経由でprocess 0の専用スタック上から呼ぶpower_off(kernel_mainの引数を保持) */
+static void (*g_qemu_test_power_off)(void) = 0;
+
+/** test/lisp/qemu_boot_test.lispをcc_loadしてからpower_offする(process 0専用スタック上で実行される) */
+static void run_qemu_boot_test(void) {
+    cc_load(os_make_cons(os_make_string("test/lisp/qemu_boot_test.lisp"), nil), global_environment);
+    g_qemu_test_power_off();
+}
+
 void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pixels_per_scanline, UINT64 heap_base, UINT64 heap_size, UINT64 boot_epoch_seconds, void (*power_off)(void)) {
 
     asm volatile ("cli");
@@ -89,16 +98,23 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     init_idt();
 
     // リポジトリルートに.qemu-test-triggerがあれば、テスト用のLispファイルを
-    // 自動loadしてから電源を切る(make test-qemuからの全自動実行用)
+    // 自動loadしてから電源を切る(make test-qemuからの全自動実行用)。
+    // kernel_mainのブート時スタック上で直接cc_loadを呼ぶとスタックサイズ不足で
+    // クラッシュするため、process 0がタイマー割り込み経由で最初に起動される際に
+    // (16KBの専用スタック上で)実行させる(process_trampoline_c参照)
     os_stream_t trigger_probe;
     char trigger_err[64];
+    int qemu_test_mode = 0;
     if (os_stream_open_9p_file(&trigger_probe, ".qemu-test-trigger", trigger_err, sizeof(trigger_err))) {
         os_stream_close(&trigger_probe);
-        cc_load(os_make_cons(os_make_string("test/lisp/qemu_boot_test.lisp"), nil), global_environment);
-        power_off();
+        qemu_test_mode = 1;
+        g_qemu_test_power_off = power_off;
+        os_set_qemu_test_mode(run_qemu_boot_test);
     }
 
-    kernel_show_information(fb);
+    if (!qemu_test_mode) {
+        kernel_show_information(fb);
+    }
 
     process_scheduler_start();
 }

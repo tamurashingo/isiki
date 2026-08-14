@@ -559,12 +559,27 @@ lisp_val_t primitive_cons(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_eqを2引数固定・非allocatingで呼ぶためのラッパー(za向け)。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return aとbが同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eq2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数NULL。第一引数がnilかどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return nilならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_nullを1引数固定・非allocatingで呼ぶためのラッパー(za向け)。
+ * @param a オペランド
+ * @return aがnilならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_null1(lisp_val_t a);
 
 /**
  * 組み込み関数*。argsの全整数(FIXNUM/bignum、負数も可)を乗算する。
@@ -898,6 +913,22 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env);
  * @return consならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_conspの論理否定にあたる非allocatingな核ロジック(za向け)。nilはconsでは
+ * ないためatomとして扱う。
+ * @param val 判定対象
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom1(lisp_val_t val);
+
+/**
+ * 組み込み関数ATOM。第一引数がconsでないかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。

@@ -888,6 +888,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("PARSE-NUMBER"), os_make_native_function((lisp_addr_t)(void *)primitive_parse_number), global_environment);
         os_set_function(os_make_symbol("SYMBOLP"), os_make_native_function((lisp_addr_t)(void *)primitive_symbolp), global_environment);
         os_set_function(os_make_symbol("CONSP"), os_make_native_function((lisp_addr_t)(void *)primitive_consp), global_environment);
+        os_set_function(os_make_symbol("ATOM"), os_make_native_function((lisp_addr_t)(void *)primitive_atom), global_environment);
         os_set_function(os_make_symbol("EQL"), os_make_native_function((lisp_addr_t)(void *)primitive_eql), global_environment);
         os_set_function(os_make_symbol("EQUAL"), os_make_native_function((lisp_addr_t)(void *)primitive_equal), global_environment);
         // NOTはnullと仕様上完全に同一(「objがnilならt、それ以外はnil」)なので実体を共用する
@@ -2424,6 +2425,18 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_eqを2引数固定・非allocatingで呼ぶためのラッパー。zaのJITコンパイル済み
+ * コードから呼ばれることを想定する。primitive_add2等と異なり、eq自体は元から固定
+ * 2引数のポインタ比較で確保を伴わないため、引数リストconsで包まずに直接比較する。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return aとbが同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eq2(lisp_val_t a, lisp_val_t b) {
+    return a == b ? g_sym_t : nil;
+}
+
+/**
  * 組み込み関数NULL。第一引数がnilかどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -2431,6 +2444,16 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env) {
     return cc_car(args) == nil ? g_sym_t : nil;
+}
+
+/**
+ * primitive_nullを1引数固定・非allocatingで呼ぶためのラッパー。zaのJITコンパイル済み
+ * コードから呼ばれることを想定する。
+ * @param a オペランド
+ * @return aがnilならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_null1(lisp_val_t a) {
+    return a == nil ? g_sym_t : nil;
 }
 
 /**
@@ -3417,6 +3440,29 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
         return nil;
     }
     return (val & TAG_MASK) == TAG_CONS ? g_sym_t : nil;
+}
+
+/**
+ * primitive_conspの論理否定にあたる非allocatingな核ロジック。nilはconsではないため
+ * atomとして扱う(g_sym_tを返す)。zaのJITコンパイル済みコードからも直接呼ばれる。
+ * @param val 判定対象
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom1(lisp_val_t val) {
+    if (val == nil) {
+        return g_sym_t;
+    }
+    return (val & TAG_MASK) == TAG_CONS ? nil : g_sym_t;
+}
+
+/**
+ * 組み込み関数ATOM。第一引数がconsでないかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom(lisp_val_t args, lisp_val_t env) {
+    return primitive_atom1(cc_car(args));
 }
 
 /**

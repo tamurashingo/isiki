@@ -240,3 +240,85 @@
   (progn (+ x 1)))
 (assert-equal nil (%%za-compiled-p (function isiki-za-test-progn-fallback)))
 (assert-equal 6 (isiki-za-test-progn-fallback 5))
+
+;;; --- 拡張1: 基本データ操作とヒープ確保・シャドウスタック連携 ---
+;;
+;; car/cdr/atom/null/eqは非allocating(cc_car/cc_cdrを直接呼ぶ、または引数リストconsを
+;; 経由しない直接比較)、consのみヒープ確保を伴う(os_make_cons自身がGC_PROTECTで
+;; 自分の2引数を保護するため、za側で追加のshadow stack link/unlinkは不要)。
+;; いずれもleaf限定のexprとして+/-/*/</=/ifと同じ位置制約でコンパイルされる。
+(close (open-output-file "tmp/ckpt-0-start.txt"))
+
+;; (car x) / (cdr x) : leafのcar/cdrはzaでコンパイルされる
+(defun isiki-za-test-car (x) (car x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-car)))
+(assert-equal 1 (isiki-za-test-car (cons 1 2)))
+(defun isiki-za-test-cdr (x) (cdr x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-cdr)))
+(assert-equal 2 (isiki-za-test-cdr (cons 1 2)))
+(close (open-output-file "tmp/ckpt-1-carcdr.txt"))
+
+;; (atom x) : fixnum/symbol/nilはatom、consはatomでない
+(defun isiki-za-test-atom (x) (atom x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-atom)))
+(assert-equal t (isiki-za-test-atom 1))
+(assert-equal t (isiki-za-test-atom nil))
+(assert-equal t (isiki-za-test-atom 'foo))
+(assert-equal nil (isiki-za-test-atom (cons 1 2)))
+;; ATOMはインタプリタ側でも(za未対応のフォールバック経路でも)使える正式な組み込み関数
+(assert-equal t (atom 1))
+(assert-equal nil (atom (cons 1 2)))
+(close (open-output-file "tmp/ckpt-2-atom.txt"))
+
+;; (null x) : nilならt、それ以外はnil
+(defun isiki-za-test-null (x) (null x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-null)))
+(assert-equal t (isiki-za-test-null nil))
+(assert-equal nil (isiki-za-test-null 1))
+(close (open-output-file "tmp/ckpt-3-null.txt"))
+
+;; (eq x y) : ポインタ同一性比較
+(defun isiki-za-test-eq (x y) (eq x y))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-eq)))
+(assert-equal t (isiki-za-test-eq 3 3))
+(assert-equal nil (isiki-za-test-eq 3 4))
+(assert-equal t (isiki-za-test-eq nil nil))
+(close (open-output-file "tmp/ckpt-4-eq.txt"))
+
+;; (cons x y) : ヒープ確保を伴うがleafオペランドのみでzaでコンパイルされる
+(defun isiki-za-test-cons (x y) (cons x y))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-cons)))
+(assert-equal 3 (car (isiki-za-test-cons 3 4)))
+(assert-equal 4 (cdr (isiki-za-test-cons 3 4)))
+(close (open-output-file "tmp/ckpt-5-cons.txt"))
+
+;; ifのthen/elseの中にcar/cons等を書いてもzaでコンパイルされる
+(defun isiki-za-test-car-if (x y) (if x (cons x y) (car y)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-car-if)))
+(assert-equal 5 (car (isiki-za-test-car-if 5 6)))
+(assert-equal 9 (isiki-za-test-car-if nil (cons 9 10)))
+(close (open-output-file "tmp/ckpt-6-carif.txt"))
+
+;; car/cdr/cons/atom/null/eqの引数位置に直接別の呼び出しを書く(ネスト)とzaはコンパイル
+;; を諦めインタプリタにフォールバックする(結果自体は正しい)
+(defun isiki-za-test-cons-nested-fallback (x)
+  (cons (car x) (cdr x)))
+(assert-equal nil (%%za-compiled-p (function isiki-za-test-cons-nested-fallback)))
+(assert-equal 1 (car (isiki-za-test-cons-nested-fallback (cons 1 2))))
+(assert-equal 2 (cdr (isiki-za-test-cons-nested-fallback (cons 1 2))))
+(close (open-output-file "tmp/ckpt-7-nested.txt"))
+
+;; 大量にconsを呼び続けてGC(os_gc_collect)を誘発しても、za生成コードが結果を破壊
+;; しないことを確認する(os_make_cons自身のGC_PROTECTだけで安全という設計の裏付け)。
+;; isiki-za-test-cons-chain自身はlet/for/setqを含むためza非対応(フォールバック)だが、
+;; ループ本体で呼ぶisiki-za-test-consはza機械語として繰り返し実行される。
+(defun isiki-za-test-cons-chain (n)
+  (let ((acc nil))
+    (for ((i 0 (+ i 1))) ((= i n) acc)
+      (setq acc (isiki-za-test-cons i acc)))))
+(close (open-output-file "tmp/ckpt-8-before-chain.txt"))
+
+(assert-equal 50000 (length (isiki-za-test-cons-chain 50000)))
+(close (open-output-file "tmp/ckpt-9-after-chain.txt"))
+(assert-equal 49999 (car (isiki-za-test-cons-chain 50000)))
+(close (open-output-file "tmp/ckpt-10-final.txt"))

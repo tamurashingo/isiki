@@ -40,8 +40,18 @@ void os_process_set_saved_rsp(lisp_val_t pcb, UINT64 rsp) {
  * (呼び出し元には戻らない)
  * @param proc_index 動かすprocess_tのindex(0〜PROCESS_COUNT-1)
  */
+/** os_set_qemu_test_modeで登録されたテスト実行関数(未登録時は0=通常のREPLモード) */
+static void (*g_qemu_test_entry)(void) = 0;
+
+void os_set_qemu_test_mode(void (*test_entry)(void)) {
+    g_qemu_test_entry = test_entry;
+}
+
 void __attribute__((sysv_abi)) process_trampoline_c(UINT64 proc_index) {
     process_t *proc = get_process((UINT32)proc_index);
+    if (proc_index == 0 && g_qemu_test_entry != 0) {
+        g_qemu_test_entry();
+    }
     for (;;) {
         os_repl_step(proc);
     }

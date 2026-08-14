@@ -230,6 +230,7 @@ debug:
 # .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
 # ResetSystemでQEMUを電源断する
 test-qemu: build
+	mkdir -p $(BUILD_TMPDIR)
 	rm -f .qemu-test-trigger test-results.txt
 	touch .qemu-test-trigger
 	qemu-system-x86_64 \
