@@ -11,6 +11,14 @@
 ;; za_test.lisp(拡張0〜4)・za_test_ext5.lispへの依存は無い(自己完結)。init.lisp
 ;; (ILOS実装含む)はboot-entryスクリプトがtest_framework.lispより前にloadしている
 ;; 前提で、その中で定義されるdefclass/make-instance/slot-value/slot-value等を使う。
+;;
+;; 追記: quoteシンボル対応と同じ「ILOSをJIT対象に近づける」目的の後続の増分として、
+;; &restパラメータの値参照(za_classify_operand/za_emit_operandのis_literal==3)も
+;; 本ファイルに追加している。defgenericが生成するdispatch関数
+;; `(defun name (&rest %generic-args) (%generic-call 'name %generic-args))`が
+;; これによって初めてJIT対象になる。letの直接lambda呼び出しフォールバックは
+;; 別課題として今回は対象外(make-instance/slot-value/set-slot-valueは依然
+;; インタプリタ実行のまま)。
 
 ;;; --- 拡張7: quoteシンボルリテラル ---
 ;;
@@ -38,13 +46,51 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-quote-cons)))
 (assert-equal (cons 'isiki-za-test-quote-target 42) (isiki-za-test-quote-cons 42))
 
+;;; --- &rest引数の値参照 ---
+;;
+;; za_classify_operand/za_emit_operandに&restパラメータそのものへの参照
+;; (is_literal==3)を追加した。値は元のevaluated_argsのうち固定引数分を消費した
+;; 後に残る部分リストそのもの(新しいリストを作らない、インタプリタのbind_params
+;; と同じ挙動)。固定引数が0個(&restのみ)の場合もcdrループが0回になるだけで
+;; 正しく動くことを確認する。
+
+(defun isiki-za-test-rest-only (&rest args) args)
+(assert-equal t (%%za-compiled-p (function isiki-za-test-rest-only)))
+(assert-equal nil (isiki-za-test-rest-only))
+(assert-equal (list 1 2 3) (isiki-za-test-rest-only 1 2 3))
+
+;; init.lispの`list`自身(`(defun list (&rest items) items)`)も同じ形なので、
+;; 合成テスト関数だけでなく実在のライブラリ関数がJIT対象になる実例として確認する。
+(assert-equal t (%%za-compiled-p (function list)))
+
+;; 固定引数+&restの併用。fixed_count分のcdrを済ませた残りがrestに束縛される。
+(defun isiki-za-test-rest-mixed (a &rest args) args)
+(assert-equal t (%%za-compiled-p (function isiki-za-test-rest-mixed)))
+(assert-equal nil (isiki-za-test-rest-mixed 1))
+(assert-equal (list 2 3) (isiki-za-test-rest-mixed 1 2 3))
+
+;; rest値そのものをcar/cons/eq等の既存leaf共有経路に渡す(一般呼び出しの引数位置
+;; でも使えることの確認)。
+(defun isiki-za-test-rest-first (&rest args) (car args))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-rest-first)))
+(assert-equal 10 (isiki-za-test-rest-first 10 20))
+(assert-equal nil (isiki-za-test-rest-first))
+
+;; defgenericが生成するdispatch関数`(defun name (&rest %generic-args) ...)`が
+;; 今回の対応でJIT対象になることの確認(initialize-objectはinit.lispがdefgenericで
+;; 定義し、defmethodは%register-methodへの登録のみなのでこの関数自体は上書きされない)。
+(assert-equal t (%%za-compiled-p (function initialize-object)))
+
 ;;; --- ILOSを実際に使う統合テスト ---
 ;;
 ;; defclass自体はトップレベルのマクロ展開なのでza.cの対象外(JITはdefun本体のみ)。
-;; make-instanceは&rest initargsを持つためこれもインタプリタ実行のまま(今回の
-;; スコープ外、za.cは&rest引数の値参照に未対応)。今回JIT化の到達点になるのは、
+;; make-instanceは&rest initargsを持つがボディが`let*`(即時lambda呼び出し、
+;; za_test.lisp 160-166行目のisiki-za-test-let-fallbackと同じ理由で拡張3/4完了後も
+;; 非対応のまま)を使っているため、上記の&rest対応の有無に関わらずインタプリタ実行
+;; のまま(letフォールバックは別課題として今回は対象外)。今回JIT化の到達点になるのは、
 ;; quoteシンボルのクラス名・initarg・スロット名を使ってmake-instance/slot-valueを
-;; 呼び出す「側」の、&restを使わないユーザー定義関数がコンパイル対象になること。
+;; 呼び出す「側」の、letを使わないユーザー定義関数がコンパイル対象になること。
+(assert-equal nil (%%za-compiled-p (function make-instance)))
 
 (defclass isiki-za-test-point ()
   ((x :initarg :x :initform (lambda () 0))

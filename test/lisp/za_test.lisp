@@ -31,9 +31,15 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-add-fixed)))
 (assert-equal 11 (isiki-za-test-add-fixed 10 20 30))
 
-;; rest引数名を+のオペランドに使うとzaはコンパイルを諦めインタプリタにフォールバックする
-(defun isiki-za-test-bad-rest (x &rest y) (+ x y))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-bad-rest)))
+;; rest引数名を+のオペランドに使う場合。以前は&restの値参照自体が未対応だったため
+;; ここでフォールバックしていたが、za_classify_operand/za_emit_operandへの
+;; is_literal==3(&restリファレンス、test/lisp/za_test_ext7.lisp参照)追加により、
+;; 現在は構造的にコンパイル対象になる。za.cはオペランドの型をコンパイル時に検証しない
+;; ため(fixnum以外の固定引数を+に渡しても同様にコンパイルされる)、これは想定通りの
+;; 挙動であり、実際に呼び出した場合の型検査はインタプリタと同じくprimitive_add側の
+;; 実行時チェックに委ねられる。
+(defun isiki-za-test-rest-in-arith (x &rest y) (+ x y))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-rest-in-arith)))
 
 ;; xを17個並べてzaのオペランド上限(16個)を超えるとインタプリタにフォールバックする
 (defun isiki-za-test-add17 (x)

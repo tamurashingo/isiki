@@ -262,7 +262,11 @@ static void za_emit_untag_instance(UINT8 dst_reg, UINT8 src_reg) {
 /**
  * is_literal: 0=paramsのidx番目を参照、1=fixnum即値(literalをそのままmovabs)、
  * 2=quoteシンボル(literalは現在のタグ付きシンボル値だが、GCで移動しうるため
- * emit時はmovabsで直接埋め込まず名前から再解決する。za_emit_operand参照)。
+ * emit時はmovabsで直接埋め込まず名前から再解決する。za_emit_operand参照)、
+ * 3=&restパラメータそのものへの参照(param_indexはcdrする回数=fixed_countを保持する。
+ * 値は元のevaluated_argsのうち固定引数分を消費した後に残る部分リストそのもので、
+ * 0と同じcdrループの末尾でcc_carを呼ばない点だけが違う。インタプリタのbind_params
+ * (eval.c)が新しいリストを作らずrestへ残りをそのまま束縛するのと同じ挙動)。
  */
 typedef struct {
     int is_literal;
@@ -285,6 +289,31 @@ static int za_param_index(lisp_val_t params, lisp_val_t sym, UINT64 fixed_count,
         }
     }
     return 0;
+}
+
+/**
+ * paramsに&rest仮引数が存在する場合、そのrest引数名(シンボル)を取得する。
+ * paramsをfixed_count回cdrした先のセルが&restシンボルであるという、
+ * za_validate_paramsが検証済みの構造(そのままの`params`/`fixed_count`)を前提にする。
+ * @return 見つかれば1(out_symに書く)、&restが無ければ0
+ */
+static int za_rest_param_symbol(lisp_val_t params, UINT64 fixed_count, lisp_val_t *out_sym) {
+    lisp_val_t cur = params;
+    for (UINT64 i = 0; i < fixed_count; i++) {
+        if (cur == nil || (cur & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        cur = cc_cdr(cur);
+    }
+    if (cur == nil || (cur & TAG_MASK) != TAG_CONS || cc_car(cur) != g_sym_rest) {
+        return 0;
+    }
+    lisp_val_t tail = cc_cdr(cur);
+    if (tail == nil || (tail & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    *out_sym = cc_car(tail);
+    return 1;
 }
 
 /**
@@ -346,12 +375,18 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
     }
     if ((form & TAG_MASK) == TAG_SYMBOL) {
         UINT64 idx;
-        if (!za_param_index(params, form, fixed_count, &idx)) {
-            return 0;
+        if (za_param_index(params, form, fixed_count, &idx)) {
+            out->is_literal = 0;
+            out->param_index = idx;
+            return 1;
         }
-        out->is_literal = 0;
-        out->param_index = idx;
-        return 1;
+        lisp_val_t rest_sym;
+        if (za_rest_param_symbol(params, fixed_count, &rest_sym) && form == rest_sym) {
+            out->is_literal = 3;
+            out->param_index = fixed_count;
+            return 1;
+        }
+        return 0;
     }
     // 拡張7(ILOS): (quote sym)形式のシンボルリテラルのみ許可する。リスト等の
     // quoteは今回スコープ外なので、素直に0を返してインタプリタへfallbackさせる。
@@ -538,6 +573,12 @@ static void za_emit_operand(const za_operand_t *op) {
         jit_movabs_r11((UINT64)(void *)cc_cdr);
         jit_call_r11();
         jit_mov_rcx_rax();
+    }
+    if (op->is_literal == 3) {
+        // &rest: 固定引数分のcdrをすでに済ませたrcxの中身(残りの部分リストそのもの)を
+        // そのまま返す。0(単一パラメータ参照)と違い、最後のcc_car呼び出しをしない。
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_RCX);
+        return;
     }
     jit_movabs_r11((UINT64)(void *)cc_car);
     jit_call_r11();
