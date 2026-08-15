@@ -11,7 +11,11 @@
 ;;
 ;; %%za-compiled-p は第一引数の関数がzaで機械語へコンパイルされたかどうかを判定する
 ;; テスト用の内部組み込み関数(ISLisp仕様外なので%%を付ける、runtime.c参照)。
-;; 本ファイルは test/lisp/isiki_test.lisp が定義する assert-equal 等をそのまま使う。
+;; 本ファイルは test/lisp/test_framework.lisp が定義する assert-equal 等をそのまま
+;; 使う(boot-entryスクリプトが本ファイルより先にそれをloadしている前提)。
+;;
+;; 拡張5(非局所脱出: block/return-from, catch/throw, tagbody/go, unwind-protect)は
+;; test/lisp/za_test_ext5.lisp に分割してある(QEMUテストのmilestone分割用)。
 
 ;; (+ x y z) : オペランド3個の+はzaでコンパイルされる
 (defun isiki-za-test-add3 (x y z) (+ x y z))

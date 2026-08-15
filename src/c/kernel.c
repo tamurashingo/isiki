@@ -62,9 +62,12 @@ UINT64 kernel_get_boot_epoch_seconds(void) {
 /** os_set_qemu_test_mode経由でprocess 0の専用スタック上から呼ぶpower_off(kernel_mainの引数を保持) */
 static void (*g_qemu_test_power_off)(void) = 0;
 
-/** test/lisp/qemu_boot_test.lispをcc_loadしてからpower_offする(process 0専用スタック上で実行される) */
+/** .qemu-test-triggerの内容(cc_loadするboot-entryスクリプトのパス)を保持する */
+static char g_qemu_test_boot_script[256] = "test/lisp/qemu_boot_test.lisp";
+
+/** g_qemu_test_boot_scriptが指すboot-entryスクリプトをcc_loadしてからpower_offする(process 0専用スタック上で実行される) */
 static void run_qemu_boot_test(void) {
-    cc_load(os_make_cons(os_make_string("test/lisp/qemu_boot_test.lisp"), nil), global_environment);
+    cc_load(os_make_cons(os_make_string(g_qemu_test_boot_script), nil), global_environment);
     g_qemu_test_power_off();
 }
 
@@ -97,8 +100,10 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     init_pit();
     init_idt();
 
-    // リポジトリルートに.qemu-test-triggerがあれば、テスト用のLispファイルを
-    // 自動loadしてから電源を切る(make test-qemuからの全自動実行用)。
+    // リポジトリルートに.qemu-test-triggerがあれば、その内容が指すLispファイルを
+    // 自動loadしてから電源を切る(make test-qemu/test-qemu-milestoneからの全自動実行用)。
+    // 内容が空(従来通りのtouchのみ)ならg_qemu_test_boot_scriptの初期値
+    // (test/lisp/qemu_boot_test.lisp、全milestoneを通しで実行する)をそのまま使う。
     // kernel_mainのブート時スタック上で直接cc_loadを呼ぶとスタックサイズ不足で
     // クラッシュするため、process 0がタイマー割り込み経由で最初に起動される際に
     // (16KBの専用スタック上で)実行させる(process_trampoline_c参照)
@@ -106,7 +111,18 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     char trigger_err[64];
     int qemu_test_mode = 0;
     if (os_stream_open_9p_file(&trigger_probe, ".qemu-test-trigger", trigger_err, sizeof(trigger_err))) {
+        UINT64 len = 0;
+        char ch;
+        while (len + 1 < sizeof(g_qemu_test_boot_script) && os_stream_read_char(&trigger_probe, &ch)) {
+            if (ch == '\n' || ch == '\r') {
+                break;
+            }
+            g_qemu_test_boot_script[len++] = ch;
+        }
         os_stream_close(&trigger_probe);
+        if (len > 0) {
+            g_qemu_test_boot_script[len] = '\0';
+        }
         qemu_test_mode = 1;
         g_qemu_test_power_off = power_off;
         os_set_qemu_test_mode(run_qemu_boot_test);

@@ -245,3 +245,24 @@ test-qemu: build
 	test -f test-results.txt
 	cat test-results.txt
 	grep -q " 0 failed" test-results.txt
+
+# test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
+# .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
+# (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)
+test-qemu-milestone: build
+	mkdir -p $(BUILD_TMPDIR)
+	test -n "$(MILESTONE)"
+	rm -f .qemu-test-trigger test-results.txt
+	echo "$(MILESTONE)" > .qemu-test-trigger
+	qemu-system-x86_64 \
+		-m 256M \
+		-display none \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive format=raw,file=fat:rw:./esp_dir \
+		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
+		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		-no-reboot
+	rm -f .qemu-test-trigger
+	test -f test-results.txt
+	cat test-results.txt
+	grep -q " 0 failed" test-results.txt

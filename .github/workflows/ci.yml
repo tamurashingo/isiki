@@ -25,11 +25,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf
-
-      - name: Run Lisp tests in QEMU
-        timeout-minutes: 10
-        run: |
           OVMF_CODE=$(find /usr/share -iname 'OVMF_CODE*.fd' 2>/dev/null | sort | head -n1)
           echo "Using OVMF_CODE=$OVMF_CODE"
           test -n "$OVMF_CODE"
-          make test-qemu OVMF_CODE="$OVMF_CODE"
+          echo "OVMF_CODE=$OVMF_CODE" >> $GITHUB_ENV
+
+      - name: Run Lisp tests in QEMU (milestone 1: base)
+        timeout-minutes: 4
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m1_base.lisp
+
+      - name: Run Lisp tests in QEMU (milestone 2: za base)
+        timeout-minutes: 4
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m2_za.lisp
+
+      - name: Run Lisp tests in QEMU (milestone 3: za ext5 non-local-exit)
+        timeout-minutes: 4
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m3_za_ext5.lisp

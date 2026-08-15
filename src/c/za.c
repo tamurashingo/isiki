@@ -223,6 +223,42 @@ static void jit_serialize_icache(void) {
     (void)a;
 }
 
+/**
+ * 制御転送チェック&早期脱出パターン(拡張5: block/return-from/catch/throw/tagbody)。
+ * raxに評価済みの値がある状態で呼ぶ: os_is_control_transfer(rax)(eval.h:82、
+ * TAG_INSTANCE+MAGIC_BLOCK_EXIT/MAGIC_CATCH_EXIT/MAGIC_GO_EXITのいずれかを判定する
+ * ヒープ確保無しの単純な比較)を呼び出し、
+ *  - 制御転送でなければraxを元の値に復元してフォールスルーする。
+ *  - 制御転送であればraxを元の値に復元した上でプレースホルダjmpを発行し、そのオフセット
+ *    を返す(呼び出し元がjit_patch_rel32/jit_patch_rel32_targetで伝播先へpatchする)。
+ * os_is_control_transferはヒープ確保を一切しないため、呼び出し前後でr13へ元の値を
+ * 退避するだけで安全(GCによる再配置を心配しなくてよい)。
+ */
+static UINT64 za_emit_ct_check_and_jmp_if_transfer(void) {
+    jit_mov_rcx_rax();
+    jit_mov_r13_rax();
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_is_control_transfer);
+    jit_call_r11();
+    jit_movabs_r11(0);
+    jit_cmp_rax_r11();
+    UINT64 je_not_transfer = jit_emit_je_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 jmp_transfer = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32(je_not_transfer);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    return jmp_transfer;
+}
+
+/** src_reg(TAG_INSTANCEでタグ付けされた値)のタグを外した実アドレスをdst_regへ計算する
+ * (mov dst,src; and dst,-8)。obj[0]〜obj[3]をjit_mov_reg_from_mem_disp8(reg,dst_reg,k*8)
+ * で読むための前処理(block/catchが自分自身の制御転送magicかどうかを生の構造体比較で
+ * 判定する際に使う。eval_catch/eval_tagbodyがos_is_control_transferでなく直接
+ * TAG_MASK+obj[0]比較を行っているのと同じ手口)。 */
+static void za_emit_untag_instance(UINT8 dst_reg, UINT8 src_reg) {
+    jit_mov_reg_reg(dst_reg, src_reg);
+    jit_and_reg_imm8(dst_reg, (UINT8)0xF8);
+}
+
 typedef struct {
     int is_literal;
     lisp_val_t literal;
@@ -369,6 +405,14 @@ static void za_gc_unlink(gc_rootnode *saved_head) {
     get_current_process()->gc_roots = saved_head;
 }
 
+/** nodeのnext(=link時点のgc_roots)へ復元し、node1個だけをshadow stackから外す。
+ * 外部にsaved_headを持たなくてよい(node->nextはlink後、他のnode/gc_rootsの書き換えで
+ * 変化しないため、常にこのnode自身の「元の1個前」を指し続ける)。拡張5のNLXスロット
+ * (throw/catch/unwind-protect/return-fromが1個ずつ独立にlink/unlinkする)向け。 */
+static void za_gc_unlink_node(gc_rootnode *node) {
+    get_current_process()->gc_roots = node->next;
+}
+
 /**
  * za_try_compile_defunが確保する追加フレームのレイアウト(すべてrsp相対オフセット)。
  * env用は関数本体の実行中ずっとリンクしたまま(プロローグでリンク、エピローグ/
@@ -396,16 +440,28 @@ static void za_gc_unlink(gc_rootnode *saved_head) {
 #define ZA_OFF_LAMBDA_ENV_NODE   128  /* 16バイト */
 #define ZA_OFF_LAMBDA_TMP_VAL    144
 #define ZA_OFF_LAMBDA_TMP_NODE   152  /* 16バイト */
-/* 168-175: 16バイト境界を保つためのpadding */
-#define ZA_OFF_ARG_BASE        176
+/* 拡張5(非局所脱出): throw/catch/unwind-protect/return-fromが値をリンクした
+ * まま別の再帰的コンパイル呼び出し(GCを起こしうる)を挟んで保持するための
+ * 深さ指定スロット配列。同時に生きているspanningスロットは常に1本のスタック
+ * として積み重なるため、種類を問わず同じ配列を使い回す。 */
+#define ZA_MAX_NLX_DEPTH       4
+#define ZA_OFF_NLX_BASE        168
+#define ZA_NLX_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
+/* 168 + 4*24 = 264-271: 16バイト境界を保つためのpadding */
+#define ZA_OFF_ARG_BASE        272
 #define ZA_ARG_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
-/* ZA_OFF_ARG_BASE + ZA_MAX_OPERANDS*ZA_ARG_SLOT_SIZE(=560) は既に16バイト境界 */
-#define ZA_FRAME_EXTRA         560
+/* ZA_OFF_ARG_BASE + ZA_MAX_OPERANDS*ZA_ARG_SLOT_SIZE(=656) は既に16バイト境界 */
+#define ZA_FRAME_EXTRA         656
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
 static UINT32 za_arg_val_off(UINT64 i) { return ZA_OFF_ARG_BASE + (UINT32)i * ZA_ARG_SLOT_SIZE; }
 static UINT32 za_arg_node_off(UINT64 i) { return za_arg_val_off(i) + 8; }
+
+/** 深さdepth(0始まり)のNLXスロットの値オフセット。throw/catch/unwind-protect/
+ * return-fromが共有する(za_arg_val_offと同じ「配列インデックス」パターン)。 */
+static UINT32 za_nlx_val_off(UINT64 depth) { return ZA_OFF_NLX_BASE + (UINT32)depth * ZA_NLX_SLOT_SIZE; }
+static UINT32 za_nlx_node_off(UINT64 depth) { return za_nlx_val_off(depth) + 8; }
 
 /** [rsp+off]の値をregへ読み出す */
 static void za_load_slot(UINT8 reg, UINT32 off) { jit_mov_reg_from_rsp(reg, (INT32)off); }
@@ -420,6 +476,14 @@ static void za_emit_gc_link_slot(UINT32 value_off, UINT32 node_off) {
     za_addr_of_slot(ZA_REG_RCX, node_off);
     za_addr_of_slot(ZA_REG_RDX, value_off);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_link);
+    jit_call_r11();
+}
+
+/** node_off番地のgc_rootnodeを1個だけshadow stackから外す(za_gc_unlink_nodeの呼び出し。
+ * rcx=&node)。拡張5のNLXスロット(throw/catch/unwind-protect/return-fromの一時値)向け。 */
+static void za_emit_gc_unlink_slot(UINT32 node_off) {
+    za_addr_of_slot(ZA_REG_RCX, node_off);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink_node);
     jit_call_r11();
 }
 
@@ -644,17 +708,16 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
 
 /**
  * head(必ずTAG_SYMBOL)が一般呼び出しとして扱えない特殊形式のシンボルかどうかを判定する。
- * eval.cのos_eval特殊形式ディスパッチ表と同じ集合(quote・if・+・-・*・<・=はza_compile_expr側で
+ * eval.cのos_eval特殊形式ディスパッチ表と同じ集合(quote・if・+・-・*・<・=、および
+ * block・return-from・catch・throw・tagbody・go・unwind-protectはza_compile_expr側で
  * 先に個別に処理済みなのでここには含めない)。
  */
 static int za_is_excluded_special_form(lisp_val_t head) {
     return head == g_sym_quote || head == g_sym_progn || head == g_sym_setq ||
            head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
-           head == g_sym_quasiquote || head == g_sym_block || head == g_sym_return_from ||
-           head == g_sym_unwind_protect || head == g_sym_function || head == g_sym_flet ||
+           head == g_sym_quasiquote || head == g_sym_function || head == g_sym_flet ||
            head == g_sym_labels || head == g_sym_defvar || head == g_sym_defconstant ||
-           head == g_sym_defdynamic || head == g_sym_defglobal || head == g_sym_dynamic ||
-           head == g_sym_catch || head == g_sym_throw || head == g_sym_tagbody || head == g_sym_go;
+           head == g_sym_defdynamic || head == g_sym_defglobal || head == g_sym_dynamic;
 }
 
 /**
@@ -683,8 +746,85 @@ static UINT64 za_emit_symbol_name(lisp_val_t sym) {
     return str_offset;
 }
 
+/**
+ * 拡張5(非局所脱出)のうち`tagbody`/`go`用のコンパイル時ラベル解決テーブル。
+ * `go`は宛先のタグが同一(ネストしていない)tagbody内に静的に存在する前提で、
+ * 実行時に制御転送オブジェクトを作らずコンパイル時に直接jmpへ解決する。
+ * 前方参照(未解決のタグへのgo)は`pending`にプレースホルダのオフセットを積んでおき、
+ * 該当タグの位置に到達した時点でまとめてpatchする。全てコンパイル時のスタック上の
+ * ローカル変数であり、実行時メモリは不要。
+ */
+#define ZA_MAX_TAGBODY_TAGS 16
+#define ZA_MAX_TAGBODY_GOTOS_PER_TAG 8
+
+typedef struct za_tag_entry {
+    lisp_val_t tag;
+    UINT64 offset;
+    int resolved;
+    UINT64 pending[ZA_MAX_TAGBODY_GOTOS_PER_TAG];
+    int pending_count;
+} za_tag_entry_t;
+
+typedef struct za_tagbody_ctx {
+    za_tag_entry_t tags[ZA_MAX_TAGBODY_TAGS];
+    int tag_count;
+    /* このtagbody自身のnlx_depth(za_compile_tagbodyが呼ばれた時点の値)。goが
+     * catch/throw/unwind-protectのspanningスロットを開いたまま(nlx_depthが
+     * これより深い状態)で直接jmpすると、そのスロットのunlinkコードを飛び越えて
+     * GCルートリンクが残留する。za_compile_goはこの値と自分の呼び出し時点の
+     * nlx_depthを比較し、不一致ならコンパイルを断念する(block/return-fromは
+     * spanningスロットを使わないのでnlx_depthを変えず、この制約の対象にならない)。 */
+    UINT64 base_nlx_depth;
+} za_tagbody_ctx_t;
+
+static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                            lisp_val_t env, int allow_call, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
+
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
-                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset);
+                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
+
+/** forms(リスト)を先頭から順にza_compile_expr(allow_call=1, is_tail=0)で評価する
+ * 共通ヘルパー(block/catch/tagbodyのbody、unwind-protectのcleanup-formsで使う)。
+ * 各要素の評価結果が制御転送であれば残りのformsをスキップしrax=その転送値のまま
+ * 戻る(1を返す)。formsが空(nil)ならrax=nilとする(eval_prognの空リスト規約)。
+ * 最後の要素の結果には制御転送チェックを行わない(その値がそのままこの関数の結果
+ * になるので、呼び出し元が必要なら自分で判定する)。 */
+static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                  lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `(block name . body)`。bodyをza_compile_body_formsで評価し、結果が制御転送で
+ * MAGIC_BLOCK_EXITかつobj[1]がnameと一致するならobj[2]を、そうでなければ結果を
+ * そのまま返す。 */
+static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `(return-from name . value-rest)`。value-restが空ならnil、それ以外は評価した値を
+ * MAGIC_BLOCK_EXITでラップして返す(すでに制御転送ならラップせずそのまま返す)。 */
+static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                   lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `(catch tag-form . body)`。 */
+static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `(throw tag-form result-form)`。 */
+static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `(unwind-protect protected-form . cleanup-forms)`。 */
+static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                      lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `(tagbody . body)`。tb_ctx!=NULL(すでにtagbodyの中)なら0を返す(ネスト非対応)。 */
+static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                               lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `(go tag)`。tb_ctx==NULL(tagbodyの外)、またはnlx_depthがtb_ctx->base_nlx_depthより
+ * 深い(catch/throw/unwind-protectのspanningスロットを開いたままjmpで飛び越えることに
+ * なる)場合は0を返す。 */
+static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
 
 /**
  * 「(lambda (lambda_params...) . lambda_body)」から、外側のJIT関数と同じ表現
@@ -817,7 +957,8 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
  */
 static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                            lisp_val_t env, int allow_call, int is_tail, UINT64 trampoline_offset) {
+                            lisp_val_t env, int allow_call, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
     form = za_macroexpand(form, env);
 
     za_operand_t leaf;
@@ -896,14 +1037,18 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
             has_else = 1;
         }
 
-        if (!za_compile_expr(test_form, params, fixed_count, syms, env, 0, 0, trampoline_offset)) {
+        if (!za_compile_expr(test_form, params, fixed_count, syms, env, 0, 0, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
+        // testが制御転送(return-from/throw/go等をtest位置に書いたケース)ならthen/elseの
+        // 評価を行わず、if全体の結果としてそのまま伝播する(ct_patchはif全体の終端、
+        // つまり通常経路がthen/elseを評価し終えて流れ落ちる地点と同じ着地点へ合流する)。
+        UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
         jit_movabs_r11(nil);
         jit_cmp_rax_r11();
         UINT64 je_patch = jit_emit_je_rel32_placeholder();
 
-        if (!za_compile_expr(then_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset)) {
+        if (!za_compile_expr(then_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
         // then分岐の実行後は必ずelse/nilフォールバック側を飛び越える(elseが無い場合も
@@ -913,14 +1058,39 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
 
         jit_patch_rel32(je_patch);
         if (has_else) {
-            if (!za_compile_expr(else_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset)) {
+            if (!za_compile_expr(else_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset, nlx_depth, tb_ctx)) {
                 return 0;
             }
         } else {
             jit_movabs_rax(nil);
         }
         jit_patch_rel32(jmp_patch);
+        jit_patch_rel32(ct_patch);
         return 1;
+    }
+
+    // 拡張5(非局所脱出): if同様、allow_callゲートより前で無条件に認識する
+    // (インタプリタと同じくifのtestや呼び出しの引数位置にも書けるようにするため)。
+    if (head == g_sym_block) {
+        return za_compile_block(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+    }
+    if (head == g_sym_return_from) {
+        return za_compile_return_from(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+    }
+    if (head == g_sym_catch) {
+        return za_compile_catch(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+    }
+    if (head == g_sym_throw) {
+        return za_compile_throw(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+    }
+    if (head == g_sym_unwind_protect) {
+        return za_compile_unwind_protect(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+    }
+    if (head == g_sym_tagbody) {
+        return za_compile_tagbody(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+    }
+    if (head == g_sym_go) {
+        return za_compile_go(form, nlx_depth, tb_ctx);
     }
 
     // 一般呼び出し: headがシンボルで、除外リストの特殊形式でなければ関数呼び出しとして
@@ -932,7 +1102,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     if ((head & TAG_MASK) != TAG_SYMBOL || za_is_excluded_special_form(head)) {
         return 0;
     }
-    return za_compile_call(form, head, params, fixed_count, syms, env, is_tail, trampoline_offset);
+    return za_compile_call(form, head, params, fixed_count, syms, env, is_tail, trampoline_offset, nlx_depth, tb_ctx);
 }
 
 /**
@@ -952,7 +1122,8 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
  */
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
-                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset) {
+                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
     /*
      * fn_sym/paramsは引数loop(下記)がza_compile_expr経由でza_compile_lambdaへ再入した
      * 場合、そちら側でos_make_cons/os_make_symbolという実アロケーションを伴うコンパイル
@@ -980,13 +1151,35 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     jit_call_r11();
     za_store_slot(ZA_REG_RAX, ZA_OFF_CALL_SAVED_HEAD);
 
-    // 2. 引数を左から順に評価し、引数スロットへ書き込み、linkする。
+    // 2. 引数を左から順に評価し、引数スロットへ書き込み、linkする。いずれかの引数が
+    // 制御転送を返した場合は残りの引数評価・関数解決・呼び出しをすべて中止し、
+    // abort_cleanup(このループの直後)へ直接jmpする(すでにlinkした引数0..i-1分を
+    // CALL_SAVED_HEADでまとめてunlinkしてから、関数末尾の共通着地点へ合流する)。
+    UINT64 ct_patches[ZA_MAX_OPERANDS];
+    UINT64 ct_patch_count = 0;
     for (UINT64 i = 0; i < argc; i++) {
-        if (!za_compile_expr(arg_forms[i], params, fixed_count, syms, env, 0, 0, trampoline_offset)) {
+        if (!za_compile_expr(arg_forms[i], params, fixed_count, syms, env, 0, 0, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
+        ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
         za_store_slot(ZA_REG_RAX, za_arg_val_off(i));
         za_emit_gc_link_slot(za_arg_val_off(i), za_arg_node_off(i));
+    }
+
+    // abort_cleanup: 引数評価中の制御転送で中断した場合のみ到達する(通常経路は
+    // 直後のjmpで読み飛ばす)。rax(制御転送値)をr13へ退避してCALL_SAVED_HEADで
+    // unlinkし、関数末尾の共通着地点(非末尾呼び出しの通常完了と同じ地点)へ合流する。
+    UINT64 abort_skip_patch = jit_emit_jmp_rel32_placeholder();
+    UINT64 abort_cleanup_offset = g_jit_used;
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, ZA_OFF_CALL_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 abort_to_end_patch = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32(abort_skip_patch);
+    for (UINT64 i = 0; i < ct_patch_count; i++) {
+        jit_patch_rel32_target(ct_patches[i], abort_cleanup_offset);
     }
 
     // 3. os_get_function(fn_sym, env)をfnスロットへ書き込み、linkする。
@@ -1027,23 +1220,445 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         za_load_slot(ZA_REG_R8, ZA_OFF_ENV_VAL);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_function);
         jit_call_r11();
-        return 1;
+    } else {
+        // 6b. 末尾: envのリンクも外す。
+        za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+        jit_call_r11();
+
+        // トランポリンの呼び出し規約(rcx=evaluated_args, rdx=env, r8=fn)に沿って、
+        // フレームを解体する前に値スロットからレジスタへ読み出しておく。
+        za_load_slot(ZA_REG_RCX, ZA_OFF_ACC_VAL);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        za_load_slot(ZA_REG_R8, ZA_OFF_FN_VAL);
+        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+        jit_pop_r13();
+        jit_pop_rbx();
+        jit_emit_jmp_to(trampoline_offset);
+        // 通常経路はここで(実行時に)トランポリンへ抜けるため、以下の
+        // abort_to_end_patchの着地点はis_tail=1の場合は「引数評価中に制御転送で
+        // 中断した」場合のみ機械語レベルで到達する(その場合は実呼び出しを一切
+        // 行わずrax=制御転送値のまま、非末尾呼び出しの通常完了と同じ形で
+        // za_compile_expr側へ戻る — 呼び出しが実際には発生していないため
+        // トランポリンへは絶対に飛ばない)。
     }
 
-    // 6b. 末尾: envのリンクも外す。
-    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    // 引数評価中に制御転送で中断した場合の共通着地点(is_tail=0の通常完了地点とも
+    // 一致する)。ここに到達する時点でrax=結果(通常のapply結果、または中断した
+    // 制御転送値)であり、追加の処理は不要。
+    jit_patch_rel32(abort_to_end_patch);
+    return 1;
+}
+
+static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                  lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    if (forms == nil) {
+        jit_movabs_rax(nil);
+        return 1;
+    }
+    // 各要素(最後を除く)が制御転送ならこの共通着地点へ合流し、rax=その転送値のまま
+    // 戻る。要素数はZA_MAX_OPERANDSと同じ規模の上限で十分(既存の他構文と同じ考え方)。
+    UINT64 end_patches[ZA_MAX_OPERANDS];
+    UINT64 end_patch_count = 0;
+    for (lisp_val_t rest = forms; rest != nil; rest = cc_cdr(rest)) {
+        if ((rest & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        lisp_val_t elem = cc_car(rest);
+        int is_last = (cc_cdr(rest) == nil);
+        if (!za_compile_expr(elem, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+            return 0;
+        }
+        if (!is_last) {
+            if (end_patch_count >= ZA_MAX_OPERANDS) {
+                return 0;
+            }
+            end_patches[end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+        }
+    }
+    for (UINT64 i = 0; i < end_patch_count; i++) {
+        jit_patch_rel32(end_patches[i]);
+    }
+    return 1;
+}
+
+static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t name = cc_car(rest);
+    if ((name & TAG_MASK) != TAG_SYMBOL) {
+        return 0;
+    }
+    lisp_val_t body = cc_cdr(rest);
+
+    if (!za_compile_body_forms(body, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset)) {
+        return 0;
+    }
+
+    // 結果が制御転送でなければ(通常経路)そのまま返す。制御転送ならobj[1]==nameを
+    // チェックしてobj[2]を返す(eval_blockと同じ。obj[0]のmagicはチェックしない —
+    // eval_blockも同様にチェックしていないため、throw/goのタグがたまたまnameと
+    // 同じシンボルの場合もここで捕捉される)。
+    UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
+    UINT64 skip_patch = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(ct_patch);
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    UINT64 name_off = za_emit_symbol_name(name);
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_R11, ZA_REG_RAX);
+
+    za_emit_untag_instance(ZA_REG_RCX, ZA_REG_R13);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RCX, 8);
+    jit_cmp_rax_r11();
+    UINT64 je_match = jit_emit_je_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 jmp_no_match = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(je_match);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RCX, 16);
+
+    jit_patch_rel32(jmp_no_match);
+    jit_patch_rel32(skip_patch);
+    return 1;
+}
+
+static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                   lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t name = cc_car(rest);
+    if ((name & TAG_MASK) != TAG_SYMBOL) {
+        return 0;
+    }
+    lisp_val_t value_rest = cc_cdr(rest);
+    if (value_rest != nil && (value_rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        return 0;
+    }
+
+    if (value_rest != nil) {
+        if (!za_compile_expr(cc_car(value_rest), params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+            return 0;
+        }
+    } else {
+        jit_movabs_rax(nil);
+    }
+
+    // valが制御転送ならラップせずそのまま返す(eval_return_fromと同じ)。
+    UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
+
+    // valをos_make_symbol呼び出し(ヒープ確保を伴いGCを起こしうる)を挟んで保護する
+    // ため、NLXスロットへ格納してlinkする(r13への素の退避では不十分)。
+    UINT64 val_off = za_nlx_val_off(nlx_depth);
+    UINT64 node_off = za_nlx_node_off(nlx_depth);
+    za_store_slot(ZA_REG_RAX, val_off);
+    za_emit_gc_link_slot(val_off, node_off);
+
+    UINT64 name_off = za_emit_symbol_name(name);
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RAX);
+    za_load_slot(ZA_REG_R8, val_off);
+    jit_movabs_reg(ZA_REG_RCX, MAGIC_BLOCK_EXIT);
+    jit_movabs_reg(ZA_REG_R9, nil);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_instance);
     jit_call_r11();
 
-    // トランポリンの呼び出し規約(rcx=evaluated_args, rdx=env, r8=fn)に沿って、
-    // フレームを解体する前に値スロットからレジスタへ読み出しておく。
-    za_load_slot(ZA_REG_RCX, ZA_OFF_ACC_VAL);
-    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-    za_load_slot(ZA_REG_R8, ZA_OFF_FN_VAL);
-    jit_add_rsp_imm32(ZA_FRAME_TOTAL);
-    jit_pop_r13();
-    jit_pop_rbx();
-    jit_emit_jmp_to(trampoline_offset);
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_emit_gc_unlink_slot(node_off);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+
+    jit_patch_rel32(ct_patch);
+    return 1;
+}
+
+static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t tag_form = cc_car(rest);
+    lisp_val_t body = cc_cdr(rest);
+    if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        return 0;
+    }
+
+    if (!za_compile_expr(tag_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+        return 0;
+    }
+    // tagが制御転送ならbodyへ入らずそのまま返す(eval_catchと同じ)。
+    UINT64 tag_ct_patch = za_emit_ct_check_and_jmp_if_transfer();
+
+    UINT64 tag_val_off = za_nlx_val_off(nlx_depth);
+    UINT64 tag_node_off = za_nlx_node_off(nlx_depth);
+    za_store_slot(ZA_REG_RAX, tag_val_off);
+    za_emit_gc_link_slot(tag_val_off, tag_node_off);
+
+    if (!za_compile_body_forms(body, params, fixed_count, syms, env, nlx_depth + 1, tb_ctx, trampoline_offset)) {
+        return 0;
+    }
+
+    // 結果がTAG_INSTANCEでobj[0]==MAGIC_CATCH_EXITかつobj[1]==tag(スロットの現在値)
+    // ならobj[2]を、そうでなければ結果をそのまま返す(eval_catchと同じ)。
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    jit_and_reg_imm8(ZA_REG_RAX, (UINT8)TAG_MASK);
+    jit_movabs_r11(TAG_INSTANCE);
+    jit_cmp_rax_r11();
+    UINT64 je_is_instance = jit_emit_je_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 jmp_not_instance = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(je_is_instance);
+    za_emit_untag_instance(ZA_REG_RCX, ZA_REG_R13);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RCX, 0);
+    jit_movabs_r11(MAGIC_CATCH_EXIT);
+    jit_cmp_rax_r11();
+    UINT64 je_magic = jit_emit_je_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 jmp_not_magic = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(je_magic);
+    za_load_slot(ZA_REG_R11, tag_val_off);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RCX, 8);
+    jit_cmp_rax_r11();
+    UINT64 je_tag = jit_emit_je_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 jmp_not_tag = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(je_tag);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RCX, 16);
+
+    jit_patch_rel32(jmp_not_instance);
+    jit_patch_rel32(jmp_not_magic);
+    jit_patch_rel32(jmp_not_tag);
+
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_emit_gc_unlink_slot(tag_node_off);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+
+    jit_patch_rel32(tag_ct_patch);
+    return 1;
+}
+
+static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t tag_form = cc_car(rest);
+    lisp_val_t rest2 = cc_cdr(rest);
+    if (rest2 == nil || (rest2 & TAG_MASK) != TAG_CONS || cc_cdr(rest2) != nil) {
+        return 0;
+    }
+    lisp_val_t result_form = cc_car(rest2);
+    if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        return 0;
+    }
+
+    if (!za_compile_expr(tag_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+        return 0;
+    }
+    UINT64 tag_ct_patch = za_emit_ct_check_and_jmp_if_transfer();
+
+    UINT64 tag_val_off = za_nlx_val_off(nlx_depth);
+    UINT64 tag_node_off = za_nlx_node_off(nlx_depth);
+    za_store_slot(ZA_REG_RAX, tag_val_off);
+    za_emit_gc_link_slot(tag_val_off, tag_node_off);
+
+    if (!za_compile_expr(result_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth + 1, tb_ctx)) {
+        return 0;
+    }
+
+    // resultが制御転送ならtagのlinkだけ外してそのまま返す。そうでなければtagを外して
+    // MAGIC_CATCH_EXITでラップする(いずれもeval_throwと同じ)。
+    UINT64 result_ct_patch = za_emit_ct_check_and_jmp_if_transfer();
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_emit_gc_unlink_slot(tag_node_off);
+    za_load_slot(ZA_REG_RDX, tag_val_off);
+    jit_mov_reg_reg(ZA_REG_R8, ZA_REG_R13);
+    jit_movabs_reg(ZA_REG_RCX, MAGIC_CATCH_EXIT);
+    jit_movabs_reg(ZA_REG_R9, nil);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_instance);
+    jit_call_r11();
+    UINT64 skip_ct_patch = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(result_ct_patch);
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_emit_gc_unlink_slot(tag_node_off);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+
+    jit_patch_rel32(skip_ct_patch);
+    jit_patch_rel32(tag_ct_patch);
+    return 1;
+}
+
+static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                      lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t protected_form = cc_car(rest);
+    lisp_val_t cleanup_forms = cc_cdr(rest);
+    if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        return 0;
+    }
+
+    // protected-formの評価結果は制御転送かどうかに関わらずcleanupへ進む
+    // (eval_unwind_protectと同じ。ここでは即時チェックを行わない)。
+    // nlx_depth+1で評価する: protected_form内のgoがこのunwind-protectのスパンを
+    // 飛び越えてcleanup-formsの実行をバイパスすることをbase_nlx_depthチェックで
+    // 確実に拒否させるため(cleanup-formsと同じ深さで評価する)。
+    if (!za_compile_expr(protected_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth + 1, tb_ctx)) {
+        return 0;
+    }
+
+    UINT64 val_off = za_nlx_val_off(nlx_depth);
+    UINT64 node_off = za_nlx_node_off(nlx_depth);
+    za_store_slot(ZA_REG_RAX, val_off);
+    za_emit_gc_link_slot(val_off, node_off);
+
+    // cleanup-formsの結果は捨てる(cleanup内で新たな脱出が起きてもここでは無視する —
+    // eval_unwind_protectの既知の簡略化に合わせる)。
+    if (!za_compile_body_forms(cleanup_forms, params, fixed_count, syms, env, nlx_depth + 1, tb_ctx, trampoline_offset)) {
+        return 0;
+    }
+
+    za_load_slot(ZA_REG_RAX, val_off);
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_emit_gc_unlink_slot(node_off);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    return 1;
+}
+
+/** tagbody本体1個あたりの(タグを除く)form要素数の上限。goが無いプレーンなbody要素も
+ * 含めて数える(コード量を有限に保つための実装上の上限。ZA_MAX_OPERANDS等と同じ考え方)。 */
+#define ZA_MAX_TAGBODY_FORMS 64
+
+static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                               lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    if (tb_ctx != 0) {
+        return 0;
+    }
+    lisp_val_t body = cc_cdr(form);
+
+    za_tagbody_ctx_t new_ctx;
+    new_ctx.tag_count = 0;
+    new_ctx.base_nlx_depth = nlx_depth;
+
+    // 各form要素(タグを除く)の評価結果が制御転送なら(自分のタグへのgoはza_compile_go
+    // が直接jmpで解決済みなので、ここに到達するのは他のcatch/block/goのみ)tagbody
+    // 全体の結果としてそのまま伝播する(eval_tagbodyの「一致しなければ伝播」と同じ)。
+    UINT64 end_patches[ZA_MAX_TAGBODY_FORMS];
+    UINT64 end_patch_count = 0;
+
+    for (lisp_val_t rest = body; rest != nil; rest = cc_cdr(rest)) {
+        if ((rest & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        lisp_val_t elem = cc_car(rest);
+        if (elem != nil && (elem & TAG_MASK) == TAG_SYMBOL) {
+            int idx = -1;
+            for (int i = 0; i < new_ctx.tag_count; i++) {
+                if (new_ctx.tags[i].tag == elem) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0) {
+                if (new_ctx.tag_count >= ZA_MAX_TAGBODY_TAGS) {
+                    return 0;
+                }
+                idx = new_ctx.tag_count++;
+                new_ctx.tags[idx].tag = elem;
+                new_ctx.tags[idx].resolved = 0;
+                new_ctx.tags[idx].pending_count = 0;
+            }
+            new_ctx.tags[idx].offset = g_jit_used;
+            new_ctx.tags[idx].resolved = 1;
+            for (int i = 0; i < new_ctx.tags[idx].pending_count; i++) {
+                jit_patch_rel32_target(new_ctx.tags[idx].pending[i], new_ctx.tags[idx].offset);
+            }
+            new_ctx.tags[idx].pending_count = 0;
+            continue;
+        }
+
+        if (end_patch_count >= ZA_MAX_TAGBODY_FORMS) {
+            return 0;
+        }
+        if (!za_compile_expr(elem, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, &new_ctx)) {
+            return 0;
+        }
+        end_patches[end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+    }
+
+    // 未解決の前方参照が残っていたら(=body中に無いタグへのgo)コンパイル断念。
+    for (int i = 0; i < new_ctx.tag_count; i++) {
+        if (new_ctx.tags[i].pending_count > 0) {
+            return 0;
+        }
+    }
+
+    // 最後まで正常終了した場合は常にnil(eval_tagbodyと同じ)。
+    jit_movabs_rax(nil);
+
+    for (UINT64 i = 0; i < end_patch_count; i++) {
+        jit_patch_rel32(end_patches[i]);
+    }
+    return 1;
+}
+
+static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
+    if (tb_ctx == 0 || nlx_depth != tb_ctx->base_nlx_depth) {
+        return 0;
+    }
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
+        return 0;
+    }
+    lisp_val_t tag = cc_car(rest);
+    if ((tag & TAG_MASK) != TAG_SYMBOL) {
+        return 0;
+    }
+
+    int idx = -1;
+    for (int i = 0; i < tb_ctx->tag_count; i++) {
+        if (tb_ctx->tags[i].tag == tag) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        if (tb_ctx->tag_count >= ZA_MAX_TAGBODY_TAGS) {
+            return 0;
+        }
+        idx = tb_ctx->tag_count++;
+        tb_ctx->tags[idx].tag = tag;
+        tb_ctx->tags[idx].resolved = 0;
+        tb_ctx->tags[idx].pending_count = 0;
+    }
+
+    if (tb_ctx->tags[idx].resolved) {
+        jit_emit_jmp_to(tb_ctx->tags[idx].offset);
+    } else {
+        if (tb_ctx->tags[idx].pending_count >= ZA_MAX_TAGBODY_GOTOS_PER_TAG) {
+            return 0;
+        }
+        tb_ctx->tags[idx].pending[tb_ctx->tags[idx].pending_count++] = jit_emit_jmp_rel32_placeholder();
+    }
     return 1;
 }
 
@@ -1099,7 +1714,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     za_emit_gc_link_slot(ZA_OFF_ENV_VAL, ZA_OFF_ENV_NODE);
     za_emit_gc_link_slot(ZA_OFF_ARGS_VAL, ZA_OFF_ARGS_NODE);
 
-    if (!za_compile_expr(form, params, fixed_count, &syms, env, 1, 1, trampoline_offset)) {
+    if (!za_compile_expr(form, params, fixed_count, &syms, env, 1, 1, trampoline_offset, 0, 0)) {
         g_jit_used = entry;
         return nil;
     }
