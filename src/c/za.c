@@ -708,16 +708,18 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
 
 /**
  * head(必ずTAG_SYMBOL)が一般呼び出しとして扱えない特殊形式のシンボルかどうかを判定する。
- * eval.cのos_eval特殊形式ディスパッチ表と同じ集合(quote・if・+・-・*・<・=、および
- * block・return-from・catch・throw・tagbody・go・unwind-protectはza_compile_expr側で
- * 先に個別に処理済みなのでここには含めない)。
+ * eval.cのos_eval特殊形式ディスパッチ表と同じ集合(quote・if・+・-・*・<・=、
+ * block・return-from・catch・throw・tagbody・go・unwind-protect・dynamic・defdynamicは
+ * za_compile_expr側で先に個別に処理済みなのでここには含めない)。
+ * defglobal(レキシカルなグローバル変数、defdynamicとは無関係の別機構)は未対応のまま
+ * ここに残す。
  */
 static int za_is_excluded_special_form(lisp_val_t head) {
     return head == g_sym_quote || head == g_sym_progn || head == g_sym_setq ||
            head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
            head == g_sym_quasiquote || head == g_sym_function || head == g_sym_flet ||
            head == g_sym_labels || head == g_sym_defvar || head == g_sym_defconstant ||
-           head == g_sym_defdynamic || head == g_sym_defglobal || head == g_sym_dynamic;
+           head == g_sym_defglobal;
 }
 
 /**
@@ -825,6 +827,15 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
  * 深い(catch/throw/unwind-protectのspanningスロットを開いたままjmpで飛び越えることに
  * なる)場合は0を返す。 */
 static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
+
+/** `(dynamic name)`。nameは評価しない。os_get_dynamicで動的束縛(g_dynamic_bindings)
+ * から現在の値を返す(未束縛ならnil)。 */
+static int za_compile_dynamic(lisp_val_t form);
+
+/** `(defdynamic name value-form)`。value-formを評価し、os_set_dynamicで動的束縛
+ * (g_dynamic_bindings)へ登録してnameを返す。 */
+static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                  lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /**
  * 「(lambda (lambda_params...) . lambda_body)」から、外側のJIT関数と同じ表現
@@ -1091,6 +1102,14 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     }
     if (head == g_sym_go) {
         return za_compile_go(form, nlx_depth, tb_ctx);
+    }
+
+    // 拡張6(動的変数): if/block等と同様、allow_callゲートより前で無条件に認識する。
+    if (head == g_sym_dynamic) {
+        return za_compile_dynamic(form);
+    }
+    if (head == g_sym_defdynamic) {
+        return za_compile_defdynamic(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
 
     // 一般呼び出し: headがシンボルで、除外リストの特殊形式でなければ関数呼び出しとして
@@ -1378,6 +1397,97 @@ static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fix
     jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
     za_emit_gc_unlink_slot(node_off);
     jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+
+    jit_patch_rel32(ct_patch);
+    return 1;
+}
+
+/**
+ * `(dynamic name)`。nameは評価しない(quote相当)。os_get_dynamicで動的束縛
+ * (g_dynamic_bindings、レキシカルなenvとは無関係の単一グローバルalist)から
+ * 現在の値を読み取って返す(未束縛ならnil)。os_get_dynamicはcc_assoc_eqによる
+ * 走査のみでヒープ確保しないため、os_make_symbol呼び出しを挟んでの保護は不要。
+ */
+static int za_compile_dynamic(lisp_val_t form) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
+        return 0;
+    }
+    lisp_val_t name = cc_car(rest);
+    if ((name & TAG_MASK) != TAG_SYMBOL) {
+        return 0;
+    }
+
+    UINT64 name_off = za_emit_symbol_name(name);
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_dynamic);
+    jit_call_r11();
+    return 1;
+}
+
+/**
+ * `(defdynamic name value-form)`。value-formを評価し、結果が制御転送でなければ
+ * os_set_dynamicで動的束縛(g_dynamic_bindings)へ登録してnameを返す(制御転送なら
+ * os_set_dynamicを呼ばずそのまま返す。eval_defdynamicと同じ規約 — os_set_dynamic
+ * 自身の戻り値はvalなので、最終的な戻り値としてはそちらを使わない)。
+ * valをos_set_dynamic呼び出し(既存束縛が無い場合os_make_consでヒープ確保しGCを
+ * 起こしうる)を挟んで保護するため、NLXスロットへ格納してlink/unlinkする
+ * (return-fromと同じ手口。defdynamic自身は非局所脱出構文ではないのでnlx_depthは
+ * 変えずそのまま借用する)。os_set_dynamic呼び出し後にnameを戻り値として使う際は、
+ * 呼び出し前のnameの生レジスタ退避に頼らず、name_offのバイト列から再度
+ * os_make_symbolして現在有効なタグ付きシンボル値を取り直す
+ * (za_emit_symbol_nameのコメントと同じ理由。symbolオブジェクトもGCで移動する)。
+ */
+static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+                                  lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t name = cc_car(rest);
+    if ((name & TAG_MASK) != TAG_SYMBOL) {
+        return 0;
+    }
+    lisp_val_t rest2 = cc_cdr(rest);
+    if (rest2 == nil || (rest2 & TAG_MASK) != TAG_CONS || cc_cdr(rest2) != nil) {
+        return 0;
+    }
+    if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        return 0;
+    }
+
+    if (!za_compile_expr(cc_car(rest2), params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+        return 0;
+    }
+
+    // valが制御転送ならos_set_dynamicを呼ばずそのまま返す(eval_defdynamicと同じ)。
+    UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
+
+    UINT64 val_off = za_nlx_val_off(nlx_depth);
+    UINT64 node_off = za_nlx_node_off(nlx_depth);
+    za_store_slot(ZA_REG_RAX, val_off);
+    za_emit_gc_link_slot(val_off, node_off);
+
+    UINT64 name_off = za_emit_symbol_name(name);
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RDX, val_off);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_dynamic);
+    jit_call_r11();
+
+    za_emit_gc_unlink_slot(node_off);
+
+    // 戻り値はos_set_dynamicの戻り値(val)ではなくname自身。上のos_set_dynamic呼び出しで
+    // GCが起きている可能性があるため、同じname_offのバイト列から再度os_make_symbolして
+    // 現在有効なタグ付きシンボル値を取り直す。
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
 
     jit_patch_rel32(ct_patch);
     return 1;

@@ -413,3 +413,50 @@
 ;; sum_{i=0}^{49999} (i+1) = sum_{i=0}^{49999} i + 50000 = 49999*50000/2 + 50000 = 1250025000
 (assert-equal 1250025000 (isiki-za-test-sum-closure-chain (isiki-za-test-adder-chain 50000)))
 (close (open-output-file "tmp/ckpt-19-final.txt"))
+
+;;; --- 拡張6: 動的変数(defdynamic/dynamic) ---
+
+(defdynamic *iza-test-dyn1* 111)
+
+(defun isiki-za-test-read-dyn1 () (dynamic *iza-test-dyn1*))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-read-dyn1)))
+(assert-equal 111 (isiki-za-test-read-dyn1))
+
+(defun isiki-za-test-write-dyn1 (v) (defdynamic *iza-test-dyn1* v))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-write-dyn1)))
+;; defdynamicはeval_defdynamicと同じくvalではなくname自身を返す
+(assert-equal '*iza-test-dyn1* (isiki-za-test-write-dyn1 222))
+(assert-equal 222 (isiki-za-test-read-dyn1))
+
+;; defdynamicのvalue-formが制御転送(return-from)を返すなら、os_set_dynamicを呼ばず
+;; そのまま制御転送を伝播すること(動的値は更新されないままであること)
+(defun isiki-za-test-defdynamic-nlx (n)
+  (block done
+    (defdynamic *iza-test-dyn1* (if (< n 0) (return-from done 999) 333))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-defdynamic-nlx)))
+(assert-equal 999 (isiki-za-test-defdynamic-nlx -1))
+(assert-equal 222 (isiki-za-test-read-dyn1))
+(assert-equal '*iza-test-dyn1* (isiki-za-test-defdynamic-nlx 1))
+(assert-equal 333 (isiki-za-test-read-dyn1))
+
+;; 大量にdefdynamicを呼び続けてGC(os_gc_collect)を誘発しても、戻り値(name)が
+;; コンパイル時に埋め込んだシンボルとeqであり続けること(os_set_dynamic呼び出しを
+;; 挟んだ後の再解決が正しいことの確認)、および動的値自体も最終的に正しいことを確認する
+(defdynamic *iza-test-dyn2* 0)
+
+(defun isiki-za-test-write-dyn2 (v) (defdynamic *iza-test-dyn2* v))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-write-dyn2)))
+
+(defun isiki-za-test-dyn-stress (n)
+  (let ((acc nil))
+    (for ((i 0 (+ i 1))) ((= i n) acc)
+      (setq acc (cons (isiki-za-test-write-dyn2 i) acc)))))
+
+(defun isiki-za-test-all-eq-sym (lst sym)
+  (for ((rest lst (cdr rest)) (ok t ok)) ((null rest) ok)
+    (if (not (eq (car rest) sym)) (setq ok nil))))
+
+(assert-equal 50000 (length (isiki-za-test-dyn-stress 50000)))
+(assert-equal t (isiki-za-test-all-eq-sym (isiki-za-test-dyn-stress 50000) '*iza-test-dyn2*))
+(assert-equal 49999 (dynamic *iza-test-dyn2*))
+(close (open-output-file "tmp/ckpt-20-defdynamic.txt"))
