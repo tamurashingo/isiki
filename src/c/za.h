@@ -20,6 +20,10 @@
  *         | (atom leaf) | (null leaf)             ※ 非allocating
  *         | (eq leaf leaf)                        ※ 非allocating(ポインタ同一性比較)
  *         | (cons leaf leaf)                      ※ ヒープ確保を伴う(os_make_consを1回呼ぶ)
+ *         | (lambda (params...) . body)  ※ ヒープ確保を伴う。単一レベルのクロージャのみ
+ *           対応: 外側関数の固定引数(&restを除く)を呼ばれるたびに新規environmentへ
+ *           コピーする。lambda本体自体はzaがコンパイルせず、常にインタプリタ経由で
+ *           実行される
  *         | (if expr expr expr?)  ※ test/then/elseは再帰的にexprを許容、elseは省略可
  *         | (fn-sym callarg callarg...)  ※ 一般呼び出し。fn-symはquote・if・+・-・*・<・=や
  *           progn/setq/defun/lambda/defmacro/quasiquote/block/return-from/

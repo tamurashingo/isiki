@@ -359,7 +359,7 @@ UINT64 os_gc_collect_count(void) {
  * initialize_processes等、同じアドレスを何度も渡してくる呼び出し元があるため、
  * 単純な追加だけだとテーブルがすぐ枯渇する。
  */
-#define GC_MAX_EXTRA_ROOTS 8
+#define GC_MAX_EXTRA_ROOTS 40
 static lisp_val_t *g_gc_extra_roots[GC_MAX_EXTRA_ROOTS];
 static UINT64 g_gc_extra_root_count = 0;
 
@@ -767,7 +767,6 @@ void os_bootstrap() {
         cell[1] = tagged;
         nil = tagged;
     }
-
     g_dynamic_bindings = nil;
 
     // global_environment の作成
@@ -1412,10 +1411,13 @@ void os_mark_constant(lisp_val_t sym, lisp_val_t env) {
         return;
     }
     lisp_val_t new_pair = os_make_cons(sym, g_sym_t);
-    // os_make_consでGCが発火しconst_slotが移動している可能性があるため、
-    // 書き込み先アドレスはconst_slot(GC_PROTECT済み)から今読み直す
+    lisp_val_t new_alist = os_make_cons(new_pair, alist);
+    // 上記2回のos_make_cons双方でGCが発火しconst_slotが移動している可能性があるため、
+    // 書き込み先アドレスはconst_slot(GC_PROTECT済み)から、両方の確保が完了した今
+    // 最後に読み直す(先に読んでしまうと2回目のos_make_consのGCで書き込み先が
+    // 古いfrom-space上のアドレスのまま stale になり、登録が失われる)
     lisp_addr_t const_slot_addr = const_slot & ~TAG_MASK;
-    ((lisp_val_t *)const_slot_addr)[1] = os_make_cons(new_pair, alist);
+    ((lisp_val_t *)const_slot_addr)[1] = new_alist;
 }
 
 /**
@@ -1539,11 +1541,14 @@ lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
     } else {
         // 新規追加
         lisp_val_t new_pair = os_make_cons(sym, val);
-        // os_make_consでGCが発火しvar_slotが移動している可能性があるため、
-        // 書き込み先アドレスはvar_slot(GC_PROTECT済み)から今読み直す
-        lisp_addr_t var_slot_addr = var_slot & ~TAG_MASK;
         // (push new-pair alist)
-        ((lisp_val_t *)var_slot_addr)[1] = os_make_cons(new_pair, alist);
+        lisp_val_t new_alist = os_make_cons(new_pair, alist);
+        // 上記2回のos_make_cons双方でGCが発火しvar_slotが移動している可能性があるため、
+        // 書き込み先アドレスはvar_slot(GC_PROTECT済み)から、両方の確保が完了した今
+        // 最後に読み直す(先に読んでしまうと2回目のos_make_consのGCで書き込み先が
+        // 古いfrom-space上のアドレスのまま stale になり、束縛の追加が失われる)
+        lisp_addr_t var_slot_addr = var_slot & ~TAG_MASK;
+        ((lisp_val_t *)var_slot_addr)[1] = new_alist;
     }
 
     return val;
@@ -1614,11 +1619,14 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
     } else {
         // 新規追加
         lisp_val_t new_pair = os_make_cons(sym, fn_obj);
-        // os_make_consでGCが発火しfunc_slotが移動している可能性があるため、
-        // 書き込み先アドレスはfunc_slot(GC_PROTECT済み)から今読み直す
-        lisp_addr_t func_slot_addr = func_slot & ~TAG_MASK;
         // (push new-pair alist)
-        ((lisp_val_t *)func_slot_addr)[1] = os_make_cons(new_pair, alist);
+        lisp_val_t new_alist = os_make_cons(new_pair, alist);
+        // 上記2回のos_make_cons双方でGCが発火しfunc_slotが移動している可能性があるため、
+        // 書き込み先アドレスはfunc_slot(GC_PROTECT済み)から、両方の確保が完了した今
+        // 最後に読み直す(先に読んでしまうと2回目のos_make_consのGCで書き込み先が
+        // 古いfrom-space上のアドレスのまま stale になり、束縛の追加が失われる)
+        lisp_addr_t func_slot_addr = func_slot & ~TAG_MASK;
+        ((lisp_val_t *)func_slot_addr)[1] = new_alist;
     }
 
     return fn_obj;
@@ -1848,17 +1856,23 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
         }
     }
 
-    // 先にcount=0のプレースホルダでMAGIC_BIGNUMをラップしGC_PROTECTしてからlimbバッファを
-    // 確保する。プレースホルダはgc_relocate_bignumがword2(count)==0なら何もコピーしないため
-    // 安全であり、書き込みはword3(limb配列アドレス)→word2(count)の順に行うことで、
-    // 「countだけ確定してaddrが未確定」という危険な中間状態を作らない
-    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
-    GC_PROTECT(bignum);
+    // limbsは呼び出し元が管理する生バッファで、GCのルートとして追跡されない。
+    // この後アロケーションを2回以上挟むとGCがfrom/to空間を2回フリップし得て、
+    // 2回目のフリップで元のfrom空間(=limbsの実体があった領域)が新たなto空間として
+    // 再利用され、まだ読んでいないlimbsの内容が上書きされる危険がある。そのため、
+    // limbsを読む最後の操作(このコピー)を、limbs確保後最初のアロケーション
+    // (limb配列自体の確保)の直後、他のアロケーションを一切挟まずに完了させる
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
         dst[i] = limbs[i];
     }
+
+    // ここから先はlimbsを二度と読まないため、以降で何回アロケーションが発生しても安全。
+    // 書き込みはword3(limb配列アドレス)→word2(count)の順に行うことで、
+    // 「countだけ確定してaddrが未確定」という危険な中間状態を作らない
+    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
+    GC_PROTECT(bignum);
     UINT64 *words = (UINT64 *)(bignum & ~TAG_MASK);
     words[3] = (UINT64)limb_addr;
     words[2] = count;

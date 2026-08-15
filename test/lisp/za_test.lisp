@@ -322,3 +322,90 @@
 (close (open-output-file "tmp/ckpt-9-after-chain.txt"))
 (assert-equal 49999 (car (isiki-za-test-cons-chain 50000)))
 (close (open-output-file "tmp/ckpt-10-final.txt"))
+
+;;; --- 拡張4: クロージャ・lambda ---
+;;
+;; (lambda (params...) . body)は、外側defunの固定引数(&restを除く)を呼ばれるたびに
+;; 新規environmentへos_set_variableでコピーし、それを閉じ込めたMAGIC_FUNCTION_INTERPRETED
+;; インスタンス(インタプリタの通常のクロージャ表現そのもの)を組み立てるだけで、単一
+;; レベルのネストのみ対応する。lambda本体自体はzaがコンパイルせず、呼び出しは常に
+;; インタプリタ(apply_function)経由で実行される。
+
+;; 定数を返すだけのクロージャ
+(defun isiki-za-test-make-const (x) (lambda () x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-make-const)))
+(assert-equal 42 (funcall (isiki-za-test-make-const 42)))
+(close (open-output-file "tmp/ckpt-11-const.txt"))
+
+;; 1引数を捕捉するアダー・クロージャ
+(defun isiki-za-test-make-adder (x) (lambda (y) (+ x y)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-make-adder)))
+(assert-equal 7 (funcall (isiki-za-test-make-adder 3) 4))
+(close (open-output-file "tmp/ckpt-12-adder.txt"))
+
+;; 複数の固定引数を捕捉するクロージャ
+(defun isiki-za-test-make-combo (x y) (lambda (z) (+ x (+ y z))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-make-combo)))
+(assert-equal 6 (funcall (isiki-za-test-make-combo 1 2) 3))
+(close (open-output-file "tmp/ckpt-13-combo.txt"))
+
+;; 独立性: isiki-za-test-make-adder(za機械語として実行される)を異なる引数で2回呼び、
+;; 両方のクロージャを同時に保持しても互いに影響されず独立した値を保持すること
+(let ((c1 (isiki-za-test-make-adder 10))
+      (c2 (isiki-za-test-make-adder 20)))
+  (assert-equal 15 (funcall c1 5))
+  (assert-equal 25 (funcall c2 5))
+  (assert-equal 15 (funcall c1 5)))
+(close (open-output-file "tmp/ckpt-14-independence.txt"))
+
+;; if分岐内のlambda: どちらの分岐でクロージャが作られても正しく捕捉される
+(defun isiki-za-test-maybe (x) (if (< x 0) (lambda () -1) (lambda () 1)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-maybe)))
+(assert-equal (- 1) (funcall (isiki-za-test-maybe (- 5))))
+(assert-equal 1 (funcall (isiki-za-test-maybe 5)))
+(close (open-output-file "tmp/ckpt-15-maybe.txt"))
+
+;; lambdaを引数位置に置くが、呼び出し先はfuncall(組み込みnative)ではなく
+;; JIT/インタプリタのユーザ定義関数(引数をそのまま返すだけ)にするケース
+(defun isiki-za-test-arg-echo (f) f)
+
+;; 外側関数の固定引数が0個(コピーループが0回)の場合でも正しくクロージャが
+;; 構築・伝播されること
+(defun isiki-za-test-lambda-as-arg-zero-diag () (isiki-za-test-arg-echo (lambda () 42)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-lambda-as-arg-zero-diag)))
+(assert-equal t (functionp (isiki-za-test-lambda-as-arg-zero-diag)))
+(assert-equal 42 (funcall (isiki-za-test-lambda-as-arg-zero-diag)))
+
+(defun isiki-za-test-lambda-as-arg-diag (x) (isiki-za-test-arg-echo (lambda (y) (+ x y))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-lambda-as-arg-diag)))
+(assert-equal t (functionp (isiki-za-test-lambda-as-arg-diag 5)))
+(assert-equal nil (consp (isiki-za-test-lambda-as-arg-diag 5)))
+(assert-equal 105 (funcall (isiki-za-test-lambda-as-arg-diag 5) 100))
+(close (open-output-file "tmp/ckpt-15c-lambda-as-arg-diag.txt"))
+
+;; 呼び出しの引数位置に直接lambdaが現れるケース(ZA_OFF_LAMBDA_SAVED_HEADが
+;; ZA_OFF_CALL_SAVED_HEADと衝突しないことの確認): funcallは既存の組み込み関数
+(defun isiki-za-test-apply-it (x) (funcall (lambda (y) (+ x y)) 100))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-apply-it)))
+(assert-equal 105 (isiki-za-test-apply-it 5))
+(close (open-output-file "tmp/ckpt-16-apply-it.txt"))
+
+;; 大量にクロージャを生成し続けてGC(os_gc_collect)を誘発しても、古いクロージャ・
+;; 新しいクロージャどちらも正しい値を返すことを確認する
+(defun isiki-za-test-adder-chain (n)
+  (let ((acc nil))
+    (for ((i 0 (+ i 1))) ((= i n) acc)
+      (setq acc (cons (isiki-za-test-make-adder i) acc)))))
+(close (open-output-file "tmp/ckpt-17-before-closure-chain.txt"))
+
+(defun isiki-za-test-sum-closure-chain (lst)
+  (let ((acc 0))
+    (for ((rest lst (cdr rest))) ((null rest) acc)
+      (setq acc (+ acc (funcall (car rest) 1))))))
+
+(assert-equal 50000 (length (isiki-za-test-adder-chain 50000)))
+(close (open-output-file "tmp/ckpt-18-after-closure-chain.txt"))
+
+;; sum_{i=0}^{49999} (i+1) = sum_{i=0}^{49999} i + 50000 = 49999*50000/2 + 50000 = 1250025000
+(assert-equal 1250025000 (isiki-za-test-sum-closure-chain (isiki-za-test-adder-chain 50000)))
+(close (open-output-file "tmp/ckpt-19-final.txt"))

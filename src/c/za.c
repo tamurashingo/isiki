@@ -50,7 +50,21 @@ static void jit_pop_r13(void) { jit_emit8(0x41); jit_emit8(0x5D); }
 static void jit_sub_rsp_imm8(UINT8 imm8) { jit_emit8(0x48); jit_emit8(0x83); jit_emit8(0xEC); jit_emit8(imm8); }
 static void jit_add_rsp_imm8(UINT8 imm8) { jit_emit8(0x48); jit_emit8(0x83); jit_emit8(0xC4); jit_emit8(imm8); }
 
-static void jit_call_r11(void) { jit_emit8(0x41); jit_emit8(0xFF); jit_emit8(0xD3); }
+/*
+ * Microsoft x64 ABIは呼び出し元に、呼び出し先が第1〜4引数(RCX/RDX/R8/R9)を
+ * 自身のスタックフレームへスピルするための32byte「shadow space」の確保を
+ * 義務付けている。呼び出し先のCコード(-O1コンパイル)がGC_PROTECT等で引数の
+ * アドレスを取ると、コンパイラはそれを[rsp+0]/[rsp+8]/[rsp+16]/[rsp+24]
+ * (=呼び出し元が確保しているはずのshadow space)へ書き込む。これを確保せずに
+ * callすると、呼び出し元自身のスタックスロット(rsp+0〜+24)を呼び出し先が
+ * 上書きしてしまう(Bug A: ZA_OFF_ENV_VAL=16がまさにこの範囲に収まり、
+ * os_make_instanceのw2引数スピルで破壊されていた)。
+ */
+static void jit_call_r11(void) {
+    jit_sub_rsp_imm8(32);
+    jit_emit8(0x41); jit_emit8(0xFF); jit_emit8(0xD3);
+    jit_add_rsp_imm8(32);
+}
 static void jit_ret(void) { jit_emit8(0xC3); }
 
 /** 汎用レジスタ番号(ModRM/REXの拡張ビットの元になるindex。rax=0始まりでr15=15まで) */
@@ -317,6 +331,20 @@ typedef struct {
 } za_syms_t;
 
 /**
+ * 拡張4(lambda): (lambda (params...) . body)のparams/bodyはコンパイル対象defunの
+ * ソースAST(生conscell)の一部であり、コンパイル成功後のMAGIC_FUNCTION_NATIVEオブジェクト
+ * はfnポインタしか保持しないため、他の何にも保持されない。生成コードから直接movabsで
+ * 埋め込むとGCで再配置され無効になるため、za.c専用の静的スロット配列へ1回だけ
+ * os_make_cons(params, body)した結果を格納し、os_gc_register_root(runtime.c)で
+ * 毎回のGCに追跡させる。生成コードはこのスロットの現在値をmovabs+読み出しで都度
+ * 再取得する(スロットの値そのものではなくアドレスを埋め込むので安全)。
+ * プロセス生涯で解放しない(JITコードバッファ自体も縮小しないのと同じ考え方)。
+ */
+#define ZA_MAX_LAMBDA_SLOTS 32
+static lisp_val_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS];
+static UINT64 g_za_lambda_slot_count = 0;
+
+/**
  * GC_PROTECTと同じ仕組み(shadow stackへのgc_rootnodeの連結)を、JIT生成コードから
  * `movabs r11, <addr>; call r11`で呼び出すための最小ヘルパー3つ。呼び出しの引数評価
  * (os_make_cons等でヒープ確保する)の間、レジスタ/ネイティブスタック上の値はGCに
@@ -358,10 +386,21 @@ static void za_gc_unlink(gc_rootnode *saved_head) {
 #define ZA_OFF_FN_NODE         72
 #define ZA_OFF_ACC_VAL         88
 #define ZA_OFF_ACC_NODE        96
-#define ZA_OFF_ARG_BASE        112
+/* 拡張4(lambda): クロージャ生成1箇所ごとの一時スロット。呼び出しは常に1つずつしか
+ * 実行中にならない前提はza_compile_callと同様だが、呼び出しの引数位置にlambdaが
+ * 現れるケース(例: (foo (lambda (y) ...)))ではza_compile_lambdaの実行中に外側の
+ * za_compile_callがCALL_SAVED_HEAD/FN_VAL/ACC_VALを使用中の可能性があるため、
+ * 衝突を避けて専用スロットを別に確保する。 */
+#define ZA_OFF_LAMBDA_SAVED_HEAD 112
+#define ZA_OFF_LAMBDA_ENV_VAL    120
+#define ZA_OFF_LAMBDA_ENV_NODE   128  /* 16バイト */
+#define ZA_OFF_LAMBDA_TMP_VAL    144
+#define ZA_OFF_LAMBDA_TMP_NODE   152  /* 16バイト */
+/* 168-175: 16バイト境界を保つためのpadding */
+#define ZA_OFF_ARG_BASE        176
 #define ZA_ARG_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
-/* ZA_OFF_ARG_BASE + ZA_MAX_OPERANDS*ZA_ARG_SLOT_SIZE(=496) は既に16バイト境界 */
-#define ZA_FRAME_EXTRA         496
+/* ZA_OFF_ARG_BASE + ZA_MAX_OPERANDS*ZA_ARG_SLOT_SIZE(=560) は既に16バイト境界 */
+#define ZA_FRAME_EXTRA         560
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
@@ -648,6 +687,117 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
                             const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset);
 
 /**
+ * 「(lambda (lambda_params...) . lambda_body)」から、外側のJIT関数と同じ表現
+ * (MAGIC_FUNCTION_INTERPRETED、eval.cのmake_interpreted_function/apply_functionが
+ * 素で扱える形)のクロージャを組み立てる機械語を出力する。lambda本体自体はzaが
+ * コンパイルせず、呼び出し時は常にインタプリタ経路(apply_function)が実行する。
+ * 単一レベルのネストのみ対応: 自由変数解析はせず、外側関数の固定引数
+ * (params[0..fixed_count-1]、&restを除く)を呼ばれるたびに全て新規environmentへ
+ * os_set_variableでコピーし、それをクロージャのenvとする(setqはza対象外なので
+ * コピー後の再代入で共有が破れる心配は無い)。
+ * @return 対応できれば1、できなければ0(lambdaスロット枯渇時も含む)
+ */
+static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_count) {
+    /*
+     * paramsはコンパイル時にこの関数末尾のループでcc_car/cc_cdrにより辿られるが、
+     * その前にos_make_cons(下記)・os_make_symbol("LAMBDA-ENV")という実アロケーションを
+     * 伴うランタイム呼び出しをコンパイル時に直接行っており、GCが発火するとparamsの
+     * 指す先が再配置される。呼び出し元(za_compile_call/za_compile_expr)が保持する
+     * paramsはこの関数にとって値渡しの別コピーであり、呼び出し元側での保護は
+     * この関数のローカル変数までは更新しないため、ここで明示的に保護する。
+     */
+    GC_PROTECT(params);
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t lambda_params = cc_car(rest);
+    lisp_val_t lambda_body = cc_cdr(rest);
+
+    if (g_za_lambda_slot_count >= ZA_MAX_LAMBDA_SLOTS) {
+        return 0;
+    }
+    UINT64 slot_idx = g_za_lambda_slot_count++;
+    g_za_lambda_slots[slot_idx] = os_make_cons(lambda_params, lambda_body);
+    os_gc_register_root(&g_za_lambda_slots[slot_idx]);
+    lisp_val_t *slot_addr = &g_za_lambda_slots[slot_idx];
+
+    // 1. lambda専用スコープ開始前のgc_rootsを保存する。
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_SAVED_HEAD);
+
+    // 2. 新規env = os_make_environment("LAMBDA-ENV", 現在のenv)を構築し、linkする。
+    UINT64 env_name_off = za_emit_symbol_name(os_make_symbol("LAMBDA-ENV"));
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + env_name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_environment);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_ENV_VAL);
+    za_emit_gc_link_slot(ZA_OFF_LAMBDA_ENV_VAL, ZA_OFF_LAMBDA_ENV_NODE);
+
+    // 3. TMPスロットを一度だけlinkし、外側の固定引数を1つずつos_set_variableで
+    // 新規envへコピーする。
+    jit_movabs_rax(nil);
+    za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_TMP_VAL);
+    za_emit_gc_link_slot(ZA_OFF_LAMBDA_TMP_VAL, ZA_OFF_LAMBDA_TMP_NODE);
+
+    lisp_val_t p = params;
+    for (UINT64 i = 0; i < fixed_count; i++) {
+        lisp_val_t param_sym = cc_car(p);
+        p = cc_cdr(p);
+
+        za_operand_t op;
+        op.is_literal = 0;
+        op.param_index = i;
+        za_emit_operand(&op); /* rax = 外側param[i]の現在値 */
+        za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_TMP_VAL);
+
+        UINT64 psym_off = za_emit_symbol_name(param_sym);
+        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + psym_off));
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_LAMBDA_TMP_VAL);
+        za_load_slot(ZA_REG_R8, ZA_OFF_LAMBDA_ENV_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
+        jit_call_r11();
+    }
+
+    // 4. クロージャ本体を構築する:
+    // os_make_instance(MAGIC_FUNCTION_INTERPRETED, lambda_params, lambda_body, new_env)
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)slot_addr);
+    jit_mov_reg_from_mem_disp8(ZA_REG_R13, ZA_REG_R11, 0); /* r13 = (lambda_params . lambda_body) 現在値 */
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)cc_car);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_TMP_VAL); /* lambda_paramsを一時退避 */
+
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)cc_cdr);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_R8, ZA_REG_RAX);          /* r8 = lambda_body(=w2) */
+
+    za_load_slot(ZA_REG_RDX, ZA_OFF_LAMBDA_TMP_VAL); /* rdx = lambda_params(=w1) */
+    za_load_slot(ZA_REG_R9, ZA_OFF_LAMBDA_ENV_VAL);  /* r9 = new_env(=w3) */
+    jit_movabs_reg(ZA_REG_RCX, MAGIC_FUNCTION_INTERPRETED);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_instance);
+    jit_call_r11();
+
+    // 5. lambda専用スコープのgc_rootsをまとめてunlinkし、結果(rax)を復元する。
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, ZA_OFF_LAMBDA_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    return 1;
+}
+
+/**
  * formを評価してraxに結果を残す機械語を出力する。対応するグラマーは
  * 「fixnumリテラル / params固定引数への参照 / (+ leaf leaf...) / (- leaf) /
  * (- leaf leaf...) / (* leaf leaf...) / (< leaf leaf) / (= leaf leaf) /
@@ -720,6 +870,9 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     }
     if (head == g_sym_cons) {
         return za_compile_binary(form, params, fixed_count, (void *)os_make_cons);
+    }
+    if (head == g_sym_lambda) {
+        return za_compile_lambda(form, params, fixed_count);
     }
     if (head == g_sym_if) {
         lisp_val_t rest = cc_cdr(form);
@@ -800,6 +953,16 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  */
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
                             const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset) {
+    /*
+     * fn_sym/paramsは引数loop(下記)がza_compile_expr経由でza_compile_lambdaへ再入した
+     * 場合、そちら側でos_make_cons/os_make_symbolという実アロケーションを伴うコンパイル
+     * 時呼び出しが発生しGCが起動する可能性がある。fn_symはloopの後(za_emit_symbol_name)
+     * まで、paramsはloopの後続の引数の再帰コンパイルまで生き続ける値渡しのコピーであり、
+     * 呼び出し元での保護はこの関数のローカルコピーまでは更新しないため、ここで明示的に
+     * 保護する。
+     */
+    GC_PROTECT(fn_sym);
+    GC_PROTECT(params);
     lisp_val_t arg_forms[ZA_MAX_OPERANDS];
     UINT64 argc = 0;
     for (lisp_val_t rest = cc_cdr(form); rest != nil; rest = cc_cdr(rest)) {
@@ -831,7 +994,9 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
     jit_call_r11();
-    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
     za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
     jit_call_r11();
