@@ -30,14 +30,14 @@ jobs:
           test -n "$OVMF_CODE"
           echo "OVMF_CODE=$OVMF_CODE" >> $GITHUB_ENV
 
-      - name: Run Lisp tests in QEMU (milestone 1: base)
+      - name: "Run Lisp tests in QEMU (milestone 1: base)"
         timeout-minutes: 4
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m1_base.lisp
 
-      - name: Run Lisp tests in QEMU (milestone 2: za base)
+      - name: "Run Lisp tests in QEMU (milestone 2: za base)"
         timeout-minutes: 4
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m2_za.lisp
 
-      - name: Run Lisp tests in QEMU (milestone 3: za ext5 non-local-exit)
+      - name: "Run Lisp tests in QEMU (milestone 3: za ext5 non-local-exit)"
         timeout-minutes: 4
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m3_za_ext5.lisp
