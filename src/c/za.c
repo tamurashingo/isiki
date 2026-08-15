@@ -259,6 +259,11 @@ static void za_emit_untag_instance(UINT8 dst_reg, UINT8 src_reg) {
     jit_and_reg_imm8(dst_reg, (UINT8)0xF8);
 }
 
+/**
+ * is_literal: 0=paramsのidx番目を参照、1=fixnum即値(literalをそのままmovabs)、
+ * 2=quoteシンボル(literalは現在のタグ付きシンボル値だが、GCで移動しうるため
+ * emit時はmovabsで直接埋め込まず名前から再解決する。za_emit_operand参照)。
+ */
 typedef struct {
     int is_literal;
     lisp_val_t literal;
@@ -329,8 +334,8 @@ static int za_validate_params(lisp_val_t params, UINT64 *out_fixed_count) {
 }
 
 /**
- * +のオペランド1個を分類する。paramsの固定引数部分に含まれるシンボル参照か、
- * 即値fixnumリテラルのみ許可する。
+ * +のオペランド1個を分類する。paramsの固定引数部分に含まれるシンボル参照、
+ * 即値fixnumリテラル、または(quote sym)形式のシンボルリテラルのみ許可する。
  * @return 分類できれば1(outに書く)、できなければ0
  */
 static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, za_operand_t *out) {
@@ -346,6 +351,21 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
         }
         out->is_literal = 0;
         out->param_index = idx;
+        return 1;
+    }
+    // 拡張7(ILOS): (quote sym)形式のシンボルリテラルのみ許可する。リスト等の
+    // quoteは今回スコープ外なので、素直に0を返してインタプリタへfallbackさせる。
+    if ((form & TAG_MASK) == TAG_CONS && cc_car(form) == g_sym_quote) {
+        lisp_val_t rest = cc_cdr(form);
+        if ((rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
+            return 0;
+        }
+        lisp_val_t quoted = cc_car(rest);
+        if ((quoted & TAG_MASK) != TAG_SYMBOL) {
+            return 0;
+        }
+        out->is_literal = 2;
+        out->literal = quoted;
         return 1;
     }
     return 0;
@@ -487,6 +507,10 @@ static void za_emit_gc_unlink_slot(UINT32 node_off) {
     jit_call_r11();
 }
 
+/* symの名前をg_jit_code内に埋め込み、そのオフセットを返す(定義は本ファイル後方)。
+ * quoteシンボルオペランドのemit(za_emit_operand)が先に必要とするため前方宣言する。 */
+static UINT64 za_emit_symbol_name(lisp_val_t sym);
+
 /**
  * オペランド1個の値をraxへ計算する機械語を出力する。paramsへの参照であれば
  * ARGS_VALスロット(プロローグでリンク済みの元のevaluated_args先頭)から毎回読み直し、
@@ -495,8 +519,18 @@ static void za_emit_gc_unlink_slot(UINT32 node_off) {
  * 生ポインタとしてキャッシュせず、リンク済みスロットから都度読み直す。
  */
 static void za_emit_operand(const za_operand_t *op) {
-    if (op->is_literal) {
+    if (op->is_literal == 1) {
         jit_movabs_rax(op->literal);
+        return;
+    }
+    if (op->is_literal == 2) {
+        // 拡張7(ILOS): quoteシンボルは生ポインタをmovabsで埋め込まず、
+        // za_compile_call/za_compile_dynamicと同じく名前から都度再解決する
+        // (GCでシンボルオブジェクトが移動しても安全)。
+        UINT64 name_off = za_emit_symbol_name(op->literal);
+        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
         return;
     }
     za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
