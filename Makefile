@@ -246,6 +246,12 @@ test-qemu: build
 	cat test-results.txt
 	grep -q " 0 failed" test-results.txt
 
+# za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
+# GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
+# するため、この負荷テストはCIのmilestone 2(qemu_boot_m2_za.lisp)からは外してある
+test-qemu-stress:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m2_za_stress.lisp
+
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)

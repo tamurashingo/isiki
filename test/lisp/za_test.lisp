@@ -16,6 +16,10 @@
 ;;
 ;; 拡張5(非局所脱出: block/return-from, catch/throw, tagbody/go, unwind-protect)は
 ;; test/lisp/za_test_ext5.lisp に分割してある(QEMUテストのmilestone分割用)。
+;;
+;; 拡張1/4/6のGC誘発を伴う負荷確認(N=50000のループ)は test/lisp/za_test_stress.lisp
+;; へ分割してある(ローカル専用、make test-qemu-stress)。本ファイル(GitHub Actionsが
+;; 実行するmilestone 2)側はN=5の小さいループで同じコード経路のロジックのみ確認する。
 
 ;; (+ x y z) : オペランド3個の+はzaでコンパイルされる
 (defun isiki-za-test-add3 (x y z) (+ x y z))
@@ -312,19 +316,19 @@
 (assert-equal 2 (cdr (isiki-za-test-cons-nested-fallback (cons 1 2))))
 (close (open-output-file "tmp/ckpt-7-nested.txt"))
 
-;; 大量にconsを呼び続けてGC(os_gc_collect)を誘発しても、za生成コードが結果を破壊
-;; しないことを確認する(os_make_cons自身のGC_PROTECTだけで安全という設計の裏付け)。
 ;; isiki-za-test-cons-chain自身はlet/for/setqを含むためza非対応(フォールバック)だが、
-;; ループ本体で呼ぶisiki-za-test-consはza機械語として繰り返し実行される。
+;; ループ本体で呼ぶisiki-za-test-consはza機械語として繰り返し実行される。GC誘発を伴う
+;; 大量ループでの負荷確認はtest/lisp/za_test_stress.lispへ分離した。ここではN=5で
+;; 同じコード経路のロジックのみ確認する。
 (defun isiki-za-test-cons-chain (n)
   (let ((acc nil))
     (for ((i 0 (+ i 1))) ((= i n) acc)
       (setq acc (isiki-za-test-cons i acc)))))
 (close (open-output-file "tmp/ckpt-8-before-chain.txt"))
 
-(assert-equal 50000 (length (isiki-za-test-cons-chain 50000)))
+(assert-equal 5 (length (isiki-za-test-cons-chain 5)))
 (close (open-output-file "tmp/ckpt-9-after-chain.txt"))
-(assert-equal 49999 (car (isiki-za-test-cons-chain 50000)))
+(assert-equal 4 (car (isiki-za-test-cons-chain 5)))
 (close (open-output-file "tmp/ckpt-10-final.txt"))
 
 ;;; --- 拡張4: クロージャ・lambda ---
@@ -394,8 +398,9 @@
 (assert-equal 105 (isiki-za-test-apply-it 5))
 (close (open-output-file "tmp/ckpt-16-apply-it.txt"))
 
-;; 大量にクロージャを生成し続けてGC(os_gc_collect)を誘発しても、古いクロージャ・
-;; 新しいクロージャどちらも正しい値を返すことを確認する
+;; 古いクロージャ・新しいクロージャどちらも正しい値を返すことを確認する。GC誘発を
+;; 伴う大量ループでの負荷確認はtest/lisp/za_test_stress.lispへ分離した。ここでは
+;; N=5で同じコード経路のロジックのみ確認する。
 (defun isiki-za-test-adder-chain (n)
   (let ((acc nil))
     (for ((i 0 (+ i 1))) ((= i n) acc)
@@ -407,11 +412,11 @@
     (for ((rest lst (cdr rest))) ((null rest) acc)
       (setq acc (+ acc (funcall (car rest) 1))))))
 
-(assert-equal 50000 (length (isiki-za-test-adder-chain 50000)))
+(assert-equal 5 (length (isiki-za-test-adder-chain 5)))
 (close (open-output-file "tmp/ckpt-18-after-closure-chain.txt"))
 
-;; sum_{i=0}^{49999} (i+1) = sum_{i=0}^{49999} i + 50000 = 49999*50000/2 + 50000 = 1250025000
-(assert-equal 1250025000 (isiki-za-test-sum-closure-chain (isiki-za-test-adder-chain 50000)))
+;; sum_{i=0}^{4} (i+1) = 1+2+3+4+5 = 15
+(assert-equal 15 (isiki-za-test-sum-closure-chain (isiki-za-test-adder-chain 5)))
 (close (open-output-file "tmp/ckpt-19-final.txt"))
 
 ;;; --- 拡張6: 動的変数(defdynamic/dynamic) ---
@@ -439,9 +444,11 @@
 (assert-equal '*iza-test-dyn1* (isiki-za-test-defdynamic-nlx 1))
 (assert-equal 333 (isiki-za-test-read-dyn1))
 
-;; 大量にdefdynamicを呼び続けてGC(os_gc_collect)を誘発しても、戻り値(name)が
-;; コンパイル時に埋め込んだシンボルとeqであり続けること(os_set_dynamic呼び出しを
-;; 挟んだ後の再解決が正しいことの確認)、および動的値自体も最終的に正しいことを確認する
+;; defdynamicの戻り値(name)がコンパイル時に埋め込んだシンボルとeqであり続けること
+;; (os_set_dynamic呼び出しを挟んだ後の再解決が正しいことの確認)、および動的値自体も
+;; 最終的に正しいことを確認する。GC誘発を伴う大量ループでの負荷確認は
+;; test/lisp/za_test_stress.lispへ分離した。ここではN=5で同じコード経路のロジックのみ
+;; 確認する。
 (defdynamic *iza-test-dyn2* 0)
 
 (defun isiki-za-test-write-dyn2 (v) (defdynamic *iza-test-dyn2* v))
@@ -456,7 +463,7 @@
   (for ((rest lst (cdr rest)) (ok t ok)) ((null rest) ok)
     (if (not (eq (car rest) sym)) (setq ok nil))))
 
-(assert-equal 50000 (length (isiki-za-test-dyn-stress 50000)))
-(assert-equal t (isiki-za-test-all-eq-sym (isiki-za-test-dyn-stress 50000) '*iza-test-dyn2*))
-(assert-equal 49999 (dynamic *iza-test-dyn2*))
+(assert-equal 5 (length (isiki-za-test-dyn-stress 5)))
+(assert-equal t (isiki-za-test-all-eq-sym (isiki-za-test-dyn-stress 5) '*iza-test-dyn2*))
+(assert-equal 4 (dynamic *iza-test-dyn2*))
 (close (open-output-file "tmp/ckpt-20-defdynamic.txt"))
