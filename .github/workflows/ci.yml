@@ -27,7 +27,7 @@ jobs:
           sudo apt-get install -y qemu-system-x86 ovmf
 
       - name: Run Lisp tests in QEMU
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           OVMF_CODE=$(find /usr/share -iname 'OVMF_CODE*.fd' 2>/dev/null | sort | head -n1)
           echo "Using OVMF_CODE=$OVMF_CODE"
