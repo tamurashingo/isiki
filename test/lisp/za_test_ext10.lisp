@@ -34,9 +34,9 @@
 (assert-equal 1 (isiki-za-test-quote-list-call-arg))
 
 ;; (car (cdr (quote ...)))のようにquoteをネストした一般呼び出しの引数位置で使う
-;; ケースは、quote自体ではなく「引数位置の一般呼び出しのネスト」が別途未対応
-;; (allow_call=0)であるため、ここでは検証しない(mandelbrot調査で洗い出した
-;; 別の既知の制約であり、拡張10のスコープ外)。
+;; ケースは、quote自体は無関係で「引数位置の一般呼び出しのネスト」対応(拡張15、
+;; za_test_ext15.lisp参照)が別途必要だったため、拡張10当時はここでは検証しなかった
+;; (拡張10のスコープ外)。
 (defun isiki-za-test-quote-list-call-arg-cdr ()
   (cdr (quote (1 2 3))))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-quote-list-call-arg-cdr)))

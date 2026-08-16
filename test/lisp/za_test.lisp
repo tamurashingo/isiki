@@ -72,9 +72,10 @@
 (assert-equal 7 (isiki-za-test-addif 3 4))
 (assert-equal 0 (isiki-za-test-addif nil 4))
 
-;; +のオペランドの位置に直接ifを書くとzaはコンパイルを諦めインタプリタにフォールバックする
+;; +のオペランドの位置に直接ifを書いてもzaでコンパイルされる(拡張16、
+;; za_test_ext16.lisp参照)
 (defun isiki-za-test-bad (x y) (+ x (if y 1 2)))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-bad)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bad)))
 (assert-equal 4 (isiki-za-test-bad 3 5))
 (assert-equal 5 (isiki-za-test-bad 3 nil))
 
@@ -128,9 +129,9 @@
 (assert-equal 2 (isiki-za-test-calc 3 5))
 (assert-equal 15 (isiki-za-test-calc 5 3))
 
-;; -のオペランドに直接ifを書くとzaはコンパイルを諦めインタプリタにフォールバックする
+;; -のオペランドに直接ifを書いてもzaでコンパイルされる(拡張16)
 (defun isiki-za-test-bad2 (x y) (- x (if y 1 2)))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-bad2)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bad2)))
 (assert-equal 9 (isiki-za-test-bad2 10 5))
 (assert-equal 8 (isiki-za-test-bad2 10 nil))
 
@@ -240,17 +241,18 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-call-other)))
 (assert-equal 6 (isiki-za-test-call-other 2 3))
 
-;; 引数の位置に別の呼び出しを直接書く(ネスト呼び出し)とzaはコンパイルを諦め
-;; インタプリタにフォールバックする(結果自体はインタプリタ経由で正しい)
+;; 引数の位置に別の呼び出しを直接書く(ネスト呼び出し)は拡張15でコンパイル対応済み
+;; (call_depth配列方式、za_test_ext15.lisp参照)。以前はallow_callゲートにより
+;; フォールバックしていたが、現在はコンパイルされて動作する。
 (defun isiki-za-test-call-nested-fallback (x)
   (isiki-za-test-add3 x (isiki-za-test-neg x) 1))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-call-nested-fallback)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-call-nested-fallback)))
 (assert-equal 1 (isiki-za-test-call-nested-fallback 5))
 
-;; ifのtest位置に呼び出しを直接書いた場合も同様にフォールバックする
+;; ifのtest位置に呼び出しを直接書いた場合も拡張15で同様にコンパイル対応済み
 (defun isiki-za-test-call-in-test-fallback (x)
   (if (isiki-za-test-numeq x 0) 1 2))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-call-in-test-fallback)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-call-in-test-fallback)))
 (assert-equal 1 (isiki-za-test-call-in-test-fallback 0))
 (assert-equal 2 (isiki-za-test-call-in-test-fallback 5))
 
@@ -318,11 +320,13 @@
 (assert-equal 9 (isiki-za-test-car-if nil (cons 9 10)))
 (close (open-output-file "tmp/ckpt-6-carif.txt"))
 
-;; car/cdr/cons/atom/null/eqの引数位置に直接別の呼び出しを書く(ネスト)とzaはコンパイル
-;; を諦めインタプリタにフォールバックする(結果自体は正しい)
+;; car/cdr/cons/atom/null/eqはza_compile_unary/za_compile_binaryを経由するため、
+;; 拡張15(一般呼び出しza_compile_call側のcall_depth配列化)の対象外だったが、
+;; 拡張16(za_compile_operand経由のオペランド再帰対応)によりオペランド位置への
+;; ネストもコンパイルされるようになった(za_test_ext16.lisp参照)。
 (defun isiki-za-test-cons-nested-fallback (x)
   (cons (car x) (cdr x)))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-cons-nested-fallback)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-cons-nested-fallback)))
 (assert-equal 1 (car (isiki-za-test-cons-nested-fallback (cons 1 2))))
 (assert-equal 2 (cdr (isiki-za-test-cons-nested-fallback (cons 1 2))))
 (close (open-output-file "tmp/ckpt-7-nested.txt"))

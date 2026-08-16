@@ -96,10 +96,10 @@
 (assert-equal t (isiki-za-test-num-le-bignum-literal 1))
 (assert-equal nil (isiki-za-test-num-le-bignum-literal 200000000000000000000))
 
-;;; --- 9. > をifのtest位置で使う(allow_call=0ゲートを迂回して通ることの確認) ---
+;;; --- 9. > をifのtest位置で使う ---
 ;;
-;; <と全く同じ経路(allow_callゲートより前のヘッドシンボル判定)を通るため、
-;; 引数位置での一般呼び出し不可制約とは無関係にコンパイルされる。
+;; <と全く同じ経路(一般呼び出しの判定より前のヘッドシンボル判定)を通るため、
+;; 正しくコンパイルされる。
 
 (defun isiki-za-test-num-gt-if-test (x y)
   (if (> x y) 'x-bigger 'y-bigger-or-equal))

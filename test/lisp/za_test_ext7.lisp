@@ -16,9 +16,10 @@
 ;; &restパラメータの値参照(za_classify_operand/za_emit_operandのis_literal==3)も
 ;; 本ファイルに追加している。defgenericが生成するdispatch関数
 ;; `(defun name (&rest %generic-args) (%generic-call 'name %generic-args))`が
-;; これによって初めてJIT対象になる。letの直接lambda呼び出しフォールバックは
-;; 別課題として今回は対象外(make-instance/slot-value/set-slot-valueは依然
-;; インタプリタ実行のまま)。
+;; これによって初めてJIT対象になる。make-instance/slot-value/set-slot-valueは
+;; 拡張7執筆時点ではインタプリタ実行のままだったが、拡張15(引数位置での一般呼び出し
+;; ネスト対応)以降はコンパイル対象になった(詳細は後述の該当assert-equal付近の
+;; コメント参照)。
 
 ;;; --- 拡張7: quoteシンボルリテラル ---
 ;;
@@ -27,12 +28,15 @@
 ;; fallbackしていた)。ILOSの slot-value 等はエラー時に'eval-errorのようなquote
 ;; シンボルを返すため、この対応が無いとILOSを使うdefunがほぼJITコンパイルされない。
 
-;; init.lispのslot-value/set-slot-valueは、エラー分岐で'eval-errorをquoteしている
-;; ものの、本体が`let`(=即時lambda呼び出し、za_test.lisp 160-166行目の
-;; isiki-za-test-let-fallbackと同じ理由で拡張3/4完了後も非対応のまま)を使っているため、
-;; quote対応の有無に関わらずコンパイル対象外のまま(結果自体はインタプリタ経由で正しい)。
-(assert-equal nil (%%za-compiled-p (function slot-value)))
-(assert-equal nil (%%za-compiled-p (function set-slot-value)))
+;; init.lispのslot-value/set-slot-valueは、エラー分岐で'eval-errorをquoteしている。
+;; 本体の`let`自体はza_compile_letが対応済みだが、そのinit式`(%slot-index slot-name
+;; (%%class-slots (%%instance-class instance)) 0)`の引数位置に別の一般呼び出し
+;; (%%class-slots/%%instance-class)がネストしており、これが拡張15以前は
+;; allow_callゲートで弾かれてコンパイル断念していた実際の原因だった。拡張15で
+;; 引数位置の一般呼び出しネストに対応したため、現在はコンパイルされる
+;; (下記のisiki-za-test-point-x/y経由の実行結果でも正しいことを確認する)。
+(assert-equal t (%%za-compiled-p (function slot-value)))
+(assert-equal t (%%za-compiled-p (function set-slot-value)))
 
 ;; quoteシンボルのコアな機構をILOSと無関係に確認する: eqの第2オペランド位置での
 ;; quoteシンボル比較(za_classify_operandはeqのオペランドにも共有される)。
@@ -84,13 +88,13 @@
 ;;; --- ILOSを実際に使う統合テスト ---
 ;;
 ;; defclass自体はトップレベルのマクロ展開なのでza.cの対象外(JITはdefun本体のみ)。
-;; make-instanceは&rest initargsを持つがボディが`let*`(即時lambda呼び出し、
-;; za_test.lisp 160-166行目のisiki-za-test-let-fallbackと同じ理由で拡張3/4完了後も
-;; 非対応のまま)を使っているため、上記の&rest対応の有無に関わらずインタプリタ実行
-;; のまま(letフォールバックは別課題として今回は対象外)。今回JIT化の到達点になるのは、
-;; quoteシンボルのクラス名・initarg・スロット名を使ってmake-instance/slot-valueを
-;; 呼び出す「側」の、letを使わないユーザー定義関数がコンパイル対象になること。
-(assert-equal nil (%%za-compiled-p (function make-instance)))
+;; make-instanceのボディの`let*`自体はza_compile_letが対応済みだが、instance束縛の
+;; init式`(%%make-instance-raw class (make-array (length (%%class-slots class))))`は
+;; 引数位置に一般呼び出しが3段ネストしており、これも拡張15以前はallow_callゲートで
+;; 弾かれてコンパイル断念していた(slot-value/set-slot-valueと同じ理由)。拡張15後は
+;; コンパイルされる(下記のisiki-za-test-make-point経由の実行結果でも正しいことを
+;; 確認する)。
+(assert-equal t (%%za-compiled-p (function make-instance)))
 
 (defclass isiki-za-test-point ()
   ((x :initarg :x :initform (lambda () 0))
