@@ -2,7 +2,6 @@
 (load "test/lisp/test_framework.lisp")
 (load "test/lisp/isiki_test.lisp")
 (load "test/lisp/za_test.lisp")
-(load "test/lisp/za_test_stress.lisp")
 (load "test/lisp/za_test_ext5.lisp")
 (load "test/lisp/za_test_ext7.lisp")
 (load "test/lisp/za_test_ext8.lisp")
@@ -10,6 +9,7 @@
 (load "test/lisp/za_test_ext10.lisp")
 (load "test/lisp/za_test_ext11.lisp")
 (load "test/lisp/za_test_ext12.lisp")
+(load "test/lisp/za_test_ext13.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

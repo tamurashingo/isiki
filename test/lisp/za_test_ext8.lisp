@@ -54,11 +54,11 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-let-star)))
 (assert-equal 21 (isiki-za-test-let-star 5))
 
-;;; --- 5. ZA_MAX_LET_DEPTH境界(9段ネストで上限超えしfallback) ---
+;;; --- 5. ZA_MAX_LET_DEPTH境界(17段ネストで上限超えしfallback) ---
 ;;
-;; 拡張12でZA_MAX_LET_DEPTHを4から8へ拡張したため、ここでの境界確認も
-;; 9段ネスト(新上限を1段超える)に更新する。境界そのものの網羅的な検証
-;; (4/5/8/9段)は test/lisp/za_test_ext12.lisp を参照。
+;; mandelbrot.lisp投入時にZA_MAX_LET_DEPTHを8から16へ拡張したため、ここでの
+;; 境界確認も17段ネスト(新上限を1段超える)に更新する。境界そのものの網羅的な
+;; 検証(4/5/8/16/17段)は test/lisp/za_test_ext12.lisp を参照。
 ;;
 ;; 結果自体はインタプリタ経由で正しいことを確認する(インライン化されないだけで
 ;; defun全体は依然インタプリタで正しく実行される)。
@@ -73,9 +73,17 @@
               (let ((g 7))
                 (let ((h 8))
                   (let ((i 9))
-                    (+ x a b c d e f g h i)))))))))))
+                    (let ((j 10))
+                      (let ((k 11))
+                        (let ((l 12))
+                          (let ((m 13))
+                            (let ((n 14))
+                              (let ((o 15))
+                                (let ((p 16))
+                                  (let ((q 17))
+                                    (+ x a b c d e f g h i j k l m n o p q)))))))))))))))))))
 (assert-equal nil (%%za-compiled-p (function isiki-za-test-let-depth-over)))
-(assert-equal 55 (isiki-za-test-let-depth-over 10))
+(assert-equal 163 (isiki-za-test-let-depth-over 10))
 
 ;;; --- 6. return-fromによる早期脱出(let body内・init式評価中の両方) ---
 

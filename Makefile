@@ -207,6 +207,7 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 
 clean:
 	rm -rf esp_dir $(BUILD_TMPDIR)
+	rm -f .qemu-test-trigger test-results.txt qemu.log
 
 run:
 	qemu-system-x86_64 \

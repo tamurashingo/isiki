@@ -10,8 +10,9 @@
 ;;
 ;; GitHub Actions側のQEMU実行(milestone 2)はハードウェア支援仮想化(KVM)を欠き
 ;; TCG(ソフトウェアCPUエミュレーション)へフォールバックするため、この負荷テストは
-;; ローカル実行専用とし、CIからはloadしない(make test-qemu-stress、または
-;; make test-qemu の全件実行からのみ到達する)。
+;; ローカル実行専用とし、CIからはloadしない。通常の make test-qemu(qemu_boot_test.lisp)
+;; からも意図的に外してあり、make test-qemu-stress(qemu_boot_m2_za_stress.lisp)から
+;; のみ到達する。
 ;;
 ;; 本ファイルは test/lisp/test_framework.lisp が定義する assert-equal 等をそのまま
 ;; 使う(boot-entryスクリプトが本ファイルより先にそれをloadしている前提)。

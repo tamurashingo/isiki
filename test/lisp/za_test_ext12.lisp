@@ -12,9 +12,13 @@
 ;; 前提)。他のext系ファイルへの依存は無い(自己完結)。
 ;;
 ;; za_compile_letのdepth(祖先let数、0始まり)は、N段ネストのうち最内側の
-;; N段目でdepth=N-1になる。depth >= ZA_MAX_LET_DEPTH(=8)になった時点で
+;; N段目でdepth=N-1になる。depth >= ZA_MAX_LET_DEPTHになった時点で
 ;; その`let`自体のコンパイルが失敗し、defun全体がインタプリタへfallbackする。
-;; つまり8段ネスト(depth 0..7)は成功、9段ネスト(9段目でdepth=8)は失敗する。
+;;
+;; mandelbrot.lisp投入時にZA_MAX_LET_DEPTHをさらに8から16へ拡張したため
+;; (with-standard-outputのdynamic-let2段+for×2段+明示let1段+for1段+
+;; let*3段+let*5段=最大深さ13に達することを実測した)、以下3./4.の境界確認も
+;; 新上限(16段成功・17段目失敗)に合わせて更新する。
 
 ;;; --- 1. 4段ネスト(旧上限ちょうど、回帰確認) ---
 
@@ -39,7 +43,7 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-let-depth-5)))
 (assert-equal 15 (funcall (isiki-za-test-let-depth-5)))
 
-;;; --- 3. 8段ネスト(新上限ちょうど) ---
+;;; --- 3. 8段ネスト(旧上限ちょうど、新上限内での回帰確認) ---
 
 (defun isiki-za-test-let-depth-8 ()
   (let ((v1 1))
@@ -54,11 +58,9 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-let-depth-8)))
 (assert-equal 36 (funcall (isiki-za-test-let-depth-8)))
 
-;;; --- 4. 9段ネスト(新上限超過)。コンパイルは失敗しインタプリタへ
-;;; fallbackするが、fallback後もインタプリタの通常の環境チェーンにより
-;;; 結果自体は正しいことを確認する ---
+;;; --- 4. 16段ネスト(新上限ちょうど) ---
 
-(defun isiki-za-test-let-depth-9 ()
+(defun isiki-za-test-let-depth-16 ()
   (let ((v1 1))
     (let ((v2 2))
       (let ((v3 3))
@@ -68,6 +70,43 @@
               (let ((v7 7))
                 (let ((v8 8))
                   (let ((v9 9))
-                    (lambda () (+ v1 v2 v3 v4 v5 v6 v7 v8 v9))))))))))))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-let-depth-9)))
-(assert-equal 45 (funcall (isiki-za-test-let-depth-9)))
+                    (let ((v10 10))
+                      (let ((v11 11))
+                        (let ((v12 12))
+                          (let ((v13 13))
+                            (let ((v14 14))
+                              (let ((v15 15))
+                                (let ((v16 16))
+                                  (lambda ()
+                                    (+ v1 v2 v3 v4 v5 v6 v7 v8
+                                       v9 v10 v11 v12 v13 v14 v15 v16)))))))))))))))))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-let-depth-16)))
+(assert-equal 136 (funcall (isiki-za-test-let-depth-16)))
+
+;;; --- 5. 17段ネスト(新上限超過)。コンパイルは失敗しインタプリタへ
+;;; fallbackするが、fallback後もインタプリタの通常の環境チェーンにより
+;;; 結果自体は正しいことを確認する ---
+
+(defun isiki-za-test-let-depth-17 ()
+  (let ((v1 1))
+    (let ((v2 2))
+      (let ((v3 3))
+        (let ((v4 4))
+          (let ((v5 5))
+            (let ((v6 6))
+              (let ((v7 7))
+                (let ((v8 8))
+                  (let ((v9 9))
+                    (let ((v10 10))
+                      (let ((v11 11))
+                        (let ((v12 12))
+                          (let ((v13 13))
+                            (let ((v14 14))
+                              (let ((v15 15))
+                                (let ((v16 16))
+                                  (let ((v17 17))
+                                    (lambda ()
+                                      (+ v1 v2 v3 v4 v5 v6 v7 v8
+                                         v9 v10 v11 v12 v13 v14 v15 v16 v17))))))))))))))))))))
+(assert-equal nil (%%za-compiled-p (function isiki-za-test-let-depth-17)))
+(assert-equal 153 (funcall (isiki-za-test-let-depth-17)))

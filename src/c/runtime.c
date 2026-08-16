@@ -2672,6 +2672,20 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_greater_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_greater_than(args, global_environment);
+}
+
+/**
  * 組み込み関数=。argsがすべて等しいかどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -2733,6 +2747,20 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_greater_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_greater_equal(args, global_environment);
+}
+
+/**
  * 組み込み関数<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -2745,6 +2773,20 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
         }
     }
     return g_sym_t;
+}
+
+/**
+ * primitive_less_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a<=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_less_equal(args, global_environment);
 }
 
 /**

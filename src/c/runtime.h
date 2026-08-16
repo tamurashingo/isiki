@@ -632,6 +632,15 @@ lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b);
 lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_greater_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数=。argsがすべて等しいかどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -667,12 +676,30 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_greater_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 単調非減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_less_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a<=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数MAX。argsのうち最大の要素を返す。

@@ -277,6 +277,19 @@ static void za_emit_untag_instance(UINT8 dst_reg, UINT8 src_reg) {
     jit_and_reg_imm8(dst_reg, (UINT8)0xF8);
 }
 
+/** valがfloat(MAGIC_FLOATのTAG_INSTANCE)かどうかを判定する。runtime.cのis_floatは
+ * staticでza.cから参照できないため、reader.cのis_number_resultと同じ手口
+ * (TAG_INSTANCEかつ先頭word=magicを直接比較)でここに複製する。 */
+static int za_is_float_literal(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT;
+}
+
+/** valがbignum(MAGIC_BIGNUMのTAG_INSTANCE)かどうかを判定する。za_is_float_literalと
+ * 同じ理由でruntime.cのis_bignumをここに複製する。 */
+static int za_is_bignum_literal(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_BIGNUM;
+}
+
 /**
  * is_literal: 0=paramsのidx番目を参照、1=fixnum即値(literalをそのままmovabs)、
  * 2=quoteシンボル(literalは現在のタグ付きシンボル値だが、GCで移動しうるため
@@ -296,6 +309,10 @@ static void za_emit_untag_instance(UINT8 dst_reg, UINT8 src_reg) {
  * 読む。za_compile_callの関数解決と同じ手口)。os_get_functionは新規ヒープ確保を
  * 行わず、返る関数オブジェクトは既存のグローバル環境から到達可能なため専用の
  * GCルートは不要(呼び出し元が結果を即座にstore+linkする既存の呼び出し規約に乗る)。
+ * 7=裸の(quoteされていない)float/bignumリテラル(拡張13)。param_indexは
+ * g_za_number_slots配列のインデックス。is_literal=5(quoteのヒープ値ケース)と
+ * 全く同じ「スロット+os_gc_register_root」パターンでGC安全性を確保するが、
+ * quote(拡張10)とは構文的トリガーが異なるため専用の別配列を使う。
  */
 typedef struct {
     int is_literal;
@@ -317,6 +334,18 @@ typedef struct {
 static lisp_val_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS];
 static UINT64 g_za_quote_slot_count = 0;
 
+/**
+ * 拡張13: 裸の(quoteされていない)float/bignumリテラル用の、g_za_quote_slotsと同型の
+ * スロット配列。reader.cがソースをパースした時点でヒープ確保済みのTAG_INSTANCE値
+ * (MAGIC_FLOAT/MAGIC_BIGNUM)をここに1回だけ格納し、os_gc_register_rootでGCに
+ * 追跡させる。quote(拡張10)とは構文的トリガーが異なる別の機能のため、専用の配列を
+ * 分けている(g_za_quote_slot_countの消費ペースに影響しないようにする)。
+ * プロセス生涯で解放しない(g_za_quote_slotsと同じ考え方)。
+ */
+#define ZA_MAX_NUMBER_SLOTS 32
+static lisp_val_t g_za_number_slots[ZA_MAX_NUMBER_SLOTS];
+static UINT64 g_za_number_slot_count = 0;
+
 /** let-IIFEインライン化(拡張B)で使うローカル変数1個分の情報。val_offは
  * za_local_val_offで計算したフレームバイトオフセット。 */
 typedef struct za_local_var {
@@ -327,7 +356,7 @@ typedef struct za_local_var {
 /** let-IIFEインライン化(拡張B)のネスト深さ・1letあたりの変数数の上限
  * (ZA_MAX_NLX_DEPTH等と同じ考え方の実装上の固定上限)。za_local_scope_tが
  * 配列サイズとして使うため、フレームレイアウト定数群より前で定義する。 */
-#define ZA_MAX_LET_DEPTH      8
+#define ZA_MAX_LET_DEPTH      16
 #define ZA_MAX_LOCALS_PER_LET 4
 
 /** let-IIFEインライン化1段分のスコープ。parentで外側スコープへ辿れる連結リスト
@@ -456,6 +485,31 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
         out->literal = form;
         return 1;
     }
+    // 拡張14: 裸の(quoteされていない)charリテラル。os_make_charはヒープ確保を伴わない
+    // 純粋なビットパックなのでGCで移動せず、fixnumと同じくmovabsで直接埋め込める
+    // (quoteされたcharケースは既に上のquote分岐(is_literal=1、nil/fixnum/charの
+    // 即値判定)で対応済み)。
+    if ((form & TAG_MASK) == TAG_CHAR) {
+        out->is_literal = 1;
+        out->literal = form;
+        return 1;
+    }
+    // 拡張13: 裸の(quoteされていない)float/bignumリテラル。reader.cがソースを
+    // パースした時点でヒープ確保済みのTAG_INSTANCE値であり、quoteのヒープ値ケース
+    // (is_literal=5)と同じ「スロット+os_gc_register_root」パターンで扱う。formは
+    // すでにdefunソースASTの一部としてヒープ上に存在する値をそのままコピーする
+    // だけなので、ここで新たなヒープ確保は発生しない。
+    if ((form & TAG_MASK) == TAG_INSTANCE && (za_is_float_literal(form) || za_is_bignum_literal(form))) {
+        if (g_za_number_slot_count >= ZA_MAX_NUMBER_SLOTS) {
+            return 0;
+        }
+        UINT64 slot_idx = g_za_number_slot_count++;
+        g_za_number_slots[slot_idx] = form;
+        os_gc_register_root(&g_za_number_slots[slot_idx]);
+        out->is_literal = 7;
+        out->param_index = slot_idx;
+        return 1;
+    }
     if ((form & TAG_MASK) == TAG_SYMBOL) {
         UINT32 local_off;
         if (za_local_lookup(locals, form, &local_off)) {
@@ -473,6 +527,18 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
         if (za_rest_param_symbol(params, fixed_count, &rest_sym) && form == rest_sym) {
             out->is_literal = 3;
             out->param_index = fixed_count;
+            return 1;
+        }
+        // 拡張14: 裸のシンボルT。ランタイム起動時にg_sym_t = os_make_symbol("T")として
+        // 生成され、他の一般シンボルと同じくGCコピー時にgc_copy_valueで再配置される
+        // (runtime.c:681)ため、nilのような固定領域には置けない。よってis_literal=1で
+        // 生ポインタをmovabsするのは不安全であり、quoteシンボルリテラル(is_literal=2)と
+        // 全く同じ「名前から都度os_make_symbolで再解決する」手口を流用する
+        // (local/paramの解決に失敗した場合のみ、つまりtという名前のローカル変数/仮引数が
+        // あればそちらを優先するシャドーイング規則は保たれる)。
+        if (form == g_sym_t) {
+            out->is_literal = 2;
+            out->literal = form;
             return 1;
         }
         return 0;
@@ -545,6 +611,9 @@ typedef struct {
     lisp_val_t star;
     lisp_val_t lt;
     lisp_val_t eq;      /* "=" (数値の等値比較) */
+    lisp_val_t gt;      /* ">" */
+    lisp_val_t le;      /* "<=" */
+    lisp_val_t ge;      /* ">=" */
     lisp_val_t eqp;     /* "EQ" (ポインタ同一性比較) */
     lisp_val_t nullsym; /* "NULL" */
     lisp_val_t atom;    /* "ATOM" */
@@ -730,6 +799,14 @@ static void za_emit_operand(const za_operand_t *op) {
         // params/bodyスロット読み出しと同じ手口。スロットの値そのものではなく
         // アドレスを埋め込むので、GCでスロットの中身が指す先が移動しても安全)。
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_quote_slots[op->param_index]);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R11, 0);
+        return;
+    }
+    if (op->is_literal == 7) {
+        // 拡張13: 裸のfloat/bignumリテラル。is_literal==5と全く同じ手口
+        // (g_za_number_slots[param_index]のアドレスをmovabsで埋め込み、都度
+        // dereferenceして現在値を読む)。
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_number_slots[op->param_index]);
         jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R11, 0);
         return;
     }
@@ -1575,6 +1652,15 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     }
     if (head == syms->eq) {
         return za_compile_binary(form, params, fixed_count, locals, (void *)primitive_num_equal2);
+    }
+    if (head == syms->gt) {
+        return za_compile_binary(form, params, fixed_count, locals, (void *)primitive_greater_than2);
+    }
+    if (head == syms->le) {
+        return za_compile_binary(form, params, fixed_count, locals, (void *)primitive_less_equal2);
+    }
+    if (head == syms->ge) {
+        return za_compile_binary(form, params, fixed_count, locals, (void *)primitive_greater_equal2);
     }
     if (head == g_sym_car) {
         return za_compile_unary(form, params, fixed_count, locals, (void *)cc_car);
@@ -2445,6 +2531,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     syms.star = os_make_symbol("*");
     syms.lt = os_make_symbol("<");
     syms.eq = os_make_symbol("=");
+    syms.gt = os_make_symbol(">");
+    syms.le = os_make_symbol("<=");
+    syms.ge = os_make_symbol(">=");
     syms.eqp = os_make_symbol("EQ");
     syms.nullsym = os_make_symbol("NULL");
     syms.atom = os_make_symbol("ATOM");
