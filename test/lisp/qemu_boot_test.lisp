@@ -8,6 +8,7 @@
 (load "test/lisp/za_test_ext8.lisp")
 (load "test/lisp/za_test_ext9.lisp")
 (load "test/lisp/za_test_ext10.lisp")
+(load "test/lisp/za_test_ext11.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

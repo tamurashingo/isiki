@@ -290,6 +290,12 @@ static void za_emit_untag_instance(UINT8 dst_reg, UINT8 src_reg) {
  * za_compile_lambdaのクロージャparams/body(g_za_lambda_slots)と同じ「スロット+
  * os_gc_register_root」パターンでGC安全性を確保し、emit時はスロットのアドレスを
  * movabsで埋め込み、都度そこから現在値を読み直す(生ポインタ自体は埋め込まない)。
+ * 6=(function sym)(拡張11)。param_indexは使わずliteralにsym(シンボル、生ポインタ)を
+ * 保持する。emit時にza_emit_symbol_name+os_make_symbolで名前から再解決し、続けて
+ * os_get_function(sym, env)を呼んでその結果を返す(envはZA_OFF_ENV_VALスロットから
+ * 読む。za_compile_callの関数解決と同じ手口)。os_get_functionは新規ヒープ確保を
+ * 行わず、返る関数オブジェクトは既存のグローバル環境から到達可能なため専用の
+ * GCルートは不要(呼び出し元が結果を即座にstore+linkする既存の呼び出し規約に乗る)。
  */
 typedef struct {
     int is_literal;
@@ -509,6 +515,23 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
         out->param_index = slot_idx;
         return 1;
     }
+    // 拡張11: (function sym)。symがシンボルの場合のみ対応する(非シンボル、
+    // 例えば(function (lambda ...))はza_is_excluded_special_formのガードで
+    // fallbackさせる)。os_get_functionは新規ヒープ確保を行わないため、quoteの
+    // ヒープ値ケースと違い専用スロットは不要(za_operand_t定義直後のコメント参照)。
+    if ((form & TAG_MASK) == TAG_CONS && cc_car(form) == g_sym_function) {
+        lisp_val_t rest = cc_cdr(form);
+        if ((rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
+            return 0;
+        }
+        lisp_val_t target = cc_car(rest);
+        if ((target & TAG_MASK) != TAG_SYMBOL) {
+            return 0;
+        }
+        out->is_literal = 6;
+        out->literal = target;
+        return 1;
+    }
     return 0;
 }
 
@@ -704,6 +727,19 @@ static void za_emit_operand(const za_operand_t *op) {
         // アドレスを埋め込むので、GCでスロットの中身が指す先が移動しても安全)。
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_quote_slots[op->param_index]);
         jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R11, 0);
+        return;
+    }
+    if (op->is_literal == 6) {
+        // 拡張11: (function sym)。za_compile_callの関数解決(za.c内、名前埋め込み→
+        // os_make_symbol→os_get_function)と同じ3ステップをそのまま踏襲する。
+        UINT64 name_off = za_emit_symbol_name(op->literal);
+        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+        jit_call_r11();
         return;
     }
     if (op->is_literal == 4) {
