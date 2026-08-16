@@ -266,6 +266,43 @@
 (assert-equal 5 (slot-value (make-instance 'labeled-point ':x 5) 'x))
 (assert-equal t (equal (list 'auto 5) (slot-value (make-instance 'labeled-point ':x 5) 'label)))
 
+;;; --- 複数ディスパッチ: 第2引数以降のspecializer ---
+;;
+;; shape/circle/squareの単一継承階層(ダイヤモンドは使わない、CPL未計算という
+;; 既知の簡略化に踏み込まないため)で、両方の引数を見て最も特定的なメソッドが
+;; 選ばれることを確認する。
+
+(defclass shape () ())
+(defclass circle (shape) ())
+(defclass square (shape) ())
+
+(defgeneric combine (a b))
+(defmethod combine (a b) 'unspecialized)
+(defmethod combine ((a shape) b) 'first-only)
+(defmethod combine ((a shape) (b shape)) 'both-shapes)
+(defmethod combine ((a circle) (b circle)) 'both-circles)
+
+;; 両方circleなら、両方指定のうち最も特定的な both-circles が選ばれる
+(assert-equal 'both-circles (combine (make-instance 'circle) (make-instance 'circle)))
+
+;; circleとsquare(どちらもshapeだがcircle-circleには非適合)なら both-shapes
+(assert-equal 'both-shapes (combine (make-instance 'circle) (make-instance 'square)))
+
+;; 第2引数がshapeでない場合は、第1引数のみ指定のfirst-onlyまで絞られる
+(assert-equal 'first-only (combine (make-instance 'circle) 5))
+
+;; どちらもshapeでない場合はunspecializedまで絞られる
+(assert-equal 'unspecialized (combine 1 2))
+
+;; call-next-method: 2引数指定のメソッド同士でも特定的な順に正しく連鎖する
+(defgeneric combine-chain (a b))
+(defmethod combine-chain (a b) (list 'base))
+(defmethod combine-chain ((a shape) (b shape)) (list 'shapes (call-next-method)))
+(defmethod combine-chain ((a circle) (b circle)) (list 'circles (call-next-method)))
+
+(assert-equal t (equal (list 'circles (list 'shapes (list 'base)))
+                        (combine-chain (make-instance 'circle) (make-instance 'circle))))
+
 ;;; --- Condition System: signal-condition / with-handler / error ---
 
 ;; with-handler + block/return-fromでcatchできる

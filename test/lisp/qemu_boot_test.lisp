@@ -1,5 +1,6 @@
 (load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
+(load "test/lisp/init_test.lisp")
 (load "test/lisp/isiki_test.lisp")
 (load "test/lisp/za_test.lisp")
 (load "test/lisp/za_test_ext5.lisp")
