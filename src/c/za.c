@@ -1170,14 +1170,23 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
                                       const za_local_scope_t *locals, const za_syms_t *syms,
                                       lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
-/** `(tagbody . body)`。tb_ctx!=NULL(すでにtagbodyの中)なら0を返す(ネスト非対応)。 */
+/** `(tagbody . body)`。呼ばれるたびに新規のza_tagbody_ctx_tをスタックローカルに
+ * 構築して再帰するので、tagbodyのネストにも対応する(外側のtb_ctxを書き換えたり
+ * 派生させたりしない)。goは常に自分に渡されたtb_ctx(=最内側のtagbody)だけを
+ * 見るため、同名タグの再利用(forマクロが常に%for-loopを使う等)は変数の
+ * シャドーイングと同じ意味論で正しく解決される。内側から外側限定のタグへの
+ * go、または外側から内側限定のタグへのgoは、いずれも自分自身のタグ表に無い
+ * 名前として未解決の前方参照になり、本体走査終了時に0を返して安全にfallbackする
+ * (za_compile_go参照)。 */
 static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                                const za_local_scope_t *locals, const za_syms_t *syms,
                                lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(go tag)`。tb_ctx==NULL(tagbodyの外)、またはnlx_depthがtb_ctx->base_nlx_depthより
  * 深い(catch/throw/unwind-protectのspanningスロットを開いたままjmpで飛び越えることに
- * なる)場合は0を返す。 */
+ * なる)場合は0を返す。tb_ctxは常に呼び出し元(最内側のtagbody)のものだけを見るので、
+ * ネストしたtagbodyでは外側のタグ表を探索しない(=goは自分のtagbody内のタグにしか
+ * 直接ジャンプできない)。 */
 static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
 
 /** `(dynamic name)`。nameは評価しない。os_get_dynamicで動的束縛(g_dynamic_bindings)
@@ -2395,9 +2404,6 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
 static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
                                const za_syms_t *syms, lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
                                UINT64 trampoline_offset) {
-    if (tb_ctx != 0) {
-        return 0;
-    }
     lisp_val_t body = cc_cdr(form);
 
     za_tagbody_ctx_t new_ctx;

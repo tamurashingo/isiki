@@ -235,15 +235,17 @@
 
 ;; --- フォールバック確認 ---
 
-;; ネストしたtagbody(1つのJITコンパイル対象関数内にtagbodyが複数レベル)は非対応で
-;; 関数全体をインタプリタへフォールバックする(結果自体はインタプリタ経由で正しい)
+;; ネストしたtagbody(1つのJITコンパイル対象関数内にtagbodyが複数レベル)は拡張14
+;; (za_test_ext14.lisp参照)で対応済み。内側tagbodyのgoが自分自身のタグ(inner)
+;; だけを使う単純なケースなので、ここではコンパイルされることを確認する
+;; (ネストの網羅的な検証はza_test_ext14.lispを参照)。
 (defun isiki-za-test-nested-tagbody-fallback (x)
   (tagbody
    outer
     (tagbody
      inner
       (isiki-za-test-log-push x))))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-nested-tagbody-fallback)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-nested-tagbody-fallback)))
 (setq *isiki-za-test-log* nil)
 (assert-equal nil (isiki-za-test-nested-tagbody-fallback 42))
 (assert-equal '(42) *isiki-za-test-log*)
