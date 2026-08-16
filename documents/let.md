@@ -24,6 +24,21 @@
 テストスイート全体を通すと不足するようになったため、`JIT_CODE_SIZE`を
 256KBへ拡張した。
 
+さらに拡張9として、下記「スコープ外にすべきもの: `setq`」節で述べていた制約の
+一部を解消した。**let-localへの`setq`のみ**対応済み(`za_compile_setq`、
+新設)。外側defunの固定引数・グローバル変数・dynamic変数への`setq`は書き込み
+可能なスロットが無いため引き続きfallbackする。クロージャキャプチャとの食い違い
+(下記参照)は、同一defun内に`setq`とエスケープする(値の位置に現れる裸の)
+`lambda`の両方が存在する場合に関数全体を無条件にfallbackさせる粗い安全網
+(`g_za_saw_setq_local`/`g_za_saw_escaping_lambda`、`za_try_compile_defun`末尾で
+判定)で対処している。
+
+また、`for`/`while`マクロがどちらも`(block nil (tagbody ...))`に展開されることに
+関連し、`(block nil ...)`/`(return-from nil ...)`がJITコンパイルできない
+(`nil`が内部的に`TAG_CONS`であり、既存の`TAG_SYMBOL`限定のブロック名チェックに
+常に落ちる)という、setqとは独立した既存バグも同時に修正した。これにより
+`setq`対応と合わせて`for`/`while`ループ自体もJIT対象になった。
+
 本メモは、`let`/`let*`が現在の実装どおり**init.lispのdefmacroのまま**
 であることを前提にした解決案(案A・案B)をまとめる。C側にletを直接実装する
 場合の検討は別メモ(let-native.md相当、本ドキュメント末尾の「今後の検討」
@@ -175,17 +190,20 @@ let/let\*/or/case/case-using/forの外側letすべてに自動的に効く。
 
 安全側に倒すなら(b)を初版の必須ガードとするのが妥当。
 
-### スコープ外にすべきもの: `setq`
+### スコープ外にすべきもの: `setq`(拡張9で一部解消済み)
 
-`setq`(`g_sym_setq`)は既に`za_is_excluded_special_form`に入っており、
-**letとは無関係に、setqを使う関数は現在すでに全部インタプリタfallback**
-している。これは案Bが新たに背負う制約ではなく既存の制約だが、実利上の影響
-がある: `for`マクロの展開はletで束縛したループ変数へ`setq`するため、案Bを
-実装しても`for`はインライン化の対象にならない(letの束縛自体はできるように
-なっても、その後のsetqが別の理由でfallbackさせる)。恩恵を受けるのは
-`let`/`let*`/`or`/`case`/`case-using`/`with-open-*`(いずれもsetqを使わない)
-まで。`for`まで含めるには、レキシカルローカルへのsetq対応を別フェーズとして
-追加する必要がある。
+`setq`(`g_sym_setq`)は本メモ執筆時点では`za_is_excluded_special_form`に
+入っており、**letとは無関係に、setqを使う関数は現在すでに全部インタプリタ
+fallback**していた。これは案Bが新たに背負う制約ではなく既存の制約だが、実利上
+の影響があった: `for`マクロの展開はletで束縛したループ変数へ`setq`するため、
+案Bを実装しても`for`はインライン化の対象にならない(letの束縛自体はできる
+ようになっても、その後のsetqが別の理由でfallbackさせる)、という状態だった。
+
+拡張9(冒頭「実装状況(追記)」節参照)で、**let-localへの`setq`のみ**対応した。
+`for`/`while`のループ変数はいずれもlet-localなので、この対応と、独立に発見・
+修正した`block nil`/`return-from nil`バグの修正が揃ったことで、`for`/`while`
+自体もJIT対象になった。外側defunの固定引数・グローバル変数・dynamic変数への
+`setq`は引き続き非対応でfallbackする(将来の別拡張の対象)。
 
 ### 推奨v1スコープ
 
