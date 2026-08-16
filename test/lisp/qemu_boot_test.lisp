@@ -5,6 +5,7 @@
 (load "test/lisp/za_test_stress.lisp")
 (load "test/lisp/za_test_ext5.lisp")
 (load "test/lisp/za_test_ext7.lisp")
+(load "test/lisp/za_test_ext8.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

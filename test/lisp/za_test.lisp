@@ -163,27 +163,32 @@
 (assert-equal 1 (isiki-za-test-if-and 1 1))
 (assert-equal 2 (isiki-za-test-if-and 1 nil))
 
-;; letが展開する即時lambda呼び出しは、拡張3・拡張4が完了するまで非対応でフォールバックする
-;; (結果自体はインタプリタ経由で正しい)
-(defun isiki-za-test-let-fallback (x)
+;; letが展開する即時lambda呼び出しは、let-IIFEインライン化対応後はコンパイル対象になる
+;; (詳細は test/lisp/za_test_ext8.lisp を参照)
+(defun isiki-za-test-let-inline (x)
   (let ((y 1))
     (+ x y)))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-let-fallback)))
-(assert-equal 11 (isiki-za-test-let-fallback 10))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-let-inline)))
+(assert-equal 11 (isiki-za-test-let-inline 10))
 
-;; orはgensymの一時変数をletで束縛する形に展開されるため同様にフォールバックする
-(defun isiki-za-test-or-fallback (x y) (or x y))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-or-fallback)))
-(assert-equal 1 (isiki-za-test-or-fallback 1 2))
-(assert-equal 2 (isiki-za-test-or-fallback nil 2))
+;; orはgensymの一時変数をletで束縛する形に展開されるため、let-IIFEインライン化対応後は
+;; 同様にコンパイル対象になる
+(defun isiki-za-test-or-inline (x y) (or x y))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-or-inline)))
+(assert-equal 1 (isiki-za-test-or-inline 1 2))
+(assert-equal 2 (isiki-za-test-or-inline nil 2))
 
-;; condはprognを含む形に展開されるため同様にフォールバックする
-(defun isiki-za-test-cond-fallback (x)
+;; condはif/prognを含む形に展開されるが、let-IIFE/prognインライン化対応後は
+;; コンパイル対象になる。ただしza_classify_operandはシンボルをlocal/仮引数/
+;; (quote sym)のみリテラルとして許容し、裸のtシンボル(nilと違いza_compile_expr側の
+;; 特別扱いも無い)はtest位置のリテラルとして扱えない(let/progn対応とは無関係の
+;; 既存の制約)ため、catchall節には(t ...)ではなく(null x)を使う。
+(defun isiki-za-test-cond-inline (x)
   (cond (x 1)
-        (t 2)))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-cond-fallback)))
-(assert-equal 1 (isiki-za-test-cond-fallback t))
-(assert-equal 2 (isiki-za-test-cond-fallback nil))
+        ((null x) 2)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-cond-inline)))
+(assert-equal 1 (isiki-za-test-cond-inline t))
+(assert-equal 2 (isiki-za-test-cond-inline nil))
 
 ;;; --- 拡張3: 関数呼び出し(自己再帰・相互再帰・他関数呼び出し) ---
 ;;
@@ -249,11 +254,11 @@
 (assert-equal 1 (isiki-za-test-call-in-test-fallback 0))
 (assert-equal 2 (isiki-za-test-call-in-test-fallback 5))
 
-;; 除外リストの特殊形式(progn)がbody直下に来る場合も同様にフォールバックする
-(defun isiki-za-test-progn-fallback (x)
+;; prognはlet*インライン化対応の一環でコンパイル対象になった(za_compile_progn参照)
+(defun isiki-za-test-progn-inline (x)
   (progn (+ x 1)))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-progn-fallback)))
-(assert-equal 6 (isiki-za-test-progn-fallback 5))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-progn-inline)))
+(assert-equal 6 (isiki-za-test-progn-inline 5))
 
 ;;; --- 拡張1: 基本データ操作とヒープ確保・シャドウスタック連携 ---
 ;;

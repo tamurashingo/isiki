@@ -6,7 +6,11 @@
 
 #if defined(__x86_64__)
 
-#define JIT_CODE_SIZE 65536
+/* let-IIFEインライン化(拡張B)およびprogn対応により、以前はインタプリタへfallback
+ * していたlet、let-star、or、cond等の多くがJIT対象になった分、プロセス全体で累積する
+ * コード量が増えた。旧65536だと長いテストスイート(ext5+ext7+ext8)の途中でg_jit_usedが
+ * 上限に達しoverflowで以降の全コンパイルがfallbackしてしまうため拡張した。 */
+#define JIT_CODE_SIZE 262144
 /** サポートする仮引数(&restより手前の固定引数)の最大個数(コード量とコンパイル時間を有限に保つための上限) */
 #define ZA_MAX_PARAMS 16
 /** サポートする+のオペランドの最大個数(同上) */
@@ -274,6 +278,28 @@ typedef struct {
     UINT64 param_index;
 } za_operand_t;
 
+/** let-IIFEインライン化(拡張B)で使うローカル変数1個分の情報。val_offは
+ * za_local_val_offで計算したフレームバイトオフセット。 */
+typedef struct za_local_var {
+    lisp_val_t sym;
+    UINT32 val_off;
+} za_local_var_t;
+
+/** let-IIFEインライン化(拡張B)のネスト深さ・1letあたりの変数数の上限
+ * (ZA_MAX_NLX_DEPTH等と同じ考え方の実装上の固定上限)。za_local_scope_tが
+ * 配列サイズとして使うため、フレームレイアウト定数群より前で定義する。 */
+#define ZA_MAX_LET_DEPTH      4
+#define ZA_MAX_LOCALS_PER_LET 4
+
+/** let-IIFEインライン化1段分のスコープ。parentで外側スコープへ辿れる連結リスト
+ * (ネスト深さはこのチェーンを辿って数えるだけで済むため、既存のnlx_depthのように
+ * 別のUINT64引数として全関数へスレッドする必要はない)。 */
+typedef struct za_local_scope {
+    za_local_var_t vars[ZA_MAX_LOCALS_PER_LET];
+    UINT64 count;
+    const struct za_local_scope *parent;
+} za_local_scope_t;
+
 /**
  * paramsの固定引数部分(先頭からfixed_count個)の中からsymと同じシンボルの位置(0始まり)を探す。
  * fixed_countで探索範囲を区切ることで、&restのrest引数名(固定引数の後ろにある)が
@@ -362,18 +388,41 @@ static int za_validate_params(lisp_val_t params, UINT64 *out_fixed_count) {
     return 1;
 }
 
+/** let-IIFEインライン化(拡張B)のローカル変数を、内側スコープから外側へ向かって
+ * 探索する。最初に見つかった(=最も内側の)一致を返すことで、シャドーイング
+ * (letローカルが外側paramや外側letと同名)が自然に正しく解決される。 */
+static int za_local_lookup(const za_local_scope_t *locals, lisp_val_t sym, UINT32 *out_val_off) {
+    for (const za_local_scope_t *s = locals; s != 0; s = s->parent) {
+        for (UINT64 i = 0; i < s->count; i++) {
+            if (s->vars[i].sym == sym) {
+                *out_val_off = s->vars[i].val_off;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /**
- * +のオペランド1個を分類する。paramsの固定引数部分に含まれるシンボル参照、
- * 即値fixnumリテラル、または(quote sym)形式のシンボルリテラルのみ許可する。
+ * +のオペランド1個を分類する。let-IIFEインライン化のローカル変数、paramsの
+ * 固定引数部分に含まれるシンボル参照、即値fixnumリテラル、または(quote sym)
+ * 形式のシンボルリテラルのみ許可する。
  * @return 分類できれば1(outに書く)、できなければ0
  */
-static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, za_operand_t *out) {
+static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                const za_local_scope_t *locals, za_operand_t *out) {
     if ((form & TAG_MASK) == TAG_FIXNUM) {
         out->is_literal = 1;
         out->literal = form;
         return 1;
     }
     if ((form & TAG_MASK) == TAG_SYMBOL) {
+        UINT32 local_off;
+        if (za_local_lookup(locals, form, &local_off)) {
+            out->is_literal = 4;
+            out->param_index = local_off;
+            return 1;
+        }
         UINT64 idx;
         if (za_param_index(params, form, fixed_count, &idx)) {
             out->is_literal = 0;
@@ -506,7 +555,19 @@ static void za_gc_unlink_node(gc_rootnode *node) {
 #define ZA_OFF_ARG_BASE        272
 #define ZA_ARG_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
 /* ZA_OFF_ARG_BASE + ZA_MAX_OPERANDS*ZA_ARG_SLOT_SIZE(=656) は既に16バイト境界 */
-#define ZA_FRAME_EXTRA         656
+/* let-IIFEインライン化(拡張B): let-localの値+gc_rootnodeのスロット領域。
+ * ネスト深さ×1letあたりの変数数で固定サイズを確保し、兄弟let同士(ネストして
+ * いない)はスロットを再利用する(depthのみでインデックスするため)。 */
+#define ZA_OFF_LOCAL_BASE      656  /* ZA_OFF_ARG_BASE + 16*24 の直後 */
+#define ZA_LOCAL_SLOT_SIZE     24   /* 値8バイト+gc_rootnode16バイト */
+/* letのbodyはallow_callゲートを経由せず常に評価される(block/catch/unwind-protect
+ * と同じ扱い)ため、外側letのbody内で内側letが同時に「開いている」ことが構文的に
+ * 起こり得る。ZA_OFF_CALL_SAVED_HEAD/ZA_OFF_LAMBDA_SAVED_HEADのような単一スロットは
+ * 「引数位置はallow_call=0で再帰するため同時稼働しない」制約があるから成立するもので、
+ * let-scopeにはその制約が無いため、ZA_OFF_NLX_BASEと同じ深さごとの配列にする。 */
+#define ZA_OFF_LET_SAVED_HEAD_BASE 1040  /* 656 + 4*4*24 */
+/* 既存656から変更: 1040 + ZA_MAX_LET_DEPTH(4)*8 */
+#define ZA_FRAME_EXTRA         1072
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
@@ -517,6 +578,17 @@ static UINT32 za_arg_node_off(UINT64 i) { return za_arg_val_off(i) + 8; }
  * return-fromが共有する(za_arg_val_offと同じ「配列インデックス」パターン)。 */
 static UINT32 za_nlx_val_off(UINT64 depth) { return ZA_OFF_NLX_BASE + (UINT32)depth * ZA_NLX_SLOT_SIZE; }
 static UINT32 za_nlx_node_off(UINT64 depth) { return za_nlx_val_off(depth) + 8; }
+
+/** 深さdepth・インデックスidxのlet-localスロットの値オフセット(za_arg_val_off/
+ * za_nlx_val_offと同じ「配列インデックス」パターン)。 */
+static UINT32 za_local_val_off(UINT64 depth, UINT64 idx) {
+    return ZA_OFF_LOCAL_BASE + (UINT32)depth * (ZA_MAX_LOCALS_PER_LET * ZA_LOCAL_SLOT_SIZE) +
+           (UINT32)idx * ZA_LOCAL_SLOT_SIZE;
+}
+static UINT32 za_local_node_off(UINT64 depth, UINT64 idx) { return za_local_val_off(depth, idx) + 8; }
+
+/** 深さdepth(0始まり)のlet SAVED_HEADスロットのオフセット。 */
+static UINT32 za_let_saved_head_off(UINT64 depth) { return ZA_OFF_LET_SAVED_HEAD_BASE + (UINT32)depth * 8; }
 
 /** [rsp+off]の値をregへ読み出す */
 static void za_load_slot(UINT8 reg, UINT32 off) { jit_mov_reg_from_rsp(reg, (INT32)off); }
@@ -566,6 +638,12 @@ static void za_emit_operand(const za_operand_t *op) {
         jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
         jit_call_r11();
+        return;
+    }
+    if (op->is_literal == 4) {
+        // let-IIFEインライン化(拡張B): param_indexをparams配列のインデックスではなく
+        // フレームバイトオフセットとして直接使う(za_local_val_off参照)。
+        za_load_slot(ZA_REG_RAX, (UINT32)op->param_index);
         return;
     }
     za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
@@ -644,7 +722,8 @@ static UINT64 za_ensure_trampoline(void) {
  * @return 対応できれば1、できなければ0(この場合何バイト書き込んだかは呼び出し元が
  * ロールバックするので気にしなくてよい)
  */
-static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, void *wrapper_fn) {
+static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                            const za_local_scope_t *locals, void *wrapper_fn) {
     za_operand_t ops[ZA_MAX_OPERANDS];
     UINT64 count = 0;
     for (lisp_val_t rest = cc_cdr(form); rest != nil; rest = cc_cdr(rest)) {
@@ -654,7 +733,7 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         if (count >= ZA_MAX_OPERANDS) {
             return 0;
         }
-        if (!za_classify_operand(cc_car(rest), params, fixed_count, &ops[count])) {
+        if (!za_classify_operand(cc_car(rest), params, fixed_count, locals, &ops[count])) {
             return 0;
         }
         count++;
@@ -687,7 +766,8 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  * ションではない)。
  * @return 対応できれば1、できなければ0
  */
-static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_count) {
+static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                             const za_local_scope_t *locals) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -695,9 +775,9 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     if (cc_cdr(rest) == nil) {
         lisp_val_t zero_form = os_make_cons(cc_car(form),
                                     os_make_cons(os_make_fixnum(0), os_make_cons(cc_car(rest), nil)));
-        return za_compile_fold(zero_form, params, fixed_count, (void *)primitive_subtract2);
+        return za_compile_fold(zero_form, params, fixed_count, locals, (void *)primitive_subtract2);
     }
-    return za_compile_fold(form, params, fixed_count, (void *)primitive_subtract2);
+    return za_compile_fold(form, params, fixed_count, locals, (void *)primitive_subtract2);
 }
 
 /**
@@ -706,13 +786,14 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * オペランドはleaf限定。
  * @return 対応できれば1、できなければ0
  */
-static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, void *wrapper_fn) {
+static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                             const za_local_scope_t *locals, void *wrapper_fn) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
         return 0;
     }
     za_operand_t op0;
-    if (!za_classify_operand(cc_car(rest), params, fixed_count, &op0)) {
+    if (!za_classify_operand(cc_car(rest), params, fixed_count, locals, &op0)) {
         return 0;
     }
     za_emit_operand(&op0);
@@ -730,13 +811,14 @@ static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * 3個以上の連鎖・1個以下は今回は非対応(フォールバックする)。
  * @return 対応できれば1、できなければ0
  */
-static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, void *wrapper_fn) {
+static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                              const za_local_scope_t *locals, void *wrapper_fn) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
     }
     za_operand_t op0;
-    if (!za_classify_operand(cc_car(rest), params, fixed_count, &op0)) {
+    if (!za_classify_operand(cc_car(rest), params, fixed_count, locals, &op0)) {
         return 0;
     }
     lisp_val_t rest2 = cc_cdr(rest);
@@ -744,7 +826,7 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
         return 0;
     }
     za_operand_t op1;
-    if (!za_classify_operand(cc_car(rest2), params, fixed_count, &op1)) {
+    if (!za_classify_operand(cc_car(rest2), params, fixed_count, locals, &op1)) {
         return 0;
     }
 
@@ -790,7 +872,7 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
  * ここに残す。
  */
 static int za_is_excluded_special_form(lisp_val_t head) {
-    return head == g_sym_quote || head == g_sym_progn || head == g_sym_setq ||
+    return head == g_sym_quote || head == g_sym_setq ||
            head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
            head == g_sym_quasiquote || head == g_sym_function || head == g_sym_flet ||
            head == g_sym_labels || head == g_sym_defvar || head == g_sym_defconstant ||
@@ -854,13 +936,14 @@ typedef struct za_tagbody_ctx {
     UINT64 base_nlx_depth;
 } za_tagbody_ctx_t;
 
-static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                            const za_local_scope_t *locals, const za_syms_t *syms,
                             lisp_val_t env, int allow_call, int is_tail, UINT64 trampoline_offset,
                             UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
 
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
-                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset,
-                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
+                            const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
+                            UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
 
 /** forms(リスト)を先頭から順にza_compile_expr(allow_call=1, is_tail=0)で評価する
  * 共通ヘルパー(block/catch/tagbodyのbody、unwind-protectのcleanup-formsで使う)。
@@ -868,34 +951,41 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
  * 戻る(1を返す)。formsが空(nil)ならrax=nilとする(eval_prognの空リスト規約)。
  * 最後の要素の結果には制御転送チェックを行わない(その値がそのままこの関数の結果
  * になるので、呼び出し元が必要なら自分で判定する)。 */
-static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms,
                                   lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(block name . body)`。bodyをza_compile_body_formsで評価し、結果が制御転送で
  * MAGIC_BLOCK_EXITかつobj[1]がnameと一致するならobj[2]を、そうでなければ結果を
  * そのまま返す。 */
-static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                             const za_local_scope_t *locals, const za_syms_t *syms,
                              lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(return-from name . value-rest)`。value-restが空ならnil、それ以外は評価した値を
  * MAGIC_BLOCK_EXITでラップして返す(すでに制御転送ならラップせずそのまま返す)。 */
-static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                   const za_local_scope_t *locals, const za_syms_t *syms,
                                    lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(catch tag-form . body)`。 */
-static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                             const za_local_scope_t *locals, const za_syms_t *syms,
                              lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(throw tag-form result-form)`。 */
-static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                             const za_local_scope_t *locals, const za_syms_t *syms,
                              lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(unwind-protect protected-form . cleanup-forms)`。 */
-static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                      const za_local_scope_t *locals, const za_syms_t *syms,
                                       lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(tagbody . body)`。tb_ctx!=NULL(すでにtagbodyの中)なら0を返す(ネスト非対応)。 */
-static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                               const za_local_scope_t *locals, const za_syms_t *syms,
                                lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
 
 /** `(go tag)`。tb_ctx==NULL(tagbodyの外)、またはnlx_depthがtb_ctx->base_nlx_depthより
@@ -909,21 +999,44 @@ static int za_compile_dynamic(lisp_val_t form);
 
 /** `(defdynamic name value-form)`。value-formを評価し、os_set_dynamicで動的束縛
  * (g_dynamic_bindings)へ登録してnameを返す。 */
-static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms,
                                   lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset);
+
+/** `((lambda (v1 v2...) . body) i1 i2...)`形式のIIFE(let-IIFEインライン化、拡張B)を、
+ * 実際の関数呼び出し手続きを経ずbodyをその場にインライン展開する。letのボディは
+ * block/catch/unwind-protectと同様allow_callゲートを経由せず常に評価可能とするため、
+ * allow_callパラメータは受け取らない。 */
+static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                           const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
+                           UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
+
+/** `(progn . body)`。let*の展開の末端(`(let* () . body)` => `(progn ,@body)`)が
+ * 必ずこの形を経由するため、let*がlet-IIFEインライン化(拡張B)の恩恵を受けるには
+ * progn自体もインライン展開できる必要がある。prognは新しい変数束縛を持たないので
+ * let-IIFEのgc_roots保存/unlinkは不要で、za_compile_letのbodyループと同じ「最後の
+ * フォームのみ呼び出し元のis_tailを継承」ロジックだけを行う。if/let-IIFE同様、
+ * allow_callゲートより前で無条件に認識する。 */
+static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
+                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx);
 
 /**
  * 「(lambda (lambda_params...) . lambda_body)」から、外側のJIT関数と同じ表現
  * (MAGIC_FUNCTION_INTERPRETED、eval.cのmake_interpreted_function/apply_functionが
  * 素で扱える形)のクロージャを組み立てる機械語を出力する。lambda本体自体はzaが
  * コンパイルせず、呼び出し時は常にインタプリタ経路(apply_function)が実行する。
- * 単一レベルのネストのみ対応: 自由変数解析はせず、外側関数の固定引数
- * (params[0..fixed_count-1]、&restを除く)を呼ばれるたびに全て新規environmentへ
- * os_set_variableでコピーし、それをクロージャのenvとする(setqはza対象外なので
- * コピー後の再代入で共有が破れる心配は無い)。
+ * 自由変数解析はせず、外側関数の固定引数(params[0..fixed_count-1]、&restを除く)、
+ * および呼ばれた時点で見えているlet-IIFEローカル(locals、let-IIFEインライン化拡張B)
+ * を呼ばれるたびに全て新規environmentへos_set_variableでコピーし、それをクロージャの
+ * envとする(setqはza対象外なのでコピー後の再代入で共有が破れる心配は無い)。localsは
+ * 外側→内側の順でコピーする: os_set_variableは同一env内の既存の同名束縛を上書きする
+ * ため、この順序であれば内側letが外側letや外側paramと同名でシャドーイングしている
+ * 場合も、後からコピーされる内側の値が正しく最終的に勝つ。
  * @return 対応できれば1、できなければ0(lambdaスロット枯渇時も含む)
  */
-static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_count) {
+static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                              const za_local_scope_t *locals) {
     /*
      * paramsはコンパイル時にこの関数末尾のループでcc_car/cc_cdrにより辿られるが、
      * その前にos_make_cons(下記)・os_make_symbol("LAMBDA-ENV")という実アロケーションを
@@ -993,6 +1106,39 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
         jit_call_r11();
     }
 
+    // 3.5. let-IIFEローカル(locals)を外側→内側の順で同様にコピーする(クロージャ
+    // キャプチャ対策(a)、let-IIFEインライン化拡張B)。localsの連結リストは内側→外側
+    // なので、祖先を配列に集めてから逆順(外側→内側)に処理する。os_set_variableは
+    // 同一env内の既存の同名束縛を上書きするため、この順序であれば内側のシャドーイング
+    // が後から正しく勝つ。
+    {
+        const za_local_scope_t *chain[ZA_MAX_LET_DEPTH];
+        UINT64 chain_count = 0;
+        for (const za_local_scope_t *s = locals; s != 0 && chain_count < ZA_MAX_LET_DEPTH; s = s->parent) {
+            chain[chain_count++] = s;
+        }
+        for (UINT64 ci = chain_count; ci > 0; ci--) {
+            const za_local_scope_t *s = chain[ci - 1];
+            for (UINT64 i = 0; i < s->count; i++) {
+                za_operand_t lop;
+                lop.is_literal = 4;
+                lop.param_index = s->vars[i].val_off;
+                za_emit_operand(&lop); /* rax = let-localの現在値 */
+                za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_TMP_VAL);
+
+                UINT64 lsym_off = za_emit_symbol_name(s->vars[i].sym);
+                jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + lsym_off));
+                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+                jit_call_r11();
+                jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+                za_load_slot(ZA_REG_RDX, ZA_OFF_LAMBDA_TMP_VAL);
+                za_load_slot(ZA_REG_R8, ZA_OFF_LAMBDA_ENV_VAL);
+                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
+                jit_call_r11();
+            }
+        }
+    }
+
     // 4. クロージャ本体を構築する:
     // os_make_instance(MAGIC_FUNCTION_INTERPRETED, lambda_params, lambda_body, new_env)
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)slot_addr);
@@ -1024,6 +1170,229 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
 }
 
 /**
+ * let-IIFEインライン化(拡張B)のために、`(lambda (v1 v2...) . body)`の仮引数部分が
+ * 「重複のない、平坦なシンボルのみ・&rest無し・ZA_MAX_LOCALS_PER_LET以下」で
+ * あることを検証し、シンボルを出現順にout_symsへ書き出す(v1スコープでは&restを
+ * 持つIIFEは非対応、documents/let.mdの対策(b)は不採用のためbody内のlambda検出は
+ * 行わない — クロージャキャプチャはza_compile_lambda側の対策(a)で吸収する)。
+ * @return 検証できれば1(個数をout_countに書く)、できなければ0
+ */
+static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out_syms, UINT64 *out_count) {
+    UINT64 count = 0;
+    for (lisp_val_t cur = lambda_vars; cur != nil; cur = cc_cdr(cur)) {
+        if ((cur & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        lisp_val_t sym = cc_car(cur);
+        if ((sym & TAG_MASK) != TAG_SYMBOL || sym == g_sym_rest) {
+            return 0;
+        }
+        for (UINT64 i = 0; i < count; i++) {
+            if (out_syms[i] == sym) {
+                return 0;
+            }
+        }
+        if (count >= ZA_MAX_LOCALS_PER_LET) {
+            return 0;
+        }
+        out_syms[count++] = sym;
+    }
+    *out_count = count;
+    return 1;
+}
+
+/**
+ * `((lambda (v1 v2...) . body) i1 i2...)`形式のIIFE(let-IIFEインライン化、拡張B)を、
+ * 実際の関数呼び出し手続き(za_compile_call)を経ずbodyをその場にインライン展開する。
+ * let, let-star, or, case, case-using, with-open-*はいずれもマクロ展開後この形に
+ * 帰着するため自動的に恩恵を受ける(setqを使うforのみza_is_excluded_special_formの
+ * 既存除外で対象外のまま、documents/let.md参照)。
+ *
+ * letのbodyはblock/catch/unwind-protectと同様allow_callゲートを経由せず常に評価
+ * 可能とするため、allow_callパラメータは受け取らない。init式はまだ新スコープを
+ * 積んでいない外側のlocalsで評価し、bodyは新スコープ(parent=呼び出し時のlocals)で
+ * 評価する。最後のbody要素のみ呼び出し元のis_tailを継承する(それ以外は0)。
+ *
+ * GC安全性: za_compile_call/za_compile_lambdaと同じ「SAVED_HEAD保存→(init評価/body
+ * 実行)→za_gc_unlinkで一括アンリンク」パターンを踏襲する。init式評価中に
+ * return-from/throw/goで中断した場合はabort_cleanupへjmpし、その時点までにlinkした
+ * init分だけをまとめてunlinkしてから共通着地点へ合流する。bodyの非最終要素が制御転送
+ * した場合はza_emit_ct_check_and_jmp_if_transferで検出し、bodyの後続評価をスキップして
+ * 終端のunlinkへ合流する(unlink自体は転送値に関わらず常に行う)。末尾呼び出しで
+ * トランポリンへjmpして抜けた場合、この関数末尾の明示的unlinkは実行時に到達しない
+ * (unreachableな)コードになるだけで安全 — za_compile_callのis_tail=1経路が
+ * ENV_SAVED_HEADまで一括でunlinkするため、let-localのノードも含めて解除される。
+ */
+static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
+                           const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                           UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
+    /* paramsはinit式/body評価のza_compile_expr再帰経由でコンパイル時アロケーションが
+     * 起きうるため、za_compile_call/za_compile_lambdaと同じ理由で明示的に保護する。 */
+    GC_PROTECT(params);
+
+    lisp_val_t head = cc_car(form);
+    lisp_val_t lrest = cc_cdr(head);
+    if (lrest == nil || (lrest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t lambda_vars = cc_car(lrest);
+    lisp_val_t lambda_body = cc_cdr(lrest);
+
+    lisp_val_t var_syms[ZA_MAX_LOCALS_PER_LET];
+    UINT64 var_count = 0;
+    if (!za_local_validate_lambda_vars(lambda_vars, var_syms, &var_count)) {
+        return 0;
+    }
+
+    UINT64 depth = 0;
+    for (const za_local_scope_t *s = locals; s != 0; s = s->parent) {
+        depth++;
+    }
+    if (depth >= ZA_MAX_LET_DEPTH) {
+        return 0;
+    }
+
+    lisp_val_t init_forms[ZA_MAX_LOCALS_PER_LET];
+    UINT64 init_count = 0;
+    for (lisp_val_t rest = cc_cdr(form); rest != nil; rest = cc_cdr(rest)) {
+        if ((rest & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        if (init_count >= ZA_MAX_LOCALS_PER_LET) {
+            return 0;
+        }
+        init_forms[init_count++] = cc_car(rest);
+    }
+    if (init_count != var_count) {
+        return 0;
+    }
+
+    // 1. letスコープ開始前のgc_rootsを保存する。
+    UINT64 saved_head_off = za_let_saved_head_off(depth);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, saved_head_off);
+
+    // 2. 各init式を、まだ新スコープを積んでいない外側のlocalsで左から順に評価し、
+    // 対応するローカルスロットへ格納・linkする。いずれかが制御転送を返した場合は
+    // 残りのinit評価・body実行をすべて中止し、abort_cleanupへ直接jmpする
+    // (za_compile_callの引数評価ループと同一パターン)。
+    UINT64 ct_patches[ZA_MAX_LOCALS_PER_LET];
+    UINT64 ct_patch_count = 0;
+    for (UINT64 i = 0; i < var_count; i++) {
+        if (!za_compile_expr(init_forms[i], params, fixed_count, locals, syms, env, 1, 0, trampoline_offset,
+                              nlx_depth, tb_ctx)) {
+            return 0;
+        }
+        ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+        UINT64 val_off = za_local_val_off(depth, i);
+        UINT64 node_off = za_local_node_off(depth, i);
+        za_store_slot(ZA_REG_RAX, val_off);
+        za_emit_gc_link_slot(val_off, node_off);
+    }
+
+    // abort_cleanup: init評価中の制御転送で中断した場合のみ到達する(通常経路は
+    // 直後のjmpで読み飛ばす)。
+    UINT64 abort_skip_patch = jit_emit_jmp_rel32_placeholder();
+    UINT64 abort_cleanup_offset = g_jit_used;
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, saved_head_off);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 abort_to_end_patch = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32(abort_skip_patch);
+    for (UINT64 i = 0; i < ct_patch_count; i++) {
+        jit_patch_rel32_target(ct_patches[i], abort_cleanup_offset);
+    }
+
+    // 3. 新しいローカルスコープ(parent=呼び出し時のlocals)を積み、bodyをコンパイル
+    // する。za_compile_body_formsはis_tail=0を全要素に固定するため再利用せず、
+    // letが末尾位置にある場合のtail-call性を保つ専用ループを使う(最後のフォームのみ
+    // 呼び出し元のis_tailを継承)。
+    za_local_scope_t new_scope;
+    new_scope.count = var_count;
+    new_scope.parent = locals;
+    for (UINT64 i = 0; i < var_count; i++) {
+        new_scope.vars[i].sym = var_syms[i];
+        new_scope.vars[i].val_off = za_local_val_off(depth, i);
+    }
+
+    UINT64 body_end_patches[ZA_MAX_OPERANDS];
+    UINT64 body_end_patch_count = 0;
+    if (lambda_body == nil) {
+        jit_movabs_rax(nil);
+    } else {
+        for (lisp_val_t rest = lambda_body; rest != nil; rest = cc_cdr(rest)) {
+            if ((rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            lisp_val_t elem = cc_car(rest);
+            int is_last = (cc_cdr(rest) == nil);
+            if (!za_compile_expr(elem, params, fixed_count, &new_scope, syms, env, 1, is_last ? is_tail : 0,
+                                  trampoline_offset, nlx_depth, tb_ctx)) {
+                return 0;
+            }
+            if (!is_last) {
+                if (body_end_patch_count >= ZA_MAX_OPERANDS) {
+                    return 0;
+                }
+                body_end_patches[body_end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+            }
+        }
+    }
+    for (UINT64 i = 0; i < body_end_patch_count; i++) {
+        jit_patch_rel32(body_end_patches[i]);
+    }
+
+    // 4. letスコープのgc_rootsをまとめてunlinkする(末尾呼び出しでトランポリンへ
+    // jmpして抜けた場合、以下は実行時に到達しないコードになるだけで安全 — 関数末尾
+    // コメント参照)。
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, saved_head_off);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+
+    jit_patch_rel32(abort_to_end_patch);
+    return 1;
+}
+
+static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
+                             const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                             UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
+    lisp_val_t body = cc_cdr(form);
+
+    UINT64 body_end_patches[ZA_MAX_OPERANDS];
+    UINT64 body_end_patch_count = 0;
+    if (body == nil) {
+        jit_movabs_rax(nil);
+    } else {
+        for (lisp_val_t rest = body; rest != nil; rest = cc_cdr(rest)) {
+            if ((rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            lisp_val_t elem = cc_car(rest);
+            int is_last = (cc_cdr(rest) == nil);
+            if (!za_compile_expr(elem, params, fixed_count, locals, syms, env, 1, is_last ? is_tail : 0,
+                                  trampoline_offset, nlx_depth, tb_ctx)) {
+                return 0;
+            }
+            if (!is_last) {
+                if (body_end_patch_count >= ZA_MAX_OPERANDS) {
+                    return 0;
+                }
+                body_end_patches[body_end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+            }
+        }
+    }
+    for (UINT64 i = 0; i < body_end_patch_count; i++) {
+        jit_patch_rel32(body_end_patches[i]);
+    }
+    return 1;
+}
+
+/**
  * formを評価してraxに結果を残す機械語を出力する。対応するグラマーは
  * 「fixnumリテラル / params固定引数への参照 / (+ leaf leaf...) / (- leaf) /
  * (- leaf leaf...) / (* leaf leaf...) / (< leaf leaf) / (= leaf leaf) /
@@ -1042,13 +1411,14 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
  * @param trampoline_offset 末尾呼び出しが共有トランポリンへjmpする際の着地先オフセット
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
  */
-static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
+static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                            const za_local_scope_t *locals, const za_syms_t *syms,
                             lisp_val_t env, int allow_call, int is_tail, UINT64 trampoline_offset,
                             UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
     form = za_macroexpand(form, env);
 
     za_operand_t leaf;
-    if (za_classify_operand(form, params, fixed_count, &leaf)) {
+    if (za_classify_operand(form, params, fixed_count, locals, &leaf)) {
         za_emit_operand(&leaf);
         return 1;
     }
@@ -1065,41 +1435,57 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         return 0;
     }
     lisp_val_t head = cc_car(form);
+    // let-IIFEインライン化(拡張B): headが(lambda 仮引数 . body)という形のcons
+    // (即時呼び出しIIFE)であれば、実際の関数呼び出し手続きを経ずbodyをその場に
+    // インライン展開する。let/let*/or/case/case-using/with-open-*はいずれも
+    // マクロ展開後この形に帰着するため自動的に恩恵を受ける。if同様、allow_callゲートより
+    // 前で無条件に認識する(ifのtest位置等でも使えるようにするため)。
+    if ((head & TAG_MASK) == TAG_CONS && cc_car(head) == g_sym_lambda) {
+        return za_compile_let(form, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth,
+                               tb_ctx);
+    }
+    // progn: let*の展開の末端が必ず`(progn ,@body)`を経由するため、let*がlet-IIFE
+    // インライン化の恩恵を受けるにはprognもインライン展開できる必要がある(za_compile_progn
+    // 参照)。let-IIFE同様、allow_callゲートより前で無条件に認識する。
+    if (head == g_sym_progn) {
+        return za_compile_progn(form, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth,
+                                 tb_ctx);
+    }
     if (head == syms->plus) {
-        return za_compile_fold(form, params, fixed_count, (void *)primitive_add2);
+        return za_compile_fold(form, params, fixed_count, locals, (void *)primitive_add2);
     }
     if (head == syms->minus) {
-        return za_compile_minus(form, params, fixed_count);
+        return za_compile_minus(form, params, fixed_count, locals);
     }
     if (head == syms->star) {
-        return za_compile_fold(form, params, fixed_count, (void *)primitive_multiply2);
+        return za_compile_fold(form, params, fixed_count, locals, (void *)primitive_multiply2);
     }
     if (head == syms->lt) {
-        return za_compile_binary(form, params, fixed_count, (void *)primitive_less_than2);
+        return za_compile_binary(form, params, fixed_count, locals, (void *)primitive_less_than2);
     }
     if (head == syms->eq) {
-        return za_compile_binary(form, params, fixed_count, (void *)primitive_num_equal2);
+        return za_compile_binary(form, params, fixed_count, locals, (void *)primitive_num_equal2);
     }
     if (head == g_sym_car) {
-        return za_compile_unary(form, params, fixed_count, (void *)cc_car);
+        return za_compile_unary(form, params, fixed_count, locals, (void *)cc_car);
     }
     if (head == g_sym_cdr) {
-        return za_compile_unary(form, params, fixed_count, (void *)cc_cdr);
+        return za_compile_unary(form, params, fixed_count, locals, (void *)cc_cdr);
     }
     if (head == syms->nullsym) {
-        return za_compile_unary(form, params, fixed_count, (void *)primitive_null1);
+        return za_compile_unary(form, params, fixed_count, locals, (void *)primitive_null1);
     }
     if (head == syms->atom) {
-        return za_compile_unary(form, params, fixed_count, (void *)primitive_atom1);
+        return za_compile_unary(form, params, fixed_count, locals, (void *)primitive_atom1);
     }
     if (head == syms->eqp) {
-        return za_compile_binary(form, params, fixed_count, (void *)primitive_eq2);
+        return za_compile_binary(form, params, fixed_count, locals, (void *)primitive_eq2);
     }
     if (head == g_sym_cons) {
-        return za_compile_binary(form, params, fixed_count, (void *)os_make_cons);
+        return za_compile_binary(form, params, fixed_count, locals, (void *)os_make_cons);
     }
     if (head == g_sym_lambda) {
-        return za_compile_lambda(form, params, fixed_count);
+        return za_compile_lambda(form, params, fixed_count, locals);
     }
     if (head == g_sym_if) {
         lisp_val_t rest = cc_cdr(form);
@@ -1123,7 +1509,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
             has_else = 1;
         }
 
-        if (!za_compile_expr(test_form, params, fixed_count, syms, env, 0, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+        if (!za_compile_expr(test_form, params, fixed_count, locals, syms, env, 0, 0, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
         // testが制御転送(return-from/throw/go等をtest位置に書いたケース)ならthen/elseの
@@ -1134,7 +1520,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         jit_cmp_rax_r11();
         UINT64 je_patch = jit_emit_je_rel32_placeholder();
 
-        if (!za_compile_expr(then_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset, nlx_depth, tb_ctx)) {
+        if (!za_compile_expr(then_form, params, fixed_count, locals, syms, env, allow_call, is_tail, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
         // then分岐の実行後は必ずelse/nilフォールバック側を飛び越える(elseが無い場合も
@@ -1144,7 +1530,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
 
         jit_patch_rel32(je_patch);
         if (has_else) {
-            if (!za_compile_expr(else_form, params, fixed_count, syms, env, allow_call, is_tail, trampoline_offset, nlx_depth, tb_ctx)) {
+            if (!za_compile_expr(else_form, params, fixed_count, locals, syms, env, allow_call, is_tail, trampoline_offset, nlx_depth, tb_ctx)) {
                 return 0;
             }
         } else {
@@ -1158,22 +1544,22 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     // 拡張5(非局所脱出): if同様、allow_callゲートより前で無条件に認識する
     // (インタプリタと同じくifのtestや呼び出しの引数位置にも書けるようにするため)。
     if (head == g_sym_block) {
-        return za_compile_block(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+        return za_compile_block(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
     if (head == g_sym_return_from) {
-        return za_compile_return_from(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+        return za_compile_return_from(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
     if (head == g_sym_catch) {
-        return za_compile_catch(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+        return za_compile_catch(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
     if (head == g_sym_throw) {
-        return za_compile_throw(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+        return za_compile_throw(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
     if (head == g_sym_unwind_protect) {
-        return za_compile_unwind_protect(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+        return za_compile_unwind_protect(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
     if (head == g_sym_tagbody) {
-        return za_compile_tagbody(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+        return za_compile_tagbody(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
     if (head == g_sym_go) {
         return za_compile_go(form, nlx_depth, tb_ctx);
@@ -1184,7 +1570,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         return za_compile_dynamic(form);
     }
     if (head == g_sym_defdynamic) {
-        return za_compile_defdynamic(form, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset);
+        return za_compile_defdynamic(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset);
     }
 
     // 一般呼び出し: headがシンボルで、除外リストの特殊形式でなければ関数呼び出しとして
@@ -1196,7 +1582,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     if ((head & TAG_MASK) != TAG_SYMBOL || za_is_excluded_special_form(head)) {
         return 0;
     }
-    return za_compile_call(form, head, params, fixed_count, syms, env, is_tail, trampoline_offset, nlx_depth, tb_ctx);
+    return za_compile_call(form, head, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth, tb_ctx);
 }
 
 /**
@@ -1216,8 +1602,8 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
  */
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
-                            const za_syms_t *syms, lisp_val_t env, int is_tail, UINT64 trampoline_offset,
-                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
+                            const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
+                            UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
     /*
      * fn_sym/paramsは引数loop(下記)がza_compile_expr経由でza_compile_lambdaへ再入した
      * 場合、そちら側でos_make_cons/os_make_symbolという実アロケーションを伴うコンパイル
@@ -1252,7 +1638,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     UINT64 ct_patches[ZA_MAX_OPERANDS];
     UINT64 ct_patch_count = 0;
     for (UINT64 i = 0; i < argc; i++) {
-        if (!za_compile_expr(arg_forms[i], params, fixed_count, syms, env, 0, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+        if (!za_compile_expr(arg_forms[i], params, fixed_count, locals, syms, env, 0, 0, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
         ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -1344,8 +1730,9 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     return 1;
 }
 
-static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                                  lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                  UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
     if (forms == nil) {
         jit_movabs_rax(nil);
         return 1;
@@ -1360,7 +1747,7 @@ static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fix
         }
         lisp_val_t elem = cc_car(rest);
         int is_last = (cc_cdr(rest) == nil);
-        if (!za_compile_expr(elem, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+        if (!za_compile_expr(elem, params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
         if (!is_last) {
@@ -1376,8 +1763,9 @@ static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fix
     return 1;
 }
 
-static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
+                             const za_syms_t *syms, lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                             UINT64 trampoline_offset) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -1388,7 +1776,7 @@ static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     }
     lisp_val_t body = cc_cdr(rest);
 
-    if (!za_compile_body_forms(body, params, fixed_count, syms, env, nlx_depth, tb_ctx, trampoline_offset)) {
+    if (!za_compile_body_forms(body, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, trampoline_offset)) {
         return 0;
     }
 
@@ -1422,8 +1810,9 @@ static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     return 1;
 }
 
-static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                                   lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                   const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                   UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -1441,7 +1830,7 @@ static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fix
     }
 
     if (value_rest != nil) {
-        if (!za_compile_expr(cc_car(value_rest), params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+        if (!za_compile_expr(cc_car(value_rest), params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
             return 0;
         }
     } else {
@@ -1516,8 +1905,9 @@ static int za_compile_dynamic(lisp_val_t form) {
  * os_make_symbolして現在有効なタグ付きシンボル値を取り直す
  * (za_emit_symbol_nameのコメントと同じ理由。symbolオブジェクトもGCで移動する)。
  */
-static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                                  lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                  UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -1534,7 +1924,7 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
         return 0;
     }
 
-    if (!za_compile_expr(cc_car(rest2), params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+    if (!za_compile_expr(cc_car(rest2), params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
         return 0;
     }
 
@@ -1568,8 +1958,9 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
     return 1;
 }
 
-static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
+                             const za_syms_t *syms, lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                             UINT64 trampoline_offset) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -1580,7 +1971,7 @@ static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
         return 0;
     }
 
-    if (!za_compile_expr(tag_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+    if (!za_compile_expr(tag_form, params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
         return 0;
     }
     // tagが制御転送ならbodyへ入らずそのまま返す(eval_catchと同じ)。
@@ -1591,7 +1982,7 @@ static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     za_store_slot(ZA_REG_RAX, tag_val_off);
     za_emit_gc_link_slot(tag_val_off, tag_node_off);
 
-    if (!za_compile_body_forms(body, params, fixed_count, syms, env, nlx_depth + 1, tb_ctx, trampoline_offset)) {
+    if (!za_compile_body_forms(body, params, fixed_count, locals, syms, env, nlx_depth + 1, tb_ctx, trampoline_offset)) {
         return 0;
     }
 
@@ -1637,8 +2028,9 @@ static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     return 1;
 }
 
-static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                             lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
+                             const za_syms_t *syms, lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                             UINT64 trampoline_offset) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -1653,7 +2045,7 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
         return 0;
     }
 
-    if (!za_compile_expr(tag_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
+    if (!za_compile_expr(tag_form, params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth, tb_ctx)) {
         return 0;
     }
     UINT64 tag_ct_patch = za_emit_ct_check_and_jmp_if_transfer();
@@ -1663,7 +2055,7 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     za_store_slot(ZA_REG_RAX, tag_val_off);
     za_emit_gc_link_slot(tag_val_off, tag_node_off);
 
-    if (!za_compile_expr(result_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth + 1, tb_ctx)) {
+    if (!za_compile_expr(result_form, params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth + 1, tb_ctx)) {
         return 0;
     }
 
@@ -1690,8 +2082,9 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     return 1;
 }
 
-static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                                      lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                      const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                      UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
         return 0;
@@ -1707,7 +2100,7 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
     // nlx_depth+1で評価する: protected_form内のgoがこのunwind-protectのスパンを
     // 飛び越えてcleanup-formsの実行をバイパスすることをbase_nlx_depthチェックで
     // 確実に拒否させるため(cleanup-formsと同じ深さで評価する)。
-    if (!za_compile_expr(protected_form, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth + 1, tb_ctx)) {
+    if (!za_compile_expr(protected_form, params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth + 1, tb_ctx)) {
         return 0;
     }
 
@@ -1718,7 +2111,7 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
 
     // cleanup-formsの結果は捨てる(cleanup内で新たな脱出が起きてもここでは無視する —
     // eval_unwind_protectの既知の簡略化に合わせる)。
-    if (!za_compile_body_forms(cleanup_forms, params, fixed_count, syms, env, nlx_depth + 1, tb_ctx, trampoline_offset)) {
+    if (!za_compile_body_forms(cleanup_forms, params, fixed_count, locals, syms, env, nlx_depth + 1, tb_ctx, trampoline_offset)) {
         return 0;
     }
 
@@ -1733,8 +2126,9 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
  * 含めて数える(コード量を有限に保つための実装上の上限。ZA_MAX_OPERANDS等と同じ考え方)。 */
 #define ZA_MAX_TAGBODY_FORMS 64
 
-static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_syms_t *syms,
-                               lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 trampoline_offset) {
+static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
+                               const za_syms_t *syms, lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                               UINT64 trampoline_offset) {
     if (tb_ctx != 0) {
         return 0;
     }
@@ -1784,7 +2178,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
         if (end_patch_count >= ZA_MAX_TAGBODY_FORMS) {
             return 0;
         }
-        if (!za_compile_expr(elem, params, fixed_count, syms, env, 1, 0, trampoline_offset, nlx_depth, &new_ctx)) {
+        if (!za_compile_expr(elem, params, fixed_count, locals, syms, env, 1, 0, trampoline_offset, nlx_depth, &new_ctx)) {
             return 0;
         }
         end_patches[end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -1899,7 +2293,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     za_emit_gc_link_slot(ZA_OFF_ENV_VAL, ZA_OFF_ENV_NODE);
     za_emit_gc_link_slot(ZA_OFF_ARGS_VAL, ZA_OFF_ARGS_NODE);
 
-    if (!za_compile_expr(form, params, fixed_count, &syms, env, 1, 1, trampoline_offset, 0, 0)) {
+    if (!za_compile_expr(form, params, fixed_count, 0, &syms, env, 1, 1, trampoline_offset, 0, 0)) {
         g_jit_used = entry;
         return nil;
     }
