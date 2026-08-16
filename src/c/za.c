@@ -327,7 +327,7 @@ typedef struct za_local_var {
 /** let-IIFEインライン化(拡張B)のネスト深さ・1letあたりの変数数の上限
  * (ZA_MAX_NLX_DEPTH等と同じ考え方の実装上の固定上限)。za_local_scope_tが
  * 配列サイズとして使うため、フレームレイアウト定数群より前で定義する。 */
-#define ZA_MAX_LET_DEPTH      4
+#define ZA_MAX_LET_DEPTH      8
 #define ZA_MAX_LOCALS_PER_LET 4
 
 /** let-IIFEインライン化1段分のスコープ。parentで外側スコープへ辿れる連結リスト
@@ -645,9 +645,13 @@ static void za_gc_unlink_node(gc_rootnode *node) {
  * 起こり得る。ZA_OFF_CALL_SAVED_HEAD/ZA_OFF_LAMBDA_SAVED_HEADのような単一スロットは
  * 「引数位置はallow_call=0で再帰するため同時稼働しない」制約があるから成立するもので、
  * let-scopeにはその制約が無いため、ZA_OFF_NLX_BASEと同じ深さごとの配列にする。 */
-#define ZA_OFF_LET_SAVED_HEAD_BASE 1040  /* 656 + 4*4*24 */
-/* 既存656から変更: 1040 + ZA_MAX_LET_DEPTH(4)*8 */
-#define ZA_FRAME_EXTRA         1072
+/* 拡張12でZA_MAX_LET_DEPTHを4から8へ拡張した際、べた書きの数値
+ * (旧: 1040 = 656 + 4*4*24、1072 = 1040 + 4*8)を手計算し直す必要が
+ * あるのはミスの元なので、ZA_MAX_LET_DEPTH経由の計算式に変更した
+ * (656 + 8*4*24 = 1424、1424 + 8*8 = 1488、いずれも16バイト境界を保つ)。 */
+#define ZA_OFF_LET_SAVED_HEAD_BASE \
+    (ZA_OFF_LOCAL_BASE + ZA_MAX_LET_DEPTH * ZA_MAX_LOCALS_PER_LET * ZA_LOCAL_SLOT_SIZE)
+#define ZA_FRAME_EXTRA (ZA_OFF_LET_SAVED_HEAD_BASE + ZA_MAX_LET_DEPTH * 8)
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
