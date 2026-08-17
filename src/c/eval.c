@@ -517,11 +517,14 @@ static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env);
 
 /**
  * list(評価済み、unquote-splicingで得られたリスト)の要素をtailの手前に非破壊的に継ぎ足す。
+ * za.c(JIT)がquasiquoteコンパイル時、list-position unquote-splicingの実行時fold処理で
+ * os_make_consと同じ呼び出し規約(引数2個、両方GCリンク済みスロットから渡す)で呼ぶため
+ * 非staticにしている。
  * @param list 継ぎ足す要素のリスト
  * @param tail listの末尾に続ける残りのリスト
  * @return listの要素 . tail
  */
-static lisp_val_t qq_append(lisp_val_t list, lisp_val_t tail) {
+lisp_val_t qq_append(lisp_val_t list, lisp_val_t tail) {
     if (list == nil) {
         return tail;
     }

@@ -361,6 +361,35 @@ static int za_alloc_quote_slot(lisp_val_t value, UINT64 *out_slot_idx) {
 }
 
 /**
+ * (quote X)のXが確定した後の分類本体(za_classify_operandのquote分岐と
+ * za_compile_quasiquoteの定数畳み込みで共有する)。呼び出し側は`(quote X)`という
+ * consを実際に合成せず、Xの値をそのまま渡すこと — quotedを未保護のままos_make_cons
+ * で新たなconsを組んでから委譲すると、その合成呼び出し自体がGCを引き起こした場合に
+ * quotedがFrom空間の古いアドレスを指したままza_alloc_quote_slotへ格納されてしまう
+ * (za_alloc_quote_slotはvalueをそのまま信頼して格納するだけで、moveされたかどうかの
+ * 検証はしない)。
+ */
+static int za_classify_quoted_value(lisp_val_t quoted, za_operand_t *out) {
+    if ((quoted & TAG_MASK) == TAG_SYMBOL) {
+        out->is_literal = 2;
+        out->literal = quoted;
+        return 1;
+    }
+    if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM || (quoted & TAG_MASK) == TAG_CHAR) {
+        out->is_literal = 1;
+        out->literal = quoted;
+        return 1;
+    }
+    UINT64 slot_idx;
+    if (!za_alloc_quote_slot(quoted, &slot_idx)) {
+        return 0;
+    }
+    out->is_literal = 5;
+    out->param_index = slot_idx;
+    return 1;
+}
+
+/**
  * 拡張13: 裸の(quoteされていない)float/bignumリテラル用の、g_za_quote_slotsと同型の
  * スロット配列。reader.cがソースをパースした時点でヒープ確保済みのTAG_INSTANCE値
  * (MAGIC_FLOAT/MAGIC_BIGNUM)をここに1回だけ格納し、os_gc_register_rootでGCに
@@ -627,32 +656,7 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
             return 0;
         }
         lisp_val_t quoted = cc_car(rest);
-        if ((quoted & TAG_MASK) == TAG_SYMBOL) {
-            out->is_literal = 2;
-            out->literal = quoted;
-            return 1;
-        }
-        // fixnum/char/nilは即値(GCで移動しない)なので、fixnumリテラルと同じく
-        // movabsで直接埋め込める(nilが安全な理由: g_nil_cellというFrom/To空間の
-        // どちらにも属さない固定領域。charが安全な理由: os_make_charはヒープ確保を
-        // 伴わない純粋なビットパック)。
-        if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM || (quoted & TAG_MASK) == TAG_CHAR) {
-            out->is_literal = 1;
-            out->literal = quoted;
-            return 1;
-        }
-        // cons(nil以外)/string/instance/raw_pointer: ヒープ確保されGCで移動しうる
-        // ため、za_compile_lambdaのクロージャキャプチャ(g_za_lambda_slots)と同じ
-        // 「スロット+os_gc_register_root」パターンで扱う。quotedはすでにdefunソース
-        // ASTの一部としてヒープ上に存在する値をそのままコピーするだけなので、
-        // ここで新たなヒープ確保は発生しない。
-        UINT64 slot_idx;
-        if (!za_alloc_quote_slot(quoted, &slot_idx)) {
-            return 0;
-        }
-        out->is_literal = 5;
-        out->param_index = slot_idx;
-        return 1;
+        return za_classify_quoted_value(quoted, out);
     }
     // 拡張11: (function sym)。symがシンボルの場合のみ対応する(非シンボル、
     // 例えば(function (lambda ...))はza_is_excluded_special_formのガードで
@@ -842,8 +846,24 @@ static void za_gc_unlink_node(gc_rootnode *node) {
  * さらに束縛数方向にも広げた2次元配列にする(束縛ごとに独立したgc_rootnodeが要る)。 */
 #define ZA_OFF_FLET_OLD_BASE   (ZA_OFF_FLET_BASE + 64)
 #define ZA_FLET_OLD_SLOT_SIZE  24  /* 値8バイト+gc_rootnode16バイト */
-#define ZA_FRAME_EXTRA \
+/* quasiquote(za_compile_quasiquote): eval.cのqq_expandはcdr方向にも再帰するが、
+ * これをそのままCの再帰・実行時スロット深さに写すとフラットな要素数(リスト長)が
+ * そのまま深さ上限を消費してしまい非現実的に小さい上限しか許容できなくなる。
+ * そこで1回のquasiquoteレベル内のリスト走査はza_compile_callの引数loopと同じ
+ * 「配列で要素ごとにスロットを持ち、右から左へfoldする」方式にし、深さ(qq_depth)は
+ * 「動的な内容を含むネストしたサブテンプレートに再帰する場合」だけ消費する
+ * (call_depthが要素数[ZA_MAX_OPERANDS]とは別に管理されるのと同じ発想)。 */
+#define ZA_MAX_QQ_DEPTH     4    /* ZA_MAX_CALL_DEPTH等と同じ値 */
+#define ZA_MAX_QQ_ELEMENTS  16   /* ZA_MAX_OPERANDSと同じ値 */
+#define ZA_QQ_SLOT_SIZE     24   /* 値8バイト+gc_rootnode16バイト */
+#define ZA_OFF_QQ_BASE \
     (ZA_OFF_FLET_OLD_BASE + ZA_MAX_NLX_DEPTH * ZA_MAX_FLET_BINDINGS * ZA_FLET_OLD_SLOT_SIZE)
+/* 1レベル分 = SAVED_HEAD(8、za_call_saved_head_offと同じ用途) +
+ * 要素配列(ZA_MAX_QQ_ELEMENTS個、za_arg_val_offと同じ「配列インデックス」パターン) +
+ * foldアキュムレータ用1個(za_arith_val_offと同じ単一スロット)。 */
+#define ZA_QQ_LEVEL_SIZE    (8 + (ZA_MAX_QQ_ELEMENTS + 1) * ZA_QQ_SLOT_SIZE)
+#define ZA_FRAME_EXTRA \
+    (ZA_OFF_QQ_BASE + ZA_MAX_QQ_DEPTH * ZA_QQ_LEVEL_SIZE)
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
@@ -884,6 +904,22 @@ static UINT32 za_flet_old_val_off(UINT64 nlx_depth, UINT64 idx) {
            (UINT32)idx * ZA_FLET_OLD_SLOT_SIZE;
 }
 static UINT32 za_flet_old_node_off(UINT64 nlx_depth, UINT64 idx) { return za_flet_old_val_off(nlx_depth, idx) + 8; }
+
+/** 深さqq_depth(0始まり)のquasiquote SAVED_HEADスロットのオフセット
+ * (za_call_saved_head_offと同じ用途)。 */
+static UINT32 za_qq_saved_head_off(UINT64 qq_depth) { return ZA_OFF_QQ_BASE + (UINT32)qq_depth * ZA_QQ_LEVEL_SIZE; }
+/** 深さqq_depth・要素インデックスiのquasiquote要素スロットの値オフセット
+ * (za_arg_val_offと同じ「配列インデックス」パターン)。 */
+static UINT32 za_qq_elem_val_off(UINT64 qq_depth, UINT64 i) {
+    return za_qq_saved_head_off(qq_depth) + 8 + (UINT32)i * ZA_QQ_SLOT_SIZE;
+}
+static UINT32 za_qq_elem_node_off(UINT64 qq_depth, UINT64 i) { return za_qq_elem_val_off(qq_depth, i) + 8; }
+/** 深さqq_depth(0始まり)のquasiquote foldアキュムレータスロットの値オフセット
+ * (要素配列ZA_MAX_QQ_ELEMENTS個分の直後、za_arith_val_offと同じ単一スロットの発想)。 */
+static UINT32 za_qq_acc_val_off(UINT64 qq_depth) {
+    return za_qq_saved_head_off(qq_depth) + 8 + ZA_MAX_QQ_ELEMENTS * ZA_QQ_SLOT_SIZE;
+}
+static UINT32 za_qq_acc_node_off(UINT64 qq_depth) { return za_qq_acc_val_off(qq_depth) + 8; }
 
 /** [rsp+off]の値をregへ読み出す */
 static void za_load_slot(UINT8 reg, UINT32 off) { jit_mov_reg_from_rsp(reg, (INT32)off); }
@@ -1071,13 +1107,36 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
  * ここに残す。
  */
 static int za_is_excluded_special_form(lisp_val_t head) {
-    // flet/labels(za_compile_flet_labels)はここから除外する(za_compile_exprが
-    // 一般呼び出し判定より前で無条件に認識するため、ここに来た時点でどちらでもない)。
+    // flet/labels(za_compile_flet_labels)・quasiquote(za_compile_quasiquote)は
+    // ここから除外する(za_compile_exprが一般呼び出し判定より前で無条件に認識するため、
+    // ここに来た時点でどれでもない)。
     return head == g_sym_quote ||
            head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
-           head == g_sym_quasiquote || head == g_sym_function ||
+           head == g_sym_function ||
            head == g_sym_defvar || head == g_sym_defconstant ||
            head == g_sym_defglobal;
+}
+
+/**
+ * formのコンス木のどこかに(unquote x)/(unquote-splicing x)がheadとして現れるかを
+ * コンパイル時だけに判定する(eval.cのqq_expandの分岐条件elem==g_sym_unquote/
+ * unquote_splicingと同じ着眼点の静的解析版)。真ならza_compile_quasiquoteはこの
+ * サブフォームを実行時に組み立てる必要があり、偽なら(quote form)へ丸ごと畳み込める。
+ * Cの素朴な再帰(コンパイル時のみ、実行時スロット/GCは絡まないためza_rewrite_fn_refs
+ * 同様に深さ制限を設けない)。
+ */
+static int za_qq_contains_unquote(lisp_val_t form) {
+    // nilはg_nil_cellという自己参照consでTAG_CONSタグを持つため、下のTAG_CONS判定
+    // だけではnilを弾けずcar(nil)==nilへの無限再帰に陥る(eval.cのqq_expandも
+    // 同じ理由でform==nilを先にチェックしている、この関数直前のコメント参照)。
+    if (form == nil || (form & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t elem = cc_car(form);
+    if (elem == g_sym_unquote || elem == g_sym_unquote_splicing) {
+        return 1;
+    }
+    return za_qq_contains_unquote(elem) || za_qq_contains_unquote(cc_cdr(form));
 }
 
 /**
@@ -1242,6 +1301,14 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
                                    const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                                    UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
                                    UINT64 trampoline_offset, UINT64 arith_depth);
+
+/** `(quasiquote template)`。za_compile_quasiquote定義直前のコメント参照。qq_depthは
+ * 0始まりで、動的な内容を含むネストしたサブテンプレートに再帰する場合だけ+1する
+ * (1レベル内のリスト走査自体はCのforループで反復するため、要素数は消費しない)。 */
+static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                  UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                                  UINT64 call_depth, UINT64 arith_depth, UINT64 qq_depth);
 
 /** `(progn . body)`。let*の展開の末端(`(let* () . body)` => `(progn ,@body)`)が
  * 必ずこの形を経由するため、let*がlet-IIFEインライン化(拡張B)の恩恵を受けるには
@@ -2129,6 +2196,18 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
                                 trampoline_offset, arith_depth);
     }
 
+    // 拡張(quasiquote): if/setq等と同様、一般呼び出しの判定より前で無条件に認識する
+    // (za_compile_quasiquote定義直前のコメント参照)。formは`(quasiquote template)`
+    // という2要素リストなので、渡すのはcadrのtemplateだけ。qq_depthは0から始める。
+    if (head == g_sym_quasiquote) {
+        lisp_val_t qq_rest = cc_cdr(form);
+        if ((qq_rest & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        return za_compile_quasiquote(cc_car(qq_rest), params, fixed_count, locals, syms, env, trampoline_offset,
+                                      nlx_depth, tb_ctx, call_depth, arith_depth, 0);
+    }
+
     // 一般呼び出し: headがシンボルで、除外リストの特殊形式でなければ関数呼び出しとして
     // 扱う。ネスト深さの上限チェック・スロットのdepth化はza_compile_call自身が行う
     // (拡張15、ZA_MAX_CALL_DEPTH参照)。
@@ -2314,6 +2393,223 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     // 引数評価中に制御転送で中断した場合の共通着地点(is_tail=0の通常完了地点とも
     // 一致する)。ここに到達する時点でrax=結果(通常のapply結果、または中断した
     // 制御転送値)であり、追加の処理は不要。
+    jit_patch_rel32(abort_to_end_patch);
+    return 1;
+}
+
+/** za_compile_quasiquoteの1レベル分のリスト走査で集める要素(コンパイル時のみ使う、
+ * 実行時スロットとは無関係)。is_splice=0はELEMENT(qq_expandのhead位置、この関数
+ * 自身をqq_depth+1で再帰する)、is_splice=1はSPLICE(,@xのx、za_compile_operandで
+ * 直接評価する、テンプレート再帰はしない)。 */
+typedef struct {
+    lisp_val_t data;
+    int is_splice;
+} za_qq_item_t;
+
+/**
+ * 「(quasiquote template)」を検証しつつeval.cのqq_expand/qq_appendと等価な結果を
+ * 実行時に構築する機械語を出力する。eval.cのqq_expand同様、ネストしたbacktickは
+ * 特別扱いしない(quote-levelを追跡しない素朴な実装。za_qq_contains_unquote/この
+ * 関数のどちらもQUASIQUOTEシンボル自体を特別扱いしないため、自然にこの意味論に
+ * 一致する)。
+ *
+ * 1. templateのコンス木のどこにもunquote/unquote-splicingが現れなければ
+ *    (za_qq_contains_unquote)、(quote template)へ丸ごと合成し既存のquote
+ *    コンパイルパス(za_compile_operand経由のza_classify_operand/za_alloc_quote_slot)
+ *    へ委譲する(実行時cons化は一切不要)。
+ * 2. templateが直接`(unquote x)`/`(unquote-splicing x)`(qq_expandの先頭チェックに
+ *    相当)なら、xをza_compile_operandでそのままコンパイルする。foldもqq_depthの
+ *    消費も不要。
+ * 3. それ以外は1レベル分のリストをCのforループで走査し(za_compile_callの引数loop
+ *    と同じ「配列に集めてから右から左へfold」方式、リスト長はqq_depthを消費しない)、
+ *    各要素をELEMENT(この関数自身をqq_depth+1で再帰=qq_expandの「head =
+ *    qq_expand(elem)」に相当。中でさらに(1)(2)へ自然に分岐する)、または
+ *    SPLICE(,@xのxをza_compile_operandで直接評価。qq_expandがxをos_evalで直接
+ *    評価するのに対応)に分類する。末尾(tail)はTAIL_NIL(nil)/TAIL_CONST(atom、
+ *    dotted listの終端)/TAIL_UNQUOTE(x、`(a . ,b)`の,bまたは裸の,x/,@x)の
+ *    いずれかで、foldの初期シードになる。right-to-leftでfoldし、ELEMENTは
+ *    os_make_cons、SPLICEはqq_appendを使う(za_compile_callの手順4と同型)。
+ *    qq_depth>=ZA_MAX_QQ_DEPTH、要素数>=ZA_MAX_QQ_ELEMENTSはいずれもfallback
+ *    (0を返す)。NLX(制御転送)安全性はza_compile_callのabort_cleanupと同じ
+ *    二層構造で確保する。
+ * @param qq_depth 現在のネスト深さ(0始まり、ELEMENT再帰時だけ+1する)
+ * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元が
+ * ロールバックするので気にしなくてよい)
+ */
+static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                  UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                                  UINT64 call_depth, UINT64 arith_depth, UINT64 qq_depth) {
+    // 1. 全体が定数(unquote/unquote-splicingを一切含まない)なら丸ごとquote委譲する。
+    // (quote template_form)というconsを実際に合成してza_compile_operandへ委譲すると、
+    // その合成用os_make_cons自体がGCを引き起こした場合にtemplate_formが未保護のまま
+    // From空間の古いアドレスを指し続けてしまう(za_classify_quoted_value直前のコメント
+    // 参照)ため、合成せずtemplate_formをそのまま分類する。
+    if (!za_qq_contains_unquote(template_form)) {
+        za_operand_t leaf;
+        if (!za_classify_quoted_value(template_form, &leaf)) {
+            return 0;
+        }
+        za_emit_operand(&leaf);
+        return 1;
+    }
+    // 2. template自身が裸の(unquote x)/(unquote-splicing x)(qq_expandの先頭チェック)
+    // なら、xを直接コンパイルしfold不要で済ませる。
+    if ((template_form & TAG_MASK) == TAG_CONS) {
+        lisp_val_t bare_head = cc_car(template_form);
+        if (bare_head == g_sym_unquote || bare_head == g_sym_unquote_splicing) {
+            lisp_val_t bare_rest = cc_cdr(template_form);
+            if ((bare_rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            return za_compile_operand(cc_car(bare_rest), params, fixed_count, locals, syms, env, trampoline_offset,
+                                       nlx_depth, tb_ctx, call_depth, arith_depth);
+        }
+    }
+    if (qq_depth >= ZA_MAX_QQ_DEPTH) {
+        return 0;
+    }
+
+    // 3. 1レベル分のリストを走査し、要素配列とtailの種類を確定する(コンパイル時のみ、
+    // cc_car/cc_cdrの読み出しだけでアロケーションは起きない)。
+    za_qq_item_t items[ZA_MAX_QQ_ELEMENTS];
+    UINT64 item_count = 0;
+    enum { QQ_TAIL_NIL, QQ_TAIL_CONST, QQ_TAIL_UNQUOTE } tail_kind = QQ_TAIL_NIL;
+    lisp_val_t tail_data = nil;
+    lisp_val_t remaining = template_form;
+    for (;;) {
+        if (remaining == nil) {
+            tail_kind = QQ_TAIL_NIL;
+            break;
+        }
+        if ((remaining & TAG_MASK) != TAG_CONS) {
+            tail_kind = QQ_TAIL_CONST;
+            tail_data = remaining;
+            break;
+        }
+        lisp_val_t elem = cc_car(remaining);
+        if (elem == g_sym_unquote || elem == g_sym_unquote_splicing) {
+            lisp_val_t unq_rest = cc_cdr(remaining);
+            if ((unq_rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            tail_kind = QQ_TAIL_UNQUOTE;
+            tail_data = cc_car(unq_rest);
+            break;
+        }
+        if ((elem & TAG_MASK) == TAG_CONS && cc_car(elem) == g_sym_unquote_splicing) {
+            lisp_val_t splice_rest = cc_cdr(elem);
+            if ((splice_rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+                return 0;
+            }
+            items[item_count].data = cc_car(splice_rest);
+            items[item_count].is_splice = 1;
+            item_count++;
+            remaining = cc_cdr(remaining);
+            continue;
+        }
+        if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+            return 0;
+        }
+        items[item_count].data = elem;
+        items[item_count].is_splice = 0;
+        item_count++;
+        remaining = cc_cdr(remaining);
+    }
+
+    // paramsは本関数の残り全体(tail・各要素の再帰コンパイル、いずれもza_compile_lambda
+    // 経由の実アロケーションを伴い得る)で使われ続けるため、za_compile_callのfn_sym/
+    // paramsと同じ理由で明示的に保護する。
+    GC_PROTECT(params);
+
+    // 4. 呼び出し前のgc_rootsを保存する(za_compile_callの手順1と同じ用途)。
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, za_qq_saved_head_off(qq_depth));
+
+    UINT64 ct_patches[ZA_MAX_QQ_ELEMENTS + 1];
+    UINT64 ct_patch_count = 0;
+
+    // 5. tailをfoldの初期シードとしてaccスロットへ評価・link(za_compile_callのacc
+    // 初期化に相当、ただしnil固定ではなくtailの実際の値を使う)。
+    switch (tail_kind) {
+        case QQ_TAIL_NIL:
+            jit_movabs_rax(nil);
+            break;
+        case QQ_TAIL_CONST: {
+            za_operand_t tail_leaf;
+            if (!za_classify_quoted_value(tail_data, &tail_leaf)) {
+                return 0;
+            }
+            za_emit_operand(&tail_leaf);
+            break;
+        }
+        case QQ_TAIL_UNQUOTE:
+            if (!za_compile_operand(tail_data, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth,
+                                     tb_ctx, call_depth, arith_depth)) {
+                return 0;
+            }
+            break;
+    }
+    ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+    za_store_slot(ZA_REG_RAX, za_qq_acc_val_off(qq_depth));
+    za_emit_gc_link_slot(za_qq_acc_val_off(qq_depth), za_qq_acc_node_off(qq_depth));
+
+    // 6. 各要素を左から順に評価し、要素スロットへ格納・link(za_compile_callの手順2と
+    // 同じ、制御転送はabort_cleanupへ合流する)。ELEMENTはこの関数自身をqq_depth+1で
+    // 再帰し、SPLICEはza_compile_operandで直接評価する(上記doc comment参照)。
+    for (UINT64 i = 0; i < item_count; i++) {
+        int ok;
+        if (items[i].is_splice) {
+            ok = za_compile_operand(items[i].data, params, fixed_count, locals, syms, env, trampoline_offset,
+                                     nlx_depth, tb_ctx, call_depth, arith_depth);
+        } else {
+            ok = za_compile_quasiquote(items[i].data, params, fixed_count, locals, syms, env, trampoline_offset,
+                                        nlx_depth, tb_ctx, call_depth, arith_depth, qq_depth + 1);
+        }
+        if (!ok) {
+            return 0;
+        }
+        ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+        za_store_slot(ZA_REG_RAX, za_qq_elem_val_off(qq_depth, i));
+        za_emit_gc_link_slot(za_qq_elem_val_off(qq_depth, i), za_qq_elem_node_off(qq_depth, i));
+    }
+
+    // abort_cleanup: tail/要素評価中の制御転送で中断した場合のみ到達する(通常経路は
+    // 直後のjmpで読み飛ばす。za_compile_callのabort_cleanupと同型)。
+    UINT64 abort_skip_patch = jit_emit_jmp_rel32_placeholder();
+    UINT64 abort_cleanup_offset = g_jit_used;
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, za_qq_saved_head_off(qq_depth));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 abort_to_end_patch = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32(abort_skip_patch);
+    for (UINT64 i = 0; i < ct_patch_count; i++) {
+        jit_patch_rel32_target(ct_patches[i], abort_cleanup_offset);
+    }
+
+    // 7. 右から左へfoldする(ELEMENTはos_make_cons、SPLICEはqq_append)。
+    for (UINT64 i = item_count; i > 0; i--) {
+        za_load_slot(ZA_REG_RCX, za_qq_elem_val_off(qq_depth, i - 1));
+        za_load_slot(ZA_REG_RDX, za_qq_acc_val_off(qq_depth));
+        void *combinator = items[i - 1].is_splice ? (void *)qq_append : (void *)os_make_cons;
+        jit_movabs_reg(ZA_REG_R11, (UINT64)combinator);
+        jit_call_r11();
+        za_store_slot(ZA_REG_RAX, za_qq_acc_val_off(qq_depth));
+    }
+
+    // 8. リンクをまとめて外し、accスロットから最終結果をraxへ読み直す(za_gc_unlink自体
+    // もCALL経由でraxを破壊するため)。
+    za_load_slot(ZA_REG_RCX, za_qq_saved_head_off(qq_depth));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    za_load_slot(ZA_REG_RAX, za_qq_acc_val_off(qq_depth));
+
     jit_patch_rel32(abort_to_end_patch);
     return 1;
 }
