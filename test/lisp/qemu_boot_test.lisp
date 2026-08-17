@@ -14,6 +14,7 @@
 (load "test/lisp/za_test_ext14.lisp")
 (load "test/lisp/za_test_ext15.lisp")
 (load "test/lisp/za_test_ext16.lisp")
+(load "test/lisp/za_test_ext17.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

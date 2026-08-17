@@ -358,8 +358,12 @@ UINT64 os_gc_collect_count(void) {
  * 登録する(idempotent: 同じポインタを複数回登録しても1回分の登録として扱う)。
  * initialize_processes等、同じアドレスを何度も渡してくる呼び出し元があるため、
  * 単純な追加だけだとテーブルがすぐ枯渇する。
+ * za.c側の各スロットプール(g_za_quote_slots/g_za_number_slots/g_za_lambda_slots、
+ * 各上限32、いずれもスロットごとに異なるアドレスをidempotentでなく都度登録する)
+ * だけで最大96、プロセス環境(PROCESS_COUNT)分を加えるとさらに増えるため、
+ * 三者が同時に上限近くまで使われる状況を見込んで十分な余裕を持たせる。
  */
-#define GC_MAX_EXTRA_ROOTS 40
+#define GC_MAX_EXTRA_ROOTS 160
 static lisp_val_t *g_gc_extra_roots[GC_MAX_EXTRA_ROOTS];
 static UINT64 g_gc_extra_root_count = 0;
 
