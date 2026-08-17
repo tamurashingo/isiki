@@ -36,6 +36,14 @@ static int g_za_saw_setq_local = 0;
  * za_try_compile_defun末尾参照)。 */
 static int g_za_saw_escaping_lambda = 0;
 
+/** 拡張(flet/labels): 今回のdefun内で`(function name)`がflet/labels束縛関数を
+ * 指すケースをコンパイルしたことを示すフラグ。束縛関数のgensym登録は
+ * flet/labels本体の動的extent内でのみglobal_environment上に存在するため、
+ * `(function name)`でクロージャを取り出してその外へ持ち出す(脱出させる)使い方は
+ * 対応できない。g_za_saw_escaping_lambdaと同じ「粗い過大近似+無条件fallback」で
+ * 安全側に倒す(za_try_compile_defun末尾参照)。 */
+static int g_za_saw_flet_labels_escape = 0;
+
 static void jit_emit8(UINT8 b) {
     if (g_jit_used >= JIT_CODE_SIZE) {
         g_jit_overflow = 1;
@@ -335,6 +343,53 @@ static lisp_val_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS];
 static UINT64 g_za_quote_slot_count = 0;
 
 /**
+ * g_za_quote_slotsプールから1枠確保し、valueを格納してos_gc_register_rootする
+ * (quoteのヒープ値ケースだけでなく、flet/labelsのgensymシンボル保持でも共有する
+ * — gensymはg_symbol_tableに載らないため名前再解決に乗せられず、このスロット越しに
+ * しか安全に参照できない、documents/jit.md/このファイル冒頭のコメント参照)。
+ * @return 確保できれば1(out_slot_idxに書く)、プール枯渇なら0
+ */
+static int za_alloc_quote_slot(lisp_val_t value, UINT64 *out_slot_idx) {
+    if (g_za_quote_slot_count >= ZA_MAX_QUOTE_SLOTS) {
+        return 0;
+    }
+    UINT64 slot_idx = g_za_quote_slot_count++;
+    g_za_quote_slots[slot_idx] = value;
+    os_gc_register_root(&g_za_quote_slots[slot_idx]);
+    *out_slot_idx = slot_idx;
+    return 1;
+}
+
+/**
+ * (quote X)のXが確定した後の分類本体(za_classify_operandのquote分岐と
+ * za_compile_quasiquoteの定数畳み込みで共有する)。呼び出し側は`(quote X)`という
+ * consを実際に合成せず、Xの値をそのまま渡すこと — quotedを未保護のままos_make_cons
+ * で新たなconsを組んでから委譲すると、その合成呼び出し自体がGCを引き起こした場合に
+ * quotedがFrom空間の古いアドレスを指したままza_alloc_quote_slotへ格納されてしまう
+ * (za_alloc_quote_slotはvalueをそのまま信頼して格納するだけで、moveされたかどうかの
+ * 検証はしない)。
+ */
+static int za_classify_quoted_value(lisp_val_t quoted, za_operand_t *out) {
+    if ((quoted & TAG_MASK) == TAG_SYMBOL) {
+        out->is_literal = 2;
+        out->literal = quoted;
+        return 1;
+    }
+    if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM || (quoted & TAG_MASK) == TAG_CHAR) {
+        out->is_literal = 1;
+        out->literal = quoted;
+        return 1;
+    }
+    UINT64 slot_idx;
+    if (!za_alloc_quote_slot(quoted, &slot_idx)) {
+        return 0;
+    }
+    out->is_literal = 5;
+    out->param_index = slot_idx;
+    return 1;
+}
+
+/**
  * 拡張13: 裸の(quoteされていない)float/bignumリテラル用の、g_za_quote_slotsと同型の
  * スロット配列。reader.cがソースをパースした時点でヒープ確保済みのTAG_INSTANCE値
  * (MAGIC_FLOAT/MAGIC_BIGNUM)をここに1回だけ格納し、os_gc_register_rootでGCに
@@ -367,6 +422,55 @@ typedef struct za_local_scope {
     UINT64 count;
     const struct za_local_scope *parent;
 } za_local_scope_t;
+
+/** flet/labelsの同時束縛数の上限(ZA_MAX_LOCALS_PER_LETと同じ考え方の実装上の固定上限)。
+ * フレームレイアウト定数群より前で定義する。 */
+#define ZA_MAX_FLET_BINDINGS 4
+
+/** flet/labels束縛関数1個分のコンパイル時ブックキーピング。gensym_slot_addrは
+ * g_za_quote_slots(za_alloc_quote_slot)上のこの束縛専用のgensymシンボルの
+ * アドレスで、生成コードはここから都度現在値をロードして
+ * os_get_function/os_set_function(…, global_environment)の第1引数に使う
+ * (gensymは名前再解決に乗せられないため、documents/jit.md参照)。 */
+typedef struct za_fn_binding {
+    lisp_val_t orig_name;
+    lisp_val_t *gensym_slot_addr;
+} za_fn_binding_t;
+
+/** flet/labels 1段分のスコープ。za_local_scope_tと同じ「親への連結リスト、
+ * Cスタック上、実行時スロット不要」設計。束縛関数の本体は常にインタプリタ実行
+ * (JIT再帰しない)なので、このスコープが実際に読まれるのはコンパイル時の2箇所
+ * (za_compile_callの呼び出し先解決、za_classify_operandの(function sym)判定)
+ * のみであり、既存のnlx_depth/localsのように全関数へパラメータとしてスレッド
+ * せず、za_compile_flet_labelsがコンパイル対象body評価の直前後でのみ
+ * g_za_fn_scope(下記)を差し替える(save/restore)方式を採る。C再帰は
+ * レキシカルネストと1対1に対応するため、この方式はパラメータスレッディングと
+ * 意味的に等価である。 */
+typedef struct za_fn_scope {
+    za_fn_binding_t bindings[ZA_MAX_FLET_BINDINGS];
+    UINT64 count;
+    const struct za_fn_scope *parent;
+} za_fn_scope_t;
+
+/** 現在コンパイル中の式を包むflet/labelsスコープの連結リスト先頭。
+ * za_compile_flet_labelsがbody評価の直前に新スコープへ差し替え、直後に元へ戻す
+ * (za_fn_scope_tのコメント参照)。 */
+static const za_fn_scope_t *g_za_fn_scope = 0;
+
+/** g_za_fn_scope(を含む親チェーン全体)からsymを探す。
+ * @return 見つかれば1(out_bindingに書く)、見つからなければ0
+ */
+static int za_fn_scope_lookup(const za_fn_scope_t *scope, lisp_val_t sym, const za_fn_binding_t **out_binding) {
+    for (const za_fn_scope_t *s = scope; s != 0; s = s->parent) {
+        for (UINT64 i = 0; i < s->count; i++) {
+            if (s->bindings[i].orig_name == sym) {
+                *out_binding = &s->bindings[i];
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
 
 /**
  * paramsの固定引数部分(先頭からfixed_count個)の中からsymと同じシンボルの位置(0始まり)を探す。
@@ -552,34 +656,7 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
             return 0;
         }
         lisp_val_t quoted = cc_car(rest);
-        if ((quoted & TAG_MASK) == TAG_SYMBOL) {
-            out->is_literal = 2;
-            out->literal = quoted;
-            return 1;
-        }
-        // fixnum/char/nilは即値(GCで移動しない)なので、fixnumリテラルと同じく
-        // movabsで直接埋め込める(nilが安全な理由: g_nil_cellというFrom/To空間の
-        // どちらにも属さない固定領域。charが安全な理由: os_make_charはヒープ確保を
-        // 伴わない純粋なビットパック)。
-        if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM || (quoted & TAG_MASK) == TAG_CHAR) {
-            out->is_literal = 1;
-            out->literal = quoted;
-            return 1;
-        }
-        // cons(nil以外)/string/instance/raw_pointer: ヒープ確保されGCで移動しうる
-        // ため、za_compile_lambdaのクロージャキャプチャ(g_za_lambda_slots)と同じ
-        // 「スロット+os_gc_register_root」パターンで扱う。quotedはすでにdefunソース
-        // ASTの一部としてヒープ上に存在する値をそのままコピーするだけなので、
-        // ここで新たなヒープ確保は発生しない。
-        if (g_za_quote_slot_count >= ZA_MAX_QUOTE_SLOTS) {
-            return 0;
-        }
-        UINT64 slot_idx = g_za_quote_slot_count++;
-        g_za_quote_slots[slot_idx] = quoted;
-        os_gc_register_root(&g_za_quote_slots[slot_idx]);
-        out->is_literal = 5;
-        out->param_index = slot_idx;
-        return 1;
+        return za_classify_quoted_value(quoted, out);
     }
     // 拡張11: (function sym)。symがシンボルの場合のみ対応する(非シンボル、
     // 例えば(function (lambda ...))はza_is_excluded_special_formのガードで
@@ -592,6 +669,16 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
         }
         lisp_val_t target = cc_car(rest);
         if ((target & TAG_MASK) != TAG_SYMBOL) {
+            return 0;
+        }
+        // flet/labels束縛関数を(function name)で取り出すケースは、gensymの
+        // global_environment登録がflet/labelsの動的extentの外では復元済み(=消えて
+        // いる)ため、クロージャがそのextentを越えて使われると解決に失敗する。
+        // 安全側に倒して無条件fallbackさせる(g_za_saw_flet_labels_escapeのコメント
+        // 参照、既存のg_za_saw_escaping_lambdaと同じ思想)。
+        const za_fn_binding_t *binding;
+        if (za_fn_scope_lookup(g_za_fn_scope, target, &binding)) {
+            g_za_saw_flet_labels_escape = 1;
             return 0;
         }
         out->is_literal = 6;
@@ -743,7 +830,40 @@ static void za_gc_unlink_node(gc_rootnode *node) {
 #define ZA_OFF_ARITH_BASE (ZA_OFF_CALL_BASE + ZA_MAX_CALL_DEPTH * ZA_CALL_SLOT_SIZE)
 #define ZA_ARITH_SLOT_SIZE 24  /* 値8バイト+gc_rootnode16バイト */
 /* 4*24=96は元から16の倍数なので、ZA_MAX_CALL_DEPTHのように偶数に揃える特別な配慮は不要。 */
-#define ZA_FRAME_EXTRA (ZA_OFF_ARITH_BASE + ZA_MAX_ARITH_DEPTH * ZA_ARITH_SLOT_SIZE)
+#define ZA_OFF_FLET_BASE (ZA_OFF_ARITH_BASE + ZA_MAX_ARITH_DEPTH * ZA_ARITH_SLOT_SIZE)
+/* flet/labels: 束縛関数を1個ずつ逐次構築して即os_set_functionで消費するため
+ * (本体はインタプリタ実行=不透明データなので構築時点では評価されない、
+ * za_compile_lambdaの兄弟lambdaが同じTMPスロットを再利用できる理由と同じ)、
+ * キャプチャenv構築用のスクラッチはZA_OFF_LAMBDA_*と同型の単一固定スロットで足りる。 */
+#define ZA_OFF_FLET_SAVED_HEAD ZA_OFF_FLET_BASE
+#define ZA_OFF_FLET_ENV_VAL    (ZA_OFF_FLET_BASE + 8)
+#define ZA_OFF_FLET_ENV_NODE   (ZA_OFF_FLET_BASE + 16)  /* 16バイト */
+#define ZA_OFF_FLET_TMP_VAL    (ZA_OFF_FLET_BASE + 32)
+#define ZA_OFF_FLET_TMP_NODE   (ZA_OFF_FLET_BASE + 40)  /* 16バイト、56バイトで終わる */
+/* 56-63: 16バイト境界を保つためのpadding(ZA_OFF_NLX_BASEの264-271と同じ考え方)。 */
+/* 復元用の「旧バインディング値」はin-body全体の実行が終わるまで束縛数×ネスト深さ分
+ * 生存させる必要があるため、ZA_OFF_NLX_BASEと同じ「深さでインデックスする配列」を
+ * さらに束縛数方向にも広げた2次元配列にする(束縛ごとに独立したgc_rootnodeが要る)。 */
+#define ZA_OFF_FLET_OLD_BASE   (ZA_OFF_FLET_BASE + 64)
+#define ZA_FLET_OLD_SLOT_SIZE  24  /* 値8バイト+gc_rootnode16バイト */
+/* quasiquote(za_compile_quasiquote): eval.cのqq_expandはcdr方向にも再帰するが、
+ * これをそのままCの再帰・実行時スロット深さに写すとフラットな要素数(リスト長)が
+ * そのまま深さ上限を消費してしまい非現実的に小さい上限しか許容できなくなる。
+ * そこで1回のquasiquoteレベル内のリスト走査はza_compile_callの引数loopと同じ
+ * 「配列で要素ごとにスロットを持ち、右から左へfoldする」方式にし、深さ(qq_depth)は
+ * 「動的な内容を含むネストしたサブテンプレートに再帰する場合」だけ消費する
+ * (call_depthが要素数[ZA_MAX_OPERANDS]とは別に管理されるのと同じ発想)。 */
+#define ZA_MAX_QQ_DEPTH     4    /* ZA_MAX_CALL_DEPTH等と同じ値 */
+#define ZA_MAX_QQ_ELEMENTS  16   /* ZA_MAX_OPERANDSと同じ値 */
+#define ZA_QQ_SLOT_SIZE     24   /* 値8バイト+gc_rootnode16バイト */
+#define ZA_OFF_QQ_BASE \
+    (ZA_OFF_FLET_OLD_BASE + ZA_MAX_NLX_DEPTH * ZA_MAX_FLET_BINDINGS * ZA_FLET_OLD_SLOT_SIZE)
+/* 1レベル分 = SAVED_HEAD(8、za_call_saved_head_offと同じ用途) +
+ * 要素配列(ZA_MAX_QQ_ELEMENTS個、za_arg_val_offと同じ「配列インデックス」パターン) +
+ * foldアキュムレータ用1個(za_arith_val_offと同じ単一スロット)。 */
+#define ZA_QQ_LEVEL_SIZE    (8 + (ZA_MAX_QQ_ELEMENTS + 1) * ZA_QQ_SLOT_SIZE)
+#define ZA_FRAME_EXTRA \
+    (ZA_OFF_QQ_BASE + ZA_MAX_QQ_DEPTH * ZA_QQ_LEVEL_SIZE)
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
@@ -776,6 +896,30 @@ static UINT32 za_local_node_off(UINT64 depth, UINT64 idx) { return za_local_val_
 
 /** 深さdepth(0始まり)のlet SAVED_HEADスロットのオフセット。 */
 static UINT32 za_let_saved_head_off(UINT64 depth) { return ZA_OFF_LET_SAVED_HEAD_BASE + (UINT32)depth * 8; }
+
+/** nlx_depth(0始まり)・束縛インデックスidxのflet/labels旧バインディング退避スロット
+ * の値オフセット(za_local_val_offと同じ「2次元配列インデックス」パターン)。 */
+static UINT32 za_flet_old_val_off(UINT64 nlx_depth, UINT64 idx) {
+    return ZA_OFF_FLET_OLD_BASE + (UINT32)nlx_depth * (ZA_MAX_FLET_BINDINGS * ZA_FLET_OLD_SLOT_SIZE) +
+           (UINT32)idx * ZA_FLET_OLD_SLOT_SIZE;
+}
+static UINT32 za_flet_old_node_off(UINT64 nlx_depth, UINT64 idx) { return za_flet_old_val_off(nlx_depth, idx) + 8; }
+
+/** 深さqq_depth(0始まり)のquasiquote SAVED_HEADスロットのオフセット
+ * (za_call_saved_head_offと同じ用途)。 */
+static UINT32 za_qq_saved_head_off(UINT64 qq_depth) { return ZA_OFF_QQ_BASE + (UINT32)qq_depth * ZA_QQ_LEVEL_SIZE; }
+/** 深さqq_depth・要素インデックスiのquasiquote要素スロットの値オフセット
+ * (za_arg_val_offと同じ「配列インデックス」パターン)。 */
+static UINT32 za_qq_elem_val_off(UINT64 qq_depth, UINT64 i) {
+    return za_qq_saved_head_off(qq_depth) + 8 + (UINT32)i * ZA_QQ_SLOT_SIZE;
+}
+static UINT32 za_qq_elem_node_off(UINT64 qq_depth, UINT64 i) { return za_qq_elem_val_off(qq_depth, i) + 8; }
+/** 深さqq_depth(0始まり)のquasiquote foldアキュムレータスロットの値オフセット
+ * (要素配列ZA_MAX_QQ_ELEMENTS個分の直後、za_arith_val_offと同じ単一スロットの発想)。 */
+static UINT32 za_qq_acc_val_off(UINT64 qq_depth) {
+    return za_qq_saved_head_off(qq_depth) + 8 + ZA_MAX_QQ_ELEMENTS * ZA_QQ_SLOT_SIZE;
+}
+static UINT32 za_qq_acc_node_off(UINT64 qq_depth) { return za_qq_acc_val_off(qq_depth) + 8; }
 
 /** [rsp+off]の値をregへ読み出す */
 static void za_load_slot(UINT8 reg, UINT32 off) { jit_mov_reg_from_rsp(reg, (INT32)off); }
@@ -963,11 +1107,36 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
  * ここに残す。
  */
 static int za_is_excluded_special_form(lisp_val_t head) {
+    // flet/labels(za_compile_flet_labels)・quasiquote(za_compile_quasiquote)は
+    // ここから除外する(za_compile_exprが一般呼び出し判定より前で無条件に認識するため、
+    // ここに来た時点でどれでもない)。
     return head == g_sym_quote ||
            head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
-           head == g_sym_quasiquote || head == g_sym_function || head == g_sym_flet ||
-           head == g_sym_labels || head == g_sym_defvar || head == g_sym_defconstant ||
+           head == g_sym_function ||
+           head == g_sym_defvar || head == g_sym_defconstant ||
            head == g_sym_defglobal;
+}
+
+/**
+ * formのコンス木のどこかに(unquote x)/(unquote-splicing x)がheadとして現れるかを
+ * コンパイル時だけに判定する(eval.cのqq_expandの分岐条件elem==g_sym_unquote/
+ * unquote_splicingと同じ着眼点の静的解析版)。真ならza_compile_quasiquoteはこの
+ * サブフォームを実行時に組み立てる必要があり、偽なら(quote form)へ丸ごと畳み込める。
+ * Cの素朴な再帰(コンパイル時のみ、実行時スロット/GCは絡まないためza_rewrite_fn_refs
+ * 同様に深さ制限を設けない)。
+ */
+static int za_qq_contains_unquote(lisp_val_t form) {
+    // nilはg_nil_cellという自己参照consでTAG_CONSタグを持つため、下のTAG_CONS判定
+    // だけではnilを弾けずcar(nil)==nilへの無限再帰に陥る(eval.cのqq_expandも
+    // 同じ理由でform==nilを先にチェックしている、この関数直前のコメント参照)。
+    if (form == nil || (form & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t elem = cc_car(form);
+    if (elem == g_sym_unquote || elem == g_sym_unquote_splicing) {
+        return 1;
+    }
+    return za_qq_contains_unquote(elem) || za_qq_contains_unquote(cc_cdr(form));
 }
 
 /**
@@ -1124,6 +1293,22 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
                            const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
                            UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
                            UINT64 arith_depth);
+
+/** `(flet bindings . body)`/`(labels bindings . body)`(is_labelsで判別)。unwind-protect
+ * と同様、復元cleanupを必ず経由させる必要があるためis_tailを取らない(za_compile_flet_labels
+ * 定義直前のコメント参照)。 */
+static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t params, UINT64 fixed_count,
+                                   const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                   UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
+                                   UINT64 trampoline_offset, UINT64 arith_depth);
+
+/** `(quasiquote template)`。za_compile_quasiquote定義直前のコメント参照。qq_depthは
+ * 0始まりで、動的な内容を含むネストしたサブテンプレートに再帰する場合だけ+1する
+ * (1レベル内のリスト走査自体はCのforループで反復するため、要素数は消費しない)。 */
+static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                  UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                                  UINT64 call_depth, UINT64 arith_depth, UINT64 qq_depth);
 
 /** `(progn . body)`。let*の展開の末端(`(let* () . body)` => `(progn ,@body)`)が
  * 必ずこの形を経由するため、let*がlet-IIFEインライン化(拡張B)の恩恵を受けるには
@@ -1383,17 +1568,107 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
 }
 
 /**
+ * 「外側のenv(ZA_OFF_ENV_VAL)を親とする新規environmentを作り、外側関数の固定引数
+ * (params[0..fixed_count-1]、&restを除く)と、呼ばれた時点で見えているlet-IIFE
+ * ローカル(locals、let-IIFEインライン化拡張B)を全てos_set_variableでコピーする」
+ * という、クロージャ用キャプチャenv構築の共通処理を出力する
+ * (za_compile_lambda・za_compile_flet_labelsで共有)。呼び出し前にsaved_head_off/
+ * env_val_off/env_node_off/tmp_val_off/tmp_node_offに対応するスロットが未使用で
+ * あることを前提とする(呼び出し後、env_val_offに新規envが格納されlinkされた状態、
+ * tmp_val_offはlinkされたスクラッチとして残る)。localsは外側→内側の順でコピーする:
+ * os_set_variableは同一env内の既存の同名束縛を上書きするため、この順序であれば
+ * 内側letが外側letや外側paramと同名でシャドーイングしている場合も、後からコピー
+ * される内側の値が正しく最終的に勝つ。
+ */
+static void za_emit_build_capture_env(lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
+                                       UINT32 saved_head_off, UINT32 env_val_off, UINT32 env_node_off,
+                                       UINT32 tmp_val_off, UINT32 tmp_node_off) {
+    // 1. 専用スコープ開始前のgc_rootsを保存する。
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, saved_head_off);
+
+    // 2. 新規env = os_make_environment("LAMBDA-ENV", 現在のenv)を構築し、linkする。
+    UINT64 env_name_off = za_emit_symbol_name(os_make_symbol("LAMBDA-ENV"));
+    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + env_name_off));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_environment);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, env_val_off);
+    za_emit_gc_link_slot(env_val_off, env_node_off);
+
+    // 3. TMPスロットを一度だけlinkし、外側の固定引数を1つずつos_set_variableで
+    // 新規envへコピーする。
+    jit_movabs_rax(nil);
+    za_store_slot(ZA_REG_RAX, tmp_val_off);
+    za_emit_gc_link_slot(tmp_val_off, tmp_node_off);
+
+    lisp_val_t p = params;
+    for (UINT64 i = 0; i < fixed_count; i++) {
+        lisp_val_t param_sym = cc_car(p);
+        p = cc_cdr(p);
+
+        za_operand_t op;
+        op.is_literal = 0;
+        op.param_index = i;
+        za_emit_operand(&op); /* rax = 外側param[i]の現在値 */
+        za_store_slot(ZA_REG_RAX, tmp_val_off);
+
+        UINT64 psym_off = za_emit_symbol_name(param_sym);
+        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + psym_off));
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+        za_load_slot(ZA_REG_RDX, tmp_val_off);
+        za_load_slot(ZA_REG_R8, env_val_off);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
+        jit_call_r11();
+    }
+
+    // 3.5. let-IIFEローカル(locals)を外側→内側の順で同様にコピーする(クロージャ
+    // キャプチャ対策(a)、let-IIFEインライン化拡張B)。localsの連結リストは内側→外側
+    // なので、祖先を配列に集めてから逆順(外側→内側)に処理する。
+    {
+        const za_local_scope_t *chain[ZA_MAX_LET_DEPTH];
+        UINT64 chain_count = 0;
+        for (const za_local_scope_t *s = locals; s != 0 && chain_count < ZA_MAX_LET_DEPTH; s = s->parent) {
+            chain[chain_count++] = s;
+        }
+        for (UINT64 ci = chain_count; ci > 0; ci--) {
+            const za_local_scope_t *s = chain[ci - 1];
+            for (UINT64 i = 0; i < s->count; i++) {
+                za_operand_t lop;
+                lop.is_literal = 4;
+                lop.param_index = s->vars[i].val_off;
+                za_emit_operand(&lop); /* rax = let-localの現在値 */
+                za_store_slot(ZA_REG_RAX, tmp_val_off);
+
+                UINT64 lsym_off = za_emit_symbol_name(s->vars[i].sym);
+                jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + lsym_off));
+                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+                jit_call_r11();
+                jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+                za_load_slot(ZA_REG_RDX, tmp_val_off);
+                za_load_slot(ZA_REG_R8, env_val_off);
+                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
+                jit_call_r11();
+            }
+        }
+    }
+}
+
+/**
  * 「(lambda (lambda_params...) . lambda_body)」から、外側のJIT関数と同じ表現
  * (MAGIC_FUNCTION_INTERPRETED、eval.cのmake_interpreted_function/apply_functionが
  * 素で扱える形)のクロージャを組み立てる機械語を出力する。lambda本体自体はzaが
  * コンパイルせず、呼び出し時は常にインタプリタ経路(apply_function)が実行する。
- * 自由変数解析はせず、外側関数の固定引数(params[0..fixed_count-1]、&restを除く)、
- * および呼ばれた時点で見えているlet-IIFEローカル(locals、let-IIFEインライン化拡張B)
- * を呼ばれるたびに全て新規environmentへos_set_variableでコピーし、それをクロージャの
- * envとする(setqはza対象外なのでコピー後の再代入で共有が破れる心配は無い)。localsは
- * 外側→内側の順でコピーする: os_set_variableは同一env内の既存の同名束縛を上書きする
- * ため、この順序であれば内側letが外側letや外側paramと同名でシャドーイングしている
- * 場合も、後からコピーされる内側の値が正しく最終的に勝つ。
+ * 自由変数解析はせず、外側関数の固定引数と見えているlet-IIFEローカルを呼ばれるたびに
+ * 全て新規environmentへコピーし、それをクロージャのenvとする
+ * (setqはza対象外なのでコピー後の再代入で共有が破れる心配は無い、
+ * za_emit_build_capture_env参照)。
  * @return 対応できれば1、できなければ0(lambdaスロット枯渇時も含む)
  */
 static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
@@ -1422,83 +1697,8 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     os_gc_register_root(&g_za_lambda_slots[slot_idx]);
     lisp_val_t *slot_addr = &g_za_lambda_slots[slot_idx];
 
-    // 1. lambda専用スコープ開始前のgc_rootsを保存する。
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
-    jit_call_r11();
-    za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_SAVED_HEAD);
-
-    // 2. 新規env = os_make_environment("LAMBDA-ENV", 現在のenv)を構築し、linkする。
-    UINT64 env_name_off = za_emit_symbol_name(os_make_symbol("LAMBDA-ENV"));
-    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + env_name_off));
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
-    jit_call_r11();
-    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
-    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_environment);
-    jit_call_r11();
-    za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_ENV_VAL);
-    za_emit_gc_link_slot(ZA_OFF_LAMBDA_ENV_VAL, ZA_OFF_LAMBDA_ENV_NODE);
-
-    // 3. TMPスロットを一度だけlinkし、外側の固定引数を1つずつos_set_variableで
-    // 新規envへコピーする。
-    jit_movabs_rax(nil);
-    za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_TMP_VAL);
-    za_emit_gc_link_slot(ZA_OFF_LAMBDA_TMP_VAL, ZA_OFF_LAMBDA_TMP_NODE);
-
-    lisp_val_t p = params;
-    for (UINT64 i = 0; i < fixed_count; i++) {
-        lisp_val_t param_sym = cc_car(p);
-        p = cc_cdr(p);
-
-        za_operand_t op;
-        op.is_literal = 0;
-        op.param_index = i;
-        za_emit_operand(&op); /* rax = 外側param[i]の現在値 */
-        za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_TMP_VAL);
-
-        UINT64 psym_off = za_emit_symbol_name(param_sym);
-        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + psym_off));
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
-        jit_call_r11();
-        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
-        za_load_slot(ZA_REG_RDX, ZA_OFF_LAMBDA_TMP_VAL);
-        za_load_slot(ZA_REG_R8, ZA_OFF_LAMBDA_ENV_VAL);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
-        jit_call_r11();
-    }
-
-    // 3.5. let-IIFEローカル(locals)を外側→内側の順で同様にコピーする(クロージャ
-    // キャプチャ対策(a)、let-IIFEインライン化拡張B)。localsの連結リストは内側→外側
-    // なので、祖先を配列に集めてから逆順(外側→内側)に処理する。os_set_variableは
-    // 同一env内の既存の同名束縛を上書きするため、この順序であれば内側のシャドーイング
-    // が後から正しく勝つ。
-    {
-        const za_local_scope_t *chain[ZA_MAX_LET_DEPTH];
-        UINT64 chain_count = 0;
-        for (const za_local_scope_t *s = locals; s != 0 && chain_count < ZA_MAX_LET_DEPTH; s = s->parent) {
-            chain[chain_count++] = s;
-        }
-        for (UINT64 ci = chain_count; ci > 0; ci--) {
-            const za_local_scope_t *s = chain[ci - 1];
-            for (UINT64 i = 0; i < s->count; i++) {
-                za_operand_t lop;
-                lop.is_literal = 4;
-                lop.param_index = s->vars[i].val_off;
-                za_emit_operand(&lop); /* rax = let-localの現在値 */
-                za_store_slot(ZA_REG_RAX, ZA_OFF_LAMBDA_TMP_VAL);
-
-                UINT64 lsym_off = za_emit_symbol_name(s->vars[i].sym);
-                jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + lsym_off));
-                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
-                jit_call_r11();
-                jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
-                za_load_slot(ZA_REG_RDX, ZA_OFF_LAMBDA_TMP_VAL);
-                za_load_slot(ZA_REG_R8, ZA_OFF_LAMBDA_ENV_VAL);
-                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
-                jit_call_r11();
-            }
-        }
-    }
+    za_emit_build_capture_env(params, fixed_count, locals, ZA_OFF_LAMBDA_SAVED_HEAD, ZA_OFF_LAMBDA_ENV_VAL,
+                               ZA_OFF_LAMBDA_ENV_NODE, ZA_OFF_LAMBDA_TMP_VAL, ZA_OFF_LAMBDA_TMP_NODE);
 
     // 4. クロージャ本体を構築する:
     // os_make_instance(MAGIC_FUNCTION_INTERPRETED, lambda_params, lambda_body, new_env)
@@ -1966,6 +2166,18 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         return za_compile_go(form, nlx_depth, tb_ctx);
     }
 
+    // 拡張(flet/labels): unwind-protectと同様、復元cleanupを必ず経由させる必要が
+    // あるため一般呼び出しの判定より前で無条件に認識する(za_compile_flet_labels
+    // 定義直前のコメント参照)。
+    if (head == g_sym_flet) {
+        return za_compile_flet_labels(form, 0, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, call_depth,
+                                       trampoline_offset, arith_depth);
+    }
+    if (head == g_sym_labels) {
+        return za_compile_flet_labels(form, 1, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, call_depth,
+                                       trampoline_offset, arith_depth);
+    }
+
     // 拡張6(動的変数): if/block等と同様、一般呼び出しの判定より前で無条件に認識する。
     if (head == g_sym_dynamic) {
         return za_compile_dynamic(form);
@@ -1982,6 +2194,18 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     if (head == g_sym_setq) {
         return za_compile_setq(form, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, call_depth,
                                 trampoline_offset, arith_depth);
+    }
+
+    // 拡張(quasiquote): if/setq等と同様、一般呼び出しの判定より前で無条件に認識する
+    // (za_compile_quasiquote定義直前のコメント参照)。formは`(quasiquote template)`
+    // という2要素リストなので、渡すのはcadrのtemplateだけ。qq_depthは0から始める。
+    if (head == g_sym_quasiquote) {
+        lisp_val_t qq_rest = cc_cdr(form);
+        if ((qq_rest & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        return za_compile_quasiquote(cc_car(qq_rest), params, fixed_count, locals, syms, env, trampoline_offset,
+                                      nlx_depth, tb_ctx, call_depth, arith_depth, 0);
     }
 
     // 一般呼び出し: headがシンボルで、除外リストの特殊形式でなければ関数呼び出しとして
@@ -2022,6 +2246,12 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     if (call_depth >= ZA_MAX_CALL_DEPTH) {
         return 0;
     }
+    // fn_symがflet/labels束縛関数を指す場合、名前再解決ではなくgensymスロット経由で
+    // 解決する(下記手順3参照)。このスコープ探索はfn_sym自身(=呼び出しformの構文上の
+    // head)にのみ関わるため、引数評価中に入れ子のflet/labelsがg_za_fn_scopeを一時的に
+    // 差し替えて元に戻す(za_compile_flet_labels参照)影響を受けない。
+    const za_fn_binding_t *fn_binding = 0;
+    za_fn_scope_lookup(g_za_fn_scope, fn_sym, &fn_binding);
     /*
      * fn_sym/paramsは引数loop(下記)がza_compile_expr経由でza_compile_lambdaへ再入した
      * 場合、そちら側でos_make_cons/os_make_symbolという実アロケーションを伴うコンパイル
@@ -2084,16 +2314,32 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     }
 
     // 3. os_get_function(fn_sym, env)をfnスロットへ書き込み、linkする。
-    UINT64 name_off = za_emit_symbol_name(fn_sym);
-    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
-    jit_call_r11();
-    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    if (fn_binding) {
+        // flet/labels束縛関数: gensymは名前再解決(g_symbol_table検索)に乗せられない
+        // ため、コンパイル時に確保したgensymスロットのアドレスをmovabsで埋め込み、
+        // そこから都度現在値を読む(za_alloc_quote_slot/is_literal=5と同じ手口)。
+        // 解決は常にglobal_environmentに対して行う(Design B、レキシカルenvは
+        // 使わない。global_environment自体もGCで内容が更新されうるため、値そのもの
+        // ではなく変数のアドレスを埋め込み都度dereferenceする)。
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)fn_binding->gensym_slot_addr);
+        jit_mov_reg_from_mem_disp8(ZA_REG_R13, ZA_REG_R11, 0);
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&global_environment);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RDX, ZA_REG_R11, 0);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+        jit_call_r11();
+    } else {
+        UINT64 name_off = za_emit_symbol_name(fn_sym);
+        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
 
-    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
-    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
-    jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+        jit_call_r11();
+    }
     za_store_slot(ZA_REG_RAX, ZA_OFF_FN_VAL);
     za_emit_gc_link_slot(ZA_OFF_FN_VAL, ZA_OFF_FN_NODE);
 
@@ -2147,6 +2393,223 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     // 引数評価中に制御転送で中断した場合の共通着地点(is_tail=0の通常完了地点とも
     // 一致する)。ここに到達する時点でrax=結果(通常のapply結果、または中断した
     // 制御転送値)であり、追加の処理は不要。
+    jit_patch_rel32(abort_to_end_patch);
+    return 1;
+}
+
+/** za_compile_quasiquoteの1レベル分のリスト走査で集める要素(コンパイル時のみ使う、
+ * 実行時スロットとは無関係)。is_splice=0はELEMENT(qq_expandのhead位置、この関数
+ * 自身をqq_depth+1で再帰する)、is_splice=1はSPLICE(,@xのx、za_compile_operandで
+ * 直接評価する、テンプレート再帰はしない)。 */
+typedef struct {
+    lisp_val_t data;
+    int is_splice;
+} za_qq_item_t;
+
+/**
+ * 「(quasiquote template)」を検証しつつeval.cのqq_expand/qq_appendと等価な結果を
+ * 実行時に構築する機械語を出力する。eval.cのqq_expand同様、ネストしたbacktickは
+ * 特別扱いしない(quote-levelを追跡しない素朴な実装。za_qq_contains_unquote/この
+ * 関数のどちらもQUASIQUOTEシンボル自体を特別扱いしないため、自然にこの意味論に
+ * 一致する)。
+ *
+ * 1. templateのコンス木のどこにもunquote/unquote-splicingが現れなければ
+ *    (za_qq_contains_unquote)、(quote template)へ丸ごと合成し既存のquote
+ *    コンパイルパス(za_compile_operand経由のza_classify_operand/za_alloc_quote_slot)
+ *    へ委譲する(実行時cons化は一切不要)。
+ * 2. templateが直接`(unquote x)`/`(unquote-splicing x)`(qq_expandの先頭チェックに
+ *    相当)なら、xをza_compile_operandでそのままコンパイルする。foldもqq_depthの
+ *    消費も不要。
+ * 3. それ以外は1レベル分のリストをCのforループで走査し(za_compile_callの引数loop
+ *    と同じ「配列に集めてから右から左へfold」方式、リスト長はqq_depthを消費しない)、
+ *    各要素をELEMENT(この関数自身をqq_depth+1で再帰=qq_expandの「head =
+ *    qq_expand(elem)」に相当。中でさらに(1)(2)へ自然に分岐する)、または
+ *    SPLICE(,@xのxをza_compile_operandで直接評価。qq_expandがxをos_evalで直接
+ *    評価するのに対応)に分類する。末尾(tail)はTAIL_NIL(nil)/TAIL_CONST(atom、
+ *    dotted listの終端)/TAIL_UNQUOTE(x、`(a . ,b)`の,bまたは裸の,x/,@x)の
+ *    いずれかで、foldの初期シードになる。right-to-leftでfoldし、ELEMENTは
+ *    os_make_cons、SPLICEはqq_appendを使う(za_compile_callの手順4と同型)。
+ *    qq_depth>=ZA_MAX_QQ_DEPTH、要素数>=ZA_MAX_QQ_ELEMENTSはいずれもfallback
+ *    (0を返す)。NLX(制御転送)安全性はza_compile_callのabort_cleanupと同じ
+ *    二層構造で確保する。
+ * @param qq_depth 現在のネスト深さ(0始まり、ELEMENT再帰時だけ+1する)
+ * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元が
+ * ロールバックするので気にしなくてよい)
+ */
+static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UINT64 fixed_count,
+                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                  UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
+                                  UINT64 call_depth, UINT64 arith_depth, UINT64 qq_depth) {
+    // 1. 全体が定数(unquote/unquote-splicingを一切含まない)なら丸ごとquote委譲する。
+    // (quote template_form)というconsを実際に合成してza_compile_operandへ委譲すると、
+    // その合成用os_make_cons自体がGCを引き起こした場合にtemplate_formが未保護のまま
+    // From空間の古いアドレスを指し続けてしまう(za_classify_quoted_value直前のコメント
+    // 参照)ため、合成せずtemplate_formをそのまま分類する。
+    if (!za_qq_contains_unquote(template_form)) {
+        za_operand_t leaf;
+        if (!za_classify_quoted_value(template_form, &leaf)) {
+            return 0;
+        }
+        za_emit_operand(&leaf);
+        return 1;
+    }
+    // 2. template自身が裸の(unquote x)/(unquote-splicing x)(qq_expandの先頭チェック)
+    // なら、xを直接コンパイルしfold不要で済ませる。
+    if ((template_form & TAG_MASK) == TAG_CONS) {
+        lisp_val_t bare_head = cc_car(template_form);
+        if (bare_head == g_sym_unquote || bare_head == g_sym_unquote_splicing) {
+            lisp_val_t bare_rest = cc_cdr(template_form);
+            if ((bare_rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            return za_compile_operand(cc_car(bare_rest), params, fixed_count, locals, syms, env, trampoline_offset,
+                                       nlx_depth, tb_ctx, call_depth, arith_depth);
+        }
+    }
+    if (qq_depth >= ZA_MAX_QQ_DEPTH) {
+        return 0;
+    }
+
+    // 3. 1レベル分のリストを走査し、要素配列とtailの種類を確定する(コンパイル時のみ、
+    // cc_car/cc_cdrの読み出しだけでアロケーションは起きない)。
+    za_qq_item_t items[ZA_MAX_QQ_ELEMENTS];
+    UINT64 item_count = 0;
+    enum { QQ_TAIL_NIL, QQ_TAIL_CONST, QQ_TAIL_UNQUOTE } tail_kind = QQ_TAIL_NIL;
+    lisp_val_t tail_data = nil;
+    lisp_val_t remaining = template_form;
+    for (;;) {
+        if (remaining == nil) {
+            tail_kind = QQ_TAIL_NIL;
+            break;
+        }
+        if ((remaining & TAG_MASK) != TAG_CONS) {
+            tail_kind = QQ_TAIL_CONST;
+            tail_data = remaining;
+            break;
+        }
+        lisp_val_t elem = cc_car(remaining);
+        if (elem == g_sym_unquote || elem == g_sym_unquote_splicing) {
+            lisp_val_t unq_rest = cc_cdr(remaining);
+            if ((unq_rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            tail_kind = QQ_TAIL_UNQUOTE;
+            tail_data = cc_car(unq_rest);
+            break;
+        }
+        if ((elem & TAG_MASK) == TAG_CONS && cc_car(elem) == g_sym_unquote_splicing) {
+            lisp_val_t splice_rest = cc_cdr(elem);
+            if ((splice_rest & TAG_MASK) != TAG_CONS) {
+                return 0;
+            }
+            if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+                return 0;
+            }
+            items[item_count].data = cc_car(splice_rest);
+            items[item_count].is_splice = 1;
+            item_count++;
+            remaining = cc_cdr(remaining);
+            continue;
+        }
+        if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+            return 0;
+        }
+        items[item_count].data = elem;
+        items[item_count].is_splice = 0;
+        item_count++;
+        remaining = cc_cdr(remaining);
+    }
+
+    // paramsは本関数の残り全体(tail・各要素の再帰コンパイル、いずれもza_compile_lambda
+    // 経由の実アロケーションを伴い得る)で使われ続けるため、za_compile_callのfn_sym/
+    // paramsと同じ理由で明示的に保護する。
+    GC_PROTECT(params);
+
+    // 4. 呼び出し前のgc_rootsを保存する(za_compile_callの手順1と同じ用途)。
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+    jit_call_r11();
+    za_store_slot(ZA_REG_RAX, za_qq_saved_head_off(qq_depth));
+
+    UINT64 ct_patches[ZA_MAX_QQ_ELEMENTS + 1];
+    UINT64 ct_patch_count = 0;
+
+    // 5. tailをfoldの初期シードとしてaccスロットへ評価・link(za_compile_callのacc
+    // 初期化に相当、ただしnil固定ではなくtailの実際の値を使う)。
+    switch (tail_kind) {
+        case QQ_TAIL_NIL:
+            jit_movabs_rax(nil);
+            break;
+        case QQ_TAIL_CONST: {
+            za_operand_t tail_leaf;
+            if (!za_classify_quoted_value(tail_data, &tail_leaf)) {
+                return 0;
+            }
+            za_emit_operand(&tail_leaf);
+            break;
+        }
+        case QQ_TAIL_UNQUOTE:
+            if (!za_compile_operand(tail_data, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth,
+                                     tb_ctx, call_depth, arith_depth)) {
+                return 0;
+            }
+            break;
+    }
+    ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+    za_store_slot(ZA_REG_RAX, za_qq_acc_val_off(qq_depth));
+    za_emit_gc_link_slot(za_qq_acc_val_off(qq_depth), za_qq_acc_node_off(qq_depth));
+
+    // 6. 各要素を左から順に評価し、要素スロットへ格納・link(za_compile_callの手順2と
+    // 同じ、制御転送はabort_cleanupへ合流する)。ELEMENTはこの関数自身をqq_depth+1で
+    // 再帰し、SPLICEはza_compile_operandで直接評価する(上記doc comment参照)。
+    for (UINT64 i = 0; i < item_count; i++) {
+        int ok;
+        if (items[i].is_splice) {
+            ok = za_compile_operand(items[i].data, params, fixed_count, locals, syms, env, trampoline_offset,
+                                     nlx_depth, tb_ctx, call_depth, arith_depth);
+        } else {
+            ok = za_compile_quasiquote(items[i].data, params, fixed_count, locals, syms, env, trampoline_offset,
+                                        nlx_depth, tb_ctx, call_depth, arith_depth, qq_depth + 1);
+        }
+        if (!ok) {
+            return 0;
+        }
+        ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
+        za_store_slot(ZA_REG_RAX, za_qq_elem_val_off(qq_depth, i));
+        za_emit_gc_link_slot(za_qq_elem_val_off(qq_depth, i), za_qq_elem_node_off(qq_depth, i));
+    }
+
+    // abort_cleanup: tail/要素評価中の制御転送で中断した場合のみ到達する(通常経路は
+    // 直後のjmpで読み飛ばす。za_compile_callのabort_cleanupと同型)。
+    UINT64 abort_skip_patch = jit_emit_jmp_rel32_placeholder();
+    UINT64 abort_cleanup_offset = g_jit_used;
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, za_qq_saved_head_off(qq_depth));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 abort_to_end_patch = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32(abort_skip_patch);
+    for (UINT64 i = 0; i < ct_patch_count; i++) {
+        jit_patch_rel32_target(ct_patches[i], abort_cleanup_offset);
+    }
+
+    // 7. 右から左へfoldする(ELEMENTはos_make_cons、SPLICEはqq_append)。
+    for (UINT64 i = item_count; i > 0; i--) {
+        za_load_slot(ZA_REG_RCX, za_qq_elem_val_off(qq_depth, i - 1));
+        za_load_slot(ZA_REG_RDX, za_qq_acc_val_off(qq_depth));
+        void *combinator = items[i - 1].is_splice ? (void *)qq_append : (void *)os_make_cons;
+        jit_movabs_reg(ZA_REG_R11, (UINT64)combinator);
+        jit_call_r11();
+        za_store_slot(ZA_REG_RAX, za_qq_acc_val_off(qq_depth));
+    }
+
+    // 8. リンクをまとめて外し、accスロットから最終結果をraxへ読み直す(za_gc_unlink自体
+    // もCALL経由でraxを破壊するため)。
+    za_load_slot(ZA_REG_RCX, za_qq_saved_head_off(qq_depth));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    za_load_slot(ZA_REG_RAX, za_qq_acc_val_off(qq_depth));
+
     jit_patch_rel32(abort_to_end_patch);
     return 1;
 }
@@ -2577,6 +3040,506 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     return 1;
 }
 
+/** za_rewrite_fn_refsの前方宣言(body-list版と相互再帰する)。 */
+static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_fn_scope_t *scope, int *ok);
+/** za_rewrite_binding_list(入れ子flet/labelsのbindings書き換え)の前方宣言。 */
+static lisp_val_t za_rewrite_binding_list(lisp_val_t bindings, lisp_val_t env, const za_fn_scope_t *scope, int *ok);
+
+/**
+ * formsを「progn的に評価される式の並び」(labels束縛bodyそのもの、flet/labels
+ * (入れ子含む)のbody部分)として扱い、各要素をza_rewrite_fn_refsで書き換えた上で
+ * os_make_consで新しいリストへ組み直す。コンパイル時アロケーション
+ * (os_make_cons)を伴うため、za_compile_call等と同じ規約でGC_PROTECTしながら進める。
+ * @param ok 失敗時(*okが元々1でも)0を書く。呼び出し元はこの場合戻り値を無視して
+ * fallbackする。
+ */
+static lisp_val_t za_rewrite_body_list(lisp_val_t forms, lisp_val_t env, const za_fn_scope_t *scope, int *ok) {
+    if (forms == nil) {
+        return nil;
+    }
+    if ((forms & TAG_MASK) != TAG_CONS) {
+        *ok = 0;
+        return nil;
+    }
+    GC_PROTECT(forms);
+    lisp_val_t first = za_rewrite_fn_refs(cc_car(forms), env, scope, ok);
+    if (!*ok) {
+        return nil;
+    }
+    GC_PROTECT(first);
+    lisp_val_t rest = za_rewrite_body_list(cc_cdr(forms), env, scope, ok);
+    if (!*ok) {
+        return nil;
+    }
+    return os_make_cons(first, rest);
+}
+
+/**
+ * 入れ子flet/labelsのbindings((name params . body) ...)を書き換える。nameとparamsは
+ * 呼び出しhead位置・値位置のいずれでもない別namespace(それぞれ「これから新規束縛する
+ * 名前」「仮引数リスト」)なので変更せず、各bindingのbodyのみza_rewrite_body_listで
+ * 同じscope(=呼び出し元、まだ入れ子自身の新しい束縛は含まない)を保って再帰する。
+ */
+static lisp_val_t za_rewrite_binding_list(lisp_val_t bindings, lisp_val_t env, const za_fn_scope_t *scope, int *ok) {
+    if (bindings == nil) {
+        return nil;
+    }
+    if ((bindings & TAG_MASK) != TAG_CONS) {
+        *ok = 0;
+        return nil;
+    }
+    GC_PROTECT(bindings);
+    lisp_val_t binding = cc_car(bindings);
+    if ((binding & TAG_MASK) != TAG_CONS) {
+        *ok = 0;
+        return nil;
+    }
+    lisp_val_t name = cc_car(binding);
+    lisp_val_t brest = cc_cdr(binding);
+    if ((brest & TAG_MASK) != TAG_CONS) {
+        *ok = 0;
+        return nil;
+    }
+    lisp_val_t binding_params = cc_car(brest);
+    lisp_val_t binding_body = cc_cdr(brest);
+    lisp_val_t new_body = za_rewrite_body_list(binding_body, env, scope, ok);
+    if (!*ok) {
+        return nil;
+    }
+    GC_PROTECT(name);
+    GC_PROTECT(binding_params);
+    GC_PROTECT(new_body);
+    lisp_val_t new_binding = os_make_cons(name, os_make_cons(binding_params, new_body));
+    GC_PROTECT(new_binding);
+    lisp_val_t new_rest = za_rewrite_binding_list(cc_cdr(bindings), env, scope, ok);
+    if (!*ok) {
+        return nil;
+    }
+    return os_make_cons(new_binding, new_rest);
+}
+
+/**
+ * 拡張(labels): labels束縛関数のbody(常にインタプリタ実行、JIT再帰しない)内部に
+ * 現れる自己/相互再帰呼び出しを、scope内の名前をgensymへ差し替えることで解決可能に
+ * するASTリライトパス。インタプリタの関数呼び出し解決(os_get_function、eval.c)は
+ * シンボルの素の名前一致(global_environmentへのeq連想)しか見ないため、
+ * このリライトを経ずに元のシンボル名(例: FACT)のままでは、za_compile_flet_labelsが
+ * gensymキーでglobal_environmentへ登録した束縛を見つけられない(documents/jit.md、
+ * za_fn_scope_tのコメント参照)。
+ *
+ * 書き換え対象は「呼び出しhead位置」と「(function name)のname位置」の2箇所のみ
+ * (関数namespaceと変数namespaceは分離されており、lambda引数・let-local・&rest名等の
+ * 値位置に現れる同名シンボルは無関係の変数参照なので書き換えない)。
+ *
+ * @param form 書き換え対象フォーム(defunの定義時ソースASTの一部、まだJIT非依存)
+ * @param env マクロ展開に使う環境(defunの定義時環境、za_macroexpandへそのまま渡す)
+ * @param scope 現在のlabels束縛群(入れ子であれば親スコープも含む)
+ * @param ok 失敗時0を書く(束縛数上限超過、構文エラー、入れ子flet/labelsの
+ * 名前衝突など)。この場合戻り値は不定でよく、呼び出し元はfallbackする。
+ * @return 書き換え後のフォーム(新しいcons構造、コンパイル時アロケーション)
+ */
+static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_fn_scope_t *scope, int *ok) {
+    form = za_macroexpand(form, env);
+    // nilはTAG_CONS(g_nil_cellへの自己参照)なので次のTAG_CONSチェックだけでは
+    // 素通りしてしまい、cc_car(nil)=nilをheadとして扱った結果、一般呼び出し分岐
+    // (headがシンボルでない場合の再帰)がza_rewrite_fn_refs(nil)を無限に再帰呼び出し
+    // してCスタックを溢れさせる(za_compile_exprの同名コメント参照、同じ危険性)。
+    // 書き換え不要な値位置の参照として、他のアトムと同じくここで先に捕まえる。
+    if (form == nil) {
+        return form;
+    }
+    if ((form & TAG_MASK) != TAG_CONS) {
+        // 裸のシンボル・fixnum等。呼び出しhead位置・(function name)のname位置は
+        // 呼び出し元(このforms自身がconsであるケース)が個別に処理するため、
+        // ここに来るのは常に「値位置の参照」であり書き換え不要。
+        return form;
+    }
+
+    lisp_val_t head = cc_car(form);
+    if (head == g_sym_quote || head == g_sym_quasiquote) {
+        return form;
+    }
+
+    GC_PROTECT(form);
+    lisp_val_t rest = cc_cdr(form);
+
+    if (head == g_sym_setq) {
+        // (setq var value-form): 単一pair(eval_setq/za_compile_setqいずれも
+        // 複数pair非対応、za_compile_setqのコメント参照)。varは別namespaceなので
+        // 書き換えず、value-formのみ再帰する。
+        if ((rest & TAG_MASK) != TAG_CONS) {
+            *ok = 0;
+            return form;
+        }
+        lisp_val_t var = cc_car(rest);
+        lisp_val_t rest2 = cc_cdr(rest);
+        if ((rest2 & TAG_MASK) != TAG_CONS || cc_cdr(rest2) != nil) {
+            *ok = 0;
+            return form;
+        }
+        lisp_val_t val_form = cc_car(rest2);
+        lisp_val_t new_val = za_rewrite_fn_refs(val_form, env, scope, ok);
+        if (!*ok) {
+            return form;
+        }
+        GC_PROTECT(var);
+        GC_PROTECT(new_val);
+        return os_make_cons(head, os_make_cons(var, os_make_cons(new_val, nil)));
+    }
+
+    if (head == g_sym_function) {
+        // (function name): nameがscope内の名前なら、動的extentを越えて
+        // クロージャが使われる可能性を安全側に倒して無条件fallbackさせる
+        // (g_za_saw_flet_labels_escapeのコメント、za_classify_operandの
+        // 同名分岐と同じ思想 — こちらはJIT実行されないbody内部の参照なので
+        // 別途この関数で検出する必要がある)。
+        if ((rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
+            return form;
+        }
+        lisp_val_t target = cc_car(rest);
+        if ((target & TAG_MASK) == TAG_SYMBOL) {
+            const za_fn_binding_t *binding;
+            if (za_fn_scope_lookup(scope, target, &binding)) {
+                g_za_saw_flet_labels_escape = 1;
+                *ok = 0;
+                return form;
+            }
+        }
+        return form;
+    }
+
+    if (head == g_sym_flet || head == g_sym_labels) {
+        // 入れ子flet/labels: 新しい束縛名がscope内の名前と重複すればfallback
+        // (v1では再shadowing非対応)。重複が無ければ同じscopeを保って再帰する
+        // (実際のgensym割り当て・save/restoreは入れ子側のza_compile_flet_labels
+        // 再入時に独立して行われる。ここでの役目はscope内の名前への参照を
+        // 素通りさせずgensymへ届けることだけ)。
+        if ((rest & TAG_MASK) != TAG_CONS) {
+            *ok = 0;
+            return form;
+        }
+        lisp_val_t bindings = cc_car(rest);
+        lisp_val_t inner_body = cc_cdr(rest);
+        for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
+            if ((b & TAG_MASK) != TAG_CONS) {
+                *ok = 0;
+                return form;
+            }
+            lisp_val_t binding = cc_car(b);
+            if ((binding & TAG_MASK) != TAG_CONS) {
+                *ok = 0;
+                return form;
+            }
+            lisp_val_t name = cc_car(binding);
+            const za_fn_binding_t *existing;
+            if (za_fn_scope_lookup(scope, name, &existing)) {
+                *ok = 0;
+                return form;
+            }
+        }
+        lisp_val_t new_bindings = za_rewrite_binding_list(bindings, env, scope, ok);
+        if (!*ok) {
+            return form;
+        }
+        GC_PROTECT(new_bindings);
+        lisp_val_t new_inner_body = za_rewrite_body_list(inner_body, env, scope, ok);
+        if (!*ok) {
+            return form;
+        }
+        return os_make_cons(head, os_make_cons(new_bindings, new_inner_body));
+    }
+
+    // 一般呼び出し、あるいはif/block/catch/tagbody等bodyを持つその他の特殊形式。
+    // headがシンボルでscope内の名前ならgensymへ差し替える(呼び出しhead位置のみ)。
+    // headがシンボルでない場合(letが展開された即時呼び出しlambda等、head自体が式)は
+    // 差し替えず、他の要素と同様に再帰する。
+    lisp_val_t new_head;
+    if ((head & TAG_MASK) == TAG_SYMBOL) {
+        new_head = head;
+        const za_fn_binding_t *binding;
+        if (za_fn_scope_lookup(scope, head, &binding)) {
+            new_head = *binding->gensym_slot_addr;
+        }
+    } else {
+        new_head = za_rewrite_fn_refs(head, env, scope, ok);
+        if (!*ok) {
+            return form;
+        }
+    }
+    GC_PROTECT(new_head);
+    lisp_val_t new_rest = za_rewrite_body_list(rest, env, scope, ok);
+    if (!*ok) {
+        return form;
+    }
+    return os_make_cons(new_head, new_rest);
+}
+
+/** GC_PROTECTは1個の名前付きローカル変数専用(トークン連結で内部変数名を作るため
+ * 配列添字`arr[i]`のような式を渡せない)。za_compile_flet_labelsのname_syms/
+ * binding_params/binding_bodies配列は、束縛数(binding_count、実行時に決まる)分の
+ * 要素をgensym確保・za_rewrite_fn_refs呼び出し(いずれもos_make_cons等の実アロケーション
+ * を伴う)の間、生存させ続ける必要があるため、この汎用ヘルパーで1要素ずつ手動で
+ * shadow stackへlinkする(GC_PROTECTの内部実装と同じ「node->var_ptr、現在のgc_rootsを
+ * nextに繋いで先頭を差し替える」手順を、配列分だけ繰り返すだけ)。 */
+typedef struct {
+    gc_rootnode *saved_head;
+} za_gc_protect_batch_t;
+
+static inline void za_gc_protect_batch_cleanup(za_gc_protect_batch_t *batch) {
+    get_current_process()->gc_roots = batch->saved_head;
+}
+
+static inline void za_gc_protect_batch_push(gc_rootnode *node, lisp_val_t *var_ptr) {
+    node->var_ptr = var_ptr;
+    node->next = get_current_process()->gc_roots;
+    get_current_process()->gc_roots = node;
+}
+
+/**
+ * `(flet bindings . body)`/`(labels bindings . body)`。各bindingは`(name params . body)`。
+ * 束縛関数の名前空間解決は常にgensym+global_environment経由(Design B、za_fn_scope_tの
+ * コメント参照)で行い、変数namespaceは外側関数のenv/localsをそのまま使う。束縛関数の
+ * 本体は常にインタプリタ実行(JIT再帰しない、za_compile_lambdaと同じ)なので、この
+ * 関数がg_za_fn_scopeを読むのは実質za_compile_call/za_classify_operandがin-body側の
+ * 呼び出しをgensym解決する場合のみであり、束縛body自身はここでコンパイルしない
+ * (labelsの場合のみ、束縛body側の自己/相互再帰呼び出しをza_rewrite_fn_refsで
+ * gensymへ書き換える。fletは束縛関数の本体が外側スコープをそのまま見るのが
+ * 正しい意味論なので書き換えない、上のis_labels分岐参照)。
+ *
+ * 各bindingのクロージャは、外側の固定引数・let-IIFEローカルをコピーした1個の共有
+ * キャプチャenv(za_emit_build_capture_env)を使い回す。eval_flet/eval_labelsは
+ * bindingごとに別のnew_env(flet)/共通のnew_env(labels)を作るが、そのenvは元々
+ * 「(1)束縛関数同士の関数namespace解決」と「(2)束縛関数から見える変数namespace」の
+ * 両方を兼ねていた。(1)はgensym+global_environmentへ完全に置き換えたため、
+ * (2)だけならbinding間で共有しても意味的な差が無い(どのクロージャもJITが再入
+ * しないため、他のbindingのgensymを直接読む必要が無い)。
+ *
+ * 復元(save/restore)はza_compile_unwind_protectと同じnlx_depthカウンタ・スロットを
+ * 共有する(return-from/throw/goがこの区間を飛び越えてもcleanupが必ず実行される
+ * 必要があるのはunwind-protectと同一の要求のため)。cleanupは制御転送の種類に
+ * 関わらず無条件に実行し、bodyの最後の要素をトランポリンへ末尾jmpさせるとこの
+ * cleanupをバイパスしてしまうため、この関数はis_tailを取らない(za_compile_block/
+ * za_compile_catch/za_compile_throw/za_compile_tagbodyと同じ理由)。
+ * @return 対応できれば1、できなければ0
+ */
+static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t params, UINT64 fixed_count,
+                                   const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
+                                   UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
+                                   UINT64 trampoline_offset, UINT64 arith_depth) {
+    /* paramsはこの関数の後段(za_emit_build_capture_env内のコピーループ)で
+     * cc_car/cc_cdrにより辿られるが、その前にgensym確保(os_make_uninterned_symbol)
+     * ・lambdaスロット用os_make_cons等の実アロケーションを伴うコンパイル時呼び出しを
+     * 行っており、GCが発火するとparamsの指す先が再配置される。呼び出し元が保持する
+     * paramsはこの関数にとって値渡しの別コピーであり、呼び出し元側の保護はこの関数の
+     * ローカル変数までは更新しないため、za_compile_call/za_compile_lambdaと同じ理由で
+     * ここで明示的に保護する。 */
+    GC_PROTECT(params);
+
+    lisp_val_t rest = cc_cdr(form);
+    if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t bindings = cc_car(rest);
+    lisp_val_t body = cc_cdr(rest);
+
+    if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        return 0;
+    }
+
+    // bindings検証: 「(name params . body)」の形を持つ、重複を許す平坦なリスト
+    // (仮引数リスト自体の検証はza_compile_lambdaと同じくここでは行わない — 束縛body
+    // は常にインタプリタ実行であり、呼び出し時にインタプリタ側が検証するため)。
+    lisp_val_t name_syms[ZA_MAX_FLET_BINDINGS];
+    lisp_val_t binding_params[ZA_MAX_FLET_BINDINGS];
+    lisp_val_t binding_bodies[ZA_MAX_FLET_BINDINGS];
+    UINT64 binding_count = 0;
+    for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
+        if ((b & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        lisp_val_t binding = cc_car(b);
+        if ((binding & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        lisp_val_t name = cc_car(binding);
+        if ((name & TAG_MASK) != TAG_SYMBOL) {
+            return 0;
+        }
+        lisp_val_t brest = cc_cdr(binding);
+        if (brest == nil || (brest & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        if (binding_count >= ZA_MAX_FLET_BINDINGS) {
+            return 0;
+        }
+        name_syms[binding_count] = name;
+        binding_params[binding_count] = cc_car(brest);
+        binding_bodies[binding_count] = cc_cdr(brest);
+        binding_count++;
+    }
+
+    // ここから先はgensym確保(os_make_uninterned_symbol)・za_rewrite_fn_refs
+    // (os_make_cons)等の実アロケーションを伴うコンパイル時呼び出しが続き、GCが
+    // 起動する可能性がある。name_syms/binding_params/binding_bodiesはbinding_count個
+    // すべてが以降の複数の処理(gensym割り当てループ、labelsのリライトループ、
+    // クロージャ構築ループ)をまたいで生存する必要があるため、各要素を個別に
+    // shadow stackへlinkして保護する(za_gc_protect_batch_tのコメント参照)。
+    za_gc_protect_batch_t flet_gc_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    flet_gc_batch.saved_head = get_current_process()->gc_roots;
+    gc_rootnode flet_gc_nodes[ZA_MAX_FLET_BINDINGS * 3];
+    for (UINT64 i = 0; i < binding_count; i++) {
+        za_gc_protect_batch_push(&flet_gc_nodes[i * 3 + 0], &name_syms[i]);
+        za_gc_protect_batch_push(&flet_gc_nodes[i * 3 + 1], &binding_params[i]);
+        za_gc_protect_batch_push(&flet_gc_nodes[i * 3 + 2], &binding_bodies[i]);
+    }
+
+    // 各bindingにgensymを確保し(g_za_quote_slotsプールを共有、za_fn_binding_tの
+    // コメント参照)、in-body側の呼び出し解決用の新しいza_fn_scope_tを構築する。
+    za_fn_scope_t new_scope;
+    new_scope.count = binding_count;
+    new_scope.parent = g_za_fn_scope;
+    for (UINT64 i = 0; i < binding_count; i++) {
+        lisp_val_t gensym = os_make_uninterned_symbol("FLET-FN");
+        UINT64 slot_idx;
+        if (!za_alloc_quote_slot(gensym, &slot_idx)) {
+            return 0;
+        }
+        new_scope.bindings[i].orig_name = name_syms[i];
+        new_scope.bindings[i].gensym_slot_addr = &g_za_quote_slots[slot_idx];
+    }
+
+    // labelsの場合のみ、各bindingのbodyをnew_scope(自分自身・兄弟bindingを含む)で
+    // リライトし、本体内部の自己/相互再帰呼び出しをgensym経由で解決可能にする
+    // (za_rewrite_fn_refsのコメント参照)。fletでは束縛関数の本体は外側スコープを
+    // そのまま見るのが正しい意味論(eval_flet/eval_labelsの違い、この関数のdoc
+    // comment冒頭参照)なのでリライトしない。
+    if (is_labels) {
+        int rewrite_ok = 1;
+        for (UINT64 i = 0; i < binding_count; i++) {
+            binding_bodies[i] = za_rewrite_body_list(binding_bodies[i], env, &new_scope, &rewrite_ok);
+            if (!rewrite_ok) {
+                return 0;
+            }
+        }
+    }
+
+    // 1./2. 全bindingで共有する1個のキャプチャenvを構築する(za_compile_lambdaと同型、
+    // za_emit_build_capture_envのコメント参照)。関数namespaceはgensym+
+    // global_environment経由なので、このenvには一切登録しない(変数namespace専用)。
+    za_emit_build_capture_env(params, fixed_count, locals, ZA_OFF_FLET_SAVED_HEAD, ZA_OFF_FLET_ENV_VAL,
+                               ZA_OFF_FLET_ENV_NODE, ZA_OFF_FLET_TMP_VAL, ZA_OFF_FLET_TMP_NODE);
+
+    // 3. 各bindingにつき、クロージャを構築し(za_compile_lambda末尾のos_make_instance
+    // 部分と同型)、gensymの現在のグローバル束縛を退避してから新しいクロージャへ
+    // 差し替える。束縛関数は1個ずつ逐次構築して即os_set_functionで消費するため、
+    // ZA_OFF_FLET_TMP_VAL/NODE(すでにza_emit_build_capture_env内でlink済み)を
+    // そのままクロージャ退避用スクラッチとして使い回せる(za_compile_lambdaの
+    // 兄弟lambdaが同じTMPスロットを再利用できる理由と同じ)。
+    for (UINT64 i = 0; i < binding_count; i++) {
+        if (g_za_lambda_slot_count >= ZA_MAX_LAMBDA_SLOTS) {
+            return 0;
+        }
+        UINT64 lambda_slot_idx = g_za_lambda_slot_count++;
+        g_za_lambda_slots[lambda_slot_idx] = os_make_cons(binding_params[i], binding_bodies[i]);
+        os_gc_register_root(&g_za_lambda_slots[lambda_slot_idx]);
+        lisp_val_t *lambda_slot_addr = &g_za_lambda_slots[lambda_slot_idx];
+        lisp_val_t *gensym_slot_addr = new_scope.bindings[i].gensym_slot_addr;
+
+        // クロージャ本体: os_make_instance(MAGIC_FUNCTION_INTERPRETED, binding_params,
+        // binding_body, 共有キャプチャenv)。
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)lambda_slot_addr);
+        jit_mov_reg_from_mem_disp8(ZA_REG_R13, ZA_REG_R11, 0); /* r13 = (binding_params . binding_body) 現在値 */
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)cc_car);
+        jit_call_r11();
+        za_store_slot(ZA_REG_RAX, ZA_OFF_FLET_TMP_VAL); /* binding_paramsを一時退避 */
+
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)cc_cdr);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_R8, ZA_REG_RAX);          /* r8 = binding_body(=w2) */
+
+        za_load_slot(ZA_REG_RDX, ZA_OFF_FLET_TMP_VAL);   /* rdx = binding_params(=w1) */
+        za_load_slot(ZA_REG_R9, ZA_OFF_FLET_ENV_VAL);    /* r9 = 共有キャプチャenv(=w3) */
+        jit_movabs_reg(ZA_REG_RCX, MAGIC_FUNCTION_INTERPRETED);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_instance);
+        jit_call_r11();
+        za_store_slot(ZA_REG_RAX, ZA_OFF_FLET_TMP_VAL); /* クロージャを退避(TMP_NODEでlink済み) */
+
+        // 旧バインディング値を取得し、退避スロットへ保存・linkする(解決は常に
+        // global_environmentに対して行う、Design B。gensymは名前再解決に乗せられない
+        // ため、確保したスロットのアドレスをmovabsで埋め込み都度現在値を読む —
+        // za_compile_callのfn_binding分岐と同じ手口)。
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)gensym_slot_addr);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RCX, ZA_REG_R11, 0);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&global_environment);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RDX, ZA_REG_R11, 0);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+        jit_call_r11();
+        UINT64 old_val_off = za_flet_old_val_off(nlx_depth, i);
+        UINT64 old_node_off = za_flet_old_node_off(nlx_depth, i);
+        za_store_slot(ZA_REG_RAX, old_val_off);
+        za_emit_gc_link_slot(old_val_off, old_node_off);
+
+        // 新しいクロージャをgensym経由でglobal_environmentへ登録する。
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)gensym_slot_addr);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RCX, ZA_REG_R11, 0);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_FLET_TMP_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&global_environment);
+        jit_mov_reg_from_mem_disp8(ZA_REG_R8, ZA_REG_R11, 0);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_function);
+        jit_call_r11();
+    }
+
+    // 4. in-body(bodyの評価)は新しいfn_scopeの下でコンパイルする。g_za_fn_scopeは
+    // コンパイル時のみ読まれるC変数であり、このbody評価呼び出しの前後だけ差し替えて
+    // 元に戻せば、Cの再帰呼び出しがレキシカルネストと1対1対応するため
+    // パラメータスレッディングと意味的に等価になる(za_fn_scope_tのコメント参照)。
+    // cleanupは制御転送の種類に関わらず無条件に実行するため(eval_unwind_protectと
+    // 同じ簡略化)、nlx_depth+1でza_compile_body_formsを呼ぶ(unwind-protectの
+    // cleanup-formsと同じ配線)。
+    const za_fn_scope_t *saved_fn_scope = g_za_fn_scope;
+    g_za_fn_scope = &new_scope;
+    int body_ok = za_compile_body_forms(body, params, fixed_count, locals, syms, env, nlx_depth + 1, tb_ctx,
+                                         call_depth, trampoline_offset, arith_depth);
+    g_za_fn_scope = saved_fn_scope;
+    if (!body_ok) {
+        return 0;
+    }
+
+    UINT64 nlx_val_off = za_nlx_val_off(nlx_depth);
+    UINT64 nlx_node_off = za_nlx_node_off(nlx_depth);
+    za_store_slot(ZA_REG_RAX, nlx_val_off);
+    za_emit_gc_link_slot(nlx_val_off, nlx_node_off);
+
+    // 5. cleanup: 各bindingにつき、退避しておいた旧バインディング値でgensymの
+    // global_environment登録を無条件に復元する(cleanup-formsの結果は捨てる、
+    // eval_unwind_protectの既知の簡略化に合わせる)。
+    for (UINT64 i = 0; i < binding_count; i++) {
+        lisp_val_t *gensym_slot_addr = new_scope.bindings[i].gensym_slot_addr;
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)gensym_slot_addr);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RCX, ZA_REG_R11, 0);
+        za_load_slot(ZA_REG_RDX, za_flet_old_val_off(nlx_depth, i));
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&global_environment);
+        jit_mov_reg_from_mem_disp8(ZA_REG_R8, ZA_REG_R11, 0);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_function);
+        jit_call_r11();
+    }
+
+    // 6. bodyの結果を読み直し、flet/labelsスコープ開始時点までgc_rootsを一括unlinkする
+    // (za_compile_letと同じ「saved_headを1回だけ捕捉し、末尾で一括unlink」パターン。
+    // 共有キャプチャenvの2ノード+bindingごとの旧値ノード+このnlxノードが、いずれも
+    // ZA_OFF_FLET_SAVED_HEAD捕捉後にlinkされた同じGCルートスタック上に積まれている
+    // ため、1回のza_gc_unlinkでまとめて解除できる)。
+    za_load_slot(ZA_REG_RAX, nlx_val_off);
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, ZA_OFF_FLET_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    return 1;
+}
+
 static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                                       const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                                       UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 trampoline_offset,
@@ -2771,6 +3734,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     g_jit_overflow = 0;
     g_za_saw_setq_local = 0;
     g_za_saw_escaping_lambda = 0;
+    g_za_saw_flet_labels_escape = 0;
     // トランポリンは全JIT関数で共有するため、今回のコンパイル対象用にentryを記録する
     // より前に確定させる(コンパイル失敗時のg_jit_used巻き戻しでスタブ自体が失われない
     // ようにするため)。
@@ -2814,8 +3778,10 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
 
     // setqとエスケープするlambdaが同一defun内に両方存在する場合、クロージャキャプチャの
     // コピー後setqが反映されない食い違いを避けるため無条件にfallbackさせる(粗い過大近似、
-    // g_za_saw_setq_local/g_za_saw_escaping_lambdaのコメント参照)。
-    if (g_jit_overflow || (g_za_saw_setq_local && g_za_saw_escaping_lambda)) {
+    // g_za_saw_setq_local/g_za_saw_escaping_lambdaのコメント参照)。同様に、flet/labels
+    // 束縛関数を(function name)で取り出したケースも無条件にfallbackさせる
+    // (g_za_saw_flet_labels_escapeのコメント参照)。
+    if (g_jit_overflow || (g_za_saw_setq_local && g_za_saw_escaping_lambda) || g_za_saw_flet_labels_escape) {
         g_jit_used = entry;
         return nil;
     }

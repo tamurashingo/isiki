@@ -73,6 +73,16 @@ void os_register_eval_primitives(void);
 lisp_val_t os_apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_t env);
 
 /**
+ * list(評価済み、unquote-splicingで得られたリスト)の要素をtailの手前に非破壊的に継ぎ足す。
+ * za.c(JIT)がquasiquoteコンパイル時、list-position unquote-splicingの実行時fold処理で
+ * os_make_consと同じ呼び出し規約(引数2個、両方GCリンク済みスロットから渡す)で呼ぶ。
+ * @param list 継ぎ足す要素のリスト
+ * @param tail listの末尾に続ける残りのリスト
+ * @return listの要素 . tail
+ */
+lisp_val_t qq_append(lisp_val_t list, lisp_val_t tail);
+
+/**
  * vがblock/return-from/unwind-protect/catch/throw/tagbody/goの非局所脱出シグナルかどうかを判定する。
  * os_apply_function経由でLisp側の関数を呼んだ結果、非局所脱出やsignal-conditionの伝播が
  * 起きていないかをCプリミティブ側でチェックするために使う。
