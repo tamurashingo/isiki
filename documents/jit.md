@@ -135,6 +135,40 @@
 (defun bump-counter () (dynamic *counter*))
 ```
 
+### `flet` / `labels`
+
+```lisp
+(defun double-it (x)
+  (flet ((double (y) (* y 2)))
+    (double x)))                    ; fletは束縛関数の自己/相互再帰不可(仕様通り)
+
+(defun fact-labels (n)
+  (labels ((fact (k) (if (= k 0) 1 (* k (fact (- k 1))))))
+    (fact n)))                      ; labelsは自己/相互再帰OK(za_rewrite_fn_refsで対応)
+```
+束縛関数名はgensymへ差し替えてglobal_environment上に一時登録し、動的extentを抜けると
+無条件に復元します(`unwind-protect`と同じsave/restore規約)。束縛関数の**本体自体は
+常にインタプリタ実行**(JIT再帰しない)ですが、外側関数の本体(束縛関数を呼び出す側)は
+JIT対象です。1つの`flet`/`labels`で同時に束縛できるのは`ZA_MAX_FLET_BINDINGS`(4)個まで。
+束縛関数のクロージャが`(function name)`等でその動的extentを越えて外へ持ち出される場合は
+安全側に倒して全体フォールバックします。
+
+### `quasiquote` / `unquote` / `unquote-splicing`
+
+```lisp
+(defun make-point-list (x y)
+  `(point ,x ,y))                   ; unquoteの内容は任意の式(JIT/インタプリタ問わず可)
+
+(defun prepend-all (xs rest)
+  `(,@xs . ,rest))                  ; unquote-splicing・dotted tail unquoteもOK
+```
+サブフォームに`unquote`/`unquote-splicing`を全く含まない部分はコンパイル時に
+`(quote ...)`へ畳み込んで既存のquoteコンパイルパスへ委譲し、動的な部分だけを実行時に
+`cons`/`qq_append`で組み立てます(`eval.c`の`qq_expand`/`qq_append`と等価な結果)。
+ネストしたbacktickは特別扱いしません(quote-levelを追跡しない素朴な意味論のまま、
+内側の`,x`も同じ1回の走査で評価されます)。ネスト段数は`ZA_MAX_QQ_DEPTH`(4)、
+1レベルあたりの要素数は`ZA_MAX_QQ_ELEMENTS`(16)まで(超えるとフォールバック)。
+
 ### ILOSの関数本体(`slot-value`等)
 
 ```lisp
@@ -152,15 +186,14 @@
 ### 動的head呼び出し・非対応の特殊形式
 
 ```lisp
-(defmacro my-when (test &rest body)
-  `(if ,test (progn ,@body)))       ; quasiquoteはza未対応。展開後の関数がquasiquoteを
-                                     ; 直接使う場合はフォールバックする
-
 (defglobal *table* (make-hash-table))  ; defglobal自体は常にフォールバック要因
 
-(flet ((sq (x) (* x x)))            ; flet/labelsはza未対応
-  (sq 5))
+(defvar *v* 0)          ; defvarも同様に常にフォールバック要因
+(defconstant +k+ 1)      ; defconstantも同様
 ```
+`defmacro`自体はトップレベルのマクロ展開なのでJIT対象外ですが、展開後の関数本体が
+`quasiquote`や`flet`/`labels`を使うケースは現在ではJIT対象です(前述の
+「コンパイルできるパターン」参照)。
 
 ### let-local以外への`setq`
 
@@ -306,13 +339,18 @@
 | 裸float/bignumリテラルスロット数 | `ZA_MAX_NUMBER_SLOTS` | 32 |
 | tagbodyラベル数 | `ZA_MAX_TAGBODY_TAGS` | 16 |
 | 1ラベルあたりgoの個数 | `ZA_MAX_TAGBODY_GOTOS_PER_TAG` | 8 |
+| 1flet/labelsあたりの同時束縛関数数 | `ZA_MAX_FLET_BINDINGS` | 4 |
+| quasiquoteのネスト段数 | `ZA_MAX_QQ_DEPTH` | 4 |
+| quasiquote 1レベルあたりの要素数 | `ZA_MAX_QQ_ELEMENTS` | 16 |
 | JITコード全体のバッファサイズ | `JIT_CODE_SIZE` | 512KB |
 
 ## 参考: `za_is_excluded_special_form`に残るシンボル
 
-`quote`/`defun`/`lambda`/`defmacro`/`quasiquote`/`function`/`flet`/`labels`/
-`defvar`/`defconstant`/`defglobal`。このうち`quote`/`function`/`lambda`は
-一般呼び出しとして誤解釈しないための安全網として残っているだけで、実際には
-専用の分岐(`za_classify_operand`等)で構文的に対応済みです。実質的に今も
-専用コンパイル処理が無く常にフォールバックするのは`quasiquote`/`flet`/`labels`/
-`defvar`/`defconstant`/`defglobal`の6つです。
+`quote`/`defun`/`lambda`/`defmacro`/`function`/`defvar`/`defconstant`/
+`defglobal`。このうち`quote`/`function`/`lambda`は一般呼び出しとして誤解釈
+しないための安全網として残っているだけで、実際には専用の分岐
+(`za_classify_operand`等)で構文的に対応済みです。`quasiquote`/`flet`/`labels`は
+専用コンパイル処理(`za_compile_quasiquote`/`za_compile_flet_labels`)が
+`za_compile_expr`側で一般呼び出し判定より前に無条件で認識するため、この除外
+リストには載っていません。実質的に今も専用コンパイル処理が無く常にフォールバック
+するのは`defvar`/`defconstant`/`defglobal`の3つです。
