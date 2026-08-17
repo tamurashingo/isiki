@@ -130,6 +130,7 @@ see [LICENSE](./assets/fonts/LICENSE)
 - Transport Layerを関数ポインタインタフェースで分離し、VirtIOの実装を `transport_virtio_9p` としてカプセル化
 - 起動時にVirtIO-9pデバイスの検出結果を画面に表示
 - ISLisp準拠のLispを実装
+- JITコンパイラを実装
 
-![screenshot](./documents/images/version_0_0_6.png)
+![screenshot](./documents/images/version_0_0_7.png)
 

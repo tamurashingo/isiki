@@ -1,5 +1,6 @@
 #include "eval.h"
 #include "lisp.h"
+#include "za.h"
 
 /**
  * vがblock/return-from/unwind-protect/catch/throw/tagbody/goの非局所脱出シグナル
@@ -28,6 +29,13 @@ static lisp_val_t eval_args(lisp_val_t args, lisp_val_t env) {
     if (args == nil) {
         return nil;
     }
+    // argsはこの関数のCスタックフレーム独自のローカル変数(値渡し)であり、
+    // 呼び出し元(os_eval等)がGC_PROTECTしていても、それはあくまで呼び出し元自身の
+    // スタックスロットの保護に過ぎずここには及ばない。os_eval(cc_car(args), env)は
+    // 任意の深さの評価(GCを誘発しうる)を行うため、その後のcc_cdr(args)より前に
+    // 自分自身でargsを保護しておく必要がある
+    GC_PROTECT(args);
+    GC_PROTECT(env);
     lisp_val_t head = os_eval(cc_car(args), env);
     GC_PROTECT(head);
     if (is_control_transfer(head)) {
@@ -88,6 +96,13 @@ static lisp_val_t make_interpreted_function(lisp_val_t params, lisp_val_t body, 
 static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t call_env) {
     lisp_val_t p = params;
     lisp_val_t a = evaluated_args;
+    // os_set_variableはcall_envへの新規束縛時にos_make_consで確保を行いGCを誘発しうる。
+    // ループが2回以上回る(仮引数が2個以上)場合、p/a/call_envはこの関数自身のCスタック
+    // フレーム独自のローカル変数なので、呼び出し元の保護とは無関係にここで保護しないと
+    // 次のパラメータを束縛する時点で全て古いアドレスを指したままになる
+    GC_PROTECT(p);
+    GC_PROTECT(a);
+    GC_PROTECT(call_env);
     while (p != nil) {
         lisp_val_t param = cc_car(p);
         if (param == g_sym_rest) {
@@ -125,6 +140,10 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         GC_PROTECT(closure_env);
         GC_PROTECT(body);
         lisp_val_t call_env = os_make_environment(os_make_symbol("CALL-ENV"), closure_env);
+        // bind_params内のGC_PROTECTはbind_params自身のスタックフレーム限りで、
+        // ここ(呼び出し元)のcall_envローカルは別のスタックスロットなので追随しない。
+        // bind_params完了後もcall_envをeval_prognに渡すため、ここでも保護する
+        GC_PROTECT(call_env);
         bind_params(params, evaluated_args, call_env);
         return eval_progn(body, call_env);
     }
@@ -332,7 +351,10 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(name);
     GC_PROTECT(env);
 
-    lisp_val_t fn = make_interpreted_function(params, body, env);
+    lisp_val_t fn = za_try_compile_defun(params, body, env);
+    if (fn == nil) {
+        fn = make_interpreted_function(params, body, env);
+    }
     os_set_function(name, fn, env);
     return name;
 }

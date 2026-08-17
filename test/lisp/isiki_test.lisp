@@ -20,32 +20,8 @@
 ;;     このカーネルの IEEE754 double 実装が仕様の記載値とビット単位で一致するとは
 ;;     限らないため、assert-equalではなく許容誤差付きの assert-float-close を使う
 ;;
-
-(defglobal *isiki-test-stream* (open-output-stream))
-(defglobal *isiki-test-pass* 0)
-(defglobal *isiki-test-fail* 0)
-
-(defmacro assert-equal (expected form)
-  `(let ((%isiki-expected ,expected) (%isiki-actual ,form))
-     (if (equal %isiki-expected %isiki-actual)
-         (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
-         (progn
-           (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
-           (format *isiki-test-stream* "[NG] ~S => ~S (expected ~S)~%"
-                   ',form %isiki-actual %isiki-expected)))))
-
-(defmacro assert-float-close (expected form)
-  `(let ((%isiki-expected ,expected) (%isiki-actual ,form))
-     (if (< (abs (- %isiki-expected %isiki-actual)) 1.0e-6)
-         (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
-         (progn
-           (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
-           (format *isiki-test-stream* "[NG] ~S => ~S (expected ~~ ~S)~%"
-                   ',form %isiki-actual %isiki-expected)))))
-
-(defun isiki-test-report ()
-  (format *isiki-test-stream* "~%==== isiki_test.lisp: ~D passed, ~D failed ====~%"
-          *isiki-test-pass* *isiki-test-fail*))
+;; 本ファイルは test/lisp/test_framework.lisp が定義する assert-equal 等をそのまま
+;; 使う(boot-entryスクリプトが本ファイルより先にそれをloadしている前提)。
 
 
 ;; p.19 (defun copy-cell (x) (cons (car x) (cdr x))) の例。defunの戻り値が関数名
@@ -923,7 +899,3 @@ line2"))
 ;; cf. p.122 (identity '(a b c)) の例。値を変更。
 (assert-equal 5 (identity 5))
 (assert-equal 'a (identity 'a))
-
-;;; --- 最終レポート ---
-
-(isiki-test-report)

@@ -12,7 +12,6 @@ static void stream_init_common(os_stream_t *stream, stream_kind_t kind) {
     stream->kind = kind;
     stream->fid = 0;
     stream->next_offset = 0;
-    stream->buf_data = 0;
     stream->buf_count = 0;
     stream->buf_pos = 0;
     stream->write_buf_len = 0;
@@ -133,12 +132,20 @@ int os_stream_read_char(os_stream_t *stream, char *out_ch) {
                 }
             }
             char err_msg[128];
+            const UINT8 *chunk_data;
+            UINT32 chunk_count;
             if (!os_virtio9p_read_chunk(stream->fid, stream->next_offset, STREAM_READ_CHUNK,
-                                         &stream->buf_data, &stream->buf_count,
+                                         &chunk_data, &chunk_count,
                                          err_msg, sizeof(err_msg))) {
                 stream->error = 1;
                 return 0;
             }
+            /* chunk_dataは全9pストリームで共有される受信バッファへの参照なので、
+               他のストリームのTreadで上書きされる前にstream自身へコピーしておく */
+            for (UINT32 i = 0; i < chunk_count; i++) {
+                stream->buf_data[i] = chunk_data[i];
+            }
+            stream->buf_count = chunk_count;
             stream->buf_pos = 0;
             stream->next_offset += stream->buf_count;
             if (stream->buf_count == 0) {

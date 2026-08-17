@@ -1480,7 +1480,10 @@ void test_gc_reclaims_unreferenced_garbage() {
 // setup_small_heapはos_reset_runtime_state_for_testでglobal_environment/symbol table等の
 // 全状態をリセットするため、このセクションのテストはmain()の最後にまとめて実行する。
 
-#define SMALL_HEAP_SIZE (64 * 1024)
+// %%ZA-COMPILED-Pの追加でos_bootstrap()が恒久的に消費するバイト数が増えたため、
+// 元の64KBのままだとbignum加算テストがGC後も本当に確保不能になってしまう。
+// GCが計算途中で発火するというテストの意図(margin)を保ったまま、その分だけ広げる
+#define SMALL_HEAP_SIZE (68 * 1024)
 
 static void setup_small_heap(void) {
     void *heap = malloc(SMALL_HEAP_SIZE);

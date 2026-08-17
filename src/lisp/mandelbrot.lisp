@@ -17,4 +17,3 @@
                     (setq i (+ i 1))))))
           (format-char (standard-output)
                        (if hit #\space #\*)))))))
-

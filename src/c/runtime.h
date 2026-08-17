@@ -458,9 +458,16 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すC関数のアドレス
- * @return MAGIC_FUNCTION_NATIVEのINSTANCE
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)
  */
 lisp_val_t os_make_native_function(lisp_addr_t fnptr);
+
+/**
+ * fnptrをza.cがコンパイルしたネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
+ * @param fnptr 呼び出すJITコンパイル済み機械語のアドレス
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
 
 /**
  * init.lisp の (make-instance class-sym . initargs) と (signal-condition condition nil) を
@@ -511,12 +518,29 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_addを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return 合計値の整数(60bit以内ならFIXNUM、それを超えるならbignum)
+ */
+lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として符号を反転する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 減算結果の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_subtractを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a-b(primitive_subtractと同じ規則で計算)
+ */
+lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数CONS。第一引数をcar、第二引数をcdrとするconsを返す。
@@ -535,6 +559,14 @@ lisp_val_t primitive_cons(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_eqを2引数固定・非allocatingで呼ぶためのラッパー(za向け)。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return aとbが同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eq2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数NULL。第一引数がnilかどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -543,12 +575,28 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_nullを1引数固定・非allocatingで呼ぶためのラッパー(za向け)。
+ * @param a オペランド
+ * @return aがnilならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_null1(lisp_val_t a);
+
+/**
  * 組み込み関数*。argsの全整数(FIXNUM/bignum、負数も可)を乗算する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 積の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_multiplyを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a*b(primitive_multiplyと同じ規則で計算)
+ */
+lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
@@ -567,6 +615,15 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_less_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a<bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数>。argsが単調減少(a>b>c>...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -575,12 +632,30 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_greater_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数=。argsがすべて等しいかどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return すべて等しいならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_num_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数/=。argsの隣接する要素同士がすべて等しくないかどうかを判定する
@@ -601,12 +676,30 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_greater_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
  * @return 単調非減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_less_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a<=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数MAX。argsのうち最大の要素を返す。
@@ -849,6 +942,22 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_conspの論理否定にあたる非allocatingな核ロジック(za向け)。nilはconsでは
+ * ないためatomとして扱う。
+ * @param val 判定対象
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom1(lisp_val_t val);
+
+/**
+ * 組み込み関数ATOM。第一引数がconsでないかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。
  * 仕様上eqとの違いは数値(同クラスかつ同値)と文字(同文字)の比較。fixnum/charは即値表現
  * (同じ論理値なら同じビットパタン)なのでeqのポインタ比較のままで正しく判定できるが、
@@ -952,6 +1061,16 @@ lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env);
  * @return 関数ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%ZA-COMPILED-P。第一引数がza.cによって機械語へJITコンパイルされた関数
+ * (MAGIC_FUNCTION_NATIVEでword2がfixnum)かどうかを判定する。テスト用の内部primitiveの
+ * ため%%を付ける(ISLisp仕様外)。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return JITコンパイル済みならg_sym_t、インタプリタ実行(またはそれ以外)ならnil
+ */
+lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数GENERIC-FUNCTION-P。本実装にはdefgeneric/defmethodが存在せず

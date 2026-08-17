@@ -116,11 +116,14 @@ static void setup_heap() {
     os_bootstrap();
 }
 
-// テスト用に + と - だけを登録した環境を作る
+// テスト用に + - * < = だけを登録した環境を作る
 static lisp_val_t make_arith_env() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
     os_set_function(os_make_symbol("+"), os_make_native_function((lisp_addr_t)(void *)primitive_add), env);
     os_set_function(os_make_symbol("-"), os_make_native_function((lisp_addr_t)(void *)primitive_subtract), env);
+    os_set_function(os_make_symbol("*"), os_make_native_function((lisp_addr_t)(void *)primitive_multiply), env);
+    os_set_function(os_make_symbol("<"), os_make_native_function((lisp_addr_t)(void *)primitive_less_than), env);
+    os_set_function(os_make_symbol("="), os_make_native_function((lisp_addr_t)(void *)primitive_num_equal), env);
     return env;
 }
 

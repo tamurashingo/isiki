@@ -29,6 +29,13 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
         return g_sym_eval_error;
     }
 
+    // envはループの複数回のイテレーションを跨いで再利用される。os_eval_top_level経由で
+    // 呼び出したform(load対象のファイル自体が(defun ...)等でヒープ確保を伴う)の評価中に
+    // GCが走るとenvが指す先(例: global_environment)が再配置されるため、GC_PROTECTで
+    // 毎回のGCで自動的に追随させないと、以後の全formが再配置前の古いアドレス(GCにより
+    // 転送マーカーで上書き済み)を参照してしまう
+    GC_PROTECT(env);
+
     for (;;) {
         lisp_val_t form = os_read_stream(&stream);
 

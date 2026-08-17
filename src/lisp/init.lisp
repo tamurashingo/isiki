@@ -712,64 +712,98 @@
 
 ;;; --- 総称関数(最小実装): defgeneric / defmethod / call-next-method / next-method-p ---
 ;;;
-;;; 既知の簡略化: 単一(第1引数のみ)dispatch。:before/:after/:aroundなどの
-;;; method-qualifierは実装しない(primary methodのみ)。メソッドの特定性順序は
-;;; specializerクラス間のsubclassp比較による簡易な挿入ソートで、真のクラス優先度
-;;; リスト(MRO)計算は行わない(defclassのスロット継承が単純な連結であることと
-;;; 同水準の簡略化)。call-next-method/next-method-pは仕様上`labels`によりレキシカルに
+;;; 複数引数のクラスを見て特定性を判定する複数ディスパッチに対応する。
+;;; 既知の簡略化: :before/:after/:aroundなどのmethod-qualifierは実装しない
+;;; (primary methodのみ)。メソッドの特定性順序は各引数位置ごとのspecializer
+;;; クラス間のsubclassp比較による簡易な挿入ソートで、真のクラス優先順位リスト
+;;; (CPL/MRO)計算は行わない(defclassのスロット継承が単純な連結であることと
+;;; 同水準の簡略化)。多重継承のダイヤモンド構造では、比較対象の引数位置で
+;;; specializer同士がsubclassp関係を持たない場合に順序が不定になりうる。
+;;; call-next-method/next-method-pは仕様上`labels`によりレキシカルに
 ;;; 束縛されるが、本実装では動的変数によるフレームスタックで代替する。
 
-;; *generic-methods*: alist、gf-name -> methods((specializer . fn)*)。
+;; *generic-methods*: alist、gf-name -> methods((specializers . fn)*)。
+;; specializersは引数位置ごとのクラス(またはnil=無指定)のリスト。
 ;; *classes*/*handlers*と同じ理由でdefdynamic+%%set-dynamicを使う
 (defdynamic *generic-methods* nil)
 
 (defun %find-generic-methods (name)
   (cdr (assoc name (dynamic *generic-methods*))))
 
-;; specializerが等しいかどうか。nil同士も含めてeqで比較してよい
-;; (クラスオブジェクトはdefclassごとに1つの同一オブジェクトとして扱う)
-(defun %remove-method-with-specializer (specializer methods)
+;; specializersのリストが位置ごとに等しいかどうか。各要素はnil同士も含めて
+;; eqで比較してよい(クラスオブジェクトはdefclassごとに1つの同一オブジェクトと
+;; して扱う)
+(defun %specializers-equal-p (s1 s2)
+  (if (null s1)
+      (null s2)
+      (if (null s2)
+          nil
+          (if (eq (car s1) (car s2))
+              (%specializers-equal-p (cdr s1) (cdr s2))
+              nil))))
+
+(defun %remove-method-with-specializer (specializers methods)
   (if (null methods)
       nil
-      (if (eq specializer (car (car methods)))
-          (%remove-method-with-specializer specializer (cdr methods))
-          (cons (car methods) (%remove-method-with-specializer specializer (cdr methods))))))
+      (if (%specializers-equal-p specializers (car (car methods)))
+          (%remove-method-with-specializer specializers (cdr methods))
+          (cons (car methods) (%remove-method-with-specializer specializers (cdr methods))))))
 
-;; 同じgf-name・同じspecializerの既存メソッドを取り除いた上で新しいメソッドを
+;; 同じgf-name・同じspecializersの既存メソッドを取り除いた上で新しいメソッドを
 ;; 先頭に積んで登録する(defclass/%register-classと同じ「再定義は前に積んでshadow」
 ;; パターン)
-(defun %register-method (name specializer fn)
+(defun %register-method (name specializers fn)
   (let* ((existing (%find-generic-methods name))
-         (updated (cons (cons specializer fn) (%remove-method-with-specializer specializer existing))))
+         (updated (cons (cons specializers fn) (%remove-method-with-specializer specializers existing))))
     (%%set-dynamic '*generic-methods* (cons (cons name updated) (dynamic *generic-methods*)))
     name))
 
-;; specializerがnil(無指定)のメソッドは常に適用可能。それ以外はarg0のクラス
+;; specializerがnil(無指定)のメソッドは常に適用可能。それ以外はargのクラス
 ;; (class-of、組み込み型も含む)がspecializerのサブクラス(自身含む)である場合のみ
 ;; 適用可能
-(defun %method-applicable-p (specializer arg0)
+(defun %method-applicable-p (specializer arg)
   (if (null specializer)
       t
-      (subclassp (class-of arg0) specializer)))
+      (subclassp (class-of arg) specializer)))
 
-(defun %applicable-methods (name arg0)
-  (%filter-applicable-methods (%find-generic-methods name) arg0))
+;; specializersの各要素と、対応する位置のargが全て%method-applicable-pであるか
+;; (ANDを取る。specializersがargsより短い場合、残りのargは無指定として扱われる)
+(defun %specializers-applicable-p (specializers args)
+  (if (null specializers)
+      t
+      (if (%method-applicable-p (car specializers) (car args))
+          (%specializers-applicable-p (cdr specializers) (cdr args))
+          nil)))
 
-(defun %filter-applicable-methods (methods arg0)
+(defun %applicable-methods (name args)
+  (%filter-applicable-methods (%find-generic-methods name) args))
+
+(defun %filter-applicable-methods (methods args)
   (if (null methods)
       nil
-      (if (%method-applicable-p (car (car methods)) arg0)
-          (cons (car methods) (%filter-applicable-methods (cdr methods) arg0))
-          (%filter-applicable-methods (cdr methods) arg0))))
+      (if (%specializers-applicable-p (car (car methods)) args)
+          (cons (car methods) (%filter-applicable-methods (cdr methods) args))
+          (%filter-applicable-methods (cdr methods) args))))
 
-;; m1がm2より特定的かどうか。specializerがnilのメソッドは常に最も非特定的
+;; specializers1がspecializers2より特定的かどうか。先頭の位置から順に見て、
+;; その位置のspecializerが完全に一致(eq、両方nilの場合も含む)する場合のみ
+;; 次の位置へ進み、一致しない場合はその位置で即決する(specializerがnilの
+;; 位置は常に最も非特定的)。CPLは計算しないため、一致しない位置で両方が
+;; 非nilかつsubclassp関係を持たない場合はnil(決着つかず)を返す
+(defun %specializers-more-specific-p (s1 s2)
+  (if (null s1)
+      nil
+      (if (eq (car s1) (car s2))
+          (%specializers-more-specific-p (cdr s1) (cdr s2))
+          (if (null (car s2))
+              t
+              (if (null (car s1))
+                  nil
+                  (subclassp (car s1) (car s2)))))))
+
+;; m1がm2より特定的かどうか
 (defun %more-specific-p (m1 m2)
-  (let ((s1 (car m1)) (s2 (car m2)))
-    (if (null s2)
-        (not (null s1))
-        (if (null s1)
-            nil
-            (subclassp s1 s2)))))
+  (%specializers-more-specific-p (car m1) (car m2)))
 
 (defun %insert-method-by-specificity (m sorted)
   (if (null sorted)
@@ -803,7 +837,7 @@
           (%%set-dynamic '*next-methods* saved)))))
 
 (defun %generic-call (name args)
-  (%invoke-method-chain (%order-methods (%applicable-methods name (car args))) args))
+  (%invoke-method-chain (%order-methods (%applicable-methods name args)) args))
 
 ;; (next-method-p) → boolean: 現在のメソッドの内側でcall-next-methodが呼べるか
 (defun next-method-p ()
@@ -824,7 +858,7 @@
 (defmacro defgeneric (name lambda-list &rest options)
   `(defun ,name (&rest %generic-args) (%generic-call ',name %generic-args)))
 
-;; parameter-profileの先頭要素から(未評価の)specializer class-nameを取り出す。
+;; parameter-profileの各要素から(未評価の)specializer class-nameを取り出す。
 ;; (var class-name)形式ならclass-name、単純なvarならnil(specializer無し)
 (defun %first-param-specializer (param)
   (if (consp param) (car (cdr param)) nil))
@@ -832,32 +866,37 @@
 (defun %first-param-var (param)
   (if (consp param) (car param) param))
 
-;; 第1引数以外にspecializerが書かれていないか検査する(多重ディスパッチは
-;; 実装しないという制約を、暗黙に無視せず明示的なerrorとして表面化させる)
-(defun %check-no-more-specializers (params)
-  (if (null params)
+;; lambda-listの各要素から(未評価の)specializer class-nameを、位置に対応する
+;; リストとして取り出す
+(defun %lambda-list-specializers (lambda-list)
+  (if (null lambda-list)
       nil
-      (if (consp (car params))
-          (error "defmethod: 第1引数以外へのspecializerは未対応")
-          (%check-no-more-specializers (cdr params)))))
+      (cons (%first-param-specializer (car lambda-list))
+            (%lambda-list-specializers (cdr lambda-list)))))
 
-;; lambda-listを、実際にlambdaへ渡せる引数リスト(先頭要素のspecializerを
+;; lambda-listを、実際にlambdaへ渡せる引数リスト(各要素のspecializerを
 ;; 取り除いたもの)に変換する
 (defun %method-plain-params (lambda-list)
   (if (null lambda-list)
       nil
-      (progn (%check-no-more-specializers (cdr lambda-list))
-             (cons (%first-param-var (car lambda-list)) (cdr lambda-list)))))
+      (cons (%first-param-var (car lambda-list))
+            (%method-plain-params (cdr lambda-list)))))
+
+;; (未評価の)specializer class-nameのリストを、classマクロ(既存、%find-classを
+;; ラップ)呼び出し形のリストへ変換する。無指定(nil)の位置はnilのまま
+(defun %specializer-forms (names)
+  (if (null names)
+      nil
+      (cons (if (car names) (list 'class (car names)) nil)
+            (%specializer-forms (cdr names)))))
 
 ;; (defmethod name parameter-profile form*)
-;; 第1パラメータのみ(var class-name)形式のspecializerを許可する(単一dispatch)。
-;; classマクロ(既存、%find-classをラップ)をそのまま再利用してspecializer
-;; クラスオブジェクトを取得する
+;; 各パラメータに(var class-name)形式のspecializerを書ける(複数ディスパッチ)。
+;; classマクロをそのまま再利用してspecializerクラスオブジェクトを取得する
 (defmacro defmethod (name lambda-list &rest body)
-  (let ((specializer-name (%first-param-specializer (car lambda-list))))
-    `(%register-method ',name
-       ,(if specializer-name (list 'class specializer-name) nil)
-       (lambda ,(%method-plain-params lambda-list) ,@body))))
+  `(%register-method ',name
+     (list ,@(%specializer-forms (%lambda-list-specializers lambda-list)))
+     (lambda ,(%method-plain-params lambda-list) ,@body)))
 
 ;; (initialize-object instance initialization-arguments) → <object>
 ;; createがインスタンス生成時に呼ぶ総称関数。システム標準のprimary methodは

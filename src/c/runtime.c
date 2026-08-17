@@ -73,7 +73,9 @@
  *    - word0: このinstanceの種別を表わすMAGIC NUMBER
  *    - word1: MAGIC_FUNCTION_NATIVEの場合: cの関数のアドレス
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
- *    - word2: MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
+ *    - word2: MAGIC_FUNCTION_NATIVEの場合: fixnum 1(za.cがコンパイルした関数)またはNIL(組み込みprimitive)。
+ *             GCで移動しない即値(fixnum/nil)のみを許すことで、word1と同様に素通しできる
+ *             MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
  *    - word3: MAGIC_FUNCTION_INTERPRETEDの場合: 定義時の環境のアドレス
  *             MAGIC_VECTORの場合: word1に多次元配列(general array)本体への生ポインタを
  *             持つ(ヒープ可変長、8*(1+rank+total)byte、8byte境界に整列)。
@@ -357,7 +359,7 @@ UINT64 os_gc_collect_count(void) {
  * initialize_processes等、同じアドレスを何度も渡してくる呼び出し元があるため、
  * 単純な追加だけだとテーブルがすぐ枯渇する。
  */
-#define GC_MAX_EXTRA_ROOTS 8
+#define GC_MAX_EXTRA_ROOTS 40
 static lisp_val_t *g_gc_extra_roots[GC_MAX_EXTRA_ROOTS];
 static UINT64 g_gc_extra_root_count = 0;
 
@@ -513,9 +515,10 @@ static void gc_relocate_vector_block(UINT64 *words) {
 }
 
 /**
- * MAGIC_STREAM(word1=os_stream_tへの生ポインタ)を再配置する。buf_data(9P受信バッファ)/
- * out_fb(frame buffer)は常にLispヒープ外の静的領域を指すため素通しし、str_buf
- * (STREAM_STRING_INPUT/OUTPUTのみヒープ上)だけ追加で再配置する。
+ * MAGIC_STREAM(word1=os_stream_tへの生ポインタ)を再配置する。buf_dataはos_stream_t
+ * 本体に埋め込まれた配列なので構造体ごとコピーすれば移動する。out_fb(frame buffer)は
+ * 常にLispヒープ外の静的領域を指すため素通しし、str_buf(STREAM_STRING_INPUT/OUTPUT
+ * のみヒープ上)だけ追加で再配置する。
  */
 static void gc_relocate_stream(UINT64 *words) {
     os_stream_t *old_stream = (os_stream_t *)words[1];
@@ -764,7 +767,6 @@ void os_bootstrap() {
         cell[1] = tagged;
         nil = tagged;
     }
-
     g_dynamic_bindings = nil;
 
     // global_environment の作成
@@ -885,6 +887,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("PARSE-NUMBER"), os_make_native_function((lisp_addr_t)(void *)primitive_parse_number), global_environment);
         os_set_function(os_make_symbol("SYMBOLP"), os_make_native_function((lisp_addr_t)(void *)primitive_symbolp), global_environment);
         os_set_function(os_make_symbol("CONSP"), os_make_native_function((lisp_addr_t)(void *)primitive_consp), global_environment);
+        os_set_function(os_make_symbol("ATOM"), os_make_native_function((lisp_addr_t)(void *)primitive_atom), global_environment);
         os_set_function(os_make_symbol("EQL"), os_make_native_function((lisp_addr_t)(void *)primitive_eql), global_environment);
         os_set_function(os_make_symbol("EQUAL"), os_make_native_function((lisp_addr_t)(void *)primitive_equal), global_environment);
         // NOTはnullと仕様上完全に同一(「objがnilならt、それ以外はnil」)なので実体を共用する
@@ -899,6 +902,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("CHAR>="), os_make_native_function((lisp_addr_t)(void *)primitive_char_greater_equal), global_environment);
         os_set_function(os_make_symbol("STRINGP"), os_make_native_function((lisp_addr_t)(void *)primitive_stringp), global_environment);
         os_set_function(os_make_symbol("FUNCTIONP"), os_make_native_function((lisp_addr_t)(void *)primitive_functionp), global_environment);
+        os_set_function(os_make_symbol("%%ZA-COMPILED-P"), os_make_native_function((lisp_addr_t)(void *)primitive_za_compiled_p), global_environment);
         os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
         os_set_function(os_make_symbol("BASIC-ARRAY-P"), os_make_native_function((lisp_addr_t)(void *)primitive_basic_array_p), global_environment);
         // basic-array*-pとgeneral-array*-pは本実装では外延が一致するため実体を共用する
@@ -1407,10 +1411,13 @@ void os_mark_constant(lisp_val_t sym, lisp_val_t env) {
         return;
     }
     lisp_val_t new_pair = os_make_cons(sym, g_sym_t);
-    // os_make_consでGCが発火しconst_slotが移動している可能性があるため、
-    // 書き込み先アドレスはconst_slot(GC_PROTECT済み)から今読み直す
+    lisp_val_t new_alist = os_make_cons(new_pair, alist);
+    // 上記2回のos_make_cons双方でGCが発火しconst_slotが移動している可能性があるため、
+    // 書き込み先アドレスはconst_slot(GC_PROTECT済み)から、両方の確保が完了した今
+    // 最後に読み直す(先に読んでしまうと2回目のos_make_consのGCで書き込み先が
+    // 古いfrom-space上のアドレスのまま stale になり、登録が失われる)
     lisp_addr_t const_slot_addr = const_slot & ~TAG_MASK;
-    ((lisp_val_t *)const_slot_addr)[1] = os_make_cons(new_pair, alist);
+    ((lisp_val_t *)const_slot_addr)[1] = new_alist;
 }
 
 /**
@@ -1444,10 +1451,21 @@ lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val) {
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すC関数のアドレス
- * @return MAGIC_FUNCTION_NATIVEのINSTANCE
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)
  */
 lisp_val_t os_make_native_function(UINT64 fnptr) {
     return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, nil, nil);
+}
+
+/**
+ * fnptrをza.cがコンパイルしたネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
+ * os_make_native_functionとの違いはword2にfixnum 1を立てる点のみで、印字時にコンパイル済みと
+ * 組み込みprimitiveを区別するために使う。
+ * @param fnptr 呼び出すJITコンパイル済み機械語のアドレス
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function(UINT64 fnptr) {
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(1), nil);
 }
 
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
@@ -1523,11 +1541,14 @@ lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
     } else {
         // 新規追加
         lisp_val_t new_pair = os_make_cons(sym, val);
-        // os_make_consでGCが発火しvar_slotが移動している可能性があるため、
-        // 書き込み先アドレスはvar_slot(GC_PROTECT済み)から今読み直す
-        lisp_addr_t var_slot_addr = var_slot & ~TAG_MASK;
         // (push new-pair alist)
-        ((lisp_val_t *)var_slot_addr)[1] = os_make_cons(new_pair, alist);
+        lisp_val_t new_alist = os_make_cons(new_pair, alist);
+        // 上記2回のos_make_cons双方でGCが発火しvar_slotが移動している可能性があるため、
+        // 書き込み先アドレスはvar_slot(GC_PROTECT済み)から、両方の確保が完了した今
+        // 最後に読み直す(先に読んでしまうと2回目のos_make_consのGCで書き込み先が
+        // 古いfrom-space上のアドレスのまま stale になり、束縛の追加が失われる)
+        lisp_addr_t var_slot_addr = var_slot & ~TAG_MASK;
+        ((lisp_val_t *)var_slot_addr)[1] = new_alist;
     }
 
     return val;
@@ -1598,11 +1619,14 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
     } else {
         // 新規追加
         lisp_val_t new_pair = os_make_cons(sym, fn_obj);
-        // os_make_consでGCが発火しfunc_slotが移動している可能性があるため、
-        // 書き込み先アドレスはfunc_slot(GC_PROTECT済み)から今読み直す
-        lisp_addr_t func_slot_addr = func_slot & ~TAG_MASK;
         // (push new-pair alist)
-        ((lisp_val_t *)func_slot_addr)[1] = os_make_cons(new_pair, alist);
+        lisp_val_t new_alist = os_make_cons(new_pair, alist);
+        // 上記2回のos_make_cons双方でGCが発火しfunc_slotが移動している可能性があるため、
+        // 書き込み先アドレスはfunc_slot(GC_PROTECT済み)から、両方の確保が完了した今
+        // 最後に読み直す(先に読んでしまうと2回目のos_make_consのGCで書き込み先が
+        // 古いfrom-space上のアドレスのまま stale になり、束縛の追加が失われる)
+        lisp_addr_t func_slot_addr = func_slot & ~TAG_MASK;
+        ((lisp_val_t *)func_slot_addr)[1] = new_alist;
     }
 
     return fn_obj;
@@ -1832,17 +1856,23 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
         }
     }
 
-    // 先にcount=0のプレースホルダでMAGIC_BIGNUMをラップしGC_PROTECTしてからlimbバッファを
-    // 確保する。プレースホルダはgc_relocate_bignumがword2(count)==0なら何もコピーしないため
-    // 安全であり、書き込みはword3(limb配列アドレス)→word2(count)の順に行うことで、
-    // 「countだけ確定してaddrが未確定」という危険な中間状態を作らない
-    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
-    GC_PROTECT(bignum);
+    // limbsは呼び出し元が管理する生バッファで、GCのルートとして追跡されない。
+    // この後アロケーションを2回以上挟むとGCがfrom/to空間を2回フリップし得て、
+    // 2回目のフリップで元のfrom空間(=limbsの実体があった領域)が新たなto空間として
+    // 再利用され、まだ読んでいないlimbsの内容が上書きされる危険がある。そのため、
+    // limbsを読む最後の操作(このコピー)を、limbs確保後最初のアロケーション
+    // (limb配列自体の確保)の直後、他のアロケーションを一切挟まずに完了させる
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
         dst[i] = limbs[i];
     }
+
+    // ここから先はlimbsを二度と読まないため、以降で何回アロケーションが発生しても安全。
+    // 書き込みはword3(limb配列アドレス)→word2(count)の順に行うことで、
+    // 「countだけ確定してaddrが未確定」という危険な中間状態を作らない
+    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
+    GC_PROTECT(bignum);
     UINT64 *words = (UINT64 *)(bignum & ~TAG_MASK);
     words[3] = (UINT64)limb_addr;
     words[2] = count;
@@ -2262,6 +2292,35 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_addを2引数固定で呼ぶためのラッパー。JITコンパイルされたコードから
+ * 呼ばれることを想定し、引数aとbは呼び出し直後にGC_PROTECTしてからconsリストへ
+ * 組み立てるため、この呼び出し中にGCが走ってもa/bが失われることはない。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return primitive_addと同じ規則で計算した合計値
+ */
+lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_add(args, global_environment);
+}
+
+/**
+ * primitive_subtractを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return primitive_subtractと同じ規則で計算したa-b
+ */
+lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_subtract(args, global_environment);
+}
+
+/**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として
  * 符号を反転する。floatが1つでも含まれる場合は全オペランドをdoubleへ変換して減算する。
  * それ以外で全オペランドが非負FIXNUMかつ結果が負にならない場合はヒープ確保なしの
@@ -2380,6 +2439,18 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_eqを2引数固定・非allocatingで呼ぶためのラッパー。zaのJITコンパイル済み
+ * コードから呼ばれることを想定する。primitive_add2等と異なり、eq自体は元から固定
+ * 2引数のポインタ比較で確保を伴わないため、引数リストconsで包まずに直接比較する。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return aとbが同一ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_eq2(lisp_val_t a, lisp_val_t b) {
+    return a == b ? g_sym_t : nil;
+}
+
+/**
  * 組み込み関数NULL。第一引数がnilかどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -2387,6 +2458,16 @@ lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env) {
     return cc_car(args) == nil ? g_sym_t : nil;
+}
+
+/**
+ * primitive_nullを1引数固定・非allocatingで呼ぶためのラッパー。zaのJITコンパイル済み
+ * コードから呼ばれることを想定する。
+ * @param a オペランド
+ * @return aがnilならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_null1(lisp_val_t a) {
+    return a == nil ? g_sym_t : nil;
 }
 
 /**
@@ -2453,6 +2534,20 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
     }
 
     return acc_val;
+}
+
+/**
+ * primitive_multiplyを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return primitive_multiplyと同じ規則で計算したa*b
+ */
+lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_multiply(args, global_environment);
 }
 
 /**
@@ -2548,6 +2643,20 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_less_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a<bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_less_than(args, global_environment);
+}
+
+/**
  * 組み込み関数>。argsが単調減少(a>b>c>...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -2563,6 +2672,20 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_greater_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_greater_than(args, global_environment);
+}
+
+/**
  * 組み込み関数=。argsがすべて等しいかどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -2575,6 +2698,20 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
         }
     }
     return g_sym_t;
+}
+
+/**
+ * primitive_num_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_num_equal(args, global_environment);
 }
 
 /**
@@ -2610,6 +2747,20 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_greater_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a>=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_greater_equal(args, global_environment);
+}
+
+/**
  * 組み込み関数<=。argsが単調非減少(a<=b<=c<=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -2622,6 +2773,20 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
         }
     }
     return g_sym_t;
+}
+
+/**
+ * primitive_less_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a<=bならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_less_equal(args, global_environment);
 }
 
 /**
@@ -3334,6 +3499,29 @@ lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_conspの論理否定にあたる非allocatingな核ロジック。nilはconsではないため
+ * atomとして扱う(g_sym_tを返す)。zaのJITコンパイル済みコードからも直接呼ばれる。
+ * @param val 判定対象
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom1(lisp_val_t val) {
+    if (val == nil) {
+        return g_sym_t;
+    }
+    return (val & TAG_MASK) == TAG_CONS ? nil : g_sym_t;
+}
+
+/**
+ * 組み込み関数ATOM。第一引数がconsでないかどうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return consでなければg_sym_t、consならnil
+ */
+lisp_val_t primitive_atom(lisp_val_t args, lisp_val_t env) {
+    return primitive_atom1(cc_car(args));
+}
+
+/**
  * 組み込み関数EQL。第一引数と第二引数が同一かどうかを判定する。
  * 仕様上eqとの違いは数値・文字の値比較だが、本実装のfixnum/charは即値表現のため
  * eqのポインタ比較のままで正しく判定できる。ただしbignumは同じ値でも異なるヒープ
@@ -3823,6 +4011,23 @@ lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env) {
     }
     UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
     return (obj[0] == MAGIC_FUNCTION_NATIVE || obj[0] == MAGIC_FUNCTION_INTERPRETED) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%ZA-COMPILED-P。第一引数がza.cによって機械語へJITコンパイルされた関数
+ * (MAGIC_FUNCTION_NATIVEでword2がfixnum)かどうかを判定する。テスト用の内部primitiveの
+ * ため%%を付ける(ISLisp仕様外)。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return JITコンパイル済みならg_sym_t、インタプリタ実行(またはそれ以外)ならnil
+ */
+lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    return (obj[0] == MAGIC_FUNCTION_NATIVE && obj[2] != nil) ? g_sym_t : nil;
 }
 
 /**
