@@ -1427,11 +1427,16 @@
 
 (defun switch-environment (env) (%%set-current-environment env))
 
+;; 追記(命名について): 当初`in-environment`という名前で実装したが、Common Lispの
+;; `in-package`(一度呼ぶとそれ以降ずっと有効な、動的スコープを持たない一方通行の切り替え)
+;; と同じ動作を期待させる名前であり、実際の動作(unwind-protectでbody終了時に必ず
+;; 元へ戻る、スコープ付きの一時切り替え)と食い違うため`with-environment`へ改名した。
+;;
 ;; 追記(実装時の発見、1点目): progn/let等のC実装はいずれも呼び出し元から渡された
 ;; env引数をそのまま(レキシカルに)子フォームへ伝播するだけで、%%set-current-
 ;; environmentによるproc->envの書き換えを一切参照しない。したがって当初案(bodyを
 ;; (progn (%%set-current-environment env) ,@body)へまとめてunwind-protectで復元する)
-;; では、bodyはin-environmentが呼ばれた時点のレキシカルenv(マクロ展開の呼び出し元の
+;; では、bodyはwith-environmentが呼ばれた時点のレキシカルenv(マクロ展開の呼び出し元の
 ;; env)で評価されたままになり、envへ実際には切り替わらない(defunした関数もその
 ;; 呼び出し元envへ書き込まれてしまう)。%%eval-in-environmentでbodyをformとして
 ;; envのもとへ明示的に評価することで、実際にenv上でdefun等が行われるようにする。
@@ -1442,7 +1447,7 @@
 ;; 明示的な評価(実際の副作用の対象)と、%%set-current-environmentによるproc->envの
 ;; 一時切り替え(destroy-environment等がinspectする「現在の環境」というブックキーピング
 ;; 情報)は別々の目的を持つため、両方を行う。
-(defmacro in-environment (env &rest body)
+(defmacro with-environment (env &rest body)
   (let ((saved (gensym)) (target (gensym)))
     `(let ((,target ,env))
        (let ((,saved (%%current-environment)))

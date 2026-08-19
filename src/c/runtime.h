@@ -1234,7 +1234,7 @@ lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数%%EVAL-IN-ENVIRONMENT。第一引数のformを第二引数のenvのもとで評価する
- * (documents/environment.md Phase4)。in-environment(Lisp、init.lisp)がbodyを
+ * (documents/environment.md Phase4)。with-environment(Lisp、init.lisp)がbodyを
  * 対象環境で実際に評価するために使う: progn/let等のC実装はいずれも呼び出し元から
  * 渡されたenv引数をそのまま子フォームへレキシカルに伝播するだけで、
  * %%set-current-environmentによるproc->envの書き換えを一切参照しないため、

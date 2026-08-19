@@ -1,7 +1,7 @@
 ;; test/lisp/environment_utilities_test.lisp
 ;;
 ;; Phase4(documents/environment.md、Environment操作ユーティリティ)の動作確認。
-;; make-environment/switch-environment/in-environment/list-environments/
+;; make-environment/switch-environment/with-environment/list-environments/
 ;; destroy-environmentの一連の流れ(一時環境作成→シャドウイング→実行確認→破棄→
 ;; 元定義への復帰)、および使用中の環境自身・祖先環境の破棄を試みてエラーになる
 ;; ことを確認する(Q3)。
@@ -22,11 +22,11 @@
 (assert-equal t (if (member eutil-temp-env (list-environments)) t nil))
 
 ;; 一時環境へ切り替えて同名関数を再定義すると、その環境内でシャドウイングされる
-(in-environment eutil-temp-env
+(with-environment eutil-temp-env
   (defun eutil-shadow-fn (x) (+ x 100))
   (assert-equal 105 (eutil-shadow-fn 5)))
 
-;; in-environmentを抜けたら元の環境の定義に戻っている(shadowingはeutil-temp-envの
+;; with-environmentを抜けたら元の環境の定義に戻っている(shadowingはeutil-temp-envの
 ;; functionsスロットにのみ書き込まれ、このトップレベルフォーム自体はeutil-temp-envの
 ;; 外側の環境で評価されるため、そもそも影響を受けていない)
 (assert-equal 6 (eutil-shadow-fn 5))
@@ -48,12 +48,12 @@
 (defglobal eutil-env-a (make-environment 'eutil-a))
 (defglobal eutil-env-b (make-environment 'eutil-b eutil-env-a))
 
-(in-environment eutil-env-b
+(with-environment eutil-env-b
   (assert-equal nil (ignore-errors (destroy-environment eutil-env-a)))
   ;; 拒否された後もeutil-env-a自身は生きており、子環境(現在の環境)からの評価も継続できる
   (assert-equal 6 (eutil-shadow-fn 5)))
 
-;; in-environmentを抜けた後、a/bともまだlist-environmentsに残っている(拒否されたため破棄されていない)
+;; with-environmentを抜けた後、a/bともまだlist-environmentsに残っている(拒否されたため破棄されていない)
 (assert-equal t (if (member eutil-env-a (list-environments)) t nil))
 (assert-equal t (if (member eutil-env-b (list-environments)) t nil))
 
