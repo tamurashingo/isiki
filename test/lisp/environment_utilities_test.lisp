@@ -90,3 +90,12 @@
 (assert-equal nil (ignore-errors (switch-environment 'eutil-no-such-env)))
 
 (destroy-environment eutil-sw-env)
+
+;;; --- 5. プロセスのREPL環境(F1,F2,...)も*environments*に登録され、list-environmentsから見える ---
+;;
+;; %%current-environmentは呼び出し元プロセスのproc->envを初回呼び出し時に
+;; os_make_process_environment(runtime.c)で遅延生成する。以前はこの遅延生成が
+;; os_make_environmentを直接呼ぶだけで*environments*へ登録しなかったため、
+;; プロセスのREPL環境(F1,F2,...)がlist-environmentsに一切表示されなかった。
+
+(assert-equal t (if (member (%environment-name (%%current-environment)) (list-environments)) t nil))

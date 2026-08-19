@@ -17,7 +17,7 @@
  */
 void os_repl_step(process_t *proc) {
     if (proc->env == 0) {
-        proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
+        proc->env = os_make_process_environment(proc->name);
     }
 
     lisp_val_t form = os_read(proc);

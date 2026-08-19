@@ -438,6 +438,18 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3);
 lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env);
 
 /**
+ * global_environmentの子として、nameを名前とする新しい環境を生成し、*environments*
+ * (init.lispのdefdynamicで定義されるグローバルな環境一覧)へも登録する。
+ * os_repl_step/primitive_current_environmentが各プロセスのproc->envを初回呼び出し時に
+ * 遅延生成する際に使う共通ヘルパー。os_make_environmentを直接呼ぶだけでは
+ * *environments*へ登録されず、list-environmentsからプロセスのREPL環境(F1,F2,...)が
+ * 見えなくなるため、登録まで含めてここに一本化する。
+ * @param name 新しい環境の名前(proc->nameを渡す想定)
+ * @return 生成した環境
+ */
+lisp_val_t os_make_process_environment(const char *name);
+
+/**
  * symがenvまたはその親のいずれかのconstantsスロットに登録されているかどうかを判定する。
  * defconstantで定義された定数をsetqで上書きできないようにするために使う。
  * os_setq_variableが親を辿って書き込み先を探すため、ネストしたクロージャからの

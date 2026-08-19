@@ -1491,6 +1491,27 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
 }
 
 /**
+ * global_environmentの子として、nameを名前とする新しい環境を生成し、*environments*
+ * (init.lispのdefdynamicで定義されるグローバルな環境一覧)へも登録する。
+ * *environments*自体はg_dynamic_bindings(全プロセス共有のグローバルなalist)上に
+ * あるため、init.lispがまだロードされていない(=まだ*environments*がdefdynamicされて
+ * いない)タイミングで呼ばれてもos_set_dynamicが新規entryとして追加するだけで問題ない。
+ * @param name 新しい環境の名前(proc->nameを渡す想定)
+ * @return 生成した環境
+ */
+lisp_val_t os_make_process_environment(const char *name) {
+    lisp_val_t env = os_make_environment(os_make_symbol(name), global_environment);
+    GC_PROTECT(env);
+    lisp_val_t envs_sym = os_make_symbol("*environments*");
+    GC_PROTECT(envs_sym);
+    lisp_val_t existing = os_get_dynamic(envs_sym);
+    GC_PROTECT(existing);
+    lisp_val_t updated = os_make_cons(env, existing);
+    os_set_dynamic(envs_sym, updated);
+    return env;
+}
+
+/**
  * symがenvまたはその親のいずれかのconstantsスロットに登録されているかどうかを判定する。
  * os_setq_variableが親を辿って書き込み先を探すため、ネストしたクロージャ内からの
  * setqが外側スコープのdefconstant定数を素通りして書き換えてしまわないよう、
@@ -4314,12 +4335,12 @@ lisp_val_t primitive_make_environment(lisp_val_t args, lisp_val_t env) {
 
 lisp_val_t primitive_current_environment(lisp_val_t args, lisp_val_t env) {
     process_t *proc = get_current_process();
-    // envの遅延生成(repl.c os_repl_step:19-20と同じロジック)。REPL経由の実行では
-    // os_repl_stepが初回呼び出し時に生成するが、cc_load経由(make test-qemuの
-    // boot-entryスクリプトなど)ではos_repl_stepを一度も通らないため、ここで
-    // 生成しないとproc->envが未初期化を表す生の整数0のまま返ってしまう。
+    // envの遅延生成(repl.c os_repl_stepと同じos_make_process_environmentを使う)。
+    // REPL経由の実行ではos_repl_stepが初回呼び出し時に生成するが、cc_load経由
+    // (make test-qemuのboot-entryスクリプトなど)ではos_repl_stepを一度も通らないため、
+    // ここで生成しないとproc->envが未初期化を表す生の整数0のまま返ってしまう。
     if (proc->env == 0) {
-        proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
+        proc->env = os_make_process_environment(proc->name);
     }
     return proc->env;
 }
