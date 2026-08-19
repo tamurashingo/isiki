@@ -1425,7 +1425,12 @@
       (%%set-dynamic '*environments* (cons env (dynamic *environments*)))
       env)))
 
-(defun switch-environment (env) (%%set-current-environment env))
+;; 戻り値はenv自体ではなく環境名symbolにする。envそのものを返すと、REPLで
+;; (switch-environment my-env)を評価した際にvariables/functions等のalistを
+;; 含む環境の内部構造がそのまま表示されてしまうため。
+(defun switch-environment (env)
+  (%%set-current-environment env)
+  (cdr (car env)))
 
 ;; 追記(命名について): 当初`in-environment`という名前で実装したが、Common Lispの
 ;; `in-package`(一度呼ぶとそれ以降ずっと有効な、動的スコープを持たない一方通行の切り替え)
