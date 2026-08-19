@@ -266,6 +266,78 @@ void test_os_get_function() {
     assert(v3 == nil, "未定義の関数はnilが返る");
 }
 
+// primitive_global_environmentが、呼び出し元のenv引数(与えた別環境)や引数の内容に
+// 関わらず常にglobal_environment(os_bootstrap()が生成したroot environment)そのものを
+// 返すことを確認する。primitive_current_environmentが返すproc->env(プロセスごとの
+// 子env)とは別物であることが本質のため、あえてglobal_environmentとは無関係な
+// 別環境をenv引数に渡して呼び出す。
+void test_primitive_global_environment_returns_global_environment_regardless_of_caller_env() {
+    lisp_val_t unrelated_env = os_make_environment(os_make_symbol("UNRELATED-ENV"), nil);
+
+    lisp_val_t v1 = primitive_global_environment(nil, unrelated_env);
+    assert(v1 == global_environment, "呼び出し元envと無関係にglobal_environmentが返る");
+
+    lisp_val_t v2 = primitive_global_environment(nil, global_environment);
+    assert(v2 == global_environment, "global_environmentを渡しても同じ値が返る(冗等)");
+}
+
+// primitive_set_current_environmentの戻り値がt/nilになったこと(旧実装は切り替え先の
+// 環境そのものを返していたが、REPLで直接呼んだ際に環境の内部構造がそのまま表示されて
+// 出力が大量になるため変更した)、および環境として妥当でない値(nil、cons以外)を渡した
+// 場合は切り替えを行わずnilを返すことを確認する。
+void test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid_env() {
+    lisp_val_t env1 = os_make_environment(os_make_symbol("SET-CUR-ENV-1"), nil);
+    lisp_val_t env2 = os_make_environment(os_make_symbol("SET-CUR-ENV-2"), nil);
+
+    lisp_val_t args1 = os_make_cons(env1, nil);
+    lisp_val_t r1 = primitive_set_current_environment(args1, nil);
+    assert(r1 == g_sym_t, "妥当な環境への切り替えはtが返る");
+    assert(get_current_process()->env == env1, "実際にproc->envがenv1へ切り替わっている");
+
+    lisp_val_t args_nil = os_make_cons(nil, nil);
+    lisp_val_t r2 = primitive_set_current_environment(args_nil, nil);
+    assert(r2 == nil, "nilは環境として妥当でないためnilが返る");
+    assert(get_current_process()->env == env1, "失敗時はproc->envが変更されず前の環境のまま");
+
+    lisp_val_t args_fixnum = os_make_cons(os_make_fixnum(42), nil);
+    lisp_val_t r3 = primitive_set_current_environment(args_fixnum, nil);
+    assert(r3 == nil, "consでない値も環境として妥当でないためnilが返る");
+    assert(get_current_process()->env == env1, "失敗時はproc->envが変更されず前の環境のまま");
+
+    lisp_val_t args2 = os_make_cons(env2, nil);
+    lisp_val_t r4 = primitive_set_current_environment(args2, nil);
+    assert(r4 == g_sym_t, "2回目の妥当な切り替えもtが返る");
+    assert(get_current_process()->env == env2, "実際にproc->envがenv2へ切り替わっている");
+}
+
+// Phase2動作確認: Function Cellのアドレスは再defunしても不変であること(呼び出し側は
+// cellアドレスだけ握っていればよく、cellの中身がどこを指しているかを意識しなくてよい)、
+// および同じcellアドレス経由での呼び出しがcellの中身の書き換えに応じて動的に切り替わる
+// ことを確認する。
+void test_os_function_cell() {
+    lisp_val_t env = os_make_environment(os_make_symbol("CELL-TEST-ENV"), nil);
+    lisp_val_t sym = os_make_symbol("cell-test-fn");
+
+    lisp_val_t fn_car = os_make_native_function((lisp_addr_t)(void *)primitive_car);
+    os_set_function(sym, fn_car, env);
+    lisp_val_t cell = os_get_function_cell(sym, env);
+    assert(cell != nil, "定義済み関数のFunction Cellはnilではない");
+
+    lisp_val_t pair = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t args = os_make_cons(pair, nil);
+    lisp_val_t r1 = os_apply_via_cell(cell, args, env);
+    assert(r1 == os_make_fixnum(1), "carとして定義した直後はcell経由の呼び出しがcarとして動く");
+
+    // 再defun。呼び出し側が握っているcellアドレス自体は不変のまま、内容だけがcdrへ切り替わる
+    lisp_val_t fn_cdr = os_make_native_function((lisp_addr_t)(void *)primitive_cdr);
+    os_set_function(sym, fn_cdr, env);
+    lisp_val_t cell_after = os_get_function_cell(sym, env);
+    assert(cell_after == cell, "再defunしてもFunction Cellのアドレス自体は不変");
+
+    lisp_val_t r2 = os_apply_via_cell(cell, args, env);
+    assert(r2 == os_make_fixnum(2), "同じcellアドレス経由の呼び出しが再defun後はcdrとして動く(動的切り替え)");
+}
+
 static lisp_val_t make_arg_list(int argc, ...) {
     lisp_val_t vals[8];
     va_list ap;
@@ -1365,6 +1437,143 @@ void test_primitive_make_instance_raw_and_accessors() {
     assert(primitive_class_instance_p(os_make_cons(class, nil), nil) == nil, "(%%class-instance-p c)(クラス自身)はnilを返す");
 }
 
+void test_imm_page_alloc_survives_gc_and_free_list_reuses_page() {
+    UINT8 *page = (UINT8 *)os_imm_page_alloc();
+    for (int i = 0; i < IMM_PAGE_SIZE; i++) {
+        page[i] = (UINT8)(i & 0xFF);
+    }
+
+    // From/To空間側にゴミを積んでGCが実際に走る状況を作る
+    lisp_val_t garbage = nil;
+    for (int i = 0; i < 100; i++) {
+        garbage = os_make_cons(os_make_fixnum(i), garbage);
+    }
+    os_gc_collect();
+
+    for (int i = 0; i < IMM_PAGE_SIZE; i++) {
+        assert(page[i] == (UINT8)(i & 0xFF),
+               "Immobilized Spaceのページはos_gc_collectを挟んでも移動・破棄されない");
+    }
+
+    os_imm_page_free(page);
+    UINT8 *reused = (UINT8 *)os_imm_page_alloc();
+    assert(reused == page, "os_imm_page_freeで返却したページはos_imm_page_allocで再利用される");
+}
+
+void test_imm_slot_alloc_carves_aligned_slots_from_pages() {
+    imm_slot_cursor_t cursor = {0, 0};
+    void *a = os_imm_slot_alloc(&cursor, 8);
+    void *b = os_imm_slot_alloc(&cursor, 8);
+    assert((UINT64)a % 16 == 0, "os_imm_slot_allocが返すアドレスは16byteアライメント");
+    assert((UINT64)b % 16 == 0, "os_imm_slot_allocが返すアドレスは16byteアライメント");
+    assert(b == (UINT8 *)a + 16, "8byte要求でも16byteアライメントに切り上げられ、次のスロットは16byte先になる");
+    assert(cursor.page != 0, "カーソルはos_imm_page_allocで確保したページを保持する");
+}
+
+// Phase3動作確認: os_imm_pages_alloc_contiguousが返す複数ページは物理的に連続しており、
+// (フリーリストを経由しない)続く単ページ確保はその直後から始まることを確認する。
+void test_imm_pages_alloc_contiguous_returns_physically_contiguous_pages() {
+    UINT8 *dest = (UINT8 *)os_imm_pages_alloc_contiguous(3);
+    assert(dest != 0, "3ページの確保が成功する");
+
+    UINT8 *next = (UINT8 *)os_imm_page_alloc();
+    assert(next == dest + 3 * IMM_PAGE_SIZE,
+           "3ページ分は物理的に連続しており、続く単ページ確保はその直後から始まる");
+}
+
+// Phase3動作確認: 空き容量を大きく超える要求は、os_imm_page_allocのようにハードハルトせず
+// NULLを返し、かつbump領域を消費しないことを確認する。
+void test_imm_pages_alloc_contiguous_returns_null_when_request_exceeds_space() {
+    UINT8 *before = (UINT8 *)os_imm_page_alloc();
+
+    void *huge = os_imm_pages_alloc_contiguous(1000000);
+    assert(huge == 0, "空き容量を超える要求はハードハルトせずNULLを返す");
+
+    UINT8 *after = (UINT8 *)os_imm_page_alloc();
+    assert(after == before + IMM_PAGE_SIZE,
+           "失敗した確保はbump領域を消費しない(続く単ページ確保は直前の続きから始まる)");
+}
+
+// Phase3動作確認: 環境の7番目のslot「pages」に登録したImmobilized Pageが、
+// os_environment_reclaim_pagesでos_imm_page_freeへ返却され、フリーリスト経由で
+// os_imm_page_allocから再利用可能になることを確認する。
+void test_os_environment_register_and_reclaim_pages() {
+    lisp_val_t env = os_make_environment(os_make_symbol("PAGES-TEST-ENV"), nil);
+    void *dest = os_imm_pages_alloc_contiguous(2);
+    assert(dest != 0, "2ページの確保が成功する");
+
+    os_environment_register_pages(env, dest, 2);
+    os_environment_reclaim_pages(env);
+
+    void *r1 = os_imm_page_alloc();
+    void *r2 = os_imm_page_alloc();
+    UINT8 *page0 = (UINT8 *)dest;
+    UINT8 *page1 = (UINT8 *)dest + IMM_PAGE_SIZE;
+    assert((r1 == page0 || r1 == page1), "回収した1ページ目がフリーリスト経由で再利用される");
+    assert((r2 == page0 || r2 == page1) && r2 != r1, "回収した2ページ目もフリーリスト経由で再利用される");
+}
+
+// Phase3.6動作確認: os_gc_unregister_rootで登録を外したrootはGCのスキャン対象から外れ
+// (アドレスが更新されない)、他の登録済みroot(swap-remove後に配列末尾から詰め替わった
+// 要素を含む)は影響を受けず正しく追跡され続けることを確認する。
+void test_os_gc_unregister_root_removes_only_target_and_keeps_others_tracked() {
+    lisp_val_t a = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t b = os_make_cons(os_make_fixnum(3), os_make_fixnum(4));
+    lisp_val_t c = os_make_cons(os_make_fixnum(5), os_make_fixnum(6));
+    os_gc_register_root(&a);
+    os_gc_register_root(&b);
+    os_gc_register_root(&c);
+
+    lisp_addr_t b_before = b & ~TAG_MASK;
+
+    os_gc_unregister_root(&b);
+
+    os_gc_collect();
+
+    assert((a & TAG_MASK) == TAG_CONS, "登録を外していないaはGC後もconsのまま");
+    assert((c & TAG_MASK) == TAG_CONS, "登録を外していないcはGC後もconsのまま");
+    assert(cc_car(a) == os_make_fixnum(1), "登録を外していないaはGC後も正しい値を保持する(swap-removeで巻き込まれない)");
+    assert(cc_car(c) == os_make_fixnum(5), "登録を外していないcはGC後も正しい値を保持する(swap-removeで巻き込まれない)");
+    assert((b & ~TAG_MASK) == b_before,
+           "登録解除したbはGCでアドレスが更新されない(rootとして追跡されなくなった)");
+
+    os_gc_unregister_root(&a);
+    os_gc_unregister_root(&c);
+}
+
+// Phase3.6動作確認: 環境の8番目のslot「literal-slots」に登録したアドレスが、
+// os_environment_reclaim_literal_slotsで登録した順にコールバックへ渡され、
+// 呼び出し後にスロットがnilへ戻ることを確認する(za.c側のza_free_literal_slotに
+// 相当する処理を、テスト側の記録用コールバックで代替して検証する)。
+static lisp_val_t *g_literal_slot_reclaim_seen[8];
+static UINT64 g_literal_slot_reclaim_seen_count = 0;
+static void test_literal_slot_reclaim_callback(lisp_val_t *slot_addr) {
+    g_literal_slot_reclaim_seen[g_literal_slot_reclaim_seen_count++] = slot_addr;
+}
+void test_os_environment_register_and_reclaim_literal_slots() {
+    lisp_val_t env = os_make_environment(os_make_symbol("LITERAL-SLOTS-TEST-ENV"), nil);
+    lisp_val_t fake_slot_a = os_make_fixnum(111);
+    lisp_val_t fake_slot_b = os_make_fixnum(222);
+
+    g_literal_slot_reclaim_seen_count = 0;
+    os_environment_register_literal_slot(env, &fake_slot_a);
+    os_environment_register_literal_slot(env, &fake_slot_b);
+    os_environment_reclaim_literal_slots(env, test_literal_slot_reclaim_callback);
+
+    assert(g_literal_slot_reclaim_seen_count == 2, "登録した2件それぞれについてコールバックが呼ばれる");
+    assert((g_literal_slot_reclaim_seen[0] == &fake_slot_a || g_literal_slot_reclaim_seen[0] == &fake_slot_b),
+           "コールバックに渡されるのは登録したアドレスのいずれか");
+    assert((g_literal_slot_reclaim_seen[1] == &fake_slot_a || g_literal_slot_reclaim_seen[1] == &fake_slot_b),
+           "コールバックに渡されるのは登録したアドレスのいずれか");
+    assert(g_literal_slot_reclaim_seen[0] != g_literal_slot_reclaim_seen[1], "同じアドレスが重複して渡されない");
+
+    // 回収後、literal-slotsスロットは空リスト(nil)へ戻っており、再度reclaimしても
+    // コールバックは呼ばれない。
+    g_literal_slot_reclaim_seen_count = 0;
+    os_environment_reclaim_literal_slots(env, test_literal_slot_reclaim_callback);
+    assert(g_literal_slot_reclaim_seen_count == 0, "回収後のliteral-slotsスロットは空になっている");
+}
+
 void test_gc_cons_survives_and_relocates() {
     // symをos_gc_collect()を挟んで直接使うと、sym自身がFrom空間の古いアドレスのまま
     // 更新されない(rootとして登録していないローカル変数はGCが書き換えてくれない)ため、
@@ -1483,7 +1692,13 @@ void test_gc_reclaims_unreferenced_garbage() {
 // %%ZA-COMPILED-Pの追加でos_bootstrap()が恒久的に消費するバイト数が増えたため、
 // 元の64KBのままだとbignum加算テストがGC後も本当に確保不能になってしまう。
 // GCが計算途中で発火するというテストの意図(margin)を保ったまま、その分だけ広げる
-#define SMALL_HEAP_SIZE (68 * 1024)
+//
+// Function Cell導入(os_set_function参照)により、os_bootstrapが登録する
+// native関数1つにつきcellsスロットへ2つの新規cons(new_cell_pair/new_cells_alist、
+// 計32byte)が恒久的にglobal_environmentから到達可能になった。os_bootstrapが
+// 登録するnative関数は100個超あり、合計で3KB超の恒久消費が増える。68KBのままだと
+// vector構築テスト(N=750)がGC後も確保不能になり停止するため、その分さらに広げる
+#define SMALL_HEAP_SIZE (76 * 1024)
 
 static void setup_small_heap(void) {
     void *heap = malloc(SMALL_HEAP_SIZE);
@@ -1664,6 +1879,9 @@ int main(int argc, char** argv) {
    test_os_make_symbol_prefix_is_not_confused();
    test_os_get_variable();
    test_os_get_function();
+   test_primitive_global_environment_returns_global_environment_regardless_of_caller_env();
+   test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid_env();
+   test_os_function_cell();
    test_os_make_fixnum_signed();
    test_os_make_integer_promotes_to_bignum();
    test_primitive_add_signed_and_bignum();
@@ -1734,6 +1952,14 @@ int main(int argc, char** argv) {
    test_primitive_make_class_raw_and_accessors();
    test_primitive_make_builtin_class_raw_and_metaclass_predicates();
    test_primitive_make_instance_raw_and_accessors();
+
+   test_imm_page_alloc_survives_gc_and_free_list_reuses_page();
+   test_imm_slot_alloc_carves_aligned_slots_from_pages();
+   test_imm_pages_alloc_contiguous_returns_physically_contiguous_pages();
+   test_imm_pages_alloc_contiguous_returns_null_when_request_exceeds_space();
+   test_os_environment_register_and_reclaim_pages();
+   test_os_gc_unregister_root_removes_only_target_and_keeps_others_tracked();
+   test_os_environment_register_and_reclaim_literal_slots();
 
    test_gc_cons_survives_and_relocates();
    test_gc_symbol_survives_via_symbol_table();

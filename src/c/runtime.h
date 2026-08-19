@@ -203,6 +203,56 @@ void os_gc_collect(void);
  */
 UINT64 os_gc_collect_count(void);
 
+/* ============================== Immobilized Space ==============================
+ * GC(copy GC)が移動・破棄しない固定領域。JITコードやFunction Cellなど、Cのポインタとして
+ * 直接掴んでおきたいデータの置き場所として使う。os_gc_collectのスキャン対象外であり、
+ * ここへのポインタをTAG_RAW_POINTERとしてLisp値に埋め込んでも、gc_copy_valueは
+ * fixnum/char同様に即値としてそのまま素通しする(移動・追跡しない)。
+ */
+
+/** Immobilized Spaceの1ページのバイト数 */
+#define IMM_PAGE_SIZE 4096
+
+/**
+ * Immobilized Spaceから4KBページを1枚確保する。空間が枯渇した場合は診断メッセージを
+ * 表示して停止する。
+ * @return 確保した4KBページの先頭アドレス
+ */
+void *os_imm_page_alloc(void);
+
+/**
+ * os_imm_page_allocで確保したページをフリーリストへ返却し、再利用可能にする。
+ * @param page 返却するページの先頭アドレス(os_imm_page_allocが返したものに限る)
+ */
+void os_imm_page_free(void *page);
+
+/**
+ * Immobilized Spaceのbump領域から、物理的に連続したcountページを確保する。
+ * os_imm_page_freeで返却されたページは返却順に連続性の保証がないため、フリーリストは
+ * 使わずbump領域のみを対象にする。JITコンパイル済み関数1つ分のコードを、複数ページに
+ * わたる場合でも1つの連続領域として配置したいza.cからの利用を想定している。
+ * os_imm_page_allocの単ページ確保と異なり、枯渇時はハードハルトせずNULLを返す
+ * (呼び出し元がインタプリタへのフォールバックという既存の劣化パスを持つため)。
+ * @param count 確保するページ数
+ * @return 確保できた先頭ページのアドレス。空き不足の場合はNULL
+ */
+void *os_imm_pages_alloc_contiguous(UINT64 count);
+
+/** os_imm_slot_allocが使う、1ページ内でのバンプアロケーションの進行状況を保持するカーソル */
+typedef struct {
+    UINT8 *page;   /* 現在切り出し中のページ(0ならまだページ未確保) */
+    UINT64 offset; /* そのページ内で次に切り出す位置 */
+} imm_slot_cursor_t;
+
+/**
+ * cursorが指すページから16byteアライメントでsizeバイトを切り出す。ページが未確保、
+ * または残りが足りない場合は新しいページをos_imm_page_allocで確保してcursorを進める。
+ * @param cursor 呼び出し元が保持するカーソル(呼ぶたびに状態が進む)
+ * @param size 切り出すバイト数(IMM_PAGE_SIZEを超えるサイズは指定できない)
+ * @return 切り出した領域の先頭アドレス
+ */
+void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size);
+
 /**
  * lisp_val_t型の変数へのポインタを、os_gc_collectが毎回書き換えるルート集合に登録する
  * (idempotent: 同じポインタを複数回登録しても1回分の登録として扱われる)。
@@ -211,6 +261,15 @@ UINT64 os_gc_collect_count(void);
  * @param root_ptr 登録するroot変数へのポインタ
  */
 void os_gc_register_root(lisp_val_t *root_ptr);
+
+/**
+ * os_gc_register_rootで登録したrootを登録解除する(Phase3.6: リテラルスロットプール
+ * 枯渇解消)。g_gc_extra_roots(固定配列+線形スキャン、順序に意味を持たない)から
+ * 該当エントリを見つけ、配列末尾要素と入れ替えてcountを減らす(swap-remove)。
+ * 見つからない場合は何もしない(冪等)。
+ * @param root_ptr 登録解除するroot変数へのポインタ(os_gc_register_rootに渡したものと同一)
+ */
+void os_gc_unregister_root(lisp_val_t *root_ptr);
 
 /**
  * GC_PROTECTされたローカル変数のcleanup(スコープ脱出時)ハンドラ。
@@ -379,6 +438,18 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3);
 lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env);
 
 /**
+ * global_environmentの子として、nameを名前とする新しい環境を生成し、*environments*
+ * (init.lispのdefdynamicで定義されるグローバルな環境一覧)へも登録する。
+ * os_repl_step/primitive_current_environmentが各プロセスのproc->envを初回呼び出し時に
+ * 遅延生成する際に使う共通ヘルパー。os_make_environmentを直接呼ぶだけでは
+ * *environments*へ登録されず、list-environmentsからプロセスのREPL環境(F1,F2,...)が
+ * 見えなくなるため、登録まで含めてここに一本化する。
+ * @param name 新しい環境の名前(proc->nameを渡す想定)
+ * @return 生成した環境
+ */
+lisp_val_t os_make_process_environment(const char *name);
+
+/**
  * symがenvまたはその親のいずれかのconstantsスロットに登録されているかどうかを判定する。
  * defconstantで定義された定数をsetqで上書きできないようにするために使う。
  * os_setq_variableが親を辿って書き込み先を探すため、ネストしたクロージャからの
@@ -454,6 +525,72 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env);
  * @return val 自身
  */
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
+
+/**
+ * envおよびその親を順に辿り、symの関数定義に対応するFunction Cellを取得する。
+ * Function CellはImmobilized Space上の固定アドレスに置かれた8byteのセルで、現在の
+ * 関数オブジェクトを保持する。cellのアドレス自体は(sym, env)の束縛が存在する間不変
+ * だが、中身はos_set_functionが再defunのたびに書き換える。呼び出し側はcellの
+ * アドレスだけ握っておけば、中身を読むたびに常に最新の定義を得られる。
+ * @param sym 検索するsymbol
+ * @param env 検索を開始する環境
+ * @return 見つかったFunction Cellを指す、TAG_RAW_POINTER付きのアドレス。未定義の場合はnil
+ */
+lisp_val_t os_get_function_cell(lisp_val_t sym, lisp_val_t env);
+
+/**
+ * os_get_function_cellが返したFunction Cell経由で関数を適用する。cellの中身
+ * (現在の関数オブジェクト)を読み出し、os_apply_functionへそのまま委譲する。
+ * @param cell os_get_function_cellが返したTAG_RAW_POINTER付きのcellアドレス(nil可)
+ * @param evaluated_args 評価済みの引数リスト
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果
+ */
+lisp_val_t os_apply_via_cell(lisp_val_t cell, lisp_val_t evaluated_args, lisp_val_t env);
+
+/**
+ * envのpagesスロット(7番目)に、firstから始まるcount個の連続Immobilized Pageの
+ * アドレスを1ページ1エントリのフラットなリストとして追加する(TAG_RAW_POINTER
+ * タグ付き)。za.cがos_imm_pages_alloc_contiguousで確保したJITコード配置先ページを、
+ * コンパイルを実行したenvironmentの所有物として記録するために使う。
+ * @param env 登録先の環境
+ * @param first_page 確保した先頭ページのアドレス
+ * @param count ページ数
+ */
+void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 count);
+
+/**
+ * envのpagesスロット(7番目)を辿り、登録されている各Immobilized Pageをos_imm_page_free
+ * でフリーリストへ返却する。環境破棄時に、そのenvironmentが所有していたJITコード
+ * 配置先ページをまとめて回収するために使う(destroy-environmentからの呼び出しは
+ * 別フェーズの実装物)。
+ * @param env 回収対象の環境
+ */
+void os_environment_reclaim_pages(lisp_val_t env);
+
+/**
+ * envのliteral-slotsスロット(8番目)に、za.c側のリテラルスロットプール
+ * (g_za_quote_slots/g_za_number_slots/g_za_lambda_slots)上の1エントリのアドレスを
+ * 1件のフラットなリストとして追加する(TAG_RAW_POINTERタグ付き、pagesスロットの
+ * 追加パスと同じ考え方)。za.cがコンパイル成功時に、そのコンパイルで確保したスロットを
+ * 実行したenvironmentの所有物として記録するために使う(Phase3.6)。
+ * @param env 登録先の環境
+ * @param slot_addr 登録するスロットのアドレス(g_za_*_slots配列内の1要素へのポインタ)
+ */
+void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr);
+
+/**
+ * envのliteral-slotsスロット(8番目)を辿り、登録されている各アドレスについて
+ * free_slotを呼び出してから、スロットを空リストへ戻す。プール自体の構造
+ * (どのプールの何番目か、フリーリストへどう返却するか)はza.c側の知識であり、
+ * runtime.cはアドレスのライフサイクル(GC root解除含む)をfree_slotへ委譲するだけに
+ * とどめる(os_environment_reclaim_pagesがos_imm_page_freeを直接呼べるのは、pagesが
+ * runtime.c自身が所有するImmobilized Spaceの資源だからであり、za.c所有のスロット
+ * プールについては同じ構造にできないため、コールバック経由にしている)。
+ * @param env 回収対象の環境
+ * @param free_slot 各アドレスに対して呼ぶ解放コールバック(za_free_literal_slot想定)
+ */
+void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp_val_t *slot_addr));
 
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
@@ -1071,6 +1208,75 @@ lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env);
  * @return JITコンパイル済みならg_sym_t、インタプリタ実行(またはそれ以外)ならnil
  */
 lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%MAKE-ENVIRONMENT。os_make_environmentをそのままLispへ公開する薄いラッパー
+ * (documents/environment.md Phase4)。特殊形式ではなく通常の関数として実装するため、
+ * 名前(第一引数)はシンボルとして評価される(呼び出し側でquoteする)。テスト用の内部
+ * primitiveのため%%を付ける(ISLisp仕様外、Lisp側のmake-environmentがラップする)。
+ * @param args 評価済みの引数リスト(第一引数: 環境名symbol、第二引数: 親環境)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新規作成した環境
+ */
+lisp_val_t primitive_make_environment(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%CURRENT-ENVIRONMENT。get_current_process()->envを返す
+ * (documents/environment.md Phase4)。envはproc->env==0(未初期化を表すセンチネル、
+ * process.c:156)の場合、repl.c os_repl_step:19-20と同じロジックでここで遅延生成する。
+ * cc_load経由の実行(make test-qemuのboot-entryスクリプト等)はos_repl_stepを一度も
+ * 経由しないため、この遅延生成が無いと生の整数0がそのままLisp側へ漏れてしまう
+ * (0はTAG_FIXNUMのfixnum 0であり、nilとは異なる値のため後続の環境操作が誤動作する)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用、レキシカルなenvであり現在のprocessの実行環境とは別物)
+ * @return 現在のprocessの実行環境
+ */
+lisp_val_t primitive_current_environment(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%GLOBAL-ENVIRONMENT。全プロセス共通のroot environmentである
+ * global_environment(C側グローバル、runtime.c:212)をそのまま返す。
+ * primitive_current_environmentが返すproc->env(プロセスごとに異なる子env)とは
+ * 別物であり、呼び出し元のprocessや呼び出し時のenvに関わらず常に同じ値を返す。
+ * init.lisp等をglobal_environmentへ直接loadしたい場合、
+ * (with-environment (%%global-environment) (load ...))のように使う想定
+ * (documents/environment.md管轄外の変更のため、この用途はコード側コメントにのみ記す)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return global_environment
+ */
+lisp_val_t primitive_global_environment(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%SET-CURRENT-ENVIRONMENT。get_current_process()->envを第一引数へ切り替える
+ * (documents/environment.md Phase4)。get_current_process()->envはprocess初期化時に
+ * os_gc_register_rootでルート登録済み(プロセス構造体自身のフィールドアドレスを指すため、
+ * 値の書き換えはGCに対して安全)。
+ * 第一引数がnilまたはconsでない(=環境として妥当でない)場合は切り替えを行わずnilを返す。
+ * 戻り値を切り替え先の環境そのものにしていた旧実装は、REPLで直接呼んだ際に
+ * variables/functions等のalistを含む環境の内部構造がそのまま表示され、大量の出力と
+ * なっていたため、成功/失敗のみを示すt/nilに変更した(switch-environment/
+ * with-environmentはいずれも戻り値を参照していないため、この変更による影響はない)。
+ * @param args 評価済みの引数リスト(第一引数: 切り替え先の環境)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 切り替えに成功したらt、第一引数が環境として妥当でなければnil
+ */
+lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%EVAL-IN-ENVIRONMENT。第一引数のformを第二引数のenvのもとで評価する
+ * (documents/environment.md Phase4)。with-environment(Lisp、init.lisp)がbodyを
+ * 対象環境で実際に評価するために使う: progn/let等のC実装はいずれも呼び出し元から
+ * 渡されたenv引数をそのまま子フォームへレキシカルに伝播するだけで、
+ * %%set-current-environmentによるproc->envの書き換えを一切参照しないため、
+ * bodyを(progn ...)へまとめて%%set-current-environmentするだけでは対象環境での
+ * 評価にならない(呼び出し元のマクロ展開時点のレキシカルenvで評価されたままになる)。
+ * @param args 評価済みの引数リスト(第一引数: 未評価のform、呼び出し側でquote済み。
+ *             第二引数: 評価対象の環境)
+ * @param env 呼び出し時の環境(未使用、formの評価には第二引数のenvを使う)
+ * @return formを第二引数のenvのもとで評価した結果
+ */
+lisp_val_t primitive_eval_in_environment(lisp_val_t args, lisp_val_t env);
 
 /**
  * 組み込み関数GENERIC-FUNCTION-P。本実装にはdefgeneric/defmethodが存在せず

@@ -105,6 +105,10 @@ void os_repl_step(process_t *proc) {
     (void)proc;
 }
 
+// os_repl_stepは本来呼び出し前にproc->envを遅延生成するが、上のダミー実装は何もしないため、
+// print_prompt(reader.c)がproc->envを参照できるよう、main側でos_repl_stepと同じ手順
+// (os_make_environment(os_make_symbol(proc->name), global_environment))を自前で行う
+
 // reader.c の ensure_data が proc->stdout_buffer 経由でプロンプトを書き込むための
 // 各プロセス用ダミーバッファ。内容の検証はしないため何もしない実装で良い
 static void dummy_buf_write_char(struct _frame_buffer *self, UINT8 c) {
@@ -243,6 +247,7 @@ int main(int argc, char** argv) {
     setup_buffers();
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
 
     os_set_function(os_make_symbol("assert-equal"),
                      os_make_native_function((lisp_addr_t)(void *)primitive_assert_equal),
@@ -258,8 +263,15 @@ int main(int argc, char** argv) {
 
     lisp_val_t init_env = os_make_environment(os_make_symbol("INIT-TEST-ENV"), global_environment);
 
+    // 実機の対話的なREPLではos_repl_step(repl.c)がinit.lisp読み込みより先にproc->envを
+    // 遅延生成し、os_make_process_environment経由で*environments*へ登録する。この
+    // 順序を再現し、init.lisp内の(defdynamic *environments* ...)がこの事前登録を
+    // 消してしまわないことをinit_test.lispの末尾で確認する
+    os_make_process_environment("F1");
+
     run_lisp_file(proc, init_env, "src/lisp/init.lisp");
     run_lisp_file(proc, init_env, "test/lisp/init_test.lisp");
+    run_lisp_file(proc, init_env, "test/lisp/environments_predefined_test.lisp");
 
     return g_test_failed ? 1 : 0;
 }

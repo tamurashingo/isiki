@@ -191,7 +191,7 @@ void test_os_repl_step_empty_line_shows_prompt() {
 
     os_repl_step(proc);
 
-    assert(strcmp(captured(), "> ") == 0, "空行では入力待ちのプロンプト'> 'が1回だけ表示される");
+    assert(strcmp(captured(), "F1> ") == 0, "空行では入力待ちのプロンプト'環境名> 'が1回だけ表示される");
 }
 
 void test_os_repl_step_lazily_initializes_env() {
@@ -233,8 +233,8 @@ void test_os_repl_step_multiline_string_shows_prompt_once() {
 
     os_repl_step(proc);
 
-    assert(strcmp(captured(), "> \"a\nb\nc\"\n") == 0,
-        "複数行にわたる文字列の入力では継続行に'> 'が表示されない");
+    assert(strcmp(captured(), "F1> \"a\nb\nc\"\n") == 0,
+        "複数行にわたる文字列の入力では継続行に'環境名> 'が表示されない");
 }
 
 int main(int argc, char** argv) {
