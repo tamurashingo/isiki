@@ -263,8 +263,15 @@ int main(int argc, char** argv) {
 
     lisp_val_t init_env = os_make_environment(os_make_symbol("INIT-TEST-ENV"), global_environment);
 
+    // 実機の対話的なREPLではos_repl_step(repl.c)がinit.lisp読み込みより先にproc->envを
+    // 遅延生成し、os_make_process_environment経由で*environments*へ登録する。この
+    // 順序を再現し、init.lisp内の(defdynamic *environments* ...)がこの事前登録を
+    // 消してしまわないことをinit_test.lispの末尾で確認する
+    os_make_process_environment("F1");
+
     run_lisp_file(proc, init_env, "src/lisp/init.lisp");
     run_lisp_file(proc, init_env, "test/lisp/init_test.lisp");
+    run_lisp_file(proc, init_env, "test/lisp/environments_predefined_test.lisp");
 
     return g_test_failed ? 1 : 0;
 }

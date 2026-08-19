@@ -1415,7 +1415,16 @@
 ;; 生成済みの環境の一覧(list-environments用)。*classes*/*handlers*と同じ理由で
 ;; defdynamic+%%set-dynamicを使う(setq/os_set_variableは呼び出し先の環境内での
 ;; 書き込みが呼び出し元から見えないため)。
-(defdynamic *environments* nil)
+;;
+;; 実機の対話的なREPLでは、os_repl_step(repl.c)がinit.lisp読み込みより先に
+;; proc->envを遅延生成し、os_make_process_environment(runtime.c)経由でこの
+;; *environments*へ登録済みのことがある(REPLプロンプトはinit.lisp読み込み前から
+;; 動いているため)。defdynamicはeval_defdynamicが無条件にos_set_dynamicで
+;; 上書きする仕様(他のdefdynamic変数の再定義がこの上書きに依存しているため、
+;; defdynamic自体の仕様は変更しない)なので、value-formに(dynamic *environments*)
+;; を渡し、まだ何も登録されていなければnil、既に登録済みならその値をそのまま
+;; 書き戻す(実質no-op)ことで、init.lisp読み込みによるリセットを防ぐ。
+(defdynamic *environments* (dynamic *environments*))
 
 ;; parent-envは&restで受け、省略時は現在の環境をparentとする(このコードベースは
 ;; &optionalに対応していないため、&restで実質的な省略可能引数を表現する)。
