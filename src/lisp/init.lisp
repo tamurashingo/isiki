@@ -1425,12 +1425,34 @@
       (%%set-dynamic '*environments* (cons env (dynamic *environments*)))
       env)))
 
+;; 環境のcons列((name . env-symbol) (variables . alist) ...)の1番目のスロットが
+;; (name . env-symbol)なので、そのcdrが環境名symbol。
+(defun %environment-name (env) (cdr (car env)))
+
+;; nameとeqな名前を持つ環境を*environments*(登録済みの環境一覧)から検索する。
+;; 見つからなければerror。
+(defun %environment-find-by-name-in (name list)
+  (cond ((null list) (error "switch-environment: no such environment ~S" name))
+        ((eq name (%environment-name (car list))) (car list))
+        (t (%environment-find-by-name-in name (cdr list)))))
+
+(defun %environment-find-by-name (name)
+  (%environment-find-by-name-in name (dynamic *environments*)))
+
+;; envがconsなら環境そのものとしてそのままセットする。symbol/stringが渡された
+;; 場合はlist-environmentsに表示される名前として扱い、*environments*から
+;; 名前が一致する環境を検索してセットする(stringはstring-to-symbolでsymbolに
+;; 変換した上でeq比較する。symbolはinternされているためeqで比較できる)。
 ;; 戻り値はenv自体ではなく環境名symbolにする。envそのものを返すと、REPLで
 ;; (switch-environment my-env)を評価した際にvariables/functions等のalistを
 ;; 含む環境の内部構造がそのまま表示されてしまうため。
 (defun switch-environment (env)
-  (%%set-current-environment env)
-  (cdr (car env)))
+  (let ((target (cond ((consp env) env)
+                       ((symbolp env) (%environment-find-by-name env))
+                       ((stringp env) (%environment-find-by-name (string-to-symbol env)))
+                       (t (error "switch-environment: env must be an environment, a symbol, or a string ~S" env)))))
+    (%%set-current-environment target)
+    (%environment-name target)))
 
 ;; 追記(命名について): 当初`in-environment`という名前で実装したが、Common Lispの
 ;; `in-package`(一度呼ぶとそれ以降ずっと有効な、動的スコープを持たない一方通行の切り替え)
@@ -1462,7 +1484,10 @@
                (%%eval-in-environment '(progn ,@body) ,target))
            (%%set-current-environment ,saved))))))
 
-(defun list-environments () (dynamic *environments*))
+;; 戻り値は環境そのものではなく環境名symbolのリストにする。環境そのものを返すと、
+;; REPLでlist-environmentsを評価した際にvariables/functions等のalistを含む
+;; 各環境の内部構造がそのまま表示されてしまうため。
+(defun list-environments () (mapcar (lambda (env) (%environment-name env)) (dynamic *environments*)))
 
 ;; 環境のcons列((name . env-symbol) (variables . alist) (functions . alist)
 ;; (parent . parent-env) ...)の4番目のスロットがparent。
