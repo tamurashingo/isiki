@@ -123,14 +123,17 @@
 (assert-equal t (iz17-labels-mutual 10))
 (assert-equal nil (iz17-labels-mutual 7))
 
-;;; --- 10. labels束縛関数の本体内部に、同名を再束縛する入れ子labelsがあるケースは
-;;;         v1では再shadowingに対応せず無条件fallbackし、インタプリタ経由の結果は
-;;;         仕様通り正しい(内側のfがシャドーイングする)ままである ---
+;;; --- 10. labels束縛関数の本体内部に、同名を再束縛する入れ子labelsがあるケース。
+;;;         za_rewrite_fn_refsが内側束縛名用にgensym_slot_addr=0(未確定センチネル)の
+;;;         一時スコープフレームを積んで再帰するため、内側のfへの参照はセンチネルとして
+;;;         見つかり書き換え対象から外れる(=前処理時点では素通りし、実行時のeval_labels
+;;;         による通常のレキシカル評価で内側のfが正しくシャドーイングする)。これにより
+;;;         フォールバックせずJIT化される(結果は従来通り内側のfが呼ばれ105)。 ---
 
 (defun iz17-labels-nested-shadow (n)
   (labels ((f (k) (labels ((f (j) (+ j 100))) (f k))))
     (f n)))
-(assert-equal nil (%%za-compiled-p (function iz17-labels-nested-shadow)))
+(assert-equal t (%%za-compiled-p (function iz17-labels-nested-shadow)))
 (assert-equal 105 (iz17-labels-nested-shadow 5))
 
 ;;; --- 11. labels本体内でユーザーマクロ(let)を使ってもza_rewrite_fn_refsが

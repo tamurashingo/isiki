@@ -3278,7 +3278,13 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
         lisp_val_t target = cc_car(rest);
         if ((target & TAG_MASK) == TAG_SYMBOL) {
             const za_fn_binding_t *binding;
-            if (za_fn_scope_lookup(scope, target, &binding)) {
+            // gensym_slot_addr==0(センチネル)は入れ子flet/labels自身の局所束縛名
+            // (下のhead==g_sym_flet/g_sym_labels分岐参照)であり、実gensymへの解決を
+            // 経ていない単なる「ここでシャドウされている」印。そのnameへの(function ...)
+            // 参照はeval.cの通常のレキシカル評価がそのまま正しく処理できるため、
+            // escapeフォールバックの対象外とする(実gensymを指すbinding、つまり
+            // outer/ancestorスコープの実際に解決済みの束縛のみを対象とする)。
+            if (za_fn_scope_lookup(scope, target, &binding) && binding->gensym_slot_addr != 0) {
                 g_za_saw_flet_labels_escape = 1;
                 *ok = 0;
                 return form;
@@ -3288,17 +3294,28 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
     }
 
     if (head == g_sym_flet || head == g_sym_labels) {
-        // 入れ子flet/labels: 新しい束縛名がscope内の名前と重複すればfallback
-        // (v1では再shadowing非対応)。重複が無ければ同じscopeを保って再帰する
-        // (実際のgensym割り当て・save/restoreは入れ子側のza_compile_flet_labels
-        // 再入時に独立して行われる。ここでの役目はscope内の名前への参照を
-        // 素通りさせずgensymへ届けることだけ)。
+        // 入れ子flet/labels: 内側で新規に束縛される各名前について、
+        // gensym_slot_addr=0(未確定センチネル)の一時エントリを持つ新しい
+        // za_fn_scope_tフレームを構築し、parentを現在のscopeにして積んだ上で
+        // 内側のbindings/bodyを再帰する。センチネルは「ここで局所的にシャドウ
+        // されているが、まだ実gensymへは解決しない」を意味し、この一時フレーム内で
+        // 見つかった参照はza_fn_scope_lookup呼び出し元(gensym_slot_addr!=0チェック)
+        // により書き換え対象から除外される。これにより、内側スコープの名前への
+        // 参照は前処理時点では素通りし(実際の解決はeval.cの通常のレキシカル評価、
+        // あるいはこの入れ子形式が「in body」位置でza_compile_flet_labelsにより
+        // 再帰コンパイルされる際に行われる)、外側scope由来の同名参照だけが
+        // 誤って書き換えられることを防げる。内外で名前が重複しない場合は従来通り
+        // (センチネルがlookupで見つからず素通りするだけなので)動作は変わらない。
         if ((rest & TAG_MASK) != TAG_CONS) {
             *ok = 0;
             return form;
         }
         lisp_val_t bindings = cc_car(rest);
         lisp_val_t inner_body = cc_cdr(rest);
+
+        za_fn_scope_t inner_scope;
+        inner_scope.count = 0;
+        inner_scope.parent = scope;
         for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
             if ((b & TAG_MASK) != TAG_CONS) {
                 *ok = 0;
@@ -3310,18 +3327,20 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
                 return form;
             }
             lisp_val_t name = cc_car(binding);
-            const za_fn_binding_t *existing;
-            if (za_fn_scope_lookup(scope, name, &existing)) {
+            if (inner_scope.count >= ZA_MAX_FLET_BINDINGS) {
                 *ok = 0;
                 return form;
             }
+            inner_scope.bindings[inner_scope.count].orig_name = name;
+            inner_scope.bindings[inner_scope.count].gensym_slot_addr = 0;
+            inner_scope.count++;
         }
-        lisp_val_t new_bindings = za_rewrite_binding_list(bindings, env, scope, ok);
+        lisp_val_t new_bindings = za_rewrite_binding_list(bindings, env, &inner_scope, ok);
         if (!*ok) {
             return form;
         }
         GC_PROTECT(new_bindings);
-        lisp_val_t new_inner_body = za_rewrite_body_list(inner_body, env, scope, ok);
+        lisp_val_t new_inner_body = za_rewrite_body_list(inner_body, env, &inner_scope, ok);
         if (!*ok) {
             return form;
         }
@@ -3336,7 +3355,9 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
     if ((head & TAG_MASK) == TAG_SYMBOL) {
         new_head = head;
         const za_fn_binding_t *binding;
-        if (za_fn_scope_lookup(scope, head, &binding)) {
+        // gensym_slot_addr==0(センチネル)は入れ子flet/labels自身の局所束縛名で、
+        // まだ実gensymへ解決していないため書き換えない(下の入れ子flet/labels分岐参照)。
+        if (za_fn_scope_lookup(scope, head, &binding) && binding->gensym_slot_addr != 0) {
             new_head = *binding->gensym_slot_addr;
         }
     } else {
