@@ -2,33 +2,106 @@
 
 `isiki`（イシキ）は、x86-64アーキテクチャ上で動作する、ISLispベースのベアメタル・Lispオペレーティングシステム（LispOS）です。
 
-UEFIからブートした直後の真っ暗なベアメタル空間にLispランタイムを立ち上げ、プログラマがREPLを通じてハードウェアのすべてを直接、かつ動的に掌握できる環境を提供します。
 
-## 特徴
+## Require
 
-### 1. すべてを Lisp で扱うことができる
-本OSにおいて、C言語はブートとランタイムの基礎（肉体）を構成するためだけに存在し、起動後の制御権はすべてLisp（意識）へと移譲されます。
-- **C言語関数の直接呼び出し:** ブートストラップ層や低レイヤーで定義されたC言語の関数を、Lisp側から透過的に呼び出すことができます。
-- **Lispからの直接I/O・ハードウェア制御:** `%%`（ダブルパーセント）および `%`（シングルパーセント）という、isikiOS独自のレイヤー記法（詳細は後述の「命名規則」を参照）を用いることで、アセンブリやC言語を介することなく、Lispから直接I/Oポートや周辺機器の制御が行えます。
-- **生メモリ・タグデータの直接操作:** Lispオブジェクトの型を識別するための「タグ」で構成された生の物理メモリ構造を、Lispから直接参照・編集（ハック）することが可能です。ポインタの操作からランタイム構造の書き換えまで、すべてがLispで表現できます。
+- docker
+- QEMU
+- OVMF
 
-### 2. シングルアドレス空間 ＆ 言語による隔離 (SASOS)
-ハードウェア（MMU）による強制的なプロセス隔離を行いません。カーネルもドライバもアプリケーションも、システム全体がひとつの広大なフラットメモリ空間を共有します。
-メモリの安全性とコードの隔離は、ハードウェアではなく「環境（environment）」という言語レベルの仕組み（言語の壁）のみによって優雅に統治されます。アドレス空間の分離というオーバーヘッドを排除した、究極にフラットで高速な実行環境を実現します。
-- **他プロセスの状態への直接介入:** MMUによる保護が無いため、他プロセスのPC・スタックフレーム・レジスタといった実行状態そのものを、他プロセスから直接参照・変更することも可能です。
+## Usage
 
-### 3. 環境（environment）によるインクリメンタルな開発とシャドウイング
+QEMUとOVMFをインストール後、 `make build` でイメージを作成し、 `make run` で起動します。
+起動しない場合は正しい OVMF のパスを指定してください。
+
+```
+make build && make run
+```
+
+起動後、 REPL が立ち上がるので以下のコマンドで ISLisp 環境を構築します。
+
+```lisp
+(%%set-current-environment (%%global-environment))
+;; global-environment に ISLisp を読み込ませる
+(load "src/lisp/init.lisp")
+
+;; F1 のプロセスで実行していた場合は環境を F1 に戻します
+(switch-environment 'f1)
+```
+
+9Pプロトコルにより、QEMU内からホストのファイルにアクセスすることができます。
+
+F1, F2, F3, F4 を押すことでプロセスを切り替えることができます。
+
+
+## Features
+
+#### ISLisp全般
+
+[ISLisp-WorkingDraft-v23](http://islisp.org/docs/islisp-v23.pdf) に記載の機能はほぼ実装しています。
+[isiki_test.lisp](test/lisp/isiki_test.lisp) で、仕様書に記載している内容をテストしています。
+
+#### 環境
+
 ISLisp には Common Lisp のような動的な package システムがなく、module は完成したコードをカプセル化してロードすることを主な前提としています。isikiOS では ISLisp の module 構造を尊重しつつ、REPL 上でコードを動的に書き換えながら進めるインクリメンタルな開発スタイルを実現するため、これとは別に「環境（environment）」という独自のファーストクラスな仕組みを導入しています。
+
 
 - **環境の構造:** 各環境は `variables` ・ `functions` ・ `parent` の3スロットを持ち、ルートとなる `global-environment` を頂点とする木構造をなします。
 - **書き込みは常に現在の環境のみ:** `defparameter` や `defun` は、実行時の現在の環境（current environment）にのみ束縛を書き込みます。親環境の束縛が書き換わることはありません。
 - **読み込みは親を辿るシャドウイング:** symbol はグローバルに1つだけinternされているため、どの環境から見ても同じsymbolを指します。親環境で使われているシンボルと同じシンボルを現在の環境に登録すると、参照時には現在の環境から親へと辿るため、親側の定義は隠され（shadow）自由に上書きできます。ISLisp本来は組み込み関数の再定義やシャドウイングを制限していますが、isikiOSでは明示的にこれを許可しています。
-- **他環境への直接アクセス:** symbolは全環境で共有されているため、現在の環境ではなく親環境や別の環境を明示的に指定して、その環境の変数・関数を直接参照・上書きすることもできます。
+- **他環境への直接アクセス:** symbolは全環境で共有されているため、現在の環境ではなく親環境や別の環境を明示的に指定して、その環境の変数・関数を直接参照・上書きすることもできます(実装予定・未実装)。
 
 これにより、専用の環境を作って自由に「汚し」ながら試行錯誤し、固まった変更だけを親環境（`global-environment` など）へ反映させる、といった開発フローが可能になります。
 
-### 4. REPL駆動のライブシステム開発
-ベアメタル上で起動したREPL（対話環境）そのものがOSの操作インターフェースであり、開発環境です。グラフィックスコンソール（GOP）を通じてS式を入力し、動作しているOSのコードやメモリ空間をリアルタイムに再定義・拡張していくことができます。
+
+```lisp
+;; foo-env という名前で環境を作成し、 foo-env という symbol にセット
+;; 親環境は未指定なので global-environment が自動的にセットされる
+(defglobal foo-env (make-environment 'foo-env))
+
+;; foo-env に環境をスイッチ
+(switch-environment 'foo-env)
+
+;; foo-env 環境に関数を定義
+(defun foo ()
+  42)
+
+(foo)
+-> 42
+
+
+;; foo-env を親環境として別の bar-env 環境を作成する
+(defglobal bar-env (make-environment 'bar-env foo-env))
+
+;; bar-env にスイッチ
+(switch-environment 'bar-env)
+
+;; 親である foo-env 環境にあった関数を実行することができる
+(foo)
+-> 42
+
+;; 親の環境と同じ名前の関数を bar-env 環境で作成することができる
+(defun foo ()
+  "hello world")
+
+(foo)
+-> "hello world"
+
+;; foo-env にスイッチし、 foo を実行すると foo-env で定義した内容になっている
+(swtich-environment 'foo-env)
+(foo)
+-> 42
+```
+
+
+#### シングルアドレス空間 ＆ 言語による隔離 (SASOS)
+
+**現在は未実装**
+
+ハードウェア（MMU）による強制的なプロセス隔離を行いません。カーネルもドライバもアプリケーションも、システム全体がひとつの広大なフラットメモリ空間を共有します。
+メモリの安全性とコードの隔離は、ハードウェアではなく「環境（environment）」という言語レベルの仕組み（言語の壁）のみによって優雅に統治されます。アドレス空間の分離というオーバーヘッドを排除した、究極にフラットで高速な実行環境を実現します。
+- **他プロセスの状態への直接介入:** MMUによる保護が無いため、他プロセスのPC・スタックフレーム・レジスタといった実行状態そのものを、他プロセスから直接参照・変更することも可能です。
+
 
 
 ## アーキテクチャとレイヤー命名規則
@@ -77,13 +150,6 @@ ISLisp には Common Lisp のような動的な package システムがなく、
 - **ターゲット言語:** ISLisp
 - **ユーザーモデル:** シングルユーザー・マルチプロセス
 
-## 開発のロードマップ
-- [x] UEFIブートおよびGOP（Graphics Output Protocol）によるコンソール出力の確立
-- [x] `%%` レイヤー（物理I/O、生ポインタ・タグメモリ制御）の実装
-- [x] ISLisp準拠のコアランタイム・GCの移植
-- [x] ベアメタル上でのREPLの起動および自己ブートストラップ環境の構築
-
-
 
 ## 名前の由来
 - **IS**: 言語のルーツである ISLisp の「IS」
@@ -102,35 +168,49 @@ Copyright (c) 2018-2026, Frederic Cambus
 
 see [LICENSE](./assets/fonts/LICENSE)
 
-## 開発状況
+## screen shot
 
-- UEFIを使ったhello world
-- キー入力結果を画面に表示(GOP)
-- 複数の仮想バッファを切り替えて使用可能(F1〜F4)
-- REPL から + 演算が可能
-- 以下のprimitiveなオペレータを実装
-  - `quote`
-  - `if`
-  - `progn`
-  - `setq`
-  - `defun`
-  - `lambda`
-  - `cons`
-  - `car`
-  - `cdr`
-  - `eq`
-  - `null`
-  - `%%in-8`
-  - `%%out-8`
-  - `%%peek`
-  - `%%poke`
-- MACROが可能
-- 9Pプロトコル(VirtIO-9p)を使い、ホスト共有ディレクトリのファイルを読み込み可能
-- Streamを抽象化し、`(load "path")` で9P経由のLispファイルをread→evalできる
-- Transport Layerを関数ポインタインタフェースで分離し、VirtIOの実装を `transport_virtio_9p` としてカプセル化
-- 起動時にVirtIO-9pデバイスの検出結果を画面に表示
-- ISLisp準拠のLispを実装
-- JITコンパイラを実装
+version 0.0.9
 
-![screenshot](./documents/images/version_0_0_7.png)
+![version 0.0.9](./documents/images/version_0_0_9.png)
+
+version 0.0.8
+
+なし
+
+version 0.0.7
+
+![version 0.0.7](./documents/images/version_0_0_7.png)
+
+version 0.0.6
+
+![version 0.0.6](./documents/images/version_0_0_6.png)
+
+version 0.0.5
+
+![version 0.0.5](./documents/images/version_0_0_5.png)
+
+version 0.0.4
+
+![version 0.0.4](./documents/images/version_0_0_4.png)
+
+version 0.0.3
+
+![version 0.0.3](./documents/images/version_0_0_3.png)
+
+version 0.0.2
+
+![version 0.0.2](./documents/images/version_0_0_2.png)
+
+version 0.0.1
+
+![version 0.0.1](./documents/images/version_0_0_1.png)
+
+
+version 0.0.0
+
+![version 0.0.0](./documents/images/version_0_0_0.png)
+
+
+[インタプリタとコンパイラの速度の比較(YouTube)](https://www.youtube.com/watch?v=NaNsI1Ex_CE)
 
