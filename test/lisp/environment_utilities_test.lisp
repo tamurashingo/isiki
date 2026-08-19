@@ -99,3 +99,32 @@
 ;; プロセスのREPL環境(F1,F2,...)がlist-environmentsに一切表示されなかった。
 
 (assert-equal t (if (member (%environment-name (%%current-environment)) (list-environments)) t nil))
+
+;;; --- 6. %%global-environment: 複数プロセスがそれぞれ(load "src/lisp/init.lisp")する
+;;; ことで発生する「同じ関数が別の環境に重複定義される」問題を、global_environmentへ
+;;; 直接定義することで解消できることを確認する(F1/F2それぞれのproc->envを
+;;; make-environmentで模して代用する)。
+
+;; %%current-environmentはこのファイルの実行時点で既にプロセスの子envを遅延生成済み
+;; (セクション2で初回呼び出し済み)なので、%%global-environmentとは異なる値になる
+(assert-equal nil (eq (%%global-environment) (%%current-environment)))
+
+;; F1/F2に相当する子環境を、実際のos_make_process_environmentと同じく
+;; global_environmentの直接の子として作成する
+(defglobal eutil-f1-env (make-environment 'eutil-f1 (%%global-environment)))
+(defglobal eutil-f2-env (make-environment 'eutil-f2 (%%global-environment)))
+
+;; global_environmentへ直接定義する(F1側が(load "src/lisp/init.lisp")する想定の代用)
+(with-environment (%%global-environment)
+  (defun eutil-shared-fn (x) (+ x 1000)))
+
+;; F1側・F2側どちらの子環境からも、global_environmentへの唯一の定義が
+;; (親envを辿って)同じ結果として見える。呼び出しごとに別々の定義を作る
+;; 従来の(load "src/lisp/init.lisp")とは異なり、重複無しに共有できている
+(with-environment eutil-f1-env
+  (assert-equal 1001 (eutil-shared-fn 1)))
+(with-environment eutil-f2-env
+  (assert-equal 1002 (eutil-shared-fn 2)))
+
+(destroy-environment eutil-f1-env)
+(destroy-environment eutil-f2-env)

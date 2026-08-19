@@ -266,6 +266,21 @@ void test_os_get_function() {
     assert(v3 == nil, "未定義の関数はnilが返る");
 }
 
+// primitive_global_environmentが、呼び出し元のenv引数(与えた別環境)や引数の内容に
+// 関わらず常にglobal_environment(os_bootstrap()が生成したroot environment)そのものを
+// 返すことを確認する。primitive_current_environmentが返すproc->env(プロセスごとの
+// 子env)とは別物であることが本質のため、あえてglobal_environmentとは無関係な
+// 別環境をenv引数に渡して呼び出す。
+void test_primitive_global_environment_returns_global_environment_regardless_of_caller_env() {
+    lisp_val_t unrelated_env = os_make_environment(os_make_symbol("UNRELATED-ENV"), nil);
+
+    lisp_val_t v1 = primitive_global_environment(nil, unrelated_env);
+    assert(v1 == global_environment, "呼び出し元envと無関係にglobal_environmentが返る");
+
+    lisp_val_t v2 = primitive_global_environment(nil, global_environment);
+    assert(v2 == global_environment, "global_environmentを渡しても同じ値が返る(冗等)");
+}
+
 // Phase2動作確認: Function Cellのアドレスは再defunしても不変であること(呼び出し側は
 // cellアドレスだけ握っていればよく、cellの中身がどこを指しているかを意識しなくてよい)、
 // および同じcellアドレス経由での呼び出しがcellの中身の書き換えに応じて動的に切り替わる
@@ -1835,6 +1850,7 @@ int main(int argc, char** argv) {
    test_os_make_symbol_prefix_is_not_confused();
    test_os_get_variable();
    test_os_get_function();
+   test_primitive_global_environment_returns_global_environment_regardless_of_caller_env();
    test_os_function_cell();
    test_os_make_fixnum_signed();
    test_os_make_integer_promotes_to_bignum();

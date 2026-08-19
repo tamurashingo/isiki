@@ -1234,6 +1234,20 @@ lisp_val_t primitive_make_environment(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_current_environment(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数%%GLOBAL-ENVIRONMENT。全プロセス共通のroot environmentである
+ * global_environment(C側グローバル、runtime.c:212)をそのまま返す。
+ * primitive_current_environmentが返すproc->env(プロセスごとに異なる子env)とは
+ * 別物であり、呼び出し元のprocessや呼び出し時のenvに関わらず常に同じ値を返す。
+ * init.lisp等をglobal_environmentへ直接loadしたい場合、
+ * (with-environment (%%global-environment) (load ...))のように使う想定
+ * (documents/environment.md管轄外の変更のため、この用途はコード側コメントにのみ記す)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return global_environment
+ */
+lisp_val_t primitive_global_environment(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数%%SET-CURRENT-ENVIRONMENT。get_current_process()->envを第一引数へ切り替える
  * (documents/environment.md Phase4)。get_current_process()->envはprocess初期化時に
  * os_gc_register_rootでルート登録済み(プロセス構造体自身のフィールドアドレスを指すため、

@@ -993,6 +993,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%ZA-COMPILED-P"), os_make_native_function((lisp_addr_t)(void *)primitive_za_compiled_p), global_environment);
         os_set_function(os_make_symbol("%%MAKE-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_make_environment), global_environment);
         os_set_function(os_make_symbol("%%CURRENT-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_current_environment), global_environment);
+        os_set_function(os_make_symbol("%%GLOBAL-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_global_environment), global_environment);
         os_set_function(os_make_symbol("%%SET-CURRENT-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_set_current_environment), global_environment);
         os_set_function(os_make_symbol("%%EVAL-IN-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_eval_in_environment), global_environment);
         os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
@@ -4343,6 +4344,12 @@ lisp_val_t primitive_current_environment(lisp_val_t args, lisp_val_t env) {
         proc->env = os_make_process_environment(proc->name);
     }
     return proc->env;
+}
+
+lisp_val_t primitive_global_environment(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return global_environment;
 }
 
 lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env) {
