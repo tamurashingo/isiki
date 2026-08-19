@@ -86,4 +86,11 @@
  */
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env);
 
+/**
+ * za.c実装のネイティブ関数(%%DESTROY-ENVIRONMENT-RECLAIM、documents/environment.md
+ * Phase4)をglobal_environmentへ登録する。os_bootstrap()等の他のos_register_*関数と
+ * 同じタイミングでkernel_mainのブート列から呼ぶ。
+ */
+void os_register_za_primitives(void);
+
 #endif /* _ZA_H_ */

@@ -4062,7 +4062,47 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     return os_make_jit_function((lisp_addr_t)(void *)dest_bytes);
 }
 
+/**
+ * 組み込み関数%%DESTROY-ENVIRONMENT-RECLAIM(documents/environment.md Phase4)。
+ * 対象環境が所有するImmobilized Page(Phase3)とリテラルスロット(Phase3.6)を回収する。
+ * runtime.cはza.cのプール構造を知らないため、za_free_literal_slotをコールバックとして
+ * 渡す一方向依存(za.c→runtime.c)を保つ。呼び出し元のdestroy-environment(Lisp、
+ * init.lisp)が対象環境が現在の環境自身/祖先でないことを確認済みであることを前提とする。
+ * @param args 評価済みの引数リスト(第一引数: 破棄対象の環境)
+ * @param env 呼び出し時の環境(未使用)
+ * @return g_sym_t
+ */
+static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t target_env = cc_car(args);
+    os_environment_reclaim_pages(target_env);
+    os_environment_reclaim_literal_slots(target_env, za_free_literal_slot);
+    return g_sym_t;
+}
+
+/** za.c実装のネイティブ関数をglobal_environmentへ登録する。kernel_mainのブート列で
+ * os_bootstrap()以降に呼ぶ(za.c→runtime.cの一方向依存を保つため、os_bootstrap()
+ * 自体には登録しない)。 */
+void os_register_za_primitives(void) {
+    os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
+}
+
 #else /* !defined(__x86_64__) */
+
+/**
+ * 非x86_64ビルドではza_try_compile_defunが常にnilを返しJITコンパイルが発生しないため、
+ * リテラルスロットプール自体が存在しない。Immobilized Pageの回収のみ行う。
+ */
+static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t target_env = cc_car(args);
+    os_environment_reclaim_pages(target_env);
+    return g_sym_t;
+}
+
+void os_register_za_primitives(void) {
+    os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
+}
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
     (void)params;

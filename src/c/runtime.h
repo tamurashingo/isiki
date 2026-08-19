@@ -1198,6 +1198,56 @@ lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数%%MAKE-ENVIRONMENT。os_make_environmentをそのままLispへ公開する薄いラッパー
+ * (documents/environment.md Phase4)。特殊形式ではなく通常の関数として実装するため、
+ * 名前(第一引数)はシンボルとして評価される(呼び出し側でquoteする)。テスト用の内部
+ * primitiveのため%%を付ける(ISLisp仕様外、Lisp側のmake-environmentがラップする)。
+ * @param args 評価済みの引数リスト(第一引数: 環境名symbol、第二引数: 親環境)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 新規作成した環境
+ */
+lisp_val_t primitive_make_environment(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%CURRENT-ENVIRONMENT。get_current_process()->envを返す
+ * (documents/environment.md Phase4)。envはproc->env==0(未初期化を表すセンチネル、
+ * process.c:156)の場合、repl.c os_repl_step:19-20と同じロジックでここで遅延生成する。
+ * cc_load経由の実行(make test-qemuのboot-entryスクリプト等)はos_repl_stepを一度も
+ * 経由しないため、この遅延生成が無いと生の整数0がそのままLisp側へ漏れてしまう
+ * (0はTAG_FIXNUMのfixnum 0であり、nilとは異なる値のため後続の環境操作が誤動作する)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用、レキシカルなenvであり現在のprocessの実行環境とは別物)
+ * @return 現在のprocessの実行環境
+ */
+lisp_val_t primitive_current_environment(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%SET-CURRENT-ENVIRONMENT。get_current_process()->envを第一引数へ切り替える
+ * (documents/environment.md Phase4)。get_current_process()->envはprocess初期化時に
+ * os_gc_register_rootでルート登録済み(プロセス構造体自身のフィールドアドレスを指すため、
+ * 値の書き換えはGCに対して安全)。
+ * @param args 評価済みの引数リスト(第一引数: 切り替え先の環境)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 切り替え先の環境(第一引数そのまま)
+ */
+lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%EVAL-IN-ENVIRONMENT。第一引数のformを第二引数のenvのもとで評価する
+ * (documents/environment.md Phase4)。in-environment(Lisp、init.lisp)がbodyを
+ * 対象環境で実際に評価するために使う: progn/let等のC実装はいずれも呼び出し元から
+ * 渡されたenv引数をそのまま子フォームへレキシカルに伝播するだけで、
+ * %%set-current-environmentによるproc->envの書き換えを一切参照しないため、
+ * bodyを(progn ...)へまとめて%%set-current-environmentするだけでは対象環境での
+ * 評価にならない(呼び出し元のマクロ展開時点のレキシカルenvで評価されたままになる)。
+ * @param args 評価済みの引数リスト(第一引数: 未評価のform、呼び出し側でquote済み。
+ *             第二引数: 評価対象の環境)
+ * @param env 呼び出し時の環境(未使用、formの評価には第二引数のenvを使う)
+ * @return formを第二引数のenvのもとで評価した結果
+ */
+lisp_val_t primitive_eval_in_environment(lisp_val_t args, lisp_val_t env);
+
+/**
  * 組み込み関数GENERIC-FUNCTION-P。本実装にはdefgeneric/defmethodが存在せず
  * generic function自体を表すオブジェクトが作れないため、常にnilを返す。
  * @param args 評価済みの引数リスト(未使用)

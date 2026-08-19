@@ -5,6 +5,7 @@
 #include "eval.h"
 #include "reader.h"
 #include "stream.h"
+#include "process.h"
 #ifdef ISIKIOS_UNIT_TEST
 /* ネイティブ(x86_64以外を含む)ホストでのユニットテストではx87/SSE2インラインアセンブラが
    使えないため、libmの対応する関数で計算する。実機(x86_64 UEFI, ISIKIOS_UNIT_TEST未定義)
@@ -990,6 +991,10 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("STRINGP"), os_make_native_function((lisp_addr_t)(void *)primitive_stringp), global_environment);
         os_set_function(os_make_symbol("FUNCTIONP"), os_make_native_function((lisp_addr_t)(void *)primitive_functionp), global_environment);
         os_set_function(os_make_symbol("%%ZA-COMPILED-P"), os_make_native_function((lisp_addr_t)(void *)primitive_za_compiled_p), global_environment);
+        os_set_function(os_make_symbol("%%MAKE-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_make_environment), global_environment);
+        os_set_function(os_make_symbol("%%CURRENT-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_current_environment), global_environment);
+        os_set_function(os_make_symbol("%%SET-CURRENT-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_set_current_environment), global_environment);
+        os_set_function(os_make_symbol("%%EVAL-IN-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_eval_in_environment), global_environment);
         os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
         os_set_function(os_make_symbol("BASIC-ARRAY-P"), os_make_native_function((lisp_addr_t)(void *)primitive_basic_array_p), global_environment);
         // basic-array*-pとgeneral-array*-pは本実装では外延が一致するため実体を共用する
@@ -4299,6 +4304,48 @@ lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env) {
     }
     UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
     return (obj[0] == MAGIC_FUNCTION_NATIVE && obj[2] != nil) ? g_sym_t : nil;
+}
+
+lisp_val_t primitive_make_environment(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t name = cc_car(args);
+    lisp_val_t parent_env = cc_car(cc_cdr(args));
+    return os_make_environment(name, parent_env);
+}
+
+lisp_val_t primitive_current_environment(lisp_val_t args, lisp_val_t env) {
+    process_t *proc = get_current_process();
+    // envの遅延生成(repl.c os_repl_step:19-20と同じロジック)。REPL経由の実行では
+    // os_repl_stepが初回呼び出し時に生成するが、cc_load経由(make test-qemuの
+    // boot-entryスクリプトなど)ではos_repl_stepを一度も通らないため、ここで
+    // 生成しないとproc->envが未初期化を表す生の整数0のまま返ってしまう。
+    if (proc->env == 0) {
+        proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
+    }
+    return proc->env;
+}
+
+lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t new_env = cc_car(args);
+    get_current_process()->env = new_env;
+    return new_env;
+}
+
+/**
+ * 組み込み関数%%EVAL-IN-ENVIRONMENT(documents/environment.md Phase4)。formを
+ * envのもとで評価する。in-environment(Lisp、init.lisp)がbodyを対象環境で実際に
+ * 評価するために使う: progn/let等は呼び出し時にCの呼び出し元から渡されたenv引数を
+ * そのまま(レキシカルに)子フォームへ伝播するだけで、%%set-current-environmentによる
+ * proc->envの書き換えを一切参照しないため、単にbodyを(progn ...)へまとめて
+ * %%set-current-environmentするだけでは対象環境で評価したことにならない。
+ * @param args (form env) formは未評価のS式(呼び出し側でquote済み)
+ * @param env 呼び出し時の環境(未使用、formの評価にはargsのenvを使う)
+ * @return formをargsのenvのもとで評価した結果
+ */
+lisp_val_t primitive_eval_in_environment(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t form = cc_car(args);
+    lisp_val_t target_env = cc_car(cc_cdr(args));
+    return os_eval_top_level(form, target_env);
 }
 
 /**

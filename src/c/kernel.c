@@ -13,6 +13,7 @@
 #include "format.h"
 #include "clock.h"
 #include "stream.h"
+#include "za.h"
 
 
 /**
@@ -85,6 +86,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_streams();
     os_register_format();
     os_register_clock();
+    os_register_za_primitives();
 
     frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);

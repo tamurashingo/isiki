@@ -18,6 +18,7 @@
 (load "test/lisp/za_test_ext18.lisp")
 (load "test/lisp/environment_pages_test.lisp")
 (load "test/lisp/environment_literal_slots_test.lisp")
+(load "test/lisp/environment_utilities_test.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

@@ -1404,3 +1404,82 @@
 ;; 読める必要があるためdefdynamicではなくdefconstantを使う(defdynamicの値は
 ;; (dynamic name)経由でしか読めず、bareなシンボル参照は未定義変数アクセスになる)
 (defconstant *pi* 3.141592653589793)
+
+;;; Environment操作ユーティリティ(documents/environment.md Phase4)。Q4の決定に従い、
+;;; make-environment等は特殊形式ではなく通常のLisp関数として実装する。名前(第一引数)は
+;;; シンボルとして評価されるため、呼び出し側でquoteする(%%make-environmentが素朴に
+;;; ラップしているだけで、defmacro等による名前の暗黙quoteは行わない)。戻り値はdefglobal
+;;; (このコードベースにdefparameterは存在しないため)等で呼び出し側が明示的に変数へ
+;;; 束縛する運用とする。
+
+;; 生成済みの環境の一覧(list-environments用)。*classes*/*handlers*と同じ理由で
+;; defdynamic+%%set-dynamicを使う(setq/os_set_variableは呼び出し先の環境内での
+;; 書き込みが呼び出し元から見えないため)。
+(defdynamic *environments* nil)
+
+;; parent-envは&restで受け、省略時は現在の環境をparentとする(このコードベースは
+;; &optionalに対応していないため、&restで実質的な省略可能引数を表現する)。
+(defun make-environment (name &rest parent-env)
+  (let ((parent (if parent-env (car parent-env) (%%current-environment))))
+    (let ((env (%%make-environment name parent)))
+      (%%set-dynamic '*environments* (cons env (dynamic *environments*)))
+      env)))
+
+(defun switch-environment (env) (%%set-current-environment env))
+
+;; 追記(実装時の発見、1点目): progn/let等のC実装はいずれも呼び出し元から渡された
+;; env引数をそのまま(レキシカルに)子フォームへ伝播するだけで、%%set-current-
+;; environmentによるproc->envの書き換えを一切参照しない。したがって当初案(bodyを
+;; (progn (%%set-current-environment env) ,@body)へまとめてunwind-protectで復元する)
+;; では、bodyはin-environmentが呼ばれた時点のレキシカルenv(マクロ展開の呼び出し元の
+;; env)で評価されたままになり、envへ実際には切り替わらない(defunした関数もその
+;; 呼び出し元envへ書き込まれてしまう)。%%eval-in-environmentでbodyをformとして
+;; envのもとへ明示的に評価することで、実際にenv上でdefun等が行われるようにする。
+;;
+;; 追記(2点目): 上記の修正だけではdestroy-environmentのQ3ガード(%%current-
+;; environment、つまりproc->envを参照する)がbody実行中もenvへ切り替わっていることを
+;; 前提にしたテスト(祖先環境破棄の拒否確認)が成立しない。%%eval-in-environmentによる
+;; 明示的な評価(実際の副作用の対象)と、%%set-current-environmentによるproc->envの
+;; 一時切り替え(destroy-environment等がinspectする「現在の環境」というブックキーピング
+;; 情報)は別々の目的を持つため、両方を行う。
+(defmacro in-environment (env &rest body)
+  (let ((saved (gensym)) (target (gensym)))
+    `(let ((,target ,env))
+       (let ((,saved (%%current-environment)))
+         (unwind-protect
+             (progn
+               (%%set-current-environment ,target)
+               (%%eval-in-environment '(progn ,@body) ,target))
+           (%%set-current-environment ,saved))))))
+
+(defun list-environments () (dynamic *environments*))
+
+;; 環境のcons列((name . env-symbol) (variables . alist) (functions . alist)
+;; (parent . parent-env) ...)の4番目のスロットがparent。
+(defun %environment-parent (env) (cdr (car (cdr (cdr (cdr env))))))
+
+;; candidateがenv自身、またはenvのparentチェーンを遡って見つかるかを確認する。
+(defun %environment-ancestor-p (candidate env)
+  (cond ((null env) nil)
+        ((eq candidate env) t)
+        (t (%environment-ancestor-p candidate (%environment-parent env)))))
+
+;; *environments*からenvとeqな要素を1つだけ取り除いた新しいリストを返す。
+(defun %environment-remove (env list)
+  (if (null list)
+      nil
+      (if (eq env (car list))
+          (cdr list)
+          (cons (car list) (%environment-remove env (cdr list))))))
+
+;; Q3: 対象envが現在の環境自身、またはそのparentチェーンを遡って一致する場合は
+;; フォールバックせずエラーにする(使用中の環境を破壊すると以降の評価が壊れるため)。
+;; 一致しない場合のみ、Phase3のImmobilized Page回収とPhase3.6のリテラルスロット回収を
+;; 実行して環境を破棄する。
+(defun destroy-environment (env)
+  (if (%environment-ancestor-p env (%%current-environment))
+      (error "destroy-environment: 使用中の環境またはその祖先は破棄できません ~S" env)
+      (progn
+        (%%destroy-environment-reclaim env)
+        (%%set-dynamic '*environments* (%environment-remove env (dynamic *environments*)))
+        t)))
