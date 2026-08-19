@@ -1469,6 +1469,67 @@ void test_os_environment_register_and_reclaim_pages() {
     assert((r2 == page0 || r2 == page1) && r2 != r1, "回収した2ページ目もフリーリスト経由で再利用される");
 }
 
+// Phase3.6動作確認: os_gc_unregister_rootで登録を外したrootはGCのスキャン対象から外れ
+// (アドレスが更新されない)、他の登録済みroot(swap-remove後に配列末尾から詰め替わった
+// 要素を含む)は影響を受けず正しく追跡され続けることを確認する。
+void test_os_gc_unregister_root_removes_only_target_and_keeps_others_tracked() {
+    lisp_val_t a = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t b = os_make_cons(os_make_fixnum(3), os_make_fixnum(4));
+    lisp_val_t c = os_make_cons(os_make_fixnum(5), os_make_fixnum(6));
+    os_gc_register_root(&a);
+    os_gc_register_root(&b);
+    os_gc_register_root(&c);
+
+    lisp_addr_t b_before = b & ~TAG_MASK;
+
+    os_gc_unregister_root(&b);
+
+    os_gc_collect();
+
+    assert((a & TAG_MASK) == TAG_CONS, "登録を外していないaはGC後もconsのまま");
+    assert((c & TAG_MASK) == TAG_CONS, "登録を外していないcはGC後もconsのまま");
+    assert(cc_car(a) == os_make_fixnum(1), "登録を外していないaはGC後も正しい値を保持する(swap-removeで巻き込まれない)");
+    assert(cc_car(c) == os_make_fixnum(5), "登録を外していないcはGC後も正しい値を保持する(swap-removeで巻き込まれない)");
+    assert((b & ~TAG_MASK) == b_before,
+           "登録解除したbはGCでアドレスが更新されない(rootとして追跡されなくなった)");
+
+    os_gc_unregister_root(&a);
+    os_gc_unregister_root(&c);
+}
+
+// Phase3.6動作確認: 環境の8番目のslot「literal-slots」に登録したアドレスが、
+// os_environment_reclaim_literal_slotsで登録した順にコールバックへ渡され、
+// 呼び出し後にスロットがnilへ戻ることを確認する(za.c側のza_free_literal_slotに
+// 相当する処理を、テスト側の記録用コールバックで代替して検証する)。
+static lisp_val_t *g_literal_slot_reclaim_seen[8];
+static UINT64 g_literal_slot_reclaim_seen_count = 0;
+static void test_literal_slot_reclaim_callback(lisp_val_t *slot_addr) {
+    g_literal_slot_reclaim_seen[g_literal_slot_reclaim_seen_count++] = slot_addr;
+}
+void test_os_environment_register_and_reclaim_literal_slots() {
+    lisp_val_t env = os_make_environment(os_make_symbol("LITERAL-SLOTS-TEST-ENV"), nil);
+    lisp_val_t fake_slot_a = os_make_fixnum(111);
+    lisp_val_t fake_slot_b = os_make_fixnum(222);
+
+    g_literal_slot_reclaim_seen_count = 0;
+    os_environment_register_literal_slot(env, &fake_slot_a);
+    os_environment_register_literal_slot(env, &fake_slot_b);
+    os_environment_reclaim_literal_slots(env, test_literal_slot_reclaim_callback);
+
+    assert(g_literal_slot_reclaim_seen_count == 2, "登録した2件それぞれについてコールバックが呼ばれる");
+    assert((g_literal_slot_reclaim_seen[0] == &fake_slot_a || g_literal_slot_reclaim_seen[0] == &fake_slot_b),
+           "コールバックに渡されるのは登録したアドレスのいずれか");
+    assert((g_literal_slot_reclaim_seen[1] == &fake_slot_a || g_literal_slot_reclaim_seen[1] == &fake_slot_b),
+           "コールバックに渡されるのは登録したアドレスのいずれか");
+    assert(g_literal_slot_reclaim_seen[0] != g_literal_slot_reclaim_seen[1], "同じアドレスが重複して渡されない");
+
+    // 回収後、literal-slotsスロットは空リスト(nil)へ戻っており、再度reclaimしても
+    // コールバックは呼ばれない。
+    g_literal_slot_reclaim_seen_count = 0;
+    os_environment_reclaim_literal_slots(env, test_literal_slot_reclaim_callback);
+    assert(g_literal_slot_reclaim_seen_count == 0, "回収後のliteral-slotsスロットは空になっている");
+}
+
 void test_gc_cons_survives_and_relocates() {
     // symをos_gc_collect()を挟んで直接使うと、sym自身がFrom空間の古いアドレスのまま
     // 更新されない(rootとして登録していないローカル変数はGCが書き換えてくれない)ため、
@@ -1851,6 +1912,8 @@ int main(int argc, char** argv) {
    test_imm_pages_alloc_contiguous_returns_physically_contiguous_pages();
    test_imm_pages_alloc_contiguous_returns_null_when_request_exceeds_space();
    test_os_environment_register_and_reclaim_pages();
+   test_os_gc_unregister_root_removes_only_target_and_keeps_others_tracked();
+   test_os_environment_register_and_reclaim_literal_slots();
 
    test_gc_cons_survives_and_relocates();
    test_gc_symbol_survives_via_symbol_table();

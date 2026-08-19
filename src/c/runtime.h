@@ -263,6 +263,15 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size);
 void os_gc_register_root(lisp_val_t *root_ptr);
 
 /**
+ * os_gc_register_rootで登録したrootを登録解除する(Phase3.6: リテラルスロットプール
+ * 枯渇解消)。g_gc_extra_roots(固定配列+線形スキャン、順序に意味を持たない)から
+ * 該当エントリを見つけ、配列末尾要素と入れ替えてcountを減らす(swap-remove)。
+ * 見つからない場合は何もしない(冪等)。
+ * @param root_ptr 登録解除するroot変数へのポインタ(os_gc_register_rootに渡したものと同一)
+ */
+void os_gc_unregister_root(lisp_val_t *root_ptr);
+
+/**
  * GC_PROTECTされたローカル変数のcleanup(スコープ脱出時)ハンドラ。
  * 現在のプロセスのshadow stack先頭を、このノードのnextに巻き戻す。
  * GC_PROTECTマクロ内でのみ使う。
@@ -546,6 +555,30 @@ void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 coun
  * @param env 回収対象の環境
  */
 void os_environment_reclaim_pages(lisp_val_t env);
+
+/**
+ * envのliteral-slotsスロット(8番目)に、za.c側のリテラルスロットプール
+ * (g_za_quote_slots/g_za_number_slots/g_za_lambda_slots)上の1エントリのアドレスを
+ * 1件のフラットなリストとして追加する(TAG_RAW_POINTERタグ付き、pagesスロットの
+ * 追加パスと同じ考え方)。za.cがコンパイル成功時に、そのコンパイルで確保したスロットを
+ * 実行したenvironmentの所有物として記録するために使う(Phase3.6)。
+ * @param env 登録先の環境
+ * @param slot_addr 登録するスロットのアドレス(g_za_*_slots配列内の1要素へのポインタ)
+ */
+void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr);
+
+/**
+ * envのliteral-slotsスロット(8番目)を辿り、登録されている各アドレスについて
+ * free_slotを呼び出してから、スロットを空リストへ戻す。プール自体の構造
+ * (どのプールの何番目か、フリーリストへどう返却するか)はza.c側の知識であり、
+ * runtime.cはアドレスのライフサイクル(GC root解除含む)をfree_slotへ委譲するだけに
+ * とどめる(os_environment_reclaim_pagesがos_imm_page_freeを直接呼べるのは、pagesが
+ * runtime.c自身が所有するImmobilized Spaceの資源だからであり、za.c所有のスロット
+ * プールについては同じ構造にできないため、コールバック経由にしている)。
+ * @param env 回収対象の環境
+ * @param free_slot 各アドレスに対して呼ぶ解放コールバック(za_free_literal_slot想定)
+ */
+void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp_val_t *slot_addr));
 
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。

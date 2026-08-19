@@ -455,6 +455,16 @@ void os_gc_register_root(lisp_val_t *root_ptr) {
     g_gc_extra_roots[g_gc_extra_root_count++] = root_ptr;
 }
 
+void os_gc_unregister_root(lisp_val_t *root_ptr) {
+    for (UINT64 i = 0; i < g_gc_extra_root_count; i++) {
+        if (g_gc_extra_roots[i] == root_ptr) {
+            g_gc_extra_roots[i] = g_gc_extra_roots[g_gc_extra_root_count - 1];
+            g_gc_extra_root_count--;
+            return;
+        }
+    }
+}
+
 /**
  * コピー済み(To空間へ転送済み)だがまだフィールドを転送していないオブジェクトのFIFOキュー
  * (gray list)。conの再帰的コピー(depth-first)はcdr連鎖でCスタックを溢れさせる危険が
@@ -1413,16 +1423,22 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
      *     (cons 'parent parent-env)
      *     (cons 'constants nil)
      *     (cons 'cells nil)
-     *     (cons 'pages nil)))
+     *     (cons 'pages nil)
+     *     (cons 'literal-slots nil)))
      *
-     * constants/cells/pagesは既存のos_get_variable/os_get_function/os_set_variable/
-     * os_set_functionが4番目(parent)までしか固定位置参照しないため、末尾に追加する
-     * だけで既存コードに影響しない。cellsは(sym . TAG_RAW_POINTER付きFunction Cell
-     * アドレス)のalistで、os_set_functionがfunctionsスロットと同時に同期する
-     * (os_get_function_cell参照)。pagesはこのenvironmentが所有するImmobilized Page
-     * (TAG_RAW_POINTER付きページアドレス)のフラットなリストで、za.cがJITコードの
+     * constants/cells/pages/literal-slotsは既存のos_get_variable/os_get_function/
+     * os_set_variable/os_set_functionが4番目(parent)までしか固定位置参照しないため、
+     * 末尾に追加するだけで既存コードに影響しない。cellsは(sym . TAG_RAW_POINTER付き
+     * Function Cellアドレス)のalistで、os_set_functionがfunctionsスロットと同時に
+     * 同期する(os_get_function_cell参照)。pagesはこのenvironmentが所有するImmobilized
+     * Page(TAG_RAW_POINTER付きページアドレス)のフラットなリストで、za.cがJITコードの
      * 配置先として確保したページをos_environment_register_pagesで登録し、環境破棄時に
      * os_environment_reclaim_pagesが1ページずつos_imm_page_freeへ返却する。
+     * literal-slotsは同じ考え方で、za.c側のg_za_quote_slots/g_za_number_slots/
+     * g_za_lambda_slotsプールからこのenvironmentへのdefunコンパイルが確保した
+     * スロットのアドレス(TAG_RAW_POINTER付き)のフラットなリストであり、
+     * os_environment_register_literal_slotで登録し、環境破棄時に
+     * os_environment_reclaim_literal_slotsがza.c側のフリーリストへ返却する(Phase3.6)。
      */
     lisp_val_t name_symbol = os_make_symbol("name");
     GC_PROTECT(name_symbol);
@@ -1438,6 +1454,8 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     GC_PROTECT(cells_symbol);
     lisp_val_t pages_symbol = os_make_symbol("pages");
     GC_PROTECT(pages_symbol);
+    lisp_val_t literal_slots_symbol = os_make_symbol("literal-slots");
+    GC_PROTECT(literal_slots_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     GC_PROTECT(name_slot);
@@ -1452,8 +1470,11 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     lisp_val_t cells_slot = os_make_cons(cells_symbol, nil);
     GC_PROTECT(cells_slot);
     lisp_val_t pages_slot = os_make_cons(pages_symbol, nil);
+    GC_PROTECT(pages_slot);
+    lisp_val_t literal_slots_slot = os_make_cons(literal_slots_symbol, nil);
 
-    lisp_val_t list_step6 = os_make_cons(pages_slot, nil);
+    lisp_val_t list_step7 = os_make_cons(literal_slots_slot, nil);
+    lisp_val_t list_step6 = os_make_cons(pages_slot, list_step7);
     lisp_val_t list_step5 = os_make_cons(cells_slot, list_step6);
     lisp_val_t list_step4 = os_make_cons(constants_slot, list_step5);
     lisp_val_t list_step3 = os_make_cons(parent_slot, list_step4);
@@ -1849,6 +1870,37 @@ void os_environment_reclaim_pages(lisp_val_t env) {
 
     lisp_addr_t pages_slot_addr = pages_slot & ~TAG_MASK;
     ((lisp_val_t *)pages_slot_addr)[1] = nil;
+}
+
+void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr) {
+    GC_PROTECT(env);
+    // literal-slotsスロット(8番目、cddddr(cdr(env))のcddrのcar)を取り出す
+    lisp_val_t literal_slots_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))))));
+    GC_PROTECT(literal_slots_slot);
+
+    lisp_val_t list = cc_cdr(literal_slots_slot);
+    GC_PROTECT(list);
+    lisp_val_t tagged_slot = ((lisp_val_t)(lisp_addr_t)slot_addr) | TAG_RAW_POINTER;
+    lisp_val_t new_list = os_make_cons(tagged_slot, list);
+    // pagesスロットの追加パスと同じ理由で、書き込み先アドレスはos_make_cons
+    // 完了後にliteral_slots_slot(GC_PROTECT済み)から読み直す
+    lisp_addr_t literal_slots_slot_addr = literal_slots_slot & ~TAG_MASK;
+    ((lisp_val_t *)literal_slots_slot_addr)[1] = new_list;
+}
+
+void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp_val_t *slot_addr)) {
+    lisp_val_t literal_slots_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))))));
+    lisp_val_t list = cc_cdr(literal_slots_slot);
+
+    while (list != nil) {
+        lisp_val_t tagged_slot = cc_car(list);
+        lisp_val_t *slot_addr = (lisp_val_t *)(lisp_addr_t)(tagged_slot & ~TAG_MASK);
+        free_slot(slot_addr);
+        list = cc_cdr(list);
+    }
+
+    lisp_addr_t literal_slots_slot_addr = literal_slots_slot & ~TAG_MASK;
+    ((lisp_val_t *)literal_slots_slot_addr)[1] = nil;
 }
 
 

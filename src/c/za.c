@@ -144,6 +144,27 @@ static UINT32 g_jit_reloc_count = 0;
 static UINT64 g_jit_trampoline_jmp_patch_offsets[ZA_MAX_TRAMPOLINE_JMPS];
 static UINT32 g_jit_trampoline_jmp_count = 0;
 
+/** 1回のza_try_compile_defun呼び出し(1defunのコンパイル試行)で、g_za_quote_slots/
+ * g_za_number_slots/g_za_lambda_slots(いずれかのプール)から確保したスロットの
+ * アドレスの一覧(za_try_compile_defun冒頭でリセットする)。コンパイル成功時は
+ * os_environment_register_literal_slotで環境の所有物として登録し、失敗時は
+ * za_release_literal_slot_allocsで即座にフリーリストへ返却する(Phase3.6)。
+ * 3プールの上限合計(32*3=96)を超えて確保されることはないため、この配列サイズで
+ * 安全(g_jit_overflowと違い、上限超過はここでは理論上発生しないため専用の
+ * overflowフラグには合流しない)。 */
+#define ZA_MAX_LITERAL_SLOT_ALLOCS 96
+static lisp_val_t *g_za_literal_slot_allocs[ZA_MAX_LITERAL_SLOT_ALLOCS];
+static UINT32 g_za_literal_slot_alloc_count = 0;
+
+/** addrをg_za_literal_slot_allocsへ記録する(3プール共有のスロット確保ヘルパー
+ * za_alloc_quote_slotと、number/lambdaスロットのインライン確保箇所の両方から
+ * 呼ばれる)。 */
+static void za_track_literal_slot_alloc(lisp_val_t *addr) {
+    if (g_za_literal_slot_alloc_count < ZA_MAX_LITERAL_SLOT_ALLOCS) {
+        g_za_literal_slot_allocs[g_za_literal_slot_alloc_count++] = addr;
+    }
+}
+
 /**
  * g_jit_code内の別オフセット(target_off、za_emit_symbol_name等が埋め込んだ文字列の
  * 先頭)を指す自己参照movabsを発行する。jit_movabs_regとの違いは、即値の埋め込み位置
@@ -404,21 +425,34 @@ typedef struct {
 #define ZA_MAX_QUOTE_SLOTS 32
 static lisp_val_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS];
 static UINT64 g_za_quote_slot_count = 0;
+/** Phase3.6: 環境破棄時にza_free_literal_slotが返却したスロットindexのフリーリスト
+ * (スタック、LIFO)。za_alloc_quote_slotはここを先に見て、空ならモノトニック
+ * カウンタから新規確保する。 */
+static UINT64 g_za_quote_slot_free[ZA_MAX_QUOTE_SLOTS];
+static UINT64 g_za_quote_slot_free_count = 0;
 
 /**
  * g_za_quote_slotsプールから1枠確保し、valueを格納してos_gc_register_rootする
  * (quoteのヒープ値ケースだけでなく、flet/labelsのgensymシンボル保持でも共有する
  * — gensymはg_symbol_tableに載らないため名前再解決に乗せられず、このスロット越しに
  * しか安全に参照できない、documents/jit.md/このファイル冒頭のコメント参照)。
+ * このコンパイル試行で確保したスロットとしてg_za_literal_slot_allocsへも記録する
+ * (za_try_compile_defunが成功/失敗いずれの場合も、環境への登録またはフリーリストへの
+ * 即時返却に使う、Phase3.6)。
  * @return 確保できれば1(out_slot_idxに書く)、プール枯渇なら0
  */
 static int za_alloc_quote_slot(lisp_val_t value, UINT64 *out_slot_idx) {
-    if (g_za_quote_slot_count >= ZA_MAX_QUOTE_SLOTS) {
+    UINT64 slot_idx;
+    if (g_za_quote_slot_free_count > 0) {
+        slot_idx = g_za_quote_slot_free[--g_za_quote_slot_free_count];
+    } else if (g_za_quote_slot_count < ZA_MAX_QUOTE_SLOTS) {
+        slot_idx = g_za_quote_slot_count++;
+    } else {
         return 0;
     }
-    UINT64 slot_idx = g_za_quote_slot_count++;
     g_za_quote_slots[slot_idx] = value;
     os_gc_register_root(&g_za_quote_slots[slot_idx]);
+    za_track_literal_slot_alloc(&g_za_quote_slots[slot_idx]);
     *out_slot_idx = slot_idx;
     return 1;
 }
@@ -463,6 +497,9 @@ static int za_classify_quoted_value(lisp_val_t quoted, za_operand_t *out) {
 #define ZA_MAX_NUMBER_SLOTS 32
 static lisp_val_t g_za_number_slots[ZA_MAX_NUMBER_SLOTS];
 static UINT64 g_za_number_slot_count = 0;
+/** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
+static UINT64 g_za_number_slot_free[ZA_MAX_NUMBER_SLOTS];
+static UINT64 g_za_number_slot_free_count = 0;
 
 /** let-IIFEインライン化(拡張B)で使うローカル変数1個分の情報。val_offは
  * za_local_val_offで計算したフレームバイトオフセット。 */
@@ -667,12 +704,17 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
     // すでにdefunソースASTの一部としてヒープ上に存在する値をそのままコピーする
     // だけなので、ここで新たなヒープ確保は発生しない。
     if ((form & TAG_MASK) == TAG_INSTANCE && (za_is_float_literal(form) || za_is_bignum_literal(form))) {
-        if (g_za_number_slot_count >= ZA_MAX_NUMBER_SLOTS) {
+        UINT64 slot_idx;
+        if (g_za_number_slot_free_count > 0) {
+            slot_idx = g_za_number_slot_free[--g_za_number_slot_free_count];
+        } else if (g_za_number_slot_count < ZA_MAX_NUMBER_SLOTS) {
+            slot_idx = g_za_number_slot_count++;
+        } else {
             return 0;
         }
-        UINT64 slot_idx = g_za_number_slot_count++;
         g_za_number_slots[slot_idx] = form;
         os_gc_register_root(&g_za_number_slots[slot_idx]);
+        za_track_literal_slot_alloc(&g_za_number_slots[slot_idx]);
         out->is_literal = 7;
         out->param_index = slot_idx;
         return 1;
@@ -782,6 +824,52 @@ typedef struct {
 #define ZA_MAX_LAMBDA_SLOTS 32
 static lisp_val_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS];
 static UINT64 g_za_lambda_slot_count = 0;
+/** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
+static UINT64 g_za_lambda_slot_free[ZA_MAX_LAMBDA_SLOTS];
+static UINT64 g_za_lambda_slot_free_count = 0;
+
+/**
+ * addrがg_za_quote_slots/g_za_number_slots/g_za_lambda_slotsのいずれかのプールの
+ * 1エントリを指している前提で、そのプールを判別し(ポインタの範囲比較)、
+ * os_gc_unregister_rootでGC rootから外してから、そのプールのフリーリストへ
+ * indexを返却する(Phase3.6)。os_environment_reclaim_literal_slotsが環境の
+ * literal-slotsスロットを辿って登録済みの各アドレスに対して呼ぶコールバックとして
+ * 使う(runtime.cはこの3プールの構造を知らないため、コールバック越しに委譲する)。
+ * どのプールにも属さないアドレスが渡された場合は何もしない(該当しない、通常発生しない)。
+ * @param addr 解放するスロットのアドレス(いずれかのg_za_*_slots配列内の1要素)
+ */
+static void za_free_literal_slot(lisp_val_t *addr) {
+    os_gc_unregister_root(addr);
+    if (addr >= g_za_quote_slots && addr < g_za_quote_slots + ZA_MAX_QUOTE_SLOTS) {
+        UINT64 idx = (UINT64)(addr - g_za_quote_slots);
+        g_za_quote_slot_free[g_za_quote_slot_free_count++] = idx;
+        return;
+    }
+    if (addr >= g_za_number_slots && addr < g_za_number_slots + ZA_MAX_NUMBER_SLOTS) {
+        UINT64 idx = (UINT64)(addr - g_za_number_slots);
+        g_za_number_slot_free[g_za_number_slot_free_count++] = idx;
+        return;
+    }
+    if (addr >= g_za_lambda_slots && addr < g_za_lambda_slots + ZA_MAX_LAMBDA_SLOTS) {
+        UINT64 idx = (UINT64)(addr - g_za_lambda_slots);
+        g_za_lambda_slot_free[g_za_lambda_slot_free_count++] = idx;
+        return;
+    }
+}
+
+/**
+ * g_za_literal_slot_allocs(このコンパイル試行で確保した全スロット)を1件ずつ
+ * za_free_literal_slotで即座に解放し、記録数を0へ戻す。za_try_compile_defunの
+ * 各失敗exitで呼び、失敗したコンパイル試行が確保したスロットをそのまま次回の
+ * コンパイル試行へ即座に再利用可能にする(Phase3.6、計画の文言を越えたボーナス改善
+ * — 従来は失敗時に永久リークしていた)。
+ */
+static void za_release_literal_slot_allocs(void) {
+    for (UINT32 i = 0; i < g_za_literal_slot_alloc_count; i++) {
+        za_free_literal_slot(g_za_literal_slot_allocs[i]);
+    }
+    g_za_literal_slot_alloc_count = 0;
+}
 
 /**
  * GC_PROTECTと同じ仕組み(shadow stackへのgc_rootnodeの連結)を、JIT生成コードから
@@ -1760,13 +1848,18 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     lisp_val_t lambda_params = cc_car(rest);
     lisp_val_t lambda_body = cc_cdr(rest);
 
-    if (g_za_lambda_slot_count >= ZA_MAX_LAMBDA_SLOTS) {
+    UINT64 slot_idx;
+    if (g_za_lambda_slot_free_count > 0) {
+        slot_idx = g_za_lambda_slot_free[--g_za_lambda_slot_free_count];
+    } else if (g_za_lambda_slot_count < ZA_MAX_LAMBDA_SLOTS) {
+        slot_idx = g_za_lambda_slot_count++;
+    } else {
         return 0;
     }
-    UINT64 slot_idx = g_za_lambda_slot_count++;
     g_za_lambda_slots[slot_idx] = os_make_cons(lambda_params, lambda_body);
     os_gc_register_root(&g_za_lambda_slots[slot_idx]);
     lisp_val_t *slot_addr = &g_za_lambda_slots[slot_idx];
+    za_track_literal_slot_alloc(slot_addr);
 
     za_emit_build_capture_env(params, fixed_count, locals, ZA_OFF_LAMBDA_SAVED_HEAD, ZA_OFF_LAMBDA_ENV_VAL,
                                ZA_OFF_LAMBDA_ENV_NODE, ZA_OFF_LAMBDA_TMP_VAL, ZA_OFF_LAMBDA_TMP_NODE);
@@ -3536,13 +3629,18 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
     // そのままクロージャ退避用スクラッチとして使い回せる(za_compile_lambdaの
     // 兄弟lambdaが同じTMPスロットを再利用できる理由と同じ)。
     for (UINT64 i = 0; i < binding_count; i++) {
-        if (g_za_lambda_slot_count >= ZA_MAX_LAMBDA_SLOTS) {
+        UINT64 lambda_slot_idx;
+        if (g_za_lambda_slot_free_count > 0) {
+            lambda_slot_idx = g_za_lambda_slot_free[--g_za_lambda_slot_free_count];
+        } else if (g_za_lambda_slot_count < ZA_MAX_LAMBDA_SLOTS) {
+            lambda_slot_idx = g_za_lambda_slot_count++;
+        } else {
             return 0;
         }
-        UINT64 lambda_slot_idx = g_za_lambda_slot_count++;
         g_za_lambda_slots[lambda_slot_idx] = os_make_cons(binding_params[i], binding_bodies[i]);
         os_gc_register_root(&g_za_lambda_slots[lambda_slot_idx]);
         lisp_val_t *lambda_slot_addr = &g_za_lambda_slots[lambda_slot_idx];
+        za_track_literal_slot_alloc(lambda_slot_addr);
         lisp_val_t *gensym_slot_addr = new_scope.bindings[i].gensym_slot_addr;
 
         // クロージャ本体: os_make_instance(MAGIC_FUNCTION_INTERPRETED, binding_params,
@@ -3837,11 +3935,16 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     g_za_saw_flet_labels_escape = 0;
     g_jit_reloc_count = 0;
     g_jit_trampoline_jmp_count = 0;
+    // Phase3.6: このコンパイル試行で確保するリテラルスロット(quote/number/lambda)の
+    // 一覧をリセットする。失敗exitではza_release_literal_slot_allocsで即座にフリーリストへ
+    // 返却し、成功時はos_environment_register_literal_slotでenvへ登録する。
+    g_za_literal_slot_alloc_count = 0;
     // トランポリンは全JIT関数で共有するため、今回のコンパイル対象用にentryを記録する
     // より前に確定させる(コンパイル失敗時のg_jit_used巻き戻しでスタブ自体が失われない
     // ようにするため)。
     UINT64 trampoline_offset = za_ensure_trampoline();
     if (g_jit_overflow) {
+        za_release_literal_slot_allocs();
         return nil;
     }
 
@@ -3861,6 +3964,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     za_emit_gc_link_slot(ZA_OFF_ARGS_VAL, ZA_OFF_ARGS_NODE);
 
     if (!za_compile_expr(form, params, fixed_count, 0, &syms, env, 1, trampoline_offset, 0, 0, 0, 0)) {
+        za_release_literal_slot_allocs();
         g_jit_used = entry;
         return nil;
     }
@@ -3884,6 +3988,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     // 束縛関数を(function name)で取り出したケースも無条件にfallbackさせる
     // (g_za_saw_flet_labels_escapeのコメント参照)。
     if (g_jit_overflow || (g_za_saw_setq_local && g_za_saw_escaping_lambda) || g_za_saw_flet_labels_escape) {
+        za_release_literal_slot_allocs();
         g_jit_used = entry;
         return nil;
     }
@@ -3898,6 +4003,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     UINT64 page_count = (code_len + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
     void *dest = os_imm_pages_alloc_contiguous(page_count);
     if (dest == 0) {
+        za_release_literal_slot_allocs();
         g_jit_used = entry;
         return nil;
     }
@@ -3942,6 +4048,14 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     jit_serialize_icache();
 
     os_environment_register_pages(env, dest, page_count);
+
+    // Phase3.6: このコンパイル試行で確保したリテラルスロットをenvの所有物として登録する
+    // (pagesスロットと同じタイミング)。環境破棄時にos_environment_reclaim_literal_slotsが
+    // za_free_literal_slotを呼んでフリーリストへ返却する。
+    for (UINT32 i = 0; i < g_za_literal_slot_alloc_count; i++) {
+        os_environment_register_literal_slot(env, g_za_literal_slot_allocs[i]);
+    }
+    g_za_literal_slot_alloc_count = 0;
 
     g_jit_used = entry;
 
