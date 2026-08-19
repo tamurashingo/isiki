@@ -4353,9 +4353,15 @@ lisp_val_t primitive_global_environment(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t new_env = cc_car(args);
+    // nilはconsとしてのタグを持つ自己参照セル(実装上の都合)だが、環境としては
+    // 妥当ではないため、primitive_conspと同じくTAG_CONSチェックの前に明示的に除外する
+    if (new_env == nil || (new_env & TAG_MASK) != TAG_CONS) {
+        return nil;
+    }
     get_current_process()->env = new_env;
-    return new_env;
+    return g_sym_t;
 }
 
 /**

@@ -281,6 +281,35 @@ void test_primitive_global_environment_returns_global_environment_regardless_of_
     assert(v2 == global_environment, "global_environmentを渡しても同じ値が返る(冗等)");
 }
 
+// primitive_set_current_environmentの戻り値がt/nilになったこと(旧実装は切り替え先の
+// 環境そのものを返していたが、REPLで直接呼んだ際に環境の内部構造がそのまま表示されて
+// 出力が大量になるため変更した)、および環境として妥当でない値(nil、cons以外)を渡した
+// 場合は切り替えを行わずnilを返すことを確認する。
+void test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid_env() {
+    lisp_val_t env1 = os_make_environment(os_make_symbol("SET-CUR-ENV-1"), nil);
+    lisp_val_t env2 = os_make_environment(os_make_symbol("SET-CUR-ENV-2"), nil);
+
+    lisp_val_t args1 = os_make_cons(env1, nil);
+    lisp_val_t r1 = primitive_set_current_environment(args1, nil);
+    assert(r1 == g_sym_t, "妥当な環境への切り替えはtが返る");
+    assert(get_current_process()->env == env1, "実際にproc->envがenv1へ切り替わっている");
+
+    lisp_val_t args_nil = os_make_cons(nil, nil);
+    lisp_val_t r2 = primitive_set_current_environment(args_nil, nil);
+    assert(r2 == nil, "nilは環境として妥当でないためnilが返る");
+    assert(get_current_process()->env == env1, "失敗時はproc->envが変更されず前の環境のまま");
+
+    lisp_val_t args_fixnum = os_make_cons(os_make_fixnum(42), nil);
+    lisp_val_t r3 = primitive_set_current_environment(args_fixnum, nil);
+    assert(r3 == nil, "consでない値も環境として妥当でないためnilが返る");
+    assert(get_current_process()->env == env1, "失敗時はproc->envが変更されず前の環境のまま");
+
+    lisp_val_t args2 = os_make_cons(env2, nil);
+    lisp_val_t r4 = primitive_set_current_environment(args2, nil);
+    assert(r4 == g_sym_t, "2回目の妥当な切り替えもtが返る");
+    assert(get_current_process()->env == env2, "実際にproc->envがenv2へ切り替わっている");
+}
+
 // Phase2動作確認: Function Cellのアドレスは再defunしても不変であること(呼び出し側は
 // cellアドレスだけ握っていればよく、cellの中身がどこを指しているかを意識しなくてよい)、
 // および同じcellアドレス経由での呼び出しがcellの中身の書き換えに応じて動的に切り替わる
@@ -1851,6 +1880,7 @@ int main(int argc, char** argv) {
    test_os_get_variable();
    test_os_get_function();
    test_primitive_global_environment_returns_global_environment_regardless_of_caller_env();
+   test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid_env();
    test_os_function_cell();
    test_os_make_fixnum_signed();
    test_os_make_integer_promotes_to_bignum();

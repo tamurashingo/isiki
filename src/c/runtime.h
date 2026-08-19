@@ -1252,9 +1252,14 @@ lisp_val_t primitive_global_environment(lisp_val_t args, lisp_val_t env);
  * (documents/environment.md Phase4)。get_current_process()->envはprocess初期化時に
  * os_gc_register_rootでルート登録済み(プロセス構造体自身のフィールドアドレスを指すため、
  * 値の書き換えはGCに対して安全)。
+ * 第一引数がnilまたはconsでない(=環境として妥当でない)場合は切り替えを行わずnilを返す。
+ * 戻り値を切り替え先の環境そのものにしていた旧実装は、REPLで直接呼んだ際に
+ * variables/functions等のalistを含む環境の内部構造がそのまま表示され、大量の出力と
+ * なっていたため、成功/失敗のみを示すt/nilに変更した(switch-environment/
+ * with-environmentはいずれも戻り値を参照していないため、この変更による影響はない)。
  * @param args 評価済みの引数リスト(第一引数: 切り替え先の環境)
  * @param env 呼び出し時の環境(未使用)
- * @return 切り替え先の環境(第一引数そのまま)
+ * @return 切り替えに成功したらt、第一引数が環境として妥当でなければnil
  */
 lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env);
 
