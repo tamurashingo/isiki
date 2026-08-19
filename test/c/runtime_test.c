@@ -1426,6 +1426,49 @@ void test_imm_slot_alloc_carves_aligned_slots_from_pages() {
     assert(cursor.page != 0, "カーソルはos_imm_page_allocで確保したページを保持する");
 }
 
+// Phase3動作確認: os_imm_pages_alloc_contiguousが返す複数ページは物理的に連続しており、
+// (フリーリストを経由しない)続く単ページ確保はその直後から始まることを確認する。
+void test_imm_pages_alloc_contiguous_returns_physically_contiguous_pages() {
+    UINT8 *dest = (UINT8 *)os_imm_pages_alloc_contiguous(3);
+    assert(dest != 0, "3ページの確保が成功する");
+
+    UINT8 *next = (UINT8 *)os_imm_page_alloc();
+    assert(next == dest + 3 * IMM_PAGE_SIZE,
+           "3ページ分は物理的に連続しており、続く単ページ確保はその直後から始まる");
+}
+
+// Phase3動作確認: 空き容量を大きく超える要求は、os_imm_page_allocのようにハードハルトせず
+// NULLを返し、かつbump領域を消費しないことを確認する。
+void test_imm_pages_alloc_contiguous_returns_null_when_request_exceeds_space() {
+    UINT8 *before = (UINT8 *)os_imm_page_alloc();
+
+    void *huge = os_imm_pages_alloc_contiguous(1000000);
+    assert(huge == 0, "空き容量を超える要求はハードハルトせずNULLを返す");
+
+    UINT8 *after = (UINT8 *)os_imm_page_alloc();
+    assert(after == before + IMM_PAGE_SIZE,
+           "失敗した確保はbump領域を消費しない(続く単ページ確保は直前の続きから始まる)");
+}
+
+// Phase3動作確認: 環境の7番目のslot「pages」に登録したImmobilized Pageが、
+// os_environment_reclaim_pagesでos_imm_page_freeへ返却され、フリーリスト経由で
+// os_imm_page_allocから再利用可能になることを確認する。
+void test_os_environment_register_and_reclaim_pages() {
+    lisp_val_t env = os_make_environment(os_make_symbol("PAGES-TEST-ENV"), nil);
+    void *dest = os_imm_pages_alloc_contiguous(2);
+    assert(dest != 0, "2ページの確保が成功する");
+
+    os_environment_register_pages(env, dest, 2);
+    os_environment_reclaim_pages(env);
+
+    void *r1 = os_imm_page_alloc();
+    void *r2 = os_imm_page_alloc();
+    UINT8 *page0 = (UINT8 *)dest;
+    UINT8 *page1 = (UINT8 *)dest + IMM_PAGE_SIZE;
+    assert((r1 == page0 || r1 == page1), "回収した1ページ目がフリーリスト経由で再利用される");
+    assert((r2 == page0 || r2 == page1) && r2 != r1, "回収した2ページ目もフリーリスト経由で再利用される");
+}
+
 void test_gc_cons_survives_and_relocates() {
     // symをos_gc_collect()を挟んで直接使うと、sym自身がFrom空間の古いアドレスのまま
     // 更新されない(rootとして登録していないローカル変数はGCが書き換えてくれない)ため、
@@ -1805,6 +1848,9 @@ int main(int argc, char** argv) {
 
    test_imm_page_alloc_survives_gc_and_free_list_reuses_page();
    test_imm_slot_alloc_carves_aligned_slots_from_pages();
+   test_imm_pages_alloc_contiguous_returns_physically_contiguous_pages();
+   test_imm_pages_alloc_contiguous_returns_null_when_request_exceeds_space();
+   test_os_environment_register_and_reclaim_pages();
 
    test_gc_cons_survives_and_relocates();
    test_gc_symbol_survives_via_symbol_table();

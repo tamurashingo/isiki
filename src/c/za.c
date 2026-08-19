@@ -117,6 +117,55 @@ static void jit_movabs_reg(UINT8 reg, UINT64 imm) {
     jit_emit64(imm);
 }
 
+/** g_jit_code内の自己参照movabs(g_jit_code+offset形式の即値)の最大記録数。
+ * za_emit_symbol_nameが埋め込むシンボル名文字列を都度os_make_symbolへ渡すために
+ * 呼び出しごとに発行されるため、1defun内の呼び出し式の個数に応じて増える
+ * (他の固定上限値と同様、超過時はg_jit_overflowと同じグレースフル・フォールバックに
+ * 合流する)。 */
+#define ZA_MAX_JIT_RELOCS 128
+/** jit_movabs_self_refが発行した自己参照movabsの即値フィールドの位置(g_jit_code内の
+ * 絶対オフセット)の一覧。za_try_compile_defunがコンパイル成功後にコードをImmobilized
+ * Spaceへコピーする際、この一覧を辿って即値を新しい配置先のアドレスに基づき書き換える
+ * (za_try_compile_defun冒頭でリセットする) */
+static UINT64 g_jit_reloc_patch_offsets[ZA_MAX_JIT_RELOCS];
+static UINT32 g_jit_reloc_count = 0;
+
+/** jit_emit_jmp_to_trampoline(トランポリンへの末尾呼び出しjmp)が発行するrel32フィールドの
+ * 位置(g_jit_code内の絶対オフセット)の最大記録数。トランポリン自体はg_jit_code内に固定
+ * (再配置されない)だが、jmp命令自身はコンパイル対象の関数本体の一部としてImmobilized
+ * Spaceへコピーされて移動するため、rel32(その場のIP相対)は素朴なmemcpyでは古い相対距離
+ * のまま残ってしまい、コピー先から実行すると全く別の場所へ飛ぶ。したがってg_jit_reloc_*
+ * とは別に、trampoline_offset(コピー後も不変)への絶対距離として再計算しパッチする
+ * 必要がある。tagbodyのgoが確定済みタグへ飛ぶ既存のjit_emit_jmp_to(target_offsetは今回の
+ * コンパイル対象と一緒に移動する)とは意味が異なるため、記録対象はこの専用関数の呼び出しに
+ * 限定する(両者を同一視して全件パッチすると、go側の元々正しかったrel32を誤って書き換えて
+ * 壊してしまう)。 */
+#define ZA_MAX_TRAMPOLINE_JMPS 128
+static UINT64 g_jit_trampoline_jmp_patch_offsets[ZA_MAX_TRAMPOLINE_JMPS];
+static UINT32 g_jit_trampoline_jmp_count = 0;
+
+/**
+ * g_jit_code内の別オフセット(target_off、za_emit_symbol_name等が埋め込んだ文字列の
+ * 先頭)を指す自己参照movabsを発行する。jit_movabs_regとの違いは、即値の埋め込み位置
+ * (常に発行開始時点のg_jit_used+2。jit_movabs_regはREX+opcodeの2byteの後に8byte即値を
+ * 置くため)をg_jit_reloc_patch_offsetsへ記録する点のみ。この記録により、
+ * za_try_compile_defunがコンパイル済みコードをImmobilized Spaceへコピーする際、
+ * 「g_jit_code内の別の場所を指す」という自己参照の意味を保ったまま即値を新しい
+ * 配置先アドレスへパッチできる(素朴なmemcpyだけでは古いg_jit_codeを指したままになり
+ * 壊れる)。
+ * @param reg 書き込み先レジスタ
+ * @param target_off 指し先のg_jit_code内オフセット
+ */
+static void jit_movabs_self_ref(UINT8 reg, UINT64 target_off) {
+    UINT64 patch_offset = g_jit_used + 2;
+    if (g_jit_reloc_count < ZA_MAX_JIT_RELOCS) {
+        g_jit_reloc_patch_offsets[g_jit_reloc_count++] = patch_offset;
+    } else {
+        g_jit_overflow = 1;
+    }
+    jit_movabs_reg(reg, (UINT64)(void *)(g_jit_code + target_off));
+}
+
 /** and reg, imm8 (符号拡張、"and r/m64, imm8"opcode0x83 /4でエンコード) */
 static void jit_and_reg_imm8(UINT8 reg, UINT8 imm8) {
     UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
@@ -237,6 +286,20 @@ static void jit_patch_rel32(UINT64 patch_offset) {
 static void jit_emit_jmp_to(UINT64 target_offset) {
     UINT64 patch = jit_emit_jmp_rel32_placeholder();
     jit_patch_rel32_target(patch, target_offset);
+}
+
+/** jit_emit_jmp_toと同じくrel32のjmpを発行するが、着地点が共有トランポリンのように
+ * 「今回のコンパイル対象とは一緒に移動しない、固定された場所」である場合専用。
+ * パッチ位置をg_jit_trampoline_jmp_patch_offsetsへ記録し、za_try_compile_defunの
+ * コピー後にトランポリンの実アドレスへ向けて再計算・再パッチする。 */
+static void jit_emit_jmp_to_trampoline(UINT64 target_offset) {
+    UINT64 patch = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32_target(patch, target_offset);
+    if (g_jit_trampoline_jmp_count < ZA_MAX_TRAMPOLINE_JMPS) {
+        g_jit_trampoline_jmp_patch_offsets[g_jit_trampoline_jmp_count++] = patch;
+    } else {
+        g_jit_overflow = 1;
+    }
 }
 
 /**
@@ -966,7 +1029,7 @@ static void za_emit_operand(const za_operand_t *op) {
         // za_compile_call/za_compile_dynamicと同じく名前から都度再解決する
         // (GCでシンボルオブジェクトが移動しても安全)。
         UINT64 name_off = za_emit_symbol_name(op->literal);
-        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
         jit_call_r11();
         return;
@@ -992,7 +1055,7 @@ static void za_emit_operand(const za_operand_t *op) {
         // 拡張11: (function sym)。za_compile_callの関数解決(za.c内、名前埋め込み→
         // os_make_symbol→os_get_function)と同じ3ステップをそのまま踏襲する。
         UINT64 name_off = za_emit_symbol_name(op->literal);
-        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
         jit_call_r11();
         jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
@@ -1598,7 +1661,7 @@ static void za_emit_build_capture_env(lisp_val_t params, UINT64 fixed_count, con
 
     // 2. 新規env = os_make_environment("LAMBDA-ENV", 現在のenv)を構築し、linkする。
     UINT64 env_name_off = za_emit_symbol_name(os_make_symbol("LAMBDA-ENV"));
-    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + env_name_off));
+    jit_movabs_self_ref(ZA_REG_RCX, env_name_off);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
     jit_call_r11();
     jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
@@ -1626,7 +1689,7 @@ static void za_emit_build_capture_env(lisp_val_t params, UINT64 fixed_count, con
         za_store_slot(ZA_REG_RAX, tmp_val_off);
 
         UINT64 psym_off = za_emit_symbol_name(param_sym);
-        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + psym_off));
+        jit_movabs_self_ref(ZA_REG_RCX, psym_off);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
         jit_call_r11();
         jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
@@ -1655,7 +1718,7 @@ static void za_emit_build_capture_env(lisp_val_t params, UINT64 fixed_count, con
                 za_store_slot(ZA_REG_RAX, tmp_val_off);
 
                 UINT64 lsym_off = za_emit_symbol_name(s->vars[i].sym);
-                jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + lsym_off));
+                jit_movabs_self_ref(ZA_REG_RCX, lsym_off);
                 jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
                 jit_call_r11();
                 jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
@@ -2344,7 +2407,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         jit_call_r11();
     } else {
         UINT64 name_off = za_emit_symbol_name(fn_sym);
-        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
         jit_call_r11();
         jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
@@ -2397,7 +2460,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         jit_add_rsp_imm32(ZA_FRAME_TOTAL);
         jit_pop_r13();
         jit_pop_rbx();
-        jit_emit_jmp_to(trampoline_offset);
+        jit_emit_jmp_to_trampoline(trampoline_offset);
         // 通常経路はここで(実行時に)トランポリンへ抜けるため、以下の
         // abort_to_end_patchの着地点はis_tail=1の場合は「引数評価中に制御転送で
         // 中断した」場合のみ機械語レベルで到達する(その場合は実呼び出しを一切
@@ -2700,7 +2763,7 @@ static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
         jit_movabs_reg(ZA_REG_R11, nil);
     } else {
         UINT64 name_off = za_emit_symbol_name(name);
-        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
         jit_call_r11();
         jit_mov_reg_reg(ZA_REG_R11, ZA_REG_RAX);
@@ -2766,7 +2829,7 @@ static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fix
         jit_movabs_reg(ZA_REG_RDX, nil);
     } else {
         UINT64 name_off = za_emit_symbol_name(name);
-        jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
         jit_call_r11();
         jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RAX);
@@ -2802,7 +2865,7 @@ static int za_compile_dynamic(lisp_val_t form) {
     }
 
     UINT64 name_off = za_emit_symbol_name(name);
-    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_self_ref(ZA_REG_RCX, name_off);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
     jit_call_r11();
     jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
@@ -2858,7 +2921,7 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
     za_emit_gc_link_slot(val_off, node_off);
 
     UINT64 name_off = za_emit_symbol_name(name);
-    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_self_ref(ZA_REG_RCX, name_off);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
     jit_call_r11();
     jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
@@ -2871,7 +2934,7 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
     // 戻り値はos_set_dynamicの戻り値(val)ではなくname自身。上のos_set_dynamic呼び出しで
     // GCが起きている可能性があるため、同じname_offのバイト列から再度os_make_symbolして
     // 現在有効なタグ付きシンボル値を取り直す。
-    jit_movabs_reg(ZA_REG_RCX, (UINT64)(void *)(g_jit_code + name_off));
+    jit_movabs_self_ref(ZA_REG_RCX, name_off);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
     jit_call_r11();
 
@@ -3751,6 +3814,8 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     g_za_saw_setq_local = 0;
     g_za_saw_escaping_lambda = 0;
     g_za_saw_flet_labels_escape = 0;
+    g_jit_reloc_count = 0;
+    g_jit_trampoline_jmp_count = 0;
     // トランポリンは全JIT関数で共有するため、今回のコンパイル対象用にentryを記録する
     // より前に確定させる(コンパイル失敗時のg_jit_used巻き戻しでスタブ自体が失われない
     // ようにするため)。
@@ -3802,9 +3867,64 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         return nil;
     }
 
+    // ここまでコンパイル成功。g_jit_code[entry..g_jit_used)をImmobilized Spaceの
+    // 環境所有ページへコピーし、自己参照movabs(g_jit_reloc_patch_offsets)を新しい
+    // 配置先アドレスに基づきパッチする。コピー元(g_jit_code)は関数間で共有される
+    // ステージング用スクラッチバッファのため、この関数の呼び出しごとにg_jit_usedを
+    // entryへロールバックして再利用する(呼び出し元が確保する512KBの予算は
+    // コンパイル済み関数の総量ではなく「1関数分の最悪サイズ」だけで済む)。
+    UINT64 code_len = g_jit_used - entry;
+    UINT64 page_count = (code_len + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
+    void *dest = os_imm_pages_alloc_contiguous(page_count);
+    if (dest == 0) {
+        g_jit_used = entry;
+        return nil;
+    }
+
+    UINT8 *dest_bytes = (UINT8 *)dest;
+    for (UINT64 i = 0; i < code_len; i++) {
+        dest_bytes[i] = g_jit_code[entry + i];
+    }
+
+    for (UINT32 i = 0; i < g_jit_reloc_count; i++) {
+        UINT64 patch_offset = g_jit_reloc_patch_offsets[i];
+        UINT64 old_imm = 0;
+        for (UINT64 b = 0; b < 8; b++) {
+            old_imm |= ((UINT64)g_jit_code[patch_offset + b]) << (b * 8);
+        }
+        UINT64 target_off = old_imm - (UINT64)(void *)g_jit_code;
+        UINT64 new_imm = (UINT64)(void *)dest_bytes + (target_off - entry);
+        UINT64 dest_patch_offset = patch_offset - entry;
+        for (UINT64 b = 0; b < 8; b++) {
+            dest_bytes[dest_patch_offset + b] = (UINT8)(new_imm >> (b * 8));
+        }
+    }
+
+    // 末尾呼び出しの共有トランポリンへのjmp(jit_emit_jmp_to、g_jit_trampoline_jmp_patch_
+    // offsets)は、上のmovabs自己参照とは異なりrel32(その場のIP相対距離)でエンコードされて
+    // いる。トランポリン自身はg_jit_code内に固定(コピーされない)なので、jmp命令だけが
+    // dest_bytesへ移動した後は、g_jit_code内の距離としてbakeされていた古いrel32値は
+    // 無意味になる。dest_bytes側の新しい位置から見たトランポリンへの絶対距離で再計算する。
+    UINT64 trampoline_abs = (UINT64)(void *)(g_jit_code + trampoline_offset);
+    for (UINT32 i = 0; i < g_jit_trampoline_jmp_count; i++) {
+        UINT64 patch_offset = g_jit_trampoline_jmp_patch_offsets[i];
+        UINT64 dest_patch_offset = patch_offset - entry;
+        UINT64 next_instr_addr = (UINT64)(void *)(dest_bytes + dest_patch_offset + 4);
+        INT64 rel = (INT64)trampoline_abs - (INT64)next_instr_addr;
+        UINT32 rel32 = (UINT32)rel;
+        dest_bytes[dest_patch_offset] = (UINT8)(rel32);
+        dest_bytes[dest_patch_offset + 1] = (UINT8)(rel32 >> 8);
+        dest_bytes[dest_patch_offset + 2] = (UINT8)(rel32 >> 16);
+        dest_bytes[dest_patch_offset + 3] = (UINT8)(rel32 >> 24);
+    }
+
     jit_serialize_icache();
 
-    return os_make_jit_function((lisp_addr_t)(void *)(g_jit_code + entry));
+    os_environment_register_pages(env, dest, page_count);
+
+    g_jit_used = entry;
+
+    return os_make_jit_function((lisp_addr_t)(void *)dest_bytes);
 }
 
 #else /* !defined(__x86_64__) */

@@ -226,6 +226,18 @@ void *os_imm_page_alloc(void);
  */
 void os_imm_page_free(void *page);
 
+/**
+ * Immobilized Spaceのbump領域から、物理的に連続したcountページを確保する。
+ * os_imm_page_freeで返却されたページは返却順に連続性の保証がないため、フリーリストは
+ * 使わずbump領域のみを対象にする。JITコンパイル済み関数1つ分のコードを、複数ページに
+ * わたる場合でも1つの連続領域として配置したいza.cからの利用を想定している。
+ * os_imm_page_allocの単ページ確保と異なり、枯渇時はハードハルトせずNULLを返す
+ * (呼び出し元がインタプリタへのフォールバックという既存の劣化パスを持つため)。
+ * @param count 確保するページ数
+ * @return 確保できた先頭ページのアドレス。空き不足の場合はNULL
+ */
+void *os_imm_pages_alloc_contiguous(UINT64 count);
+
 /** os_imm_slot_allocが使う、1ページ内でのバンプアロケーションの進行状況を保持するカーソル */
 typedef struct {
     UINT8 *page;   /* 現在切り出し中のページ(0ならまだページ未確保) */
@@ -514,6 +526,26 @@ lisp_val_t os_get_function_cell(lisp_val_t sym, lisp_val_t env);
  * @return 関数呼び出しの結果
  */
 lisp_val_t os_apply_via_cell(lisp_val_t cell, lisp_val_t evaluated_args, lisp_val_t env);
+
+/**
+ * envのpagesスロット(7番目)に、firstから始まるcount個の連続Immobilized Pageの
+ * アドレスを1ページ1エントリのフラットなリストとして追加する(TAG_RAW_POINTER
+ * タグ付き)。za.cがos_imm_pages_alloc_contiguousで確保したJITコード配置先ページを、
+ * コンパイルを実行したenvironmentの所有物として記録するために使う。
+ * @param env 登録先の環境
+ * @param first_page 確保した先頭ページのアドレス
+ * @param count ページ数
+ */
+void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 count);
+
+/**
+ * envのpagesスロット(7番目)を辿り、登録されている各Immobilized Pageをos_imm_page_free
+ * でフリーリストへ返却する。環境破棄時に、そのenvironmentが所有していたJITコード
+ * 配置先ページをまとめて回収するために使う(destroy-environmentからの呼び出しは
+ * 別フェーズの実装物)。
+ * @param env 回収対象の環境
+ */
+void os_environment_reclaim_pages(lisp_val_t env);
 
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。

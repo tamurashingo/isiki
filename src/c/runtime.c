@@ -360,9 +360,15 @@ UINT64 os_gc_collect_count(void) {
  * os_imm_page_freeでフリーリストへ返却して再利用できるようにする。
  */
 
-/** Immobilized Spaceの総サイズ。従来za.cが単独のg_jit_code[524288]として持っていたのと同じ
- * サイズを確保し、今後はこちらをページ単位で環境ごとに所有・解放できるようにする */
-#define IMM_SPACE_SIZE (512 * 1024)
+/** Immobilized Spaceの総サイズ。当初は従来za.cが単独のg_jit_code[524288]として持っていた
+ * のと同じサイズ(512KB)にしていたが、g_jit_codeはバイト単位で詰めて使う共有バッファ
+ * だったのに対し、こちらはos_imm_pages_alloc_contiguousにより1関数につき最低でも
+ * IMM_PAGE_SIZE(4KB)単位で切り出すため、ページ内部フラグメンテーションにより実質的な
+ * 収容関数数が大幅に減る(質問参照: `documents/environment.md`のPhase3追記内容)。
+ * 既存のqemu_boot_test.lisp一式(init.lisp+全za_test*.lisp、トップレベルdefun約390個)を
+ * 単一の生存し続けるREPL環境上で全て実行してもページ枯渇によるJITフォールバックが
+ * 起きないよう、余裕を持って8倍(4MB)に拡張した。 */
+#define IMM_SPACE_SIZE (4 * 1024 * 1024)
 
 static UINT8 g_imm_space[IMM_SPACE_SIZE] __attribute__((aligned(IMM_PAGE_SIZE)));
 /** 未使用領域のうち、まだページ切り出しに使っていない先頭アドレス */
@@ -390,6 +396,16 @@ void *os_imm_page_alloc(void) {
 void os_imm_page_free(void *page) {
     *(void **)page = g_imm_free_list;
     g_imm_free_list = page;
+}
+
+void *os_imm_pages_alloc_contiguous(UINT64 count) {
+    UINT64 needed = count * IMM_PAGE_SIZE;
+    if (g_imm_bump + needed > g_imm_space + IMM_SPACE_SIZE) {
+        return 0;
+    }
+    void *pages = g_imm_bump;
+    g_imm_bump += needed;
+    return pages;
 }
 
 void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
@@ -1396,13 +1412,17 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
      *     (cons 'functions nil)
      *     (cons 'parent parent-env)
      *     (cons 'constants nil)
-     *     (cons 'cells nil)))
+     *     (cons 'cells nil)
+     *     (cons 'pages nil)))
      *
-     * constants/cellsは既存のos_get_variable/os_get_function/os_set_variable/
+     * constants/cells/pagesは既存のos_get_variable/os_get_function/os_set_variable/
      * os_set_functionが4番目(parent)までしか固定位置参照しないため、末尾に追加する
      * だけで既存コードに影響しない。cellsは(sym . TAG_RAW_POINTER付きFunction Cell
      * アドレス)のalistで、os_set_functionがfunctionsスロットと同時に同期する
-     * (os_get_function_cell参照)
+     * (os_get_function_cell参照)。pagesはこのenvironmentが所有するImmobilized Page
+     * (TAG_RAW_POINTER付きページアドレス)のフラットなリストで、za.cがJITコードの
+     * 配置先として確保したページをos_environment_register_pagesで登録し、環境破棄時に
+     * os_environment_reclaim_pagesが1ページずつos_imm_page_freeへ返却する。
      */
     lisp_val_t name_symbol = os_make_symbol("name");
     GC_PROTECT(name_symbol);
@@ -1416,6 +1436,8 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     GC_PROTECT(constants_symbol);
     lisp_val_t cells_symbol = os_make_symbol("cells");
     GC_PROTECT(cells_symbol);
+    lisp_val_t pages_symbol = os_make_symbol("pages");
+    GC_PROTECT(pages_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     GC_PROTECT(name_slot);
@@ -1428,8 +1450,11 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     lisp_val_t constants_slot = os_make_cons(constants_symbol, nil);
     GC_PROTECT(constants_slot);
     lisp_val_t cells_slot = os_make_cons(cells_symbol, nil);
+    GC_PROTECT(cells_slot);
+    lisp_val_t pages_slot = os_make_cons(pages_symbol, nil);
 
-    lisp_val_t list_step5 = os_make_cons(cells_slot, nil);
+    lisp_val_t list_step6 = os_make_cons(pages_slot, nil);
+    lisp_val_t list_step5 = os_make_cons(cells_slot, list_step6);
     lisp_val_t list_step4 = os_make_cons(constants_slot, list_step5);
     lisp_val_t list_step3 = os_make_cons(parent_slot, list_step4);
     lisp_val_t list_step2 = os_make_cons(functions_slot, list_step3);
@@ -1790,6 +1815,40 @@ lisp_val_t os_apply_via_cell(lisp_val_t cell, lisp_val_t evaluated_args, lisp_va
     lisp_addr_t cell_addr = (lisp_addr_t)(cell & ~TAG_MASK);
     lisp_val_t fn_obj = *(lisp_val_t *)cell_addr;
     return os_apply_function(fn_obj, evaluated_args, env);
+}
+
+void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 count) {
+    GC_PROTECT(env);
+    // pagesスロット(7番目、cddddr(cdr(env))のcdrのcar)を取り出す
+    lisp_val_t pages_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))))));
+    GC_PROTECT(pages_slot);
+
+    for (UINT64 i = 0; i < count; i++) {
+        lisp_val_t alist = cc_cdr(pages_slot);
+        GC_PROTECT(alist);
+        void *page = (UINT8 *)first_page + i * IMM_PAGE_SIZE;
+        lisp_val_t tagged_page = ((lisp_val_t)(lisp_addr_t)page) | TAG_RAW_POINTER;
+        lisp_val_t new_list = os_make_cons(tagged_page, alist);
+        // functionsスロットの追加パスと同じ理由で、書き込み先アドレスはos_make_cons
+        // 完了後にpages_slot(GC_PROTECT済み)から読み直す
+        lisp_addr_t pages_slot_addr = pages_slot & ~TAG_MASK;
+        ((lisp_val_t *)pages_slot_addr)[1] = new_list;
+    }
+}
+
+void os_environment_reclaim_pages(lisp_val_t env) {
+    lisp_val_t pages_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))))));
+    lisp_val_t list = cc_cdr(pages_slot);
+
+    while (list != nil) {
+        lisp_val_t tagged_page = cc_car(list);
+        void *page = (void *)(lisp_addr_t)(tagged_page & ~TAG_MASK);
+        os_imm_page_free(page);
+        list = cc_cdr(list);
+    }
+
+    lisp_addr_t pages_slot_addr = pages_slot & ~TAG_MASK;
+    ((lisp_val_t *)pages_slot_addr)[1] = nil;
 }
 
 
