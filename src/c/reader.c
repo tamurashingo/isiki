@@ -29,10 +29,31 @@ static void reset_line(process_t *proc) {
 }
 
 /**
- * 1回の os_read 呼び出し内で "> " を表示済みかどうか。
+ * 1回の os_read 呼び出し内でプロンプト("<環境名>> ")を表示済みかどうか。
  * 複数行にわたる式(文字列やリストの途中改行)の継続行では表示しない。
  */
 static int prompt_shown = 0;
+
+/**
+ * proc の現在の環境名("(name . env-symbol)"、環境の1番目のslot)に続けて"> "を
+ * 表示する。os_repl_stepがos_readを呼ぶ前に必ずproc->envを遅延生成済みのため、
+ * ここで参照するproc->envは常に有効な環境である。
+ * SYMBOLの名前を出力するだけなのでprint.c(print_symbol/print_bytes)には依存せず、
+ * STRINGオブジェクトのレイアウト([len(8byte)][chars...])を直接読んで出力する
+ * (print.cのstatic関数を公開APIに切り出すよりも、モジュール間の依存を増やさない
+ * 方を優先した)。
+ * @param proc プロンプトを表示するプロセス
+ */
+static void print_prompt(process_t *proc) {
+    lisp_val_t env_name = cc_cdr(cc_car(proc->env));
+    lisp_val_t name_str = ((lisp_val_t *)(env_name & ~TAG_MASK))[0];
+    UINT64 len = ((UINT64 *)(name_str & ~TAG_MASK))[0];
+    const char *bytes = (const char *)((name_str & ~TAG_MASK) + 8);
+    for (UINT64 i = 0; i < len; i++) {
+        proc->stdout_buffer->write_char(proc->stdout_buffer, (UINT8)bytes[i]);
+    }
+    proc->stdout_buffer->write_string(proc->stdout_buffer, "> ");
+}
 
 /**
  * proc のバッファを使い切った際、次の行の入力(Enterによるready確定)を待つ。
@@ -44,7 +65,7 @@ static void ensure_data(process_t *proc) {
     }
     reset_line(proc);
     if (!prompt_shown) {
-        proc->stdout_buffer->write_string(proc->stdout_buffer, "> ");
+        print_prompt(proc);
         prompt_shown = 1;
     }
     os_wait_for_more_input(proc);

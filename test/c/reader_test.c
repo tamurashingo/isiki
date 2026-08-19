@@ -101,6 +101,11 @@ void os_repl_step(process_t *proc) {
     (void)proc;
 }
 
+// os_repl_stepは本来呼び出し前にproc->envを遅延生成するが、上のダミー実装は何もしないため、
+// 各テストはprint_prompt(reader.c)がproc->envを参照できるよう、get_current_process()の直後で
+// os_repl_stepと同じ手順(os_make_environment(os_make_symbol(proc->name), global_environment))
+// を自前で行う
+
 // reader.c の ensure_data が proc->stdout_buffer 経由でプロンプトを書き込むための
 // 各プロセス用ダミーバッファ。内容の検証はしないため何もしない実装で良い
 static void dummy_buf_write_char(struct _frame_buffer *self, UINT8 c) {
@@ -166,6 +171,7 @@ void os_wait_for_more_input(process_t *proc) {
 void test_os_read_empty() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
 
     lisp_val_t v = os_read(proc);
     assert(v == nil, "空入力ではnilが返る");
@@ -174,6 +180,7 @@ void test_os_read_empty() {
 void test_os_read_whitespace_only() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "   \n");
 
     lisp_val_t v = os_read(proc);
@@ -185,6 +192,7 @@ void test_os_read_whitespace_only() {
 void test_os_read_fixnum() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "42");
 
     lisp_val_t v = os_read(proc);
@@ -194,6 +202,7 @@ void test_os_read_fixnum() {
 void test_os_read_negative_fixnum() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "-42");
 
     lisp_val_t v = os_read(proc);
@@ -203,6 +212,7 @@ void test_os_read_negative_fixnum() {
 void test_os_read_bare_minus_is_symbol() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "-");
 
     lisp_val_t v = os_read(proc);
@@ -212,6 +222,7 @@ void test_os_read_bare_minus_is_symbol() {
 void test_os_read_bignum_literal() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     // 2^60 = 1152921504606846976は60bitのFIXNUM_MAGNITUDE_MASKを超えるのでbignumになる
     push_string(proc, "1152921504606846976");
 
@@ -225,6 +236,7 @@ void test_os_read_bignum_literal() {
 void test_os_read_negative_bignum_literal() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "-1152921504606846976");
 
     lisp_val_t v = os_read(proc);
@@ -237,6 +249,7 @@ void test_os_read_negative_bignum_literal() {
 void test_os_read_small_literal_stays_fixnum() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "123456789012345");
 
     lisp_val_t v = os_read(proc);
@@ -247,6 +260,7 @@ void test_os_read_small_literal_stays_fixnum() {
 void test_os_read_positive_fixnum_with_sign() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "+42");
 
     lisp_val_t v = os_read(proc);
@@ -256,6 +270,7 @@ void test_os_read_positive_fixnum_with_sign() {
 void test_os_read_bare_plus_is_symbol() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "+");
 
     lisp_val_t v = os_read(proc);
@@ -265,6 +280,7 @@ void test_os_read_bare_plus_is_symbol() {
 void test_os_read_binary_literal() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#b1010");
 
     lisp_val_t v = os_read(proc);
@@ -274,6 +290,7 @@ void test_os_read_binary_literal() {
 void test_os_read_binary_literal_uppercase_prefix() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#B1010");
 
     lisp_val_t v = os_read(proc);
@@ -283,6 +300,7 @@ void test_os_read_binary_literal_uppercase_prefix() {
 void test_os_read_octal_literal() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#o17");
 
     lisp_val_t v = os_read(proc);
@@ -292,6 +310,7 @@ void test_os_read_octal_literal() {
 void test_os_read_octal_literal_uppercase_prefix() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#O17");
 
     lisp_val_t v = os_read(proc);
@@ -301,6 +320,7 @@ void test_os_read_octal_literal_uppercase_prefix() {
 void test_os_read_hex_literal_lowercase_digits() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#xff");
 
     lisp_val_t v = os_read(proc);
@@ -310,6 +330,7 @@ void test_os_read_hex_literal_lowercase_digits() {
 void test_os_read_hex_literal_uppercase_prefix_and_digits() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#XFF");
 
     lisp_val_t v = os_read(proc);
@@ -319,6 +340,7 @@ void test_os_read_hex_literal_uppercase_prefix_and_digits() {
 void test_os_read_radix_literal_negative() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#b-101");
 
     lisp_val_t v = os_read(proc);
@@ -328,6 +350,7 @@ void test_os_read_radix_literal_negative() {
 void test_os_read_radix_literal_explicit_positive_sign() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#o+17");
 
     lisp_val_t v = os_read(proc);
@@ -337,6 +360,7 @@ void test_os_read_radix_literal_explicit_positive_sign() {
 void test_os_read_radix_literal_invalid_digit_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#b12");
 
     lisp_val_t v = os_read(proc);
@@ -346,6 +370,7 @@ void test_os_read_radix_literal_invalid_digit_is_read_error() {
 void test_os_read_radix_literal_no_digits_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#b ");
 
     lisp_val_t v = os_read(proc);
@@ -355,6 +380,7 @@ void test_os_read_radix_literal_no_digits_is_read_error() {
 void test_os_read_hex_bignum_literal() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     // 16^15 = 2^60は60bitのFIXNUM_MAGNITUDE_MASKを超えるのでbignumになる
     push_string(proc, "#x1000000000000000");
 
@@ -368,6 +394,7 @@ void test_os_read_hex_bignum_literal() {
 void test_os_read_float_literal_simple() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "1.5");
 
     lisp_val_t v = os_read(proc);
@@ -380,6 +407,7 @@ void test_os_read_float_literal_simple() {
 void test_os_read_float_literal_negative_with_exponent() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "-2.0E10");
 
     lisp_val_t v = os_read(proc);
@@ -390,6 +418,7 @@ void test_os_read_float_literal_negative_with_exponent() {
 void test_os_read_float_literal_exponent_only() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "3E5");
 
     lisp_val_t v = os_read(proc);
@@ -400,6 +429,7 @@ void test_os_read_float_literal_exponent_only() {
 void test_os_read_float_literal_trailing_dot_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "1.");
 
     lisp_val_t v = os_read(proc);
@@ -409,6 +439,7 @@ void test_os_read_float_literal_trailing_dot_is_read_error() {
 void test_os_read_float_literal_leading_dot_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, ".5");
 
     lisp_val_t v = os_read(proc);
@@ -418,6 +449,7 @@ void test_os_read_float_literal_leading_dot_is_read_error() {
 void test_os_read_float_literal_bare_exponent_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "E5");
 
     lisp_val_t v = os_read(proc);
@@ -427,6 +459,7 @@ void test_os_read_float_literal_bare_exponent_is_read_error() {
 void test_os_read_symbol() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "foo");
 
     lisp_val_t v = os_read(proc);
@@ -436,6 +469,7 @@ void test_os_read_symbol() {
 void test_os_read_string() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "\"hello\"");
 
     lisp_val_t v = os_read(proc);
@@ -451,6 +485,7 @@ void test_os_read_string() {
 void test_os_read_empty_list() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "()");
 
     lisp_val_t v = os_read(proc);
@@ -460,6 +495,7 @@ void test_os_read_empty_list() {
 void test_os_read_list() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(1 2 3)");
 
     lisp_val_t v = os_read(proc);
@@ -472,6 +508,7 @@ void test_os_read_list() {
 void test_os_read_dotted_pair() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(one . 11)");
 
     lisp_val_t v = os_read(proc);
@@ -483,6 +520,7 @@ void test_os_read_dotted_pair() {
 void test_os_read_dotted_pair_with_multiple_leading_elements() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(1 2 . 3)");
 
     lisp_val_t v = os_read(proc);
@@ -494,6 +532,7 @@ void test_os_read_dotted_pair_with_multiple_leading_elements() {
 void test_os_read_dot_inside_float_token_is_not_dotted_pair() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(1 2.5)");
 
     lisp_val_t v = os_read(proc);
@@ -505,6 +544,7 @@ void test_os_read_dot_inside_float_token_is_not_dotted_pair() {
 void test_os_read_leading_dot_in_list_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(. 1)");
 
     lisp_val_t v = os_read(proc);
@@ -514,6 +554,7 @@ void test_os_read_leading_dot_in_list_is_read_error() {
 void test_os_read_dotted_pair_missing_cdr_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(1 .)");
 
     lisp_val_t v = os_read(proc);
@@ -523,6 +564,7 @@ void test_os_read_dotted_pair_missing_cdr_is_read_error() {
 void test_os_read_dotted_pair_extra_element_after_cdr_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(1 . 2 3)");
 
     lisp_val_t v = os_read(proc);
@@ -532,6 +574,7 @@ void test_os_read_dotted_pair_extra_element_after_cdr_is_read_error() {
 void test_os_read_vector_literal_with_dot_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#(1 . 2)");
 
     lisp_val_t v = os_read(proc);
@@ -541,6 +584,7 @@ void test_os_read_vector_literal_with_dot_is_read_error() {
 void test_os_read_quote() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "'foo");
 
     lisp_val_t v = os_read(proc);
@@ -552,6 +596,7 @@ void test_os_read_quote() {
 void test_os_read_quasiquote() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "`foo");
 
     lisp_val_t v = os_read(proc);
@@ -563,6 +608,7 @@ void test_os_read_quasiquote() {
 void test_os_read_unquote() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, ",foo");
 
     lisp_val_t v = os_read(proc);
@@ -574,6 +620,7 @@ void test_os_read_unquote() {
 void test_os_read_unquote_splicing() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, ",@foo");
 
     lisp_val_t v = os_read(proc);
@@ -585,6 +632,7 @@ void test_os_read_unquote_splicing() {
 void test_os_read_quasiquote_with_unquote_in_list() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "`(a ,b ,@c)");
 
     lisp_val_t v = os_read(proc);
@@ -605,6 +653,7 @@ void test_os_read_quasiquote_with_unquote_in_list() {
 void test_os_read_multiple_expr_per_line() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(+ 1 2) (- 3 4)");
 
     lisp_val_t v1 = os_read(proc);
@@ -622,6 +671,7 @@ void test_os_read_multiple_expr_per_line() {
 void test_os_read_stray_close_paren() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, ")");
 
     lisp_val_t v = os_read(proc);
@@ -631,6 +681,7 @@ void test_os_read_stray_close_paren() {
 void test_os_read_unterminated_string() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "\"abc");
 
     lisp_val_t v = os_read(proc);
@@ -640,6 +691,7 @@ void test_os_read_unterminated_string() {
 void test_os_read_unterminated_list() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "(1 2");
 
     lisp_val_t v = os_read(proc);
@@ -649,6 +701,7 @@ void test_os_read_unterminated_list() {
 void test_os_read_multiline_list() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     clear_next_lines();
     push_string(proc, "(defun foo (x)\n");
     queue_next_line("  (+ x 1))\n");
@@ -670,6 +723,7 @@ void test_os_read_multiline_list() {
 void test_os_read_line_comment_only() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "; this is a comment\n");
 
     lisp_val_t v = os_read(proc);
@@ -679,6 +733,7 @@ void test_os_read_line_comment_only() {
 void test_os_read_comment_after_expr() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "42 ; the answer\n");
 
     lisp_val_t v = os_read(proc);
@@ -688,6 +743,7 @@ void test_os_read_comment_after_expr() {
 void test_os_read_comment_immediately_after_token() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "42;comment\n");
 
     lisp_val_t v = os_read(proc);
@@ -697,6 +753,7 @@ void test_os_read_comment_immediately_after_token() {
 void test_os_read_multiline_list_with_comment_line() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     clear_next_lines();
     push_string(proc, "(defun foo (x)\n");
     queue_next_line("  ; コメント行\n");
@@ -713,6 +770,7 @@ void test_os_read_multiline_list_with_comment_line() {
 void test_os_read_function_sugar() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#'car");
 
     lisp_val_t v = os_read(proc);
@@ -724,6 +782,7 @@ void test_os_read_function_sugar() {
 void test_os_read_vector_literal() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#(1 2 3)");
 
     lisp_val_t v = os_read(proc);
@@ -742,6 +801,7 @@ void test_os_read_vector_literal() {
 void test_os_read_empty_vector_literal() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#()");
 
     lisp_val_t v = os_read(proc);
@@ -755,6 +815,7 @@ void test_os_read_empty_vector_literal() {
 void test_os_read_char_literal_simple() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#\\a");
 
     lisp_val_t v = os_read(proc);
@@ -765,6 +826,7 @@ void test_os_read_char_literal_simple() {
 void test_os_read_char_literal_paren() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#\\(");
 
     lisp_val_t v = os_read(proc);
@@ -775,6 +837,7 @@ void test_os_read_char_literal_paren() {
 void test_os_read_char_literal_space() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#\\Space");
 
     lisp_val_t v = os_read(proc);
@@ -785,6 +848,7 @@ void test_os_read_char_literal_space() {
 void test_os_read_char_literal_newline() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#\\Newline");
 
     lisp_val_t v = os_read(proc);
@@ -795,6 +859,7 @@ void test_os_read_char_literal_newline() {
 void test_os_read_char_literal_unknown_name_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
     push_string(proc, "#\\Foo");
 
     lisp_val_t v = os_read(proc);

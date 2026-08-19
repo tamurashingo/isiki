@@ -105,6 +105,10 @@ void os_repl_step(process_t *proc) {
     (void)proc;
 }
 
+// os_repl_stepは本来呼び出し前にproc->envを遅延生成するが、上のダミー実装は何もしないため、
+// print_prompt(reader.c)がproc->envを参照できるよう、main側でos_repl_stepと同じ手順
+// (os_make_environment(os_make_symbol(proc->name), global_environment))を自前で行う
+
 // reader.c の ensure_data が proc->stdout_buffer 経由でプロンプトを書き込むための
 // 各プロセス用ダミーバッファ。内容の検証はしないため何もしない実装で良い
 static void dummy_buf_write_char(struct _frame_buffer *self, UINT8 c) {
@@ -243,6 +247,7 @@ int main(int argc, char** argv) {
     setup_buffers();
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
 
     os_set_function(os_make_symbol("assert-equal"),
                      os_make_native_function((lisp_addr_t)(void *)primitive_assert_equal),

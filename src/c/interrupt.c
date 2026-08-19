@@ -227,8 +227,10 @@ void c_keyboard_handler(uint8_t scancode) {
     }
 
     if (c == '\b') {
-        backspace();
+        // stdin_lenが0(バッファに何も入力していない)ならプロンプト自体を消してしまう
+        // ため、その場合は何もしない
         if (current->stdin_len > 0) {
+            backspace();
             current->stdin_len -= 1;
         }
         return;
