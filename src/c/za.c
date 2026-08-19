@@ -1030,8 +1030,9 @@ static int g_za_trampoline_ready = 0;
  * 全JIT関数の末尾呼び出しサイトが共有する小さなトランポリンスタブをg_jit_codeへ
  * 一度だけ書き込み、そのオフセットを返す(2回目以降は書き込まずキャッシュ済みの
  * オフセットを返す)。呼び出し規約(スタブ独自): rcx=evaluated_args, rdx=env,
- * r8=fn(タグ付きINSTANCE)。呼び出し元はここへjmpする前に自分のフレームを完全に
- * 畳んでおくこと(呼び出し元のレジスタ/フレームはここでは一切保存しない)。
+ * r8=cell(TAG_RAW_POINTER付きのFunction Cellアドレス、os_get_function_cell参照)。
+ * 呼び出し元はここへjmpする前に自分のフレームを完全に畳んでおくこと(呼び出し元の
+ * レジスタ/フレームはここでは一切保存しない)。
  * このスタブ自体は毎回のza_try_compile_defun呼び出しの冒頭、コンパイル対象の
  * 関数用にg_jit_usedを記録する(=ロールバック時に巻き戻る)より前に確定させる
  * ことで、コンパイル失敗によるロールバックでスタブ自体が失われないようにする。
@@ -1041,6 +1042,13 @@ static UINT64 za_ensure_trampoline(void) {
         return g_za_trampoline_offset;
     }
     UINT64 offset = g_jit_used;
+
+    // r8はFunction Cell(TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)。
+    // 中身(現在のfn、TAG_INSTANCE)を読み出してr8を差し替えてから、以降は従来通り
+    // fn自体に対する分岐を行う(拡張: 間接呼び出し化)。
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_R8);
+    jit_and_reg_imm8(ZA_REG_R10, 0xF8); // ~TAG_MASK(0x7)
+    jit_mov_reg_from_mem_disp8(ZA_REG_R8, ZA_REG_R10, 0); // r8 = *cell (fn, タグ付き)
 
     // r10 = fn(r8)からTAG_INSTANCEを外した生アドレス
     jit_mov_reg_reg(ZA_REG_R10, ZA_REG_R8);
@@ -2227,14 +2235,17 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  *      であってもcall_depth+1側の専用スロットを使うため、自分のCALL_SAVED_HEAD・
  *      評価済みの引数スロットと衝突しない。
  *   3. os_make_symbolでfn_symの名前から現在のタグ付きシンボルポインタを再解決し、
- *      os_get_function(sym, env)をfnスロットへ書き込み、linkする(envはENV_VALスロット
- *      から読み直す)。FN_VAL/ACC_VALは引数loop完了後にしか書き込まれず直後に消費される
- *      ため、depth化せず単一スロットのままで安全。
+ *      os_get_function_cell(sym, env)の結果(Function Cellのアドレス、fn_obj自体では
+ *      ない)をfnスロットへ書き込み、linkする(envはENV_VALスロットから読み直す)。
+ *      FN_VAL/ACC_VALは引数loop完了後にしか書き込まれず直後に消費されるため、depth化
+ *      せず単一スロットのままで安全。
  *   4. accスロットをnilで初期化しlinkした後、引数スロットを右から左へ
  *      os_make_cons(argslot[i], accslot)で辿ってconsし、その都度accスロットを書き換える。
  *   5. CALL_SAVED_HEADでfn/acc/引数のリンクをまとめて外す。
- *   6. 非末尾ならos_apply_function(fn, evaluated_args, env)を通常のcallで呼ぶ。末尾なら
- *      envのリンクも外し、自分のフレームを完全に畳んだ上で共有トランポリンへjmpする。
+ *   6. 非末尾ならos_apply_via_cell(cell, evaluated_args, env)を通常のcallで呼ぶ(内部で
+ *      cellの中身を読んでos_apply_functionへ委譲する)。末尾ならenvのリンクも外し、
+ *      自分のフレームを完全に畳んだ上で共有トランポリンへjmpする(トランポリンもr8に
+ *      cellを受け取り、中身を読んでから既存の分岐に入る)。
  * @param call_depth 自分が使うCALL_SAVED_HEAD/引数スロットの深さ。ZA_MAX_CALL_DEPTH
  * 以上ならコンパイルを断念する(引数を評価する再帰にはcall_depth+1を渡す)。
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
@@ -2313,7 +2324,10 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         jit_patch_rel32_target(ct_patches[i], abort_cleanup_offset);
     }
 
-    // 3. os_get_function(fn_sym, env)をfnスロットへ書き込み、linkする。
+    // 3. os_get_function_cell(fn_sym, env)の結果(Function Cellのアドレス)を
+    // fnスロットへ書き込み、linkする。呼び出し先そのもの(fn_obj)ではなくcellの
+    // アドレスを保持することで、6a/6bの呼び出しはos_apply_via_cell/トランポリンを
+    // 経由した間接呼び出しになる(拡張: Function Cellによる間接呼び出し化)。
     if (fn_binding) {
         // flet/labels束縛関数: gensymは名前再解決(g_symbol_table検索)に乗せられない
         // ため、コンパイル時に確保したgensymスロットのアドレスをmovabsで埋め込み、
@@ -2326,7 +2340,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&global_environment);
         jit_mov_reg_from_mem_disp8(ZA_REG_RDX, ZA_REG_R11, 0);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
         jit_call_r11();
     } else {
         UINT64 name_off = za_emit_symbol_name(fn_sym);
@@ -2337,7 +2351,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
 
         jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
         jit_call_r11();
     }
     za_store_slot(ZA_REG_RAX, ZA_OFF_FN_VAL);
@@ -2361,11 +2375,13 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     jit_call_r11();
 
     if (!is_tail) {
-        // 6a. 非末尾: os_apply_function(fn, evaluated_args, env)を通常のcallで呼ぶ。
+        // 6a. 非末尾: os_apply_via_cell(cell, evaluated_args, env)を通常のcallで呼ぶ。
+        // FN_VALはos_get_function_cellが返したcellアドレスであり、fn_obj自体は
+        // 呼び出し先が都度cellの中身を読んで取得する(間接呼び出し化)。
         za_load_slot(ZA_REG_RCX, ZA_OFF_FN_VAL);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ACC_VAL);
         za_load_slot(ZA_REG_R8, ZA_OFF_ENV_VAL);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_function);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_via_cell);
         jit_call_r11();
     } else {
         // 6b. 末尾: envのリンクも外す。
@@ -2373,7 +2389,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
         jit_call_r11();
 
-        // トランポリンの呼び出し規約(rcx=evaluated_args, rdx=env, r8=fn)に沿って、
+        // トランポリンの呼び出し規約(rcx=evaluated_args, rdx=env, r8=cell)に沿って、
         // フレームを解体する前に値スロットからレジスタへ読み出しておく。
         za_load_slot(ZA_REG_RCX, ZA_OFF_ACC_VAL);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);

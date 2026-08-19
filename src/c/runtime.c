@@ -351,6 +351,63 @@ UINT64 os_gc_collect_count(void) {
     return g_gc_collect_count;
 }
 
+/* ============================== Immobilized Space ==============================
+ * GCが移動・破棄しない固定領域。JITコード(za.c)や、後続フェーズで導入するFunction Cell
+ * など、Cヘのポインタとして直接掴んでおきたいデータの置き場所として使う。
+ * Lispのcopy GCヒープ(From/To空間)とは完全に独立した固定サイズの静的領域であり、
+ * os_heap_init/os_gc_collectの対象外(GCはこの領域のアドレスを一切スキャンしない)。
+ * 4KB単位のページをos_imm_page_allocで確保し、環境などの所有者が破棄される際は
+ * os_imm_page_freeでフリーリストへ返却して再利用できるようにする。
+ */
+
+/** Immobilized Spaceの総サイズ。従来za.cが単独のg_jit_code[524288]として持っていたのと同じ
+ * サイズを確保し、今後はこちらをページ単位で環境ごとに所有・解放できるようにする */
+#define IMM_SPACE_SIZE (512 * 1024)
+
+static UINT8 g_imm_space[IMM_SPACE_SIZE] __attribute__((aligned(IMM_PAGE_SIZE)));
+/** 未使用領域のうち、まだページ切り出しに使っていない先頭アドレス */
+static UINT8 *g_imm_bump = g_imm_space;
+/** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */
+static void *g_imm_free_list = 0;
+
+void *os_imm_page_alloc(void) {
+    if (g_imm_free_list) {
+        void *page = g_imm_free_list;
+        g_imm_free_list = *(void **)page;
+        return page;
+    }
+    if (g_imm_bump + IMM_PAGE_SIZE > g_imm_space + IMM_SPACE_SIZE) {
+        frame_buffer *fb = get_active_frame_buffer();
+        fb->write_string(fb, "imm: space exhausted...");
+        for (;;) {
+        }
+    }
+    void *page = g_imm_bump;
+    g_imm_bump += IMM_PAGE_SIZE;
+    return page;
+}
+
+void os_imm_page_free(void *page) {
+    *(void **)page = g_imm_free_list;
+    g_imm_free_list = page;
+}
+
+void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
+    UINT64 aligned = (size + 15) & ~15ULL;
+    if (cursor->page == 0 || cursor->offset + aligned > IMM_PAGE_SIZE) {
+        cursor->page = (UINT8 *)os_imm_page_alloc();
+        cursor->offset = 0;
+    }
+    void *slot = cursor->page + cursor->offset;
+    cursor->offset += aligned;
+    return slot;
+}
+
+/** Function Cell(os_get_function_cell/os_set_function参照)の確保に使う
+ * バンプカーソル。全environment共通の1本のみ持つ(現状はどのenvironmentが所有する
+ * ページかを区別しない、Phase3でenvironmentごとの所有ページリストに置き換える予定) */
+static imm_slot_cursor_t g_function_cell_cursor = {0, 0};
+
 /* ============================== GC (Cheney方式コピーGC) ============================== */
 
 /**
@@ -1248,6 +1305,10 @@ void os_reset_runtime_state_for_test(void) {
     global_environment = nil;
     g_dynamic_bindings = nil;
     g_gc_extra_root_count = 0;
+    g_imm_bump = g_imm_space;
+    g_imm_free_list = 0;
+    g_function_cell_cursor.page = 0;
+    g_function_cell_cursor.offset = 0;
 }
 
 
@@ -1334,10 +1395,14 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
      *     (cons 'variables nil)
      *     (cons 'functions nil)
      *     (cons 'parent parent-env)
-     *     (cons 'constants nil)))
+     *     (cons 'constants nil)
+     *     (cons 'cells nil)))
      *
-     * constantsは既存のos_get_variable/os_get_function/os_set_variable/os_set_functionが
-     * 4番目(parent)までしか固定位置参照しないため、末尾に追加するだけで既存コードに影響しない
+     * constants/cellsは既存のos_get_variable/os_get_function/os_set_variable/
+     * os_set_functionが4番目(parent)までしか固定位置参照しないため、末尾に追加する
+     * だけで既存コードに影響しない。cellsは(sym . TAG_RAW_POINTER付きFunction Cell
+     * アドレス)のalistで、os_set_functionがfunctionsスロットと同時に同期する
+     * (os_get_function_cell参照)
      */
     lisp_val_t name_symbol = os_make_symbol("name");
     GC_PROTECT(name_symbol);
@@ -1349,6 +1414,8 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     GC_PROTECT(parent_symbol);
     lisp_val_t constants_symbol = os_make_symbol("constants");
     GC_PROTECT(constants_symbol);
+    lisp_val_t cells_symbol = os_make_symbol("cells");
+    GC_PROTECT(cells_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     GC_PROTECT(name_slot);
@@ -1359,8 +1426,11 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     lisp_val_t parent_slot = os_make_cons(parent_symbol, parent_env);
     GC_PROTECT(parent_slot);
     lisp_val_t constants_slot = os_make_cons(constants_symbol, nil);
+    GC_PROTECT(constants_slot);
+    lisp_val_t cells_slot = os_make_cons(cells_symbol, nil);
 
-    lisp_val_t list_step4 = os_make_cons(constants_slot, nil);
+    lisp_val_t list_step5 = os_make_cons(cells_slot, nil);
+    lisp_val_t list_step4 = os_make_cons(constants_slot, list_step5);
     lisp_val_t list_step3 = os_make_cons(parent_slot, list_step4);
     lisp_val_t list_step2 = os_make_cons(functions_slot, list_step3);
     lisp_val_t list_step1 = os_make_cons(variables_slot, list_step2);
@@ -1598,14 +1668,22 @@ lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
 
 /**
  * envの関数slotにsymの関数定義としてfn_objを設定する(既存なら破壊的に上書き、無ければ新規追加)。
+ * 併せて、対応するFunction Cell(cellsスロット、os_get_function_cell参照)の内容も
+ * 同期させる: 既存セルがあれば中身を書き換え、無ければImmobilized Space上に新規セルを
+ * 確保してcellsスロットへ追加する。
  * @param sym 設定するsymbol
  * @param fn_obj 設定する関数オブジェクト
  * @param env 設定先の環境
  * @return fn_obj 自身
  */
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
-    // 新規追加パスではos_make_cons後にfn_objをreturnで読み直すため保護する
+    // 新規追加パスではos_make_cons後にfn_obj/sym/envをreturnや後続のcellsスロット
+    // 同期処理で読み直すため保護する(symは既存のfunctionsスロット処理では未使用の
+    // ため元々保護されていなかったが、Function Cell同期の追加でos_make_cons後にも
+    // 使うようになったため、この変更に合わせて新たに保護する)
     GC_PROTECT(fn_obj);
+    GC_PROTECT(sym);
+    GC_PROTECT(env);
     // current environment から (functions . alist) のペアを取り出すため、 cddr を取る
     lisp_val_t next_cell = cc_cdr(cc_cdr(env));
 
@@ -1633,7 +1711,85 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
         ((lisp_val_t *)func_slot_addr)[1] = new_alist;
     }
 
+    // Function Cellの同期。cellsスロット(6番目、cddddr(cdr(env))のcar)を取り出す。
+    lisp_val_t cells_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))));
+    GC_PROTECT(cells_slot);
+    lisp_val_t cells_alist = cc_cdr(cells_slot);
+    GC_PROTECT(cells_alist);
+    lisp_val_t existing_cell_pair = cc_assoc_eq(sym, cells_alist);
+
+    if (existing_cell_pair != nil) {
+        // 既存セルがあれば内容だけ書き換える(セル自身のアドレスは不変)
+        lisp_addr_t cell_addr = (lisp_addr_t)(cc_cdr(existing_cell_pair) & ~TAG_MASK);
+        *(lisp_val_t *)cell_addr = fn_obj;
+    } else {
+        // 新規セルをImmobilized Spaceに確保し、fn_objで初期化してcellsへ追加する
+        lisp_val_t *cell_ptr = (lisp_val_t *)os_imm_slot_alloc(&g_function_cell_cursor, sizeof(lisp_val_t));
+        *cell_ptr = fn_obj;
+        lisp_val_t tagged_cell = ((lisp_val_t)(lisp_addr_t)cell_ptr) | TAG_RAW_POINTER;
+        lisp_val_t new_cell_pair = os_make_cons(sym, tagged_cell);
+        lisp_val_t new_cells_alist = os_make_cons(new_cell_pair, cells_alist);
+        // functionsスロットの追加パスと同じ理由で、書き込み先アドレスは両方の
+        // os_make_cons完了後にcells_slot(GC_PROTECT済み)から読み直す
+        lisp_addr_t cells_slot_addr = cells_slot & ~TAG_MASK;
+        ((lisp_val_t *)cells_slot_addr)[1] = new_cells_alist;
+    }
+
     return fn_obj;
+}
+
+/**
+ * envおよびその親を順に辿り、symの関数定義に対応するFunction Cellを取得する。
+ * os_set_functionがfunctionsスロットへの追加/更新と同時にcellsスロットも必ず
+ * 同期するため、functionsで見つかったレベルのcellsには対応するcellが必ず存在する。
+ * @param sym 検索するsymbol
+ * @param env 検索を開始する環境
+ * @return 見つかったFunction Cellを指す、TAG_RAW_POINTER付きのアドレス。未定義の場合はnil
+ */
+lisp_val_t os_get_function_cell(lisp_val_t sym, lisp_val_t env) {
+    lisp_val_t current_env = env;
+
+    while (current_env != nil) {
+        lisp_val_t func_slot = cc_car(cc_cdr(cc_cdr(current_env)));
+        lisp_val_t alist = cc_cdr(func_slot);
+        lisp_val_t pair = cc_assoc_eq(sym, alist);
+
+        if (pair != nil) {
+            lisp_val_t cells_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(current_env))))));
+            lisp_val_t cells_alist = cc_cdr(cells_slot);
+            lisp_val_t cell_pair = cc_assoc_eq(sym, cells_alist);
+            return cc_cdr(cell_pair);
+        }
+
+        lisp_val_t cell1 = cc_cdr(current_env);
+        lisp_val_t cell2 = cc_cdr(cell1);
+        lisp_val_t cell3 = cc_cdr(cell2);
+        lisp_val_t par_slot = cc_car(cell3);
+
+        current_env = cc_cdr(par_slot);
+    }
+
+    return nil;
+}
+
+/**
+ * Function Cell(TAG_RAW_POINTER付きの、Immobilized Space上の固定アドレス)経由で
+ * 関数を適用する。cellの中身(現在の関数オブジェクト)を読み出し、既存のos_apply_function
+ * にそのまま委譲する。cell==nil(os_get_function_cellが未定義を返した場合)は、
+ * os_get_functionが未定義時にnilを返し、そのままos_apply_function(nil, ...)へ渡して
+ * いた既存の挙動(eval-errorへの遷移)と同じにするため、fn_objとしてnilを渡す。
+ * @param cell os_get_function_cellが返したTAG_RAW_POINTER付きのcellアドレス(nil可)
+ * @param evaluated_args 評価済みの引数リスト
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果
+ */
+lisp_val_t os_apply_via_cell(lisp_val_t cell, lisp_val_t evaluated_args, lisp_val_t env) {
+    if (cell == nil) {
+        return os_apply_function(nil, evaluated_args, env);
+    }
+    lisp_addr_t cell_addr = (lisp_addr_t)(cell & ~TAG_MASK);
+    lisp_val_t fn_obj = *(lisp_val_t *)cell_addr;
+    return os_apply_function(fn_obj, evaluated_args, env);
 }
 
 

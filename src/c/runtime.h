@@ -203,6 +203,44 @@ void os_gc_collect(void);
  */
 UINT64 os_gc_collect_count(void);
 
+/* ============================== Immobilized Space ==============================
+ * GC(copy GC)が移動・破棄しない固定領域。JITコードやFunction Cellなど、Cのポインタとして
+ * 直接掴んでおきたいデータの置き場所として使う。os_gc_collectのスキャン対象外であり、
+ * ここへのポインタをTAG_RAW_POINTERとしてLisp値に埋め込んでも、gc_copy_valueは
+ * fixnum/char同様に即値としてそのまま素通しする(移動・追跡しない)。
+ */
+
+/** Immobilized Spaceの1ページのバイト数 */
+#define IMM_PAGE_SIZE 4096
+
+/**
+ * Immobilized Spaceから4KBページを1枚確保する。空間が枯渇した場合は診断メッセージを
+ * 表示して停止する。
+ * @return 確保した4KBページの先頭アドレス
+ */
+void *os_imm_page_alloc(void);
+
+/**
+ * os_imm_page_allocで確保したページをフリーリストへ返却し、再利用可能にする。
+ * @param page 返却するページの先頭アドレス(os_imm_page_allocが返したものに限る)
+ */
+void os_imm_page_free(void *page);
+
+/** os_imm_slot_allocが使う、1ページ内でのバンプアロケーションの進行状況を保持するカーソル */
+typedef struct {
+    UINT8 *page;   /* 現在切り出し中のページ(0ならまだページ未確保) */
+    UINT64 offset; /* そのページ内で次に切り出す位置 */
+} imm_slot_cursor_t;
+
+/**
+ * cursorが指すページから16byteアライメントでsizeバイトを切り出す。ページが未確保、
+ * または残りが足りない場合は新しいページをos_imm_page_allocで確保してcursorを進める。
+ * @param cursor 呼び出し元が保持するカーソル(呼ぶたびに状態が進む)
+ * @param size 切り出すバイト数(IMM_PAGE_SIZEを超えるサイズは指定できない)
+ * @return 切り出した領域の先頭アドレス
+ */
+void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size);
+
 /**
  * lisp_val_t型の変数へのポインタを、os_gc_collectが毎回書き換えるルート集合に登録する
  * (idempotent: 同じポインタを複数回登録しても1回分の登録として扱われる)。
@@ -454,6 +492,28 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env);
  * @return val 自身
  */
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
+
+/**
+ * envおよびその親を順に辿り、symの関数定義に対応するFunction Cellを取得する。
+ * Function CellはImmobilized Space上の固定アドレスに置かれた8byteのセルで、現在の
+ * 関数オブジェクトを保持する。cellのアドレス自体は(sym, env)の束縛が存在する間不変
+ * だが、中身はos_set_functionが再defunのたびに書き換える。呼び出し側はcellの
+ * アドレスだけ握っておけば、中身を読むたびに常に最新の定義を得られる。
+ * @param sym 検索するsymbol
+ * @param env 検索を開始する環境
+ * @return 見つかったFunction Cellを指す、TAG_RAW_POINTER付きのアドレス。未定義の場合はnil
+ */
+lisp_val_t os_get_function_cell(lisp_val_t sym, lisp_val_t env);
+
+/**
+ * os_get_function_cellが返したFunction Cell経由で関数を適用する。cellの中身
+ * (現在の関数オブジェクト)を読み出し、os_apply_functionへそのまま委譲する。
+ * @param cell os_get_function_cellが返したTAG_RAW_POINTER付きのcellアドレス(nil可)
+ * @param evaluated_args 評価済みの引数リスト
+ * @param env 呼び出し時の環境
+ * @return 関数呼び出しの結果
+ */
+lisp_val_t os_apply_via_cell(lisp_val_t cell, lisp_val_t evaluated_args, lisp_val_t env);
 
 /**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。

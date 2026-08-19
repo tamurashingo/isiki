@@ -266,6 +266,34 @@ void test_os_get_function() {
     assert(v3 == nil, "未定義の関数はnilが返る");
 }
 
+// Phase2動作確認: Function Cellのアドレスは再defunしても不変であること(呼び出し側は
+// cellアドレスだけ握っていればよく、cellの中身がどこを指しているかを意識しなくてよい)、
+// および同じcellアドレス経由での呼び出しがcellの中身の書き換えに応じて動的に切り替わる
+// ことを確認する。
+void test_os_function_cell() {
+    lisp_val_t env = os_make_environment(os_make_symbol("CELL-TEST-ENV"), nil);
+    lisp_val_t sym = os_make_symbol("cell-test-fn");
+
+    lisp_val_t fn_car = os_make_native_function((lisp_addr_t)(void *)primitive_car);
+    os_set_function(sym, fn_car, env);
+    lisp_val_t cell = os_get_function_cell(sym, env);
+    assert(cell != nil, "定義済み関数のFunction Cellはnilではない");
+
+    lisp_val_t pair = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t args = os_make_cons(pair, nil);
+    lisp_val_t r1 = os_apply_via_cell(cell, args, env);
+    assert(r1 == os_make_fixnum(1), "carとして定義した直後はcell経由の呼び出しがcarとして動く");
+
+    // 再defun。呼び出し側が握っているcellアドレス自体は不変のまま、内容だけがcdrへ切り替わる
+    lisp_val_t fn_cdr = os_make_native_function((lisp_addr_t)(void *)primitive_cdr);
+    os_set_function(sym, fn_cdr, env);
+    lisp_val_t cell_after = os_get_function_cell(sym, env);
+    assert(cell_after == cell, "再defunしてもFunction Cellのアドレス自体は不変");
+
+    lisp_val_t r2 = os_apply_via_cell(cell, args, env);
+    assert(r2 == os_make_fixnum(2), "同じcellアドレス経由の呼び出しが再defun後はcdrとして動く(動的切り替え)");
+}
+
 static lisp_val_t make_arg_list(int argc, ...) {
     lisp_val_t vals[8];
     va_list ap;
@@ -1365,6 +1393,39 @@ void test_primitive_make_instance_raw_and_accessors() {
     assert(primitive_class_instance_p(os_make_cons(class, nil), nil) == nil, "(%%class-instance-p c)(クラス自身)はnilを返す");
 }
 
+void test_imm_page_alloc_survives_gc_and_free_list_reuses_page() {
+    UINT8 *page = (UINT8 *)os_imm_page_alloc();
+    for (int i = 0; i < IMM_PAGE_SIZE; i++) {
+        page[i] = (UINT8)(i & 0xFF);
+    }
+
+    // From/To空間側にゴミを積んでGCが実際に走る状況を作る
+    lisp_val_t garbage = nil;
+    for (int i = 0; i < 100; i++) {
+        garbage = os_make_cons(os_make_fixnum(i), garbage);
+    }
+    os_gc_collect();
+
+    for (int i = 0; i < IMM_PAGE_SIZE; i++) {
+        assert(page[i] == (UINT8)(i & 0xFF),
+               "Immobilized Spaceのページはos_gc_collectを挟んでも移動・破棄されない");
+    }
+
+    os_imm_page_free(page);
+    UINT8 *reused = (UINT8 *)os_imm_page_alloc();
+    assert(reused == page, "os_imm_page_freeで返却したページはos_imm_page_allocで再利用される");
+}
+
+void test_imm_slot_alloc_carves_aligned_slots_from_pages() {
+    imm_slot_cursor_t cursor = {0, 0};
+    void *a = os_imm_slot_alloc(&cursor, 8);
+    void *b = os_imm_slot_alloc(&cursor, 8);
+    assert((UINT64)a % 16 == 0, "os_imm_slot_allocが返すアドレスは16byteアライメント");
+    assert((UINT64)b % 16 == 0, "os_imm_slot_allocが返すアドレスは16byteアライメント");
+    assert(b == (UINT8 *)a + 16, "8byte要求でも16byteアライメントに切り上げられ、次のスロットは16byte先になる");
+    assert(cursor.page != 0, "カーソルはos_imm_page_allocで確保したページを保持する");
+}
+
 void test_gc_cons_survives_and_relocates() {
     // symをos_gc_collect()を挟んで直接使うと、sym自身がFrom空間の古いアドレスのまま
     // 更新されない(rootとして登録していないローカル変数はGCが書き換えてくれない)ため、
@@ -1483,7 +1544,13 @@ void test_gc_reclaims_unreferenced_garbage() {
 // %%ZA-COMPILED-Pの追加でos_bootstrap()が恒久的に消費するバイト数が増えたため、
 // 元の64KBのままだとbignum加算テストがGC後も本当に確保不能になってしまう。
 // GCが計算途中で発火するというテストの意図(margin)を保ったまま、その分だけ広げる
-#define SMALL_HEAP_SIZE (68 * 1024)
+//
+// Function Cell導入(os_set_function参照)により、os_bootstrapが登録する
+// native関数1つにつきcellsスロットへ2つの新規cons(new_cell_pair/new_cells_alist、
+// 計32byte)が恒久的にglobal_environmentから到達可能になった。os_bootstrapが
+// 登録するnative関数は100個超あり、合計で3KB超の恒久消費が増える。68KBのままだと
+// vector構築テスト(N=750)がGC後も確保不能になり停止するため、その分さらに広げる
+#define SMALL_HEAP_SIZE (76 * 1024)
 
 static void setup_small_heap(void) {
     void *heap = malloc(SMALL_HEAP_SIZE);
@@ -1664,6 +1731,7 @@ int main(int argc, char** argv) {
    test_os_make_symbol_prefix_is_not_confused();
    test_os_get_variable();
    test_os_get_function();
+   test_os_function_cell();
    test_os_make_fixnum_signed();
    test_os_make_integer_promotes_to_bignum();
    test_primitive_add_signed_and_bignum();
@@ -1734,6 +1802,9 @@ int main(int argc, char** argv) {
    test_primitive_make_class_raw_and_accessors();
    test_primitive_make_builtin_class_raw_and_metaclass_predicates();
    test_primitive_make_instance_raw_and_accessors();
+
+   test_imm_page_alloc_survives_gc_and_free_list_reuses_page();
+   test_imm_slot_alloc_carves_aligned_slots_from_pages();
 
    test_gc_cons_survives_and_relocates();
    test_gc_symbol_survives_via_symbol_table();
