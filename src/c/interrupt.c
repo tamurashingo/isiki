@@ -118,6 +118,39 @@ uint32_t inl(uint16_t port) {
 }
 
 
+/** COM1(0x3F8)のI/Oポート群。診断出力をQEMUの-serialへ流すためだけに使う */
+#define SERIAL_COM1_PORT 0x3F8
+
+/**
+ * COM1を38400bps/8N1/FIFO有効で初期化する。QEMUは-serialオプション無しでも
+ * デバイス自体はデフォルトで存在するため、outbが失敗することはない
+ * (実機の欠品ハードウェアは対象外)
+ */
+static void serial_init(void) {
+    outb(SERIAL_COM1_PORT + 1, 0x00); // 割り込み無効
+    outb(SERIAL_COM1_PORT + 3, 0x80); // DLAB=1
+    outb(SERIAL_COM1_PORT + 0, 0x03); // divisor下位(115200/3=38400bps)
+    outb(SERIAL_COM1_PORT + 1, 0x00); // divisor上位
+    outb(SERIAL_COM1_PORT + 3, 0x03); // 8bit, no parity, 1 stop bit(DLAB=0に戻る)
+    outb(SERIAL_COM1_PORT + 2, 0xC7); // FIFO有効化・クリア・14byte閾値
+    outb(SERIAL_COM1_PORT + 4, 0x0B); // RTS/DSRセット
+}
+
+/** THR(送信バッファ)が空くまで待ってから1バイト送出する */
+static void serial_write_char(char c) {
+    while ((inb(SERIAL_COM1_PORT + 5) & 0x20) == 0) {
+    }
+    outb(SERIAL_COM1_PORT, (uint8_t)c);
+}
+
+/** 文字列を先頭からserial_write_charで送出する */
+static void serial_write_string(const char *s) {
+    while (*s) {
+        serial_write_char(*s);
+        s++;
+    }
+}
+
 /** GP例外(vector 13)のエントリポイント。エラーコードとvectorを積んでcpu_exception_commonへ入る */
 void asm_gpf_handler(void);
 /** ページフォルト(vector 14)のエントリポイント。エラーコードとvectorを積んでcpu_exception_commonへ入る */
@@ -129,6 +162,7 @@ void asm_pf_handler(void);
  * @param fault_addr GPFでは未使用の引数(esiに載る値、現状は捨てている)
  */
 void __attribute__((sysv_abi)) c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr);
+
 // asm_gpf_handler/asm_pf_handlerの共通後続処理。15汎用レジスタとexceptionのコンテキストを
 // ExceptionContextとしてスタックに積み、c_cpu_exception_handlerを呼ぶ(戻ってこない)
 asm(
@@ -431,9 +465,64 @@ void init_pit(void) {
     outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
 }
 
+/**
+ * 64bit値を"0x"付き16桁16進数文字列としてfbへ書き込む(snprintf等が使えない
+ * フリースタンディング環境向けの、この診断出力専用の簡易フォーマッタ)
+ * @param fb 出力先
+ * @param v 出力する値
+ */
+static void fb_write_hex64(frame_buffer *fb, uint64_t v) {
+    static const char hex_digits[] = "0123456789ABCDEF";
+    char buf[19];
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        buf[2 + i] = hex_digits[(v >> ((15 - i) * 4)) & 0xF];
+    }
+    buf[18] = '\0';
+    fb->write_string(fb, buf);
+    serial_write_string(buf);
+}
+
+/** fbへの出力と同時にserialへも同じ文字列を送る(-display noneでも診断内容を読めるようにする) */
+static void diag_write_string(frame_buffer *fb, const char *s) {
+    fb->write_string(fb, s);
+    serial_write_string(s);
+}
+
+/**
+ * GPF/PF発生時に、原因追跡に必要な最低限の情報(vector, error_code, rip, rsp, rflags、
+ * PFの場合はCR2=フォルトしたアドレス)をfbへ表示してから停止する。
+ * 元は単に'c'を1文字表示するだけのスタブだったため、どの命令が何のフォルトを
+ * 起こしたのか一切分からず、GPF/PFが発生するとキーボード割り込みも二度と
+ * 入らず無応答になる(cpu_exception_commonのhlt;jmp .-1がinterrupt gate経由=IF=0の
+ * まま無限loopするため)問題そのものは今回のスコープ外だが、原因調査のため
+ * 表示内容だけ拡張する
+ */
 void __attribute__((sysv_abi)) c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr) {
+    (void)fault_addr;
     frame_buffer *fb = get_active_frame_buffer();
-    fb->write_char(fb, 'c');
+
+    diag_write_string(fb, "\n!! CPU EXCEPTION !!\nvector=");
+    fb_write_hex64(fb, ctx->vector);
+    diag_write_string(fb, " error_code=");
+    fb_write_hex64(fb, ctx->error_code);
+    diag_write_string(fb, "\nrip=");
+    fb_write_hex64(fb, ctx->rip);
+    diag_write_string(fb, " cs=");
+    fb_write_hex64(fb, ctx->cs);
+    diag_write_string(fb, "\nrsp=");
+    fb_write_hex64(fb, ctx->rsp);
+    diag_write_string(fb, " rflags=");
+    fb_write_hex64(fb, ctx->rflags);
+
+    if (ctx->vector == 14) {
+        uint64_t cr2 = 0;
+        asm volatile ("mov %%cr2, %0" : "=r"(cr2));
+        diag_write_string(fb, "\ncr2(fault addr)=");
+        fb_write_hex64(fb, cr2);
+    }
+    diag_write_string(fb, "\n");
 }
 
 /**
@@ -535,6 +624,7 @@ void init_fpu(void) {
 
 /** IDTを構築し、GPF/PF/タイマー/キーボードの各ハンドラを登録してlidt/stiする */
 void init_idt(void) {
+    serial_init();
     set_idt_entry(13, (void *)asm_gpf_handler);
     set_idt_entry(14, (void *)asm_pf_handler);
     set_idt_entry(32, (void *)asm_timer_handler);
