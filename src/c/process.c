@@ -10,8 +10,14 @@ static process_t g_processes[PROCESS_COUNT];
 /** @brief 現在アクティブ(表示フォーカスがある)プロセスのindex。switch_active_processが更新する */
 static UINT32 g_current_process_index = 0;
 
-/** @brief プロセスごとの専用実行スタックのサイズ(バイト) */
-#define STACK_SIZE (16 * 1024)
+/**
+ * @brief プロセスごとの専用実行スタックのサイズ(バイト)
+ * 16KBでは(load "src/lisp/init.lisp")のような初回フルロードでC側の再帰(reader等)が
+ * 実測約35〜36KBまで達し、スタックを踏み越えてGPFになることを確認済み(ガードページが
+ * 無いため隣接プロセスのスタック領域へ静かに侵入する)。64KBは実測ピークの約1.8倍の
+ * 余裕があり、複数回の再現実験で例外なく完走することを確認している
+ */
+#define STACK_SIZE (64 * 1024)
 
 /** @brief プロセスごとの専用実行スタック。GCが関知しないOS層の生メモリなので静的配列で確保する */
 static UINT8 g_stacks[PROCESS_COUNT][STACK_SIZE] __attribute__((aligned(16)));
