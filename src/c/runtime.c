@@ -1740,6 +1740,23 @@ lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
 
 
 /**
+ * setq対象がdefconstantの定数ならg_sym_eval_errorを返し(eval_setqのos_is_constant保護と
+ * 同じ)、そうでなければos_setq_variableで書き込む。zaのJITコンパイル済みコードから
+ * グローバル/未束縛変数へのsetqを行う際に使う。
+ * @param sym 設定するsymbol
+ * @param val 設定する値
+ * @param env 探索を開始する環境
+ * @return val、またはsymが定数の場合はg_sym_eval_error
+ */
+lisp_val_t os_setq_variable_checked(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
+    if (os_is_constant(sym, env)) {
+        return g_sym_eval_error;
+    }
+    return os_setq_variable(sym, val, env);
+}
+
+
+/**
  * 既存の(sym . val)ペアpairをコピーせずそのままenvのalistへ連結する。os_set_variableの
  * 新規追加分岐(os_make_cons(sym,val)でペアを作る部分)からペア生成だけを省いたもの。
  * @param pair 連結する(sym . val)ペア

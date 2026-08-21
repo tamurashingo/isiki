@@ -755,7 +755,13 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
             out->literal = form;
             return 1;
         }
-        return 0;
+        // 拡張19: local/param/rest/裸のTのいずれでもない裸シンボルは、eval.cのシンボル
+        // 評価(os_get_variableへの委譲)と同じくグローバル/未束縛変数の読み込みとして
+        // 扱う。コンパイル時に「本当にdefglobalか」を判定する必要は無く、実行時に
+        // os_get_variableがenvの親チェーンを辿って解決する(インタプリタと同じ)。
+        out->is_literal = 9;
+        out->literal = form;
+        return 1;
     }
     // 拡張7(ILOS)で(quote sym)形式のシンボルリテラルに対応し、拡張10でXの実際の
     // タグに応じて即値(fixnum/char/nil)またはヒープ値(cons/string/instance等)にも
@@ -1017,8 +1023,17 @@ static void za_gc_unlink_node(gc_rootnode *node) {
  * 要素配列(ZA_MAX_QQ_ELEMENTS個、za_arg_val_offと同じ「配列インデックス」パターン) +
  * foldアキュムレータ用1個(za_arith_val_offと同じ単一スロット)。 */
 #define ZA_QQ_LEVEL_SIZE    (8 + (ZA_MAX_QQ_ELEMENTS + 1) * ZA_QQ_SLOT_SIZE)
-#define ZA_FRAME_EXTRA \
+/* 拡張19(グローバル変数setq): os_make_symbol呼び出し前にRAX(val_formの評価結果)を
+ * 退避する専用スクラッチスロット。ZA_OFF_ACC_VALは呼び出し引数loopの実行中にしか
+ * 使われず、setqの右辺(val_form)自体が別の関数呼び出しを含みうるため流用できない
+ * (za.c:980のコメント参照)。ZA_OFF_LAMBDA_TMP_VAL/NODEと同型の単一固定スロット。 */
+#define ZA_OFF_SETQ_TMP_VAL \
     (ZA_OFF_QQ_BASE + ZA_MAX_QQ_DEPTH * ZA_QQ_LEVEL_SIZE)
+#define ZA_OFF_SETQ_TMP_NODE (ZA_OFF_SETQ_TMP_VAL + 8)  /* 16バイト、24バイトで終わる */
+/* 24-31: 16バイト境界(sub rsp総量を8 mod 16に保つ、ZA_OFF_NLX_BASEの264-271と
+ * 同じ考え方)を保つためのpadding */
+#define ZA_FRAME_EXTRA \
+    (ZA_OFF_SETQ_TMP_VAL + 32)
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
@@ -1153,6 +1168,21 @@ static void za_emit_operand(const za_operand_t *op) {
         jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function);
+        jit_call_r11();
+        return;
+    }
+    if (op->is_literal == 9) {
+        // 拡張19: local/param/rest/裸のTのいずれでもない裸シンボル(グローバル/未束縛
+        // 変数の読み込み)。is_literal==6と同じ3ステップだが、os_get_functionではなく
+        // os_get_variableを呼ぶ(eval.cのシンボル評価と同じ、envの親チェーンを辿って
+        // 解決する。見つからない場合はnilを返す)。
+        UINT64 name_off = za_emit_symbol_name(op->literal);
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_variable);
         jit_call_r11();
         return;
     }
@@ -3256,14 +3286,16 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
 
 /**
  * 拡張9: `(setq sym val-form)`。let-localのみ対応する(v1スコープ)。外側defunの
- * 固定引数・グローバル変数・dynamic変数への再代入は書き込み可能なスロットが無いため
- * 非対応でfallbackする(za_local_lookupが失敗し0を返す)。
+ * 固定引数・dynamic変数への再代入は書き込み可能なスロットが無いため引き続き
+ * 非対応でfallbackする。
  * let-localのスロットはza_compile_let(束縛時)で既にza_emit_gc_link_slotによりアドレス
  * リンク済みなので、val-formの評価結果を同じスロットへ上書きするだけでよく、
  * 再リンクは不要(GCスキャンはリンクされたアドレスを都度dereferenceするため)。
  * val-form評価と書き込みの間にヒープ確保を伴う呼び出しは挟まないため、defdynamic/
  * return-fromのようなNLXスロット経由の退避保護も不要(ZA_VAR_BOXEDの場合はos_setcdr呼び出し
  * を挟むが、値そのもの(既にrax)以外に保護すべきものが無いため同様に安全)。
+ * 拡張19: let-localでもparam/&restでもない裸シンボルは、グローバル/未束縛変数への
+ * setqとして扱う(eval_setqがos_setq_variableに委譲する場合と同じ)。
  */
 static int za_compile_setq(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
@@ -3286,7 +3318,46 @@ static int za_compile_setq(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     UINT32 val_off;
     za_var_kind_t kind;
     if (!za_local_lookup(locals, sym, &val_off, &kind)) {
-        return 0;
+        UINT64 dummy_idx;
+        lisp_val_t dummy_sym;
+        if (za_param_index(params, sym, fixed_count, &dummy_idx) ||
+            za_rest_param_symbol(params, fixed_count, &dummy_sym)) {
+            return 0;  // 既存の制限: 固定引数/&restへのsetqは非対応のまま
+        }
+
+        // グローバル/未束縛変数へのsetq。val-formを評価→制御転送チェック→
+        // os_setq_variable_checkedで書き込む(defconstantの保護込み)。
+        if (!za_compile_expr(val_form, params, fixed_count, locals, syms, env, 0, trampoline_offset, nlx_depth,
+                              tb_ctx, call_depth, arith_depth)) {
+            return 0;
+        }
+        UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
+
+        // os_make_symbolの呼び出し(新規シンボル登録時にヒープ確保しうる)を挟む前に
+        // valをRAX破壊から退避する。ZA_OFF_ACC_VALは呼び出し引数loopのネスト実行中に
+        // 使われるため流用できない(ZA_OFF_SETQ_TMP_VALのコメント参照)。
+        za_store_slot(ZA_REG_RAX, ZA_OFF_SETQ_TMP_VAL);
+        za_emit_gc_link_slot(ZA_OFF_SETQ_TMP_VAL, ZA_OFF_SETQ_TMP_NODE);
+
+        UINT64 name_off = za_emit_symbol_name(sym);
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);          // sym
+        za_load_slot(ZA_REG_RDX, ZA_OFF_SETQ_TMP_VAL);    // val
+        za_load_slot(ZA_REG_R8, ZA_OFF_ENV_VAL);          // env
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_setq_variable_checked);
+        jit_call_r11();
+
+        // os_setq_variable_checkedの戻り値(raxこそが式全体の返り値)をza_gc_unlink_node
+        // 呼び出しから守るため、呼び出し規約上callee-savedなr13へ一時退避する
+        // (za_compile_block(name!=nil)のMAGIC_BLOCK_EXIT生成、za.c:3185-3187と同じ手法)。
+        jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+        za_emit_gc_unlink_slot(ZA_OFF_SETQ_TMP_NODE);
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+
+        jit_patch_rel32(ct_patch);
+        return 1;
     }
 
     if (!za_compile_expr(val_form, params, fixed_count, locals, syms, env, 0, trampoline_offset, nlx_depth, tb_ctx,

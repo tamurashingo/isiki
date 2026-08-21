@@ -510,6 +510,17 @@ lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 
 /**
+ * setq対象がdefconstantの定数ならg_sym_eval_errorを返し(eval_setqのos_is_constant保護と
+ * 同じ)、そうでなければos_setq_variableで書き込む。zaのJITコンパイル済みコードから
+ * グローバル/未束縛変数へのsetqを行う際に使う。
+ * @param sym 設定するsymbol
+ * @param val 設定する値
+ * @param env 探索を開始する環境
+ * @return val、またはsymが定数の場合はg_sym_eval_error
+ */
+lisp_val_t os_setq_variable_checked(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
+
+/**
  * 既存の(sym . val)ペアpairをコピーせずそのままenvのalistへ連結する。os_set_variableが
  * 常に新規ペアを作るのに対し、これは呼び出し元が既に持っているペアの同一性(アドレス)を
  * 保つ。zaのJITコンパイラがlet-local変数をboxとしてクロージャへ捕捉する際、値コピーの
