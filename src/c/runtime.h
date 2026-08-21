@@ -510,6 +510,27 @@ lisp_val_t os_set_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 
 /**
+ * 既存の(sym . val)ペアpairをコピーせずそのままenvのalistへ連結する。os_set_variableが
+ * 常に新規ペアを作るのに対し、これは呼び出し元が既に持っているペアの同一性(アドレス)を
+ * 保つ。zaのJITコンパイラがlet-local変数をboxとしてクロージャへ捕捉する際、値コピーの
+ * 代わりに束縛cons自体を新環境と共有するために使う(za_emit_build_capture_env参照)。
+ * @param pair 連結する(sym . val)ペア
+ * @param env 連結先の環境
+ * @return pair自身
+ */
+lisp_val_t os_env_add_binding_pair(lisp_val_t pair, lisp_val_t env);
+
+/**
+ * consのcdrをvalへ破壊的に書き換える(rplacd相当)。zaのJITコンパイラがbox化された
+ * let-local変数へのsetqを、束縛cons自体を直接書き換えることで実装するために使う
+ * (za_compile_setq参照)。
+ * @param cons 書き換え対象のcons
+ * @param val 新しい値
+ * @return val自身
+ */
+lisp_val_t os_setcdr(lisp_val_t cons, lisp_val_t val);
+
+/**
  * envおよびその親を順に辿り、symの関数定義を取得する。
  * @param sym 検索するsymbol
  * @param env 検索を開始する環境

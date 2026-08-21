@@ -1740,6 +1740,42 @@ lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
 
 
 /**
+ * 既存の(sym . val)ペアpairをコピーせずそのままenvのalistへ連結する。os_set_variableの
+ * 新規追加分岐(os_make_cons(sym,val)でペアを作る部分)からペア生成だけを省いたもの。
+ * @param pair 連結する(sym . val)ペア
+ * @param env 連結先の環境
+ * @return pair自身
+ */
+lisp_val_t os_env_add_binding_pair(lisp_val_t pair, lisp_val_t env) {
+    GC_PROTECT(pair);
+    // current environment の (variables . alist) のペアを取り出す(cadr)
+    lisp_val_t var_slot = cc_car(cc_cdr(env));
+    GC_PROTECT(var_slot);
+
+    lisp_val_t alist = cc_cdr(var_slot); // cdr (alist)
+    lisp_val_t new_alist = os_make_cons(pair, alist);
+    // os_make_consでGCが発火しvar_slotが移動している可能性があるため、書き込み先アドレスは
+    // GC_PROTECT済みのvar_slotから確保完了後に読み直す(os_set_variableの新規追加分岐と同じ理由)
+    lisp_addr_t var_slot_addr = var_slot & ~TAG_MASK;
+    ((lisp_val_t *)var_slot_addr)[1] = new_alist;
+
+    return pair;
+}
+
+
+/**
+ * consのcdrをvalへ破壊的に書き換える(rplacd相当)。
+ * @param cons 書き換え対象のcons
+ * @param val 新しい値
+ * @return val自身
+ */
+lisp_val_t os_setcdr(lisp_val_t cons, lisp_val_t val) {
+    ((lisp_val_t *)(cons & ~TAG_MASK))[1] = val;
+    return val;
+}
+
+
+/**
  * envの関数slotにsymの関数定義としてfn_objを設定する(既存なら破壊的に上書き、無ければ新規追加)。
  * 併せて、対応するFunction Cell(cellsスロット、os_get_function_cell参照)の内容も
  * 同期させる: 既存セルがあれば中身を書き換え、無ければImmobilized Space上に新規セルを

@@ -482,3 +482,83 @@
 (assert-equal t (isiki-za-test-all-eq-sym (isiki-za-test-dyn-stress 5) '*iza-test-dyn2*))
 (assert-equal 4 (dynamic *iza-test-dyn2*))
 (close (open-output-file "tmp/ckpt-20-defdynamic.txt"))
+
+;;; --- 拡張7: let-local変数のbox化(setq x エスケープするlambdaの捕捉) ---
+;;
+;; letで束縛したローカル変数が「setqされる」かつ「エスケープするlambdaに捕捉される」
+;; の両方を満たす場合のみ、変数はヒープ上のセル(box)に昇格される。以下はSBCL方式の
+;; cell昇格が(assigned, captured)の4通りの組み合わせすべてで正しく動くかを確認する。
+
+;; assigned=false, captured=false: 単純なlet-local(既存動作、boxなし)
+(defun isiki-za-test-box-plain (x) (let ((y (+ x 1))) y))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-box-plain)))
+(assert-equal 6 (isiki-za-test-box-plain 5))
+
+;; assigned=true, captured=false: setqされるが誰にも捕捉されないlet-local(既存動作、boxなし)
+(defun isiki-za-test-box-assigned-only (x)
+  (let ((y x))
+    (setq y (+ y 1))
+    y))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-box-assigned-only)))
+(assert-equal 6 (isiki-za-test-box-assigned-only 5))
+
+;; assigned=false, captured=true: 捕捉されるがsetqされないlet-local(既存動作、
+;; クロージャ生成時に値を1回だけコピーするだけで正しい、boxなし)
+(defun isiki-za-test-box-captured-only (x)
+  (let ((y x))
+    (let ((f (lambda () y)))
+      (funcall f))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-box-captured-only)))
+(assert-equal 5 (isiki-za-test-box-captured-only 5))
+
+;; assigned=true, captured=true(本命): クロージャ生成後にsetqした変更がクロージャ側にも
+;; 見えること。値コピーのままだと古い値(0)を返してしまう
+(defun isiki-za-test-box-captured-and-assigned (x)
+  (let ((y x))
+    (let ((f (lambda () y)))
+      (setq y 99)
+      (funcall f))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-box-captured-and-assigned)))
+(assert-equal 99 (isiki-za-test-box-captured-and-assigned 0))
+(close (open-output-file "tmp/ckpt-21-box-basic.txt"))
+
+;; 複数のクロージャが同じboxを共有すること: 片方(g)でsetqした変更が、もう片方(f)の
+;; 読み込みにも反映される(fとgが同一の束縛consを共有している証拠)
+(defun isiki-za-test-box-shared (x)
+  (let ((y x))
+    (let ((f (lambda () y))
+          (g (lambda () (setq y (+ y 1)))))
+      (funcall g)
+      (funcall f))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-box-shared)))
+(assert-equal 1 (isiki-za-test-box-shared 0))
+(close (open-output-file "tmp/ckpt-22-box-shared.txt"))
+
+;; box化された変数を含むクロージャ対を多数生成してもGC(os_gc_collect)を誘発しても
+;; 破壊されないことの確認。N=5でロジックのみ確認する。大量N版はza_test_stress.lispへ分離した。
+(defun isiki-za-test-make-box-counter (start)
+  (let ((cnt start))
+    (let ((inc (lambda () (setq cnt (+ cnt 1)) cnt))
+          (get (lambda () cnt)))
+      (cons inc get))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-make-box-counter)))
+
+(defun isiki-za-test-box-counter-chain (n)
+  (let ((acc nil))
+    (for ((i 0 (+ i 1))) ((= i n) acc)
+      (setq acc (cons (isiki-za-test-make-box-counter i) acc)))))
+
+(defun isiki-za-test-sum-box-counters (lst)
+  (let ((acc 0))
+    (for ((rest lst (cdr rest))) ((null rest) acc)
+      (let ((pair (car rest)))
+        (funcall (car pair))
+        (funcall (car pair))
+        (setq acc (+ acc (funcall (cdr pair))))))))
+
+(assert-equal 5 (length (isiki-za-test-box-counter-chain 5)))
+(close (open-output-file "tmp/ckpt-23-box-counter-chain.txt"))
+
+;; sum_{i=0}^{4} (i+2) = (0+1+2+3+4) + 2*5 = 10+10 = 20
+(assert-equal 20 (isiki-za-test-sum-box-counters (isiki-za-test-box-counter-chain 5)))
+(close (open-output-file "tmp/ckpt-24-box-counter-final.txt"))
