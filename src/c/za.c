@@ -22,26 +22,14 @@ static UINT64 g_jit_used = 0;
  * za_try_compile_defunがg_jit_usedをコンパイル開始前の位置まで巻き戻してnilを返す */
 static int g_jit_overflow = 0;
 
-/** 拡張9(setq): 今回のdefun内でza_compile_setqがlet-localへの書き込みに成功した
- * ことを示すフラグ。g_za_saw_escaping_lambdaと組み合わせて、setqとクロージャキャプチャの
- * 食い違いを検出するための粗い安全網に使う(za_try_compile_defun末尾で判定)。 */
-static int g_za_saw_setq_local = 0;
-/** 拡張9(setq): 今回のdefun内で値の位置に現れる裸の(lambda ...)(クロージャ生成、
- * let-IIFEインライン化のlambdaとは別の分岐)をコンパイルしたことを示すフラグ。
- * クロージャ生成時にlet-localの値を一度だけコピーする現在の実装(za_compile_lambda)は、
- * コピー後にそのlocalへsetqしてもクロージャ側には反映されない。インタプリタの環境モデル
- * (setqが既存consのcdrをその場で書き換える参照共有セマンティクス、runtime.cの
- * os_setq_variable)と食い違うため、同一defun内にsetqとエスケープするlambdaの両方が
- * 存在する場合は安全側に倒して全体をfallbackさせる(g_za_saw_setq_localとの併用、
- * za_try_compile_defun末尾参照)。 */
-static int g_za_saw_escaping_lambda = 0;
-
 /** 拡張(flet/labels): 今回のdefun内で`(function name)`がflet/labels束縛関数を
  * 指すケースをコンパイルしたことを示すフラグ。束縛関数のgensym登録は
  * flet/labels本体の動的extent内でのみglobal_environment上に存在するため、
  * `(function name)`でクロージャを取り出してその外へ持ち出す(脱出させる)使い方は
- * 対応できない。g_za_saw_escaping_lambdaと同じ「粗い過大近似+無条件fallback」で
- * 安全側に倒す(za_try_compile_defun末尾参照)。 */
+ * 対応できない。「粗い過大近似+無条件fallback」で安全側に倒す
+ * (za_try_compile_defun末尾参照)。setq×エスケープするlambdaの食い違い問題は、
+ * 同様の関数レベルの粗いフラグではなく変数単位のbox昇格(ZA_VAR_BOXED、
+ * za_analyze_var_usage参照)で構造的に解決済みのため、対応するフラグは存在しない。 */
 static int g_za_saw_flet_labels_escape = 0;
 
 static void jit_emit8(UINT8 b) {
@@ -422,7 +410,7 @@ typedef struct {
  * 現在値をmovabs+読み出しで都度再取得する。プロセス生涯で解放しない(g_za_lambda_slots
  * と同じ考え方)。
  */
-#define ZA_MAX_QUOTE_SLOTS 32
+#define ZA_MAX_QUOTE_SLOTS 40
 static lisp_val_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS];
 static UINT64 g_za_quote_slot_count = 0;
 /** Phase3.6: 環境破棄時にza_free_literal_slotが返却したスロットindexのフリーリスト
@@ -501,11 +489,21 @@ static UINT64 g_za_number_slot_count = 0;
 static UINT64 g_za_number_slot_free[ZA_MAX_NUMBER_SLOTS];
 static UINT64 g_za_number_slot_free_count = 0;
 
+/** let-local変数がsetqされ、かつエスケープするlambdaに捕捉される場合だけ、値を直接
+ * スタックスロットに置く代わりにヒープ上の束縛cons(インタプリタの環境alistが持つ
+ * (sym . value)ペアと同じ表現)へ昇格させる(za_analyze_var_usage参照)。ZA_VAR_PLAINは
+ * スロットに値そのもの、ZA_VAR_BOXEDはスロットに束縛consへのポインタを置く。 */
+typedef enum za_var_kind {
+    ZA_VAR_PLAIN = 0,
+    ZA_VAR_BOXED = 1,
+} za_var_kind_t;
+
 /** let-IIFEインライン化(拡張B)で使うローカル変数1個分の情報。val_offは
  * za_local_val_offで計算したフレームバイトオフセット。 */
 typedef struct za_local_var {
     lisp_val_t sym;
     UINT32 val_off;
+    za_var_kind_t kind;
 } za_local_var_t;
 
 /** let-IIFEインライン化(拡張B)のネスト深さ・1letあたりの変数数の上限
@@ -662,12 +660,15 @@ static int za_validate_params(lisp_val_t params, UINT64 *out_fixed_count) {
 
 /** let-IIFEインライン化(拡張B)のローカル変数を、内側スコープから外側へ向かって
  * 探索する。最初に見つかった(=最も内側の)一致を返すことで、シャドーイング
- * (letローカルが外側paramや外側letと同名)が自然に正しく解決される。 */
-static int za_local_lookup(const za_local_scope_t *locals, lisp_val_t sym, UINT32 *out_val_off) {
+ * (letローカルが外側paramや外側letと同名)が自然に正しく解決される。out_kindには
+ * 見つかったエントリのza_var_kind_t(ZA_VAR_PLAIN/ZA_VAR_BOXED)を書き込む。 */
+static int za_local_lookup(const za_local_scope_t *locals, lisp_val_t sym, UINT32 *out_val_off,
+                            za_var_kind_t *out_kind) {
     for (const za_local_scope_t *s = locals; s != 0; s = s->parent) {
         for (UINT64 i = 0; i < s->count; i++) {
             if (s->vars[i].sym == sym) {
                 *out_val_off = s->vars[i].val_off;
+                *out_kind = s->vars[i].kind;
                 return 1;
             }
         }
@@ -721,8 +722,12 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
     }
     if ((form & TAG_MASK) == TAG_SYMBOL) {
         UINT32 local_off;
-        if (za_local_lookup(locals, form, &local_off)) {
-            out->is_literal = 4;
+        za_var_kind_t local_kind;
+        if (za_local_lookup(locals, form, &local_off, &local_kind)) {
+            // box化された変数(ZA_VAR_BOXED)はスロットに値そのものではなく束縛consへの
+            // ポインタが置かれているため、is_literal=4(直値スロット)とは別のis_literal=8
+            // (間接読み込み、za_emit_operand参照)を使う。
+            out->is_literal = (local_kind == ZA_VAR_BOXED) ? 8 : 4;
             out->param_index = local_off;
             return 1;
         }
@@ -779,8 +784,7 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
         // flet/labels束縛関数を(function name)で取り出すケースは、gensymの
         // global_environment登録がflet/labelsの動的extentの外では復元済み(=消えて
         // いる)ため、クロージャがそのextentを越えて使われると解決に失敗する。
-        // 安全側に倒して無条件fallbackさせる(g_za_saw_flet_labels_escapeのコメント
-        // 参照、既存のg_za_saw_escaping_lambdaと同じ思想)。
+        // 安全側に倒して無条件fallbackさせる(g_za_saw_flet_labels_escapeのコメント参照)。
         const za_fn_binding_t *binding;
         if (za_fn_scope_lookup(g_za_fn_scope, target, &binding)) {
             g_za_saw_flet_labels_escape = 1;
@@ -821,7 +825,7 @@ typedef struct {
  * 再取得する(スロットの値そのものではなくアドレスを埋め込むので安全)。
  * プロセス生涯で解放しない(JITコードバッファ自体も縮小しないのと同じ考え方)。
  */
-#define ZA_MAX_LAMBDA_SLOTS 32
+#define ZA_MAX_LAMBDA_SLOTS 40
 static lisp_val_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS];
 static UINT64 g_za_lambda_slot_count = 0;
 /** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
@@ -1158,6 +1162,16 @@ static void za_emit_operand(const za_operand_t *op) {
         za_load_slot(ZA_REG_RAX, (UINT32)op->param_index);
         return;
     }
+    if (op->is_literal == 8) {
+        // box化されたlet-local変数(SBCL方式のcell昇格): スロットには値そのものではなく
+        // 束縛cons(sym . value)へのポインタが置かれている。cc_cdrを1回呼んで現在値を
+        // 読む(za_compile_unaryの1引数call手順と同じ、rcx=対象、r11=関数、call r11)。
+        za_load_slot(ZA_REG_RAX, (UINT32)op->param_index);
+        jit_mov_rcx_rax();
+        jit_movabs_r11((UINT64)(void *)cc_cdr);
+        jit_call_r11();
+        return;
+    }
     za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
     for (UINT64 i = 0; i < op->param_index; i++) {
         jit_movabs_r11((UINT64)(void *)cc_cdr);
@@ -1274,6 +1288,161 @@ static int za_is_excluded_special_form(lisp_val_t head) {
            head == g_sym_function ||
            head == g_sym_defvar || head == g_sym_defconstant ||
            head == g_sym_defglobal;
+}
+
+/**
+ * formが「let-IIFEインライン化(拡張B)の対象となるIIFE呼び出し」、つまり
+ * `((lambda 仮引数 . body) 実引数...)`という形のconsかどうかを判定する。
+ * za_compile_exprのIIFE認識(head==(lambda ...)かどうかの判定)と
+ * za_analyze_var_usage(let-local変数のcaptured/assigned静的解析)が同じ基準で
+ * 「これはlet相当か、それとも生のエスケープするlambdaか」を判定できるよう、
+ * 判定ロジックをここに一本化する。2箇所が食い違うと、解析パスがbox化不要と誤判定
+ * したのに実際はコンパイラがエスケープと認識する(またはその逆)というサイレントな
+ * バグになるため、この関数以外で同種の判定を書かないこと。
+ */
+static int za_is_iife_call(lisp_val_t form) {
+    if ((form & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    lisp_val_t head = cc_car(form);
+    return (head & TAG_MASK) == TAG_CONS && cc_car(head) == g_sym_lambda;
+}
+
+/**
+ * formが「値位置に現れた生の(lambda 仮引数 . body)」、すなわちza_compile_exprが
+ * クロージャとしてza_compile_lambdaへ委譲する対象そのものかどうかを判定する。
+ * za_is_iife_call同様、za_compile_exprの既存判定(head==g_sym_lambda)と
+ * za_analyze_var_usageの両方がこの関数を経由することで、エスケープ判定の基準を
+ * 一致させる。
+ */
+static int za_is_raw_lambda(lisp_val_t form) {
+    return (form & TAG_MASK) == TAG_CONS && cc_car(form) == g_sym_lambda;
+}
+
+/** let-local変数1個分の静的使用状況(za_analyze_var_usage参照)。symが対象シンボル、
+ * assignedはbody内でsetqされたか、capturedはエスケープするlambdaに捕捉(参照)された
+ * かを表す。両方trueの変数だけがza_compile_letでZA_VAR_BOXEDへ昇格する。 */
+typedef struct za_var_usage {
+    lisp_val_t sym;
+    int assigned;
+    int captured;
+} za_var_usage_t;
+
+static void za_analyze_var_usage(lisp_val_t form, lisp_val_t env, za_var_usage_t *usages, UINT64 n,
+                                  int in_escaping_lambda);
+
+/**
+ * lambda_vars(仮引数リスト)に含まれる名前でusagesを一時的にシャドウしてから
+ * lambda_body(za_is_iife_call/za_is_raw_lambdaで見つけたlambdaの本体)を解析し、
+ * 終わったら元に戻す。シャドウされた名前は「symをnilに置き換える」ことで、
+ * za_analyze_var_usage内のsym一致判定(TAG_SYMBOL同士の比較)が絶対に成立しなく
+ * なるようにする(nilはTAG_CONSの自己参照consであり、TAG_SYMBOL値と等しくなることは
+ * 無い — documents化済みの「nilはTAG_CONSタグを持つ」という前提と同じ)。
+ */
+static void za_analyze_body_with_shadow(lisp_val_t lambda_vars, lisp_val_t lambda_body, lisp_val_t env,
+                                         za_var_usage_t *usages, UINT64 n, int in_escaping_lambda) {
+    lisp_val_t saved_syms[ZA_MAX_LOCALS_PER_LET];
+    for (UINT64 i = 0; i < n; i++) {
+        saved_syms[i] = usages[i].sym;
+    }
+    for (lisp_val_t v = lambda_vars; (v & TAG_MASK) == TAG_CONS && v != nil; v = cc_cdr(v)) {
+        lisp_val_t vsym = cc_car(v);
+        for (UINT64 i = 0; i < n; i++) {
+            if (usages[i].sym == vsym) {
+                usages[i].sym = nil;
+            }
+        }
+    }
+    for (lisp_val_t rest = lambda_body; (rest & TAG_MASK) == TAG_CONS && rest != nil; rest = cc_cdr(rest)) {
+        za_analyze_var_usage(cc_car(rest), env, usages, n, in_escaping_lambda);
+    }
+    for (UINT64 i = 0; i < n; i++) {
+        usages[i].sym = saved_syms[i];
+    }
+}
+
+/**
+ * let-localのbody部分(za_compile_letがまだbodyをコンパイルする前)を静的に走査し、
+ * usages[0..n)の各対象シンボルについて「setqされたか(assigned)」「エスケープする
+ * lambdaに捕捉されたか(captured)」を判定する(SBCL方式のcell昇格、za_local_var_tの
+ * コメント参照)。in_escaping_lambdaは現在この式が(直接または間接に)エスケープする
+ * lambdaの本体の中かどうかを示す(let-IIFEの中はエスケープしない、生のlambdaの中は
+ * エスケープする)。
+ *
+ * IIFE(let相当)/生のエスケープするlambdaの判定は必ずza_is_iife_call/za_is_raw_lambda
+ * (za_compile_expr本体が使っているのと同じpredicate)を経由する — ここで独自の判定を
+ * 書くと解析パスとコンパイラ本体の認識が食い違い、box化漏れによるサイレントな
+ * バグを再導入してしまう。
+ *
+ * 保守的(過大近似)な設計: quote済みデータの中や(setq sym val)のsym位置は数えない
+ * ([[za_nil_self_cons_recursion_bug]]と同じ理由でform==nilを明示的にチェックする)
+ * ものの、それ以外の一般的なconsは無条件にcar/cdrへ再帰する。呼び出しhead位置の
+ * シンボル(例: (if ...)のif自体)もusagesの対象名と偶然一致すればcaptured/assignedの
+ * 判定に乗ってしまうが、これは「box化が本当は不要な変数を安全側に余分にbox化する」
+ * だけであり誤った実行結果には繋がらないため許容する。
+ */
+static void za_analyze_var_usage(lisp_val_t form, lisp_val_t env, za_var_usage_t *usages, UINT64 n,
+                                  int in_escaping_lambda) {
+    form = za_macroexpand(form, env);
+
+    if ((form & TAG_MASK) == TAG_SYMBOL) {
+        if (in_escaping_lambda) {
+            for (UINT64 i = 0; i < n; i++) {
+                if (usages[i].sym == form) {
+                    usages[i].captured = 1;
+                }
+            }
+        }
+        return;
+    }
+    if (form == nil || (form & TAG_MASK) != TAG_CONS) {
+        return;
+    }
+
+    lisp_val_t head = cc_car(form);
+    if (head == g_sym_quote) {
+        return;
+    }
+    if (head == g_sym_setq) {
+        lisp_val_t rest = cc_cdr(form);
+        if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
+            return;
+        }
+        lisp_val_t sym = cc_car(rest);
+        if ((sym & TAG_MASK) == TAG_SYMBOL) {
+            for (UINT64 i = 0; i < n; i++) {
+                if (usages[i].sym == sym) {
+                    usages[i].assigned = 1;
+                }
+            }
+        }
+        lisp_val_t rest2 = cc_cdr(rest);
+        if (rest2 != nil && (rest2 & TAG_MASK) == TAG_CONS) {
+            za_analyze_var_usage(cc_car(rest2), env, usages, n, in_escaping_lambda);
+        }
+        return;
+    }
+    if (za_is_iife_call(form)) {
+        lisp_val_t lrest = cc_cdr(head);
+        lisp_val_t lambda_vars = ((lrest & TAG_MASK) == TAG_CONS) ? cc_car(lrest) : nil;
+        lisp_val_t lambda_body = ((lrest & TAG_MASK) == TAG_CONS) ? cc_cdr(lrest) : nil;
+        // 実引数(呼び出しの引数位置)は現在のスコープで評価されるため、シャドウなし・
+        // in_escaping_lambdaそのままで解析する。
+        for (lisp_val_t a = cc_cdr(form); (a & TAG_MASK) == TAG_CONS && a != nil; a = cc_cdr(a)) {
+            za_analyze_var_usage(cc_car(a), env, usages, n, in_escaping_lambda);
+        }
+        za_analyze_body_with_shadow(lambda_vars, lambda_body, env, usages, n, in_escaping_lambda);
+        return;
+    }
+    if (za_is_raw_lambda(form)) {
+        lisp_val_t lrest = cc_cdr(form);
+        lisp_val_t lambda_vars = ((lrest & TAG_MASK) == TAG_CONS) ? cc_car(lrest) : nil;
+        lisp_val_t lambda_body = ((lrest & TAG_MASK) == TAG_CONS) ? cc_cdr(lrest) : nil;
+        za_analyze_body_with_shadow(lambda_vars, lambda_body, env, usages, n, 1);
+        return;
+    }
+    za_analyze_var_usage(cc_car(form), env, usages, n, in_escaping_lambda);
+    za_analyze_var_usage(cc_cdr(form), env, usages, n, in_escaping_lambda);
 }
 
 /**
@@ -1799,21 +1968,35 @@ static void za_emit_build_capture_env(lisp_val_t params, UINT64 fixed_count, con
         for (UINT64 ci = chain_count; ci > 0; ci--) {
             const za_local_scope_t *s = chain[ci - 1];
             for (UINT64 i = 0; i < s->count; i++) {
+                // is_literal=4はスロットの生の中身をそのままraxへ読むだけ(逆参照しない)
+                // ため、PLAIN(値そのもの)/BOXED(束縛consへのポインタ)どちらのスロットに
+                // 対しても「スロットの中身」を正しく取り出せる。
                 za_operand_t lop;
                 lop.is_literal = 4;
                 lop.param_index = s->vars[i].val_off;
-                za_emit_operand(&lop); /* rax = let-localの現在値 */
+                za_emit_operand(&lop); /* rax = let-localのスロット内容(値 or 束縛consポインタ) */
                 za_store_slot(ZA_REG_RAX, tmp_val_off);
 
-                UINT64 lsym_off = za_emit_symbol_name(s->vars[i].sym);
-                jit_movabs_self_ref(ZA_REG_RCX, lsym_off);
-                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
-                jit_call_r11();
-                jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
-                za_load_slot(ZA_REG_RDX, tmp_val_off);
-                za_load_slot(ZA_REG_R8, env_val_off);
-                jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
-                jit_call_r11();
+                if (s->vars[i].kind == ZA_VAR_BOXED) {
+                    // box化された変数: 値をコピーするのではなく、束縛cons自体(rax)を
+                    // そのまま新環境のalistへ連結する(os_env_add_binding_pair)。これにより
+                    // 新環境はsetqの影響を受ける同じセルを外側と共有する
+                    // (za_compile_setqのbox書き込み分岐参照)。
+                    za_load_slot(ZA_REG_RCX, tmp_val_off);
+                    za_load_slot(ZA_REG_RDX, env_val_off);
+                    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_env_add_binding_pair);
+                    jit_call_r11();
+                } else {
+                    UINT64 lsym_off = za_emit_symbol_name(s->vars[i].sym);
+                    jit_movabs_self_ref(ZA_REG_RCX, lsym_off);
+                    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+                    jit_call_r11();
+                    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+                    za_load_slot(ZA_REG_RDX, tmp_val_off);
+                    za_load_slot(ZA_REG_R8, env_val_off);
+                    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_set_variable);
+                    jit_call_r11();
+                }
             }
         }
     }
@@ -1968,6 +2151,23 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         return 0;
     }
 
+    // SBCL方式のcell昇格(za_local_var_tのコメント参照): setqされ、かつエスケープする
+    // lambdaに捕捉される変数だけをZA_VAR_BOXEDにする。bodyをコンパイルする前に
+    // 静的解析しておく必要がある(box化するかどうかで初期値のstore方法自体が変わる)。
+    za_var_usage_t usages[ZA_MAX_LOCALS_PER_LET];
+    for (UINT64 i = 0; i < var_count; i++) {
+        usages[i].sym = var_syms[i];
+        usages[i].assigned = 0;
+        usages[i].captured = 0;
+    }
+    for (lisp_val_t rest = lambda_body; (rest & TAG_MASK) == TAG_CONS && rest != nil; rest = cc_cdr(rest)) {
+        za_analyze_var_usage(cc_car(rest), env, usages, var_count, 0);
+    }
+    za_var_kind_t var_kind[ZA_MAX_LOCALS_PER_LET];
+    for (UINT64 i = 0; i < var_count; i++) {
+        var_kind[i] = (usages[i].assigned && usages[i].captured) ? ZA_VAR_BOXED : ZA_VAR_PLAIN;
+    }
+
     UINT64 depth = 0;
     for (const za_local_scope_t *s = locals; s != 0; s = s->parent) {
         depth++;
@@ -2011,8 +2211,27 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
         UINT64 val_off = za_local_val_off(depth, i);
         UINT64 node_off = za_local_node_off(depth, i);
+        // まず初期値そのものをスロットへ置いてlinkする(BOXEDの場合もこの時点では
+        // 生の初期値であり、直後のos_make_symbol/os_make_cons呼び出しがGCを起こしても
+        // このスロットが正しく追跡・再配置される)。
         za_store_slot(ZA_REG_RAX, val_off);
         za_emit_gc_link_slot(val_off, node_off);
+        if (var_kind[i] == ZA_VAR_BOXED) {
+            // box化: 束縛cons(sym . init_val)をos_make_cons(sym, init_val)で確保し、
+            // そのポインタで同じスロットを上書きする(既にlink済みなので再linkは不要)。
+            // インタプリタの環境alistが持つ束縛consと全く同じ表現にすることで、
+            // クロージャ捕捉時にこのconsをコピーせず直接共有できる
+            // (za_emit_build_capture_env参照)。
+            UINT64 sym_off = za_emit_symbol_name(var_syms[i]);
+            jit_movabs_self_ref(ZA_REG_RCX, sym_off);
+            jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+            jit_call_r11();
+            jit_mov_rcx_rax();
+            za_load_slot(ZA_REG_RDX, val_off);
+            jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_cons);
+            jit_call_r11();
+            za_store_slot(ZA_REG_RAX, val_off);
+        }
     }
 
     // abort_cleanup: init評価中の制御転送で中断した場合のみ到達する(通常経路は
@@ -2040,6 +2259,7 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     for (UINT64 i = 0; i < var_count; i++) {
         new_scope.vars[i].sym = var_syms[i];
         new_scope.vars[i].val_off = za_local_val_off(depth, i);
+        new_scope.vars[i].kind = var_kind[i];
     }
 
     UINT64 body_end_patches[ZA_MAX_OPERANDS];
@@ -2172,7 +2392,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     // インライン展開する。let/let*/or/case/case-using/with-open-*はいずれも
     // マクロ展開後この形に帰着するため自動的に恩恵を受ける。if同様、一般呼び出しの判定より
     // 前で無条件に認識する(ifのtest位置等でも使えるようにするため)。
-    if ((head & TAG_MASK) == TAG_CONS && cc_car(head) == g_sym_lambda) {
+    if (za_is_iife_call(form)) {
         return za_compile_let(form, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth,
                                tb_ctx, call_depth, arith_depth);
     }
@@ -2239,8 +2459,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                                   call_depth, arith_depth, (void *)os_make_cons);
     }
-    if (head == g_sym_lambda) {
-        g_za_saw_escaping_lambda = 1;
+    if (za_is_raw_lambda(form)) {
         return za_compile_lambda(form, params, fixed_count, locals);
     }
     if (head == g_sym_if) {
@@ -3043,9 +3262,8 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
  * リンク済みなので、val-formの評価結果を同じスロットへ上書きするだけでよく、
  * 再リンクは不要(GCスキャンはリンクされたアドレスを都度dereferenceするため)。
  * val-form評価と書き込みの間にヒープ確保を伴う呼び出しは挟まないため、defdynamic/
- * return-fromのようなNLXスロット経由の退避保護も不要。
- * g_za_saw_setq_localをセットする副作用については、g_za_saw_escaping_lambdaの
- * コメントおよびza_try_compile_defun末尾のチェックを参照。
+ * return-fromのようなNLXスロット経由の退避保護も不要(ZA_VAR_BOXEDの場合はos_setcdr呼び出し
+ * を挟むが、値そのもの(既にrax)以外に保護すべきものが無いため同様に安全)。
  */
 static int za_compile_setq(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
@@ -3066,7 +3284,8 @@ static int za_compile_setq(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     lisp_val_t val_form = cc_car(rest2);
 
     UINT32 val_off;
-    if (!za_local_lookup(locals, sym, &val_off)) {
+    za_var_kind_t kind;
+    if (!za_local_lookup(locals, sym, &val_off, &kind)) {
         return 0;
     }
 
@@ -3077,10 +3296,20 @@ static int za_compile_setq(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
 
     // val-formが制御転送(return-from/throw/go)ならスロットへ書き込まずそのまま伝播する。
     UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
-    za_store_slot(ZA_REG_RAX, val_off);
+    if (kind == ZA_VAR_BOXED) {
+        // box化された変数: スロットには束縛consへのポインタが置かれている(za_compile_let
+        // 参照)。値そのものを上書きするのではなく、そのconsのcdrをos_setcdr(rplacd相当)で
+        // 破壊的に書き換える。これによりこの束縛consを共有している全クロージャに新しい値が
+        // 見える(za_emit_build_capture_envのbox共有ロジック参照)。
+        jit_mov_rdx_rax();
+        za_load_slot(ZA_REG_RCX, val_off);
+        jit_movabs_r11((UINT64)(void *)os_setcdr);
+        jit_call_r11();
+    } else {
+        za_store_slot(ZA_REG_RAX, val_off);
+    }
     jit_patch_rel32(ct_patch);
 
-    g_za_saw_setq_local = 1;
     return 1;
 }
 
@@ -3930,8 +4159,6 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     syms.atom = os_make_symbol("ATOM");
 
     g_jit_overflow = 0;
-    g_za_saw_setq_local = 0;
-    g_za_saw_escaping_lambda = 0;
     g_za_saw_flet_labels_escape = 0;
     g_jit_reloc_count = 0;
     g_jit_trampoline_jmp_count = 0;
@@ -3982,12 +4209,12 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     jit_pop_rbx();
     jit_ret();
 
-    // setqとエスケープするlambdaが同一defun内に両方存在する場合、クロージャキャプチャの
-    // コピー後setqが反映されない食い違いを避けるため無条件にfallbackさせる(粗い過大近似、
-    // g_za_saw_setq_local/g_za_saw_escaping_lambdaのコメント参照)。同様に、flet/labels
-    // 束縛関数を(function name)で取り出したケースも無条件にfallbackさせる
-    // (g_za_saw_flet_labels_escapeのコメント参照)。
-    if (g_jit_overflow || (g_za_saw_setq_local && g_za_saw_escaping_lambda) || g_za_saw_flet_labels_escape) {
+    // setqとエスケープするlambdaが同一let-local変数に対して両方起きるケースは、
+    // 変数単位のcell昇格(ZA_VAR_BOXED、za_analyze_var_usage/za_compile_let参照)で
+    // 構造的に解決済みのため、ここでの関数レベルの無条件fallbackは不要になった。
+    // flet/labels束縛関数を(function name)で取り出したケースは別問題として残るため、
+    // 引き続き無条件にfallbackさせる(g_za_saw_flet_labels_escapeのコメント参照)。
+    if (g_jit_overflow || g_za_saw_flet_labels_escape) {
         za_release_literal_slot_allocs();
         g_jit_used = entry;
         return nil;

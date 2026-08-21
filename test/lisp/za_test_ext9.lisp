@@ -81,14 +81,20 @@
 (assert-equal nil (%%za-compiled-p (function isiki-za-test-setq-param-fallback)))
 (assert-equal 11 (isiki-za-test-setq-param-fallback 10))
 
-;;; --- 5. setq + エスケープするlambdaのキャプチャ(安全網の検証) ---
+;;; --- 5. setq + エスケープするlambdaのキャプチャ(box昇格の検証) ---
+;;
+;; yはsetqされ、かつエスケープするlambda fに捕捉されるためbox昇格の対象(ZA_VAR_BOXED)
+;; になる。以前はこの組み合わせを関数全体レベルの粗い安全網でインタプリタへ
+;; フォールバックさせていたが、変数単位box昇格(documents/let.mdの「最大のリスク」節
+;; 参照、za_test.lispの「拡張7」も参照)によりzaでコンパイルされ、かつ正しい結果を
+;; 返すようになった。
 
 (defun isiki-za-test-setq-capture-escape (x)
   (let ((y x))
     (let ((f (lambda () y)))
       (setq y (+ y 100))
       (funcall f))))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-setq-capture-escape)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-setq-capture-escape)))
 (assert-equal 105 (isiki-za-test-setq-capture-escape 5))
 
 ;;; --- 6. シャドーイングされた内側let-localへのsetq(外側同名変数は不変) ---

@@ -1,10 +1,12 @@
 ;; test/lisp/environment_literal_slots_test.lisp
 ;;
 ;; Phase3.6(documents/environment.md、リテラルスロットプール枯渇の解決)の動作確認。
-;; g_za_quote_slots/g_za_number_slots/g_za_lambda_slots(za.c、各上限32)はコンパイル
-;; 試行ごとに確保されるが、コンパイルが最終的にフォールバック(インタプリタ委譲)する場合、
-;; そのコンパイル試行が確保したスロットはza_release_literal_slot_allocs経由で即座に
-;; フリーリストへ返却される(za_try_compile_defunの各失敗exitに仕込んだ処理)。
+;; g_za_quote_slots/g_za_number_slots/g_za_lambda_slots(za.c、各上限40。let-local変数の
+;; box昇格対応により、以前フォールバックしていた「setq+エスケープするlambda捕捉」を
+;; 含む関数がzaでコンパイルされるようになった分の追加消費を吸収するため32から拡張した)
+;; はコンパイル試行ごとに確保されるが、コンパイルが最終的にフォールバック(インタプリタ
+;; 委譲)する場合、そのコンパイル試行が確保したスロットはza_release_literal_slot_allocs
+;; 経由で即座にフリーリストへ返却される(za_try_compile_defunの各失敗exitに仕込んだ処理)。
 ;;
 ;; ネイティブ`make test`はza_try_compile_defunが常にインタプリタへフォールバックする
 ;; ため(za.c内のISIKIOS_UNIT_TESTガード)この検証はできず、`make test-qemu`でのみ
@@ -24,8 +26,10 @@
 ;; 動的extent外への持ち出し)と同じフォールバックパターンを利用する。このパターンは
 ;; flet本体のコンパイル自体はいったん進み(gensym用quote-slot 1個、クロージャ用
 ;; lambda-slot 1個を確保した後)、g_za_saw_flet_labels_escapeが立って最終的に
-;; フォールバックする。各プールの上限(32)を超える33回以上、この確保→フォールバックを
-;; 繰り返しても失敗しないことを確認する。
+;; フォールバックする。各プールの上限(40)を優に超える33+5=38回、この確保→フォール
+;; バックを繰り返しても失敗しないことを確認する(1回ごとに確保したスロットは即座に
+;; フリーリストへ返却されるため、繰り返し回数自体がプールの恒久消費には影響しない
+;; ことの確認でもある)。
 
 ;;; --- 1. escapeするflet定義を32回を超えて繰り返し再定義しても、
 ;;;        毎回正しくフォールバックし、結果も正しいままである ---

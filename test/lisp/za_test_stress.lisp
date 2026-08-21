@@ -7,6 +7,8 @@
 ;; isiki-za-test-adder-chain/isiki-za-test-sum-closure-chain/isiki-za-test-dyn-stress/
 ;; isiki-za-test-all-eq-sym はすべてza_test.lisp側の定義を再利用する前提であり、
 ;; boot-entryスクリプトが本ファイルより先にza_test.lispをloadしていることを要求する。
+;; isiki-za-test-box-counter-chain/isiki-za-test-sum-box-countersも同様にza_test.lisp側の
+;; 定義(let-local変数のbox化テスト)を再利用する。
 ;;
 ;; GitHub Actions側のQEMU実行(milestone 2)はハードウェア支援仮想化(KVM)を欠き
 ;; TCG(ソフトウェアCPUエミュレーション)へフォールバックするため、この負荷テストは
@@ -44,3 +46,15 @@
 (assert-equal t (isiki-za-test-all-eq-sym (isiki-za-test-dyn-stress 50000) '*iza-test-dyn2*))
 (assert-equal 49999 (dynamic *iza-test-dyn2*))
 (close (open-output-file "tmp/ckpt-20-defdynamic.txt"))
+
+;; 大量にbox化された変数(setqされ、かつ2つのクロージャに捕捉されるlet-local)を含む
+;; クロージャ対を生成し続けてGC(os_gc_collect)を誘発しても、それぞれのペアが自分自身の
+;; boxだけを参照し続け、他のペアと混線しないことを確認する
+(close (open-output-file "tmp/ckpt-21-before-box-counter-chain.txt"))
+
+(assert-equal 50000 (length (isiki-za-test-box-counter-chain 50000)))
+(close (open-output-file "tmp/ckpt-22-after-box-counter-chain.txt"))
+
+;; sum_{i=0}^{49999} (i+2) = 49999*50000/2 + 2*50000 = 1249975000 + 100000 = 1250075000
+(assert-equal 1250075000 (isiki-za-test-sum-box-counters (isiki-za-test-box-counter-chain 50000)))
+(close (open-output-file "tmp/ckpt-23-box-counter-final.txt"))
