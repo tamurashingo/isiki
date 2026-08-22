@@ -1,8 +1,8 @@
 ;;;; ホスト(CommonLisp)側で実行するトランスパイラ
 ;;;;
-;;;; M2時点でサポートするのは「引数なし・本体が固定fixnumリテラル1個の
-;;;; defun」のみ。それ以外の構文(macro展開/自由変数捕捉/GC_PROTECT統合等)は
-;;;; 後続のマイルストンで拡張する。
+;;;; M3時点でサポートするのは「引数なし・本体がfixnum/string/symbol/nil/t
+;;;; リテラルまたはそれらのquote 1個のdefun」のみ。それ以外の構文
+;;;; (macro展開/自由変数捕捉/GC_PROTECT統合等)は後続のマイルストンで拡張する。
 
 (defparameter *runtime-lisp-path* "src/lisp/transpile_fixture.lisp")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
@@ -25,12 +25,46 @@
          (body (remove #\! (substitute #\_ #\- (string-downcase (subseq name prefix-len))))))
     (concatenate 'string c-prefix body)))
 
+(defun c-string-literal (s)
+  "CommonLisp文字列からCの文字列リテラル(ダブルクオート込み)を作る。
+   \\と\"のみエスケープする(現時点のfixtureはASCII識別子文字列のみのため十分)"
+  (with-output-to-string (out)
+    (write-char #\" out)
+    (loop for ch across s
+          do (when (or (char= ch #\\) (char= ch #\"))
+               (write-char #\\ out))
+             (write-char ch out))
+    (write-char #\" out)))
+
+(declaim (ftype function transpile-quoted))
+
 (defun transpile-expr (expr)
-  "現時点で対応するのは固定fixnumリテラルのみ(61bit以上の値は非対応)"
+  "fixnum/string/nil/tの裸リテラルと、それらに対するquoteおよびシンボルの
+   quoteに対応する。GCで移動しうる値(symbol/string)は、za.cのT/quoteシンボル
+   リテラル対応と同じく、生ポインタを埋め込まずos_make_symbol/os_make_stringを
+   都度呼んで解決する。nilはランタイムがGCで移動しない固定センチネルなので
+   externグローバルnilをそのまま参照してよい"
   (cond
     ((integerp expr)
      (format nil "os_make_fixnum(~AULL)" expr))
+    ((stringp expr)
+     (format nil "os_make_string(~A)" (c-string-literal expr)))
+    ((null expr) "nil")
+    ((eq expr t) "g_sym_t")
+    ((and (consp expr) (eq (car expr) 'quote) (= (length expr) 2))
+     (transpile-quoted (second expr)))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
+
+(defun transpile-quoted (val)
+  "(quote val)のval側。fixnum/string/nil/tはtranspile-exprと同じ扱いで、
+   それ以外のシンボルはos_make_symbolで名前から解決する"
+  (cond
+    ((symbolp val)
+     (cond
+       ((null val) "nil")
+       ((eq val t) "g_sym_t")
+       (t (format nil "os_make_symbol(~A)" (c-string-literal (symbol-name val))))))
+    (t (transpile-expr val))))
 
 (defun transpile-defun (form)
   "(defun name () <fixnumリテラル>) のみ対応する"

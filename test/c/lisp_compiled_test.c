@@ -1,3 +1,5 @@
+#include <stdlib.h>
+#include <string.h>
 #include "test_assert.h"
 #include "types.h"
 #include "runtime.h"
@@ -92,6 +94,22 @@ void os_wait_for_more_input(process_t *proc) {
 }
 
 extern lisp_val_t lisp_ll_transpile_fixture_answer(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_string(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_symbol(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_nil(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_t(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_quoted_fixnum(lisp_val_t args, lisp_val_t env);
+
+// os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
+// それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
+#define HEAP_SIZE (1024 * 1024)
+
+static void setup_heap(void) {
+    void *heap = malloc(HEAP_SIZE);
+    assert(heap != NULL, "1MBのヒープ用メモリをmallocで確保できる");
+    os_heap_init((UINT64)heap, HEAP_SIZE);
+    os_bootstrap();
+}
 
 static void test_transpile_fixture_answer(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_answer(0, 0);
@@ -99,7 +117,46 @@ static void test_transpile_fixture_answer(void) {
     assert((result >> 3) == 42, "transpiled function returns 42");
 }
 
+static void test_transpile_fixture_string(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_string(0, 0);
+    assert((result & TAG_MASK) == TAG_STRING, "transpiled function returns a string");
+
+    lisp_addr_t addr = result & ~TAG_MASK;
+    UINT64 *header = (UINT64 *)addr;
+    assert(header[0] == 5, "string length matches \"hello\"");
+    const char *bytes = (const char *)(addr + 8);
+    assert(strncmp(bytes, "hello", 5) == 0, "string content matches \"hello\"");
+}
+
+static void test_transpile_fixture_symbol(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_symbol(0, 0);
+    assert((result & TAG_MASK) == TAG_SYMBOL, "transpiled function returns a symbol");
+    assert(result == os_make_symbol("FOO"), "transpiled symbol is interned as FOO");
+}
+
+static void test_transpile_fixture_nil(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_nil(0, 0);
+    assert(result == nil, "transpiled function returns nil");
+}
+
+static void test_transpile_fixture_t(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_t(0, 0);
+    assert(result == g_sym_t, "transpiled function returns the T symbol");
+}
+
+static void test_transpile_fixture_quoted_fixnum(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_quoted_fixnum(0, 0);
+    assert((result & TAG_MASK) == TAG_FIXNUM, "quoted fixnum is still a fixnum");
+    assert((result >> 3) == 99, "quoted fixnum keeps its value");
+}
+
 int main(void) {
+    setup_heap();
     test_transpile_fixture_answer();
+    test_transpile_fixture_string();
+    test_transpile_fixture_symbol();
+    test_transpile_fixture_nil();
+    test_transpile_fixture_t();
+    test_transpile_fixture_quoted_fixnum();
     return g_test_failed;
 }
