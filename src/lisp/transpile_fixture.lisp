@@ -160,3 +160,21 @@
   ;; M14: let*の検証。let(並列束縛)とは異なり、bの初期化式(cons a a)が
   ;; 同じlet*内で先に束縛されたaを参照できる(逐次束縛)ことを確認する
   (let* ((a x) (b (cons a a))) b))
+
+(defun %%transpile-fixture-cond (x y)
+  ;; M14: condの検証。3clauseのうち最初にtestがnil以外になったclauseの
+  ;; bodyだけが評価される(cond自身が(if test (progn body) (cond 残り))へ
+  ;; 再帰的に展開されることの確認)ことを、xを最優先・yを次点・どちらもnilなら
+  ;; デフォルトのシンボルを返すという3値の選択で確認する
+  (cond (x x)
+        (y y)
+        (t 'cond-fallback)))
+
+(defun %%transpile-fixture-cond-body-progn (x)
+  ;; M14: condのclause bodyが複数式を持つ場合、(progn ,@body)へ展開されて
+  ;; 逐次評価されることの検証。testが真の場合はsetqでxを書き換えた後2つ目の
+  ;; 式がその書き換え後の値を返し、testが偽(nil)ならデフォルトのnilを返す
+  (cond (x
+         (setq x (cons x x))
+         x)
+        (t nil)))

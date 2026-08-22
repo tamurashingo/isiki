@@ -243,9 +243,23 @@
         `(let (,(car bindings))
            (let* ,(cdr bindings) ,@body)))))
 
+;;; cond: init.lispのdefmacro cond(%%case-expandとは別物)と同じ展開規則。
+;;; 1段展開すると結果に(cond ,@(cdr clauses))というcond自身の再帰呼び出しが
+;;; 残るが、macroexpand-allが展開結果を再度macroexpand-allに通す(let*と同じ
+;;; 理由)ため、clausesが尽きるまで自動的に繰り返し展開される
+
+(defun expand-cond (form)
+  (let ((clauses (cdr form)))
+    (if (null clauses)
+        nil
+        `(if ,(car (car clauses))
+             (progn ,@(cdr (car clauses)))
+             (cond ,@(cdr clauses))))))
+
 (defparameter *macro-expanders*
   (list (cons 'let #'expand-let)
-        (cons 'let* #'expand-let*))
+        (cons 'let* #'expand-let*)
+        (cons 'cond #'expand-cond))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")

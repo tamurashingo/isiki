@@ -126,6 +126,8 @@ extern lisp_val_t lisp_ll_transpile_fixture_let(lisp_val_t evaluated_args, lisp_
 extern lisp_val_t lisp_ll_transpile_fixture_let_multi(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_let_body_progn(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_let_star(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_cond(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_cond_body_progn(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -376,6 +378,31 @@ static void test_transpile_fixture_let_star(void) {
     assert(cc_cdr(result) == x, "let-star: bの初期化式(cons a a)が同じlet*内のaを参照できる(cdrもx)");
 }
 
+static void test_transpile_fixture_cond(void) {
+    lisp_val_t x = os_make_fixnum(1);
+    lisp_val_t y = os_make_fixnum(2);
+
+    lisp_val_t result_first = lisp_ll_transpile_fixture_cond(os_make_cons(x, os_make_cons(y, nil)), 0);
+    assert(result_first == x, "cond: xがnil以外なら最初のclauseがマッチしxを返す");
+
+    lisp_val_t result_second = lisp_ll_transpile_fixture_cond(os_make_cons(nil, os_make_cons(y, nil)), 0);
+    assert(result_second == y, "cond: xがnilでyがnil以外なら2番目のclauseがマッチしyを返す");
+
+    lisp_val_t result_default = lisp_ll_transpile_fixture_cond(os_make_cons(nil, os_make_cons(nil, nil)), 0);
+    assert(result_default == os_make_symbol("COND-FALLBACK"),
+           "cond: どのclauseもマッチしなければt節(デフォルト)のシンボルを返す");
+}
+
+static void test_transpile_fixture_cond_body_progn(void) {
+    lisp_val_t x = os_make_fixnum(3);
+    lisp_val_t result_true = lisp_ll_transpile_fixture_cond_body_progn(os_make_cons(x, nil), 0);
+    assert(cc_car(result_true) == x, "cond-body-progn: testが真ならsetq後のxのcarは元のxのまま");
+    assert(cc_cdr(result_true) == x, "cond-body-progn: bodyの2式目(x)がsetq後の値(cons x x)を返す(逐次評価の確認)");
+
+    lisp_val_t result_false = lisp_ll_transpile_fixture_cond_body_progn(os_make_cons(nil, nil), 0);
+    assert(result_false == nil, "cond-body-progn: testが偽ならt節のnilを返す");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -443,6 +470,8 @@ int main(void) {
     test_transpile_fixture_let_multi();
     test_transpile_fixture_let_body_progn();
     test_transpile_fixture_let_star();
+    test_transpile_fixture_cond();
+    test_transpile_fixture_cond_body_progn();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();
