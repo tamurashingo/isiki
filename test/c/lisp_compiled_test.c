@@ -122,6 +122,10 @@ extern lisp_val_t lisp_ll_transpile_fixture_make_counter(lisp_val_t evaluated_ar
 extern lisp_val_t lisp_ll_transpile_fixture_call_twice(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_defdynamic(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_dynamic_read(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_multi(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_body_progn(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_star(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -344,6 +348,34 @@ static void test_transpile_fixture_dynamic_read(void) {
            "直前のdefdynamicがg_dynamic_bindingsへ書き込んだ%%test-dynamic-varの値がそのまま読める");
 }
 
+static void test_transpile_fixture_let(void) {
+    lisp_val_t x = os_make_fixnum(7);
+    lisp_val_t result = lisp_ll_transpile_fixture_let(os_make_cons(x, nil), 0);
+    assert(result == x, "let: (let ((y x)) y)はxをyへ束縛して評価するのでxそのものが返る");
+}
+
+static void test_transpile_fixture_let_multi(void) {
+    lisp_val_t x = os_make_fixnum(1);
+    lisp_val_t y = os_make_fixnum(2);
+    lisp_val_t result = lisp_ll_transpile_fixture_let_multi(os_make_cons(x, os_make_cons(y, nil)), 0);
+    assert(cc_car(result) == x, "let-multi: aはxへ並列に束縛される");
+    assert(cc_cdr(result) == y, "let-multi: bはyへ並列に束縛される(bの初期化式はaを参照しない)");
+}
+
+static void test_transpile_fixture_let_body_progn(void) {
+    lisp_val_t x = os_make_fixnum(3);
+    lisp_val_t result = lisp_ll_transpile_fixture_let_body_progn(os_make_cons(x, nil), 0);
+    assert(cc_car(result) == x, "let-body-progn: setqで書き換えた後のyのcarは元のxのまま");
+    assert(cc_cdr(result) == x, "let-body-progn: bodyの2式目(y)がsetq後の値(cons y y)を返す(逐次評価の確認)");
+}
+
+static void test_transpile_fixture_let_star(void) {
+    lisp_val_t x = os_make_fixnum(9);
+    lisp_val_t result = lisp_ll_transpile_fixture_let_star(os_make_cons(x, nil), 0);
+    assert(cc_car(result) == x, "let-star: bの初期化式(cons a a)が同じlet*内のaを参照できる(carはx)");
+    assert(cc_cdr(result) == x, "let-star: bの初期化式(cons a a)が同じlet*内のaを参照できる(cdrもx)");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -407,6 +439,10 @@ int main(void) {
     test_transpile_fixture_make_counter_and_call_twice();
     test_transpile_fixture_defdynamic();
     test_transpile_fixture_dynamic_read();
+    test_transpile_fixture_let();
+    test_transpile_fixture_let_multi();
+    test_transpile_fixture_let_body_progn();
+    test_transpile_fixture_let_star();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

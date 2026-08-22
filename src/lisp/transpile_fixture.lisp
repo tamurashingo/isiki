@@ -136,3 +136,27 @@
   ;; そのまま読めることを検証する(g_dynamic_bindingsがグローバルな
   ;; フラットalistであることの確認)
   (dynamic '%%test-dynamic-var))
+
+(defun %%transpile-fixture-let (x)
+  ;; M14: 基盤A(macroexpand-all)の検証。letの単純な1束縛が、展開後
+  ;; ((lambda (y) y) x)相当のコードとして正しく評価されることを確認する
+  (let ((y x)) y))
+
+(defun %%transpile-fixture-let-multi (x y)
+  ;; M14: let複数束縛の検証。a/bはxとyそれぞれの外側の値に同時に束縛され、
+  ;; let*とは違いbの初期化式がaを参照できないことを実装が前提としている
+  ;; (aとbは並列に束縛される)ことを、consで両方の値を持ち出して確認する
+  (let ((a x) (b y)) (cons a b)))
+
+(defun %%transpile-fixture-let-body-progn (x)
+  ;; M14: letのbodyが複数式を持つ場合、(progn ,@body)へラップされて
+  ;; 逐次評価されることの検証。1つ目の式(setq)でyを書き換えた後、
+  ;; 2つ目の式(y)がその書き換え後の値を返すことを確認する
+  (let ((y x))
+    (setq y (cons y y))
+    y))
+
+(defun %%transpile-fixture-let-star (x)
+  ;; M14: let*の検証。let(並列束縛)とは異なり、bの初期化式(cons a a)が
+  ;; 同じlet*内で先に束縛されたaを参照できる(逐次束縛)ことを確認する
+  (let* ((a x) (b (cons a a))) b))

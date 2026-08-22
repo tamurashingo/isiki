@@ -186,6 +186,70 @@
    捕捉される変数だけをbox化する)でboxへ昇格すべきものを返す"
   (intersection (setq-targets body nil) (captured-params body params)))
 
+;;; M14: マクロ展開。init.lispのlet/cond/case/for/while/setf/with-open-*は全て
+;;; defmacroだが、init.lispには(defpackage/in-package)によるパッケージ分離が無いため、
+;;; これらをそのままホストSBCLへ(defmacro let ...)としてloadするとCL:LET等の
+;;; 特殊形式/標準マクロと名前衝突し"The special operator LET can't be redefined
+;;; as a macro."になる(M5/issue #20で検証済み・documents/transpiler.md参照)。
+;;; そのため、マクロ名と衝突しない通常の関数(expand-let等)としてマクロ本体を
+;;; ポートし、以下のmacroexpand-allという自前の再帰コードウォーカーから
+;;; *macro-expanders*(マクロ名->展開関数のalist)経由で呼び出す方式を採る。
+;;; gensymはホスト側SBCL標準のものを使う(展開時にのみ使う一意シンボルなので、
+;;; ランタイム側のgensymと意味的に完全に等価)。
+
+(defun macroexpand-all (form)
+  "FORM中に現れるマクロ呼び出し(*macro-expanders*に載っているもの)を再帰的に
+   展開して、コアフォーム(if/progn/setq/and/or/lambda/dynamic/defdynamic+呼び出し)
+   だけになるまで畳み込む。quoteは不透過データなので中身を展開しない。lambdaは
+   パラメータリストに触れずbodyのみ展開する。dynamicは第2引数(未評価のシンボル
+   リテラル)に触れず、defdynamicは第3引数(値を計算する式)のみ展開する(いずれも
+   free-variables/setq-targetsの特別扱いと同じ理由)。マクロ呼び出しが見つかった
+   場合は展開関数を1回呼んだ後、展開結果を再度macroexpand-allに通す(let*が
+   letへ展開するなど、展開結果がさらにマクロ呼び出しを含みうるため)"
+  (cond
+    ((atom form) form)
+    ((eq (car form) 'quote) form)
+    ((and (eq (car form) 'dynamic) (= (length form) 2)) form)
+    ((and (eq (car form) 'defdynamic) (= (length form) 3))
+     (list (first form) (second form) (macroexpand-all (third form))))
+    ((and (eq (car form) 'lambda) (= (length form) 3))
+     (list (first form) (second form) (macroexpand-all (third form))))
+    ((and (symbolp (car form)) (assoc (car form) *macro-expanders*))
+     (macroexpand-all (funcall (cdr (assoc (car form) *macro-expanders*)) form)))
+    (t (cons (macroexpand-all (car form)) (mapcar #'macroexpand-all (cdr form))))))
+
+;;; let/let*: init.lispのdefmacro let/let*(%let-vars/%let-inits)と同じ展開規則。
+;;; bodyは&restで複数式を許すが、transpile-lambda/transpile-defunは単一の本体式
+;;; のみ対応するため、init.lispの`,@body`をそのまま展開先に置く代わりに
+;;; (progn ,@body)で1式に畳み込む(prognは既存サポート済みで、複数式のうち
+;;; 最後の式の値を残す評価順もletのbody評価順と一致する)。
+
+(defun %%let-vars (bindings)
+  (if (null bindings) nil (cons (car (car bindings)) (%%let-vars (cdr bindings)))))
+
+(defun %%let-inits (bindings)
+  (if (null bindings) nil (cons (car (cdr (car bindings))) (%%let-inits (cdr bindings)))))
+
+(defun expand-let (form)
+  (destructuring-bind (let-kw bindings &rest body) form
+    (declare (ignore let-kw))
+    `((lambda ,(%%let-vars bindings) (progn ,@body)) ,@(%%let-inits bindings))))
+
+(defun expand-let* (form)
+  (destructuring-bind (let*-kw bindings &rest body) form
+    (declare (ignore let*-kw))
+    (if (null bindings)
+        `(progn ,@body)
+        `(let (,(car bindings))
+           (let* ,(cdr bindings) ,@body)))))
+
+(defparameter *macro-expanders*
+  (list (cons 'let #'expand-let)
+        (cons 'let* #'expand-let*))
+  "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
+   (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
+   これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
+
 (declaim (ftype function transpile-quoted))
 (declaim (ftype function transpile-if))
 (declaim (ftype function transpile-progn))
@@ -243,6 +307,13 @@
      (transpile-defdynamic expr scope))
     ((and (consp expr) (symbolp (car expr)))
      (transpile-call expr scope))
+    ((and (consp expr) (consp (car expr)) (eq (car (car expr)) 'lambda) (= (length (car expr)) 3))
+     ;; let/let*の展開((lambda (vars) body) inits)のような、演算子位置に直接
+     ;; lambda式が来る即時呼び出し形式。funcallプリミティブ(primitive_funcall、
+     ;; fnを第一引数、残りを実引数として受け取りapply_functionへ渡す)への
+     ;; 呼び出しへ書き換えることで、既存のtranspile-call/transpile-lambdaを
+     ;; そのまま再利用できる
+     (transpile-call (cons 'funcall expr) scope))
     ((symbolp expr)
      (error "transpile-expr: 未束縛の変数参照です: ~S" expr))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
@@ -467,11 +538,12 @@
    区別は捕捉元(outer scope)のboxed-pをそのまま継承する(boxはこのlambdaが
    新たに決めるものではなく、そのbox化された変数を最初に持つdefun/lambdaが
    一度だけ決める性質だから)"
-  (destructuring-bind (lambda-kw params body) expr
+  (destructuring-bind (lambda-kw params raw-body) expr
     (declare (ignore lambda-kw))
     (unless (every #'symbolp params)
       (error "transpile-lambda: パラメータはシンボルのみ対応です: ~S" expr))
     (let* ((c-name (format nil "__lisp_lambda_~A" (incf *lambda-name-counter*)))
+           (body (macroexpand-all raw-body))
            (free-vars (free-variables body params)))
       (dolist (v free-vars)
         (unless (assoc v scope)
@@ -661,9 +733,10 @@
     (unless (= (length body) 1)
       (error "transpile-defun: bodyは単一式のみ対応です: ~S" name))
     (let* ((c-name (lisp-name-to-c-name name))
-           (*lifted-lambda-decls* nil))
-      (multiple-value-bind (scope preamble) (param-scope-and-preamble params (first body))
-        (let ((fn-text (emit-function-body c-name params preamble (first body) scope)))
+           (*lifted-lambda-decls* nil)
+           (expanded-body (macroexpand-all (first body))))
+      (multiple-value-bind (scope preamble) (param-scope-and-preamble params expanded-body)
+        (let ((fn-text (emit-function-body c-name params preamble expanded-body scope)))
           (format nil "~{~A~%~}~A" (reverse *lifted-lambda-decls*) fn-text))))))
 
 (defun read-all-forms (path)
