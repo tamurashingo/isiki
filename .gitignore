@@ -4,4 +4,5 @@ tmp/
 *.swp
 .qemu-test-trigger
 test-results.txt
+src/c/lisp_compiled.c
 
