@@ -105,6 +105,7 @@ extern lisp_val_t lisp_ll_transpile_fixture_if(lisp_val_t evaluated_args, lisp_v
 extern lisp_val_t lisp_ll_transpile_fixture_if_no_else(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_progn(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_setq(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_gc_protect(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -197,6 +198,40 @@ static void test_transpile_fixture_setq(void) {
     assert((result >> 3) == 7, "setq: 代入後の新しい値(7)がsetq式自体の値になる");
 }
 
+// M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
+// bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
+// 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
+// 足りず、パラメータxを束縛した後・xをreturnする前に実際にos_gc_collectが発火する
+// 状況を作る。この関数呼び出しは他のテストとglobal_environment/symbol table等の
+// 状態を共有しないため、main()の最後で単独で実行する
+#define GC_PROTECT_TEST_HEAP_SIZE (160 * 1024)
+
+static void test_transpile_fixture_gc_protect(void) {
+    void *heap = malloc(GC_PROTECT_TEST_HEAP_SIZE);
+    assert(heap != NULL, "GC_PROTECT検証用の小さいヒープをmallocで確保できる");
+    os_heap_init((UINT64)heap, GC_PROTECT_TEST_HEAP_SIZE);
+    os_reset_runtime_state_for_test();
+    os_bootstrap();
+
+    lisp_val_t arg = os_make_string("payload");
+    lisp_addr_t addr_before = arg & ~TAG_MASK;
+    UINT64 gc_count_before = os_gc_collect_count();
+
+    lisp_val_t result = lisp_ll_transpile_fixture_gc_protect(os_make_cons(arg, nil), 0);
+
+    UINT64 gc_count_after = os_gc_collect_count();
+    assert(gc_count_after > gc_count_before,
+           "GC_PROTECT: 40000文字のダミー文字列確保により、body評価中に実際にos_gc_collectが発火する");
+    assert((result & TAG_MASK) == TAG_STRING, "GC_PROTECT: 内部GCを跨いでもxのタグはTAG_STRINGのまま");
+    assert((result & ~TAG_MASK) != addr_before,
+           "GC_PROTECT: 内部GCによりxの指す文字列はTo空間の新しいアドレスへ再配置される");
+
+    char buf[16];
+    os_string_to_cstr(result, buf, sizeof(buf));
+    assert(strncmp(buf, "payload", 7) == 0,
+           "GC_PROTECT: 内部GCを跨いでもxの指す文字列の内容は保たれる(パラメータが正しく追従している)");
+}
+
 int main(void) {
     setup_heap();
     test_transpile_fixture_answer();
@@ -211,5 +246,8 @@ int main(void) {
     test_transpile_fixture_if_no_else();
     test_transpile_fixture_progn();
     test_transpile_fixture_setq();
+    // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
+    // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
+    test_transpile_fixture_gc_protect();
     return g_test_failed;
 }

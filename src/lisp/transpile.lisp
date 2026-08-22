@@ -1,9 +1,10 @@
 ;;;; ホスト(CommonLisp)側で実行するトランスパイラ
 ;;;;
-;;;; M4時点でサポートするのは、fixnum/string/symbol/nil/tのリテラルとquote、
-;;;; defunパラメータ(クロージャなしのローカル変数)の参照・setq、および
-;;;; if/prognを組み合わせた単一の本体式のみ。それ以外の構文
-;;;; (マクロ展開/自由変数捕捉/GC_PROTECT統合等)は後続のマイルストンで拡張する。
+;;;; M7時点でサポートするのは、fixnum/string/symbol/nil/tのリテラルとquote、
+;;;; defunパラメータ(クロージャなしのローカル変数)の参照・setq、
+;;;; if/prognを組み合わせた単一の本体式、および生成する関数のパラメータを
+;;;; GC_PROTECTでshadow stackへ登録するコード生成のみ。それ以外の構文
+;;;; (マクロ展開/自由変数捕捉等)は後続のマイルストンで拡張する。
 
 (defparameter *runtime-lisp-path* "src/lisp/transpile_fixture.lisp")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
@@ -141,8 +142,14 @@
         (if (null params)
             (format out "    (void)evaluated_args;~%")
             (dolist (p params)
-              (format out "    lisp_val_t ~A = cc_car(evaluated_args);~%" (cdr (assoc p scope)))
-              (format out "    evaluated_args = cc_cdr(evaluated_args);~%")))
+              (let ((c-var (cdr (assoc p scope))))
+                (format out "    lisp_val_t ~A = cc_car(evaluated_args);~%" c-var)
+                (format out "    evaluated_args = cc_cdr(evaluated_args);~%")
+                ;; bodyの評価中のヒープ確保(os_make_string等)がGCを誘発しても、
+                ;; パラメータがコピーGCで移動済みの古いアドレスを指したままに
+                ;; ならないよう、束縛直後にGC_PROTECTでshadow stackへ登録する
+                ;; (eval.cのGC_PROTECT(args)/GC_PROTECT(env)と同じ考え方)
+                (format out "    GC_PROTECT(~A);~%" c-var))))
         (format out "    (void)env;~%")
         (format out "    return ~A;~%" body-c)
         (format out "}~%")))))
