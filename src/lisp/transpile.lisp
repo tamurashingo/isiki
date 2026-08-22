@@ -1,9 +1,9 @@
 ;;;; ホスト(CommonLisp)側で実行するトランスパイラ
 ;;;;
-;;;; M7時点でサポートするのは、fixnum/string/symbol/nil/tのリテラルとquote、
+;;;; M8時点でサポートするのは、fixnum/string/symbol/nil/tのリテラルとquote、
 ;;;; defunパラメータ(クロージャなしのローカル変数)の参照・setq、
-;;;; if/prognを組み合わせた単一の本体式、および生成する関数のパラメータを
-;;;; GC_PROTECTでshadow stackへ登録するコード生成のみ。それ以外の構文
+;;;; if/progn/and/orを組み合わせた単一の本体式、および生成する関数のパラメータを
+;;;; GC_PROTECTでshadow stackへ登録するコード生成のみ。let/cond/case等
 ;;;; (マクロ展開/自由変数捕捉等)は後続のマイルストンで拡張する。
 
 (defparameter *runtime-lisp-path* "src/lisp/transpile_fixture.lisp")
@@ -50,6 +50,8 @@
 (declaim (ftype function transpile-if))
 (declaim (ftype function transpile-progn))
 (declaim (ftype function transpile-setq))
+(declaim (ftype function transpile-and))
+(declaim (ftype function transpile-or))
 
 (defun transpile-expr (expr &optional scope)
   "fixnum/string/nil/tの裸リテラルと、それらに対するquote、シンボルのquote、
@@ -75,6 +77,10 @@
      (transpile-progn expr scope))
     ((and (consp expr) (eq (car expr) 'setq) (= (length expr) 3))
      (transpile-setq expr scope))
+    ((and (consp expr) (eq (car expr) 'and))
+     (transpile-and (cdr expr) scope))
+    ((and (consp expr) (eq (car expr) 'or))
+     (transpile-or (cdr expr) scope))
     ((symbolp expr)
      (error "transpile-expr: 未束縛の変数参照です: ~S" expr))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
@@ -110,6 +116,39 @@
     (unless binding
       (error "transpile-setq: setqの対象が未束縛のローカル変数です: ~S" var))
     (format nil "(~A = ~A)" (cdr binding) (transpile-expr val scope))))
+
+(defun transpile-and (forms scope)
+  "(and form*)。init.lispのdefmacro andが展開する(if a (and b...) nil)の
+   ネストと同じ形をCの三項演算子で直接生成する(=transpile-ifと同じパターン)。
+   formが1つも無い場合はt、1つだけの場合はその式自身をそのまま返す
+   (末尾のif展開に頼らずここで打ち切ることで、不要なネストを避ける)"
+  (cond
+    ((null forms) "g_sym_t")
+    ((null (cdr forms)) (transpile-expr (car forms) scope))
+    (t (format nil "((~A) != nil ? (~A) : nil)"
+               (transpile-expr (car forms) scope)
+               (transpile-and (cdr forms) scope)))))
+
+(defparameter *or-temp-counter* 0)
+
+(defun transpile-or (forms scope)
+  "(or form*)。init.lispのdefmacro orは(let ((temp a)) (if temp temp (or ...)))
+   に展開し、これはaを二重評価しないための一時変数である。このマイルストンでは
+   letが未対応(M10でlambda lifting/closuresが入るまで見送り)なため、GNU Cの
+   文(ステートメント)式({ ...; expr; })でCレベルの一時変数を導入し、同じ
+   単一評価の性質を実現する(一時変数名はネストしたブロックスコープにより
+   衝突しないが、可読性と将来の-Wshadow対策のため呼び出しごとに一意な名前を
+   振る)。formが1つも無い場合はnil、1つだけの場合はその式自身をそのまま返す"
+  (cond
+    ((null forms) "nil")
+    ((null (cdr forms)) (transpile-expr (car forms) scope))
+    (t (let ((temp (format nil "__or_tmp_~A" (incf *or-temp-counter*))))
+         (format nil "({ lisp_val_t ~A = (~A); ~A != nil ? ~A : (~A); })"
+                 temp
+                 (transpile-expr (car forms) scope)
+                 temp
+                 temp
+                 (transpile-or (cdr forms) scope))))))
 
 (defun transpile-quoted (val)
   "(quote val)のval側。fixnum/string/nil/tはtranspile-exprと同じ扱いで、

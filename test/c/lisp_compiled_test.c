@@ -105,6 +105,13 @@ extern lisp_val_t lisp_ll_transpile_fixture_if(lisp_val_t evaluated_args, lisp_v
 extern lisp_val_t lisp_ll_transpile_fixture_if_no_else(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_progn(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_setq(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_and(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_and_empty(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_and_single(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_or(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_or_empty(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_or_single(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_or_three(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_gc_protect(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
@@ -198,6 +205,71 @@ static void test_transpile_fixture_setq(void) {
     assert((result >> 3) == 7, "setq: 代入後の新しい値(7)がsetq式自体の値になる");
 }
 
+static void test_transpile_fixture_and(void) {
+    lisp_val_t x = os_make_fixnum(5);
+    lisp_val_t y = os_make_fixnum(7);
+    lisp_val_t result = lisp_ll_transpile_fixture_and(os_make_cons(x, os_make_cons(y, nil)), 0);
+    assert(result == y, "and: 両方nil以外なら最後の式の値(y)を返す");
+
+    lisp_val_t result_short = lisp_ll_transpile_fixture_and(os_make_cons(nil, os_make_cons(y, nil)), 0);
+    assert(result_short == nil, "and: 先頭がnilならそこで短絡してnilを返す");
+}
+
+static void test_transpile_fixture_and_empty(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_and_empty(0, 0);
+    assert(result == g_sym_t, "and(引数無し): tを返す");
+}
+
+static void test_transpile_fixture_and_single(void) {
+    lisp_val_t x = os_make_fixnum(5);
+    lisp_val_t result = lisp_ll_transpile_fixture_and_single(os_make_cons(x, nil), 0);
+    assert(result == x, "and(1引数): その式自身をそのまま返す");
+}
+
+static void test_transpile_fixture_or(void) {
+    lisp_val_t x = os_make_fixnum(5);
+    lisp_val_t y = os_make_fixnum(7);
+    lisp_val_t result = lisp_ll_transpile_fixture_or(os_make_cons(x, os_make_cons(y, nil)), 0);
+    assert(result == x, "or: 先頭がnil以外ならそこで短絡してxを返す");
+
+    lisp_val_t result_fallthrough = lisp_ll_transpile_fixture_or(os_make_cons(nil, os_make_cons(y, nil)), 0);
+    assert(result_fallthrough == y, "or: 先頭がnilなら次の式(y)を返す");
+
+    lisp_val_t result_all_nil = lisp_ll_transpile_fixture_or(os_make_cons(nil, os_make_cons(nil, nil)), 0);
+    assert(result_all_nil == nil, "or: 全てnilならnilを返す");
+}
+
+static void test_transpile_fixture_or_empty(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_or_empty(0, 0);
+    assert(result == nil, "or(引数無し): nilを返す");
+}
+
+static void test_transpile_fixture_or_single(void) {
+    lisp_val_t x = os_make_fixnum(5);
+    lisp_val_t result = lisp_ll_transpile_fixture_or_single(os_make_cons(x, nil), 0);
+    assert(result == x, "or(1引数): その式自身をそのまま返す");
+}
+
+static void test_transpile_fixture_or_three(void) {
+    lisp_val_t x = os_make_fixnum(1);
+    lisp_val_t y = os_make_fixnum(2);
+    lisp_val_t z = os_make_fixnum(3);
+
+    // *or-temp-counter*が呼び出しごとに一意なC変数名を振ることを、
+    // ネストしたステートメント式(3引数以上のor)経由で間接的に検証する
+    lisp_val_t result_last = lisp_ll_transpile_fixture_or_three(
+        os_make_cons(nil, os_make_cons(nil, os_make_cons(z, nil))), 0);
+    assert(result_last == z, "or(3引数): 先頭2つがnilなら最後の式(z)を返す");
+
+    lisp_val_t result_middle = lisp_ll_transpile_fixture_or_three(
+        os_make_cons(nil, os_make_cons(y, os_make_cons(z, nil))), 0);
+    assert(result_middle == y, "or(3引数): 先頭がnilで2番目がnil以外ならyで短絡する");
+
+    lisp_val_t result_first = lisp_ll_transpile_fixture_or_three(
+        os_make_cons(x, os_make_cons(y, os_make_cons(z, nil))), 0);
+    assert(result_first == x, "or(3引数): 先頭がnil以外ならxで短絡する");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -246,6 +318,13 @@ int main(void) {
     test_transpile_fixture_if_no_else();
     test_transpile_fixture_progn();
     test_transpile_fixture_setq();
+    test_transpile_fixture_and();
+    test_transpile_fixture_and_empty();
+    test_transpile_fixture_and_single();
+    test_transpile_fixture_or();
+    test_transpile_fixture_or_empty();
+    test_transpile_fixture_or_single();
+    test_transpile_fixture_or_three();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

@@ -1,6 +1,6 @@
-;;;; トランスパイラの動作確認用の最小フィクスチャ(M7時点)
+;;;; トランスパイラの動作確認用の最小フィクスチャ(M8時点)
 ;;;; fixnum/string/symbol/nil/tのリテラルとquote、パラメータ付きdefun、
-;;;; if/progn/setq、パラメータのGC_PROTECT統合をサポートする
+;;;; if/progn/setq/and/or、パラメータのGC_PROTECT統合をサポートする
 
 (defun %%transpile-fixture-answer ()
   42)
@@ -37,6 +37,29 @@
 
 (defun %%transpile-fixture-setq (x)
   (setq x 7))
+
+(defun %%transpile-fixture-and (x y)
+  (and x y))
+
+(defun %%transpile-fixture-and-empty ()
+  (and))
+
+(defun %%transpile-fixture-and-single (x)
+  (and x))
+
+(defun %%transpile-fixture-or (x y)
+  (or x y))
+
+(defun %%transpile-fixture-or-empty ()
+  (or))
+
+(defun %%transpile-fixture-or-single (x)
+  (or x))
+
+(defun %%transpile-fixture-or-three (x y z)
+  ;; 3引数以上のorで、*or-temp-counter*によるC一時変数名の一意性
+  ;; (ネストしたステートメント式の生成)を検証する
+  (or x y z))
 
 (defun %%transpile-fixture-gc-protect (x)
   ;; M7: パラメータxのGC_PROTECT統合を検証するためのフィクスチャ。
