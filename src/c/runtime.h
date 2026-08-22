@@ -639,6 +639,18 @@ lisp_val_t os_make_native_function(lisp_addr_t fnptr);
 lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
 
 /**
+ * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
+ * その定義時の捕捉環境として保持するTAG_INSTANCEオブジェクトを作る。os_make_native_function/
+ * os_make_jit_functionとの違いはword2にfixnum 2を立て、word3にcaptured_envを持つ点。
+ * apply_function(eval.c)はword2がfixnum 2のMAGIC_FUNCTION_NATIVEに対して、呼び出し時の
+ * envの代わりにこのcaptured_envをfnptrへ渡す。
+ * @param fnptr 呼び出すリフト済みlambda本体のC関数のアドレス
+ * @param captured_env 定義時に捕捉した自由変数を保持する環境
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 2、word3=captured_env)
+ */
+lisp_val_t os_make_lifted_closure(lisp_addr_t fnptr, lisp_val_t captured_env);
+
+/**
  * init.lisp の (make-instance class-sym . initargs) と (signal-condition condition nil) を
  * この順にosApplyFunction経由で呼び出す。sqrt/log(domain-error)やparse-number(parse-error)のように、
  * 生FPU命令やCの文字列走査が必要なため純Lispでは書けないが、条件の発火自体は既存のILOS/

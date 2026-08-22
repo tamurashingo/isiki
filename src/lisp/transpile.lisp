@@ -1,12 +1,23 @@
 ;;;; ホスト(CommonLisp)側で実行するトランスパイラ
 ;;;;
-;;;; M9時点でサポートするのは、fixnum/string/symbol/nil/tのリテラルとquote、
+;;;; M9までにサポートしたのは、fixnum/string/symbol/nil/tのリテラルとquote、
 ;;;; defunパラメータ(クロージャなしのローカル変数)の参照・setq、
 ;;;; if/progn/and/orを組み合わせた単一の本体式、このファイル内でdefunされた
 ;;;; 関数同士の自己/相互再帰呼び出し(za.cのような都度のシンボル名解決は行わず、
 ;;;; AOTでリンクされるC関数を直接呼び出す)、および生成する関数のパラメータを
-;;;; GC_PROTECTでshadow stackへ登録するコード生成のみ。let/cond/case等
-;;;; (マクロ展開/自由変数捕捉等)は後続のマイルストンで拡張する。
+;;;; GC_PROTECTでshadow stackへ登録するコード生成。
+;;;;
+;;;; M10ではlambdaによる第一級(エスケープ可能)クロージャを追加する。lambda式は
+;;;; トップレベルのC関数(defunと同じ__step/公開ラッパーの2関数構成)へリフトし、
+;;;; 自由変数(パラメータでも他のdefun/プリミティブ名でもない裸の変数参照)だけを
+;;;; 含む最小限の環境(os_make_environment)に捕捉する。捕捉方式はza.cの拡張4と
+;;;; 同じSBCL方式の変数単位box昇格: setqされ、かつ何らかのネストしたlambdaに
+;;;; 捕捉される変数だけをbox((val . 実値)のcons、os_setcdrで書き換え、cc_cdrで
+;;;; 読み出す)として扱い、それ以外は値コピーで捕捉する。boxは複数のクロージャが
+;;;; 同一のcons自体を共有することで、どちらから書き換えても他方から見える
+;;;; (za_emit_build_capture_envと同じ考え方)。専用のshadow-stack配列は新設せず、
+;;;; 既存のGC_PROTECTベースの仕組みで捕捉環境自体を保護する。let/cond/case等は
+;;;; 後続のマイルストンで拡張する。
 ;;;;
 ;;;; 末尾位置の既知関数呼び出しは、64KB(ガード無し)のプロセススタックを
 ;;;; 実測した結果、素朴なC再帰では約410段で隣接プロセスのスタックを破壊する
@@ -32,12 +43,17 @@
 
 (defparameter *primitive-c-names*
   ;; 自己再帰の停止条件(カウントダウン等)を書くために最低限必要な算術/比較
-  ;; プリミティブのみ対応する。これらはruntime.cのprimitive_*が生成関数と同じ
-  ;; ABI(lisp_val_t fn(lisp_val_t args, lisp_val_t env))で既に実装済みのC関数で、
-  ;; 呼び出し先アドレスはリンク時に確定するため、defunされた関数と同じ「直接
-  ;; 呼び出し」方式で扱える
+  ;; プリミティブと、M10で導入するfuncall(lambdaが生成するクロージャ値を
+  ;; 呼び出す唯一の手段)に対応する。これらはruntime.c/eval.cのprimitive_*が
+  ;; 生成関数と同じABI(lisp_val_t fn(lisp_val_t args, lisp_val_t env))で
+  ;; 既に実装済みのC関数で、呼び出し先アドレスはリンク時に確定するため、
+  ;; defunされた関数と同じ「直接呼び出し」方式で扱える。primitive_funcallは
+  ;; apply_function経由で汎用的にディスパッチするため、呼び出し先が
+  ;; os_make_lifted_closureで作ったクロージャであってもこの1エントリで
+  ;; そのまま対応できる(eval.c参照)
   '((- . "primitive_subtract")
-    (eq . "primitive_eq")))
+    (eq . "primitive_eq")
+    (funcall . "primitive_funcall")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)"
@@ -76,6 +92,81 @@
              (write-char ch out))
     (write-char #\" out)))
 
+;;; M10: lambdaの自由変数解析。let等の追加束縛フォームが無い現時点では、
+;;; 式木の中で新たに変数を束縛できるのはlambda自身のパラメータだけなので、
+;;; BOUND(既に束縛済みのシンボルのリスト)を引数で辿るだけでスコープを追跡できる。
+;;; quoteはリテラルデータなので中身を式として解釈しない。呼び出し形式
+;;; (name arg*)/if/progn/setq/and/or はいずれも(car expr)がシンボルで
+;;; (cdr expr)が処理すべき部分式のリストという共通の形をしているため、
+;;; lambda/quote以外は特別扱いせず(cdr expr)を再帰的に処理するだけでよい
+;;; (carのシンボル自身は呼び出し先名やsetqの対象決定など別の場所で解決するため、
+;;; ここでは変数参照として扱わない=自然にプリミティブ名/defun名を除外できる)
+
+(defun free-variables (expr bound)
+  "EXPR中の裸シンボル参照のうち、BOUND(シンボルのリスト)に含まれないものを
+   重複なく集めて返す。lambda式に出会った場合はそのパラメータをBOUNDに加えて
+   本体を再帰的に走査するため、ネストしたlambdaがさらに内側でしか使わない
+   変数は自然に除外され、外側からの捕捉が必要な自由変数だけが伝播する"
+  (cond
+    ((integerp expr) nil)
+    ((stringp expr) nil)
+    ((null expr) nil)
+    ((eq expr t) nil)
+    ((symbolp expr) (if (member expr bound) nil (list expr)))
+    ((and (consp expr) (eq (car expr) 'quote)) nil)
+    ((and (consp expr) (eq (car expr) 'lambda) (= (length expr) 3))
+     (free-variables (third expr) (append (second expr) bound)))
+    ((consp expr)
+     (reduce #'union (mapcar (lambda (e) (free-variables e bound)) (cdr expr))
+             :initial-value nil))
+    (t nil)))
+
+(defun setq-targets (expr bound)
+  "EXPR中でsetqの対象になっている変数のうち、BOUNDに含まれないものを重複なく
+   集めて返す(free-variablesと同じBOUND伝播規則でlambdaのネストを辿るため、
+   ネストしたlambdaの内部で行われるsetqも見つかる)。この関数はboxに昇格すべき
+   パラメータを判定するために、あるパラメータが自分の本体のどこか(直接でも
+   ネストしたlambda経由でも)でsetqされるかどうかを調べる目的で使う"
+  (cond
+    ((atom expr) nil)
+    ((eq (car expr) 'quote) nil)
+    ((and (eq (car expr) 'lambda) (= (length expr) 3))
+     (setq-targets (third expr) (append (second expr) bound)))
+    ((and (eq (car expr) 'setq) (= (length expr) 3))
+     (union (if (member (second expr) bound) nil (list (second expr)))
+            (setq-targets (third expr) bound)))
+    (t (reduce #'union (mapcar (lambda (e) (setq-targets e bound)) (cdr expr))
+               :initial-value nil))))
+
+(defun find-lambda-forms (expr)
+  "EXPR中に直接現れるlambda式を集める。見つけたlambdaの内部(そのbody)までは
+   辿らない: ネストしたlambdaが外側の変数を必要とする場合、それはfree-variables
+   がそのネストしたlambdaを直接囲むlambdaの自由変数として再帰的に伝播させるため、
+   ここで別途掘り進める必要が無い(captured-params参照)"
+  (cond
+    ((atom expr) nil)
+    ((eq (car expr) 'quote) nil)
+    ((and (eq (car expr) 'lambda) (= (length expr) 3)) (list expr))
+    (t (reduce #'append (mapcar #'find-lambda-forms (cdr expr)) :initial-value nil))))
+
+(defun captured-params (body params)
+  "BODY中のどこかにネストして現れるlambdaが自由変数として必要とする変数のうち、
+   PARAMS(この関数自身のパラメータ)に含まれるものを集めて返す(=このパラメータは
+   何らかのネストしたlambdaに捕捉される、という判定)。find-lambda-formsで見つけた
+   直接ネストのlambdaそれぞれについて、そのlambda自身のパラメータだけをBOUNDとした
+   free-variablesを取ることで、より深くネストしたlambdaの要求も(free-variables自身の
+   lambda特別扱いにより)自動的に伝播して含まれる"
+  (intersection params
+                (reduce #'union
+                        (mapcar (lambda (l) (free-variables (third l) (second l)))
+                                (find-lambda-forms body))
+                        :initial-value nil)))
+
+(defun boxed-params (body params)
+  "PARAMSのうち、za.cの拡張4と同じ基準(setqされ、かつエスケープするlambdaに
+   捕捉される変数だけをbox化する)でboxへ昇格すべきものを返す"
+  (intersection (setq-targets body nil) (captured-params body params)))
+
 (declaim (ftype function transpile-quoted))
 (declaim (ftype function transpile-if))
 (declaim (ftype function transpile-progn))
@@ -83,6 +174,7 @@
 (declaim (ftype function transpile-and))
 (declaim (ftype function transpile-or))
 (declaim (ftype function transpile-call))
+(declaim (ftype function transpile-lambda))
 (declaim (ftype function transpile-tail-stmt))
 (declaim (ftype function transpile-tail-and))
 (declaim (ftype function transpile-tail-or))
@@ -94,7 +186,10 @@
    値(symbol/string)は、za.cのT/quoteシンボルリテラル対応と同じく、生ポインタを
    埋め込まずos_make_symbol/os_make_stringを都度呼んで解決する。nilはランタイムが
    GCで移動しない固定センチネルなのでexternグローバルnilをそのまま参照してよい。
-   scopeはdefunパラメータ名(シンボル)からCのローカル変数名へのalist"
+   scopeはシンボルからCのローカル変数の情報(c-name . boxed-p)へのalist。
+  boxed-pがnon-nilの変数は、値そのものではなくbox((捨て値 . 実値)のcons)を
+  c-nameが指すため、読み出しはcc_cdrを経由する(M10のbox化パラメータ/自由変数、
+  transpile-defun/transpile-lambda参照)"
   (cond
     ((integerp expr)
      (format nil "os_make_fixnum(~AULL)" expr))
@@ -103,7 +198,10 @@
     ((null expr) "nil")
     ((eq expr t) "g_sym_t")
     ((and (symbolp expr) (assoc expr scope))
-     (cdr (assoc expr scope)))
+     (let ((binding (cdr (assoc expr scope))))
+       (if (cdr binding)
+           (format nil "cc_cdr(~A)" (car binding))
+           (car binding))))
     ((and (consp expr) (eq (car expr) 'quote) (= (length expr) 2))
      (transpile-quoted (second expr)))
     ((and (consp expr) (eq (car expr) 'if))
@@ -116,6 +214,8 @@
      (transpile-and (cdr expr) scope))
     ((and (consp expr) (eq (car expr) 'or))
      (transpile-or (cdr expr) scope))
+    ((and (consp expr) (eq (car expr) 'lambda) (= (length expr) 3))
+     (transpile-lambda expr scope))
     ((and (consp expr) (symbolp (car expr)))
      (transpile-call expr scope))
     ((symbolp expr)
@@ -144,15 +244,24 @@
         (format nil "(~{~A~^, ~})" (mapcar (lambda (f) (transpile-expr f scope)) forms)))))
 
 (defun transpile-setq (expr scope)
-  "(setq var val)。varはscope内の束縛済みローカル変数(defunパラメータ)のみ
-   対応する(このマイルストンの対象はクロージャ無しのローカル変数)。Cの代入式は
-   代入後の値そのものに評価されるため、追加の処理無くLispのsetqの戻り値規約と一致する"
+  "(setq var val)。varはscope内の束縛済みローカル変数(defun/lambdaパラメータ、
+   またはlambdaが捕捉した自由変数)のみ対応する。box化されていない変数への
+   代入は、Cの代入式が代入後の値そのものに評価される性質を使い、追加の処理
+   無くLispのsetqの戻り値規約と一致する。box化された変数(za.cの拡張4と同じ
+   基準でsetqされエスケープするlambdaに捕捉されたもの)への代入はos_setcdrで
+   box(cons)のcdrを直接書き換える(このboxを共有する他のクロージャや外側の
+   スコープからも変更後の値が見える)。os_setcdrはval自身を返す規約なので、
+   ここでもCの代入式と同じく戻り値の扱いを変える必要がない"
   (let* ((var (second expr))
          (val (third expr))
          (binding (assoc var scope)))
     (unless binding
       (error "transpile-setq: setqの対象が未束縛のローカル変数です: ~S" var))
-    (format nil "(~A = ~A)" (cdr binding) (transpile-expr val scope))))
+    (let ((c-name (car (cdr binding)))
+          (boxed-p (cdr (cdr binding))))
+      (if boxed-p
+          (format nil "os_setcdr(~A, ~A)" c-name (transpile-expr val scope))
+          (format nil "(~A = ~A)" c-name (transpile-expr val scope))))))
 
 (defun transpile-and (forms scope)
   "(and form*)。init.lispのdefmacro andが展開する(if a (and b...) nil)の
@@ -197,6 +306,148 @@
        ((eq val t) "g_sym_t")
        (t (format nil "os_make_symbol(~A)" (c-string-literal (symbol-name val))))))
     (t (transpile-expr val))))
+
+(defparameter *lambda-name-counter* 0)
+(defparameter *lifted-lambda-decls* nil
+  "現在transpile-defunがdefun本体を走査している間に見つかったlambda式を
+   トップレベルのC関数(__step/公開ラッパー)へリフトした結果の文字列を蓄積する
+   リスト。transpile-lambdaが自身の生成物をpushする。ネストしたlambdaほど先に
+   push されるため、出力時はreverseして定義順(内側から外側)に並べる(Cは
+   使用箇所より前に定義または宣言されている必要があるため)。transpile-defunが
+   1つのdefunを処理する間だけletで新しい束縛を張る")
+(defparameter *closure-temp-counter* 0)
+
+(defun emit-param-binding-stmt (c-var boxed-p)
+  "step関数の先頭で、パラメータ1つをevaluated_argsから読み出しCローカル変数
+   c-varへ束縛するC文を作る。boxed-pがnon-nilの場合(za.cの拡張4と同じ基準で
+   setqされエスケープするlambdaに捕捉されるパラメータ)は、値そのものではなく
+   (捨て値 . 実値)のconsをc-varへ束縛する。このconsが以後の全参照(このパラメータ
+   自身への読み書きと、ネストしたlambdaが捕捉する際に共有するオブジェクト)で
+   共有される「box」そのものになる"
+  (if boxed-p
+      (format nil "lisp_val_t ~A = os_make_cons(nil, cc_car(evaluated_args)); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
+              c-var c-var)
+      (format nil "lisp_val_t ~A = cc_car(evaluated_args); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
+              c-var c-var)))
+
+(defun emit-capture-fetch-stmt (c-var symbol-name-string)
+  "リフトしたlambdaのstep関数の先頭で、自由変数1つを捕捉環境(envパラメータ、
+   apply_function/za_ensure_trampolineが定義時の捕捉環境へ差し替え済み)から
+   symbol-name-stringという名前のシンボルで検索し、Cローカル変数c-varへ束縛
+   するC文を作る。この変数がboxか値コピーかは、捕捉元の外側スコープでの
+   boxed-pがそのまま伝播する(呼び出し元のtranspile-lambda参照)ため、ここでは
+   os_get_variableが返した値をそのままc-varへ入れるだけでよい"
+  (format nil "lisp_val_t ~A = os_get_variable(os_make_symbol(~A), env); GC_PROTECT(~A);"
+          c-var (c-string-literal symbol-name-string) c-var))
+
+(defun param-scope-and-preamble (params body)
+  "PARAMSとBODY(このパラメータ群だけをスコープに持つLisp式)から、za.cの拡張4と
+   同じSBCL方式の変数単位box昇格の判定を行い、(values scope preamble-stmts)を
+   返す。scopeはこの関数自身のパラメータ分のalist(シンボル -> (c-name . boxed-p))、
+   preamble-stmtsはstep関数の先頭でevaluated_argsから読み出すC文のリスト
+   (パラメータの並び順)。defun/lambdaのどちらのパラメータ束縛にも共通して使う"
+  (let ((boxed (boxed-params body params)))
+    (values
+     (mapcar (lambda (p) (cons p (cons (param-symbol-to-c-name p) (and (member p boxed) t))))
+             params)
+     (mapcar (lambda (p) (emit-param-binding-stmt (param-symbol-to-c-name p) (and (member p boxed) t)))
+             params))))
+
+(defun emit-function-body (c-name params preamble-stmts body-form scope)
+  "defun/lambdaのどちらにも共通のstep関数+公開ラッパーのC関数定義を組み立てる。
+   PARAMSはevaluated_argsを消費するパラメータの並び(空ならevaluated_args自体が
+   未使用になるため(void)キャストで警告を抑止する)、PREAMBLE-STMTSはstep関数の
+   先頭で実行するC文(パラメータ束縛+lambdaの場合は自由変数の捕捉環境からの
+   読み出し)、BODY-FORMは末尾位置として処理する本体式、SCOPEはPREAMBLE-STMTSが
+   束縛した全変数(パラメータ+自由変数)を含むalist"
+  (let ((tail-stmt (transpile-tail-stmt body-form scope)))
+    (with-output-to-string (out)
+      (format out "static tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
+      (when (null params)
+        (format out "    (void)evaluated_args;~%"))
+      (dolist (stmt preamble-stmts)
+        (format out "    ~A~%" stmt))
+      (format out "    (void)env;~%")
+      (format out "    ~A~%" tail-stmt)
+      (format out "}~%~%")
+      (format out "lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
+      (format out "    tco_result_t __r = ~A__step(evaluated_args, env);~%" c-name)
+      (format out "    while (__r.is_tail_call) {~%")
+      (format out "        __r = __r.fn(__r.args, env);~%")
+      (format out "    }~%")
+      (format out "    return __r.value;~%")
+      (format out "}~%"))))
+
+(defun emit-closure-creation (c-name free-vars outer-scope)
+  "リフトしたlambda本体(c-name)を、自由変数だけを含む最小限の捕捉環境と共に
+   os_make_lifted_closureでラップするC式を作る。自由変数が1つも無ければ環境の
+   確保自体が不要なので直接nilを渡す(このマイルストンにはletが無いため、
+   パラメータを一切参照しないlambdaは頻出しうる)。自由変数がある場合は、
+   os_make_environment(親を持たない、この捕捉専用の環境)を作りGC_PROTECTしたのち、
+   各自由変数についてOUTER-SCOPE(このlambda式が出現した時点の外側のscope)での
+   現在の値(box化されていればboxそのもの、そうでなければ値そのもの)を
+   os_env_add_binding_pairで(sym . 値)ペアとして連結する。boxそのものを共有
+   することで、複数のクロージャが同じboxを捕捉した場合に一方の書き換えが
+   他方からも見える(za.cの拡張4と同じ設計)。シンボル/consの確保がGCを
+   誘発しても既存のOUTER-SCOPEの変数は呼び出し元でGC_PROTECT済みなので安全"
+  (if (null free-vars)
+      (format nil "os_make_lifted_closure((lisp_addr_t)(void *)~A, nil)" c-name)
+      (let ((env-temp (format nil "__closure_env_~A" (incf *closure-temp-counter*))))
+        (format nil "({ lisp_val_t ~A = os_make_environment(os_make_symbol(~A), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
+                env-temp
+                (c-string-literal c-name)
+                env-temp
+                (mapcar (lambda (v)
+                          (let* ((sym-temp (format nil "__closure_sym_~A" (incf *closure-temp-counter*)))
+                                 (pair-temp (format nil "__closure_pair_~A" (incf *closure-temp-counter*)))
+                                 (outer-c-name (car (cdr (assoc v outer-scope)))))
+                            (format nil "lisp_val_t ~A = os_make_symbol(~A); GC_PROTECT(~A); lisp_val_t ~A = os_make_cons(~A, ~A); GC_PROTECT(~A); os_env_add_binding_pair(~A, ~A); "
+                                    sym-temp (c-string-literal (symbol-name v)) sym-temp
+                                    pair-temp sym-temp outer-c-name
+                                    pair-temp
+                                    pair-temp env-temp)))
+                        free-vars)
+                c-name
+                env-temp))))
+
+(defun transpile-lambda (expr scope)
+  "(lambda (param*) <本体1式>)。M10で導入する第一級(エスケープ可能)クロージャ。
+   自由変数(パラメータでも他のdefun名/プリミティブ名でもない裸の変数参照)を
+   free-variablesで解析し、外側のSCOPEで解決できなければ未束縛変数として
+   エラーにする(transpile-exprの規約と同じ)。本体はdefunと同じ__step/公開
+   ラッパーの2関数構成でトップレベルのC関数へリフトし(*lifted-lambda-decls*へ
+   push)、使用箇所にはリフト済み関数と捕捉環境をos_make_lifted_closureで
+   ラップする式(emit-closure-creation)を返す。パラメータ自身のbox昇格判定は
+   defunと同じparam-scope-and-preambleを使い、捕捉した自由変数のbox/値コピーの
+   区別は捕捉元(outer scope)のboxed-pをそのまま継承する(boxはこのlambdaが
+   新たに決めるものではなく、そのbox化された変数を最初に持つdefun/lambdaが
+   一度だけ決める性質だから)"
+  (destructuring-bind (lambda-kw params body) expr
+    (declare (ignore lambda-kw))
+    (unless (every #'symbolp params)
+      (error "transpile-lambda: パラメータはシンボルのみ対応です: ~S" expr))
+    (let* ((c-name (format nil "__lisp_lambda_~A" (incf *lambda-name-counter*)))
+           (free-vars (free-variables body params)))
+      (dolist (v free-vars)
+        (unless (assoc v scope)
+          (error "transpile-lambda: 自由変数が外側のスコープで未束縛です: ~S" v)))
+      (multiple-value-bind (own-scope own-preamble) (param-scope-and-preamble params body)
+        (let* ((capture-scope
+                 (mapcar (lambda (v)
+                           (let* ((binding (cdr (assoc v scope)))
+                                  (outer-boxed-p (cdr binding)))
+                             (cons v (cons (format nil "__captured_~A" (param-symbol-to-c-name v))
+                                           outer-boxed-p))))
+                         free-vars))
+               (capture-preamble
+                 (mapcar (lambda (v)
+                           (emit-capture-fetch-stmt (car (cdr (assoc v capture-scope))) (symbol-name v)))
+                         free-vars))
+               (body-scope (append own-scope capture-scope))
+               (fn-text (emit-function-body c-name params (append own-preamble capture-preamble) body body-scope))
+               (closure-expr (emit-closure-creation c-name free-vars scope)))
+          (push fn-text *lifted-lambda-decls*)
+          closure-expr)))))
 
 (defun call-target-c-name (name)
   "呼び出し先シンボル名からC関数名を解決する。このファイル内でdefunされた
@@ -342,15 +593,22 @@
 (defun transpile-defun (form)
   "(defun name (param*) <本体1式>) に対応する。パラメータはシンボルのみ
    (&rest等は未対応)、bodyは単一式のみ(fixnum/string/nil/tリテラル・quote・
-   パラメータの裸参照)。za.cのネイティブABI(lisp_val_t fn(lisp_val_t
-   evaluated_args, lisp_val_t env))に合わせ、パラメータ束縛はza.cと同様に
-   evaluated_argsをcc_car/cc_cdrで辿って行う。
+   パラメータの裸参照・M10のlambda等)。za.cのネイティブABI(lisp_val_t fn(
+   lisp_val_t evaluated_args, lisp_val_t env))に合わせ、パラメータ束縛はza.cと
+   同様にevaluated_argsをcc_car/cc_cdrで辿って行う(param-scope-and-preamble/
+   emit-function-body参照。setqされ、かつ本体中のlambdaに捕捉されるパラメータは
+   box化される=M10でdefunパラメータもlambdaと同じbox昇格の対象になる)。
 
    1つのdefunから2つのC関数を生成する: 本体を1手だけ進めるstep関数
    (末尾位置の既知関数呼び出しをトランポリン継続としてreturnする)と、
    ABI互換の公開ラッパー(stepをwhileループで回し切ってlisp_val_tを返す)。
    これにより自己/相互再帰の末尾呼び出しがCの再帰呼び出しにならず、再帰段数に
-   関わらずCスタック消費が一定になる(ファイル先頭のコメント参照)"
+   関わらずCスタック消費が一定になる(ファイル先頭のコメント参照)。
+
+   本体の中にlambdaが直接またはネストして現れる場合、それらはこのdefunより先に
+   トップレベルのC関数として出力する必要があるため、*lifted-lambda-decls*を
+   このdefun専用にletで束縛し、transpile-lambdaが積んだ結果を(内側から外側の
+   順で)このdefun自身のC関数定義の前に連結する"
   (destructuring-bind (defun-kw name params &rest body) form
     (declare (ignore defun-kw))
     (unless (every #'symbolp params)
@@ -358,35 +616,10 @@
     (unless (= (length body) 1)
       (error "transpile-defun: bodyは単一式のみ対応です: ~S" name))
     (let* ((c-name (lisp-name-to-c-name name))
-           (scope (mapcar (lambda (p) (cons p (param-symbol-to-c-name p))) params))
-           (tail-stmt (transpile-tail-stmt (first body) scope)))
-      (with-output-to-string (out)
-        (format out "static tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
-        (if (null params)
-            (format out "    (void)evaluated_args;~%")
-            (dolist (p params)
-              (let ((c-var (cdr (assoc p scope))))
-                (format out "    lisp_val_t ~A = cc_car(evaluated_args);~%" c-var)
-                (format out "    evaluated_args = cc_cdr(evaluated_args);~%")
-                ;; bodyの評価中のヒープ確保(os_make_string等)がGCを誘発しても、
-                ;; パラメータがコピーGCで移動済みの古いアドレスを指したままに
-                ;; ならないよう、束縛直後にGC_PROTECTでshadow stackへ登録する
-                ;; (eval.cのGC_PROTECT(args)/GC_PROTECT(env)と同じ考え方)
-                (format out "    GC_PROTECT(~A);~%" c-var))))
-        (format out "    (void)env;~%")
-        (format out "    ~A~%" tail-stmt)
-        (format out "}~%~%")
-        (format out "lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
-        (format out "    tco_result_t __r = ~A__step(evaluated_args, env);~%" c-name)
-        ;; __rがトランポリン継続を指す間は、stepをreturn/callで往復するだけの
-        ;; フラットなループになる(Cの呼び出しが必ずreturnしてから次のstepが
-        ;; 呼ばれるため、GC_PROTECTのshadow stack登録もcleanup属性で各step呼び出し
-        ;; ごとに片付き、何回ループしても蓄積しない)
-        (format out "    while (__r.is_tail_call) {~%")
-        (format out "        __r = __r.fn(__r.args, env);~%")
-        (format out "    }~%")
-        (format out "    return __r.value;~%")
-        (format out "}~%")))))
+           (*lifted-lambda-decls* nil))
+      (multiple-value-bind (scope preamble) (param-scope-and-preamble params (first body))
+        (let ((fn-text (emit-function-body c-name params preamble (first body) scope)))
+          (format nil "~{~A~%~}~A" (reverse *lifted-lambda-decls*) fn-text))))))
 
 (defun read-all-forms (path)
   (with-open-file (in path)
@@ -402,7 +635,9 @@
          (prototypes (mapcar #'transpile-prototype defuns))
          (bodies (mapcar #'transpile-defun defuns)))
     (with-open-file (out *output-c-path* :direction :output :if-exists :supersede)
-      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%~%")
+      ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
+      ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう
+      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%~%")
       ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
       ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
       ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)

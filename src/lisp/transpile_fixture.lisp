@@ -1,7 +1,8 @@
-;;;; トランスパイラの動作確認用の最小フィクスチャ(M9時点)
+;;;; トランスパイラの動作確認用の最小フィクスチャ(M10時点)
 ;;;; fixnum/string/symbol/nil/tのリテラルとquote、パラメータ付きdefun、
 ;;;; if/progn/setq/and/or、パラメータのGC_PROTECT統合、このファイル内での
-;;;; 自己/相互再帰呼び出しをサポートする
+;;;; 自己/相互再帰呼び出しに加え、M10のlambda(自由変数のbox/値コピー捕捉、
+;;;; funcall経由の呼び出し、エスケープするクロージャ)をサポートする
 
 (defun %%transpile-fixture-answer ()
   42)
@@ -91,3 +92,32 @@
 
 (defun %%transpile-fixture-is-odd (n)
   (if (eq n 0) nil (%%transpile-fixture-is-even (- n 1))))
+
+(defun %%transpile-fixture-lambda-capture-value (x)
+  ;; M10: 自由変数の値コピー捕捉の検証。xはsetqされないため非boxで、生成される
+  ;; クロージャは自身の環境にxの値をそのままコピーして持つ。同一関数内で即座に
+  ;; funcallするだけで、エスケープはしない
+  (funcall (lambda () x)))
+
+(defun %%transpile-fixture-lambda-box-mutate (n)
+  ;; M10: box共有の検証。nはネストしたlambda内でsetqされ、かつそのlambdaに
+  ;; 捕捉されるため、boxed-paramsによりboxプロモーションされる。lambda内から
+  ;; os_setcdrでboxを直接書き換えた後、外側のnを読むと変更後の値が見える
+  ;; (同じbox consを共有しているため)ことを検証する
+  (progn
+    (funcall (lambda () (setq n 99)))
+    n))
+
+(defun %%transpile-fixture-make-counter (n)
+  ;; M10: エスケープする第一級クロージャの検証。この関数はlambdaそのものを
+  ;; 返り値として返す(呼び出されるのはこの関数のreturn後)。nはネストした
+  ;; lambda内でsetqされ、かつ捕捉されるためboxプロモーションされる。返された
+  ;; クロージャをfuncallするたびに、独立したbox経由でnがデクリメントされ続け、
+  ;; make-counterのスタックフレームが失われた後も正しく動作することを検証する
+  (lambda () (progn (setq n (- n 1)) n)))
+
+(defun %%transpile-fixture-call-twice (counter)
+  ;; M10: エスケープする第一級クロージャの検証(その2)。%%transpile-fixture-
+  ;; make-counterが返したクロージャを引数counterとして受け取り、2回funcallする。
+  ;; 1回目と2回目の呼び出しの間でも同じboxの状態が保持され続けることを検証する
+  (progn (funcall counter) (funcall counter)))

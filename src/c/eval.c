@@ -129,7 +129,12 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
     UINT64 *obj = (UINT64 *)addr;
     if (obj[0] == MAGIC_FUNCTION_NATIVE) {
         lisp_val_t (*fnptr)(lisp_val_t, lisp_val_t) = (lisp_val_t (*)(lisp_val_t, lisp_val_t))obj[1];
-        return fnptr(evaluated_args, env);
+        // word2がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)の場合、
+        // word3(定義時に捕捉した自由変数を保持する環境)をenv引数として渡す。
+        // 呼び出し元のenvではなく、リフトされた関数本体が自由変数を解決できる
+        // 環境を渡す必要があるため
+        lisp_val_t call_env = (obj[2] == os_make_fixnum(2)) ? obj[3] : env;
+        return fnptr(evaluated_args, call_env);
     }
     if (obj[0] == MAGIC_FUNCTION_INTERPRETED) {
         lisp_val_t params = obj[1];

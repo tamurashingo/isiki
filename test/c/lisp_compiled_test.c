@@ -116,6 +116,10 @@ extern lisp_val_t lisp_ll_transpile_fixture_gc_protect(lisp_val_t evaluated_args
 extern lisp_val_t lisp_ll_transpile_fixture_count_down(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_is_even(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_is_odd(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_lambda_capture_value(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_lambda_box_mutate(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_make_counter(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_call_twice(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -303,6 +307,27 @@ static void test_transpile_fixture_is_odd(void) {
     assert(result_even == nil, "is-odd: 4は相互再帰でis-evenを経由してnilを返す");
 }
 
+static void test_transpile_fixture_lambda_capture_value(void) {
+    lisp_val_t x = os_make_fixnum(5);
+    lisp_val_t result = lisp_ll_transpile_fixture_lambda_capture_value(os_make_cons(x, nil), 0);
+    assert(result == x, "lambda-capture-value: 値コピー捕捉により、クロージャ内から見えるxは呼び出し元のxと同じ値");
+}
+
+static void test_transpile_fixture_lambda_box_mutate(void) {
+    lisp_val_t n = os_make_fixnum(1);
+    lisp_val_t result = lisp_ll_transpile_fixture_lambda_box_mutate(os_make_cons(n, nil), 0);
+    assert((result >> 3) == 99, "lambda-box-mutate: ネストしたlambda内のsetqがboxを介して外側のnに伝播し99を返す");
+}
+
+static void test_transpile_fixture_make_counter_and_call_twice(void) {
+    lisp_val_t initial = os_make_fixnum(5);
+    lisp_val_t closure = lisp_ll_transpile_fixture_make_counter(os_make_cons(initial, nil), 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_call_twice(os_make_cons(closure, nil), 0);
+    assert((result >> 3) == 3,
+           "make-counter/call-twice: make-counterのスタックフレームが失われた後も、"
+           "返されたクロージャをcall-twiceが2回funcallすることでboxを共有したまま5→4→3とデクリメントする");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -361,6 +386,9 @@ int main(void) {
     test_transpile_fixture_count_down();
     test_transpile_fixture_is_even();
     test_transpile_fixture_is_odd();
+    test_transpile_fixture_lambda_capture_value();
+    test_transpile_fixture_lambda_box_mutate();
+    test_transpile_fixture_make_counter_and_call_twice();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();
