@@ -340,58 +340,19 @@
       nil
       (append (funcall fn (car list)) (mapcan fn (cdr list)))))
 
-;;; --- member / assoc ---
-;;;
-;;; いずれも要素の比較にeqを使う(ISLispのeql相当。FIXNUMはタグ付きのまま
-;;; immediate値として同一性比較できるため、eqで正しく比較できる)。
-
-;; listの中からitemとeqな要素を探し、見つかった要素から始まる部分リストを返す。
-;; 見つからなければnil。
-(defun member (item list)
-  (if (null list)
-      nil
-      (if (eq item (car list))
-          list
-          (member item (cdr list)))))
-
-;; alist((key . value)のconsを並べたリスト)からkeyとeqなキーを持つ要素(cons)を探す。
-;; 見つからなければnil。
-(defun assoc (key alist)
-  (if (null alist)
-      nil
-      (if (eq key (car (car alist)))
-          (car alist)
-          (assoc key (cdr alist)))))
-
 ;;; --- append / reverse ---
 ;;;
 ;;; ISLispの仕様上、appendはリストのみを対象とする(文字列・ベクトルは対象外)。
-;;; reverseも同様にリストのみを対象とする簡略版とする。
-
-(defun %append2 (list1 list2)
-  (if (null list1)
-      list2
-      (cons (car list1) (%append2 (cdr list1) list2))))
-
-(defun %append-lists (lists)
-  (if (null lists)
-      nil
-      (if (null (cdr lists))
-          (car lists)
-          (%append2 (car lists) (%append-lists (cdr lists))))))
+;;; reverseも同様にリストのみを対象とする簡略版とする。member/assoc/reverseと
+;;; その内部ヘルパーはsrc/lisp/init_aot.lispへ移動し、トランスパイラでAOT
+;;; コンパイルしてos_register_aot_init_functions経由でglobal_environmentへ
+;;; 登録する(M13)。appendは&restパラメータを使うためトランスパイラ未対応で
+;;; ここに残るが、呼び出し先の%append-listsが同じ環境に登録されているため
+;;; 問題なく呼び出せる。
 
 ;; 0個以上のリストを連結して1つのリストにする。
 (defun append (&rest lists)
   (%append-lists lists))
-
-(defun %reverse-helper (list acc)
-  (if (null list)
-      acc
-      (%reverse-helper (cdr list) (cons (car list) acc))))
-
-;; listの要素順を反転した新しいリストを返す。
-(defun reverse (list)
-  (%reverse-helper list nil))
 
 ;;; --- list ---
 
@@ -424,22 +385,9 @@
 (defun nreverse (list)
   (%nreverse-helper list nil))
 
-;; mapcarと同様だが、fnには要素そのものではなく後続のsublist(cdrで縮んでいく
-;; リスト自身)を適用する。
-(defun maplist (fn list)
-  (if (null list)
-      nil
-      (cons (funcall fn list) (maplist fn (cdr list)))))
-
-(defun %mapl-1 (fn list)
-  (if (null list)
-      nil
-      (progn (funcall fn list) (%mapl-1 fn (cdr list)))))
-
-;; maplistと同様にsublistへfnを副作用目的で適用し、list自身を返す(mapcの
-;; sublist版)。
-(defun mapl (fn list)
-  (progn (%mapl-1 fn list) list))
+;; maplist/%mapl-1/maplはsrc/lisp/init_aot.lispへ移動した(M13)。mapcanと同様に
+;; append経由でsublist版mapcanを実装するmapconはappend自体がトランスパイラ未対応
+;; (&rest)なためここに残る。
 
 ;; maplistと同様にsublistへfnを適用するが、結果はappendで連結する(mapcanの
 ;; sublist版)。仕様上はnconcによる破壊的な連結だが、既存のmapcanと同様に

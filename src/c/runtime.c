@@ -382,6 +382,13 @@ static UINT8 *g_imm_bump = g_imm_space;
 /** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */
 static void *g_imm_free_list = 0;
 
+/** g_imm_bumpがこれまでにg_imm_spaceから切り出した延べページ数。M13で、init.lispから
+ * トランスパイル対象関数を移動したことによるImmobilized Space使用量の削減を測定する
+ * テストのためのアクセサ(os_gc_collect_countと同じ、テスト専用の内部状態公開) */
+UINT64 os_imm_pages_used_for_test(void) {
+    return (UINT64)(g_imm_bump - g_imm_space) / IMM_PAGE_SIZE;
+}
+
 void *os_imm_page_alloc(void) {
     if (g_imm_free_list) {
         void *page = g_imm_free_list;

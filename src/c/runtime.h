@@ -214,6 +214,14 @@ UINT64 os_gc_collect_count(void);
 #define IMM_PAGE_SIZE 4096
 
 /**
+ * これまでにImmobilized Spaceから切り出された延べページ数を返す(テスト専用。
+ * os_gc_collect_countと同様、本体のロジックでは使用しない)。M13で、init.lispの
+ * 一部関数をAOTトランスパイルへ移動したことによる使用量削減を測定するために使う。
+ * @return g_imm_bumpがg_imm_spaceから切り出した延べページ数
+ */
+UINT64 os_imm_pages_used_for_test(void);
+
+/**
  * Immobilized Spaceから4KBページを1枚確保する。空間が枯渇した場合は診断メッセージを
  * 表示して停止する。
  * @return 確保した4KBページの先頭アドレス

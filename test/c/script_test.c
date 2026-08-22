@@ -12,6 +12,11 @@
 #include "stream_lisp.h"
 #include "format.h"
 
+// src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
+// gitignore対象のビルド成果物)で定義される。init.lispから移動したmember/assoc等を
+// os_set_function経由でglobal_environmentへ登録する(M13)
+extern void os_register_aot_init_functions(void);
+
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
 // ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
@@ -254,6 +259,7 @@ int main(int argc, char** argv) {
                      global_environment);
     os_register_streams();
     os_register_format();
+    os_register_aot_init_functions();
 
     lisp_val_t env = os_make_environment(os_make_symbol("SCRIPT-TEST-ENV"), global_environment);
 

@@ -34,6 +34,11 @@
 ;;;; は再帰しないstep関数を持たないため、末尾位置でも即時評価して確定値を返す。
 
 (defparameter *runtime-lisp-path* "src/lisp/transpile_fixture.lisp")
+(defparameter *aot-lisp-path* "src/lisp/init_aot.lisp"
+  "init.lispから移動した、AOTトランスパイル対象の本番関数を置くファイル(M13)。
+   transpile_fixture.lispと違い、ここでdefunされた関数はos_register_aot_init_functions
+   経由でglobal_environmentへ登録され、init.lisp側からもインタプリタで定義された
+   関数と同じシンボル名で呼び出せる")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
 
 (defparameter *known-function-names* nil
@@ -53,14 +58,26 @@
   ;; そのまま対応できる(eval.c参照)
   '((- . "primitive_subtract")
     (eq . "primitive_eq")
-    (funcall . "primitive_funcall")))
+    (funcall . "primitive_funcall")
+    ;; M13: init.lispから移動するリスト操作関数(member/assoc/%append2/...)が
+    ;; 使うcar/cdr/cons/nullに対応する。runtime.cのprimitive_car等はos_bootstrap内で
+    ;; global_environmentへ既に登録済みのコア関数で、生成関数と同じABIを持つため
+    ;; defunされた関数と同じ「直接呼び出し」方式で扱える
+    (null . "primitive_null")
+    (car . "primitive_car")
+    (cdr . "primitive_cdr")
+    (cons . "primitive_cons")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)"
   (remove #\! (substitute #\_ #\- (string-downcase name))))
 
 (defun lisp-name-to-c-name (symbol)
-  "&&mem-ref-64 -> lisp_ll_mem_ref_64"
+  "MEMBER -> lisp_ll_member / %%mem-ref-64 -> lisp_ll_mem_ref_64。
+   Lisp名の先頭に%系のマーカーが無いM13以降のような通常のトップレベル関数名
+   (member/assoc/reverse等)も、必ずlisp_ll_を付けてCのグローバル名前空間へ
+   出す(接頭辞無しのままだとlibc等の同名識別子と衝突しうるため。過去は
+   全ファイルのdefunが%%transpile-fixture-接頭辞付きだったため露見しなかった)"
   (let* ((name (symbol-name symbol))
          (prefix-len (cond
                        ((and (>= (length name) 2)
@@ -70,12 +87,8 @@
                              (char= (char name 0) #\%))
                         1)
                        (t 0)))
-         (c-prefix (case prefix-len
-                     (2 "lisp_ll_")
-                     (1 "lisp_")
-                     (t "")))
          (body (sanitize-c-ident (subseq name prefix-len))))
-    (concatenate 'string c-prefix body)))
+    (concatenate 'string "lisp_ll_" body)))
 
 (defun param-symbol-to-c-name (symbol)
   "defunパラメータ名 -> Cのローカル変数名。プレフィックスは付けない"
@@ -659,13 +672,27 @@
           until (eq form :eof)
           collect form)))
 
+(defun emit-aot-registration (aot-defuns)
+  "init_aot.lisp由来のdefun群それぞれについて、os_set_function/
+   os_make_native_functionでglobal_environmentへ登録するC関数
+   os_register_aot_init_functionsを生成する(M13)。init.lispから該当defunの
+   テキストを取り除いた後も、インタプリタ側から同じシンボル名でこれらの
+   AOTコンパイル済み関数を呼び出せるようにするための配線"
+  (format nil "void os_register_aot_init_functions(void) {~%~{    os_set_function(os_make_symbol(\"~A\"), os_make_native_function((lisp_addr_t)(void *)~A), global_environment);~%~}}~%"
+          (mapcan (lambda (form)
+                    (list (symbol-name (second form)) (lisp-name-to-c-name (second form))))
+                  aot-defuns)))
+
 (defun main ()
-  (let* ((forms (read-all-forms *runtime-lisp-path*))
-         (defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
-                                 forms))
+  (let* ((fixture-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
+                                         (read-all-forms *runtime-lisp-path*)))
+         (aot-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
+                                     (read-all-forms *aot-lisp-path*)))
+         (defuns (append fixture-defuns aot-defuns))
          (*known-function-names* (mapcar #'second defuns))
          (prototypes (mapcar #'transpile-prototype defuns))
-         (bodies (mapcar #'transpile-defun defuns)))
+         (bodies (mapcar #'transpile-defun defuns))
+         (registration (emit-aot-registration aot-defuns)))
     (with-open-file (out *output-c-path* :direction :output :if-exists :supersede)
       ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
       ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう
@@ -680,4 +707,5 @@
         (format out "~A~%" p))
       (format out "~%")
       (dolist (b bodies)
-        (format out "~A~%" b)))))
+        (format out "~A~%" b))
+      (format out "~%~A" registration))))
