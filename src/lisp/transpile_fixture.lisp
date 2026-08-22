@@ -121,3 +121,18 @@
   ;; make-counterが返したクロージャを引数counterとして受け取り、2回funcallする。
   ;; 1回目と2回目の呼び出しの間でも同じboxの状態が保持され続けることを検証する
   (progn (funcall counter) (funcall counter)))
+
+(defun %%transpile-fixture-defdynamic (n)
+  ;; M11: defdynamicの検証。動的変数%%test-dynamic-varへnを書き込み、
+  ;; 直後にdynamicで読み出す。同じprogn内での書き込み直後の読み出しが
+  ;; 正しく反映されることを検証する
+  (progn
+    (defdynamic '%%test-dynamic-var n)
+    (dynamic '%%test-dynamic-var)))
+
+(defun %%transpile-fixture-dynamic-read ()
+  ;; M11: dynamicのみの検証。他の関数(%%transpile-fixture-defdynamic)が
+  ;; 書き込んだ動的変数の値が、レキシカルな親子関係を持たない別の関数から
+  ;; そのまま読めることを検証する(g_dynamic_bindingsがグローバルな
+  ;; フラットalistであることの確認)
+  (dynamic '%%test-dynamic-var))

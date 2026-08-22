@@ -120,6 +120,8 @@ extern lisp_val_t lisp_ll_transpile_fixture_lambda_capture_value(lisp_val_t eval
 extern lisp_val_t lisp_ll_transpile_fixture_lambda_box_mutate(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_make_counter(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_call_twice(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_defdynamic(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_dynamic_read(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -328,6 +330,20 @@ static void test_transpile_fixture_make_counter_and_call_twice(void) {
            "返されたクロージャをcall-twiceが2回funcallすることでboxを共有したまま5→4→3とデクリメントする");
 }
 
+static void test_transpile_fixture_defdynamic(void) {
+    lisp_val_t n = os_make_fixnum(42);
+    lisp_val_t result = lisp_ll_transpile_fixture_defdynamic(os_make_cons(n, nil), 0);
+    assert(result == n,
+           "defdynamic: %%test-dynamic-varへnを書き込んだ直後にdynamicで読み出すとnそのものが返る");
+}
+
+static void test_transpile_fixture_dynamic_read(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_dynamic_read(nil, 0);
+    assert((result >> 3) == 42,
+           "dynamic: レキシカルな親子関係を持たない別の関数呼び出しからでも、"
+           "直前のdefdynamicがg_dynamic_bindingsへ書き込んだ%%test-dynamic-varの値がそのまま読める");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -389,6 +405,8 @@ int main(void) {
     test_transpile_fixture_lambda_capture_value();
     test_transpile_fixture_lambda_box_mutate();
     test_transpile_fixture_make_counter_and_call_twice();
+    test_transpile_fixture_defdynamic();
+    test_transpile_fixture_dynamic_read();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

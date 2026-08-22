@@ -114,6 +114,9 @@
     ((eq expr t) nil)
     ((symbolp expr) (if (member expr bound) nil (list expr)))
     ((and (consp expr) (eq (car expr) 'quote)) nil)
+    ((and (consp expr) (eq (car expr) 'dynamic) (= (length expr) 2)) nil)
+    ((and (consp expr) (eq (car expr) 'defdynamic) (= (length expr) 3))
+     (free-variables (third expr) bound))
     ((and (consp expr) (eq (car expr) 'lambda) (= (length expr) 3))
      (free-variables (third expr) (append (second expr) bound)))
     ((consp expr)
@@ -130,6 +133,9 @@
   (cond
     ((atom expr) nil)
     ((eq (car expr) 'quote) nil)
+    ((and (eq (car expr) 'dynamic) (= (length expr) 2)) nil)
+    ((and (eq (car expr) 'defdynamic) (= (length expr) 3))
+     (setq-targets (third expr) bound))
     ((and (eq (car expr) 'lambda) (= (length expr) 3))
      (setq-targets (third expr) (append (second expr) bound)))
     ((and (eq (car expr) 'setq) (= (length expr) 3))
@@ -173,6 +179,8 @@
 (declaim (ftype function transpile-setq))
 (declaim (ftype function transpile-and))
 (declaim (ftype function transpile-or))
+(declaim (ftype function transpile-dynamic-read))
+(declaim (ftype function transpile-defdynamic))
 (declaim (ftype function transpile-call))
 (declaim (ftype function transpile-lambda))
 (declaim (ftype function transpile-tail-stmt))
@@ -216,6 +224,10 @@
      (transpile-or (cdr expr) scope))
     ((and (consp expr) (eq (car expr) 'lambda) (= (length expr) 3))
      (transpile-lambda expr scope))
+    ((and (consp expr) (eq (car expr) 'dynamic) (= (length expr) 2))
+     (transpile-dynamic-read expr))
+    ((and (consp expr) (eq (car expr) 'defdynamic) (= (length expr) 3))
+     (transpile-defdynamic expr scope))
     ((and (consp expr) (symbolp (car expr)))
      (transpile-call expr scope))
     ((symbolp expr)
@@ -306,6 +318,26 @@
        ((eq val t) "g_sym_t")
        (t (format nil "os_make_symbol(~A)" (c-string-literal (symbol-name val))))))
     (t (transpile-expr val))))
+
+(defun transpile-dynamic-read (expr)
+  "(dynamic name)。nameは未評価のシンボルリテラルとして扱い(quoteと同様)、
+   os_get_dynamicで動的変数の現在値を取得する式を生成する"
+  (format nil "os_get_dynamic(~A)" (transpile-quoted (second expr))))
+
+(defparameter *defdynamic-temp-counter* 0)
+
+(defun transpile-defdynamic (expr scope)
+  "(defdynamic name value-form)。value-formをscope内で評価し、GCで移動しうる
+   その結果を一旦Cローカル変数へGC_PROTECTしてから、name(未評価のシンボル
+   リテラル)をos_make_symbolで解決してos_set_dynamicへ渡す。eval_defdynamicと
+   同じくnameそのものを式全体の値として返す(za.cの拡張6と同じ意味論)。
+   トランスパイラの対応範囲は非局所脱出(block/return-from/catch/throw)を
+   まだ含まないため、eval_defdynamicにあるis_control_transferチェックは
+   ここでは省略している"
+  (let ((temp (format nil "__defdynamic_val_~A" (incf *defdynamic-temp-counter*)))
+        (name-c (transpile-quoted (second expr))))
+    (format nil "({ lisp_val_t ~A = ~A; GC_PROTECT(~A); os_set_dynamic(~A, ~A); ~A; })"
+            temp (transpile-expr (third expr) scope) temp name-c temp name-c)))
 
 (defparameter *lambda-name-counter* 0)
 (defparameter *lifted-lambda-decls* nil
