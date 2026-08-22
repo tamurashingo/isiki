@@ -178,3 +178,15 @@
          (setq x (cons x x))
          x)
         (t nil)))
+
+(defun %%transpile-fixture-rest (&rest items)
+  ;; M14基盤B: &restパラメータのみの検証。全実引数がそのままconsチェーンとして
+  ;; itemsへ束縛されることを確認する(呼び出し側のevaluated_args構築自体は
+  ;; 固定パラメータの場合と変わらない)
+  items)
+
+(defun %%transpile-fixture-rest-with-fixed (a &rest items)
+  ;; M14基盤B: 固定パラメータの後に&restが続く場合の検証。固定パラメータaは
+  ;; cc_car/cc_cdrで通常通り1つ剥がされ、残りのevaluated_argsがそのままitemsへ
+  ;; 束縛されることを確認する
+  (cons a items))

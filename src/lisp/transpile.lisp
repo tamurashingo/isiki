@@ -460,6 +460,36 @@
       (format nil "lisp_val_t ~A = cc_car(evaluated_args); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
               c-var c-var)))
 
+;;; M14 基盤B: &restパラメータ。list/append/create-list/apply/mapcar/map-into等が
+;;; 使う。呼び出し側(transpile-call/transpile-tail-call)はパラメータの個数に
+;;; 関わらず常に実引数を1つのconsチェーン(evaluated_args)として渡すだけなので、
+;;; 変更が必要なのは呼び出される側(param-scope-and-preamble)だけでよい:
+;;; 固定パラメータをcc_car/cc_cdrで1つずつ剥がした後に残るevaluated_argsは、
+;;; 既にそのまま&restパラメータが指すべきリストそのものになっている
+
+(defun split-rest-param (params)
+  "PARAMS(defun/lambdaのパラメータリスト)を(values fixed-params rest-param)に
+   分割する。&restシンボルが無ければrest-paramはnil。&rest name(nameは
+   シンボル1つ)の形式のみ対応する"
+  (let ((pos (position '&rest params)))
+    (if (null pos)
+        (values params nil)
+        (let ((rest-tail (nthcdr (1+ pos) params)))
+          (unless (and (= (length rest-tail) 1) (symbolp (car rest-tail)))
+            (error "split-rest-param: &restの後はパラメータ名1つのみ対応です: ~S" params))
+          (values (subseq params 0 pos) (car rest-tail))))))
+
+(defun emit-rest-param-binding-stmt (c-var boxed-p)
+  "step関数の先頭で、&restパラメータへ残りのevaluated_args全部をそのまま
+   束縛するC文を作る(cc_car/cc_cdrで1つずつ剥がす通常パラメータとは異なり、
+   この時点のevaluated_args自体が既に欲しいリストそのものになっている)。
+   boxed-pの意味・box化の形はemit-param-binding-stmtと同じ"
+  (if boxed-p
+      (format nil "lisp_val_t ~A = os_make_cons(nil, evaluated_args); GC_PROTECT(~A);"
+              c-var c-var)
+      (format nil "lisp_val_t ~A = evaluated_args; GC_PROTECT(~A);"
+              c-var c-var)))
+
 (defun emit-capture-fetch-stmt (c-var symbol-name-string)
   "リフトしたlambdaのstep関数の先頭で、自由変数1つを捕捉環境(envパラメータ、
    apply_function/za_ensure_trampolineが定義時の捕捉環境へ差し替え済み)から
@@ -475,13 +505,21 @@
    同じSBCL方式の変数単位box昇格の判定を行い、(values scope preamble-stmts)を
    返す。scopeはこの関数自身のパラメータ分のalist(シンボル -> (c-name . boxed-p))、
    preamble-stmtsはstep関数の先頭でevaluated_argsから読み出すC文のリスト
-   (パラメータの並び順)。defun/lambdaのどちらのパラメータ束縛にも共通して使う"
-  (let ((boxed (boxed-params body params)))
-    (values
-     (mapcar (lambda (p) (cons p (cons (param-symbol-to-c-name p) (and (member p boxed) t))))
-             params)
-     (mapcar (lambda (p) (emit-param-binding-stmt (param-symbol-to-c-name p) (and (member p boxed) t)))
-             params))))
+   (固定パラメータの並び順、末尾に&restパラメータがあればさらにその後)。
+   defun/lambdaのどちらのパラメータ束縛にも共通して使う。&restパラメータ
+   (基盤B)はsplit-rest-paramで固定パラメータと切り分け、box昇格判定
+   (boxed-params)には固定パラメータと同じ1つの変数として扱わせる"
+  (multiple-value-bind (fixed-params rest-param) (split-rest-param params)
+    (let* ((all-params (if rest-param (append fixed-params (list rest-param)) fixed-params))
+           (boxed (boxed-params body all-params)))
+      (values
+       (mapcar (lambda (p) (cons p (cons (param-symbol-to-c-name p) (and (member p boxed) t))))
+               all-params)
+       (append
+        (mapcar (lambda (p) (emit-param-binding-stmt (param-symbol-to-c-name p) (and (member p boxed) t)))
+                fixed-params)
+        (when rest-param
+          (list (emit-rest-param-binding-stmt (param-symbol-to-c-name rest-param) (and (member rest-param boxed) t)))))))))
 
 (defun emit-function-body (c-name params preamble-stmts body-form scope)
   "defun/lambdaのどちらにも共通のstep関数+公開ラッパーのC関数定義を組み立てる。
@@ -723,7 +761,8 @@
 
 (defun transpile-defun (form)
   "(defun name (param*) <本体1式>) に対応する。パラメータはシンボルのみ
-   (&rest等は未対応)、bodyは単一式のみ(fixnum/string/nil/tリテラル・quote・
+   (末尾の&rest nameのみ許容、基盤B/param-scope-and-preamble参照)、
+   bodyは単一式のみ(fixnum/string/nil/tリテラル・quote・
    パラメータの裸参照・M10のlambda等)。za.cのネイティブABI(lisp_val_t fn(
    lisp_val_t evaluated_args, lisp_val_t env))に合わせ、パラメータ束縛はza.cと
    同様にevaluated_argsをcc_car/cc_cdrで辿って行う(param-scope-and-preamble/
@@ -743,7 +782,7 @@
   (destructuring-bind (defun-kw name params &rest body) form
     (declare (ignore defun-kw))
     (unless (every #'symbolp params)
-      (error "transpile-defun: パラメータはシンボルのみ対応です(&restは未対応): ~S" name))
+      (error "transpile-defun: パラメータはシンボルのみ対応です: ~S" name))
     (unless (= (length body) 1)
       (error "transpile-defun: bodyは単一式のみ対応です: ~S" name))
     (let* ((c-name (lisp-name-to-c-name name))

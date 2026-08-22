@@ -79,3 +79,12 @@
 ;; sublist版)。
 (defun mapl (fn list)
   (progn (%mapl-1 fn list) list))
+
+;;; --- list (M14) ---
+;;;
+;;; 基盤B(&restパラメータ対応)によりAOT対応可能になったため移動。
+
+;; 引数をそのまま並べたリストを返す。&restが評価済みの引数を既にリストとして
+;; 束縛するため、bodyはitemsをそのまま返すだけでよい。
+(defun list (&rest items)
+  items)

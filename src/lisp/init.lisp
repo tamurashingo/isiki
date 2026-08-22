@@ -354,12 +354,8 @@
 (defun append (&rest lists)
   (%append-lists lists))
 
-;;; --- list ---
-
-;; 引数をそのまま並べたリストを返す。&restが評価済みの引数を既にリストとして
-;; 束縛するため、bodyはitemsをそのまま返すだけでよい。
-(defun list (&rest items)
-  items)
+;; listはsrc/lisp/init_aot.lispへ移動した(M14: 基盤Bの&restパラメータ対応により
+;; AOT対応可能になったため)。
 
 ;;; --- create-list / nreverse / maplist / mapl / mapcon (§21.3) ---
 
