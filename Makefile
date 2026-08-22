@@ -78,7 +78,16 @@ all: build
 
 
 image:
-	docker build -t isiki-builder .
+	docker build --build-arg USER_UID="$$(id -u)" --build-arg USER_GID="$$(id -g)" -t isiki-builder .
+
+# ros(roswell)はイメージのENTRYPOINTが/usr/local/bin/sbclのため、
+# --entrypoint bashで明示的に上書きしないと引数がsbclへ直接渡ってしまう。
+# imageターゲットでホストのUID/GIDと同じbuilderユーザーを作成し、
+# そのユーザーにroswellをインストール済みのため、--userを指定しても
+# $HOMEが正しく解決され動作する。
+transpile:
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
 
 build: $(SRC) $(HDR)
 	mkdir -p esp_dir/EFI/BOOT
