@@ -101,6 +101,10 @@ extern lisp_val_t lisp_ll_transpile_fixture_t(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_quoted_fixnum(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_identity(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_second_param(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_if(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_if_no_else(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_progn(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_setq(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -167,6 +171,32 @@ static void test_transpile_fixture_second_param(void) {
     assert(result == second, "second-param(x, y) walks evaluated_args via cc_cdr to reach y");
 }
 
+static void test_transpile_fixture_if(void) {
+    lisp_val_t result_true = lisp_ll_transpile_fixture_if(os_make_cons(os_make_fixnum(5), nil), 0);
+    assert((result_true >> 3) == 1, "if: xがnil以外ならthen節(1)を返す");
+
+    lisp_val_t result_false = lisp_ll_transpile_fixture_if(os_make_cons(nil, nil), 0);
+    assert((result_false >> 3) == 2, "if: xがnilならelse節(2)を返す");
+}
+
+static void test_transpile_fixture_if_no_else(void) {
+    lisp_val_t result_true = lisp_ll_transpile_fixture_if_no_else(os_make_cons(os_make_fixnum(5), nil), 0);
+    assert((result_true >> 3) == 42, "if(else省略): xがnil以外ならthen節(42)を返す");
+
+    lisp_val_t result_false = lisp_ll_transpile_fixture_if_no_else(os_make_cons(nil, nil), 0);
+    assert(result_false == nil, "if(else省略): xがnilならelse省略時のデフォルトnilを返す");
+}
+
+static void test_transpile_fixture_progn(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_progn(os_make_cons(os_make_fixnum(1), nil), 0);
+    assert((result >> 3) == 99, "progn: 先頭のxは評価されるが値は捨てられ、最後の式(99)が返る");
+}
+
+static void test_transpile_fixture_setq(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_setq(os_make_cons(os_make_fixnum(1), nil), 0);
+    assert((result >> 3) == 7, "setq: 代入後の新しい値(7)がsetq式自体の値になる");
+}
+
 int main(void) {
     setup_heap();
     test_transpile_fixture_answer();
@@ -177,5 +207,9 @@ int main(void) {
     test_transpile_fixture_quoted_fixnum();
     test_transpile_fixture_identity();
     test_transpile_fixture_second_param();
+    test_transpile_fixture_if();
+    test_transpile_fixture_if_no_else();
+    test_transpile_fixture_progn();
+    test_transpile_fixture_setq();
     return g_test_failed;
 }

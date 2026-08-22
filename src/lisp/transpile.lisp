@@ -1,8 +1,9 @@
 ;;;; ホスト(CommonLisp)側で実行するトランスパイラ
 ;;;;
-;;;; M3時点でサポートするのは「引数なし・本体がfixnum/string/symbol/nil/t
-;;;; リテラルまたはそれらのquote 1個のdefun」のみ。それ以外の構文
-;;;; (macro展開/自由変数捕捉/GC_PROTECT統合等)は後続のマイルストンで拡張する。
+;;;; M4時点でサポートするのは、fixnum/string/symbol/nil/tのリテラルとquote、
+;;;; defunパラメータ(クロージャなしのローカル変数)の参照・setq、および
+;;;; if/prognを組み合わせた単一の本体式のみ。それ以外の構文
+;;;; (マクロ展開/自由変数捕捉/GC_PROTECT統合等)は後続のマイルストンで拡張する。
 
 (defparameter *runtime-lisp-path* "src/lisp/transpile_fixture.lisp")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
@@ -45,6 +46,9 @@
     (write-char #\" out)))
 
 (declaim (ftype function transpile-quoted))
+(declaim (ftype function transpile-if))
+(declaim (ftype function transpile-progn))
+(declaim (ftype function transpile-setq))
 
 (defun transpile-expr (expr &optional scope)
   "fixnum/string/nil/tの裸リテラルと、それらに対するquote、シンボルのquote、
@@ -64,9 +68,47 @@
      (cdr (assoc expr scope)))
     ((and (consp expr) (eq (car expr) 'quote) (= (length expr) 2))
      (transpile-quoted (second expr)))
+    ((and (consp expr) (eq (car expr) 'if))
+     (transpile-if expr scope))
+    ((and (consp expr) (eq (car expr) 'progn))
+     (transpile-progn expr scope))
+    ((and (consp expr) (eq (car expr) 'setq) (= (length expr) 3))
+     (transpile-setq expr scope))
     ((symbolp expr)
      (error "transpile-expr: 未束縛の変数参照です: ~S" expr))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
+
+(defun transpile-if (expr scope)
+  "(if test then [else])。真偽値は「nil以外はすべて真」の規約に従い、
+   testをnilと比較した結果でCの三項演算子に分岐する(za.cの拡張0と同じ設計)。
+   elseを省略した場合はnilがデフォルト(destructuring-bindの&optionalが
+   nilにデフォルトし、transpile-exprがnil式を\"nil\"に変換するのでそのまま流れる)"
+  (destructuring-bind (if-kw test then &optional else) expr
+    (declare (ignore if-kw))
+    (format nil "((~A) != nil ? (~A) : (~A))"
+            (transpile-expr test scope)
+            (transpile-expr then scope)
+            (transpile-expr else scope))))
+
+(defun transpile-progn (expr scope)
+  "(progn form*)。Cのコンマ演算子で左から順に評価し、最後の式の値を残す
+   (副作用の順序もコンマ演算子の評価順保証によりLispの逐次評価と一致する)。
+   formが1つも無い場合はnilを返す"
+  (let ((forms (cdr expr)))
+    (if (null forms)
+        "nil"
+        (format nil "(~{~A~^, ~})" (mapcar (lambda (f) (transpile-expr f scope)) forms)))))
+
+(defun transpile-setq (expr scope)
+  "(setq var val)。varはscope内の束縛済みローカル変数(defunパラメータ)のみ
+   対応する(このマイルストンの対象はクロージャ無しのローカル変数)。Cの代入式は
+   代入後の値そのものに評価されるため、追加の処理無くLispのsetqの戻り値規約と一致する"
+  (let* ((var (second expr))
+         (val (third expr))
+         (binding (assoc var scope)))
+    (unless binding
+      (error "transpile-setq: setqの対象が未束縛のローカル変数です: ~S" var))
+    (format nil "(~A = ~A)" (cdr binding) (transpile-expr val scope))))
 
 (defun transpile-quoted (val)
   "(quote val)のval側。fixnum/string/nil/tはtranspile-exprと同じ扱いで、
