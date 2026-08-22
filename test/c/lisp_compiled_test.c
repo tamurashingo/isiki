@@ -99,6 +99,8 @@ extern lisp_val_t lisp_ll_transpile_fixture_symbol(lisp_val_t args, lisp_val_t e
 extern lisp_val_t lisp_ll_transpile_fixture_nil(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_t(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_quoted_fixnum(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_identity(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_second_param(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -150,6 +152,21 @@ static void test_transpile_fixture_quoted_fixnum(void) {
     assert((result >> 3) == 99, "quoted fixnum keeps its value");
 }
 
+static void test_transpile_fixture_identity(void) {
+    lisp_val_t arg = os_make_fixnum(7);
+    lisp_val_t evaluated_args = os_make_cons(arg, nil);
+    lisp_val_t result = lisp_ll_transpile_fixture_identity(evaluated_args, 0);
+    assert(result == arg, "identity(x) returns the value bound to its parameter");
+}
+
+static void test_transpile_fixture_second_param(void) {
+    lisp_val_t first = os_make_fixnum(1);
+    lisp_val_t second = os_make_fixnum(2);
+    lisp_val_t evaluated_args = os_make_cons(first, os_make_cons(second, nil));
+    lisp_val_t result = lisp_ll_transpile_fixture_second_param(evaluated_args, 0);
+    assert(result == second, "second-param(x, y) walks evaluated_args via cc_cdr to reach y");
+}
+
 int main(void) {
     setup_heap();
     test_transpile_fixture_answer();
@@ -158,5 +175,7 @@ int main(void) {
     test_transpile_fixture_nil();
     test_transpile_fixture_t();
     test_transpile_fixture_quoted_fixnum();
+    test_transpile_fixture_identity();
+    test_transpile_fixture_second_param();
     return g_test_failed;
 }
