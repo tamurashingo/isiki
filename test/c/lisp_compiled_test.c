@@ -113,6 +113,9 @@ extern lisp_val_t lisp_ll_transpile_fixture_or_empty(lisp_val_t evaluated_args, 
 extern lisp_val_t lisp_ll_transpile_fixture_or_single(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_or_three(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_gc_protect(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_count_down(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_is_even(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_is_odd(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -270,6 +273,36 @@ static void test_transpile_fixture_or_three(void) {
     assert(result_first == x, "or(3引数): 先頭がnil以外ならxで短絡する");
 }
 
+static void test_transpile_fixture_count_down(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_count_down(os_make_cons(os_make_fixnum(3), nil), 0);
+    assert((result & TAG_MASK) == TAG_FIXNUM, "count-down: 自己再帰の結果はfixnum");
+    assert((result >> 3) == 42, "count-down: 3から0まで自己再帰しeqで停止して42を返す");
+
+    // 末尾呼び出しのトランポリン化の検証: 実測(160バイト/フレーム、64KB・
+    // ガード無しのプロセススタック)では素朴なC再帰は約410段でスタックが
+    // 破壊されるが、トランポリンによりCの呼び出しは常にreturnしてから次の
+    // 呼び出しが起きるフラットなループになるため、100000段の自己再帰でも
+    // クラッシュせず定数スタックで完了することを確認する
+    lisp_val_t deep_result = lisp_ll_transpile_fixture_count_down(os_make_cons(os_make_fixnum(100000), nil), 0);
+    assert((deep_result >> 3) == 42, "count-down: トランポリンにより100000段の自己再帰でもスタックを溢れさせずに42を返す");
+}
+
+static void test_transpile_fixture_is_even(void) {
+    lisp_val_t result_even = lisp_ll_transpile_fixture_is_even(os_make_cons(os_make_fixnum(4), nil), 0);
+    assert(result_even == g_sym_t, "is-even: 4は相互再帰でis-oddを経由してtを返す");
+
+    lisp_val_t result_odd = lisp_ll_transpile_fixture_is_even(os_make_cons(os_make_fixnum(3), nil), 0);
+    assert(result_odd == nil, "is-even: 3は相互再帰でis-oddを経由してnilを返す");
+}
+
+static void test_transpile_fixture_is_odd(void) {
+    lisp_val_t result_odd = lisp_ll_transpile_fixture_is_odd(os_make_cons(os_make_fixnum(3), nil), 0);
+    assert(result_odd == g_sym_t, "is-odd: 3は相互再帰でis-evenを経由してtを返す");
+
+    lisp_val_t result_even = lisp_ll_transpile_fixture_is_odd(os_make_cons(os_make_fixnum(4), nil), 0);
+    assert(result_even == nil, "is-odd: 4は相互再帰でis-evenを経由してnilを返す");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -325,6 +358,9 @@ int main(void) {
     test_transpile_fixture_or_empty();
     test_transpile_fixture_or_single();
     test_transpile_fixture_or_three();
+    test_transpile_fixture_count_down();
+    test_transpile_fixture_is_even();
+    test_transpile_fixture_is_odd();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();
