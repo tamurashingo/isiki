@@ -414,26 +414,11 @@
 
 ;; subclassp/%any-subclasspはsrc/lisp/init_aot.lispへ移動した(M12 Phase 2、#27)。
 
-;; instanceがclass-designator(クラスオブジェクトまたはクラス名)のインスタンスかどうか。
-;; class-ofが組み込み型も含めて汎用化されたので、ILOSインスタンス以外の値でも
-;; 正しく判定できる
-(defun typep (instance class-designator)
-  (subclassp (class-of instance)
-             (if (%%classp class-designator) class-designator (%find-class class-designator))))
-
-;; instanceがclass(クラスオブジェクト)のインスタンスかどうか。
-;; 仕様上instancepはclassを評価済みのクラスオブジェクトとして受け取り(typepの
-;; クラス名designatorとは異なる)、クラスオブジェクトでなければdomain-errorを
-;; 発生させるべきだが、<domain-error>が未実装のため既存のtypep(designatorも
-;; クラスオブジェクトも受け付ける、緩い実装)にそのまま委譲する既知の簡略化とする。
-(defun instancep (instance class)
-  (typep instance class))
+;; typep/instancepはsrc/lisp/init_aot.lispへ移動した(M12 Phase 3、#27)。
 
 ;;; --- integerp (§19: number class) ---
 
-;; FIXNUM(60bit以内)とbignum(60bit超)のいずれかであれば整数とみなす。
-(defun integerp (obj)
-  (or (fixnump obj) (bignump obj)))
+;; integerpはsrc/lisp/init_aot.lispへ移動した(M12 Phase 3、#27)。
 
 ;;; --- class / the / assure ---
 ;;;
@@ -666,28 +651,7 @@
                0)
   instance)
 
-;; (class-of obj) → <class>: objが直接属するクラスを返す。ILOSのクラスインスタンス
-;; だけでなく、クラスオブジェクト自身(メタクラス判定)や組み込み型の値も対象とする。
-;; nilはcar/cdr循環consとしてconsp/symbolp両方にマッチしうる内部表現のため、
-;; consp/symbolpより先に判定する必要がある
-(defun class-of (obj)
-  (cond
-    ((%%class-instance-p obj) (%%instance-class obj))
-    ((%%standard-classp obj) (%find-class '<standard-class>))
-    ((%%builtin-classp obj) (%find-class '<built-in-class>))
-    ((null obj) (%find-class '<null>))
-    ((consp obj) (%find-class '<cons>))
-    ((symbolp obj) (%find-class '<symbol>))
-    ((characterp obj) (%find-class '<character>))
-    ((stringp obj) (%find-class '<string>))
-    ((general-vector-p obj) (%find-class '<general-vector>))
-    ((general-array*-p obj) (%find-class '<general-array*>))
-    ((floatp obj) (%find-class '<float>))
-    ((integerp obj) (%find-class '<integer>))
-    ((numberp obj) (%find-class '<number>))
-    ((functionp obj) (%find-class '<function>))
-    ((streamp obj) (%find-class '<stream>))
-    (t (%find-class '<object>))))
+;; class-ofはsrc/lisp/init_aot.lispへ移動した(M12 Phase 3、#27)。
 
 ;;; --- エラー処理とコンディションシステム(§29): signal-condition / with-handler / error / クラス階層 ---
 ;;;

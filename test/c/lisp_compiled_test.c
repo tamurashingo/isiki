@@ -166,6 +166,10 @@ extern lisp_val_t lisp_ll_transpile_fixture_register_builtin_class_then_find(lis
 extern lisp_val_t lisp_ll_transpile_fixture_slot_value_read(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_fill_slots(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_subclassp(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_class_of_builtin(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_class_of_instance(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_typep(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_instancep(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -756,6 +760,45 @@ static void test_transpile_fixture_subclassp(void) {
            "subclassp: 逆方向(親から子)はサブクラスではないのでnilを返す");
 }
 
+static void test_transpile_fixture_class_of_builtin(void) {
+    /* class-ofのconsp分岐は内部で(%find-class '<cons>)を呼ぶため、任意の名前
+       ではなく実際に参照される<CONS>という名前で登録しないとeqが成立しない */
+    lisp_val_t name = os_make_symbol("<CONS>");
+    lisp_val_t obj = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+
+    assert(lisp_ll_transpile_fixture_class_of_builtin(os_make_cons(name, os_make_cons(obj, nil)), 0) == g_sym_t,
+           "class-of: consp分岐が(%find-class '<cons>)経由でその場で%register-builtin-classしたクラスとeqで一致する");
+}
+
+static void test_transpile_fixture_class_of_instance(void) {
+    lisp_val_t class = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("ISIKI-TEST-CLASS-OF-INSTANCE-CLASS"), os_make_cons(nil, os_make_cons(nil, nil))), nil);
+    lisp_val_t instance = primitive_make_instance_raw(os_make_cons(class, os_make_cons(nil, nil)), nil);
+
+    assert(lisp_ll_transpile_fixture_class_of_instance(os_make_cons(instance, nil), 0) == class,
+           "class-of: %%class-instance-p分岐が組み込み型判定より先にinstanceの直接のクラスを返す");
+}
+
+static void test_transpile_fixture_typep_instancep(void) {
+    lisp_val_t class_a = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("ISIKI-TEST-TYPEP-A"), os_make_cons(nil, os_make_cons(nil, nil))), nil);
+    lisp_val_t class_b = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("ISIKI-TEST-TYPEP-B"), os_make_cons(os_make_cons(class_a, nil), os_make_cons(nil, nil))), nil);
+    lisp_val_t instance_b = primitive_make_instance_raw(os_make_cons(class_b, os_make_cons(nil, nil)), nil);
+    lisp_val_t name_a = os_make_symbol("ISIKI-TEST-TYPEP-NAME-A");
+    lisp_val_t classes_sym = os_make_symbol("*CLASSES*");
+    os_set_dynamic(classes_sym, os_make_cons(os_make_cons(name_a, class_a), os_get_dynamic(classes_sym)));
+
+    assert(lisp_ll_transpile_fixture_typep(os_make_cons(instance_b, os_make_cons(class_a, nil)), 0) == g_sym_t,
+           "typep: class-designatorがクラスオブジェクトそのもの(%%classp)の場合、subclassp経由で親クラスに一致する");
+    assert(lisp_ll_transpile_fixture_typep(os_make_cons(instance_b, os_make_cons(name_a, nil)), 0) == g_sym_t,
+           "typep: class-designatorがクラス名シンボルの場合、%find-class経由で解決してから一致する");
+    assert(lisp_ll_transpile_fixture_typep(os_make_cons(instance_b, os_make_cons(class_b, nil)), 0) == g_sym_t,
+           "typep: instance自身のクラスとも一致する");
+    assert(lisp_ll_transpile_fixture_instancep(os_make_cons(instance_b, os_make_cons(class_a, nil)), 0) == g_sym_t,
+           "instancep: typepへの委譲がそのまま成り立つ");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -1037,6 +1080,9 @@ int main(void) {
     test_transpile_fixture_slot_value_read();
     test_transpile_fixture_fill_slots();
     test_transpile_fixture_subclassp();
+    test_transpile_fixture_class_of_builtin();
+    test_transpile_fixture_class_of_instance();
+    test_transpile_fixture_typep_instancep();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

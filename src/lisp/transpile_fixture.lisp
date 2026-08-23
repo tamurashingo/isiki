@@ -443,3 +443,28 @@
   ;; M12 Phase 2(#27): subclassp/%any-subclasspが%%class-supersを再帰的に辿り、
   ;; c1がc2自身または(推移的な)サブクラスかどうかを正しく判定することを確認する
   (subclassp c1 c2))
+
+(defun %%transpile-fixture-class-of-builtin (name obj)
+  ;; M12 Phase 3(#27): class-ofの組み込み型判定分岐(consp/symbolp等)が正しい
+  ;; クラスを解決することを、その場で%register-builtin-classした結果とeq比較で
+  ;; 確認する(%%class-instance-p等の判定より後に評価される分岐であること自体は
+  ;; C側テストが渡すobjの種類で確認する)。letでregisteredをclass-of呼び出しより
+  ;; 先に評価させる必要がある(先に評価しないとclass-ofが未登録名でnilを返す)
+  (let ((registered (%register-builtin-class name nil)))
+    (eq (class-of obj) registered)))
+
+(defun %%transpile-fixture-class-of-instance (instance)
+  ;; M12 Phase 3(#27): class-ofが%%class-instance-p分岐(組み込み型判定より先に
+  ;; 評価される)でinstanceの直接のクラスを正しく返すことを確認する
+  (class-of instance))
+
+(defun %%transpile-fixture-typep (instance class-designator)
+  ;; M12 Phase 3(#27): typepがclass-designatorがクラスオブジェクトそのもの
+  ;; (%%classp)の場合とクラス名シンボル(%find-class経由)の場合の両方で、
+  ;; subclassp経由で正しく判定できることを確認する
+  (typep instance class-designator))
+
+(defun %%transpile-fixture-instancep (instance class)
+  ;; M12 Phase 3(#27): instancepがtypepへ委譲する既知の簡略化のまま正しく
+  ;; 動作することを確認する
+  (instancep instance class))

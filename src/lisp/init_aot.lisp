@@ -364,3 +364,52 @@
       (if (subclassp (car classes) c2)
           t
           (%any-subclassp (cdr classes) c2))))
+
+;;; --- class-of (M12 基盤D, Phase 3, #27) ---
+;;;
+;;; init.lispからの移動。condはexpand-cond(*macro-expanders*)によりネストした
+;;; ifへ展開されるため、macroexpand-all経由で対応済み(新規のexpand-*追加は
+;;; 不要)。typep/instancepはPhase 2では見送っていたが、class-ofが揃ったので
+;;; ここで合わせて移動する。
+
+;; FIXNUM(60bit以内)とbignum(60bit超)のいずれかであれば整数とみなす。
+(defun integerp (obj)
+  (or (fixnump obj) (bignump obj)))
+
+;; objが直接属するクラスを返す。ILOSのクラスインスタンスだけでなく、クラス
+;; オブジェクト自身(メタクラス判定)や組み込み型の値も対象とする。nilは
+;; car/cdr循環consとしてconsp/symbolp両方にマッチしうる内部表現のため、
+;; consp/symbolpより先に判定する必要がある
+(defun class-of (obj)
+  (cond
+    ((%%class-instance-p obj) (%%instance-class obj))
+    ((%%standard-classp obj) (%find-class '<standard-class>))
+    ((%%builtin-classp obj) (%find-class '<built-in-class>))
+    ((null obj) (%find-class '<null>))
+    ((consp obj) (%find-class '<cons>))
+    ((symbolp obj) (%find-class '<symbol>))
+    ((characterp obj) (%find-class '<character>))
+    ((stringp obj) (%find-class '<string>))
+    ((general-vector-p obj) (%find-class '<general-vector>))
+    ((general-array*-p obj) (%find-class '<general-array*>))
+    ((floatp obj) (%find-class '<float>))
+    ((integerp obj) (%find-class '<integer>))
+    ((numberp obj) (%find-class '<number>))
+    ((functionp obj) (%find-class '<function>))
+    ((streamp obj) (%find-class '<stream>))
+    (t (%find-class '<object>))))
+
+;; instanceがclass-designator(クラスオブジェクトまたはクラス名)のインスタンスかどうか。
+;; class-ofが組み込み型も含めて汎用化されたので、ILOSインスタンス以外の値でも
+;; 正しく判定できる
+(defun typep (instance class-designator)
+  (subclassp (class-of instance)
+             (if (%%classp class-designator) class-designator (%find-class class-designator))))
+
+;; instanceがclass(クラスオブジェクト)のインスタンスかどうか。
+;; 仕様上instancepはclassを評価済みのクラスオブジェクトとして受け取り(typepの
+;; クラス名designatorとは異なる)、クラスオブジェクトでなければdomain-errorを
+;; 発生させるべきだが、<domain-error>が未実装のため既存のtypep(designatorも
+;; クラスオブジェクトも受け付ける、緩い実装)にそのまま委譲する既知の簡略化とする。
+(defun instancep (instance class)
+  (typep instance class))

@@ -107,7 +107,29 @@
     ;; M12(#27): slot-valueがインスタンスのスロットベクタから値を読み出すのに使う
     (aref . "primitive_aref")
     ;; M12(#27): subclasspがクラスの直接の親クラス一覧を辿るのに使う
-    (%%class-supers . "primitive_class_supers")))
+    (%%class-supers . "primitive_class_supers")
+    ;; M12基盤D(#27): class-ofが値の種別に応じてpredefinedクラスを解決するのに
+    ;; 使う型判定8個。integerp(既存defun、本Phaseで移動)が使うfixnump/bignumpも
+    ;; 含む
+    (numberp . "primitive_numberp")
+    (fixnump . "primitive_fixnump")
+    (bignump . "primitive_bignump")
+    (floatp . "primitive_floatp")
+    (symbolp . "primitive_symbolp")
+    (consp . "primitive_consp")
+    (characterp . "primitive_characterp")
+    (stringp . "primitive_stringp")
+    (functionp . "primitive_functionp")
+    (general-array*-p . "primitive_array_star_p")
+    (general-vector-p . "primitive_general_vector_p")
+    (streamp . "primitive_streamp")
+    ;; M12(#27): class-ofがインスタンス/クラスオブジェクトの種別を判定するのに使う
+    (%%standard-classp . "primitive_standard_classp")
+    (%%builtin-classp . "primitive_builtin_classp")
+    (%%class-instance-p . "primitive_class_instance_p")
+    ;; M12(#27): typepがclass-designatorがクラスオブジェクトそのものかどうかを
+    ;; 判定するのに使う
+    (%%classp . "primitive_classp")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
