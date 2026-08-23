@@ -353,20 +353,8 @@
 
 ;;; --- create-list / nreverse / maplist / mapl / mapcon (§21.3) ---
 
-;; %create-list-helper/create-listはsrc/lisp/init_aot.lispへ移動した(M14:
-;; 基盤Bの&restパラメータ対応によりAOT対応可能になったため)。
-
-(defun %nreverse-helper (list prev)
-  (if (null list)
-      prev
-      (let ((next (cdr list)))
-        (set-cdr list prev)
-        (%nreverse-helper next list))))
-
-;; reverseの破壊的版。listを構成するconsのcdrをset-cdrで書き換えて反転する
-;; (新しいconsは確保しない)。
-(defun nreverse (list)
-  (%nreverse-helper list nil))
+;; %create-list-helper/create-list/%nreverse-helper/nreverseはsrc/lisp/
+;; init_aot.lispへ移動した(M14: 基盤A/Bによりそれぞれ対応可能になったため)。
 
 ;; maplist/%mapl-1/maplはsrc/lisp/init_aot.lispへ移動した(M13)。mapcanと同様に
 ;; append経由でsublist版mapcanを実装するmapconはappend自体がトランスパイラ未対応

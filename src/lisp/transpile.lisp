@@ -68,7 +68,9 @@
     (cdr . "primitive_cdr")
     (cons . "primitive_cons")
     ;; M14: create-list(%create-list-helper)が停止条件に使う数値等価比較
-    (= . "primitive_num_equal")))
+    (= . "primitive_num_equal")
+    ;; M14: nreverse(%nreverse-helper)が破壊的な反転に使う
+    (set-cdr . "primitive_set_cdr")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)"

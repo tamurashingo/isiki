@@ -111,3 +111,19 @@
 ;; implementation defined)で、本実装では省略時はnilを詰める。
 (defun create-list (n &rest initial-element)
   (%create-list-helper n (if (null initial-element) nil (car initial-element))))
+
+;;; --- nreverse (M14) ---
+;;;
+;;; 基盤A(let/let*のマクロ展開)によりAOT対応可能になったため移動。
+
+(defun %nreverse-helper (list prev)
+  (if (null list)
+      prev
+      (let ((next (cdr list)))
+        (set-cdr list prev)
+        (%nreverse-helper next list))))
+
+;; reverseの破壊的版。listを構成するconsのcdrをset-cdrで書き換えて反転する
+;; (新しいconsは確保しない)。
+(defun nreverse (list)
+  (%nreverse-helper list nil))
