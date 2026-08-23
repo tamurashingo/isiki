@@ -19,7 +19,9 @@
 ;; これによって初めてJIT対象になる。make-instance/slot-value/set-slot-valueは
 ;; 拡張7執筆時点ではインタプリタ実行のままだったが、拡張15(引数位置での一般呼び出し
 ;; ネスト対応)以降はコンパイル対象になった(詳細は後述の該当assert-equal付近の
-;; コメント参照)。
+;; コメント参照)。ただしset-slot-valueはその後M14(#29)でinit_aot.lispへ移動し、
+;; za.c JITではなくAOTトランスパイラの対象になったため、現在は%%za-compiled-p が
+;; nilを返す(詳細は同assert-equal付近のコメント参照)。
 
 ;;; --- 拡張7: quoteシンボルリテラル ---
 ;;
@@ -36,7 +38,13 @@
 ;; 引数位置の一般呼び出しネストに対応したため、現在はコンパイルされる
 ;; (下記のisiki-za-test-point-x/y経由の実行結果でも正しいことを確認する)。
 (assert-equal t (%%za-compiled-p (function slot-value)))
-(assert-equal t (%%za-compiled-p (function set-slot-value)))
+;; set-slot-valueはM14(#29、setf)でinit.lispのdefunからinit_aot.lispのAOT
+;; トランスパイル対象へ移動した(src/lisp/transpile.lisp)。ビルド時にC関数へ直接
+;; 変換され、za.cのJIT(machine語へのランタイムコンパイル)を経由しないネイティブ
+;; 関数として起動時に登録されるため、%%za-compiled-p(za.cが機械語化したかどうかの
+;; 判定)はnilになる——インタプリタへfallbackしているわけではなく、常時コンパイル
+;; 済みという点ではza.c JITより上位の状態にある。
+(assert-equal nil (%%za-compiled-p (function set-slot-value)))
 
 ;; quoteシンボルのコアな機構をILOSと無関係に確認する: eqの第2オペランド位置での
 ;; quoteシンボル比較(za_classify_operandはeqのオペランドにも共有される)。
@@ -63,9 +71,13 @@
 (assert-equal nil (isiki-za-test-rest-only))
 (assert-equal (list 1 2 3) (isiki-za-test-rest-only 1 2 3))
 
-;; init.lispの`list`自身(`(defun list (&rest items) items)`)も同じ形なので、
-;; 合成テスト関数だけでなく実在のライブラリ関数がJIT対象になる実例として確認する。
-(assert-equal t (%%za-compiled-p (function list)))
+;; init.lispの`list`自身(`(defun list (&rest items) items)`)も同じ形だったため、
+;; 元々は合成テスト関数だけでなく実在のライブラリ関数がJIT対象になる実例として
+;; ここで確認していた。M14(#29、list)でinit_aot.lispのAOTトランスパイル対象へ
+;; 移動したため、set-slot-valueと同じ理由でza.c JITを経由しない(%%za-compiled-p
+;; はnilになる)。&restパラメータの値参照自体のJIT対応は直上のisiki-za-test-rest-*
+;; 系(合成テスト関数、init.lispに残置)で引き続き検証できている。
+(assert-equal nil (%%za-compiled-p (function list)))
 
 ;; 固定引数+&restの併用。fixed_count分のcdrを済ませた残りがrestに束縛される。
 (defun isiki-za-test-rest-mixed (a &rest args) args)
