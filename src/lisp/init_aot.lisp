@@ -230,3 +230,14 @@
   (if (null list)
       nil
       (append (funcall fn (car list)) (mapcan fn (cdr list)))))
+
+;;; --- mapcon (M14) ---
+;;;
+;;; appendが基盤B(&rest)によりAOT対応済みになったため移動。maplist/mapcanと
+;;; 同様にsublistへfnを適用するが、結果はappendで連結する(mapcanのsublist版)。
+;;; 仕様上はnconcによる破壊的な連結だが、既存のmapcanと同様にnconcが未実装の
+;;; ためappendで代用する簡略化になっている。
+(defun mapcon (fn list)
+  (if (null list)
+      nil
+      (append (funcall fn list) (mapcon fn (cdr list)))))

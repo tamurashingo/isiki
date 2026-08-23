@@ -147,6 +147,7 @@ extern lisp_val_t lisp_ll_apply(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_mapcar(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_mapc(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_mapcan(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_mapcon(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -656,6 +657,27 @@ static void test_mapcan(void) {
     assert(cc_cdr(cc_cdr(cc_cdr(cc_cdr(result)))) == nil, "mapcan: 4要素で終端する");
 }
 
+// mapconの検証専用: sublistの先頭要素を2回並べたリストを返すネイティブ関数
+// (mapcanと違いsublist自身を受け取ることを、carで取り出す形で検証する)
+static lisp_val_t test_mapcon_double_car_fn(lisp_val_t evaluated_args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t sublist = cc_car(evaluated_args);
+    lisp_val_t x = cc_car(sublist);
+    return os_make_cons(x, os_make_cons(x, nil));
+}
+
+static void test_mapcon(void) {
+    lisp_val_t fn = os_make_native_function((lisp_addr_t)(void *)test_mapcon_double_car_fn);
+    lisp_val_t list1 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
+
+    lisp_val_t result = lisp_ll_mapcon(os_make_cons(fn, os_make_cons(list1, nil)), 0);
+    assert((cc_car(result) >> 3) == 1, "mapcon: (mapcon fn '(1 2))の1番目はfnがsublist(1 2)のcar(1)から作る1");
+    assert((cc_car(cc_cdr(result)) >> 3) == 1, "mapcon: 2番目もfn(sublist (1 2))がappendした2つ目の1");
+    assert((cc_car(cc_cdr(cc_cdr(result))) >> 3) == 2, "mapcon: 3番目はfn(sublist (2))がappendした1つ目の2");
+    assert((cc_car(cc_cdr(cc_cdr(cc_cdr(result)))) >> 3) == 2, "mapcon: 4番目はfn(sublist (2))がappendした2つ目の2");
+    assert(cc_cdr(cc_cdr(cc_cdr(cc_cdr(result)))) == nil, "mapcon: 4要素で終端する");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -743,6 +765,7 @@ int main(void) {
     test_mapcar();
     test_mapc();
     test_mapcan();
+    test_mapcon();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

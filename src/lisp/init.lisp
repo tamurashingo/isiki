@@ -291,17 +291,9 @@
 ;; %create-list-helper/create-list/%nreverse-helper/nreverseはsrc/lisp/
 ;; init_aot.lispへ移動した(M14: 基盤A/Bによりそれぞれ対応可能になったため)。
 
-;; maplist/%mapl-1/maplはsrc/lisp/init_aot.lispへ移動した(M13)。mapcanと同様に
-;; append経由でsublist版mapcanを実装するmapconはappend自体がトランスパイラ未対応
-;; (&rest)なためここに残る。
-
-;; maplistと同様にsublistへfnを適用するが、結果はappendで連結する(mapcanの
-;; sublist版)。仕様上はnconcによる破壊的な連結だが、既存のmapcanと同様に
-;; nconcが未実装のためappendで代用する簡略化になっている。
-(defun mapcon (fn list)
-  (if (null list)
-      nil
-      (append (funcall fn list) (mapcon fn (cdr list)))))
+;; maplist/%mapl-1/maplはsrc/lisp/init_aot.lispへ移動した(M13)。mapconも
+;; src/lisp/init_aot.lispへ移動した(M14: appendが基盤BによりAOT対応済みに
+;; なったため)。
 
 ;;; --- map-into ---
 ;;;
