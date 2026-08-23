@@ -161,3 +161,17 @@
     (if (null idx)
         'eval-error
         (set-aref (%%instance-slots instance) idx value))))
+
+;;; --- apply (M14) ---
+;;;
+;;; 基盤B(&restパラメータ対応)+基盤C(%%apply)によりAOT対応可能になったため移動。
+
+;; objsの最後の要素(list引数)以外を、その手前にconsで連結していく。
+(defun %apply-args (objs)
+  (if (null (cdr objs))
+      (car objs)
+      (cons (car objs) (%apply-args (cdr objs)))))
+
+;; fnを、obj*を個別の引数として、末尾のlistの要素をさらに展開した引数列で呼び出す。
+(defun apply (fn &rest objs)
+  (%%apply fn (%apply-args objs)))

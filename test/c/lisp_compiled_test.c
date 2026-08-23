@@ -143,6 +143,7 @@ extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_nreverse(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_apply(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -590,6 +591,19 @@ static void test_nreverse(void) {
     assert(cc_cdr(cc_cdr(cc_cdr(result))) == nil, "nreverse: (nreverse (1 2 3))は3要素で終端する");
 }
 
+static void test_apply(void) {
+    lisp_val_t add_fn = os_make_native_function((lisp_addr_t)(void *)primitive_add);
+    lisp_val_t tail_list = os_make_cons(os_make_fixnum(3), os_make_cons(os_make_fixnum(4), nil));
+    lisp_val_t evaluated_args = os_make_cons(
+        add_fn,
+        os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), os_make_cons(tail_list, nil))));
+
+    lisp_val_t result = lisp_ll_apply(evaluated_args, 0);
+    assert((result >> 3) == 10,
+           "apply: (apply #'+ 1 2 '(3 4))はobj*(1 2)と末尾list(3 4)を1本の引数リストに"
+           "組み立てて+へ渡し10を返す");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -673,6 +687,7 @@ int main(void) {
     test_append();
     test_create_list();
     test_nreverse();
+    test_apply();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

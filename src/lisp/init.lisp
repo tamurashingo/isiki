@@ -266,19 +266,8 @@
 
 ;;; --- apply (§9) ---
 ;;;
-;;; %%apply(eval.c側の組み込み関数。fnと評価済みの引数リストの2つを取り、
-;;; リストの内容をfnの実引数として展開して呼び出す)を、構文上並べたobj*と
-;;; 末尾のlist引数を1本の引数リストに組み立てた上で呼ぶだけのLisp合成関数。
-
-;; objsの最後の要素(list引数)以外を、その手前にconsで連結していく。
-(defun %apply-args (objs)
-  (if (null (cdr objs))
-      (car objs)
-      (cons (car objs) (%apply-args (cdr objs)))))
-
-;; fnを、obj*を個別の引数として、末尾のlistの要素をさらに展開した引数列で呼び出す。
-(defun apply (fn &rest objs)
-  (%%apply fn (%apply-args objs)))
+;;; %apply-args/applyはsrc/lisp/init_aot.lispへ移動した(M14: 基盤B(&rest対応)+
+;;; 基盤C(%%apply)によりAOT対応可能になったため)。
 
 ;;; --- mapcar / mapc / mapcan ---
 ;;;
