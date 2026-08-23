@@ -155,6 +155,11 @@ extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_stream_early_exit(li
 extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_file(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_with_open_output_stream_early_exit(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_with_open_output_file(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_catch_throw_basic(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_catch_no_throw(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_catch_mismatched_tag(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_catch_throw_runtime_tag(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_catch_with_cleanup(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -637,6 +642,43 @@ static void test_transpile_fixture_with_open_output_file(void) {
            "with-open-output-file: open-output-fileで開いたstreamもwith-open-output-stream経由でcloseが保証される(open-stream-pがnil)");
 }
 
+static void test_transpile_fixture_catch_throw_basic(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_throw_basic(0, 0);
+    assert(result == os_make_fixnum(42),
+           "catch/throw: throwされた値(42)がcatch式全体の値になる");
+}
+
+static void test_transpile_fixture_catch_no_throw(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_no_throw(0, 0);
+    assert(result == os_make_fixnum(3),
+           "catch: throwが起きない場合はprognと同じくbody最後のformの値を返す");
+}
+
+static void test_transpile_fixture_catch_mismatched_tag(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_mismatched_tag(0, 0);
+    assert(result == os_make_fixnum(99),
+           "catch/throw: タグが一致しない内側のcatchは素通りし、一致する外側のcatchで捕捉される");
+}
+
+static void test_transpile_fixture_catch_throw_runtime_tag(void) {
+    lisp_val_t tag = os_make_symbol("ISIKI-TEST-DYNAMIC-TAG");
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_throw_runtime_tag(os_make_cons(tag, nil), 0);
+    assert(cc_car(result) == os_make_symbol("CAUGHT"),
+           "catch/throw: タグは実行時に評価された値同士のeq比較で一致する");
+    assert(cc_cdr(result) == tag,
+           "catch/throw: throwに渡した実行時タグの値がそのまま伝わる");
+}
+
+static void test_transpile_fixture_catch_with_cleanup(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_with_cleanup(0, 0);
+    lisp_val_t exit_value = cc_car(result);
+    lisp_val_t count = cc_cdr(result);
+    assert(exit_value == os_make_fixnum(7),
+           "catch/throw: unwind-protectのprotected-form中のthrowの値がcatch式全体の値として伝播する");
+    assert(count == os_make_fixnum(1),
+           "catch/throw: throwによる非局所脱出であってもunwind-protectのcleanup-formは必ず実行される");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -907,6 +949,11 @@ int main(void) {
     test_transpile_fixture_with_open_input_file();
     test_transpile_fixture_with_open_output_stream_early_exit();
     test_transpile_fixture_with_open_output_file();
+    test_transpile_fixture_catch_throw_basic();
+    test_transpile_fixture_catch_no_throw();
+    test_transpile_fixture_catch_mismatched_tag();
+    test_transpile_fixture_catch_throw_runtime_tag();
+    test_transpile_fixture_catch_with_cleanup();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

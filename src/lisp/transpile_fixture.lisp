@@ -374,3 +374,38 @@
     (with-open-output-file (s "fake/path")
       (setq captured s))
     (open-stream-p captured)))
+
+(defun %%transpile-fixture-catch-throw-basic ()
+  ;; M12基盤A: catch/throwの基本検証。throwされた値がcatch式全体の値になる
+  (catch 'tag (throw 'tag 42)))
+
+(defun %%transpile-fixture-catch-no-throw ()
+  ;; M12基盤A: throwが起きない場合、catchはbodyをprognと同じく評価し最後の
+  ;; formの値を返す(eval_catchの通常完了経路)
+  (catch 'tag 1 2 3))
+
+(defun %%transpile-fixture-catch-mismatched-tag ()
+  ;; M12基盤A: throwのタグが動的なeq比較であることの検証。内側のcatchは
+  ;; タグ'outerと一致しないため素通りし(os_control_transfer_name != tag)、
+  ;; 外側のcatchまで伝播して捕捉されることを確認する
+  (catch 'outer
+    (catch 'inner
+      (throw 'outer 99))))
+
+(defun %%transpile-fixture-catch-throw-runtime-tag (tag)
+  ;; M12基盤A: catch/throwのタグがblock/return-fromと違い実行時に評価された
+  ;; 値同士のeq比較であることの検証。タグは静的なquoteシンボルではなく
+  ;; パラメータ経由で渡された実行時の値
+  (catch tag (throw tag (cons 'caught tag))))
+
+(defun %%transpile-fixture-catch-with-cleanup ()
+  ;; M12基盤A: throwがunwind-protectのprotected-formを非局所脱出として貫通
+  ;; する際も、eval_unwind_protectと同じくcleanup-formは必ず実行され、その上で
+  ;; throwのシグナルがそのままcatchまで伝播することを確認する
+  (let ((count 0))
+    (cons
+     (catch 'tag
+       (unwind-protect
+           (throw 'tag 7)
+         (setq count (+ count 1))))
+     count)))

@@ -575,6 +575,10 @@
      (transpile-tagbody expr scope))
     ((and (consp expr) (eq (car expr) 'unwind-protect))
      (transpile-unwind-protect expr scope))
+    ((and (consp expr) (eq (car expr) 'catch))
+     (transpile-catch expr scope))
+    ((and (consp expr) (eq (car expr) 'throw) (= (length expr) 3))
+     (transpile-throw expr scope))
     ((and (consp expr) (symbolp (car expr)))
      (transpile-call expr scope))
     ((and (consp expr) (consp (car expr)) (eq (car (car expr)) 'lambda) (= (length (car expr)) 3))
@@ -840,6 +844,48 @@
               temp (transpile-expr protected-form scope) temp
               (transpile-progn-forms cleanup-forms scope)
               temp))))
+
+(defparameter *catch-temp-counter* 0)
+
+(defun transpile-catch (expr scope)
+  "(catch tag-form form*)。eval_catch(eval.c)と同じ意味論: tag-formを1回
+   評価し(非局所脱出シグナルならそのまま伝播)、その値をGC_PROTECTしたCローカル
+   変数(タグ比較のeq判定に使う実行時値、block/return-fromの静的quoteシンボルとは
+   違い動的な値なので毎回tag-form自身を評価する)へ保存する。bodyは
+   transpile-progn-formsで評価し、その結果がMAGIC_CATCH_EXITでタグがeq
+   (Cの==、tagはlisp_val_tなポインタ/即値エンコーディングなので値比較で
+   eqと等価)であればos_control_transfer_valueで包みを外し、それ以外(通常の値、
+   タグが一致しないthrow、block/tagbodyの他シグナル)はそのまま伝播させる"
+  (destructuring-bind (catch-kw tag-form &rest body) expr
+    (declare (ignore catch-kw))
+    (let ((tag-temp (format nil "__catch_tag_~A" (incf *catch-temp-counter*)))
+          (body-temp (format nil "__catch_body_~A" (incf *catch-temp-counter*))))
+      (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : ({ lisp_val_t ~A = (~A); GC_PROTECT(~A); (os_is_control_transfer(~A) && os_control_transfer_magic(~A) == MAGIC_CATCH_EXIT && os_control_transfer_name(~A) == ~A) ? os_control_transfer_value(~A) : ~A; }); })"
+              tag-temp (transpile-expr tag-form scope) tag-temp
+              tag-temp tag-temp
+              body-temp (transpile-progn-forms body scope) body-temp
+              body-temp body-temp body-temp tag-temp
+              body-temp body-temp))))
+
+(defparameter *throw-temp-counter* 0)
+
+(defun transpile-throw (expr scope)
+  "(throw tag-form result-form)。eval_throw(eval.c)と同じ意味論: tag-form・
+   result-formをこの順に1回だけ評価し(いずれかが非局所脱出シグナルならそのまま
+   伝播、GC_PROTECTは各値のos_make_instance呼び出しまでGCで移動しうるtempを
+   保護するため)、両方が通常値ならMAGIC_CATCH_EXITのシグナル値(tag+result)を
+   作って返す。対応するcatchが動的に外側に無い場合、シグナルはそのまま最上位まで
+   伝播する(eval_throwのコメントと同じ既知の簡略化)"
+  (destructuring-bind (throw-kw tag-form result-form) expr
+    (declare (ignore throw-kw))
+    (let ((tag-temp (format nil "__throw_tag_~A" (incf *throw-temp-counter*)))
+          (val-temp (format nil "__throw_val_~A" (incf *throw-temp-counter*))))
+      (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : ({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : os_make_instance(MAGIC_CATCH_EXIT, ~A, ~A, nil); }); })"
+              tag-temp (transpile-expr tag-form scope) tag-temp
+              tag-temp tag-temp
+              val-temp (transpile-expr result-form scope) val-temp
+              val-temp val-temp
+              tag-temp val-temp))))
 
 (defparameter *lambda-name-counter* 0)
 (defparameter *lifted-lambda-decls* nil
