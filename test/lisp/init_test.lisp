@@ -444,6 +444,26 @@
     (report-condition (make-instance '<control-error>) s)
     (string-to-symbol (get-output-stream-string s))))
 
+(assert-equal (string-to-symbol "arithmetic error: / (1 0)")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<arithmetic-error> ':operation '/ ':operands (list 1 0)) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+(assert-equal (string-to-symbol "5 is not of expected class <number>")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<domain-error> ':object 5 ':expected-class '<number>) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+(assert-equal (string-to-symbol "cannot parse abc as <integer>")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<parse-error> ':string "abc" ':expected-class '<integer>) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+(assert-equal (string-to-symbol "stream error on my-stream")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<stream-error> ':stream 'my-stream) s)
+    (string-to-symbol (get-output-stream-string s))))
+
 ;;; --- dynamic-let / set-dynamic ---
 
 (defdynamic *dl-test* 1)
