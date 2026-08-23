@@ -912,3 +912,16 @@ line2"))
 ;; cf. p.122 (identity '(a b c)) の例。値を変更。
 (assert-equal 5 (identity 5))
 (assert-equal 'a (identity 'a))
+
+
+;; M12 Phase7(#27)の恒久リグレッションテスト: %abort-top-levelがAOT化された後も、
+;; return-from %top-levelの非局所脱出がos_eval_top_level(このトップレベルフォーム
+;; 自身を包むblock %top-level)まで正しく伝播することを確認する(未解決リスク②)。
+;; %%test-aot-call-abort-top-levelは%%funcall-by-name経由でAOTコード内から呼ばれた
+;; 場合の伝播を、直後の(%abort-top-level ...)は通常のトップレベル関数呼び出しから
+;; AOTのreturn-fromが素通りするかを確認する。いずれも単独のトップレベルフォームなので
+;; block %top-levelは毎回新規に張られ、後続のフォームには影響しない。続く
+;; (assert-equal t t)まで正常に到達することが、伝播が壊れていない証拠になる
+(%%test-aot-call-abort-top-level 'isiki-test-phase7-abort-marker-1)
+(%abort-top-level 'isiki-test-phase7-abort-marker-2)
+(assert-equal t t)

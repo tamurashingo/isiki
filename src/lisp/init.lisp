@@ -589,10 +589,7 @@
            (progn ,@body)
          (%%set-dynamic '*handlers* ,saved)))))
 
-;; トップレベルでcatchされなかったconditionをabortする。os_eval_top_level(C側)が
-;; 張っているblock %TOP-LEVELへreturn-fromする。
-(defun %abort-top-level (condition)
-  (return-from %top-level condition))
+;; %abort-top-levelはsrc/lisp/init_aot.lispへ移動した(M12 Phase 7、#27)。
 
 ;; *handlers*の先頭(最も内側)のhandler-functionを、一時的に自分自身を取り除いた状態で
 ;; 呼び出す(ハンドラ内でのsignal-conditionが次の外側のハンドラに渡るようにするため)。

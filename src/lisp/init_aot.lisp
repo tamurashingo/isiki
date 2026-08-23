@@ -569,3 +569,23 @@
          (instance (%%make-instance-raw class (make-array (length (%%class-slots class))))))
     (%generic-call 'initialize-object (list instance initargs))
     instance))
+
+;;; --- 条件システム: トップレベルへのabort (M12 Phase 7, #27) ---
+;;;
+;;; init.lispからの移動。条件クラス階層(<condition>〜<storage-exhausted>)と
+;;; *handlers*のdefdynamic、with-handlerマクロ自体はdefclass/defdynamic/defmacroが
+;;; 常にインタプリタ実行される(mainがdefun以外を無視するため)ため移動不要
+;;; (計画のPhase7節参照)。移動前に、AOTコード内で発生したreturn-from %top-levelの
+;;; 非局所脱出がos_eval_top_level/eval_blockまで正しく伝播するかをQEMU実機で
+;;; 確認した(未解決リスク②)。%%test-aot-call-abort-top-levelはその確認用の
+;;; 恒久リグレッションテストで、%%funcall-by-name経由でAOTコードから呼ばれた
+;;; 関数がreturn-fromの非局所脱出シグナルを返した場合の伝播を検証する
+;;; (test/lisp/isiki_test.lisp参照)。
+
+;; トップレベルでcatchされなかったconditionをabortする。os_eval_top_level(C側)が
+;; 張っているblock %TOP-LEVELへreturn-fromする。
+(defun %abort-top-level (condition)
+  (return-from %top-level condition))
+
+(defun %%test-aot-call-abort-top-level (marker)
+  (%%funcall-by-name '%abort-top-level marker))
