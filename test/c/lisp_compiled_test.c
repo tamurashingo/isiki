@@ -144,6 +144,9 @@ extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_nreverse(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_apply(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_mapcar(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_mapc(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_mapcan(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -604,6 +607,55 @@ static void test_apply(void) {
            "組み立てて+へ渡し10を返す");
 }
 
+static void test_mapcar(void) {
+    lisp_val_t add_fn = os_make_native_function((lisp_addr_t)(void *)primitive_add);
+    lisp_val_t list1 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil)));
+    lisp_val_t list2 = os_make_cons(os_make_fixnum(10), os_make_cons(os_make_fixnum(20), os_make_cons(os_make_fixnum(30), nil)));
+
+    lisp_val_t result = lisp_ll_mapcar(os_make_cons(add_fn, os_make_cons(list1, os_make_cons(list2, nil))), 0);
+    assert((cc_car(result) >> 3) == 11, "mapcar: (mapcar #'+ '(1 2 3) '(10 20 30))の1番目は1+10=11");
+    assert((cc_car(cc_cdr(result)) >> 3) == 22, "mapcar: 2番目は2+20=22");
+    assert((cc_car(cc_cdr(cc_cdr(result))) >> 3) == 33, "mapcar: 3番目は3+30=33");
+    assert(cc_cdr(cc_cdr(cc_cdr(result))) == nil, "mapcar: 3要素で終端する");
+}
+
+// mapcの検証専用: funcallされた回数だけ要素の値を積算する副作用付きネイティブ関数
+static int g_mapc_side_effect_sum = 0;
+static lisp_val_t test_mapc_side_effect_fn(lisp_val_t evaluated_args, lisp_val_t env) {
+    (void)env;
+    g_mapc_side_effect_sum += (cc_car(evaluated_args) >> 3);
+    return nil;
+}
+
+static void test_mapc(void) {
+    g_mapc_side_effect_sum = 0;
+    lisp_val_t fn = os_make_native_function((lisp_addr_t)(void *)test_mapc_side_effect_fn);
+    lisp_val_t list1 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil)));
+
+    lisp_val_t result = lisp_ll_mapc(os_make_cons(fn, os_make_cons(list1, nil)), 0);
+    assert(result == list1, "mapc: 副作用目的でfnを適用した後、list自身を返す");
+    assert(g_mapc_side_effect_sum == 6, "mapc: fnがlistの各要素(1,2,3)に対してfuncallされ、副作用の合計が1+2+3=6になる");
+}
+
+// mapcanの検証専用: xを2回並べたリストを返すネイティブ関数(mapcanのappend連結の検証用)
+static lisp_val_t test_mapcan_double_fn(lisp_val_t evaluated_args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t x = cc_car(evaluated_args);
+    return os_make_cons(x, os_make_cons(x, nil));
+}
+
+static void test_mapcan(void) {
+    lisp_val_t fn = os_make_native_function((lisp_addr_t)(void *)test_mapcan_double_fn);
+    lisp_val_t list1 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
+
+    lisp_val_t result = lisp_ll_mapcan(os_make_cons(fn, os_make_cons(list1, nil)), 0);
+    assert((cc_car(result) >> 3) == 1, "mapcan: (mapcan fn '(1 2))の1番目は1");
+    assert((cc_car(cc_cdr(result)) >> 3) == 1, "mapcan: 2番目もfn(1)がappendした2つ目の1");
+    assert((cc_car(cc_cdr(cc_cdr(result))) >> 3) == 2, "mapcan: 3番目はfn(2)がappendした1つ目の2");
+    assert((cc_car(cc_cdr(cc_cdr(cc_cdr(result)))) >> 3) == 2, "mapcan: 4番目はfn(2)がappendした2つ目の2");
+    assert(cc_cdr(cc_cdr(cc_cdr(cc_cdr(result)))) == nil, "mapcan: 4要素で終端する");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -688,6 +740,9 @@ int main(void) {
     test_create_list();
     test_nreverse();
     test_apply();
+    test_mapcar();
+    test_mapc();
+    test_mapcan();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

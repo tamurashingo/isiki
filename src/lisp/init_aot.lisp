@@ -175,3 +175,58 @@
 ;; fnを、obj*を個別の引数として、末尾のlistの要素をさらに展開した引数列で呼び出す。
 (defun apply (fn &rest objs)
   (%%apply fn (%apply-args objs)))
+
+;;; --- mapcar / mapc / mapcan (M14) ---
+;;;
+;;; 基盤B(&restパラメータ対応)+%%apply(基盤C、既にapplyで追加済み)により
+;;; AOT対応可能になったため移動。fnは評価済みの値として受け取り、Lisp2スコープの
+;;; 制約でfnを直接呼べないため、funcall/%%apply(いずれもeval.c側の組み込み関数)を
+;;; 介して呼び出す。mapcarのみ複数リストに対応し、mapc/mapcanは単一のリストのみを
+;;; 受け取る簡略版のままとする。
+
+;; list-of-listsの各要素(サブリスト)のcarを集めたリストを返す。
+(defun %lists-car (lists)
+  (if (null lists)
+      nil
+      (cons (car (car lists)) (%lists-car (cdr lists)))))
+
+;; list-of-listsの各要素(サブリスト)のcdrを集めたリストを返す。
+(defun %lists-cdr (lists)
+  (if (null lists)
+      nil
+      (cons (cdr (car lists)) (%lists-cdr (cdr lists)))))
+
+;; list-of-listsの中に、空リストになっているものが1つでもあればtを返す。
+(defun %lists-some-null (lists)
+  (if (null lists)
+      nil
+      (if (null (car lists))
+          t
+          (%lists-some-null (cdr lists)))))
+
+;; listsの対応する位置の要素をまとめてfnに渡し(%%apply経由)、結果を集めたリストを
+;; 返す。最短のリストが尽きた時点で終了し、他のリストの余った要素は無視する。
+(defun %mapcar-lists (fn lists)
+  (if (or (null lists) (%lists-some-null lists))
+      nil
+      (cons (%%apply fn (%lists-car lists))
+            (%mapcar-lists fn (%lists-cdr lists)))))
+
+;; listの各要素にfnを適用した結果を集めたリストを返す(1つ以上のリストを受け取れる)。
+(defun mapcar (fn &rest lists)
+  (%mapcar-lists fn lists))
+
+(defun %mapc-1 (fn list)
+  (if (null list)
+      nil
+      (progn (funcall fn (car list)) (%mapc-1 fn (cdr list)))))
+
+;; listの各要素にfnを副作用目的で適用し、list自身を返す。
+(defun mapc (fn list)
+  (progn (%mapc-1 fn list) list))
+
+;; listの各要素にfnを適用した結果(リストであることを期待する)をappendで連結して返す。
+(defun mapcan (fn list)
+  (if (null list)
+      nil
+      (append (funcall fn (car list)) (mapcan fn (cdr list)))))

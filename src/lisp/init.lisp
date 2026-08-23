@@ -270,59 +270,10 @@
 ;;; 基盤C(%%apply)によりAOT対応可能になったため)。
 
 ;;; --- mapcar / mapc / mapcan ---
-;;;
-;;; いずれもfnを評価済みの値として受け取り、関数呼び出しの形はLisp2スコープの
-;;; 制約で(f x)のようには書けない(fが変数に束縛された関数値の場合、それは
-;;; 関数namespaceではなく変数namespaceにあるため)。そのため、funcall(eval.c側の
-;;; 組み込み関数)を介してfnを呼び出す。mapcarのみ複数リストに対応し、
-;;; mapc/mapcanは単一のリストのみを受け取る簡略版のままとする。
 
-;; list-of-listsの各要素(サブリスト)のcarを集めたリストを返す。
-(defun %lists-car (lists)
-  (if (null lists)
-      nil
-      (cons (car (car lists)) (%lists-car (cdr lists)))))
-
-;; list-of-listsの各要素(サブリスト)のcdrを集めたリストを返す。
-(defun %lists-cdr (lists)
-  (if (null lists)
-      nil
-      (cons (cdr (car lists)) (%lists-cdr (cdr lists)))))
-
-;; list-of-listsの中に、空リストになっているものが1つでもあればtを返す。
-(defun %lists-some-null (lists)
-  (if (null lists)
-      nil
-      (if (null (car lists))
-          t
-          (%lists-some-null (cdr lists)))))
-
-;; listsの対応する位置の要素をまとめてfnに渡し(%%apply経由)、結果を集めたリストを
-;; 返す。最短のリストが尽きた時点で終了し、他のリストの余った要素は無視する。
-(defun %mapcar-lists (fn lists)
-  (if (or (null lists) (%lists-some-null lists))
-      nil
-      (cons (%%apply fn (%lists-car lists))
-            (%mapcar-lists fn (%lists-cdr lists)))))
-
-;; listの各要素にfnを適用した結果を集めたリストを返す(1つ以上のリストを受け取れる)。
-(defun mapcar (fn &rest lists)
-  (%mapcar-lists fn lists))
-
-(defun %mapc-1 (fn list)
-  (if (null list)
-      nil
-      (progn (funcall fn (car list)) (%mapc-1 fn (cdr list)))))
-
-;; listの各要素にfnを副作用目的で適用し、list自身を返す。
-(defun mapc (fn list)
-  (progn (%mapc-1 fn list) list))
-
-;; listの各要素にfnを適用した結果(リストであることを期待する)をappendで連結して返す。
-(defun mapcan (fn list)
-  (if (null list)
-      nil
-      (append (funcall fn (car list)) (mapcan fn (cdr list)))))
+;; %lists-car/%lists-cdr/%lists-some-null/%mapcar-lists/mapcar/%mapc-1/mapc/
+;; mapcanはsrc/lisp/init_aot.lispへ移動した(M14: 基盤B(&rest)+
+;; *primitive-c-names*の%%apply追加によりAOT対応可能になったため)。
 
 ;;; --- append / reverse ---
 ;;;
