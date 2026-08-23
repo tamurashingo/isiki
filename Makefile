@@ -74,7 +74,7 @@ TEST_BIN_P9 = $(BUILD_TMPDIR)/p9_test
 TEST_SRC_VIRTIO9P = $(SRCDIR)/p9.c $(SRCDIR)/virtio9p.c $(TESTDIR)/virtio9p_test.c
 TEST_BIN_VIRTIO9P = $(BUILD_TMPDIR)/virtio9p_test
 
-TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(LISP_COMPILED) $(TESTDIR)/lisp_compiled_test.c
+TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/print.c $(LISP_COMPILED) $(TESTDIR)/lisp_compiled_test.c
 TEST_BIN_LISP_COMPILED = $(BUILD_TMPDIR)/lisp_compiled_test
 
 

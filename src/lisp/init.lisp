@@ -594,22 +594,7 @@
 ;; signal-condition/condition-continuable/continue-conditionはsrc/lisp/init_aot.lispへ
 ;; 移動した(M12 Phase 8、#27)。
 
-(defun error (format-string &rest format-arguments)
-  (signal-condition
-    (make-instance '<simple-error> ':format-string format-string ':format-arguments format-arguments)
-    nil))
-
-;; (cerror continue-string error-string obj*) → <object> : spec 6966-6980行の等価定義通り、
-;; continue-stringとerror-stringのいずれもobj*でformatする素材として<simple-error>に積み、
-;; continuableには「continue-stringをformatした文字列」を渡す(signal-conditionが正常return
-;; した場合、あるいはハンドラがcontinue-conditionでvalueを渡した場合、その値がcerrorの
-;; 戻り値になる)。
-(defun cerror (continue-string error-string &rest objs)
-  (signal-condition
-    (make-instance '<simple-error> ':format-string error-string ':format-arguments objs)
-    (let ((str (create-string-output-stream)))
-      (%%apply #'format (cons str (cons continue-string objs)))
-      (get-output-stream-string str))))
+;; error/cerrorはsrc/lisp/init_aot.lispへ移動した(M12 Phase 9、#27)。
 
 ;;; --- condition accessors (§29.3) ---
 ;;;

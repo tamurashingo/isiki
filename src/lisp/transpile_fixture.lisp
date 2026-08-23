@@ -564,3 +564,82 @@
               (let ((result (funcall (car handlers) marker)))
                 result))
           (%%set-dynamic '*%%fixture-dyn* handlers))))))
+
+(defun %%transpile-fixture-error (format-string format-argument)
+  ;; M12 Phase 9(#27): errorがcontinuable=nilでsignal-conditionを呼び、
+  ;; <simple-error>のformat-string/format-argumentsスロットへ正しく積むことを
+  ;; 直接確認する。このC側テスト環境はinit.lispをロードしないため<simple-error>
+  ;; クラス自身が存在しない。error/cerrorの本体がハードコードしている
+  ;; '<simple-error>というクラス名に対し、%%transpile-fixture-make-instanceと
+  ;; 同じ方法で最小限のテスト用クラス+initialize-objectメソッドを登録してから
+  ;; 呼ぶ。errorはcontinuable=nilでsignal-conditionを呼ぶため、ハンドラが普通に
+  ;; returnすると%abort-top-levelへフォールバックしてしまい観測できない
+  ;; (%top-levelブロックはこのfixture内には無い)。そのためこのfixture自身が
+  ;; 張るblockへreturn-fromするハンドラを1つ*handlers*へ積んでから呼ぶ
+  (let ((class (%%make-class-raw '<simple-error> nil
+                                  (list (list 'format-string ':format-string (lambda () nil))
+                                        (list 'format-arguments ':format-arguments (lambda () nil))
+                                        (list '%continuable nil (lambda () nil))
+                                        (list '%continue-tag nil (lambda () nil))))))
+    (progn
+      (%register-class '<simple-error> class)
+      (%register-method 'initialize-object (list nil nil)
+        (lambda (instance initargs)
+          (%fill-slots (%%instance-slots instance)
+                       (%slot-initial-values (%%class-slots (%%instance-class instance)) initargs)
+                       0)))
+      (block %%fixture-error-result
+        (progn
+          (%%set-dynamic '*handlers*
+            (cons (lambda (c)
+                    (return-from %%fixture-error-result
+                      (cons (slot-value c 'format-string) (slot-value c 'format-arguments))))
+                  nil))
+          (error format-string format-argument))))))
+
+(defun %%transpile-fixture-cerror-no-handler (continue-string error-string obj)
+  ;; M12 Phase 9(#27): cerrorがformat/create-string-output-stream/
+  ;; get-output-stream-string(M12基盤F、#'format経由の可変長%%apply含む)を使って
+  ;; continue-stringをobjでformatした文字列を計算しつつ、*handlers*が空の場合は
+  ;; signal-conditionの「(if (null handlers) (if continuable nil ...))」分岐へ
+  ;; 入り、continuableが真(文字列)でもハンドラが無ければnilを返すことを確認する。
+  ;; #'format/%%apply/create-string-output-stream/get-output-stream-streamの
+  ;; いずれかに問題があればformat計算自体で落ちるため、戻り値がnilであること
+  ;; 自体がこの機構全体の健全性を示す
+  (let ((class (%%make-class-raw '<simple-error> nil
+                                  (list (list 'format-string ':format-string (lambda () nil))
+                                        (list 'format-arguments ':format-arguments (lambda () nil))
+                                        (list '%continuable nil (lambda () nil))
+                                        (list '%continue-tag nil (lambda () nil))))))
+    (progn
+      (%register-class '<simple-error> class)
+      (%register-method 'initialize-object (list nil nil)
+        (lambda (instance initargs)
+          (%fill-slots (%%instance-slots instance)
+                       (%slot-initial-values (%%class-slots (%%instance-class instance)) initargs)
+                       0)))
+      (%%set-dynamic '*handlers* nil)
+      (cerror continue-string error-string obj))))
+
+(defun %%transpile-fixture-cerror-with-handler (continue-string error-string obj)
+  ;; M12 Phase 9(#27): *handlers*に「普通にreturnする」ハンドラが居る場合、
+  ;; continuableが真(formatした文字列)なのでsignal-conditionは
+  ;; %abort-top-levelへフォールバックせずハンドラの戻り値をそのまま返す経路
+  ;; (「ハンドラが正常return、continuable=t」。M12 Phase8計画項15で要求されて
+  ;; いたがsignal-conditionを直接呼ぶテストが無く未検証だった経路)を、cerror
+  ;; 経由で直接確認する
+  (let ((class (%%make-class-raw '<simple-error> nil
+                                  (list (list 'format-string ':format-string (lambda () nil))
+                                        (list 'format-arguments ':format-arguments (lambda () nil))
+                                        (list '%continuable nil (lambda () nil))
+                                        (list '%continue-tag nil (lambda () nil))))))
+    (progn
+      (%register-class '<simple-error> class)
+      (%register-method 'initialize-object (list nil nil)
+        (lambda (instance initargs)
+          (%fill-slots (%%instance-slots instance)
+                       (%slot-initial-values (%%class-slots (%%instance-class instance)) initargs)
+                       0)))
+      (%%set-dynamic '*handlers*
+        (cons (lambda (c) (cons 'handled (slot-value c 'format-string))) nil))
+      (cerror continue-string error-string obj))))

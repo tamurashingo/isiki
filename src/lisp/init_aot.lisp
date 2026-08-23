@@ -627,3 +627,23 @@
 ;; signal-conditionの呼び出しへ、catchタグを介してvalue(既定nil)を返して復帰する。
 (defun continue-condition (condition &rest value)
   (throw (slot-value condition '%continue-tag) (if value (car value) nil)))
+
+;; M12 Phase9(#27): error/cerrorをsrc/lisp/init.lispからここへ移動。
+(defun error (format-string &rest format-arguments)
+  (signal-condition
+    (make-instance '<simple-error> ':format-string format-string ':format-arguments format-arguments)
+    nil))
+
+;; (cerror continue-string error-string obj*) → <object> : spec 6966-6980行の等価定義通り、
+;; continue-stringとerror-stringのいずれもobj*でformatする素材として<simple-error>に積み、
+;; continuableには「continue-stringをformatした文字列」を渡す(signal-conditionが正常return
+;; した場合、あるいはハンドラがcontinue-conditionでvalueを渡した場合、その値がcerrorの
+;; 戻り値になる)。formatは可変長引数を取るため、objs(&restの実引数リスト)をそのまま
+;; %%apply経由で渡す必要があり、#'format(function特殊形式、M12基盤F)でformatの関数値を
+;; 取得する。
+(defun cerror (continue-string error-string &rest objs)
+  (signal-condition
+    (make-instance '<simple-error> ':format-string error-string ':format-arguments objs)
+    (let ((str (create-string-output-stream)))
+      (%%apply #'format (cons str (cons continue-string objs)))
+      (get-output-stream-string str))))

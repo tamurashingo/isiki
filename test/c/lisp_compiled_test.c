@@ -180,6 +180,9 @@ extern lisp_val_t lisp_ll_transpile_fixture_call_next_method_no_next(lisp_val_t 
 extern lisp_val_t lisp_ll_transpile_fixture_make_instance(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_nested_let_dynamic_restore(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_signal_condition_like(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_error(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_cerror_no_handler(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_cerror_with_handler(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -974,6 +977,61 @@ static void test_transpile_fixture_signal_condition_nonlocal(void) {
            "signal-condition-nonlocal: return-fromによる非局所脱出でもunwind-protectのcleanupが実行され*%%fixture-dyn*が元のhandlersへ復元される");
 }
 
+static void test_transpile_fixture_error(void) {
+    /* M12 Phase 9(#27): errorが継続不可(continuable=nil)でsignal-conditionを
+       呼び、<simple-error>のformat-string/format-argumentsスロットへ引数を
+       正しく積むことを直接確認する。continuable=nilの経路はハンドラが普通に
+       returnすると%abort-top-levelへフォールバックしてしまうため、fixture自身が
+       張るblockへreturn-fromするハンドラを使って結果を観測する */
+    lisp_val_t format_string = os_make_string("error: ~A");
+    lisp_val_t format_argument = os_make_fixnum(42);
+
+    lisp_val_t result = lisp_ll_transpile_fixture_error(
+        os_make_cons(format_string, os_make_cons(format_argument, nil)), 0);
+
+    assert(cc_car(result) == format_string,
+           "error: <simple-error>のformat-stringスロットに渡したformat-string自身が積まれる");
+    assert(cc_car(cc_cdr(result)) == format_argument,
+           "error: <simple-error>のformat-argumentsスロットに&restで束縛したformat-argumentsが積まれる");
+    assert(cc_cdr(cc_cdr(result)) == nil,
+           "error: format-argumentsは(format-argument)という1要素のリストになる");
+}
+
+static void test_transpile_fixture_cerror_no_handler(void) {
+    /* M12 Phase 9(#27): cerrorが#'format(M12基盤F、可変長objsを%%apply経由で
+       渡す新規transpiler機能)+create-string-output-stream+
+       get-output-stream-streamでcontinuable文字列を計算した上で、*handlers*が
+       空ならsignal-conditionの「continuable=真でもハンドラが無ければnilを返す」
+       分岐に入ることを確認する。format計算自体に問題があればここで直接落ちる */
+    lisp_val_t continue_string = os_make_string("continue: ~A");
+    lisp_val_t error_string = os_make_string("error: ~A");
+    lisp_val_t obj = os_make_fixnum(42);
+
+    lisp_val_t result = lisp_ll_transpile_fixture_cerror_no_handler(
+        os_make_cons(continue_string, os_make_cons(error_string, os_make_cons(obj, nil))), 0);
+
+    assert(result == nil,
+           "cerror: ハンドラが無い場合、continuableが真でもnilを返す");
+}
+
+static void test_transpile_fixture_cerror_with_handler(void) {
+    /* M12 Phase 9(#27): *handlers*に「普通にreturnする」ハンドラが居る場合、
+       continuableが真(formatした文字列)なのでsignal-conditionは
+       %abort-top-levelへフォールバックせずハンドラの戻り値をそのまま返す経路
+       (M12 Phase8計画項15で要求されていたが直接テストが無かった経路)を確認する */
+    lisp_val_t continue_string = os_make_string("continue: ~A");
+    lisp_val_t error_string = os_make_string("error: ~A");
+    lisp_val_t obj = os_make_fixnum(42);
+
+    lisp_val_t result = lisp_ll_transpile_fixture_cerror_with_handler(
+        os_make_cons(continue_string, os_make_cons(error_string, os_make_cons(obj, nil))), 0);
+
+    assert(cc_car(result) == os_make_symbol("HANDLED"),
+           "cerror: continuableが真の場合、ハンドラが普通にreturnした値がそのまま返る");
+    assert(cc_cdr(result) == error_string,
+           "cerror: <simple-error>のformat-stringスロットに渡したerror-string自身が積まれる");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -1267,6 +1325,9 @@ int main(void) {
     test_transpile_fixture_nested_let_dynamic_restore();
     test_transpile_fixture_signal_condition_like();
     test_transpile_fixture_signal_condition_nonlocal();
+    test_transpile_fixture_error();
+    test_transpile_fixture_cerror_no_handler();
+    test_transpile_fixture_cerror_with_handler();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

@@ -103,6 +103,13 @@
     (%%set-dynamic . "primitive_set_dynamic")
     ;; M12基盤E(#27): signal-conditionがcatchタグ用の一意なシンボルを作るのに使う
     (gensym . "primitive_gensym")
+    ;; M12基盤F(#27): cerrorがcontinue-stringをobjs(&restの実引数、可変長)で
+    ;; formatした文字列を作るのに使う。formatは可変長引数を取るため、cerrorの
+    ;; 呼び出しは#'format(function特殊形式、下記transpile-expr参照)で関数値を
+    ;; 取得し%%apply経由で(cons str (cons continue-string objs))を渡す
+    (format . "cc_format")
+    (create-string-output-stream . "cc_create_string_output_stream")
+    (get-output-stream-string . "cc_get_output_stream_string")
     ;; M12基盤B(#27): %register-builtin-classがbootstrap用クラスオブジェクトを
     ;; 生成するのに使う(メタクラスは<built-in-class>)
     (%%make-builtin-class-raw . "primitive_make_builtin_class_raw")
@@ -215,7 +222,8 @@
    M14基盤D: go/return-from/block/tagbodyのタグ名・block名は変数参照ではなく
    ラベルなので、汎用の(cdr expr)走査に落とすと誤って自由変数と見なされてしまう
    ため、これらは専用の分岐でタグ/名前自身を素通しし、値・本体だけを再帰的に
-   走査する"
+   走査する。M12基盤F(#27): (function name)の第二要素も同様に変数参照ではなく
+   呼び出し先名(call-target-c-nameが解決する)なので専用の分岐で素通しする"
   (cond
     ((integerp expr) nil)
     ((stringp expr) nil)
@@ -223,6 +231,7 @@
     ((eq expr t) nil)
     ((symbolp expr) (if (member expr bound) nil (list expr)))
     ((and (consp expr) (eq (car expr) 'quote)) nil)
+    ((and (consp expr) (eq (car expr) 'function) (= (length expr) 2) (symbolp (second expr))) nil)
     ((and (consp expr) (eq (car expr) 'dynamic) (= (length expr) 2)) nil)
     ((and (consp expr) (eq (car expr) 'defdynamic) (= (length expr) 3))
      (free-variables (third expr) bound))
@@ -600,6 +609,13 @@
            (car binding))))
     ((and (consp expr) (eq (car expr) 'quote) (= (length expr) 2))
      (transpile-quoted (second expr)))
+    ((and (consp expr) (eq (car expr) 'function) (= (length expr) 2) (symbolp (second expr)))
+     ;; M12基盤F(#27): #'format(cerrorが%%apply経由でformatを可変長引数付きで
+     ;; 呼ぶのに使う)。call-target-c-nameで解決したC関数を、呼び出さずに
+     ;; os_make_native_functionで第一級の関数値として包む。defunされた関数
+     ;; 名/プリミティブのホワイトリストいずれも標準ABI(evaluated_args, env)を
+     ;; 持つため、lambdaと違い自由変数の捕捉は不要
+     (format nil "os_make_native_function((lisp_addr_t)(void *)~A)" (call-target-c-name (second expr))))
     ((and (consp expr) (eq (car expr) 'if))
      (transpile-if expr scope))
     ((and (consp expr) (eq (car expr) 'progn))
@@ -760,7 +776,10 @@
      (cond
        ((null val) "nil")
        ((eq val t) "g_sym_t")
-       (t (format nil "os_make_symbol(~A)" (c-string-literal (symbol-name val))))))
+       (t (format nil "os_make_symbol(~A)"
+                  (c-string-literal (if (keywordp val)
+                                         (concatenate 'string ":" (symbol-name val))
+                                         (symbol-name val)))))))
     ((consp val)
      (format nil "os_make_cons(~A, ~A)" (transpile-quoted (car val)) (transpile-quoted (cdr val))))
     (t (transpile-expr val))))
@@ -1147,13 +1166,31 @@
 
 (defparameter *call-temp-counter* 0)
 
+(defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr)
+  "ALL-TEMPSを1つずつGC-safeに評価し、いずれかが非局所脱出シグナル
+   (os_is_control_transfer)であれば残りの引数評価とFINAL-C-EXPR(呼び出し本体)を
+   一切実行せずそのシグナル自身を式全体の値として返す。M14基盤D:
+   transpile-if/transpile-and/transpile-progn-formsと同じ短絡規則を、通常の
+   関数呼び出しの引数評価にも適用する(funcall経由でreturn-from/throwする
+   エスケープするクロージャの結果が、letの脱糖((lambda (result) body) init)の
+   ように別の呼び出しの引数として渡された場合、この規則が無いと非局所脱出
+   シグナルが素通しされずただの値として本体に渡ってしまう不具合があった)"
+  (if (null remaining-temps)
+      (funcall final-c-expr all-temps)
+      (let ((temp (car remaining-temps)))
+        (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                temp (transpile-expr (car remaining-args) scope) temp temp temp
+                (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope final-c-expr)))))
+
 (defun transpile-call (expr scope)
   "(name arg*)。nameはdefunされた関数名またはプリミティブのホワイトリストに
    限る(call-target-c-name参照)。各引数はeval.cのeval_argsと同じ考え方で、
    1つずつ評価してすぐGC_PROTECTしてから次の引数を評価する(引数式自体の評価が
    GCを誘発しても、既に評価済みの前の引数がコピーGCで移動済みの古いアドレスを
    指したままにならないようにするため)。引数が無い場合は一時変数もconsチェーンも
-   不要なため、直接nilを渡す単純な呼び出し式にする"
+   不要なため、直接nilを渡す単純な呼び出し式にする。M12 Phase 9(#27):
+   transpile-call-args-guarded参照、いずれかの引数が非局所脱出シグナルなら
+   呼び出し自体を行わずそのシグナルを伝播させる"
   (let* ((name (car expr))
          (args (cdr expr))
          (c-name (call-target-c-name name)))
@@ -1163,13 +1200,8 @@
                                 (declare (ignore arg))
                                 (format nil "__call_arg_~A" (incf *call-temp-counter*)))
                               args)))
-          (format nil "({ ~{~A~} ~A(~A, env); })"
-                  (mapcar (lambda (temp arg)
-                            (format nil "lisp_val_t ~A = (~A); GC_PROTECT(~A); "
-                                    temp (transpile-expr arg scope) temp))
-                          temps args)
-                  c-name
-                  (transpile-cons-chain temps))))))
+          (transpile-call-args-guarded temps temps args scope
+            (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps))))))))
 
 (defun tail-return-final (c-expr)
   "末尾位置で、既に確定したC式c-exprの値をそのままtco_result_tとしてreturnする
@@ -1182,7 +1214,10 @@
    ファイル内でdefunされた)場合にのみ呼ばれる。transpile-callと同様にGC-safeな
    引数一時変数を組み立てるが、実際にはstep関数を呼ばずtco_result_tへ関数
    ポインタと引数consチェーンを詰めてreturnする。呼び出し元のCフレームはここで
-   returnして消えるため、何段トランポリンが続いてもCスタックは伸びない"
+   returnして消えるため、何段トランポリンが続いてもCスタックは伸びない。
+   M12 Phase 9(#27): transpile-call-args-guardedと同じ短絡規則で、いずれかの
+   引数が非局所脱出シグナルならトランポリン継続を組み立てず、そのシグナルを
+   確定値としてreturnする"
   (let* ((name (car expr))
          (args (cdr expr))
          (c-name (lisp-name-to-c-name name)))
@@ -1192,13 +1227,19 @@
                                 (declare (ignore arg))
                                 (format nil "__call_arg_~A" (incf *call-temp-counter*)))
                               args)))
-          (format nil "{ ~{~A~} return (tco_result_t){.is_tail_call = 1, .fn = ~A__step, .args = ~A}; }"
-                  (mapcar (lambda (temp arg)
-                            (format nil "lisp_val_t ~A = (~A); GC_PROTECT(~A); "
-                                    temp (transpile-expr arg scope) temp))
-                          temps args)
-                  c-name
-                  (transpile-cons-chain temps))))))
+          (transpile-tail-call-args-guarded temps temps args scope c-name)))))
+
+(defun transpile-tail-call-args-guarded (all-temps remaining-temps remaining-args scope c-name)
+  "transpile-call-args-guardedの末尾呼び出し版。式ではなく完結したC文を返す
+   (呼び出し元のtranspile-tail-callは既にreturn文の中で使われないため、ここで
+   自分でreturn文を組み立てる)"
+  (if (null remaining-temps)
+      (format nil "return (tco_result_t){.is_tail_call = 1, .fn = ~A__step, .args = ~A};"
+              c-name (transpile-cons-chain all-temps))
+      (let ((temp (car remaining-temps)))
+        (format nil "{ lisp_val_t ~A = (~A); GC_PROTECT(~A); if (os_is_control_transfer(~A)) { return (tco_result_t){.is_tail_call = 0, .value = (~A)}; } else { ~A } }"
+                temp (transpile-expr (car remaining-args) scope) temp temp temp
+                (transpile-tail-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope c-name)))))
 
 (defun transpile-tail-and (forms scope)
   "transpile-andの末尾位置版。最後の式だけが本当の末尾位置(そこに到達した場合の
@@ -1347,7 +1388,7 @@
       ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。
       ;; M14基盤E: open-input-stream/close(cc_open_input_stream/cc_close)はstream_lisp.hで
       ;; 宣言されているため、同じ理由でstream_lisp.hも必要
-      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%~%")
+      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%~%")
       ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
       ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
       ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)
