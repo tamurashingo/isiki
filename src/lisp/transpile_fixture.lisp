@@ -285,3 +285,71 @@
          (setq n (- n 1)))
        'exhausted)
      count)))
+
+(defun %%transpile-fixture-unwind-protect-normal (n)
+  ;; M14基盤E: unwind-protectの基本検証。protected-form((+ n 1))の値が式全体の
+  ;; 値になり、cleanup-form(countへのsetq)は必ず実行される(その戻り値は捨て
+  ;; られる)ことを、cleanup実行後のcountの値から確認する
+  (let ((count 0))
+    (cons
+     (unwind-protect
+         (+ n 1)
+       (setq count (+ count 1)))
+     count)))
+
+(defun %%transpile-fixture-unwind-protect-non-local-exit ()
+  ;; M14基盤E: protected-form中でreturn-fromする場合の検証。eval_unwind_protect
+  ;; と同じく、非局所脱出シグナルであってもprotected-formの評価結果として1回だけ
+  ;; 保存され、cleanup-formは必ず実行された上で、最終的に元の脱出シグナル(値42)が
+  ;; そのままunwind-protect式全体の値として外側のblockまで伝播することを確認する
+  (let ((count 0))
+    (cons
+     (block %%fixture-uwp-block
+       (unwind-protect
+           (return-from %%fixture-uwp-block 42)
+         (setq count (+ count 1))))
+     count)))
+
+(defun %%transpile-fixture-unwind-protect-cleanup-exit-ignored ()
+  ;; M14基盤E: cleanup-form自身が新たな非局所脱出(return-from)を起こす場合の
+  ;; 検証。eval_unwind_protectに明記された既知の簡略化(cleanup-formsの評価結果は
+  ;; eval_prognで捨てられる)と同じく、cleanup内のreturn-fromは無視され、
+  ;; protected-formの結果(値7)がそのままunwind-protect式全体の値になることを
+  ;; 確認する
+  (block %%fixture-uwp-cleanup-block
+    (unwind-protect
+        7
+      (return-from %%fixture-uwp-cleanup-block 999))))
+
+(defun %%transpile-fixture-with-open-input-stream ()
+  ;; M14基盤E: with-open-input-streamの検証。streamを外側のletで捕捉し、
+  ;; with-open-input-streamを抜けた後にopen-stream-pで調べることで、body正常
+  ;; 終了時にunwind-protect経由で必ずcloseされることを確認する(fakeの9P
+  ;; transportはtest/c/lisp_compiled_test.cでos_virtio9p_openが常に成功する
+  ;; よう差し替え済み)
+  (let ((captured nil))
+    (with-open-input-stream (s (open-input-stream "fake/path"))
+      (setq captured s))
+    (open-stream-p captured)))
+
+(defun %%transpile-fixture-with-open-input-stream-early-exit ()
+  ;; M14基盤E: with-open-input-stream本体中のreturn-fromによる早期脱出の検証。
+  ;; unwind-protectが非局所脱出シグナルであってもcleanup(close呼び出し)を必ず
+  ;; 実行することを、脱出値(42、外側のblockまで正しく伝播する)とcapturedが
+  ;; close済み(open-stream-pがnil)であることの両方から確認する
+  (let ((captured nil))
+    (cons
+     (block %%fixture-wois-block
+       (with-open-input-stream (s (open-input-stream "fake/path"))
+         (setq captured s)
+         (return-from %%fixture-wois-block 42)))
+     (open-stream-p captured))))
+
+(defun %%transpile-fixture-with-open-input-file ()
+  ;; M14基盤E: with-open-input-fileの検証。with-open-input-stream(open-input-
+  ;; stream呼び出しを差し込むだけの薄いラッパー)経由でも同じくcloseが保証
+  ;; されることを確認する
+  (let ((captured nil))
+    (with-open-input-file (s "fake/path")
+      (setq captured s))
+    (open-stream-p captured)))

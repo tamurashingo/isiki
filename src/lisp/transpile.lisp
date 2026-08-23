@@ -88,7 +88,14 @@
     (< . "primitive_less_than")
     (>= . "primitive_greater_equal")
     ;; M14基盤D: for/whileの停止条件(test-and-result/test)が使う
-    (> . "primitive_greater_than")))
+    (> . "primitive_greater_than")
+    ;; M14基盤E: with-open-input-stream/with-open-input-fileの展開先(バインディング
+    ;; の初期値式、およびunwind-protectのcleanup)が使う
+    (open-input-stream . "cc_open_input_stream")
+    (close . "cc_close")
+    ;; M14基盤E: with-open-input-streamがunwind-protect経由で必ずcloseすることを
+    ;; テストfixtureから検証するために使う(cc_open_stream_p、stream_lisp.c:100)
+    (open-stream-p . "cc_open_stream_p")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
@@ -437,6 +444,28 @@
             (progn ,@body (go %while-loop))
             nil)))))
 
+;;; with-open-input-stream/with-open-input-file: init.lispのdefmacro
+;;; with-open-input-stream/with-open-input-file(init.lisp:195-210)と同じ展開規則。
+;;; 展開結果はlet(基盤A)・unwind-protect(基盤E、本コミットで追加)・
+;;; open-input-stream/closeへの呼び出し(*primitive-c-names*)のみに帰着する。
+;;; with-open-input-fileはopen-input-stream呼び出し(open-input-fileという
+;;; 別名ではなく、init.lispのマクロ本体と同じくopen-input-stream自身)を
+;;; with-open-input-streamへ差し込むだけの薄いラッパー。
+
+(defun expand-with-open-input-stream (form)
+  (destructuring-bind (kw binding &rest body) form
+    (declare (ignore kw))
+    `(let ((,(car binding) ,(car (cdr binding))))
+       (unwind-protect
+           (progn ,@body)
+         (close ,(car binding))))))
+
+(defun expand-with-open-input-file (form)
+  (destructuring-bind (kw binding &rest body) form
+    (declare (ignore kw))
+    `(with-open-input-stream (,(car binding) (open-input-stream ,(car (cdr binding))))
+       ,@body)))
+
 (defparameter *macro-expanders*
   (list (cons 'let #'expand-let)
         (cons 'let* #'expand-let*)
@@ -445,7 +474,9 @@
         (cons 'case-using #'expand-case-using)
         (cons 'setf #'expand-setf)
         (cons 'for #'expand-for)
-        (cons 'while #'expand-while))
+        (cons 'while #'expand-while)
+        (cons 'with-open-input-stream #'expand-with-open-input-stream)
+        (cons 'with-open-input-file #'expand-with-open-input-file))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
@@ -468,6 +499,7 @@
 (declaim (ftype function transpile-return-from))
 (declaim (ftype function transpile-block))
 (declaim (ftype function transpile-tagbody))
+(declaim (ftype function transpile-unwind-protect))
 
 (defun transpile-expr (expr &optional scope)
   "fixnum/string/nil/tの裸リテラルと、それらに対するquote、シンボルのquote、
@@ -517,6 +549,8 @@
      (transpile-block expr scope))
     ((and (consp expr) (eq (car expr) 'tagbody))
      (transpile-tagbody expr scope))
+    ((and (consp expr) (eq (car expr) 'unwind-protect))
+     (transpile-unwind-protect expr scope))
     ((and (consp expr) (symbolp (car expr)))
      (transpile-call expr scope))
     ((and (consp expr) (consp (car expr)) (eq (car (car expr)) 'lambda) (= (length (car expr)) 3))
@@ -764,6 +798,24 @@
                     body)
             end-label
             result-temp)))
+
+(defparameter *unwind-protect-temp-counter* 0)
+
+(defun transpile-unwind-protect (expr scope)
+  "(unwind-protect protected-form cleanup-form*)。eval_unwind_protect(eval.c)と
+   同じ意味論: protected-formを1回だけ評価し、その結果(通常の値、または
+   block/tagbodyの非局所脱出シグナルのいずれでもよい)をGC_PROTECTしたCローカル
+   変数へ保存する。cleanup-formはtranspile-progn-formsで評価するが、その戻り値は
+   捨てる——cleanup-form自身が新たな非局所脱出を起こした場合もその脱出は無視して
+   protected-formの結果を優先する、eval_unwind_protectに明記された既知の簡略化と
+   同じ。式全体の値としては常にprotected-formの結果(GC_PROTECTしたtemp)を返す"
+  (destructuring-bind (uwp-kw protected-form &rest cleanup-forms) expr
+    (declare (ignore uwp-kw))
+    (let ((temp (format nil "__unwind_protect_val_~A" (incf *unwind-protect-temp-counter*))))
+      (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); (void)(~A); ~A; })"
+              temp (transpile-expr protected-form scope) temp
+              (transpile-progn-forms cleanup-forms scope)
+              temp))))
 
 (defparameter *lambda-name-counter* 0)
 (defparameter *lifted-lambda-decls* nil
@@ -1164,8 +1216,10 @@
          (registration (emit-aot-registration aot-defuns)))
     (with-open-file (out *output-c-path* :direction :output :if-exists :supersede)
       ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
-      ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう
-      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%~%")
+      ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。
+      ;; M14基盤E: open-input-stream/close(cc_open_input_stream/cc_close)はstream_lisp.hで
+      ;; 宣言されているため、同じ理由でstream_lisp.hも必要
+      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%~%")
       ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
       ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
       ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)

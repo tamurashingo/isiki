@@ -7,15 +7,19 @@
 #include "process.h"
 #include "lisp.h"
 
-// runtime.c/process.c/za.c/reader.c/stream.cをリンクするため、それらが参照する
-// ハードウェア/REPL依存の関数のダミー実装が必要になる(runtime_test.cと同じパターン)
+// runtime.c/process.c/za.c/reader.c/stream.c/stream_lisp.cをリンクするため、それらが
+// 参照するハードウェア/REPL依存の関数のダミー実装が必要になる(runtime_test.cと同じ
+// パターン)。M14基盤E: with-open-input-stream/with-open-input-fileがunwind-protect
+// 経由で必ずcloseすることをfixtureから検証するため、os_virtio9p_openは実際のfidを返して
+// 成功させる(stream_lisp_test.cのフェイク9Pと同じ方針。読み込む内容自体は検証対象では
+// ないため、read/write/closeは従来通りダミーのままでよい)
 int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
     (void)path;
     (void)mode;
-    (void)out_fid;
     (void)err_msg;
     (void)err_msg_cap;
-    return 0;
+    *out_fid = 1;
+    return 1;
 }
 
 int os_virtio9p_create(const char *path, UINT32 perm, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
@@ -143,6 +147,12 @@ extern lisp_val_t lisp_ll_transpile_fixture_for_sum(lisp_val_t evaluated_args, l
 extern lisp_val_t lisp_ll_transpile_fixture_for_early_exit(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_while_sum(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_while_named_block_exit(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_unwind_protect_normal(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_unwind_protect_non_local_exit(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_unwind_protect_cleanup_exit_ignored(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_stream(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_stream_early_exit(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_file(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -563,6 +573,52 @@ static void test_transpile_fixture_while_named_block_exit(void) {
            "while: countが3になった時点で脱出し以降の反復(nの残りの減算)は実行されない");
 }
 
+static void test_transpile_fixture_unwind_protect_normal(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_unwind_protect_normal(os_make_cons(os_make_fixnum(5), nil), 0);
+    lisp_val_t value = cc_car(result);
+    lisp_val_t count = cc_cdr(result);
+    assert(value == os_make_fixnum(6), "unwind-protect: protected-formの値(n+1=6)が式全体の値になる");
+    assert(count == os_make_fixnum(1), "unwind-protect: cleanup-formは必ず1回実行される");
+}
+
+static void test_transpile_fixture_unwind_protect_non_local_exit(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_unwind_protect_non_local_exit(0, 0);
+    lisp_val_t exit_value = cc_car(result);
+    lisp_val_t count = cc_cdr(result);
+    assert(exit_value == os_make_fixnum(42),
+           "unwind-protect: protected-form中のreturn-fromの値42がunwind-protect式全体の値として外側のblockまで伝播する");
+    assert(count == os_make_fixnum(1),
+           "unwind-protect: 非局所脱出であってもcleanup-formは必ず実行される");
+}
+
+static void test_transpile_fixture_unwind_protect_cleanup_exit_ignored(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_unwind_protect_cleanup_exit_ignored(0, 0);
+    assert(result == os_make_fixnum(7),
+           "unwind-protect: cleanup-form自身のreturn-fromは無視され、protected-formの結果(7)が式全体の値になる");
+}
+
+static void test_transpile_fixture_with_open_input_stream(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_stream(0, 0);
+    assert(result == nil,
+           "with-open-input-stream: body正常終了後、unwind-protect経由でstreamが必ずcloseされる(open-stream-pがnil)");
+}
+
+static void test_transpile_fixture_with_open_input_stream_early_exit(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_stream_early_exit(0, 0);
+    lisp_val_t exit_value = cc_car(result);
+    lisp_val_t still_open = cc_cdr(result);
+    assert(exit_value == os_make_fixnum(42),
+           "with-open-input-stream: body中のreturn-fromの値42がwith-open-input-stream式全体の値として伝播する");
+    assert(still_open == nil,
+           "with-open-input-stream: return-fromによる早期脱出でもunwind-protect経由で必ずcloseされる");
+}
+
+static void test_transpile_fixture_with_open_input_file(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_file(0, 0);
+    assert(result == nil,
+           "with-open-input-file: with-open-input-stream経由でも同様にcloseが保証される(open-stream-pがnil)");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -825,6 +881,12 @@ int main(void) {
     test_transpile_fixture_for_early_exit();
     test_transpile_fixture_while_sum();
     test_transpile_fixture_while_named_block_exit();
+    test_transpile_fixture_unwind_protect_normal();
+    test_transpile_fixture_unwind_protect_non_local_exit();
+    test_transpile_fixture_unwind_protect_cleanup_exit_ignored();
+    test_transpile_fixture_with_open_input_stream();
+    test_transpile_fixture_with_open_input_stream_early_exit();
+    test_transpile_fixture_with_open_input_file();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();
