@@ -127,15 +127,15 @@
   ;; 直後にdynamicで読み出す。同じprogn内での書き込み直後の読み出しが
   ;; 正しく反映されることを検証する
   (progn
-    (defdynamic '%%test-dynamic-var n)
-    (dynamic '%%test-dynamic-var)))
+    (defdynamic %%test-dynamic-var n)
+    (dynamic %%test-dynamic-var)))
 
 (defun %%transpile-fixture-dynamic-read ()
   ;; M11: dynamicのみの検証。他の関数(%%transpile-fixture-defdynamic)が
   ;; 書き込んだ動的変数の値が、レキシカルな親子関係を持たない別の関数から
   ;; そのまま読めることを検証する(g_dynamic_bindingsがグローバルな
   ;; フラットalistであることの確認)
-  (dynamic '%%test-dynamic-var))
+  (dynamic %%test-dynamic-var))
 
 (defun %%transpile-fixture-let (x)
   ;; M14: 基盤A(macroexpand-all)の検証。letの単純な1束縛が、展開後
@@ -178,6 +178,24 @@
          (setq x (cons x x))
          x)
         (t nil)))
+
+(defun %%transpile-fixture-case (x)
+  ;; M14: caseの検証。(case key ...)が(let ((key# key)) (if (member key# '(...))
+  ;; ... (if ...)))へ展開されることを、3clause(2値のkeylist・1値のkeylist・
+  ;; デフォルトのt節)で確認する
+  (case x
+    ((1 2) 'one-or-two)
+    ((3) 'three)
+    (t 'other)))
+
+(defun %%transpile-fixture-case-using (x)
+  ;; M14: case-usingの検証。caseと違い各clauseの判定を実行時の%case-using-match
+  ;; (funcall経由でpredformを呼ぶ既知関数)へ委譲することを、predformとして
+  ;; その場で作った第一級クロージャ(lambda)を渡して確認する
+  (case-using (lambda (a b) (eq a b)) x
+    ((1 2) 'one-or-two)
+    ((3) 'three)
+    (t 'other)))
 
 (defun %%transpile-fixture-rest (&rest items)
   ;; M14基盤B: &restパラメータのみの検証。全実引数がそのままconsチェーンとして

@@ -260,10 +260,54 @@
              (progn ,@(cdr (car clauses)))
              (cond ,@(cdr clauses))))))
 
+;;; case: init.lispのdefmacro case(%case-expand)と同じ展開規則。t節以外の
+;;; clauseはkeylistをquoteしたまま(member key '(...))へ、t節は素通しでprognへ
+;;; 展開するif連鎖。keylistのquoteはtranspile-quotedがリスト(cons)対応する
+;;; 必要があるため、このコミットでtranspile-quotedへcons分岐を追加する。
+
+(defun %%case-expand (key clauses)
+  (if (null clauses)
+      nil
+      (if (eq (car (car clauses)) t)
+          `(progn ,@(cdr (car clauses)))
+          `(if (member ,key ',(car (car clauses)))
+               (progn ,@(cdr (car clauses)))
+               ,(%%case-expand key (cdr clauses))))))
+
+(defun expand-case (form)
+  (destructuring-bind (case-kw keyform &rest clauses) form
+    (declare (ignore case-kw))
+    (let ((key (gensym)))
+      `(let ((,key ,keyform))
+         ,(%%case-expand key clauses)))))
+
+;;; case-using: init.lispのdefmacro case-using(%case-using-expand)と同じ展開
+;;; 規則。実行時の述語呼び出しは%case-using-match(init_aot.lispへ移動する既知
+;;; 関数)へ委譲するため、caseと違いmemberを直接埋め込むのではなく関数呼び出しを
+;;; 生成する。
+
+(defun %%case-using-expand (pred key clauses)
+  (if (null clauses)
+      nil
+      (if (eq (car (car clauses)) t)
+          `(progn ,@(cdr (car clauses)))
+          `(if (%case-using-match ,pred ,key ',(car (car clauses)))
+               (progn ,@(cdr (car clauses)))
+               ,(%%case-using-expand pred key (cdr clauses))))))
+
+(defun expand-case-using (form)
+  (destructuring-bind (case-using-kw predform keyform &rest clauses) form
+    (declare (ignore case-using-kw))
+    (let ((pred (gensym)) (key (gensym)))
+      `(let ((,pred ,predform) (,key ,keyform))
+         ,(%%case-using-expand pred key clauses)))))
+
 (defparameter *macro-expanders*
   (list (cons 'let #'expand-let)
         (cons 'let* #'expand-let*)
-        (cons 'cond #'expand-cond))
+        (cons 'cond #'expand-cond)
+        (cons 'case #'expand-case)
+        (cons 'case-using #'expand-case-using))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
@@ -412,13 +456,19 @@
 
 (defun transpile-quoted (val)
   "(quote val)のval側。fixnum/string/nil/tはtranspile-exprと同じ扱いで、
-   それ以外のシンボルはos_make_symbolで名前から解決する"
+   それ以外のシンボルはos_make_symbolで名前から解決する。consは要素ごとに
+   再帰的にtranspile-quotedしたものをos_make_consで組み立てる(caseのkeylist
+   '(1 2 3)等、リテラルなリストのquote対応。transpile-cons-chainと同じ
+   「引数を評価してから呼び出す」C評価順のため、途中でGCが起きても未保護の
+   中間値が上位32bit破壊等に晒される窓は無い)"
   (cond
     ((symbolp val)
      (cond
        ((null val) "nil")
        ((eq val t) "g_sym_t")
        (t (format nil "os_make_symbol(~A)" (c-string-literal (symbol-name val))))))
+    ((consp val)
+     (format nil "os_make_cons(~A, ~A)" (transpile-quoted (car val)) (transpile-quoted (cdr val))))
     (t (transpile-expr val))))
 
 (defun transpile-dynamic-read (expr)

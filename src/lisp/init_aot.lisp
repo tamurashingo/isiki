@@ -127,3 +127,17 @@
 ;; (新しいconsは確保しない)。
 (defun nreverse (list)
   (%nreverse-helper list nil))
+
+;;; --- case-using (M14) ---
+;;;
+;;; 基盤A(macroexpand-allでのcase-using展開対応)によりAOT対応可能になった
+;;; ため移動。case-using自体はマクロ(トランスパイラでは展開されて消える)なので
+;;; ここへ移動するのは展開後のコードが実行時に呼ぶこの関数のみ。
+
+;; keylist中のいずれかのkについて(funcall pred key k)が真になるかを判定する。
+(defun %case-using-match (pred key keylist)
+  (if (null keylist)
+      nil
+      (if (funcall pred key (car keylist))
+          t
+          (%case-using-match pred key (cdr keylist)))))

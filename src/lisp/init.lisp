@@ -93,13 +93,8 @@
     `(let ((,key ,keyform))
        ,(%case-expand key clauses))))
 
-;; keylist中のいずれかのkについて(funcall pred key k)が真になるかを判定する。
-(defun %case-using-match (pred key keylist)
-  (if (null keylist)
-      nil
-      (if (funcall pred key (car keylist))
-          t
-          (%case-using-match pred key (cdr keylist)))))
+;; %case-using-matchはsrc/lisp/init_aot.lispへ移動した(M14: 基盤Aによりcaseと
+;; 同じ形で対応可能になったため)。
 
 ;; %case-using-matchの呼び出しをif連鎖として組み立てる版(caseと違い、
 ;; 述語呼び出しはbody展開時ではなく実行時に行う必要があるためformを生成する)。

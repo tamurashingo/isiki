@@ -129,6 +129,8 @@ extern lisp_val_t lisp_ll_transpile_fixture_let_body_progn(lisp_val_t evaluated_
 extern lisp_val_t lisp_ll_transpile_fixture_let_star(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_cond(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_cond_body_progn(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_case(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_case_using(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_rest(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_rest_with_fixed(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -410,6 +412,31 @@ static void test_transpile_fixture_cond_body_progn(void) {
     assert(result_false == nil, "cond-body-progn: testが偽ならt節のnilを返す");
 }
 
+static void test_transpile_fixture_case(void) {
+    lisp_val_t result_one = lisp_ll_transpile_fixture_case(os_make_cons(os_make_fixnum(1), nil), 0);
+    assert(result_one == os_make_symbol("ONE-OR-TWO"), "case: 1は(1 2)のkeylistにmemberでマッチしone-or-twoを返す");
+
+    lisp_val_t result_two = lisp_ll_transpile_fixture_case(os_make_cons(os_make_fixnum(2), nil), 0);
+    assert(result_two == os_make_symbol("ONE-OR-TWO"), "case: 2も(1 2)のkeylistにmemberでマッチしone-or-twoを返す");
+
+    lisp_val_t result_three = lisp_ll_transpile_fixture_case(os_make_cons(os_make_fixnum(3), nil), 0);
+    assert(result_three == os_make_symbol("THREE"), "case: 3は(3)のkeylistにマッチしthreeを返す");
+
+    lisp_val_t result_other = lisp_ll_transpile_fixture_case(os_make_cons(os_make_fixnum(99), nil), 0);
+    assert(result_other == os_make_symbol("OTHER"), "case: どのkeylistにもマッチしなければt節のotherを返す");
+}
+
+static void test_transpile_fixture_case_using(void) {
+    lisp_val_t result_one = lisp_ll_transpile_fixture_case_using(os_make_cons(os_make_fixnum(1), nil), 0);
+    assert(result_one == os_make_symbol("ONE-OR-TWO"), "case-using: 1は%case-using-match経由で(1 2)にマッチしone-or-twoを返す");
+
+    lisp_val_t result_three = lisp_ll_transpile_fixture_case_using(os_make_cons(os_make_fixnum(3), nil), 0);
+    assert(result_three == os_make_symbol("THREE"), "case-using: 3は%case-using-match経由で(3)にマッチしthreeを返す");
+
+    lisp_val_t result_other = lisp_ll_transpile_fixture_case_using(os_make_cons(os_make_fixnum(99), nil), 0);
+    assert(result_other == os_make_symbol("OTHER"), "case-using: どのkeylistにもマッチしなければt節のotherを返す");
+}
+
 static void test_transpile_fixture_rest(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -575,6 +602,8 @@ int main(void) {
     test_transpile_fixture_let_star();
     test_transpile_fixture_cond();
     test_transpile_fixture_cond_body_progn();
+    test_transpile_fixture_case();
+    test_transpile_fixture_case_using();
     test_transpile_fixture_rest();
     test_transpile_fixture_rest_with_fixed();
     test_list();
