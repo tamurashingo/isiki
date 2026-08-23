@@ -505,25 +505,17 @@
          (append (%merge-superclass-slots %supers)
                  (list ,@(%slot-spec-forms slot-specs)))))))
 
-;; slots(スロット記述子のリスト)の中からslot-nameのインデックス(0起点)を探す
-(defun %slot-index (slot-name slots idx)
-  (if (null slots)
-      nil
-      (if (eq slot-name (car (car slots)))
-          idx
-          (%slot-index slot-name (cdr slots) (+ idx 1)))))
+;; %slot-index/set-slot-valueはsrc/lisp/init_aot.lispへ移動した(M14: 基盤C
+;; によりsetfのslot-value place形式に対応可能になったため)。%slot-indexは
+;; slot-value(下記、インタプリタに残る)からも呼ばれるが、AOT登録された
+;; ネイティブ関数はglobal_environmentへ通常のdefunと同じシンボル名で登録される
+;; ため、呼び出し側の実装場所(インタプリタ/AOT)に関わらずそのまま解決できる。
 
 (defun slot-value (instance slot-name)
   (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
     (if (null idx)
         'eval-error
         (aref (%%instance-slots instance) idx))))
-
-(defun set-slot-value (instance slot-name value)
-  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
-    (if (null idx)
-        'eval-error
-        (set-aref (%%instance-slots instance) idx value))))
 
 ;; 対応するinitargがinitargs(:key1 val1 :key2 val2 ...)に無ければ
 ;; slot-descriptorのinitform-thunkをfuncallして初期値を得る

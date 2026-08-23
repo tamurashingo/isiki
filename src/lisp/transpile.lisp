@@ -70,7 +70,16 @@
     ;; M14: create-list(%create-list-helper)が停止条件に使う数値等価比較
     (= . "primitive_num_equal")
     ;; M14: nreverse(%nreverse-helper)が破壊的な反転に使う
-    (set-cdr . "primitive_set_cdr")))
+    (set-cdr . "primitive_set_cdr")
+    ;; M14: setfの展開先(set-car/set-aref/set-elt)と、slot-value/set-slot-value
+    ;; (%slot-index)が使う+・%%class-slots・%%instance-class・%%instance-slots
+    (set-car . "primitive_set_car")
+    (set-aref . "primitive_set_aref")
+    (set-elt . "primitive_set_elt")
+    (+ . "primitive_add")
+    (%%class-slots . "primitive_class_slots")
+    (%%instance-class . "primitive_instance_class")
+    (%%instance-slots . "primitive_instance_slots")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)"
@@ -302,12 +311,32 @@
       `(let ((,pred ,predform) (,key ,keyform))
          ,(%%case-using-expand pred key clauses)))))
 
+;;; setf: init.lispのdefmacro setfと同じ展開規則。placeの形に応じてsetq/
+;;; set-car/set-cdr/set-aref/set-elt/set-slot-value/set-propertyへ展開する。
+;;; このうちset-property(%check-symbol-arg経由でerrorを呼ぶ)はILOSの
+;;; condition system(M12)が無いと呼び出し先を解決できずtranspile時に
+;;; エラーとなるため、(setf (property ...) ...)は現時点では未対応のまま
+;;; (呼び出し先解決時にcall-target-c-nameが明示的なエラーで検出する)。
+;;; car/cdr/aref/elt/slot-valueの5形式は本コミットで対応する。
+
+(defun expand-setf (form)
+  (destructuring-bind (setf-kw place value) form
+    (declare (ignore setf-kw))
+    (cond ((symbolp place) `(setq ,place ,value))
+          ((eq (car place) 'car) `(set-car ,(car (cdr place)) ,value))
+          ((eq (car place) 'cdr) `(set-cdr ,(car (cdr place)) ,value))
+          ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))
+          ((eq (car place) 'elt) `(set-elt ,value ,@(cdr place)))
+          ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
+          ((eq (car place) 'property) `(set-property ,value ,@(cdr place))))))
+
 (defparameter *macro-expanders*
   (list (cons 'let #'expand-let)
         (cons 'let* #'expand-let*)
         (cons 'cond #'expand-cond)
         (cons 'case #'expand-case)
-        (cons 'case-using #'expand-case-using))
+        (cons 'case-using #'expand-case-using)
+        (cons 'setf #'expand-setf))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")

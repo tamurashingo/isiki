@@ -197,6 +197,31 @@
     ((3) 'three)
     (t 'other)))
 
+(defun %%transpile-fixture-setf-setq (x)
+  ;; M14: setfの検証。placeがsymbolの場合はsetqへ展開される
+  (progn (setf x 42) x))
+
+(defun %%transpile-fixture-setf-car (pair)
+  ;; M14: setfの検証。(car x)形式はset-carへ展開される
+  (progn (setf (car pair) 42) pair))
+
+(defun %%transpile-fixture-setf-cdr (pair)
+  ;; M14: setfの検証。(cdr x)形式はset-cdrへ展開される
+  (progn (setf (cdr pair) 42) pair))
+
+(defun %%transpile-fixture-setf-aref (arr)
+  ;; M14: setfの検証。(aref x i)形式はset-arefへ展開される
+  (progn (setf (aref arr 0) 42) arr))
+
+(defun %%transpile-fixture-setf-elt (lst)
+  ;; M14: setfの検証。(elt x i)形式はset-eltへ展開される
+  ;; (set-eltは仕様上「新しい値が最初」という引数順である点に注意)
+  (progn (setf (elt lst 1) 99) lst))
+
+(defun %%transpile-fixture-setf-slot-value (instance)
+  ;; M14: setfの検証。(slot-value x slot-name)形式はset-slot-valueへ展開される
+  (progn (setf (slot-value instance 'val) 42) instance))
+
 (defun %%transpile-fixture-rest (&rest items)
   ;; M14基盤B: &restパラメータのみの検証。全実引数がそのままconsチェーンとして
   ;; itemsへ束縛されることを確認する(呼び出し側のevaluated_args構築自体は

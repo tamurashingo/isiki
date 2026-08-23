@@ -141,3 +141,23 @@
       (if (funcall pred key (car keylist))
           t
           (%case-using-match pred key (cdr keylist)))))
+
+;;; --- setf: slot-value place (M14) ---
+;;;
+;;; 基盤C(set-car/set-aref/set-elt等のプリミティブ許可リスト追加)によりAOT
+;;; 対応可能になったため移動。%%class-slots/%%instance-class/%%instance-slots
+;;; はruntime.cのネイティブプリミティブとして既に登録済み。
+
+;; slots(スロット記述子のリスト)の中からslot-nameのインデックス(0起点)を探す
+(defun %slot-index (slot-name slots idx)
+  (if (null slots)
+      nil
+      (if (eq slot-name (car (car slots)))
+          idx
+          (%slot-index slot-name (cdr slots) (+ idx 1)))))
+
+(defun set-slot-value (instance slot-name value)
+  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
+    (if (null idx)
+        'eval-error
+        (set-aref (%%instance-slots instance) idx value))))

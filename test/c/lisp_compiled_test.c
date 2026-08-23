@@ -131,6 +131,12 @@ extern lisp_val_t lisp_ll_transpile_fixture_cond(lisp_val_t evaluated_args, lisp
 extern lisp_val_t lisp_ll_transpile_fixture_cond_body_progn(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_case(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_case_using(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_setf_setq(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_setf_car(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_setf_cdr(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_setf_aref(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_setf_elt(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_setf_slot_value(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_rest(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_rest_with_fixed(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -437,6 +443,57 @@ static void test_transpile_fixture_case_using(void) {
     assert(result_other == os_make_symbol("OTHER"), "case-using: どのkeylistにもマッチしなければt節のotherを返す");
 }
 
+static void test_transpile_fixture_setf_setq(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_setf_setq(os_make_cons(os_make_fixnum(1), nil), 0);
+    assert((result >> 3) == 42, "setf: placeがsymbolならsetqへ展開され新しい値(42)が返る");
+}
+
+static void test_transpile_fixture_setf_car(void) {
+    lisp_val_t pair = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t result = lisp_ll_transpile_fixture_setf_car(os_make_cons(pair, nil), 0);
+    assert(cc_car(result) == os_make_fixnum(42), "setf: (car x)はset-carへ展開されcarが書き換わる");
+    assert(cc_cdr(result) == os_make_fixnum(2), "setf: (car x)への書き込みはcdrへ影響しない");
+}
+
+static void test_transpile_fixture_setf_cdr(void) {
+    lisp_val_t pair = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    lisp_val_t result = lisp_ll_transpile_fixture_setf_cdr(os_make_cons(pair, nil), 0);
+    assert(cc_car(result) == os_make_fixnum(1), "setf: (cdr x)への書き込みはcarへ影響しない");
+    assert(cc_cdr(result) == os_make_fixnum(42), "setf: (cdr x)はset-cdrへ展開されcdrが書き換わる");
+}
+
+static void test_transpile_fixture_setf_aref(void) {
+    lisp_val_t arr = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
+    lisp_val_t result = lisp_ll_transpile_fixture_setf_aref(os_make_cons(arr, nil), 0);
+    lisp_val_t elem = primitive_aref(os_make_cons(result, os_make_cons(os_make_fixnum(0), nil)), nil);
+    assert(elem == os_make_fixnum(42), "setf: (aref x i)はset-arefへ展開され添字0の要素が書き換わる");
+}
+
+static void test_transpile_fixture_setf_elt(void) {
+    lisp_val_t lst = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
+    lisp_val_t result = lisp_ll_transpile_fixture_setf_elt(os_make_cons(lst, nil), 0);
+    assert(cc_car(result) == os_make_fixnum(1), "setf: (elt x 1)への書き込みは0番目の要素に影響しない");
+    assert(cc_car(cc_cdr(result)) == os_make_fixnum(99),
+           "setf: (elt x i)はset-eltへ展開され(値が先頭引数という順序で)1番目の要素が書き換わる");
+}
+
+static void test_transpile_fixture_setf_slot_value(void) {
+    lisp_val_t slot_descriptor = os_make_cons(os_make_symbol("VAL"), nil);
+    lisp_val_t slots = os_make_cons(slot_descriptor, nil);
+    lisp_val_t class = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("POINT"), os_make_cons(nil, os_make_cons(slots, nil))), nil);
+    lisp_val_t slots_vector = primitive_make_array(os_make_cons(os_make_fixnum(1), nil), nil);
+    lisp_val_t instance = primitive_make_instance_raw(
+        os_make_cons(class, os_make_cons(slots_vector, nil)), nil);
+
+    lisp_val_t result = lisp_ll_transpile_fixture_setf_slot_value(os_make_cons(instance, nil), 0);
+    assert(result == instance, "setf: (slot-value x slot)はset-slot-valueへ展開されinstance自体を返す");
+
+    lisp_val_t stored = primitive_aref(os_make_cons(slots_vector, os_make_cons(os_make_fixnum(0), nil)), nil);
+    assert(stored == os_make_fixnum(42),
+           "setf: (slot-value x 'val)への書き込みが%slot-index経由でslots-vectorの正しい添字に反映される");
+}
+
 static void test_transpile_fixture_rest(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -604,6 +661,12 @@ int main(void) {
     test_transpile_fixture_cond_body_progn();
     test_transpile_fixture_case();
     test_transpile_fixture_case_using();
+    test_transpile_fixture_setf_setq();
+    test_transpile_fixture_setf_car();
+    test_transpile_fixture_setf_cdr();
+    test_transpile_fixture_setf_aref();
+    test_transpile_fixture_setf_elt();
+    test_transpile_fixture_setf_slot_value();
     test_transpile_fixture_rest();
     test_transpile_fixture_rest_with_fixed();
     test_list();
