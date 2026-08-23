@@ -175,6 +175,7 @@ extern lisp_val_t lisp_ll_transpile_fixture_generic_dispatch_order(lisp_val_t ev
 extern lisp_val_t lisp_ll_transpile_fixture_call_next_method(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_generic_no_applicable_method(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_call_next_method_no_next(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_make_instance(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -857,6 +858,17 @@ static void test_transpile_fixture_call_next_method_no_next(void) {
            "call-next-method: 次のメソッドが無い場合、未定義のerrorを%%funcall-by-name経由で呼びg_sym_eval_errorへフォールバックする");
 }
 
+static void test_transpile_fixture_make_instance(void) {
+    /* class-designatorがクラスオブジェクト自身の場合の%%classp分岐、
+       %%make-instance-raw+make-arrayによるインスタンス確保、固定の
+       ジェネリック関数名'initialize-objectを%generic-call経由で呼ぶことを
+       一貫して確認する(M12 Phase 6、#27) */
+    lisp_val_t initial_value = os_make_fixnum(42);
+    lisp_val_t result = lisp_ll_transpile_fixture_make_instance(os_make_cons(initial_value, nil), 0);
+    assert(result == initial_value,
+           "make-instance: %generic-call経由で呼ばれたinitialize-objectがinitargsの値をスロットへ書き込む");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -1146,6 +1158,7 @@ int main(void) {
     test_transpile_fixture_call_next_method();
     test_transpile_fixture_generic_no_applicable_method();
     test_transpile_fixture_call_next_method_no_next();
+    test_transpile_fixture_make_instance();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

@@ -512,3 +512,23 @@
   ;; call-next-methodを直接呼び、「no next method」分岐が%%funcall-by-name経由で
   ;; 安全にg_sym_eval_errorへフォールバックすることを確認する
   (call-next-method))
+
+(defun %%transpile-fixture-make-instance (initial-value)
+  ;; M12 Phase 6(#27): make-instanceの結線(1. class-designatorがクラス
+  ;; オブジェクト自身の場合の%%classp分岐、2. %%make-instance-raw+make-array
+  ;; によるインスタンス確保、3. 固定のジェネリック関数名'initialize-objectを
+  ;; %generic-call経由で呼ぶこと)を確認する。このC側テスト環境はinit.lispを
+  ;; ロードしないため、init.lisp常駐の本物のinitialize-objectメソッド
+  ;; (defmethod)は存在しない。そのため本物と同じ%fill-slots+
+  ;; %slot-initial-values呼び出しを行う最小限のメソッドを1つだけ
+  ;; 'initialize-objectへ登録してから呼ぶ
+  (let ((class (%%make-class-raw 'isiki-test-make-instance-class nil
+                                  (list (list 'val ':val nil)))))
+    (progn
+      (%register-method 'initialize-object (list nil nil)
+        (lambda (instance initargs)
+          (%fill-slots (%%instance-slots instance)
+                       (%slot-initial-values (%%class-slots (%%instance-class instance)) initargs)
+                       0)))
+      (let ((instance (make-instance class ':val initial-value)))
+        (aref (%%instance-slots instance) 0)))))

@@ -281,6 +281,7 @@ int main(int argc, char** argv) {
     run_lisp_file(proc, global_environment, "src/lisp/init.lisp");
     run_lisp_file(proc, global_environment, "test/lisp/init_test.lisp");
     run_lisp_file(proc, global_environment, "test/lisp/environments_predefined_test.lisp");
+    run_lisp_file(proc, global_environment, "test/lisp/qemu_boot_diag_m12_host.lisp");
 
     return g_test_failed ? 1 : 0;
 }

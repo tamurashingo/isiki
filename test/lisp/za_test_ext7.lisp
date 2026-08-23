@@ -31,13 +31,12 @@
 ;; シンボルを返すため、この対応が無いとILOSを使うdefunがほぼJITコンパイルされない。
 
 ;; init.lispのslot-value/set-slot-valueは、エラー分岐で'eval-errorをquoteしている。
-;; 本体の`let`自体はza_compile_letが対応済みだが、そのinit式`(%slot-index slot-name
-;; (%%class-slots (%%instance-class instance)) 0)`の引数位置に別の一般呼び出し
-;; (%%class-slots/%%instance-class)がネストしており、これが拡張15以前は
-;; allow_callゲートで弾かれてコンパイル断念していた実際の原因だった。拡張15で
-;; 引数位置の一般呼び出しネストに対応したため、現在はコンパイルされる
-;; (下記のisiki-za-test-point-x/y経由の実行結果でも正しいことを確認する)。
-(assert-equal t (%%za-compiled-p (function slot-value)))
+;; 拡張15(引数位置での一般呼び出しネスト対応)以前はこのquoteシンボル対応が無いと
+;; JIT対象にならなかったが、slot-valueはその後M12(#27)Phase2でinit.lispのdefunから
+;; init_aot.lispのAOTトランスパイル対象へ移動した。set-slot-valueと同じ理由でza.c
+;; JITを経由しないネイティブ関数として起動時に登録されるため、%%za-compiled-p は
+;; nilになる(常時コンパイル済み、下記set-slot-valueのコメント参照)。
+(assert-equal nil (%%za-compiled-p (function slot-value)))
 ;; set-slot-valueはM14(#29、setf)でinit.lispのdefunからinit_aot.lispのAOT
 ;; トランスパイル対象へ移動した(src/lisp/transpile.lisp)。ビルド時にC関数へ直接
 ;; 変換され、za.cのJIT(machine語へのランタイムコンパイル)を経由しないネイティブ
@@ -100,13 +99,13 @@
 ;;; --- ILOSを実際に使う統合テスト ---
 ;;
 ;; defclass自体はトップレベルのマクロ展開なのでza.cの対象外(JITはdefun本体のみ)。
-;; make-instanceのボディの`let*`自体はza_compile_letが対応済みだが、instance束縛の
-;; init式`(%%make-instance-raw class (make-array (length (%%class-slots class))))`は
-;; 引数位置に一般呼び出しが3段ネストしており、これも拡張15以前はallow_callゲートで
-;; 弾かれてコンパイル断念していた(slot-value/set-slot-valueと同じ理由)。拡張15後は
-;; コンパイルされる(下記のisiki-za-test-make-point経由の実行結果でも正しいことを
-;; 確認する)。
-(assert-equal t (%%za-compiled-p (function make-instance)))
+;; make-instanceは拡張15(引数位置での一般呼び出しネスト対応)後、ボディの`let*`の
+;; instance束縛init式`(%%make-instance-raw class (make-array (length
+;; (%%class-slots class))))`(引数位置に一般呼び出しが3段ネスト)もJIT対象になって
+;; いたが、その後M12(#27)Phase6でinit.lispのdefunからinit_aot.lispのAOTトランスパイル
+;; 対象へ移動した。slot-value/set-slot-valueと同じ理由でza.c JITを経由しないネイティブ
+;; 関数として起動時に登録されるため、%%za-compiled-p はnilになる(常時コンパイル済み)。
+(assert-equal nil (%%za-compiled-p (function make-instance)))
 
 (defclass isiki-za-test-point ()
   ((x :initarg :x :initform (lambda () 0))

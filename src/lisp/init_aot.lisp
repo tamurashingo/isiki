@@ -554,3 +554,18 @@
     (if (null frame)
         (%%funcall-by-name 'error "call-next-method: no next method")
         (%invoke-method-chain (car frame) (cdr frame)))))
+
+;; (make-instance class-designator :key1 val1 :key2 val2 ...)
+;; class-designatorはクラス名(シンボル)またはクラスオブジェクト自身。
+;; スロットの初期化自体はinitialize-object(defgeneric経由で動的生成される
+;; 総称関数、init.lisp常駐)に委譲するが、initialize-objectという関数名自体は
+;; *known-function-names*/*primitive-c-names*どちらにも載らずAOT側から直接
+;; 呼び出せない(defgenericの展開結果はインタプリタのロード時に初めて生成される
+;; 動的な関数であり、init_aot.lisp中の静的テキストとして存在しないため)。
+;; そのため呼び出しを%generic-callの直接呼び出しへ手動で書き換える
+;; (計画のdesign insight②、#27)
+(defun make-instance (class-designator &rest initargs)
+  (let* ((class (if (%%classp class-designator) class-designator (%find-class class-designator)))
+         (instance (%%make-instance-raw class (make-array (length (%%class-slots class))))))
+    (%generic-call 'initialize-object (list instance initargs))
+    instance))

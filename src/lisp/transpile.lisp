@@ -104,8 +104,17 @@
     ;; M12基盤B(#27): %register-builtin-classがbootstrap用クラスオブジェクトを
     ;; 生成するのに使う(メタクラスは<built-in-class>)
     (%%make-builtin-class-raw . "primitive_make_builtin_class_raw")
+    ;; M12基盤B(#27、計画通りだがPhase6まで未使用だったため実装時に追加): defclass
+    ;; マクロは常にインタプリタ実行だが、AOT側のテストfixtureがmake-instanceの
+    ;; 結線検証用にテストクラスを直接生成するのに使う
+    (%%make-class-raw . "primitive_make_class_raw")
     ;; M12(#27): slot-valueがインスタンスのスロットベクタから値を読み出すのに使う
     (aref . "primitive_aref")
+    ;; M12 Phase6(#27): make-instanceがインスタンスのスロットベクタを確保するのに使う
+    (make-array . "primitive_make_array")
+    ;; M12 Phase6(#27): make-instanceがクラス+スロットベクタから生インスタンスを
+    ;; 生成するのに使う
+    (%%make-instance-raw . "primitive_make_instance_raw")
     ;; M12(#27): subclasspがクラスの直接の親クラス一覧を辿るのに使う
     (%%class-supers . "primitive_class_supers")
     ;; M12基盤D(#27): class-ofが値の種別に応じてpredefinedクラスを解決するのに
@@ -1038,9 +1047,16 @@
 
 (defun emit-closure-creation (c-name free-vars outer-scope)
   "リフトしたlambda本体(c-name)を、自由変数だけを含む最小限の捕捉環境と共に
-   os_make_lifted_closureでラップするC式を作る。自由変数が1つも無ければ環境の
-   確保自体が不要なので直接nilを渡す(このマイルストンにはletが無いため、
-   パラメータを一切参照しないlambdaは頻出しうる)。自由変数がある場合は、
+   os_make_lifted_closureでラップするC式を作る。自由変数が1つも無ければ捕捉用の
+   環境オブジェクトを新たに確保する必要は無いが、捕捉環境としてnilを渡すのは
+   誤り(M12 #27 Phase6のQEMU限定regressionで発見): lambda本体が%%funcall-by-name
+   経由でまだAOT化されていない(init.lisp常駐の)関数を呼ぶと、呼ばれた側の
+   インタプリタ本体評価はここで渡したenvをそのまま使うため、envがnilだと
+   os_get_functionが親を辿れずglobal_environmentへ到達できず、本体中の通常の
+   関数呼び出し(interpreted defun同士の呼び出し)がことごとく未定義関数扱いに
+   なりg_sym_eval_errorを返す。global_environmentは全ての環境チェーンの根なので
+   代わりにこれを渡す(自由変数を捕捉しないため意味的にも安全)。自由変数がある
+   場合は、
    os_make_environment(親を持たない、この捕捉専用の環境)を作りGC_PROTECTしたのち、
    各自由変数についてOUTER-SCOPE(このlambda式が出現した時点の外側のscope)での
    現在の値(box化されていればboxそのもの、そうでなければ値そのもの)を
@@ -1049,7 +1065,7 @@
    他方からも見える(za.cの拡張4と同じ設計)。シンボル/consの確保がGCを
    誘発しても既存のOUTER-SCOPEの変数は呼び出し元でGC_PROTECT済みなので安全"
   (if (null free-vars)
-      (format nil "os_make_lifted_closure((lisp_addr_t)(void *)~A, nil)" c-name)
+      (format nil "os_make_lifted_closure((lisp_addr_t)(void *)~A, global_environment)" c-name)
       (let ((env-temp (format nil "__closure_env_~A" (incf *closure-temp-counter*))))
         (format nil "({ lisp_val_t ~A = os_make_environment(os_make_symbol(~A), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
                 env-temp

@@ -400,17 +400,7 @@
 ;; slot-value/%slot-initial-value/%slot-initial-values/%fill-slotsは
 ;; src/lisp/init_aot.lispへ移動した(M12 Phase 2、#27)。
 
-;; (make-instance class-designator :key1 val1 :key2 val2 ...)
-;; class-designatorはクラス名(シンボル)またはクラスオブジェクト自身。
-;; スロットの初期化自体はinitialize-object(総称関数、下記)に委譲する。
-;; initialize-objectはmake-instanceより後で定義されるが、この処理系は
-;; 関数本体中のシンボル参照を呼び出し時に解決するインタプリタなので、
-;; テキスト上の定義順は問題にならない(defclass/%find-classと同じ前提)。
-(defun make-instance (class-designator &rest initargs)
-  (let* ((class (if (%%classp class-designator) class-designator (%find-class class-designator)))
-         (instance (%%make-instance-raw class (make-array (length (%%class-slots class))))))
-    (initialize-object instance initargs)
-    instance))
+;; make-instanceはsrc/lisp/init_aot.lispへ移動した(M12 Phase 6、#27)。
 
 ;; subclassp/%any-subclasspはsrc/lisp/init_aot.lispへ移動した(M12 Phase 2、#27)。
 
