@@ -15,6 +15,10 @@
 #include "stream.h"
 #include "za.h"
 
+// src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
+// gitignore対象のビルド成果物)で定義される。init.lispから移動したmember/assoc等を
+// os_set_function経由でglobal_environmentへ登録する(M13)
+extern void os_register_aot_init_functions(void);
 
 /**
  * バージョン文字列・ビルド日時・ハッシュ・VirtIO-9pの検出結果をfbへ表示する
@@ -87,6 +91,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_format();
     os_register_clock();
     os_register_za_primitives();
+    os_register_aot_init_functions();
 
     frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);

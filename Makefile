@@ -7,7 +7,10 @@ OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
 
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c
+# トランスパイラ(transpileターゲット)の生成物。git管理対象外で、
+# buildやtest実行時にtranspileターゲット経由で都度生成される
+LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
 HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -43,7 +46,7 @@ TEST_BIN_REPL = $(BUILD_TMPDIR)/repl_test
 TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/subprimitive.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(TESTDIR)/subprimitive_test.c
 TEST_BIN_SUBPRIMITIVE = $(BUILD_TMPDIR)/subprimitive_test
 
-TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(TESTDIR)/script_test.c
+TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
 TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
@@ -71,6 +74,9 @@ TEST_BIN_P9 = $(BUILD_TMPDIR)/p9_test
 TEST_SRC_VIRTIO9P = $(SRCDIR)/p9.c $(SRCDIR)/virtio9p.c $(TESTDIR)/virtio9p_test.c
 TEST_BIN_VIRTIO9P = $(BUILD_TMPDIR)/virtio9p_test
 
+TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/print.c $(LISP_COMPILED) $(TESTDIR)/lisp_compiled_test.c
+TEST_BIN_LISP_COMPILED = $(BUILD_TMPDIR)/lisp_compiled_test
+
 
 .PHONY: all setup image transpile build compile run test test-qemu clean
 
@@ -78,7 +84,18 @@ all: build
 
 
 image:
-	docker build -t isiki-builder .
+	docker build --build-arg USER_UID="$$(id -u)" --build-arg USER_GID="$$(id -g)" -t isiki-builder .
+
+# ros(roswell)はイメージのENTRYPOINTが/usr/local/bin/sbclのため、
+# --entrypoint bashで明示的に上書きしないと引数がsbclへ直接渡ってしまう。
+# imageターゲットでホストのUID/GIDと同じbuilderユーザーを作成し、
+# そのユーザーにroswellをインストール済みのため、--userを指定しても
+# $HOMEが正しく解決され動作する。
+transpile:
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+
+$(LISP_COMPILED): transpile
 
 build: $(SRC) $(HDR)
 	mkdir -p esp_dir/EFI/BOOT
@@ -107,7 +124,7 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-o $@ $<
 
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(HDR) | $(BUILD_TMPDIR)
+test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
@@ -188,6 +205,11 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_VIRTIO9P) $(TEST_SRC_VIRTIO9P)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_LISP_COMPILED) $(TEST_SRC_LISP_COMPILED) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_RUNTIME) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_PROCESS) -v "$(PWD)":/workspace isiki-builder
@@ -204,6 +226,7 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_CLOCK) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_P9) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_VIRTIO9P) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP_COMPILED) -v "$(PWD)":/workspace isiki-builder
 
 clean:
 	rm -rf esp_dir $(BUILD_TMPDIR)

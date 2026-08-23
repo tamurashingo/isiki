@@ -12,6 +12,11 @@
 #include "stream_lisp.h"
 #include "format.h"
 
+// src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
+// gitignore対象のビルド成果物)で定義される。init.lispから移動したmember/assoc等を
+// os_set_function経由でglobal_environmentへ登録する(M13)
+extern void os_register_aot_init_functions(void);
+
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
 // ダミー実装を置く(このテストはos_read_streamを呼ばないため中身は使われない)
@@ -254,6 +259,7 @@ int main(int argc, char** argv) {
                      global_environment);
     os_register_streams();
     os_register_format();
+    os_register_aot_init_functions();
 
     lisp_val_t env = os_make_environment(os_make_symbol("SCRIPT-TEST-ENV"), global_environment);
 
@@ -261,17 +267,21 @@ int main(int argc, char** argv) {
     run_lisp_file(proc, env, "test/lisp/rest_test.lisp");
     run_lisp_file(proc, env, "test/lisp/defmacro_test.lisp");
 
-    lisp_val_t init_env = os_make_environment(os_make_symbol("INIT-TEST-ENV"), global_environment);
-
     // 実機の対話的なREPLではos_repl_step(repl.c)がinit.lisp読み込みより先にproc->envを
     // 遅延生成し、os_make_process_environment経由で*environments*へ登録する。この
     // 順序を再現し、init.lisp内の(defdynamic *environments* ...)がこの事前登録を
     // 消してしまわないことをinit_test.lispの末尾で確認する
     os_make_process_environment("F1");
 
-    run_lisp_file(proc, init_env, "src/lisp/init.lisp");
-    run_lisp_file(proc, init_env, "test/lisp/init_test.lisp");
-    run_lisp_file(proc, init_env, "test/lisp/environments_predefined_test.lisp");
+    // QEMU実機起動(kernel.c: run_qemu_boot_test)はinit.lispをcc_load経由で
+    // global_environmentへ直接ロードする(子envを挟まない)。init_env相当の
+    // 子envで読むとこの本番トポロジーと食い違い、init.lisp内のdefun(errorなど)
+    // がglobal_environmentから辿れなくなる(M12 #27の%%funcall-by-name経路で
+    // 実際に発覚)ため、本番と同じglobal_environmentを使う
+    run_lisp_file(proc, global_environment, "src/lisp/init.lisp");
+    run_lisp_file(proc, global_environment, "test/lisp/init_test.lisp");
+    run_lisp_file(proc, global_environment, "test/lisp/environments_predefined_test.lisp");
+    run_lisp_file(proc, global_environment, "test/lisp/qemu_boot_diag_m12_host.lisp");
 
     return g_test_failed ? 1 : 0;
 }

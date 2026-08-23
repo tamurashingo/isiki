@@ -444,6 +444,26 @@
     (report-condition (make-instance '<control-error>) s)
     (string-to-symbol (get-output-stream-string s))))
 
+(assert-equal (string-to-symbol "arithmetic error: / (1 0)")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<arithmetic-error> ':operation '/ ':operands (list 1 0)) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+(assert-equal (string-to-symbol "5 is not of expected class <number>")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<domain-error> ':object 5 ':expected-class '<number>) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+(assert-equal (string-to-symbol "cannot parse abc as <integer>")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<parse-error> ':string "abc" ':expected-class '<integer>) s)
+    (string-to-symbol (get-output-stream-string s))))
+
+(assert-equal (string-to-symbol "stream error on my-stream")
+  (let ((s (create-string-output-stream)))
+    (report-condition (make-instance '<stream-error> ':stream 'my-stream) s)
+    (string-to-symbol (get-output-stream-string s))))
+
 ;;; --- dynamic-let / set-dynamic ---
 
 (defdynamic *dl-test* 1)
@@ -511,6 +531,38 @@
   (block b
     (with-handler (lambda (c) (return-from b 'outer))
       (ignore-errors (signal-condition (make-instance '<condition>) nil)))))
+
+;;; --- capstone: 独自エラークラスをdefclass/signal-condition/with-handler/
+;;; ignore-errors/report-conditionの全経路で通す(M12 Phase 13, #27) ---
+;;;
+;;; defclass/defgeneric/defmethod自体はインタプリタ実行のままだが、ここで使う
+;;; typep/subclassp/make-instance/slot-value/signal-condition/with-handler/
+;;; ignore-errors/report-conditionの下位機構は全てAOT化済み。独自クラスに対しても
+;;; 正しく動作することを一連のシナリオで確認する。
+
+(defclass <my-app-error> (<error>) ((code :initarg :code :initform nil)))
+
+(defmethod report-condition ((condition <my-app-error>) stream)
+  (format stream "my-app-error: code=~A" (slot-value condition 'code))
+  condition)
+
+;; <error>のサブクラスなのでignore-errorsで捕まえられる
+(assert-equal nil
+  (ignore-errors (signal-condition (make-instance '<my-app-error> ':code 42) nil)))
+
+;; with-handlerでインスタンスを受け取り、独自スロットへslot-valueでアクセスできる
+(assert-equal 42
+  (block b
+    (with-handler (lambda (c) (return-from b (slot-value c 'code)))
+      (signal-condition (make-instance '<my-app-error> ':code 42) nil))))
+
+;; report-conditionは独自クラスに対しても対応するdefmethodへ正しくdispatchする
+(assert-equal (string-to-symbol "my-app-error: code=42")
+  (let ((s (create-string-output-stream)))
+    (block b
+      (with-handler (lambda (c) (report-condition c s) (return-from b nil))
+        (signal-condition (make-instance '<my-app-error> ':code 42) nil)))
+    (string-to-symbol (get-output-stream-string s))))
 
 ;;; --- class / the / assure ---
 

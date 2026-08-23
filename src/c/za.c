@@ -1255,7 +1255,18 @@ static UINT64 za_ensure_trampoline(void) {
     jit_cmp_rax_r11();
     UINT64 jne_patch = jit_emit_jne_rel32_placeholder();
 
-    // native高速path: r11 = obj[1](生の関数アドレス)へ末尾jmp。rcx=args,rdx=envは
+    // obj[2](word2)がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)なら、
+    // rdx(env)を呼び出し元のenvではなくobj[3](定義時に捕捉した自由変数を保持する環境)に
+    // 差し替える。eval.cのapply_functionが行う分岐と同じ判断をここでも行う必要がある
+    // (このtrampolineはapply_functionを経由しない直接jmpの高速pathだから)
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 16); // rax = obj[2] (word2)
+    jit_movabs_reg(ZA_REG_R11, os_make_fixnum(2));
+    jit_cmp_rax_r11();
+    UINT64 jne_not_closure = jit_emit_jne_rel32_placeholder();
+    jit_mov_reg_from_mem_disp8(ZA_REG_RDX, ZA_REG_R10, 24); // rdx = obj[3] (captured env)
+    jit_patch_rel32(jne_not_closure);
+
+    // native高速path: r11 = obj[1](生の関数アドレス)へ末尾jmp。rcx=argsは
     // 呼び出し規約上すでに正しい位置にあるので、そのままneue関数の入口へ飛べる。
     jit_mov_reg_from_mem_disp8(ZA_REG_R11, ZA_REG_R10, 8);
     jit_jmp_reg(ZA_REG_R11);

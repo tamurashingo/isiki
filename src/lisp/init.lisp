@@ -93,13 +93,8 @@
     `(let ((,key ,keyform))
        ,(%case-expand key clauses))))
 
-;; keylist中のいずれかのkについて(funcall pred key k)が真になるかを判定する。
-(defun %case-using-match (pred key keylist)
-  (if (null keylist)
-      nil
-      (if (funcall pred key (car keylist))
-          t
-          (%case-using-match pred key (cdr keylist)))))
+;; %case-using-matchはsrc/lisp/init_aot.lispへ移動した(M14: 基盤Aによりcaseと
+;; 同じ形で対応可能になったため)。
 
 ;; %case-using-matchの呼び出しをif連鎖として組み立てる版(caseと違い、
 ;; 述語呼び出しはbody展開時ではなく実行時に行う必要があるためformを生成する)。
@@ -271,219 +266,40 @@
 
 ;;; --- apply (§9) ---
 ;;;
-;;; %%apply(eval.c側の組み込み関数。fnと評価済みの引数リストの2つを取り、
-;;; リストの内容をfnの実引数として展開して呼び出す)を、構文上並べたobj*と
-;;; 末尾のlist引数を1本の引数リストに組み立てた上で呼ぶだけのLisp合成関数。
-
-;; objsの最後の要素(list引数)以外を、その手前にconsで連結していく。
-(defun %apply-args (objs)
-  (if (null (cdr objs))
-      (car objs)
-      (cons (car objs) (%apply-args (cdr objs)))))
-
-;; fnを、obj*を個別の引数として、末尾のlistの要素をさらに展開した引数列で呼び出す。
-(defun apply (fn &rest objs)
-  (%%apply fn (%apply-args objs)))
+;;; %apply-args/applyはsrc/lisp/init_aot.lispへ移動した(M14: 基盤B(&rest対応)+
+;;; 基盤C(%%apply)によりAOT対応可能になったため)。
 
 ;;; --- mapcar / mapc / mapcan ---
-;;;
-;;; いずれもfnを評価済みの値として受け取り、関数呼び出しの形はLisp2スコープの
-;;; 制約で(f x)のようには書けない(fが変数に束縛された関数値の場合、それは
-;;; 関数namespaceではなく変数namespaceにあるため)。そのため、funcall(eval.c側の
-;;; 組み込み関数)を介してfnを呼び出す。mapcarのみ複数リストに対応し、
-;;; mapc/mapcanは単一のリストのみを受け取る簡略版のままとする。
 
-;; list-of-listsの各要素(サブリスト)のcarを集めたリストを返す。
-(defun %lists-car (lists)
-  (if (null lists)
-      nil
-      (cons (car (car lists)) (%lists-car (cdr lists)))))
-
-;; list-of-listsの各要素(サブリスト)のcdrを集めたリストを返す。
-(defun %lists-cdr (lists)
-  (if (null lists)
-      nil
-      (cons (cdr (car lists)) (%lists-cdr (cdr lists)))))
-
-;; list-of-listsの中に、空リストになっているものが1つでもあればtを返す。
-(defun %lists-some-null (lists)
-  (if (null lists)
-      nil
-      (if (null (car lists))
-          t
-          (%lists-some-null (cdr lists)))))
-
-;; listsの対応する位置の要素をまとめてfnに渡し(%%apply経由)、結果を集めたリストを
-;; 返す。最短のリストが尽きた時点で終了し、他のリストの余った要素は無視する。
-(defun %mapcar-lists (fn lists)
-  (if (or (null lists) (%lists-some-null lists))
-      nil
-      (cons (%%apply fn (%lists-car lists))
-            (%mapcar-lists fn (%lists-cdr lists)))))
-
-;; listの各要素にfnを適用した結果を集めたリストを返す(1つ以上のリストを受け取れる)。
-(defun mapcar (fn &rest lists)
-  (%mapcar-lists fn lists))
-
-(defun %mapc-1 (fn list)
-  (if (null list)
-      nil
-      (progn (funcall fn (car list)) (%mapc-1 fn (cdr list)))))
-
-;; listの各要素にfnを副作用目的で適用し、list自身を返す。
-(defun mapc (fn list)
-  (progn (%mapc-1 fn list) list))
-
-;; listの各要素にfnを適用した結果(リストであることを期待する)をappendで連結して返す。
-(defun mapcan (fn list)
-  (if (null list)
-      nil
-      (append (funcall fn (car list)) (mapcan fn (cdr list)))))
-
-;;; --- member / assoc ---
-;;;
-;;; いずれも要素の比較にeqを使う(ISLispのeql相当。FIXNUMはタグ付きのまま
-;;; immediate値として同一性比較できるため、eqで正しく比較できる)。
-
-;; listの中からitemとeqな要素を探し、見つかった要素から始まる部分リストを返す。
-;; 見つからなければnil。
-(defun member (item list)
-  (if (null list)
-      nil
-      (if (eq item (car list))
-          list
-          (member item (cdr list)))))
-
-;; alist((key . value)のconsを並べたリスト)からkeyとeqなキーを持つ要素(cons)を探す。
-;; 見つからなければnil。
-(defun assoc (key alist)
-  (if (null alist)
-      nil
-      (if (eq key (car (car alist)))
-          (car alist)
-          (assoc key (cdr alist)))))
+;; %lists-car/%lists-cdr/%lists-some-null/%mapcar-lists/mapcar/%mapc-1/mapc/
+;; mapcanはsrc/lisp/init_aot.lispへ移動した(M14: 基盤B(&rest)+
+;; *primitive-c-names*の%%apply追加によりAOT対応可能になったため)。
 
 ;;; --- append / reverse ---
 ;;;
 ;;; ISLispの仕様上、appendはリストのみを対象とする(文字列・ベクトルは対象外)。
-;;; reverseも同様にリストのみを対象とする簡略版とする。
+;;; reverseも同様にリストのみを対象とする簡略版とする。member/assoc/reverseと
+;;; その内部ヘルパーはsrc/lisp/init_aot.lispへ移動し、トランスパイラでAOT
+;;; コンパイルしてos_register_aot_init_functions経由でglobal_environmentへ
+;;; 登録する(M13)。
 
-(defun %append2 (list1 list2)
-  (if (null list1)
-      list2
-      (cons (car list1) (%append2 (cdr list1) list2))))
-
-(defun %append-lists (lists)
-  (if (null lists)
-      nil
-      (if (null (cdr lists))
-          (car lists)
-          (%append2 (car lists) (%append-lists (cdr lists))))))
-
-;; 0個以上のリストを連結して1つのリストにする。
-(defun append (&rest lists)
-  (%append-lists lists))
-
-(defun %reverse-helper (list acc)
-  (if (null list)
-      acc
-      (%reverse-helper (cdr list) (cons (car list) acc))))
-
-;; listの要素順を反転した新しいリストを返す。
-(defun reverse (list)
-  (%reverse-helper list nil))
-
-;;; --- list ---
-
-;; 引数をそのまま並べたリストを返す。&restが評価済みの引数を既にリストとして
-;; 束縛するため、bodyはitemsをそのまま返すだけでよい。
-(defun list (&rest items)
-  items)
+;; append/listはsrc/lisp/init_aot.lispへ移動した(M14: 基盤Bの&restパラメータ
+;; 対応によりAOT対応可能になったため)。
 
 ;;; --- create-list / nreverse / maplist / mapl / mapcon (§21.3) ---
 
-(defun %create-list-helper (n elt)
-  (if (= n 0)
-      nil
-      (cons elt (%create-list-helper (- n 1) elt))))
+;; %create-list-helper/create-list/%nreverse-helper/nreverseはsrc/lisp/
+;; init_aot.lispへ移動した(M14: 基盤A/Bによりそれぞれ対応可能になったため)。
 
-;; 長さnのリストを作る。initial-elementは仕様上省略可(省略時の初期値は
-;; implementation defined)で、本実装では省略時はnilを詰める。
-(defun create-list (n &rest initial-element)
-  (%create-list-helper n (if (null initial-element) nil (car initial-element))))
-
-(defun %nreverse-helper (list prev)
-  (if (null list)
-      prev
-      (let ((next (cdr list)))
-        (set-cdr list prev)
-        (%nreverse-helper next list))))
-
-;; reverseの破壊的版。listを構成するconsのcdrをset-cdrで書き換えて反転する
-;; (新しいconsは確保しない)。
-(defun nreverse (list)
-  (%nreverse-helper list nil))
-
-;; mapcarと同様だが、fnには要素そのものではなく後続のsublist(cdrで縮んでいく
-;; リスト自身)を適用する。
-(defun maplist (fn list)
-  (if (null list)
-      nil
-      (cons (funcall fn list) (maplist fn (cdr list)))))
-
-(defun %mapl-1 (fn list)
-  (if (null list)
-      nil
-      (progn (funcall fn list) (%mapl-1 fn (cdr list)))))
-
-;; maplistと同様にsublistへfnを副作用目的で適用し、list自身を返す(mapcの
-;; sublist版)。
-(defun mapl (fn list)
-  (progn (%mapl-1 fn list) list))
-
-;; maplistと同様にsublistへfnを適用するが、結果はappendで連結する(mapcanの
-;; sublist版)。仕様上はnconcによる破壊的な連結だが、既存のmapcanと同様に
-;; nconcが未実装のためappendで代用する簡略化になっている。
-(defun mapcon (fn list)
-  (if (null list)
-      nil
-      (append (funcall fn list) (mapcon fn (cdr list)))))
+;; maplist/%mapl-1/maplはsrc/lisp/init_aot.lispへ移動した(M13)。mapconも
+;; src/lisp/init_aot.lispへ移動した(M14: appendが基盤BによりAOT対応済みに
+;; なったため)。
 
 ;;; --- map-into ---
 ;;;
-;;; destinationとsequences(0個以上)のうち最も短い長さだけ、左から
-;;; (function (elt seq1 i) (elt seq2 i) ...)の結果をdestinationのi番目に破壊的に
-;;; 書き込み、destinationを返す。sequencesが可変長なので、mapcar等のfuncall経由
-;;; ではなく%%apply(eval.c側の組み込み関数、実引数リストをそのまま展開して呼ぶ)
-;;; を使う。
-
-;; seqsの中で最も短い長さを返す(destinationも含めてこのリストに渡される)。
-(defun %map-into-min-length (seqs)
-  (if (null (cdr seqs))
-      (length (car seqs))
-      (let ((rest-min (%map-into-min-length (cdr seqs))))
-        (if (< (length (car seqs)) rest-min)
-            (length (car seqs))
-            rest-min))))
-
-;; sequences群のindex番目の要素を並べたリストを作る(%%applyの実引数リストにする)。
-(defun %map-into-args-at (index sequences)
-  (if (null sequences)
-      nil
-      (cons (elt (car sequences) index)
-            (%map-into-args-at index (cdr sequences)))))
-
-(defun %map-into-loop (destination function sequences index limit)
-  (if (>= index limit)
-      destination
-      (progn
-        (set-elt (%%apply function (%map-into-args-at index sequences))
-                 destination index)
-        (%map-into-loop destination function sequences (+ index 1) limit))))
-
-(defun map-into (destination function &rest sequences)
-  (%map-into-loop destination function sequences 0
-                   (%map-into-min-length (cons destination sequences))))
+;;; %map-into-min-length/%map-into-args-at/%map-into-loop/map-intoはsrc/lisp/
+;;; init_aot.lispへ移動した(M14: 基盤B(&rest)と、*primitive-c-names*への
+;;; length/elt/</>=追加によりAOT対応可能になったため)。
 
 ;;; --- ILOS (最小実装): defclass / make-instance / slot-value / typep / subclassp ---
 ;;;
@@ -500,28 +316,12 @@
 ;; 環境の親子関係と無関係なグローバルとして値を持つため、この制約を受けない。
 (defdynamic *classes* nil)
 
-(defun %find-class (name)
-  (cdr (assoc name (dynamic *classes*))))
-
-(defun %register-class (name class)
-  (%%set-dynamic '*classes* (cons (cons name class) (dynamic *classes*)))
-  class)
-
-;; super-nameのリストを、対応する登録済みクラスオブジェクトのリストに変換する。
-;; defclass由来(%defclass-supers)と、直後のpredefinedクラスbootstrapの両方から
-;; 使う共通の下請け関数(bootstrap側は<object>のようにsupersが本当に空のクラスも
-;; 扱うため、空リストへのフォールバックはここでは行わない)
-(defun %resolve-supers (super-names)
-  (if (null super-names)
-      nil
-      (cons (%find-class (car super-names)) (%resolve-supers (cdr super-names)))))
-
-;; ISLisp仕様Figure 1のクラス継承木に従い、条件階層以外のpredefinedクラス
-;; (<object>とその子)を%%MAKE-BUILTIN-CLASS-RAW(メタクラスは<built-in-class>)で
-;; 登録する。supersが未登録だと%find-classがnilを返してしまうため、
-;; 親クラスが先に登録済みになる順序で呼ぶ必要がある
-(defun %register-builtin-class (name super-names)
-  (%register-class name (%%make-builtin-class-raw name (%resolve-supers super-names) nil)))
+;; %find-class/%register-class/%resolve-supers/%register-builtin-classは
+;; src/lisp/init_aot.lispへ移動した(M12基盤B/C、#27)。*classes*自体の
+;; defdynamicと、直後の21個の%register-builtin-class呼び出しはmainがdefun
+;; 以外のトップレベルフォームを読まないためinit.lisp常駐のまま(AOT登録された
+;; ネイティブ関数はglobal_environmentへ通常のdefunと同じシンボル名で登録される
+;; ため、呼び出し側の実装場所に関わらずそのまま解決できる)。
 
 (%register-builtin-class '<object> nil)
 (%register-builtin-class '<basic-array> '(<object>))
@@ -591,94 +391,24 @@
          (append (%merge-superclass-slots %supers)
                  (list ,@(%slot-spec-forms slot-specs)))))))
 
-;; slots(スロット記述子のリスト)の中からslot-nameのインデックス(0起点)を探す
-(defun %slot-index (slot-name slots idx)
-  (if (null slots)
-      nil
-      (if (eq slot-name (car (car slots)))
-          idx
-          (%slot-index slot-name (cdr slots) (+ idx 1)))))
+;; %slot-index/set-slot-valueはsrc/lisp/init_aot.lispへ移動した(M14: 基盤C
+;; によりsetfのslot-value place形式に対応可能になったため)。%slot-indexは
+;; slot-value(下記、インタプリタに残る)からも呼ばれるが、AOT登録された
+;; ネイティブ関数はglobal_environmentへ通常のdefunと同じシンボル名で登録される
+;; ため、呼び出し側の実装場所(インタプリタ/AOT)に関わらずそのまま解決できる。
 
-(defun slot-value (instance slot-name)
-  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
-    (if (null idx)
-        'eval-error
-        (aref (%%instance-slots instance) idx))))
+;; slot-value/%slot-initial-value/%slot-initial-values/%fill-slotsは
+;; src/lisp/init_aot.lispへ移動した(M12 Phase 2、#27)。
 
-(defun set-slot-value (instance slot-name value)
-  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
-    (if (null idx)
-        'eval-error
-        (set-aref (%%instance-slots instance) idx value))))
+;; make-instanceはsrc/lisp/init_aot.lispへ移動した(M12 Phase 6、#27)。
 
-;; 対応するinitargがinitargs(:key1 val1 :key2 val2 ...)に無ければ
-;; slot-descriptorのinitform-thunkをfuncallして初期値を得る
-(defun %slot-initial-value (slot-descriptor initargs)
-  (let ((initarg-key (car (cdr slot-descriptor)))
-        (thunk (car (cdr (cdr slot-descriptor)))))
-    (if (null initarg-key)
-        (funcall thunk)
-        (let ((found (member initarg-key initargs)))
-          (if found
-              (car (cdr found))
-              (funcall thunk))))))
+;; subclassp/%any-subclasspはsrc/lisp/init_aot.lispへ移動した(M12 Phase 2、#27)。
 
-(defun %slot-initial-values (slots initargs)
-  (if (null slots)
-      nil
-      (cons (%slot-initial-value (car slots) initargs) (%slot-initial-values (cdr slots) initargs))))
-
-(defun %fill-slots (vec values idx)
-  (if (null values)
-      vec
-      (progn (set-aref vec idx (car values))
-             (%fill-slots vec (cdr values) (+ idx 1)))))
-
-;; (make-instance class-designator :key1 val1 :key2 val2 ...)
-;; class-designatorはクラス名(シンボル)またはクラスオブジェクト自身。
-;; スロットの初期化自体はinitialize-object(総称関数、下記)に委譲する。
-;; initialize-objectはmake-instanceより後で定義されるが、この処理系は
-;; 関数本体中のシンボル参照を呼び出し時に解決するインタプリタなので、
-;; テキスト上の定義順は問題にならない(defclass/%find-classと同じ前提)。
-(defun make-instance (class-designator &rest initargs)
-  (let* ((class (if (%%classp class-designator) class-designator (%find-class class-designator)))
-         (instance (%%make-instance-raw class (make-array (length (%%class-slots class))))))
-    (initialize-object instance initargs)
-    instance))
-
-;; c1がc2自身、またはc2の(推移的な)サブクラスかどうか
-(defun subclassp (c1 c2)
-  (if (eq c1 c2)
-      t
-      (%any-subclassp (%%class-supers c1) c2)))
-
-(defun %any-subclassp (classes c2)
-  (if (null classes)
-      nil
-      (if (subclassp (car classes) c2)
-          t
-          (%any-subclassp (cdr classes) c2))))
-
-;; instanceがclass-designator(クラスオブジェクトまたはクラス名)のインスタンスかどうか。
-;; class-ofが組み込み型も含めて汎用化されたので、ILOSインスタンス以外の値でも
-;; 正しく判定できる
-(defun typep (instance class-designator)
-  (subclassp (class-of instance)
-             (if (%%classp class-designator) class-designator (%find-class class-designator))))
-
-;; instanceがclass(クラスオブジェクト)のインスタンスかどうか。
-;; 仕様上instancepはclassを評価済みのクラスオブジェクトとして受け取り(typepの
-;; クラス名designatorとは異なる)、クラスオブジェクトでなければdomain-errorを
-;; 発生させるべきだが、<domain-error>が未実装のため既存のtypep(designatorも
-;; クラスオブジェクトも受け付ける、緩い実装)にそのまま委譲する既知の簡略化とする。
-(defun instancep (instance class)
-  (typep instance class))
+;; typep/instancepはsrc/lisp/init_aot.lispへ移動した(M12 Phase 3、#27)。
 
 ;;; --- integerp (§19: number class) ---
 
-;; FIXNUM(60bit以内)とbignum(60bit超)のいずれかであれば整数とみなす。
-(defun integerp (obj)
-  (or (fixnump obj) (bignump obj)))
+;; integerpはsrc/lisp/init_aot.lispへ移動した(M12 Phase 3、#27)。
 
 ;;; --- class / the / assure ---
 ;;;
@@ -727,130 +457,17 @@
 ;; *classes*/*handlers*と同じ理由でdefdynamic+%%set-dynamicを使う
 (defdynamic *generic-methods* nil)
 
-(defun %find-generic-methods (name)
-  (cdr (assoc name (dynamic *generic-methods*))))
-
-;; specializersのリストが位置ごとに等しいかどうか。各要素はnil同士も含めて
-;; eqで比較してよい(クラスオブジェクトはdefclassごとに1つの同一オブジェクトと
-;; して扱う)
-(defun %specializers-equal-p (s1 s2)
-  (if (null s1)
-      (null s2)
-      (if (null s2)
-          nil
-          (if (eq (car s1) (car s2))
-              (%specializers-equal-p (cdr s1) (cdr s2))
-              nil))))
-
-(defun %remove-method-with-specializer (specializers methods)
-  (if (null methods)
-      nil
-      (if (%specializers-equal-p specializers (car (car methods)))
-          (%remove-method-with-specializer specializers (cdr methods))
-          (cons (car methods) (%remove-method-with-specializer specializers (cdr methods))))))
-
-;; 同じgf-name・同じspecializersの既存メソッドを取り除いた上で新しいメソッドを
-;; 先頭に積んで登録する(defclass/%register-classと同じ「再定義は前に積んでshadow」
-;; パターン)
-(defun %register-method (name specializers fn)
-  (let* ((existing (%find-generic-methods name))
-         (updated (cons (cons specializers fn) (%remove-method-with-specializer specializers existing))))
-    (%%set-dynamic '*generic-methods* (cons (cons name updated) (dynamic *generic-methods*)))
-    name))
-
-;; specializerがnil(無指定)のメソッドは常に適用可能。それ以外はargのクラス
-;; (class-of、組み込み型も含む)がspecializerのサブクラス(自身含む)である場合のみ
-;; 適用可能
-(defun %method-applicable-p (specializer arg)
-  (if (null specializer)
-      t
-      (subclassp (class-of arg) specializer)))
-
-;; specializersの各要素と、対応する位置のargが全て%method-applicable-pであるか
-;; (ANDを取る。specializersがargsより短い場合、残りのargは無指定として扱われる)
-(defun %specializers-applicable-p (specializers args)
-  (if (null specializers)
-      t
-      (if (%method-applicable-p (car specializers) (car args))
-          (%specializers-applicable-p (cdr specializers) (cdr args))
-          nil)))
-
-(defun %applicable-methods (name args)
-  (%filter-applicable-methods (%find-generic-methods name) args))
-
-(defun %filter-applicable-methods (methods args)
-  (if (null methods)
-      nil
-      (if (%specializers-applicable-p (car (car methods)) args)
-          (cons (car methods) (%filter-applicable-methods (cdr methods) args))
-          (%filter-applicable-methods (cdr methods) args))))
-
-;; specializers1がspecializers2より特定的かどうか。先頭の位置から順に見て、
-;; その位置のspecializerが完全に一致(eq、両方nilの場合も含む)する場合のみ
-;; 次の位置へ進み、一致しない場合はその位置で即決する(specializerがnilの
-;; 位置は常に最も非特定的)。CPLは計算しないため、一致しない位置で両方が
-;; 非nilかつsubclassp関係を持たない場合はnil(決着つかず)を返す
-(defun %specializers-more-specific-p (s1 s2)
-  (if (null s1)
-      nil
-      (if (eq (car s1) (car s2))
-          (%specializers-more-specific-p (cdr s1) (cdr s2))
-          (if (null (car s2))
-              t
-              (if (null (car s1))
-                  nil
-                  (subclassp (car s1) (car s2)))))))
-
-;; m1がm2より特定的かどうか
-(defun %more-specific-p (m1 m2)
-  (%specializers-more-specific-p (car m1) (car m2)))
-
-(defun %insert-method-by-specificity (m sorted)
-  (if (null sorted)
-      (list m)
-      (if (%more-specific-p m (car sorted))
-          (cons m sorted)
-          (cons (car sorted) (%insert-method-by-specificity m (cdr sorted))))))
-
-;; 最も特定的なメソッドが先頭になるよう並び替える(挿入ソート)
-(defun %order-methods (methods)
-  (if (null methods)
-      nil
-      (%insert-method-by-specificity (car methods) (%order-methods (cdr methods)))))
-
 ;; *next-methods*: call-next-method/next-method-pが参照する、現在呼び出し中の
 ;; メソッド呼び出しごとの「残りメソッドリスト+呼び出し引数」のフレームスタック
 ;; (内側の呼び出しが先頭)。with-handlerの*handlers*と同じ保存/復元パターン
 (defdynamic *next-methods* nil)
 
-;; orderedの先頭メソッドをargsで呼び出す。呼び出し中はorderedの残り(cdr)と
-;; argsを新しいフレームとして*next-methods*に積み、unwind-protectで必ず復元する。
-;; orderedが空(=適用可能なメソッドが無い/次のメソッドが無い)ならエラーとする
-;; (仕様: 適用可能なメソッドが無い場合、call-next-methodで次が無い場合、いずれもerror)
-(defun %invoke-method-chain (ordered args)
-  (if (null ordered)
-      (error "no applicable method")
-      (let ((saved (dynamic *next-methods*)))
-        (unwind-protect
-            (progn (%%set-dynamic '*next-methods* (cons (cons (cdr ordered) args) saved))
-                   (%%apply (cdr (car ordered)) args))
-          (%%set-dynamic '*next-methods* saved)))))
-
-(defun %generic-call (name args)
-  (%invoke-method-chain (%order-methods (%applicable-methods name args)) args))
-
-;; (next-method-p) → boolean: 現在のメソッドの内側でcall-next-methodが呼べるか
-(defun next-method-p ()
-  (if (null (dynamic *next-methods*))
-      nil
-      (if (car (car (dynamic *next-methods*))) t nil)))
-
-;; (call-next-method) → <object>: 元の呼び出し引数のまま次のメソッドを呼ぶ
-(defun call-next-method ()
-  (let ((frame (car (dynamic *next-methods*))))
-    (if (null frame)
-        (error "call-next-method: no next method")
-        (%invoke-method-chain (car frame) (cdr frame)))))
+;; %find-generic-methods/%specializers-equal-p/%remove-method-with-specializer/
+;; %register-method/%method-applicable-p/%specializers-applicable-p/
+;; %applicable-methods/%filter-applicable-methods/%specializers-more-specific-p/
+;; %more-specific-p/%insert-method-by-specificity/%order-methods/
+;; %invoke-method-chain/%generic-call/next-method-p/call-next-methodは
+;; src/lisp/init_aot.lispへ移動した(M12 Phase 5、#27)。
 
 ;; (defgeneric name lambda-list option*)
 ;; lambda-list/optionsは検証しない(既知の簡略化)。nameを、呼び出し時に
@@ -911,28 +528,7 @@
                0)
   instance)
 
-;; (class-of obj) → <class>: objが直接属するクラスを返す。ILOSのクラスインスタンス
-;; だけでなく、クラスオブジェクト自身(メタクラス判定)や組み込み型の値も対象とする。
-;; nilはcar/cdr循環consとしてconsp/symbolp両方にマッチしうる内部表現のため、
-;; consp/symbolpより先に判定する必要がある
-(defun class-of (obj)
-  (cond
-    ((%%class-instance-p obj) (%%instance-class obj))
-    ((%%standard-classp obj) (%find-class '<standard-class>))
-    ((%%builtin-classp obj) (%find-class '<built-in-class>))
-    ((null obj) (%find-class '<null>))
-    ((consp obj) (%find-class '<cons>))
-    ((symbolp obj) (%find-class '<symbol>))
-    ((characterp obj) (%find-class '<character>))
-    ((stringp obj) (%find-class '<string>))
-    ((general-vector-p obj) (%find-class '<general-vector>))
-    ((general-array*-p obj) (%find-class '<general-array*>))
-    ((floatp obj) (%find-class '<float>))
-    ((integerp obj) (%find-class '<integer>))
-    ((numberp obj) (%find-class '<number>))
-    ((functionp obj) (%find-class '<function>))
-    ((streamp obj) (%find-class '<stream>))
-    (t (%find-class '<object>))))
+;; class-ofはsrc/lisp/init_aot.lispへ移動した(M12 Phase 3、#27)。
 
 ;;; --- エラー処理とコンディションシステム(§29): signal-condition / with-handler / error / クラス階層 ---
 ;;;
@@ -993,107 +589,17 @@
            (progn ,@body)
          (%%set-dynamic '*handlers* ,saved)))))
 
-;; トップレベルでcatchされなかったconditionをabortする。os_eval_top_level(C側)が
-;; 張っているblock %TOP-LEVELへreturn-fromする。
-(defun %abort-top-level (condition)
-  (return-from %top-level condition))
+;; %abort-top-levelはsrc/lisp/init_aot.lispへ移動した(M12 Phase 7、#27)。
 
-;; *handlers*の先頭(最も内側)のhandler-functionを、一時的に自分自身を取り除いた状態で
-;; 呼び出す(ハンドラ内でのsignal-conditionが次の外側のハンドラに渡るようにするため)。
-;; 呼び出し後は*handlers*を元に戻す(unwind-protectでどの脱出経路でも保証する)。
-;; continuableな呼び出しはconditionに%continuable/%continue-tagを記録した上でcatchで
-;; 包み、continue-conditionからのthrowで指定した値を返して呼び出し元(signal-conditionの
-;; 呼び出し元)へ復帰できるようにする。continuableでないconditionでハンドラが
-;; (非局所脱出せず)普通に返ってきた場合は、仕様上はエラーだがトップレベルへのabortに
-;; フォールバックする。
-(defun signal-condition (condition continuable)
-  (let ((handlers (dynamic *handlers*)))
-    (if (null handlers)
-        (if continuable nil (%abort-top-level condition))
-        (let ((tag (gensym)))
-          (set-slot-value condition '%continuable continuable)
-          (set-slot-value condition '%continue-tag tag)
-          (catch tag
-            (unwind-protect
-                (progn
-                  (%%set-dynamic '*handlers* (cdr handlers))
-                  (let ((result (funcall (car handlers) condition)))
-                    (if continuable result (%abort-top-level condition))))
-              (%%set-dynamic '*handlers* handlers)))))))
+;; signal-condition/condition-continuable/continue-conditionはsrc/lisp/init_aot.lispへ
+;; 移動した(M12 Phase 8、#27)。
 
-;; (condition-continuable condition) → <object> : signal-conditionが記録した
-;; continuable引数(nil/t/継続用文字列)をそのまま返す。
-(defun condition-continuable (condition)
-  (slot-value condition '%continuable))
-
-;; (continue-condition condition [value]) : conditionを今まさにsignalしている
-;; signal-conditionの呼び出しへ、catchタグを介してvalue(既定nil)を返して復帰する。
-(defun continue-condition (condition &rest value)
-  (throw (slot-value condition '%continue-tag) (if value (car value) nil)))
-
-(defun error (format-string &rest format-arguments)
-  (signal-condition
-    (make-instance '<simple-error> ':format-string format-string ':format-arguments format-arguments)
-    nil))
-
-;; (cerror continue-string error-string obj*) → <object> : spec 6966-6980行の等価定義通り、
-;; continue-stringとerror-stringのいずれもobj*でformatする素材として<simple-error>に積み、
-;; continuableには「continue-stringをformatした文字列」を渡す(signal-conditionが正常return
-;; した場合、あるいはハンドラがcontinue-conditionでvalueを渡した場合、その値がcerrorの
-;; 戻り値になる)。
-(defun cerror (continue-string error-string &rest objs)
-  (signal-condition
-    (make-instance '<simple-error> ':format-string error-string ':format-arguments objs)
-    (let ((str (create-string-output-stream)))
-      (%%apply #'format (cons str (cons continue-string objs)))
-      (get-output-stream-string str))))
+;; error/cerrorはsrc/lisp/init_aot.lispへ移動した(M12 Phase 9、#27)。
 
 ;;; --- condition accessors (§29.3) ---
 ;;;
-;;; 各アクセサは対象クラスでなければ<domain-error>をsignalする(spec 7080-7081行等、
-;;; 各データ表の「An error shall be signaled if X is not a condition of class <X>
-;;; (error-id. domain-error)」という要求に対応)。
-
-;; objがclass-nameのインスタンスならそのまま返し、そうでなければ<domain-error>をsignalする。
-(defun %check-condition-class (obj class-name)
-  (if (typep obj class-name)
-      obj
-      (signal-condition
-        (make-instance '<domain-error> ':object obj ':expected-class (%find-class class-name))
-        nil)))
-
-(defun arithmetic-error-operation (condition)
-  (slot-value (%check-condition-class condition '<arithmetic-error>) 'operation))
-
-(defun arithmetic-error-operands (condition)
-  (slot-value (%check-condition-class condition '<arithmetic-error>) 'operands))
-
-(defun domain-error-object (condition)
-  (slot-value (%check-condition-class condition '<domain-error>) 'object))
-
-(defun domain-error-expected-class (condition)
-  (slot-value (%check-condition-class condition '<domain-error>) 'expected-class))
-
-(defun parse-error-string (condition)
-  (slot-value (%check-condition-class condition '<parse-error>) 'string))
-
-(defun parse-error-expected-class (condition)
-  (slot-value (%check-condition-class condition '<parse-error>) 'expected-class))
-
-(defun simple-error-format-string (condition)
-  (slot-value (%check-condition-class condition '<simple-error>) 'format-string))
-
-(defun simple-error-format-arguments (condition)
-  (slot-value (%check-condition-class condition '<simple-error>) 'format-arguments))
-
-(defun stream-error-stream (condition)
-  (slot-value (%check-condition-class condition '<stream-error>) 'stream))
-
-(defun undefined-entity-name (condition)
-  (slot-value (%check-condition-class condition '<undefined-entity>) 'name))
-
-(defun undefined-entity-namespace (condition)
-  (slot-value (%check-condition-class condition '<undefined-entity>) 'namespace))
+;;; %check-condition-class + 11個のアクセサはsrc/lisp/init_aot.lispへ移動した
+;;; (M12 Phase 11、#27)。
 
 ;;; --- report-condition (§29.2) ---
 ;;;

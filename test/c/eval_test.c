@@ -584,6 +584,28 @@ void test_primitive_apply_calls_interpreted_function_with_list() {
     assert(r == os_make_fixnum(7), "(%%apply (lambda (x y) (+ x y)) '(3 4))は7");
 }
 
+// M10: os_make_lifted_closureが表す「トランスパイラがリフトしたlambda」本体を
+// 模したC関数。捕捉環境(呼び出し時に渡されるenv)からN(自由変数)を読み、
+// 第1引数(evaluated_argsのcar)に加算して返す
+static lisp_val_t lifted_closure_body_add_captured_n(lisp_val_t evaluated_args, lisp_val_t env) {
+    lisp_val_t n = os_get_variable(os_make_symbol("N"), env);
+    return os_make_fixnum((cc_car(evaluated_args) >> 3) + (n >> 3));
+}
+
+void test_lifted_closure_uses_captured_env_not_caller_env() {
+    // 捕捉環境: N=10を束縛する。呼び出し元の環境(caller_env)には束縛しないことで、
+    // apply_functionが実際にword3(捕捉環境)をfnptrへ渡していることを検証する
+    lisp_val_t captured_env = os_make_environment(os_make_symbol("CAPTURED-ENV"), nil);
+    os_set_variable(os_make_symbol("N"), os_make_fixnum(10), captured_env);
+    lisp_val_t closure = os_make_lifted_closure(
+        (lisp_addr_t)(void *)lifted_closure_body_add_captured_n, captured_env);
+
+    lisp_val_t caller_env = os_make_environment(os_make_symbol("CALLER-ENV"), nil);
+    lisp_val_t args = os_make_cons(closure, os_make_cons(os_make_fixnum(5), nil));
+    lisp_val_t r = primitive_funcall(args, caller_env);
+    assert(r == os_make_fixnum(15), "リフトされたクロージャは呼び出し元envではなく捕捉env(N=10)を見て5+10=15を返す");
+}
+
 void test_os_eval_quasiquote_plain_list() {
     lisp_val_t env = os_make_environment(os_make_symbol("TEST-ENV"), nil);
 
@@ -1140,6 +1162,7 @@ int main(int argc, char** argv) {
     test_primitive_funcall_calls_interpreted_function();
     test_primitive_apply_calls_native_function_with_list();
     test_primitive_apply_calls_interpreted_function_with_list();
+    test_lifted_closure_uses_captured_env_not_caller_env();
     test_os_eval_function_on_symbol_returns_function_object();
     test_os_eval_function_on_lambda_returns_callable_closure();
     test_os_eval_function_on_undefined_symbol_returns_eval_error();

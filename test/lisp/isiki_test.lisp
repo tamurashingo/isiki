@@ -355,6 +355,19 @@
 (assert-equal (list 'point-desc nil) (isiki-test-describe (make-instance 'isiki-test-point)))
 (assert-equal (list '3d-desc t (list 'point-desc nil)) (isiki-test-describe (make-instance 'isiki-test-point3d)))
 
+;; M12(#27)のQEMU実機限定regression: call-next-methodで次のメソッドが無い場合の
+;; エラー通知は、AOT化されたcall-next-methodのlambdaクロージャ(自由変数0個で
+;; 生成される)から%%funcall-by-name経由でまだインタプリタ実行のerrorを呼ぶ経路を
+;; 通る。かつてこの経路の捕捉環境にnilを渡していたため、error本体からの
+;; signal-condition/make-instance呼び出しがos_get_functionでglobal_environmentへ
+;; 到達できず、条件を正しくsignalする代わりにg_sym_eval_errorが素通りしていた
+;; (ignore-errorsで捕捉できない生の値のリーク)。host側のgcc(aarch64)ビルドでは
+;; 再現しなかったが実機QEMU(x86_64/mingw)では必ず再現したため、実機スモークテスト
+;; でのみ検出できるregressionだった
+(defgeneric isiki-test-no-next-method (obj))
+(defmethod isiki-test-no-next-method (obj) (call-next-method))
+(assert-equal nil (ignore-errors (isiki-test-no-next-method 42)))
+
 ;; cf. p.61 typep/subclassp/class-of の説明に基づく独自の例
 (assert-equal t (typep (make-instance 'isiki-test-point3d) 'isiki-test-point))
 (assert-equal nil (typep (make-instance 'isiki-test-point) 'isiki-test-point3d))
@@ -899,3 +912,16 @@ line2"))
 ;; cf. p.122 (identity '(a b c)) の例。値を変更。
 (assert-equal 5 (identity 5))
 (assert-equal 'a (identity 'a))
+
+
+;; M12 Phase7(#27)の恒久リグレッションテスト: %abort-top-levelがAOT化された後も、
+;; return-from %top-levelの非局所脱出がos_eval_top_level(このトップレベルフォーム
+;; 自身を包むblock %top-level)まで正しく伝播することを確認する(未解決リスク②)。
+;; %%test-aot-call-abort-top-levelは%%funcall-by-name経由でAOTコード内から呼ばれた
+;; 場合の伝播を、直後の(%abort-top-level ...)は通常のトップレベル関数呼び出しから
+;; AOTのreturn-fromが素通りするかを確認する。いずれも単独のトップレベルフォームなので
+;; block %top-levelは毎回新規に張られ、後続のフォームには影響しない。続く
+;; (assert-equal t t)まで正常に到達することが、伝播が壊れていない証拠になる
+(%%test-aot-call-abort-top-level 'isiki-test-phase7-abort-marker-1)
+(%abort-top-level 'isiki-test-phase7-abort-marker-2)
+(assert-equal t t)

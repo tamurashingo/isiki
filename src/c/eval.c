@@ -129,7 +129,12 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
     UINT64 *obj = (UINT64 *)addr;
     if (obj[0] == MAGIC_FUNCTION_NATIVE) {
         lisp_val_t (*fnptr)(lisp_val_t, lisp_val_t) = (lisp_val_t (*)(lisp_val_t, lisp_val_t))obj[1];
-        return fnptr(evaluated_args, env);
+        // word2がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)の場合、
+        // word3(定義時に捕捉した自由変数を保持する環境)をenv引数として渡す。
+        // 呼び出し元のenvではなく、リフトされた関数本体が自由変数を解決できる
+        // 環境を渡す必要があるため
+        lisp_val_t call_env = (obj[2] == os_make_fixnum(2)) ? obj[3] : env;
+        return fnptr(evaluated_args, call_env);
     }
     if (obj[0] == MAGIC_FUNCTION_INTERPRETED) {
         lisp_val_t params = obj[1];
@@ -975,4 +980,37 @@ lisp_val_t os_apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_
  */
 int os_is_control_transfer(lisp_val_t v) {
     return is_control_transfer(v);
+}
+
+/**
+ * 非局所脱出シグナル(TAG_INSTANCE、word1=magic)のmagic(MAGIC_BLOCK_EXIT等)を
+ * 取り出す。トランスパイラが生成するCコード(lisp_compiled.c)がblock/
+ * return-from/tagbody/goを実行時に判定するために公開する。
+ * @param v os_is_control_transferがnon-zeroを返す値
+ * @return magic定数
+ */
+UINT64 os_control_transfer_magic(lisp_val_t v) {
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[0];
+}
+
+/**
+ * 非局所脱出シグナルのword2(block/return-fromのname、またはgo/tagbodyのtag)を
+ * 取り出す。
+ * @param v os_is_control_transferがnon-zeroを返す値
+ * @return name/tagのシンボル
+ */
+lisp_val_t os_control_transfer_name(lisp_val_t v) {
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[1];
+}
+
+/**
+ * 非局所脱出シグナルのword3(MAGIC_BLOCK_EXITのvalue)を取り出す。
+ * @param v os_is_control_transferがnon-zeroを返す値
+ * @return return-fromが返そうとしている値
+ */
+lisp_val_t os_control_transfer_value(lisp_val_t v) {
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[2];
 }

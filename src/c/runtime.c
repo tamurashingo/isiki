@@ -74,10 +74,15 @@
  *    - word0: このinstanceの種別を表わすMAGIC NUMBER
  *    - word1: MAGIC_FUNCTION_NATIVEの場合: cの関数のアドレス
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
- *    - word2: MAGIC_FUNCTION_NATIVEの場合: fixnum 1(za.cがコンパイルした関数)またはNIL(組み込みprimitive)。
- *             GCで移動しない即値(fixnum/nil)のみを許すことで、word1と同様に素通しできる
+ *    - word2: MAGIC_FUNCTION_NATIVEの場合: fixnum 1(za.cがコンパイルした関数)、
+ *             fixnum 2(トランスパイラがリフトしたlambdaのクロージャ)、
+ *             またはNIL(組み込みprimitive)。fixnum 1/NILはGCで移動しない即値のみを
+ *             許すことで、word1と同様に素通しできるが、fixnum 2の場合はword3に
+ *             GC管理下の捕捉環境を持つため、gc_scan_instanceで個別にトレースする
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 本体(未評価のフォーム列)
  *    - word3: MAGIC_FUNCTION_INTERPRETEDの場合: 定義時の環境のアドレス
+ *             MAGIC_FUNCTION_NATIVEでword2がfixnum 2の場合: 定義時に捕捉した
+ *             自由変数を保持する環境のアドレス(それ以外のword2ではNIL固定)
  *             MAGIC_VECTORの場合: word1に多次元配列(general array)本体への生ポインタを
  *             持つ(ヒープ可変長、8*(1+rank+total)byte、8byte境界に整列)。
  *             本体のレイアウトは以下の通り:
@@ -377,6 +382,13 @@ static UINT8 *g_imm_bump = g_imm_space;
 /** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */
 static void *g_imm_free_list = 0;
 
+/** g_imm_bumpがこれまでにg_imm_spaceから切り出した延べページ数。M13で、init.lispから
+ * トランスパイル対象関数を移動したことによるImmobilized Space使用量の削減を測定する
+ * テストのためのアクセサ(os_gc_collect_countと同じ、テスト専用の内部状態公開) */
+UINT64 os_imm_pages_used_for_test(void) {
+    return (UINT64)(g_imm_bump - g_imm_space) / IMM_PAGE_SIZE;
+}
+
 void *os_imm_page_alloc(void) {
     if (g_imm_free_list) {
         void *page = g_imm_free_list;
@@ -639,6 +651,12 @@ static void gc_scan_instance(UINT64 *words) {
     switch (magic) {
         case MAGIC_FUNCTION_NATIVE:
             // word1はCコード領域への生の関数ポインタ(Lispヒープ外)。素通し
+            // word2がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)の場合のみ、
+            // word3にGC管理下の捕捉環境を持つのでトレースする。それ以外(fixnum 1/NIL)は
+            // word3を使わずNIL固定なので何もしなくてよい
+            if (words[2] == os_make_fixnum(2)) {
+                words[3] = gc_copy_value(words[3]); // 捕捉環境
+            }
             break;
 
         case MAGIC_FUNCTION_INTERPRETED:
@@ -1047,6 +1065,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%INSTANCE-SLOTS"), os_make_native_function((lisp_addr_t)(void *)primitive_instance_slots), global_environment);
         os_set_function(os_make_symbol("%%CLASS-INSTANCE-P"), os_make_native_function((lisp_addr_t)(void *)primitive_class_instance_p), global_environment);
         os_set_function(os_make_symbol("%%SET-DYNAMIC"), os_make_native_function((lisp_addr_t)(void *)primitive_set_dynamic), global_environment);
+        os_set_function(os_make_symbol("%%FUNCALL-BY-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_funcall_by_name), global_environment);
     }
 }
 
@@ -1613,6 +1632,18 @@ lisp_val_t os_make_native_function(UINT64 fnptr) {
  */
 lisp_val_t os_make_jit_function(UINT64 fnptr) {
     return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(1), nil);
+}
+
+/**
+ * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
+ * その定義時の捕捉環境として保持するTAG_INSTANCEオブジェクトを作る。
+ * @param fnptr 呼び出すリフト済みlambda本体のC関数のアドレス
+ * @param captured_env 定義時に捕捉した自由変数を保持する環境
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 2、word3=captured_env)
+ */
+lisp_val_t os_make_lifted_closure(UINT64 fnptr, lisp_val_t captured_env) {
+    GC_PROTECT(captured_env);
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(2), captured_env);
 }
 
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
@@ -5306,6 +5337,33 @@ lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t val = cc_car(cc_cdr(args));
     return os_set_dynamic(name, val);
+}
+
+/**
+ * 組み込み関数%%FUNCALL-BY-NAME。symをglobal_environmentから関数として名前解決し、
+ * restを評価済み引数リストとしてos_apply_functionへ渡す。AOTトランスパイル済みコード
+ * から、まだAOTコンパイルされていない(init.lisp上にインタプリタ専用関数として残って
+ * いる)関数を正しい実行時セマンティクスのまま呼び出すために使う(M12 #27、
+ * %invoke-method-chain等からerrorを呼ぶ用途)。os_signal_condition(既存)と同じ
+ * 「os_get_function+os_apply_function」パターンを、対象関数名を問わない汎用形に
+ * したもの。symの解決には呼び出し時のenvではなく必ずglobal_environmentを使う
+ * (呼び出し元がAOTがリフトしたクロージャの場合、そのenvは捕捉した自由変数のみを
+ * 持ち親がnilの孤立した環境になり得るため、そこからerrorのような常にトップレベルに
+ * 定義される関数を辿れない——本primitiveはトップレベル関数名の解決専用であり、
+ * レキシカルスコープの探索を必要としない)
+ * @param args (sym . rest) 評価済みの引数リスト。symは呼び出したい関数名のシンボル、
+ *             restはsymへ渡す評価済み引数のリスト
+ * @param env rest内の関数呼び出しに使う環境(sym解決には使わない)
+ * @return symの呼び出し結果。symがglobal_environment上で未定義の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_funcall_by_name(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t sym = cc_car(args);
+    lisp_val_t rest = cc_cdr(args);
+    lisp_val_t fn = os_get_function(sym, global_environment);
+    if (fn == nil) {
+        return g_sym_eval_error;
+    }
+    return os_apply_function(fn, rest, env);
 }
 
 

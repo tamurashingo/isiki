@@ -91,4 +91,22 @@ lisp_val_t qq_append(lisp_val_t list, lisp_val_t tail);
  */
 int os_is_control_transfer(lisp_val_t v);
 
+/**
+ * 非局所脱出シグナルのmagic(MAGIC_BLOCK_EXIT等、runtime.h)を取り出す。
+ * os_is_control_transferがnon-zeroを返す値にのみ呼んでよい。
+ */
+UINT64 os_control_transfer_magic(lisp_val_t v);
+
+/**
+ * 非局所脱出シグナルのword2(block/return-fromのname、またはgo/tagbodyのtag)を
+ * 取り出す。os_is_control_transferがnon-zeroを返す値にのみ呼んでよい。
+ */
+lisp_val_t os_control_transfer_name(lisp_val_t v);
+
+/**
+ * 非局所脱出シグナルのword3(MAGIC_BLOCK_EXITのvalue)を取り出す。
+ * os_is_control_transferがnon-zeroを返す値にのみ呼んでよい。
+ */
+lisp_val_t os_control_transfer_value(lisp_val_t v);
+
 #endif /* _EVAL_H_ */

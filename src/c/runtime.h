@@ -214,6 +214,14 @@ UINT64 os_gc_collect_count(void);
 #define IMM_PAGE_SIZE 4096
 
 /**
+ * これまでにImmobilized Spaceから切り出された延べページ数を返す(テスト専用。
+ * os_gc_collect_countと同様、本体のロジックでは使用しない)。M13で、init.lispの
+ * 一部関数をAOTトランスパイルへ移動したことによる使用量削減を測定するために使う。
+ * @return g_imm_bumpがg_imm_spaceから切り出した延べページ数
+ */
+UINT64 os_imm_pages_used_for_test(void);
+
+/**
  * Immobilized Spaceから4KBページを1枚確保する。空間が枯渇した場合は診断メッセージを
  * 表示して停止する。
  * @return 確保した4KBページの先頭アドレス
@@ -637,6 +645,18 @@ lisp_val_t os_make_native_function(lisp_addr_t fnptr);
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
 lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
+
+/**
+ * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
+ * その定義時の捕捉環境として保持するTAG_INSTANCEオブジェクトを作る。os_make_native_function/
+ * os_make_jit_functionとの違いはword2にfixnum 2を立て、word3にcaptured_envを持つ点。
+ * apply_function(eval.c)はword2がfixnum 2のMAGIC_FUNCTION_NATIVEに対して、呼び出し時の
+ * envの代わりにこのcaptured_envをfnptrへ渡す。
+ * @param fnptr 呼び出すリフト済みlambda本体のC関数のアドレス
+ * @param captured_env 定義時に捕捉した自由変数を保持する環境
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 2、word3=captured_env)
+ */
+lisp_val_t os_make_lifted_closure(lisp_addr_t fnptr, lisp_val_t captured_env);
 
 /**
  * init.lisp の (make-instance class-sym . initargs) と (signal-condition condition nil) を
@@ -1710,6 +1730,21 @@ lisp_val_t primitive_class_instance_p(lisp_val_t args, lisp_val_t env);
  * @return 書き込んだvalue
  */
 lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%FUNCALL-BY-NAME。symをglobal_environmentから関数として名前解決し、
+ * restを評価済み引数リストとしてos_apply_functionへ渡す。AOTトランスパイル済み
+ * コードから、まだAOTコンパイルされていない(init.lisp上にインタプリタ専用関数として
+ * 残っている)関数を正しい実行時セマンティクスのまま呼び出すために使う(M12 #27)。
+ * symの解決には呼び出し時のenvではなく必ずglobal_environmentを使う(呼び出し元が
+ * AOTがリフトしたクロージャの場合、そのenvは捕捉した自由変数のみを持ち親がnilの
+ * 孤立した環境になり得るため)。
+ * @param args (sym . rest) 評価済みの引数リスト。symは呼び出したい関数名のシンボル、
+ *             restはsymへ渡す評価済み引数のリスト
+ * @param env rest内の関数呼び出しに使う環境(sym解決には使わない)
+ * @return symの呼び出し結果。symがglobal_environment上で未定義の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_funcall_by_name(lisp_val_t args, lisp_val_t env);
 
 /**
  * nバイト(8byte境界に整列)をLispヒープからアロケータ経由で確保する、os_alloc_bytesの公開版。
