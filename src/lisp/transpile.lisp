@@ -81,7 +81,12 @@
     (%%instance-class . "primitive_instance_class")
     (%%instance-slots . "primitive_instance_slots")
     ;; M14: apply(&restの実引数リストを展開してfnを呼ぶ、eval.c側の組み込み関数)
-    (%%apply . "primitive_apply")))
+    (%%apply . "primitive_apply")
+    ;; M14: map-into(%map-into-min-length/%map-into-loop)が使う
+    (length . "primitive_length")
+    (elt . "primitive_elt")
+    (< . "primitive_less_than")
+    (>= . "primitive_greater_equal")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)"
