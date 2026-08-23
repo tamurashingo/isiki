@@ -353,15 +353,8 @@
 
 ;;; --- create-list / nreverse / maplist / mapl / mapcon (§21.3) ---
 
-(defun %create-list-helper (n elt)
-  (if (= n 0)
-      nil
-      (cons elt (%create-list-helper (- n 1) elt))))
-
-;; 長さnのリストを作る。initial-elementは仕様上省略可(省略時の初期値は
-;; implementation defined)で、本実装では省略時はnilを詰める。
-(defun create-list (n &rest initial-element)
-  (%create-list-helper n (if (null initial-element) nil (car initial-element))))
+;; %create-list-helper/create-listはsrc/lisp/init_aot.lispへ移動した(M14:
+;; 基盤Bの&restパラメータ対応によりAOT対応可能になったため)。
 
 (defun %nreverse-helper (list prev)
   (if (null list)

@@ -97,3 +97,17 @@
 ;; 0個以上のリストを連結して1つのリストにする。
 (defun append (&rest lists)
   (%append-lists lists))
+
+;;; --- create-list (M14) ---
+;;;
+;;; 基盤B(&restパラメータ対応)によりAOT対応可能になったため移動。
+
+(defun %create-list-helper (n elt)
+  (if (= n 0)
+      nil
+      (cons elt (%create-list-helper (- n 1) elt))))
+
+;; 長さnのリストを作る。initial-elementは仕様上省略可(省略時の初期値は
+;; implementation defined)で、本実装では省略時はnilを詰める。
+(defun create-list (n &rest initial-element)
+  (%create-list-helper n (if (null initial-element) nil (car initial-element))))
