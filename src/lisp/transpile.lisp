@@ -95,7 +95,9 @@
     (close . "cc_close")
     ;; M14基盤E: with-open-input-streamがunwind-protect経由で必ずcloseすることを
     ;; テストfixtureから検証するために使う(cc_open_stream_p、stream_lisp.c:100)
-    (open-stream-p . "cc_open_stream_p")))
+    (open-stream-p . "cc_open_stream_p")
+    ;; M14: with-open-output-fileの展開先(バインディングの初期値式)が使う
+    (open-output-file . "cc_open_output_file")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
@@ -466,6 +468,26 @@
     `(with-open-input-stream (,(car binding) (open-input-stream ,(car (cdr binding))))
        ,@body)))
 
+;;; with-open-output-stream/with-open-output-file: init.lispのdefmacro
+;;; with-open-output-stream/with-open-output-file(init.lisp:223-235)と同じ展開規則。
+;;; with-open-input-stream/with-open-input-fileと同型(基盤Eは既に導入済みのため
+;;; 新規基盤は不要)。with-open-output-fileはopen-output-file呼び出しを
+;;; with-open-output-streamへ差し込むだけの薄いラッパー。
+
+(defun expand-with-open-output-stream (form)
+  (destructuring-bind (kw binding &rest body) form
+    (declare (ignore kw))
+    `(let ((,(car binding) ,(car (cdr binding))))
+       (unwind-protect
+           (progn ,@body)
+         (close ,(car binding))))))
+
+(defun expand-with-open-output-file (form)
+  (destructuring-bind (kw binding &rest body) form
+    (declare (ignore kw))
+    `(with-open-output-stream (,(car binding) (open-output-file ,(car (cdr binding))))
+       ,@body)))
+
 (defparameter *macro-expanders*
   (list (cons 'let #'expand-let)
         (cons 'let* #'expand-let*)
@@ -476,7 +498,9 @@
         (cons 'for #'expand-for)
         (cons 'while #'expand-while)
         (cons 'with-open-input-stream #'expand-with-open-input-stream)
-        (cons 'with-open-input-file #'expand-with-open-input-file))
+        (cons 'with-open-input-file #'expand-with-open-input-file)
+        (cons 'with-open-output-stream #'expand-with-open-output-stream)
+        (cons 'with-open-output-file #'expand-with-open-output-file))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")

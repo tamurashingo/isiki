@@ -353,3 +353,24 @@
     (with-open-input-file (s "fake/path")
       (setq captured s))
     (open-stream-p captured)))
+
+(defun %%transpile-fixture-with-open-output-stream-early-exit ()
+  ;; M14: with-open-output-streamの検証。with-open-input-streamと同型の展開
+  ;; (基盤Eをそのまま再利用)のため、早期脱出時の挙動も同じ形で確認する。
+  ;; captured/open-stream-pで正常終了時と早期脱出時どちらもcloseされることを
+  ;; 一度に確認する(値と副作用の両方の検証を1fixtureにまとめる)
+  (let ((captured nil))
+    (cons
+     (block %%fixture-wos-block
+       (with-open-output-stream (s (open-output-file "fake/path"))
+         (setq captured s)
+         (return-from %%fixture-wos-block 42)))
+     (open-stream-p captured))))
+
+(defun %%transpile-fixture-with-open-output-file ()
+  ;; M14: with-open-output-fileの検証。open-output-file(cc_open_output_file)
+  ;; がwith-open-output-stream経由でcloseされることを確認する
+  (let ((captured nil))
+    (with-open-output-file (s "fake/path")
+      (setq captured s))
+    (open-stream-p captured)))

@@ -153,6 +153,8 @@ extern lisp_val_t lisp_ll_transpile_fixture_unwind_protect_cleanup_exit_ignored(
 extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_stream(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_stream_early_exit(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_with_open_input_file(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_with_open_output_stream_early_exit(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_with_open_output_file(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -619,6 +621,22 @@ static void test_transpile_fixture_with_open_input_file(void) {
            "with-open-input-file: with-open-input-stream経由でも同様にcloseが保証される(open-stream-pがnil)");
 }
 
+static void test_transpile_fixture_with_open_output_stream_early_exit(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_output_stream_early_exit(0, 0);
+    lisp_val_t exit_value = cc_car(result);
+    lisp_val_t still_open = cc_cdr(result);
+    assert(exit_value == os_make_fixnum(42),
+           "with-open-output-stream: body中のreturn-fromの値42がwith-open-output-stream式全体の値として伝播する");
+    assert(still_open == nil,
+           "with-open-output-stream: return-fromによる早期脱出でもunwind-protect経由で必ずcloseされる");
+}
+
+static void test_transpile_fixture_with_open_output_file(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_output_file(0, 0);
+    assert(result == nil,
+           "with-open-output-file: open-output-fileで開いたstreamもwith-open-output-stream経由でcloseが保証される(open-stream-pがnil)");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -887,6 +905,8 @@ int main(void) {
     test_transpile_fixture_with_open_input_stream();
     test_transpile_fixture_with_open_input_stream_early_exit();
     test_transpile_fixture_with_open_input_file();
+    test_transpile_fixture_with_open_output_stream_early_exit();
+    test_transpile_fixture_with_open_output_file();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();
