@@ -532,3 +532,35 @@
                        0)))
       (let ((instance (make-instance class ':val initial-value)))
         (aref (%%instance-slots instance) 0)))))
+
+(defun %%transpile-fixture-nested-let-dynamic-restore (fn)
+  ;; M12 Phase 8(#27)デバッグ用: signal-conditionと同じ「let(outer)→
+  ;; let(inner)→catch→unwind-protect→(%%set-dynamic ...)→let(result)→funcall→
+  ;; unwind-protectのcleanupで(%%set-dynamic ...)経由でouterへ戻す」という
+  ;; 多段ネストのlet-IIFE+クロージャ捕捉が正しく動くかを、init.lispを介さず
+  ;; 直接調べるための最小再現。*%%fixture-dyn*は事前にC側でos_set_dynamicして
+  ;; おく。呼び出し後にC側でos_get_dynamicし、outerの値に戻っているか確認する
+  (let ((outer 'outer-val))
+    (let ((inner 'inner-val))
+      (catch 'fixture-tag
+        (unwind-protect
+            (progn
+              (%%set-dynamic '*%%fixture-dyn* 'changed-val)
+              (let ((result (funcall fn outer inner)))
+                result))
+          (%%set-dynamic '*%%fixture-dyn* outer))))))
+
+(defun %%transpile-fixture-signal-condition-like (marker)
+  ;; M12 Phase 8(#27)デバッグ用: signal-conditionの構造をより厳密に再現した版。
+  ;; handlersを(dynamic ...)から読み、tagを(gensym)で作り、(cdr handlers)/
+  ;; (car handlers)を経由してcatch/unwind-protectの中でfuncallする。cleanupは
+  ;; handlers自体(letで束縛したouter値)へ復元する
+  (let ((handlers (dynamic *%%fixture-dyn*)))
+    (let ((tag (gensym)))
+      (catch tag
+        (unwind-protect
+            (progn
+              (%%set-dynamic '*%%fixture-dyn* (cdr handlers))
+              (let ((result (funcall (car handlers) marker)))
+                result))
+          (%%set-dynamic '*%%fixture-dyn* handlers))))))

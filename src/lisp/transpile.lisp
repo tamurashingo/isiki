@@ -101,6 +101,8 @@
     ;; M12基盤C(#27): %register-classが*classes*を更新するのに使う。defdynamic
     ;; はシンボル名キーの動的束縛なので、変数ごとの追加登録は不要
     (%%set-dynamic . "primitive_set_dynamic")
+    ;; M12基盤E(#27): signal-conditionがcatchタグ用の一意なシンボルを作るのに使う
+    (gensym . "primitive_gensym")
     ;; M12基盤B(#27): %register-builtin-classがbootstrap用クラスオブジェクトを
     ;; 生成するのに使う(メタクラスは<built-in-class>)
     (%%make-builtin-class-raw . "primitive_make_builtin_class_raw")

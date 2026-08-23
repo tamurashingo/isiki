@@ -591,38 +591,8 @@
 
 ;; %abort-top-levelはsrc/lisp/init_aot.lispへ移動した(M12 Phase 7、#27)。
 
-;; *handlers*の先頭(最も内側)のhandler-functionを、一時的に自分自身を取り除いた状態で
-;; 呼び出す(ハンドラ内でのsignal-conditionが次の外側のハンドラに渡るようにするため)。
-;; 呼び出し後は*handlers*を元に戻す(unwind-protectでどの脱出経路でも保証する)。
-;; continuableな呼び出しはconditionに%continuable/%continue-tagを記録した上でcatchで
-;; 包み、continue-conditionからのthrowで指定した値を返して呼び出し元(signal-conditionの
-;; 呼び出し元)へ復帰できるようにする。continuableでないconditionでハンドラが
-;; (非局所脱出せず)普通に返ってきた場合は、仕様上はエラーだがトップレベルへのabortに
-;; フォールバックする。
-(defun signal-condition (condition continuable)
-  (let ((handlers (dynamic *handlers*)))
-    (if (null handlers)
-        (if continuable nil (%abort-top-level condition))
-        (let ((tag (gensym)))
-          (set-slot-value condition '%continuable continuable)
-          (set-slot-value condition '%continue-tag tag)
-          (catch tag
-            (unwind-protect
-                (progn
-                  (%%set-dynamic '*handlers* (cdr handlers))
-                  (let ((result (funcall (car handlers) condition)))
-                    (if continuable result (%abort-top-level condition))))
-              (%%set-dynamic '*handlers* handlers)))))))
-
-;; (condition-continuable condition) → <object> : signal-conditionが記録した
-;; continuable引数(nil/t/継続用文字列)をそのまま返す。
-(defun condition-continuable (condition)
-  (slot-value condition '%continuable))
-
-;; (continue-condition condition [value]) : conditionを今まさにsignalしている
-;; signal-conditionの呼び出しへ、catchタグを介してvalue(既定nil)を返して復帰する。
-(defun continue-condition (condition &rest value)
-  (throw (slot-value condition '%continue-tag) (if value (car value) nil)))
+;; signal-condition/condition-continuable/continue-conditionはsrc/lisp/init_aot.lispへ
+;; 移動した(M12 Phase 8、#27)。
 
 (defun error (format-string &rest format-arguments)
   (signal-condition

@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "test_assert.h"
@@ -6,6 +7,7 @@
 #include "framebuffer.h"
 #include "process.h"
 #include "lisp.h"
+#include "eval.h"
 
 // runtime.c/process.c/za.c/reader.c/stream.c/stream_lisp.cをリンクするため、それらが
 // 参照するハードウェア/REPL依存の関数のダミー実装が必要になる(runtime_test.cと同じ
@@ -176,6 +178,8 @@ extern lisp_val_t lisp_ll_transpile_fixture_call_next_method(lisp_val_t evaluate
 extern lisp_val_t lisp_ll_transpile_fixture_generic_no_applicable_method(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_call_next_method_no_next(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_make_instance(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_nested_let_dynamic_restore(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_signal_condition_like(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -196,6 +200,7 @@ static void setup_heap(void) {
     assert(heap != NULL, "1MBのヒープ用メモリをmallocで確保できる");
     os_heap_init((UINT64)heap, HEAP_SIZE);
     os_bootstrap();
+    os_register_eval_primitives();
 }
 
 static void test_transpile_fixture_answer(void) {
@@ -829,6 +834,11 @@ static void test_transpile_fixture_generic_dispatch_order(void) {
 static void test_transpile_fixture_call_next_method(void) {
     lisp_val_t gf_name = os_make_symbol("ISIKI-TEST-CALL-NEXT-METHOD");
     lisp_val_t arg = os_make_cons(os_make_fixnum(3), os_make_fixnum(4));
+    /* lisp_ll_transpile_fixture_call_next_method呼び出し中に発火するGCがargを
+       移動させる可能性があるため、呼び出しを跨いでeq比較する変数はGC_PROTECTする
+       (argはコピー先compact GC後もこのローカル変数が指す先が更新されて初めて
+       resultとeqになる) */
+    GC_PROTECT(arg);
 
     lisp_val_t result = lisp_ll_transpile_fixture_call_next_method(os_make_cons(gf_name, os_make_cons(arg, nil)), 0);
 
@@ -867,6 +877,101 @@ static void test_transpile_fixture_make_instance(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_make_instance(os_make_cons(initial_value, nil), 0);
     assert(result == initial_value,
            "make-instance: %generic-call経由で呼ばれたinitialize-objectがinitargsの値をスロットへ書き込む");
+}
+
+// signal-conditionと同じ形の多段ネストclosure捕捉を再現するfuncall先。
+// outer/innerをそのままconsで返すことで、呼び出し時点でのouter/innerの値が
+// 正しく捕捉されているかを検証できる
+static lisp_val_t test_nested_let_dynamic_restore_fn(lisp_val_t evaluated_args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t outer = cc_car(evaluated_args);
+    lisp_val_t inner = cc_car(cc_cdr(evaluated_args));
+    return os_make_cons(outer, inner);
+}
+
+static void test_transpile_fixture_nested_let_dynamic_restore(void) {
+    /* M12 Phase 8(#27)デバッグ用: signal-conditionと同型の
+       let(outer)→let(inner)→catch→unwind-protect→%%set-dynamic→
+       let(result)→funcall→cleanupで%%set-dynamic復元、という多段ネストが
+       正しく動くかを直接確認する */
+    lisp_val_t dyn_sym = os_make_symbol("*%%FIXTURE-DYN*");
+    os_set_dynamic(dyn_sym, os_make_symbol("INITIAL-VAL"));
+    lisp_val_t fn = os_make_native_function((lisp_addr_t)(void *)test_nested_let_dynamic_restore_fn);
+
+    lisp_val_t result = lisp_ll_transpile_fixture_nested_let_dynamic_restore(os_make_cons(fn, nil), 0);
+
+    assert(cc_car(result) == os_make_symbol("OUTER-VAL"),
+           "nested-let-dynamic-restore: funcall呼び出し時点でouterがOUTER-VALのまま正しく捕捉されている");
+    assert(cc_cdr(result) == os_make_symbol("INNER-VAL"),
+           "nested-let-dynamic-restore: funcall呼び出し時点でinnerがINNER-VALのまま正しく捕捉されている");
+    assert(os_get_dynamic(dyn_sym) == os_make_symbol("OUTER-VAL"),
+           "nested-let-dynamic-restore: unwind-protectのcleanupが*%%fixture-dyn*をouterの値へ正しく復元する");
+}
+
+static lisp_val_t test_signal_condition_like_handler_fn(lisp_val_t evaluated_args, lisp_val_t env) {
+    (void)env;
+    return cc_car(evaluated_args);
+}
+
+static void test_transpile_fixture_signal_condition_like(void) {
+    /* M12 Phase 8(#27)デバッグ用: signal-conditionの構造をより厳密に再現した
+       fixtureで、呼び出し後に*%%fixture-dyn*(=handlers相当)が元のリストへ
+       正しく復元されるかを確認する */
+    lisp_val_t dyn_sym = os_make_symbol("*%%FIXTURE-DYN*");
+    lisp_val_t handler_fn = os_make_native_function((lisp_addr_t)(void *)test_signal_condition_like_handler_fn);
+    lisp_val_t original_handlers = os_make_cons(handler_fn, os_make_cons(handler_fn, nil));
+    os_set_dynamic(dyn_sym, original_handlers);
+    lisp_val_t marker = os_make_symbol("MARKER-VAL");
+
+    lisp_val_t result = lisp_ll_transpile_fixture_signal_condition_like(os_make_cons(marker, nil), 0);
+
+    assert(result == marker,
+           "signal-condition-like: (car handlers)にmarkerを渡したfuncallの結果がそのまま返る");
+    assert(os_get_dynamic(dyn_sym) == original_handlers,
+           "signal-condition-like: unwind-protectのcleanupが*%%fixture-dyn*を元のhandlersリストへeqで復元する");
+}
+
+static void test_transpile_fixture_signal_condition_nonlocal(void) {
+    /* M12 Phase 8(#27): with-handler/ignore-errorsの実際の使い方
+       (handlerがそれ自身のlambdaより外側のblockへreturn-fromする)を再現する。
+       handlerは(インタプリタ側の)os_evalで作ったインタプリタクロージャとし、
+       signal-condition-like(AOT)から実際にfuncallで呼び出す。非局所脱出シグナルが
+       catch/unwind-protect/letの3重ネストとfuncallのAOT/インタプリタ境界を
+       飛び越えてblockまで正しく伝播し、かつunwind-protectのcleanupで
+       *%%fixture-dyn*が元のhandlersへ復元されることを確認する */
+    lisp_val_t dyn_sym = os_make_symbol("*%%FIXTURE-DYN*");
+    lisp_val_t block_name = os_make_symbol("%%FIXTURE-NONLOCAL-BLOCK");
+
+    lisp_val_t lambda_sym = os_make_symbol("LAMBDA");
+    lisp_val_t return_from_sym = os_make_symbol("RETURN-FROM");
+    lisp_val_t c_sym = os_make_symbol("C");
+    lisp_val_t return_from_form = os_make_cons(
+        return_from_sym, os_make_cons(block_name, os_make_cons(c_sym, nil)));
+    lisp_val_t lambda_form = os_make_cons(
+        lambda_sym,
+        os_make_cons(os_make_cons(c_sym, nil), os_make_cons(return_from_form, nil)));
+    lisp_val_t handler = os_eval(lambda_form, global_environment);
+
+    lisp_val_t original_handlers = os_make_cons(handler, nil);
+    os_set_dynamic(dyn_sym, original_handlers);
+
+    lisp_val_t fixture_native = os_make_native_function(
+        (lisp_addr_t)(void *)lisp_ll_transpile_fixture_signal_condition_like);
+    lisp_val_t marker = os_make_fixnum(424242);
+    lisp_val_t funcall_sym = os_make_symbol("FUNCALL");
+
+    lisp_val_t body_form = os_make_cons(
+        funcall_sym, os_make_cons(fixture_native, os_make_cons(marker, nil)));
+    lisp_val_t block_sym = os_make_symbol("BLOCK");
+    lisp_val_t block_form = os_make_cons(
+        block_sym, os_make_cons(block_name, os_make_cons(body_form, nil)));
+
+    lisp_val_t result = os_eval(block_form, global_environment);
+
+    assert(result == marker,
+           "signal-condition-nonlocal: handlerのreturn-fromした値がcatch/unwind-protect/letとfuncallを越えてblockまで正しく伝播する");
+    assert(os_get_dynamic(dyn_sym) == original_handlers,
+           "signal-condition-nonlocal: return-fromによる非局所脱出でもunwind-protectのcleanupが実行され*%%fixture-dyn*が元のhandlersへ復元される");
 }
 
 static void test_list(void) {
@@ -1159,6 +1264,9 @@ int main(void) {
     test_transpile_fixture_generic_no_applicable_method();
     test_transpile_fixture_call_next_method_no_next();
     test_transpile_fixture_make_instance();
+    test_transpile_fixture_nested_let_dynamic_restore();
+    test_transpile_fixture_signal_condition_like();
+    test_transpile_fixture_signal_condition_nonlocal();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();
