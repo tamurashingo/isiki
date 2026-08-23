@@ -981,3 +981,36 @@ lisp_val_t os_apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_
 int os_is_control_transfer(lisp_val_t v) {
     return is_control_transfer(v);
 }
+
+/**
+ * 非局所脱出シグナル(TAG_INSTANCE、word1=magic)のmagic(MAGIC_BLOCK_EXIT等)を
+ * 取り出す。トランスパイラが生成するCコード(lisp_compiled.c)がblock/
+ * return-from/tagbody/goを実行時に判定するために公開する。
+ * @param v os_is_control_transferがnon-zeroを返す値
+ * @return magic定数
+ */
+UINT64 os_control_transfer_magic(lisp_val_t v) {
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[0];
+}
+
+/**
+ * 非局所脱出シグナルのword2(block/return-fromのname、またはgo/tagbodyのtag)を
+ * 取り出す。
+ * @param v os_is_control_transferがnon-zeroを返す値
+ * @return name/tagのシンボル
+ */
+lisp_val_t os_control_transfer_name(lisp_val_t v) {
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[1];
+}
+
+/**
+ * 非局所脱出シグナルのword3(MAGIC_BLOCK_EXITのvalue)を取り出す。
+ * @param v os_is_control_transferがnon-zeroを返す値
+ * @return return-fromが返そうとしている値
+ */
+lisp_val_t os_control_transfer_value(lisp_val_t v) {
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[2];
+}

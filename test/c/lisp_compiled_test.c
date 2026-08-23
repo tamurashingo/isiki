@@ -139,6 +139,10 @@ extern lisp_val_t lisp_ll_transpile_fixture_setf_elt(lisp_val_t evaluated_args, 
 extern lisp_val_t lisp_ll_transpile_fixture_setf_slot_value(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_rest(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_rest_with_fixed(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_for_sum(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_for_early_exit(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_while_sum(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_while_named_block_exit(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -526,6 +530,39 @@ static void test_transpile_fixture_rest_with_fixed(void) {
     assert(cc_car(cc_cdr(cc_cdr(result))) == c, "rest-with-fixed: 残りのevaluated_args(2番目以降)がitemsへそのまま束縛される(その2)");
 }
 
+static void test_transpile_fixture_for_sum(void) {
+    lisp_val_t result_five = lisp_ll_transpile_fixture_for_sum(os_make_cons(os_make_fixnum(5), nil), 0);
+    assert(result_five == os_make_fixnum(15), "for: 1から5までの合計は15(bindingのstep式と反復終了判定の確認)");
+
+    lisp_val_t result_zero = lisp_ll_transpile_fixture_for_sum(os_make_cons(os_make_fixnum(0), nil), 0);
+    assert(result_zero == os_make_fixnum(0), "for: nが0なら1回目のtestで即座にresult(sum=0)を返す");
+}
+
+static void test_transpile_fixture_for_early_exit(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_for_early_exit(os_make_cons(os_make_fixnum(10), nil), 0);
+    lisp_val_t exit_value = cc_car(result);
+    lisp_val_t count = cc_cdr(result);
+    assert(exit_value == os_make_fixnum(999),
+           "for: 本体中のreturn-fromの値999がfor式全体の値になる(test-and-resultのresultではない)");
+    assert(count == os_make_fixnum(203),
+           "for: return-from以降は同一反復の残りのbodyも残りの反復も実行されない(countが203で止まる)");
+}
+
+static void test_transpile_fixture_while_sum(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_while_sum(os_make_cons(os_make_fixnum(4), nil), 0);
+    assert(result == os_make_fixnum(10), "while: 4+3+2+1を加算した結果10を返す(tagbody/goループの基本動作)");
+}
+
+static void test_transpile_fixture_while_named_block_exit(void) {
+    lisp_val_t result = lisp_ll_transpile_fixture_while_named_block_exit(os_make_cons(os_make_fixnum(10), nil), 0);
+    lisp_val_t exit_value = cc_car(result);
+    lisp_val_t count = cc_cdr(result);
+    assert(exit_value == os_make_symbol("STOPPED"),
+           "while: while自身のblock nilを素通りし外側の名前付きblockまでreturn-fromが伝播しstoppedを返す");
+    assert(count == os_make_fixnum(3),
+           "while: countが3になった時点で脱出し以降の反復(nの残りの減算)は実行されない");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -784,6 +821,10 @@ int main(void) {
     test_mapcan();
     test_mapcon();
     test_map_into();
+    test_transpile_fixture_for_sum();
+    test_transpile_fixture_for_early_exit();
+    test_transpile_fixture_while_sum();
+    test_transpile_fixture_while_named_block_exit();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

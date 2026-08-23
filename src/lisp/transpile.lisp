@@ -86,11 +86,16 @@
     (length . "primitive_length")
     (elt . "primitive_elt")
     (< . "primitive_less_than")
-    (>= . "primitive_greater_equal")))
+    (>= . "primitive_greater_equal")
+    ;; M14基盤D: for/whileの停止条件(test-and-result/test)が使う
+    (> . "primitive_greater_than")))
 
 (defun sanitize-c-ident (name)
-  "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)"
-  (remove #\! (substitute #\_ #\- (string-downcase name))))
+  "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
+   展開が使う%FOR-NEXT-VALUES等の%接頭辞(Lisp側の内部変数マーカーで、Cの識別子
+   として不正な文字)も、!と同様に読み捨てる"
+  (remove-if (lambda (c) (member c '(#\! #\%)))
+             (substitute #\_ #\- (string-downcase name))))
 
 (defun lisp-name-to-c-name (symbol)
   "MEMBER -> lisp_ll_member / %%mem-ref-64 -> lisp_ll_mem_ref_64。
@@ -135,11 +140,22 @@
 ;;; (carのシンボル自身は呼び出し先名やsetqの対象決定など別の場所で解決するため、
 ;;; ここでは変数参照として扱わない=自然にプリミティブ名/defun名を除外できる)
 
+(defun tagbody-tag-p (elem)
+  "tagbodyの本体要素のうち、goの飛び先になるタグ(nilでない裸シンボル)かどうかを
+   判定する。インタプリタのis_tagbody_tag(eval.c)は実行時の値の型で判定するが、
+   トランスパイラはtagbodyの本体をコンパイル時のリストとして持っているため、
+   構文上の形(consでない、かつnilでないシンボル)だけで静的に判定できる"
+  (and elem (symbolp elem)))
+
 (defun free-variables (expr bound)
   "EXPR中の裸シンボル参照のうち、BOUND(シンボルのリスト)に含まれないものを
    重複なく集めて返す。lambda式に出会った場合はそのパラメータをBOUNDに加えて
    本体を再帰的に走査するため、ネストしたlambdaがさらに内側でしか使わない
-   変数は自然に除外され、外側からの捕捉が必要な自由変数だけが伝播する"
+   変数は自然に除外され、外側からの捕捉が必要な自由変数だけが伝播する。
+   M14基盤D: go/return-from/block/tagbodyのタグ名・block名は変数参照ではなく
+   ラベルなので、汎用の(cdr expr)走査に落とすと誤って自由変数と見なされてしまう
+   ため、これらは専用の分岐でタグ/名前自身を素通しし、値・本体だけを再帰的に
+   走査する"
   (cond
     ((integerp expr) nil)
     ((stringp expr) nil)
@@ -152,8 +168,25 @@
      (free-variables (third expr) bound))
     ((and (consp expr) (eq (car expr) 'lambda) (= (length expr) 3))
      (free-variables (third expr) (append (second expr) bound)))
+    ((and (consp expr) (eq (car expr) 'go) (= (length expr) 2)) nil)
+    ((and (consp expr) (eq (car expr) 'return-from))
+     (if (cddr expr) (free-variables (third expr) bound) nil))
+    ((and (consp expr) (eq (car expr) 'block))
+     (reduce #'union (mapcar (lambda (e) (free-variables e bound)) (cddr expr))
+             :initial-value nil))
+    ((and (consp expr) (eq (car expr) 'tagbody))
+     (reduce #'union
+             (mapcar (lambda (e) (if (tagbody-tag-p e) nil (free-variables e bound)))
+                     (cdr expr))
+             :initial-value nil))
     ((consp expr)
-     (reduce #'union (mapcar (lambda (e) (free-variables e bound)) (cdr expr))
+     ;; let/let*の展開((lambda (vars) body) inits)のように演算子位置に直接
+     ;; lambda式が来る即時呼び出しでは、(car expr)自体も自由変数を持ちうる
+     ;; (このケースだけexpr全体を、通常の(name arg*)呼び出しでは関数名を除いた
+     ;; (cdr expr)だけを走査する)
+     (reduce #'union
+             (mapcar (lambda (e) (free-variables e bound))
+                     (if (consp (car expr)) expr (cdr expr)))
              :initial-value nil))
     (t nil)))
 
@@ -174,19 +207,25 @@
     ((and (eq (car expr) 'setq) (= (length expr) 3))
      (union (if (member (second expr) bound) nil (list (second expr)))
             (setq-targets (third expr) bound)))
-    (t (reduce #'union (mapcar (lambda (e) (setq-targets e bound)) (cdr expr))
+    (t (reduce #'union
+               (mapcar (lambda (e) (setq-targets e bound))
+                       (if (consp (car expr)) expr (cdr expr)))
                :initial-value nil))))
 
 (defun find-lambda-forms (expr)
   "EXPR中に直接現れるlambda式を集める。見つけたlambdaの内部(そのbody)までは
    辿らない: ネストしたlambdaが外側の変数を必要とする場合、それはfree-variables
    がそのネストしたlambdaを直接囲むlambdaの自由変数として再帰的に伝播させるため、
-   ここで別途掘り進める必要が無い(captured-params参照)"
+   ここで別途掘り進める必要が無い(captured-params参照)。let/let*展開の
+   ((lambda (vars) body) inits)のように演算子位置に直接lambda式が来る場合は
+   (car expr)も含めて走査しないと、その場に直接ネストしたlambdaを見落とす"
   (cond
     ((atom expr) nil)
     ((eq (car expr) 'quote) nil)
     ((and (eq (car expr) 'lambda) (= (length expr) 3)) (list expr))
-    (t (reduce #'append (mapcar #'find-lambda-forms (cdr expr)) :initial-value nil))))
+    (t (reduce #'append
+               (mapcar #'find-lambda-forms (if (consp (car expr)) expr (cdr expr)))
+               :initial-value nil))))
 
 (defun captured-params (body params)
   "BODY中のどこかにネストして現れるlambdaが自由変数として必要とする変数のうち、
@@ -337,13 +376,76 @@
           ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
           ((eq (car place) 'property) `(set-property ,value ,@(cdr place))))))
 
+;;; for/while: init.lispのdefmacro for/while(%for-vars/%for-inits/%for-next/
+;;; %for-nexts/%for-let-bindings/%for-setqs)と同じ展開規則。init.lisp側の同名
+;;; ヘルパーと衝突しないよう%%接頭辞でポートする(%%let-vars等と同じ命名規則)。
+;;; 展開結果はlet(基盤A)・if/progn/setqと、本コミットで追加するblock/
+;;; return-from/tagbody/go(基盤D)のみに帰着する。tagbody/goのタグ
+;;; (%for-loop/%while-loop)はこのform内だけで解決される局所的な識別子であり、
+;;; go/tagbody自体はマクロではないため、forが複数ネストしても新たなシンボルは
+;;; 増えない(init.lisp:159-163のコメントと同じ理由)。
+
+(defun %%for-vars (bindings)
+  (if (null bindings) nil (cons (car (car bindings)) (%%for-vars (cdr bindings)))))
+
+(defun %%for-inits (bindings)
+  (if (null bindings) nil (cons (car (cdr (car bindings))) (%%for-inits (cdr bindings)))))
+
+(defun %%for-next (binding)
+  "step式を省略したbinding (var init) は、次の値も現在値のまま(変化なし)とする"
+  (if (null (cdr (cdr binding)))
+      (car binding)
+      (car (cdr (cdr binding)))))
+
+(defun %%for-nexts (bindings)
+  (if (null bindings) nil (cons (%%for-next (car bindings)) (%%for-nexts (cdr bindings)))))
+
+(defun %%for-let-bindings (bindings)
+  (if (null bindings)
+      nil
+      (cons (list (car (car bindings)) (car (cdr (car bindings))))
+            (%%for-let-bindings (cdr bindings)))))
+
+(defun %%for-setqs (bindings list-expr)
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car (car bindings)) (car ,list-expr))
+            (%%for-setqs (cdr bindings) `(cdr ,list-expr)))))
+
+(defun expand-for (form)
+  (destructuring-bind (for-kw bindings test-and-result &rest body) form
+    (declare (ignore for-kw))
+    `(let ,(%%for-let-bindings bindings)
+       (block nil
+         (tagbody
+          %for-loop
+          (if ,(car test-and-result)
+              (return-from nil (progn ,@(cdr test-and-result)))
+              (progn
+                ,@body
+                (let ((%for-next-values (list ,@(%%for-nexts bindings))))
+                  ,@(%%for-setqs bindings '%for-next-values))
+                (go %for-loop))))))))
+
+(defun expand-while (form)
+  (destructuring-bind (while-kw test &rest body) form
+    (declare (ignore while-kw))
+    `(block nil
+       (tagbody
+        %while-loop
+        (if ,test
+            (progn ,@body (go %while-loop))
+            nil)))))
+
 (defparameter *macro-expanders*
   (list (cons 'let #'expand-let)
         (cons 'let* #'expand-let*)
         (cons 'cond #'expand-cond)
         (cons 'case #'expand-case)
         (cons 'case-using #'expand-case-using)
-        (cons 'setf #'expand-setf))
+        (cons 'setf #'expand-setf)
+        (cons 'for #'expand-for)
+        (cons 'while #'expand-while))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
@@ -362,6 +464,10 @@
 (declaim (ftype function transpile-tail-and))
 (declaim (ftype function transpile-tail-or))
 (declaim (ftype function transpile-tail-call))
+(declaim (ftype function transpile-go))
+(declaim (ftype function transpile-return-from))
+(declaim (ftype function transpile-block))
+(declaim (ftype function transpile-tagbody))
 
 (defun transpile-expr (expr &optional scope)
   "fixnum/string/nil/tの裸リテラルと、それらに対するquote、シンボルのquote、
@@ -403,6 +509,14 @@
      (transpile-dynamic-read expr))
     ((and (consp expr) (eq (car expr) 'defdynamic) (= (length expr) 3))
      (transpile-defdynamic expr scope))
+    ((and (consp expr) (eq (car expr) 'go) (= (length expr) 2))
+     (transpile-go expr))
+    ((and (consp expr) (eq (car expr) 'return-from))
+     (transpile-return-from expr scope))
+    ((and (consp expr) (eq (car expr) 'block))
+     (transpile-block expr scope))
+    ((and (consp expr) (eq (car expr) 'tagbody))
+     (transpile-tagbody expr scope))
     ((and (consp expr) (symbolp (car expr)))
      (transpile-call expr scope))
     ((and (consp expr) (consp (car expr)) (eq (car (car expr)) 'lambda) (= (length (car expr)) 3))
@@ -416,26 +530,47 @@
      (error "transpile-expr: 未束縛の変数参照です: ~S" expr))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
 
+(defparameter *ct-temp-counter* 0
+  "M14基盤D: block/return-from/tagbody/go導入に伴い、testの結果や中間式の値を
+   一時変数へ受けてos_is_control_transferで判定するif/progn/and/setqが使う
+   一意なCローカル変数名のカウンタ(*or-temp-counter*と同じ役割の専用版)")
+
 (defun transpile-if (expr scope)
   "(if test then [else])。真偽値は「nil以外はすべて真」の規約に従い、
    testをnilと比較した結果でCの三項演算子に分岐する(za.cの拡張0と同じ設計)。
    elseを省略した場合はnilがデフォルト(destructuring-bindの&optionalが
-   nilにデフォルトし、transpile-exprがnil式を\"nil\"に変換するのでそのまま流れる)"
+   nilにデフォルトし、transpile-exprがnil式を\"nil\"に変換するのでそのまま流れる)。
+   M14基盤D: eval_if(eval.c)がtestの評価結果を真偽判定の前にos_is_control_transfer
+   でチェックしているのと同じく、testがblock/tagbodyのgo/return-from非局所脱出
+   シグナルであれば真偽判定を行わずそのまま式全体の値として伝播させる(then/else
+   どちらも評価しない)"
   (destructuring-bind (if-kw test then &optional else) expr
     (declare (ignore if-kw))
-    (format nil "((~A) != nil ? (~A) : (~A))"
-            (transpile-expr test scope)
-            (transpile-expr then scope)
-            (transpile-expr else scope))))
+    (let ((temp (format nil "__if_test_~A" (incf *ct-temp-counter*))))
+      (format nil "({ lisp_val_t ~A = (~A); os_is_control_transfer(~A) ? ~A : ((~A) != nil ? (~A) : (~A)); })"
+              temp (transpile-expr test scope) temp temp temp
+              (transpile-expr then scope)
+              (transpile-expr else scope)))))
+
+(defun transpile-progn-forms (forms scope)
+  "formのリストを左から順に評価し、最後の式の値を残す(transpile-prognの本体、
+   および同じ評価順を必要とするblockの本体からも共有される)。M14基盤D:
+   eval_progn(eval.c)がform評価ごとにos_is_control_transferをチェックし
+   即座に伝播させているのと同じく、途中のformがblock/tagbodyの非局所脱出
+   シグナルを返した場合は残りのformを評価せずそのシグナルを式全体の値として
+   返す(forの本体に埋め込まれたreturn-from/goが後続のformを実行してしまう
+   のを防ぐために必須)。formが1つも無い場合はnilを返す"
+  (cond
+    ((null forms) "nil")
+    ((null (cdr forms)) (transpile-expr (car forms) scope))
+    (t (let ((temp (format nil "__progn_val_~A" (incf *ct-temp-counter*))))
+         (format nil "({ lisp_val_t ~A = (~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                 temp (transpile-expr (car forms) scope) temp temp
+                 (transpile-progn-forms (cdr forms) scope))))))
 
 (defun transpile-progn (expr scope)
-  "(progn form*)。Cのコンマ演算子で左から順に評価し、最後の式の値を残す
-   (副作用の順序もコンマ演算子の評価順保証によりLispの逐次評価と一致する)。
-   formが1つも無い場合はnilを返す"
-  (let ((forms (cdr expr)))
-    (if (null forms)
-        "nil"
-        (format nil "(~{~A~^, ~})" (mapcar (lambda (f) (transpile-expr f scope)) forms)))))
+  "(progn form*)。transpile-progn-forms参照"
+  (transpile-progn-forms (cdr expr) scope))
 
 (defun transpile-setq (expr scope)
   "(setq var val)。varはscope内の束縛済みローカル変数(defun/lambdaパラメータ、
@@ -445,29 +580,39 @@
    基準でsetqされエスケープするlambdaに捕捉されたもの)への代入はos_setcdrで
    box(cons)のcdrを直接書き換える(このboxを共有する他のクロージャや外側の
    スコープからも変更後の値が見える)。os_setcdrはval自身を返す規約なので、
-   ここでもCの代入式と同じく戻り値の扱いを変える必要がない"
+   ここでもCの代入式と同じく戻り値の扱いを変える必要がない。M14基盤D:
+   eval_setq(eval.c)がvalの評価結果をos_setq_variable呼び出しの前に
+   os_is_control_transferでチェックし、非局所脱出シグナルであれば代入自体を
+   行わずそのまま返しているのと同じく、valがそのシグナルの場合は変数/boxへの
+   代入を実行せずシグナルをそのまま式全体の値として返す"
   (let* ((var (second expr))
          (val (third expr))
          (binding (assoc var scope)))
     (unless binding
       (error "transpile-setq: setqの対象が未束縛のローカル変数です: ~S" var))
     (let ((c-name (car (cdr binding)))
-          (boxed-p (cdr (cdr binding))))
-      (if boxed-p
-          (format nil "os_setcdr(~A, ~A)" c-name (transpile-expr val scope))
-          (format nil "(~A = ~A)" c-name (transpile-expr val scope))))))
+          (boxed-p (cdr (cdr binding)))
+          (temp (format nil "__setq_val_~A" (incf *ct-temp-counter*))))
+      (format nil "({ lisp_val_t ~A = (~A); os_is_control_transfer(~A) ? ~A : ~A; })"
+              temp (transpile-expr val scope) temp temp
+              (if boxed-p
+                  (format nil "os_setcdr(~A, ~A)" c-name temp)
+                  (format nil "(~A = ~A)" c-name temp))))))
 
 (defun transpile-and (forms scope)
   "(and form*)。init.lispのdefmacro andが展開する(if a (and b...) nil)の
    ネストと同じ形をCの三項演算子で直接生成する(=transpile-ifと同じパターン)。
    formが1つも無い場合はt、1つだけの場合はその式自身をそのまま返す
-   (末尾のif展開に頼らずここで打ち切ることで、不要なネストを避ける)"
+   (末尾のif展開に頼らずここで打ち切ることで、不要なネストを避ける)。M14基盤D:
+   transpile-ifと同じ理由で、各formの評価結果が非局所脱出シグナルであれば
+   真偽判定を行わずそのまま伝播させる"
   (cond
     ((null forms) "g_sym_t")
     ((null (cdr forms)) (transpile-expr (car forms) scope))
-    (t (format nil "((~A) != nil ? (~A) : nil)"
-               (transpile-expr (car forms) scope)
-               (transpile-and (cdr forms) scope)))))
+    (t (let ((temp (format nil "__and_val_~A" (incf *ct-temp-counter*))))
+         (format nil "({ lisp_val_t ~A = (~A); os_is_control_transfer(~A) ? ~A : ((~A) != nil ? (~A) : nil); })"
+                 temp (transpile-expr (car forms) scope) temp temp temp
+                 (transpile-and (cdr forms) scope))))))
 
 (defparameter *or-temp-counter* 0)
 
@@ -519,13 +664,106 @@
    その結果を一旦Cローカル変数へGC_PROTECTしてから、name(未評価のシンボル
    リテラル)をos_make_symbolで解決してos_set_dynamicへ渡す。eval_defdynamicと
    同じくnameそのものを式全体の値として返す(za.cの拡張6と同じ意味論)。
-   トランスパイラの対応範囲は非局所脱出(block/return-from/catch/throw)を
-   まだ含まないため、eval_defdynamicにあるis_control_transferチェックは
-   ここでは省略している"
+   M14基盤D: eval_defdynamicがvalueの評価結果をos_set_dynamic呼び出しの前に
+   is_control_transferでチェックし、非局所脱出シグナルであれば設定を行わず
+   そのまま返しているのと同じく、valueがblock/tagbodyのシグナルであれば
+   os_set_dynamicを呼ばずシグナルをそのまま式全体の値として返す"
   (let ((temp (format nil "__defdynamic_val_~A" (incf *defdynamic-temp-counter*)))
         (name-c (transpile-quoted (second expr))))
-    (format nil "({ lisp_val_t ~A = ~A; GC_PROTECT(~A); os_set_dynamic(~A, ~A); ~A; })"
-            temp (transpile-expr (third expr) scope) temp name-c temp name-c)))
+    (format nil "({ lisp_val_t ~A = ~A; GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (os_set_dynamic(~A, ~A), ~A); })"
+            temp (transpile-expr (third expr) scope) temp temp temp name-c temp name-c)))
+
+(defun transpile-go (expr)
+  "(go tag)。tagは未評価のシンボルリテラル(quoteと同様)。eval_go(eval.c)と
+   同じくMAGIC_GO_EXITのシグナル値を作って返すだけで、実際のジャンプは
+   このシグナルを受け取ったtagbody側(transpile-tagbody)が行う"
+  (format nil "os_make_instance(MAGIC_GO_EXIT, ~A, nil, nil)" (transpile-quoted (second expr))))
+
+(defparameter *block-temp-counter* 0)
+
+(defun transpile-return-from (expr scope)
+  "(return-from name [value-form])。value-formの評価結果がeval_return_from
+   (eval.c)と同じく既に非局所脱出シグナルであればそのまま二重にラップせず
+   伝播させ、そうでなければMAGIC_BLOCK_EXITのシグナル値(name+value)を作って
+   返す。value-formを省略した場合はnilを返す規約(eval_return_fromと同じ)。
+   GC_PROTECTは、nameのos_make_symbol呼び出し(未internなら新規確保が起きうる)
+   評価中にGCで移動しうるtempをshadow stackへ繋いでおくためのもの"
+  (let* ((has-value (cddr expr))
+         (value-form (if has-value (third expr) nil))
+         (temp (format nil "__return_from_val_~A" (incf *block-temp-counter*))))
+    (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : os_make_instance(MAGIC_BLOCK_EXIT, ~A, ~A, nil); })"
+            temp
+            (if has-value (transpile-expr value-form scope) "nil")
+            temp temp temp
+            (transpile-quoted (second expr))
+            temp)))
+
+(defun transpile-block (expr scope)
+  "(block name form*)。formをtranspile-progn-formsと同じ規則(非局所脱出
+   シグナルなら即座に伝播)で評価し、その結果がこのblockのMAGIC_BLOCK_EXIT
+   (nameが一致するもの)であればos_control_transfer_valueで包みを外し、
+   それ以外(通常の値、または一致しないタグ/goシグナル、他のblockのシグナル)
+   はそのまま伝播させる(eval_block/eval.cと同じ意味論)。GC_PROTECTは、
+   name比較用のos_make_symbol呼び出し中にGCで移動しうるtempを保護する"
+  (destructuring-bind (block-kw name &rest body) expr
+    (declare (ignore block-kw))
+    (let ((temp (format nil "__block_val_~A" (incf *block-temp-counter*)))
+          (name-c (transpile-quoted name)))
+      (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); (os_is_control_transfer(~A) && os_control_transfer_magic(~A) == MAGIC_BLOCK_EXIT && os_control_transfer_name(~A) == (~A)) ? os_control_transfer_value(~A) : ~A; })"
+              temp (transpile-progn-forms body scope)
+              temp temp temp temp name-c temp temp))))
+
+(defparameter *tagbody-temp-counter* 0)
+
+(defun %%tagbody-c-label (tag suffix)
+  (format nil "__tagbody_label_~A_~A" (sanitize-c-ident (symbol-name tag)) suffix))
+
+(defun %%tagbody-dispatch-chain (signal-temp tags suffix result-temp end-label)
+  "signal-tempがMAGIC_GO_EXITでtags中のいずれかのタグ名と一致すれば対応する
+   Cラベルへgotoし、どれにも一致しなければ(GO_EXIT以外の非局所脱出シグナルの
+   場合も含む)result-tempへsignal-tempを保存してend-labelへgotoする(伝播)"
+  (if (null tags)
+      (format nil "~A = ~A; goto ~A;" result-temp signal-temp end-label)
+      (format nil "if (os_control_transfer_magic(~A) == MAGIC_GO_EXIT && os_control_transfer_name(~A) == (~A)) { goto ~A; } else { ~A }"
+              signal-temp signal-temp (transpile-quoted (car tags))
+              (%%tagbody-c-label (car tags) suffix)
+              (%%tagbody-dispatch-chain signal-temp (cdr tags) suffix result-temp end-label))))
+
+(defun %%tagbody-form-stmt (form tags suffix result-temp end-label scope)
+  "tagbody本体中の1つのform(タグでない要素)をCの文へ変換する。評価結果が
+   非局所脱出シグナルでなければ単に捨てて次のformへフォールスルーする
+   (tagbodyは中間値を無視する、eval_tagbodyと同じ規約)。GC_PROTECTは、
+   ディスパッチ先のタグ名比較(os_make_symbol呼び出しを含む)の間、tempが
+   GCで移動しうる場合に備えて保護する"
+  (let ((temp (format nil "__tagbody_form_~A" (incf *tagbody-temp-counter*))))
+    (format nil "{ lisp_val_t ~A = (~A); if (os_is_control_transfer(~A)) { GC_PROTECT(~A); ~A } }"
+            temp (transpile-expr form scope) temp temp
+            (%%tagbody-dispatch-chain temp tags suffix result-temp end-label))))
+
+(defun transpile-tagbody (expr scope)
+  "(tagbody form*)。formの間に挟まる裸シンボルはgoの飛び先タグとして扱う
+   (tagbody-tag-p、マクロ展開済みのフォームを扱うため静的に判定できる)。
+   タグはこのtagbody内だけで解決される局所的なCラベルへ直接コンパイルする
+   (通常のgoto/labelはC関数全体のスコープを持つため、GNU文式でネストしていても
+   問題ない)。各formはeval_tagbodyと同じくos_is_control_transferで判定し、
+   GO_EXITでこのtagbodyのいずれかのタグへ一致すればgotoでジャンプし、それ以外の
+   非局所脱出シグナル(このtagbody内で一致しないgo、またはblockのreturn-from等)
+   はそのままtagbody式全体の値として伝播させる。通常の値は捨てて次のformへ進む
+   (tagbody自体は最後まで実行した場合は常にnilを返す)"
+  (let* ((body (cdr expr))
+         (tags (remove-if-not #'tagbody-tag-p body))
+         (suffix (incf *tagbody-temp-counter*))
+         (result-temp (format nil "__tagbody_result_~A" suffix))
+         (end-label (format nil "__tagbody_end_~A" suffix)))
+    (format nil "({ lisp_val_t ~A = nil; ~{~A~}~A: ~A; })"
+            result-temp
+            (mapcar (lambda (elem)
+                      (if (tagbody-tag-p elem)
+                          (format nil "~A: ; " (%%tagbody-c-label elem suffix))
+                          (format nil "~A " (%%tagbody-form-stmt elem tags suffix result-temp end-label scope))))
+                    body)
+            end-label
+            result-temp)))
 
 (defparameter *lambda-name-counter* 0)
 (defparameter *lifted-lambda-decls* nil
@@ -785,14 +1023,33 @@
 (defun transpile-tail-and (forms scope)
   "transpile-andの末尾位置版。最後の式だけが本当の末尾位置(そこに到達した場合の
    値がand全体の値になる)で、それより前の式は真偽判定のためだけに通常評価する
-   (nilで短絡した場合の戻り値は常にnilそのものなので、確定値としてreturnする)"
+   (nilで短絡した場合の戻り値は常にnilそのものなので、確定値としてreturnする)。
+   M14基盤D: transpile-andと同じ理由で、各formの評価結果が非局所脱出シグナル
+   であれば真偽判定を行わずそのまま確定値としてreturnする"
   (cond
     ((null forms) (tail-return-final "g_sym_t"))
     ((null (cdr forms)) (transpile-tail-stmt (car forms) scope))
-    (t (format nil "if ((~A) != nil) { ~A } else { ~A }"
-               (transpile-expr (car forms) scope)
-               (transpile-tail-and (cdr forms) scope)
-               (tail-return-final "nil")))))
+    (t (let ((temp (format nil "__and_val_~A" (incf *ct-temp-counter*))))
+         (format nil "{ lisp_val_t ~A = (~A); if (os_is_control_transfer(~A)) { ~A } else if (~A != nil) { ~A } else { ~A } }"
+                 temp (transpile-expr (car forms) scope) temp (tail-return-final temp) temp
+                 (transpile-tail-and (cdr forms) scope)
+                 (tail-return-final "nil"))))))
+
+(defun transpile-tail-progn (forms scope)
+  "transpile-progn-formsの末尾位置版。最後のformだけが本当の末尾位置で、
+   それより前のformは副作用のためだけに通常評価する。M14基盤D:
+   transpile-progn-formsと同じ理由で、途中のformの評価結果が非局所脱出
+   シグナルであれば残りのformを評価せずそのシグナルを確定値としてreturnする
+   (旧実装は(void)キャストで単純に捨てて次のformへ進んでいたため、for/while
+   本体でreturn-from/goが早期脱出しても後続のformが実行されてしまう不具合が
+   あった)"
+  (cond
+    ((null forms) (tail-return-final "nil"))
+    ((null (cdr forms)) (transpile-tail-stmt (car forms) scope))
+    (t (let ((temp (format nil "__progn_val_~A" (incf *ct-temp-counter*))))
+         (format nil "{ lisp_val_t ~A = (~A); if (os_is_control_transfer(~A)) { ~A } else { ~A } }"
+                 temp (transpile-expr (car forms) scope) temp (tail-return-final temp)
+                 (transpile-tail-progn (cdr forms) scope))))))
 
 (defun transpile-tail-or (forms scope)
   "transpile-orの末尾位置版。二重評価を避けるための一時変数はtranspile-orと同じ
@@ -821,17 +1078,13 @@
     ((and (consp expr) (eq (car expr) 'if))
      (destructuring-bind (if-kw test then &optional else) expr
        (declare (ignore if-kw))
-       (format nil "if ((~A) != nil) { ~A } else { ~A }"
-               (transpile-expr test scope)
-               (transpile-tail-stmt then scope)
-               (transpile-tail-stmt else scope))))
+       (let ((temp (format nil "__if_test_~A" (incf *ct-temp-counter*))))
+         (format nil "{ lisp_val_t ~A = (~A); if (os_is_control_transfer(~A)) { ~A } else if (~A != nil) { ~A } else { ~A } }"
+                 temp (transpile-expr test scope) temp (tail-return-final temp) temp
+                 (transpile-tail-stmt then scope)
+                 (transpile-tail-stmt else scope)))))
     ((and (consp expr) (eq (car expr) 'progn))
-     (let ((forms (cdr expr)))
-       (if (null forms)
-           (tail-return-final "nil")
-           (format nil "~{(void)(~A); ~}~A"
-                   (mapcar (lambda (f) (transpile-expr f scope)) (butlast forms))
-                   (transpile-tail-stmt (car (last forms)) scope)))))
+     (transpile-tail-progn (cdr expr) scope))
     ((and (consp expr) (eq (car expr) 'and))
      (transpile-tail-and (cdr expr) scope))
     ((and (consp expr) (eq (car expr) 'or))

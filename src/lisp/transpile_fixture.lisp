@@ -233,3 +233,55 @@
   ;; cc_car/cc_cdrで通常通り1つ剥がされ、残りのevaluated_argsがそのままitemsへ
   ;; 束縛されることを確認する
   (cons a items))
+
+(defun %%transpile-fixture-for-sum (n)
+  ;; M14基盤D: forの検証。1からnまでの合計を計算する。test-and-resultの
+  ;; testが真になった時点でresultフォーム(sum)が返ることと、bindingのstep式
+  ;; (+ i 1)がgo/tagbodyループの各反復で正しく次のiへ束縛し直されることを確認する
+  (let ((sum 0))
+    (for ((i 1 (+ i 1)))
+        ((> i n) sum)
+      (setq sum (+ sum i)))))
+
+(defun %%transpile-fixture-for-early-exit (n)
+  ;; M14基盤D: for本体中のreturn-fromによる早期脱出の検証。forは(block nil ...)
+  ;; を生成するため、本体で(return-from nil 999)すると、forのtest-and-result
+  ;; (test-and-resultのresultは'not-found)ではなくreturn-fromの値999がfor式
+  ;; 全体の値になり、以降(1)同じ反復内の残りのbody(2つ目のsetq)、(2)残りの
+  ;; 反復(i=4以降)がどちらも実行されないことを、countの最終値(203、バグで
+  ;; 実行され続けた場合はもっと大きくなる)から確認する
+  (let ((count 0) (result nil))
+    (setq result
+          (for ((i 1 (+ i 1)))
+              ((> i n) 'not-found)
+            (setq count (+ count 1))
+            (if (eq i 3) (return-from nil 999))
+            (setq count (+ count 100))))
+    (cons result count)))
+
+(defun %%transpile-fixture-while-sum (n)
+  ;; M14基盤D: whileの検証。nが0になるまで1減らしながらsumへ加算する
+  ;; (tagbody/goによるループの基本動作と、while自身の戻り値は無視されて
+  ;; 後続のsumが返ることの確認)
+  (let ((sum 0))
+    (while (> n 0)
+      (setq sum (+ sum n))
+      (setq n (- n 1)))
+    sum))
+
+(defun %%transpile-fixture-while-named-block-exit (n)
+  ;; M14基盤D: 名前付きblock+return-fromの検証。while自身は(block nil ...)を
+  ;; 生成するが、ここでは別名の外側blockへreturn-fromする。非局所脱出シグナルが
+  ;; while内部のblock nil(名前が一致しない)を素通りし、さらに外側の名前付き
+  ;; blockまで正しく伝播すること(transpile-blockの名前不一致時の伝播パスと、
+  ;; os_make_symbolによる名前比較+GC_PROTECT)を、countが3になった時点で
+  ;; 'stoppedを返し以降の反復が実行されないことから確認する
+  (let ((count 0))
+    (cons
+     (block %%fixture-outer-block
+       (while (> n 0)
+         (setq count (+ count 1))
+         (if (eq count 3) (return-from %%fixture-outer-block 'stopped))
+         (setq n (- n 1)))
+       'exhausted)
+     count)))
