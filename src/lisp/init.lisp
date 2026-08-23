@@ -598,50 +598,8 @@
 
 ;;; --- condition accessors (§29.3) ---
 ;;;
-;;; 各アクセサは対象クラスでなければ<domain-error>をsignalする(spec 7080-7081行等、
-;;; 各データ表の「An error shall be signaled if X is not a condition of class <X>
-;;; (error-id. domain-error)」という要求に対応)。
-
-;; objがclass-nameのインスタンスならそのまま返し、そうでなければ<domain-error>をsignalする。
-(defun %check-condition-class (obj class-name)
-  (if (typep obj class-name)
-      obj
-      (signal-condition
-        (make-instance '<domain-error> ':object obj ':expected-class (%find-class class-name))
-        nil)))
-
-(defun arithmetic-error-operation (condition)
-  (slot-value (%check-condition-class condition '<arithmetic-error>) 'operation))
-
-(defun arithmetic-error-operands (condition)
-  (slot-value (%check-condition-class condition '<arithmetic-error>) 'operands))
-
-(defun domain-error-object (condition)
-  (slot-value (%check-condition-class condition '<domain-error>) 'object))
-
-(defun domain-error-expected-class (condition)
-  (slot-value (%check-condition-class condition '<domain-error>) 'expected-class))
-
-(defun parse-error-string (condition)
-  (slot-value (%check-condition-class condition '<parse-error>) 'string))
-
-(defun parse-error-expected-class (condition)
-  (slot-value (%check-condition-class condition '<parse-error>) 'expected-class))
-
-(defun simple-error-format-string (condition)
-  (slot-value (%check-condition-class condition '<simple-error>) 'format-string))
-
-(defun simple-error-format-arguments (condition)
-  (slot-value (%check-condition-class condition '<simple-error>) 'format-arguments))
-
-(defun stream-error-stream (condition)
-  (slot-value (%check-condition-class condition '<stream-error>) 'stream))
-
-(defun undefined-entity-name (condition)
-  (slot-value (%check-condition-class condition '<undefined-entity>) 'name))
-
-(defun undefined-entity-namespace (condition)
-  (slot-value (%check-condition-class condition '<undefined-entity>) 'namespace))
+;;; %check-condition-class + 11個のアクセサはsrc/lisp/init_aot.lispへ移動した
+;;; (M12 Phase 11、#27)。
 
 ;;; --- report-condition (§29.2) ---
 ;;;
