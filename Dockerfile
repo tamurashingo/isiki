@@ -22,6 +22,10 @@ USER builder
 ENV HOME=/home/builder
 RUN curl -L https://raw.githubusercontent.com/roswell/roswell/release/scripts/install-for-ci.sh | sh
 ENV PATH="/home/builder/.roswell/bin:${PATH}"
+# ダミーのeval実行。これによりrosが遅延インストールするsbcl-bin本体のダウンロード/
+# 展開/ビルドがこのイメージのレイヤーに焼き込まれ、docker run --rm時(sbcl-binは
+# コンテナ内で毎回消える)の再ダウンロードを防ぐ。
+RUN ros run --eval '(quit)'
 
 USER root
 WORKDIR /workspace
