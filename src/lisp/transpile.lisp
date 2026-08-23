@@ -97,7 +97,13 @@
     ;; テストfixtureから検証するために使う(cc_open_stream_p、stream_lisp.c:100)
     (open-stream-p . "cc_open_stream_p")
     ;; M14: with-open-output-fileの展開先(バインディングの初期値式)が使う
-    (open-output-file . "cc_open_output_file")))
+    (open-output-file . "cc_open_output_file")
+    ;; M12基盤C(#27): %register-classが*classes*を更新するのに使う。defdynamic
+    ;; はシンボル名キーの動的束縛なので、変数ごとの追加登録は不要
+    (%%set-dynamic . "primitive_set_dynamic")
+    ;; M12基盤B(#27): %register-builtin-classがbootstrap用クラスオブジェクトを
+    ;; 生成するのに使う(メタクラスは<built-in-class>)
+    (%%make-builtin-class-raw . "primitive_make_builtin_class_raw")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while

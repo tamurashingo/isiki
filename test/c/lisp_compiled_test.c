@@ -160,6 +160,9 @@ extern lisp_val_t lisp_ll_transpile_fixture_catch_no_throw(lisp_val_t evaluated_
 extern lisp_val_t lisp_ll_transpile_fixture_catch_mismatched_tag(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_catch_throw_runtime_tag(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_catch_with_cleanup(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_register_and_find_class(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_find_class_missing(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_register_builtin_class_then_find(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -679,6 +682,30 @@ static void test_transpile_fixture_catch_with_cleanup(void) {
            "catch/throw: throwによる非局所脱出であってもunwind-protectのcleanup-formは必ず実行される");
 }
 
+static void test_transpile_fixture_register_and_find_class(void) {
+    lisp_val_t name = os_make_symbol("ISIKI-TEST-CLASS-REGISTRY-NAME");
+    lisp_val_t value = os_make_symbol("ISIKI-TEST-CLASS-REGISTRY-VALUE");
+    lisp_val_t result = lisp_ll_transpile_fixture_register_and_find_class(
+        os_make_cons(name, os_make_cons(value, nil)), 0);
+    assert(result == value,
+           "%register-class/%find-class: 登録した値をそのままeqで引ける");
+}
+
+static void test_transpile_fixture_find_class_missing(void) {
+    lisp_val_t name = os_make_symbol("ISIKI-TEST-CLASS-REGISTRY-MISSING");
+    lisp_val_t result = lisp_ll_transpile_fixture_find_class_missing(os_make_cons(name, nil), 0);
+    assert(result == nil,
+           "%find-class: 未登録の名前に対してはnilを返す");
+}
+
+static void test_transpile_fixture_register_builtin_class_then_find(void) {
+    lisp_val_t name = os_make_symbol("ISIKI-TEST-BUILTIN-CLASS-NAME");
+    lisp_val_t result = lisp_ll_transpile_fixture_register_builtin_class_then_find(
+        os_make_cons(name, nil), 0);
+    assert(result == g_sym_t,
+           "%register-builtin-class: 登録したクラスオブジェクトを直後の%find-classがeqで引ける");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -954,6 +981,9 @@ int main(void) {
     test_transpile_fixture_catch_mismatched_tag();
     test_transpile_fixture_catch_throw_runtime_tag();
     test_transpile_fixture_catch_with_cleanup();
+    test_transpile_fixture_register_and_find_class();
+    test_transpile_fixture_find_class_missing();
+    test_transpile_fixture_register_builtin_class_then_find();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

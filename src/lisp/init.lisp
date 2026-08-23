@@ -316,28 +316,12 @@
 ;; 環境の親子関係と無関係なグローバルとして値を持つため、この制約を受けない。
 (defdynamic *classes* nil)
 
-(defun %find-class (name)
-  (cdr (assoc name (dynamic *classes*))))
-
-(defun %register-class (name class)
-  (%%set-dynamic '*classes* (cons (cons name class) (dynamic *classes*)))
-  class)
-
-;; super-nameのリストを、対応する登録済みクラスオブジェクトのリストに変換する。
-;; defclass由来(%defclass-supers)と、直後のpredefinedクラスbootstrapの両方から
-;; 使う共通の下請け関数(bootstrap側は<object>のようにsupersが本当に空のクラスも
-;; 扱うため、空リストへのフォールバックはここでは行わない)
-(defun %resolve-supers (super-names)
-  (if (null super-names)
-      nil
-      (cons (%find-class (car super-names)) (%resolve-supers (cdr super-names)))))
-
-;; ISLisp仕様Figure 1のクラス継承木に従い、条件階層以外のpredefinedクラス
-;; (<object>とその子)を%%MAKE-BUILTIN-CLASS-RAW(メタクラスは<built-in-class>)で
-;; 登録する。supersが未登録だと%find-classがnilを返してしまうため、
-;; 親クラスが先に登録済みになる順序で呼ぶ必要がある
-(defun %register-builtin-class (name super-names)
-  (%register-class name (%%make-builtin-class-raw name (%resolve-supers super-names) nil)))
+;; %find-class/%register-class/%resolve-supers/%register-builtin-classは
+;; src/lisp/init_aot.lispへ移動した(M12基盤B/C、#27)。*classes*自体の
+;; defdynamicと、直後の21個の%register-builtin-class呼び出しはmainがdefun
+;; 以外のトップレベルフォームを読まないためinit.lisp常駐のまま(AOT登録された
+;; ネイティブ関数はglobal_environmentへ通常のdefunと同じシンボル名で登録される
+;; ため、呼び出し側の実装場所に関わらずそのまま解決できる)。
 
 (%register-builtin-class '<object> nil)
 (%register-builtin-class '<basic-array> '(<object>))

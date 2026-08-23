@@ -278,3 +278,38 @@
 (defun map-into (destination function &rest sequences)
   (%map-into-loop destination function sequences 0
                    (%map-into-min-length (cons destination sequences))))
+
+;;; --- ILOSクラスレジストリ (M12基盤B/C, #27) ---
+;;;
+;;; init.lispからの移動。*classes*自体のdefdynamicと、<object>以下の組み込み
+;;; クラスをbootstrap登録する21個の%register-builtin-class呼び出しは、
+;;; mainがinit_aot.lisp中のdefun以外のトップレベルフォームを一切読まないため
+;;; init.lisp常駐のまま(移動するとAOTコードから見えず単に死んだ定義になる)。
+;;; defclassマクロが展開時に呼ぶ%plist-get/%slot-spec-form(s)/
+;;; %defclass-supers/%merge-superclass-slotsは、defclass自体がトップレベル
+;;; マクロ呼び出しとして常にインタプリタ実行される(mainがdefun以外を無視する
+;;; ため)ことをgrepで確認した結果、AOTコードから呼ばれることが無いと判明した
+;;; ので、計画に反してここでは移動しない。
+
+;; nameで登録済みクラスを引く。未登録ならnil。
+(defun %find-class (name)
+  (cdr (assoc name (dynamic *classes*))))
+
+;; *classes*にnameからclassへの対応を追加する。bodyがtranspile-defunの
+;; 「単一式のみ」制約を満たすためprognで包む(init.lisp版は2つのトップレベル式)。
+(defun %register-class (name class)
+  (progn
+    (%%set-dynamic '*classes* (cons (cons name class) (dynamic *classes*)))
+    class))
+
+;; super-nameのリストを、対応する登録済みクラスオブジェクトのリストに変換する。
+(defun %resolve-supers (super-names)
+  (if (null super-names)
+      nil
+      (cons (%find-class (car super-names)) (%resolve-supers (cdr super-names)))))
+
+;; predefinedクラス(<object>とその子)を%%MAKE-BUILTIN-CLASS-RAW(メタクラスは
+;; <built-in-class>)で登録する。supersが未登録だと%find-classがnilを返すため、
+;; 親クラスが先に登録済みになる順序で呼ぶ必要がある(呼び出し元はinit.lisp常駐)。
+(defun %register-builtin-class (name super-names)
+  (%register-class name (%%make-builtin-class-raw name (%resolve-supers super-names) nil)))

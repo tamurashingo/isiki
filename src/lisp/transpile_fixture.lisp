@@ -409,3 +409,22 @@
            (throw 'tag 7)
          (setq count (+ count 1))))
      count)))
+
+(defun %%transpile-fixture-register-and-find-class (name value)
+  ;; M12基盤C(#27): %register-class(%%set-dynamic経由)/%find-classの基本
+  ;; ラウンドトリップ検証。*classes*に登録するのはクラスオブジェクトである
+  ;; 必要はなく、任意の値を登録・検索できることだけを確認する
+  (progn
+    (%register-class name value)
+    (%find-class name)))
+
+(defun %%transpile-fixture-find-class-missing (name)
+  ;; M12基盤C(#27): 未登録名に対する%find-classがnilを返すことの検証
+  (%find-class name))
+
+(defun %%transpile-fixture-register-builtin-class-then-find (name)
+  ;; M12基盤B/C(#27): %register-builtin-class(%%make-builtin-class-rawで
+  ;; クラスオブジェクトを生成し%register-class経由で*classes*へ登録、その
+  ;; オブジェクト自身を返す)の直後に%find-classした結果がeqで同一のものとして
+  ;; 引けることを確認する
+  (eq (%register-builtin-class name nil) (%find-class name)))
