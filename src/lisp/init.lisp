@@ -346,16 +346,10 @@
 ;;; reverseも同様にリストのみを対象とする簡略版とする。member/assoc/reverseと
 ;;; その内部ヘルパーはsrc/lisp/init_aot.lispへ移動し、トランスパイラでAOT
 ;;; コンパイルしてos_register_aot_init_functions経由でglobal_environmentへ
-;;; 登録する(M13)。appendは&restパラメータを使うためトランスパイラ未対応で
-;;; ここに残るが、呼び出し先の%append-listsが同じ環境に登録されているため
-;;; 問題なく呼び出せる。
+;;; 登録する(M13)。
 
-;; 0個以上のリストを連結して1つのリストにする。
-(defun append (&rest lists)
-  (%append-lists lists))
-
-;; listはsrc/lisp/init_aot.lispへ移動した(M14: 基盤Bの&restパラメータ対応により
-;; AOT対応可能になったため)。
+;; append/listはsrc/lisp/init_aot.lispへ移動した(M14: 基盤Bの&restパラメータ
+;; 対応によりAOT対応可能になったため)。
 
 ;;; --- create-list / nreverse / maplist / mapl / mapcon (§21.3) ---
 

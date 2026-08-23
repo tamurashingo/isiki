@@ -88,3 +88,12 @@
 ;; 束縛するため、bodyはitemsをそのまま返すだけでよい。
 (defun list (&rest items)
   items)
+
+;;; --- append (M14) ---
+;;;
+;;; 基盤B(&restパラメータ対応)によりAOT対応可能になったため移動。呼び出し先の
+;;; %append-listsはM13で既にここへ移動・AOT済み。
+
+;; 0個以上のリストを連結して1つのリストにする。
+(defun append (&rest lists)
+  (%append-lists lists))

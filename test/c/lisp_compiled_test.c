@@ -132,6 +132,7 @@ extern lisp_val_t lisp_ll_transpile_fixture_cond_body_progn(lisp_val_t evaluated
 extern lisp_val_t lisp_ll_transpile_fixture_rest(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_rest_with_fixed(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
@@ -446,6 +447,28 @@ static void test_list(void) {
     assert(cc_cdr(cc_cdr(result)) == nil, "list: (list a b)は2要素で終端する");
 }
 
+static void test_append(void) {
+    lisp_val_t a = os_make_fixnum(1);
+    lisp_val_t b = os_make_fixnum(2);
+    lisp_val_t c = os_make_fixnum(3);
+    lisp_val_t d = os_make_fixnum(4);
+
+    lisp_val_t result_empty = lisp_ll_append(nil, 0);
+    assert(result_empty == nil, "append: 実引数無しで呼ぶとnilを返す");
+
+    lisp_val_t list1 = os_make_cons(a, os_make_cons(b, nil));
+    lisp_val_t result_one = lisp_ll_append(os_make_cons(list1, nil), 0);
+    assert(result_one == list1, "append: 1個のリストのみを渡すとそのリスト自身を返す");
+
+    lisp_val_t list2 = os_make_cons(c, os_make_cons(d, nil));
+    lisp_val_t result = lisp_ll_append(os_make_cons(list1, os_make_cons(list2, nil)), 0);
+    assert(cc_car(result) == a, "append: (append (1 2) (3 4))の1番目はa");
+    assert(cc_car(cc_cdr(result)) == b, "append: (append (1 2) (3 4))の2番目はb");
+    assert(cc_car(cc_cdr(cc_cdr(result))) == c, "append: (append (1 2) (3 4))の3番目はc");
+    assert(cc_car(cc_cdr(cc_cdr(cc_cdr(result)))) == d, "append: (append (1 2) (3 4))の4番目はd");
+    assert(cc_cdr(cc_cdr(cc_cdr(cc_cdr(result)))) == nil, "append: (append (1 2) (3 4))は4要素で終端する");
+}
+
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は
 // bodyの評価中に40000文字のダミー文字列を2つ、os_make_stringで順に確保する。これを
 // 小さいヒープと組み合わせることで、1つ目は確保できるが2つ目の確保時に空き領域が
@@ -518,6 +541,7 @@ int main(void) {
     test_transpile_fixture_rest();
     test_transpile_fixture_rest_with_fixed();
     test_list();
+    test_append();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();
