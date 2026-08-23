@@ -397,34 +397,8 @@
 ;; ネイティブ関数はglobal_environmentへ通常のdefunと同じシンボル名で登録される
 ;; ため、呼び出し側の実装場所(インタプリタ/AOT)に関わらずそのまま解決できる。
 
-(defun slot-value (instance slot-name)
-  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
-    (if (null idx)
-        'eval-error
-        (aref (%%instance-slots instance) idx))))
-
-;; 対応するinitargがinitargs(:key1 val1 :key2 val2 ...)に無ければ
-;; slot-descriptorのinitform-thunkをfuncallして初期値を得る
-(defun %slot-initial-value (slot-descriptor initargs)
-  (let ((initarg-key (car (cdr slot-descriptor)))
-        (thunk (car (cdr (cdr slot-descriptor)))))
-    (if (null initarg-key)
-        (funcall thunk)
-        (let ((found (member initarg-key initargs)))
-          (if found
-              (car (cdr found))
-              (funcall thunk))))))
-
-(defun %slot-initial-values (slots initargs)
-  (if (null slots)
-      nil
-      (cons (%slot-initial-value (car slots) initargs) (%slot-initial-values (cdr slots) initargs))))
-
-(defun %fill-slots (vec values idx)
-  (if (null values)
-      vec
-      (progn (set-aref vec idx (car values))
-             (%fill-slots vec (cdr values) (+ idx 1)))))
+;; slot-value/%slot-initial-value/%slot-initial-values/%fill-slotsは
+;; src/lisp/init_aot.lispへ移動した(M12 Phase 2、#27)。
 
 ;; (make-instance class-designator :key1 val1 :key2 val2 ...)
 ;; class-designatorはクラス名(シンボル)またはクラスオブジェクト自身。
@@ -438,18 +412,7 @@
     (initialize-object instance initargs)
     instance))
 
-;; c1がc2自身、またはc2の(推移的な)サブクラスかどうか
-(defun subclassp (c1 c2)
-  (if (eq c1 c2)
-      t
-      (%any-subclassp (%%class-supers c1) c2)))
-
-(defun %any-subclassp (classes c2)
-  (if (null classes)
-      nil
-      (if (subclassp (car classes) c2)
-          t
-          (%any-subclassp (cdr classes) c2))))
+;; subclassp/%any-subclasspはsrc/lisp/init_aot.lispへ移動した(M12 Phase 2、#27)。
 
 ;; instanceがclass-designator(クラスオブジェクトまたはクラス名)のインスタンスかどうか。
 ;; class-ofが組み込み型も含めて汎用化されたので、ILOSインスタンス以外の値でも

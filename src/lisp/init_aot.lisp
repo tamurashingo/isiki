@@ -313,3 +313,54 @@
 ;; 親クラスが先に登録済みになる順序で呼ぶ必要がある(呼び出し元はinit.lisp常駐)。
 (defun %register-builtin-class (name super-names)
   (%register-class name (%%make-builtin-class-raw name (%resolve-supers super-names) nil)))
+
+;;; --- スロットアクセスとインスタンス基礎 (M12 Phase 2, #27) ---
+;;;
+;;; init.lispからの移動。typep/instancepはclass-of(Phase 3で移動予定、まだ
+;;; init.lisp常駐)を呼ぶため、class-ofの移動と同じコミットにまとめる方が筋が
+;;; 良いと判断し、計画のPhase 2区分とは異なりここでは移動を見送る(Phase 3で
+;;; 対応する)。
+
+;; instanceのslot-nameスロットの値を返す。%slot-index/%%class-slots/
+;; %%instance-class/%%instance-slotsは既にM13/M14/本Phaseでwhitelist・移動済み
+(defun slot-value (instance slot-name)
+  (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
+    (if (null idx)
+        'eval-error
+        (aref (%%instance-slots instance) idx))))
+
+;; 対応するinitargがinitargs(:key1 val1 :key2 val2 ...)に無ければ
+;; slot-descriptorのinitform-thunkをfuncallして初期値を得る
+(defun %slot-initial-value (slot-descriptor initargs)
+  (let ((initarg-key (car (cdr slot-descriptor)))
+        (thunk (car (cdr (cdr slot-descriptor)))))
+    (if (null initarg-key)
+        (funcall thunk)
+        (let ((found (member initarg-key initargs)))
+          (if found
+              (car (cdr found))
+              (funcall thunk))))))
+
+(defun %slot-initial-values (slots initargs)
+  (if (null slots)
+      nil
+      (cons (%slot-initial-value (car slots) initargs) (%slot-initial-values (cdr slots) initargs))))
+
+(defun %fill-slots (vec values idx)
+  (if (null values)
+      vec
+      (progn (set-aref vec idx (car values))
+             (%fill-slots vec (cdr values) (+ idx 1)))))
+
+;; c1がc2自身、またはc2の(推移的な)サブクラスかどうか
+(defun subclassp (c1 c2)
+  (if (eq c1 c2)
+      t
+      (%any-subclassp (%%class-supers c1) c2)))
+
+(defun %any-subclassp (classes c2)
+  (if (null classes)
+      nil
+      (if (subclassp (car classes) c2)
+          t
+          (%any-subclassp (cdr classes) c2))))

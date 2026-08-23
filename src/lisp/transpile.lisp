@@ -103,7 +103,11 @@
     (%%set-dynamic . "primitive_set_dynamic")
     ;; M12基盤B(#27): %register-builtin-classがbootstrap用クラスオブジェクトを
     ;; 生成するのに使う(メタクラスは<built-in-class>)
-    (%%make-builtin-class-raw . "primitive_make_builtin_class_raw")))
+    (%%make-builtin-class-raw . "primitive_make_builtin_class_raw")
+    ;; M12(#27): slot-valueがインスタンスのスロットベクタから値を読み出すのに使う
+    (aref . "primitive_aref")
+    ;; M12(#27): subclasspがクラスの直接の親クラス一覧を辿るのに使う
+    (%%class-supers . "primitive_class_supers")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while

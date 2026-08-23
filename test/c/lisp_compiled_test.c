@@ -163,6 +163,9 @@ extern lisp_val_t lisp_ll_transpile_fixture_catch_with_cleanup(lisp_val_t evalua
 extern lisp_val_t lisp_ll_transpile_fixture_register_and_find_class(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_find_class_missing(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_register_builtin_class_then_find(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_slot_value_read(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_fill_slots(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_subclassp(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -706,6 +709,53 @@ static void test_transpile_fixture_register_builtin_class_then_find(void) {
            "%register-builtin-class: 登録したクラスオブジェクトを直後の%find-classがeqで引ける");
 }
 
+static void test_transpile_fixture_slot_value_read(void) {
+    lisp_val_t slot_descriptor = os_make_cons(os_make_symbol("VAL"), nil);
+    lisp_val_t slots = os_make_cons(slot_descriptor, nil);
+    lisp_val_t class = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("POINT"), os_make_cons(nil, os_make_cons(slots, nil))), nil);
+    lisp_val_t slots_vector = primitive_make_array(os_make_cons(os_make_fixnum(1), nil), nil);
+    primitive_set_aref(os_make_cons(slots_vector,
+        os_make_cons(os_make_fixnum(0), os_make_cons(os_make_fixnum(42), nil))), nil);
+    lisp_val_t instance = primitive_make_instance_raw(
+        os_make_cons(class, os_make_cons(slots_vector, nil)), nil);
+
+    lisp_val_t result = lisp_ll_transpile_fixture_slot_value_read(
+        os_make_cons(instance, os_make_cons(os_make_symbol("VAL"), nil)), 0);
+    assert(result == os_make_fixnum(42),
+           "slot-value: instanceのスロットベクタから%slot-indexが算出した添字の値を読む");
+}
+
+static void test_transpile_fixture_fill_slots(void) {
+    lisp_val_t vec = primitive_make_array(os_make_cons(os_make_fixnum(2), nil), nil);
+    lisp_val_t a = os_make_fixnum(10);
+    lisp_val_t b = os_make_fixnum(20);
+    lisp_val_t values = os_make_cons(a, os_make_cons(b, nil));
+
+    lisp_val_t result = lisp_ll_transpile_fixture_fill_slots(os_make_cons(vec, os_make_cons(values, nil)), 0);
+    assert(result == vec, "%fill-slots: vec自身を返す");
+    assert(primitive_aref(os_make_cons(vec, os_make_cons(os_make_fixnum(0), nil)), nil) == a,
+           "%fill-slots: valuesの1番目がvecの添字0に書き込まれる");
+    assert(primitive_aref(os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)), nil) == b,
+           "%fill-slots: valuesの2番目がvecの添字1に書き込まれる");
+}
+
+static void test_transpile_fixture_subclassp(void) {
+    lisp_val_t class_a = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("A"), os_make_cons(nil, os_make_cons(nil, nil))), nil);
+    lisp_val_t class_b = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("B"), os_make_cons(os_make_cons(class_a, nil), os_make_cons(nil, nil))), nil);
+    lisp_val_t class_c = primitive_make_class_raw(
+        os_make_cons(os_make_symbol("C"), os_make_cons(os_make_cons(class_b, nil), os_make_cons(nil, nil))), nil);
+
+    assert(lisp_ll_transpile_fixture_subclassp(os_make_cons(class_c, os_make_cons(class_c, nil)), 0) == g_sym_t,
+           "subclassp: 自分自身はサブクラス(eq)としてtを返す");
+    assert(lisp_ll_transpile_fixture_subclassp(os_make_cons(class_c, os_make_cons(class_a, nil)), 0) == g_sym_t,
+           "subclassp: C -> B -> Aと%%class-supersを推移的に辿ってtを返す");
+    assert(lisp_ll_transpile_fixture_subclassp(os_make_cons(class_a, os_make_cons(class_c, nil)), 0) == nil,
+           "subclassp: 逆方向(親から子)はサブクラスではないのでnilを返す");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -984,6 +1034,9 @@ int main(void) {
     test_transpile_fixture_register_and_find_class();
     test_transpile_fixture_find_class_missing();
     test_transpile_fixture_register_builtin_class_then_find();
+    test_transpile_fixture_slot_value_read();
+    test_transpile_fixture_fill_slots();
+    test_transpile_fixture_subclassp();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

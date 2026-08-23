@@ -428,3 +428,18 @@
   ;; オブジェクト自身を返す)の直後に%find-classした結果がeqで同一のものとして
   ;; 引けることを確認する
   (eq (%register-builtin-class name nil) (%find-class name)))
+
+(defun %%transpile-fixture-slot-value-read (instance slot-name)
+  ;; M12 Phase 2(#27): slot-valueがinstanceのスロットベクタから%slot-index
+  ;; (M14で既にAOT移動済み)が算出した添字の値を正しく読むことを確認する
+  (slot-value instance slot-name))
+
+(defun %%transpile-fixture-fill-slots (vec values)
+  ;; M12 Phase 2(#27): %fill-slotsがvaluesの各要素をvecへ先頭から順に
+  ;; 破壊的に書き込み、vec自身を返すことを確認する
+  (%fill-slots vec values 0))
+
+(defun %%transpile-fixture-subclassp (c1 c2)
+  ;; M12 Phase 2(#27): subclassp/%any-subclasspが%%class-supersを再帰的に辿り、
+  ;; c1がc2自身または(推移的な)サブクラスかどうかを正しく判定することを確認する
+  (subclassp c1 c2))
