@@ -170,6 +170,11 @@ extern lisp_val_t lisp_ll_transpile_fixture_class_of_builtin(lisp_val_t evaluate
 extern lisp_val_t lisp_ll_transpile_fixture_class_of_instance(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_typep(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_instancep(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_generic_dispatch(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_generic_dispatch_order(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_call_next_method(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_generic_no_applicable_method(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_call_next_method_no_next(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_list(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_append(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_create_list(lisp_val_t evaluated_args, lisp_val_t env);
@@ -799,6 +804,59 @@ static void test_transpile_fixture_typep_instancep(void) {
            "instancep: typepへの委譲がそのまま成り立つ");
 }
 
+static void test_transpile_fixture_generic_dispatch(void) {
+    lisp_val_t gf_name = os_make_symbol("ISIKI-TEST-GENERIC-DISPATCH");
+    lisp_val_t arg = os_make_fixnum(42);
+    lisp_val_t result = lisp_ll_transpile_fixture_generic_dispatch(os_make_cons(gf_name, os_make_cons(arg, nil)), 0);
+
+    assert(cc_car(result) == os_make_symbol("MATCHED"),
+           "%generic-call: specializer無指定の1メソッドがargで正しく呼ばれる(car)");
+    assert(cc_cdr(result) == arg,
+           "%generic-call: specializer無指定の1メソッドがargで正しく呼ばれる(cdr)");
+}
+
+static void test_transpile_fixture_generic_dispatch_order(void) {
+    lisp_val_t gf_name = os_make_symbol("ISIKI-TEST-GENERIC-DISPATCH-ORDER");
+    lisp_val_t arg = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+
+    lisp_val_t result = lisp_ll_transpile_fixture_generic_dispatch_order(os_make_cons(gf_name, os_make_cons(arg, nil)), 0);
+
+    assert(result == os_make_symbol("SPECIFIC"),
+           "%order-methods: <cons>指定のメソッドがspecializer無指定のメソッドより特定的として先に選ばれる");
+}
+
+static void test_transpile_fixture_call_next_method(void) {
+    lisp_val_t gf_name = os_make_symbol("ISIKI-TEST-CALL-NEXT-METHOD");
+    lisp_val_t arg = os_make_cons(os_make_fixnum(3), os_make_fixnum(4));
+
+    lisp_val_t result = lisp_ll_transpile_fixture_call_next_method(os_make_cons(gf_name, os_make_cons(arg, nil)), 0);
+
+    assert(cc_car(result) == os_make_symbol("GENERAL"),
+           "call-next-method: 特定的なメソッドから次の(汎用)メソッドへ正しく処理が引き渡される(car)");
+    assert(cc_cdr(result) == arg,
+           "call-next-method: 特定的なメソッドから次の(汎用)メソッドへ正しく処理が引き渡される(cdr)");
+}
+
+static void test_transpile_fixture_generic_no_applicable_method(void) {
+    /* このC側テスト環境はinit.lispをロードしないため、%invoke-method-chainの
+       「no applicable method」分岐が%%funcall-by-name経由で呼ぶerrorは未定義
+       (os_get_functionがnilを返す)。os_signal_conditionと同じ規約で
+       g_sym_eval_errorへ安全にフォールバックすることを確認する */
+    lisp_val_t gf_name = os_make_symbol("ISIKI-TEST-GENERIC-NO-APPLICABLE-METHOD");
+    lisp_val_t arg = os_make_fixnum(1);
+
+    assert(lisp_ll_transpile_fixture_generic_no_applicable_method(os_make_cons(gf_name, os_make_cons(arg, nil)), 0) == g_sym_eval_error,
+           "%invoke-method-chain: 適用可能なメソッドが無い場合、未定義のerrorを%%funcall-by-name経由で呼びg_sym_eval_errorへフォールバックする");
+}
+
+static void test_transpile_fixture_call_next_method_no_next(void) {
+    /* アクティブなメソッド呼び出しフレームが無い状態でcall-next-methodを直接呼ぶ。
+       「no next method」分岐も同じく%%funcall-by-name経由でerror(未定義)を呼び、
+       g_sym_eval_errorへフォールバックする */
+    assert(lisp_ll_transpile_fixture_call_next_method_no_next(nil, 0) == g_sym_eval_error,
+           "call-next-method: 次のメソッドが無い場合、未定義のerrorを%%funcall-by-name経由で呼びg_sym_eval_errorへフォールバックする");
+}
+
 static void test_list(void) {
     lisp_val_t a = os_make_fixnum(1);
     lisp_val_t b = os_make_fixnum(2);
@@ -1083,6 +1141,11 @@ int main(void) {
     test_transpile_fixture_class_of_builtin();
     test_transpile_fixture_class_of_instance();
     test_transpile_fixture_typep_instancep();
+    test_transpile_fixture_generic_dispatch();
+    test_transpile_fixture_generic_dispatch_order();
+    test_transpile_fixture_call_next_method();
+    test_transpile_fixture_generic_no_applicable_method();
+    test_transpile_fixture_call_next_method_no_next();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

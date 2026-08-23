@@ -1732,6 +1732,21 @@ lisp_val_t primitive_class_instance_p(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数%%FUNCALL-BY-NAME。symをglobal_environmentから関数として名前解決し、
+ * restを評価済み引数リストとしてos_apply_functionへ渡す。AOTトランスパイル済み
+ * コードから、まだAOTコンパイルされていない(init.lisp上にインタプリタ専用関数として
+ * 残っている)関数を正しい実行時セマンティクスのまま呼び出すために使う(M12 #27)。
+ * symの解決には呼び出し時のenvではなく必ずglobal_environmentを使う(呼び出し元が
+ * AOTがリフトしたクロージャの場合、そのenvは捕捉した自由変数のみを持ち親がnilの
+ * 孤立した環境になり得るため)。
+ * @param args (sym . rest) 評価済みの引数リスト。symは呼び出したい関数名のシンボル、
+ *             restはsymへ渡す評価済み引数のリスト
+ * @param env rest内の関数呼び出しに使う環境(sym解決には使わない)
+ * @return symの呼び出し結果。symがglobal_environment上で未定義の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_funcall_by_name(lisp_val_t args, lisp_val_t env);
+
+/**
  * nバイト(8byte境界に整列)をLispヒープからアロケータ経由で確保する、os_alloc_bytesの公開版。
  * stream_lisp.cがos_stream_tをLispヒープ上に確保するために使う。
  * @param n 確保するバイト数

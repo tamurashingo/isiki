@@ -129,7 +129,15 @@
     (%%class-instance-p . "primitive_class_instance_p")
     ;; M12(#27): typepがclass-designatorがクラスオブジェクトそのものかどうかを
     ;; 判定するのに使う
-    (%%classp . "primitive_classp")))
+    (%%classp . "primitive_classp")
+    ;; M12 Phase5(#27): %invoke-method-chain/call-next-methodが「no applicable
+    ;; method」「no next method」を報告するのに使う。両者はerrorを呼びたいが、
+    ;; errorはPhase9で移動予定でまだAOT側から名前解決できない(call-target-c-name
+    ;; には*known-function-names*/*primitive-c-names*どちらにも載らない呼び出しは
+    ;; 未対応エラーになる、フォールバック無し)。%%funcall-by-nameはos_get_function+
+    ;; os_apply_functionで対象関数を実行時に名前解決して呼ぶため、Phaseの前後関係に
+    ;; 関係なくinit.lisp常駐の関数を正しいセマンティクスのまま呼べる
+    (%%funcall-by-name . "primitive_funcall_by_name")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while

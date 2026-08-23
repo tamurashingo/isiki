@@ -468,3 +468,47 @@
   ;; M12 Phase 3(#27): instancepがtypepへ委譲する既知の簡略化のまま正しく
   ;; 動作することを確認する
   (instancep instance class))
+
+(defun %%transpile-fixture-generic-dispatch (gf-name arg)
+  ;; M12 Phase 5(#27): specializer無指定(nil)の1メソッドだけを登録した最小構成で、
+  ;; %register-method→%find-generic-methods→%applicable-methods→%order-methods→
+  ;; %invoke-method-chain→%generic-callの一連が正しく動くことを確認する
+  (progn
+    (%register-method gf-name (list nil) (lambda (x) (cons 'matched x)))
+    (%generic-call gf-name (list arg))))
+
+(defun %%transpile-fixture-generic-dispatch-order (gf-name arg)
+  ;; M12 Phase 5(#27): specializer無指定の汎用メソッドと、<cons>を指定した
+  ;; より特定的なメソッドの両方を登録し、argがconsの場合に%order-methods経由で
+  ;; 特定的な方が先に選ばれることを確認する(%more-specific-p/
+  ;; %insert-method-by-specificityの検証)
+  (let ((specific-class (%register-builtin-class '<cons> nil)))
+    (progn
+      (%register-method gf-name (list nil) (lambda (x) 'general))
+      (%register-method gf-name (list specific-class) (lambda (x) 'specific))
+      (%generic-call gf-name (list arg)))))
+
+(defun %%transpile-fixture-call-next-method (gf-name arg)
+  ;; M12 Phase 5(#27): 特定的なメソッドの中でnext-method-p/call-next-methodを
+  ;; 呼び、フレームスタック(*next-methods*)経由で汎用メソッドへ正しく処理が
+  ;; 引き渡されることを確認する
+  (let ((specific-class (%register-builtin-class '<cons> nil)))
+    (progn
+      (%register-method gf-name (list nil) (lambda (x) (cons 'general x)))
+      (%register-method gf-name (list specific-class)
+        (lambda (x) (if (next-method-p) (call-next-method) 'no-next)))
+      (%generic-call gf-name (list arg)))))
+
+(defun %%transpile-fixture-generic-no-applicable-method (gf-name arg)
+  ;; M12 Phase 5(#27): 未登録のgf-nameに対する%generic-callが%invoke-method-chainの
+  ;; 「no applicable method」分岐に到達し、%%funcall-by-name経由でerrorを呼ぶことを
+  ;; 確認する。このC側テスト環境はinit.lispをロードしないためerrorは未定義であり、
+  ;; %%funcall-by-nameはos_signal_conditionと同じ「未定義関数はg_sym_eval_errorで
+  ;; フォールバック」規約に従って安全にg_sym_eval_errorを返す
+  (%generic-call gf-name (list arg)))
+
+(defun %%transpile-fixture-call-next-method-no-next ()
+  ;; M12 Phase 5(#27): アクティブなメソッド呼び出しフレームが無い状態で
+  ;; call-next-methodを直接呼び、「no next method」分岐が%%funcall-by-name経由で
+  ;; 安全にg_sym_eval_errorへフォールバックすることを確認する
+  (call-next-method))

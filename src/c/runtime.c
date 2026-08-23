@@ -1065,6 +1065,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%INSTANCE-SLOTS"), os_make_native_function((lisp_addr_t)(void *)primitive_instance_slots), global_environment);
         os_set_function(os_make_symbol("%%CLASS-INSTANCE-P"), os_make_native_function((lisp_addr_t)(void *)primitive_class_instance_p), global_environment);
         os_set_function(os_make_symbol("%%SET-DYNAMIC"), os_make_native_function((lisp_addr_t)(void *)primitive_set_dynamic), global_environment);
+        os_set_function(os_make_symbol("%%FUNCALL-BY-NAME"), os_make_native_function((lisp_addr_t)(void *)primitive_funcall_by_name), global_environment);
     }
 }
 
@@ -5336,6 +5337,33 @@ lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     lisp_val_t val = cc_car(cc_cdr(args));
     return os_set_dynamic(name, val);
+}
+
+/**
+ * 組み込み関数%%FUNCALL-BY-NAME。symをglobal_environmentから関数として名前解決し、
+ * restを評価済み引数リストとしてos_apply_functionへ渡す。AOTトランスパイル済みコード
+ * から、まだAOTコンパイルされていない(init.lisp上にインタプリタ専用関数として残って
+ * いる)関数を正しい実行時セマンティクスのまま呼び出すために使う(M12 #27、
+ * %invoke-method-chain等からerrorを呼ぶ用途)。os_signal_condition(既存)と同じ
+ * 「os_get_function+os_apply_function」パターンを、対象関数名を問わない汎用形に
+ * したもの。symの解決には呼び出し時のenvではなく必ずglobal_environmentを使う
+ * (呼び出し元がAOTがリフトしたクロージャの場合、そのenvは捕捉した自由変数のみを
+ * 持ち親がnilの孤立した環境になり得るため、そこからerrorのような常にトップレベルに
+ * 定義される関数を辿れない——本primitiveはトップレベル関数名の解決専用であり、
+ * レキシカルスコープの探索を必要としない)
+ * @param args (sym . rest) 評価済みの引数リスト。symは呼び出したい関数名のシンボル、
+ *             restはsymへ渡す評価済み引数のリスト
+ * @param env rest内の関数呼び出しに使う環境(sym解決には使わない)
+ * @return symの呼び出し結果。symがglobal_environment上で未定義の場合はg_sym_eval_error
+ */
+lisp_val_t primitive_funcall_by_name(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t sym = cc_car(args);
+    lisp_val_t rest = cc_cdr(args);
+    lisp_val_t fn = os_get_function(sym, global_environment);
+    if (fn == nil) {
+        return g_sym_eval_error;
+    }
+    return os_apply_function(fn, rest, env);
 }
 
 

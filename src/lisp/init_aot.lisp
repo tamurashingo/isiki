@@ -413,3 +413,144 @@
 ;; クラスオブジェクトも受け付ける、緩い実装)にそのまま委譲する既知の簡略化とする。
 (defun instancep (instance class)
   (typep instance class))
+
+;;; --- 総称関数ディスパッチ機構(M12 Phase 5, #27) ---
+;;;
+;;; init.lispからの移動。*generic-methods*/*next-methods*のdefdynamicフォーム
+;;; 自体、およびdefgeneric/defmethodマクロとそのマクロ展開時専用ヘルパ
+;;; (%first-param-specializer/%first-param-var/%lambda-list-specializers/
+;;; %method-plain-params/%specializer-forms)は、Phase4のexpand-class同様、
+;;; 展開結果がinit_aot.lisp中の静的テキストとして現れず、defmethod/defgeneric
+;;; 呼び出し自体もmainがdefun以外を無視するためAOTから一切見えない
+;;; (defclassの%plist-get等と同じ「マクロ展開時専用ヘルパ」パターン)。よって
+;;; init.lisp常駐のまま変更しない。
+;;;
+;;; %invoke-method-chainとcall-next-methodは内部不変条件違反時にerrorを呼ぶが、
+;;; errorはPhase9で移動予定でまだAOTから直接呼べない(call-target-c-nameは
+;;; *known-function-names*/*primitive-c-names*どちらにも載らない呼び出しを
+;;; フォールバック無しでエラーにする)。%%funcall-by-name(新規Cプリミティブ、
+;;; os_get_function+os_apply_functionで対象関数を実行時に名前解決して呼ぶ)
+;;;経由でerrorを呼ぶことで、Phaseの前後関係に関係なくerrorの実際の
+;;; signal-condition経由の挙動を完全に保ったまま解決する。
+
+(defun %find-generic-methods (name)
+  (cdr (assoc name (dynamic *generic-methods*))))
+
+;; specializersのリストが位置ごとに等しいかどうか。各要素はnil同士も含めて
+;; eqで比較してよい(クラスオブジェクトはdefclassごとに1つの同一オブジェクトと
+;; して扱う)
+(defun %specializers-equal-p (s1 s2)
+  (if (null s1)
+      (null s2)
+      (if (null s2)
+          nil
+          (if (eq (car s1) (car s2))
+              (%specializers-equal-p (cdr s1) (cdr s2))
+              nil))))
+
+(defun %remove-method-with-specializer (specializers methods)
+  (if (null methods)
+      nil
+      (if (%specializers-equal-p specializers (car (car methods)))
+          (%remove-method-with-specializer specializers (cdr methods))
+          (cons (car methods) (%remove-method-with-specializer specializers (cdr methods))))))
+
+;; 同じgf-name・同じspecializersの既存メソッドを取り除いた上で新しいメソッドを
+;; 先頭に積んで登録する(defclass/%register-classと同じ「再定義は前に積んでshadow」
+;; パターン)
+(defun %register-method (name specializers fn)
+  (let* ((existing (%find-generic-methods name))
+         (updated (cons (cons specializers fn) (%remove-method-with-specializer specializers existing))))
+    (%%set-dynamic '*generic-methods* (cons (cons name updated) (dynamic *generic-methods*)))
+    name))
+
+;; specializerがnil(無指定)のメソッドは常に適用可能。それ以外はargのクラス
+;; (class-of、組み込み型も含む)がspecializerのサブクラス(自身含む)である場合のみ
+;; 適用可能
+(defun %method-applicable-p (specializer arg)
+  (if (null specializer)
+      t
+      (subclassp (class-of arg) specializer)))
+
+;; specializersの各要素と、対応する位置のargが全て%method-applicable-pであるか
+;; (ANDを取る。specializersがargsより短い場合、残りのargは無指定として扱われる)
+(defun %specializers-applicable-p (specializers args)
+  (if (null specializers)
+      t
+      (if (%method-applicable-p (car specializers) (car args))
+          (%specializers-applicable-p (cdr specializers) (cdr args))
+          nil)))
+
+(defun %filter-applicable-methods (methods args)
+  (if (null methods)
+      nil
+      (if (%specializers-applicable-p (car (car methods)) args)
+          (cons (car methods) (%filter-applicable-methods (cdr methods) args))
+          (%filter-applicable-methods (cdr methods) args))))
+
+(defun %applicable-methods (name args)
+  (%filter-applicable-methods (%find-generic-methods name) args))
+
+;; specializers1がspecializers2より特定的かどうか。先頭の位置から順に見て、
+;; その位置のspecializerが完全に一致(eq、両方nilの場合も含む)する場合のみ
+;; 次の位置へ進み、一致しない場合はその位置で即決する(specializerがnilの
+;; 位置は常に最も非特定的)。CPLは計算しないため、一致しない位置で両方が
+;; 非nilかつsubclassp関係を持たない場合はnil(決着つかず)を返す
+(defun %specializers-more-specific-p (s1 s2)
+  (if (null s1)
+      nil
+      (if (eq (car s1) (car s2))
+          (%specializers-more-specific-p (cdr s1) (cdr s2))
+          (if (null (car s2))
+              t
+              (if (null (car s1))
+                  nil
+                  (subclassp (car s1) (car s2)))))))
+
+;; m1がm2より特定的かどうか
+(defun %more-specific-p (m1 m2)
+  (%specializers-more-specific-p (car m1) (car m2)))
+
+(defun %insert-method-by-specificity (m sorted)
+  (if (null sorted)
+      (list m)
+      (if (%more-specific-p m (car sorted))
+          (cons m sorted)
+          (cons (car sorted) (%insert-method-by-specificity m (cdr sorted))))))
+
+;; 最も特定的なメソッドが先頭になるよう並び替える(挿入ソート)
+(defun %order-methods (methods)
+  (if (null methods)
+      nil
+      (%insert-method-by-specificity (car methods) (%order-methods (cdr methods)))))
+
+;; orderedの先頭メソッドをargsで呼び出す。呼び出し中はorderedの残り(cdr)と
+;; argsを新しいフレームとして*next-methods*に積み、unwind-protectで必ず復元する。
+;; orderedが空(=適用可能なメソッドが無い/次のメソッドが無い)ならエラーとする
+;; (仕様: 適用可能なメソッドが無い場合、call-next-methodで次が無い場合、いずれもerror)。
+;; errorはPhase9移動までまだAOTから直接呼べないため%%funcall-by-name経由で呼ぶ
+(defun %invoke-method-chain (ordered args)
+  (if (null ordered)
+      (%%funcall-by-name 'error "no applicable method")
+      (let ((saved (dynamic *next-methods*)))
+        (unwind-protect
+            (progn (%%set-dynamic '*next-methods* (cons (cons (cdr ordered) args) saved))
+                   (%%apply (cdr (car ordered)) args))
+          (%%set-dynamic '*next-methods* saved)))))
+
+(defun %generic-call (name args)
+  (%invoke-method-chain (%order-methods (%applicable-methods name args)) args))
+
+;; (next-method-p) → boolean: 現在のメソッドの内側でcall-next-methodが呼べるか
+(defun next-method-p ()
+  (if (null (dynamic *next-methods*))
+      nil
+      (if (car (car (dynamic *next-methods*))) t nil)))
+
+;; (call-next-method) → <object>: 元の呼び出し引数のまま次のメソッドを呼ぶ。
+;; errorはPhase9移動までまだAOTから直接呼べないため%%funcall-by-name経由で呼ぶ
+(defun call-next-method ()
+  (let ((frame (car (dynamic *next-methods*))))
+    (if (null frame)
+        (%%funcall-by-name 'error "call-next-method: no next method")
+        (%invoke-method-chain (car frame) (cdr frame)))))
