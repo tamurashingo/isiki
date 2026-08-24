@@ -186,6 +186,12 @@ void os_bootstrap();
  */
 double os_heap_used_ratio(void);
 
+/** 組み込み関数%%HEAP-TOTAL-BYTES。From空間(ヒープ全体の半分)の総バイト数を返す */
+lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env);
+
+/** 組み込み関数%%HEAP-USED-BYTES。From空間の割り当てポインタの進んだバイト数を返す */
+lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env);
+
 /**
  * Cheney方式のコピーGCを1回実行する。global_environment・g_dynamic_bindings・
  * g_symbol_table・キャッシュ済みg_sym_*・各プロセスのenv・全プロセスのshadow stack
@@ -220,6 +226,12 @@ UINT64 os_gc_collect_count(void);
  * @return g_imm_bumpがg_imm_spaceから切り出した延べページ数
  */
 UINT64 os_imm_pages_used_for_test(void);
+
+/** 組み込み関数%%IMM-SPACE-TOTAL-BYTES。Immobilized Spaceの総バイト数を返す */
+lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env);
+
+/** 組み込み関数%%IMM-SPACE-USED-BYTES。Immobilized Spaceの使用バイト数を返す */
+lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env);
 
 /**
  * Immobilized Spaceから4KBページを1枚確保する。空間が枯渇した場合は診断メッセージを

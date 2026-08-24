@@ -39,6 +39,12 @@
    transpile_fixture.lispと違い、ここでdefunされた関数はos_register_aot_init_functions
    経由でglobal_environmentへ登録され、init.lisp側からもインタプリタで定義された
    関数と同じシンボル名で呼び出せる")
+(defparameter *utility-lisp-path* "src/lisp/utility.lisp"
+  "init_aot.lispと同じくAOTトランスパイル対象だが、init.lispからの移動ではなく
+   新規に追加するアプリケーション関数(roomコマンド等)を置くファイル。
+   init_aot.lispのdefunと同じ制約(パラメータはシンボルのみ、本体は単一の
+   トップレベル式)に従う必要がある。init_aot.lispのdefunと合わせて同じ
+   os_register_aot_init_functions経由でglobal_environmentへ登録される")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
 
 (defparameter *known-function-names* nil
@@ -155,7 +161,19 @@
     ;; 未対応エラーになる、フォールバック無し)。%%funcall-by-nameはos_get_function+
     ;; os_apply_functionで対象関数を実行時に名前解決して呼ぶため、Phaseの前後関係に
     ;; 関係なくinit.lisp常駐の関数を正しいセマンティクスのまま呼べる
-    (%%funcall-by-name . "primitive_funcall_by_name")))
+    (%%funcall-by-name . "primitive_funcall_by_name")
+    ;; room(utility.lisp)用: 実装済みだがこれまでAOT側から呼ばれていなかった
+    ;; ランタイムプリミティブと、room自身が使う4つのバイト数アクセサ
+    (create-string . "primitive_create_string")
+    (string-elt . "primitive_string_elt")
+    (string-append . "primitive_string_append")
+    (div . "primitive_div")
+    (mod . "primitive_mod")
+    (open-output-stream . "cc_open_output_stream")
+    (%%heap-total-bytes . "primitive_heap_total_bytes")
+    (%%heap-used-bytes . "primitive_heap_used_bytes")
+    (%%imm-space-total-bytes . "primitive_imm_space_total_bytes")
+    (%%imm-space-used-bytes . "primitive_imm_space_used_bytes")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
@@ -1378,11 +1396,13 @@
                                          (read-all-forms *runtime-lisp-path*)))
          (aot-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
                                      (read-all-forms *aot-lisp-path*)))
-         (defuns (append fixture-defuns aot-defuns))
+         (utility-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
+                                     (read-all-forms *utility-lisp-path*)))
+         (defuns (append fixture-defuns aot-defuns utility-defuns))
          (*known-function-names* (mapcar #'second defuns))
          (prototypes (mapcar #'transpile-prototype defuns))
          (bodies (mapcar #'transpile-defun defuns))
-         (registration (emit-aot-registration aot-defuns)))
+         (registration (emit-aot-registration (append aot-defuns utility-defuns))))
     (with-open-file (out *output-c-path* :direction :output :if-exists :supersede)
       ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
       ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。

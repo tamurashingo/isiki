@@ -350,6 +350,27 @@ double os_heap_used_ratio(void) {
     return (double)used / (double)total;
 }
 
+/**
+ * 組み込み関数%%HEAP-TOTAL-BYTES。From空間(ヒープ全体の半分)の総バイト数を返す。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return From空間の総バイト数のfixnum
+ */
+lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env) {
+    return os_make_fixnum((UINT64)(g_from_end - g_from_start));
+}
+
+/**
+ * 組み込み関数%%HEAP-USED-BYTES。From空間の割り当てポインタがどこまで進んでいるかを
+ * バイト数で返す。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return From空間の使用バイト数のfixnum
+ */
+lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env) {
+    return os_make_fixnum((UINT64)(g_from_ptr - g_from_start));
+}
+
 /** os_gc_collectが呼ばれた延べ回数。テストが「計算中に実際にGCが発火したか」を確認するために使う */
 static UINT64 g_gc_collect_count = 0;
 
@@ -387,6 +408,28 @@ static void *g_imm_free_list = 0;
  * テストのためのアクセサ(os_gc_collect_countと同じ、テスト専用の内部状態公開) */
 UINT64 os_imm_pages_used_for_test(void) {
     return (UINT64)(g_imm_bump - g_imm_space) / IMM_PAGE_SIZE;
+}
+
+/**
+ * 組み込み関数%%IMM-SPACE-TOTAL-BYTES。Immobilized Spaceの総バイト数を返す。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return Immobilized Spaceの総バイト数のfixnum
+ */
+lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env) {
+    return os_make_fixnum((UINT64)IMM_SPACE_SIZE);
+}
+
+/**
+ * 組み込み関数%%IMM-SPACE-USED-BYTES。Immobilized Spaceのうちg_imm_bumpが
+ * これまでに切り出した使用バイト数を返す(フリーリストに返却済みのページも
+ * 「切り出し済み」として使用量に含まれる、os_imm_pages_used_for_testと同じ数え方)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return Immobilized Spaceの使用バイト数のfixnum
+ */
+lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env) {
+    return os_make_fixnum((UINT64)(g_imm_bump - g_imm_space));
 }
 
 void *os_imm_page_alloc(void) {
@@ -1014,6 +1057,10 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%GLOBAL-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_global_environment), global_environment);
         os_set_function(os_make_symbol("%%SET-CURRENT-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_set_current_environment), global_environment);
         os_set_function(os_make_symbol("%%EVAL-IN-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_eval_in_environment), global_environment);
+        os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
+        os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
+        os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
+        os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
         os_set_function(os_make_symbol("BASIC-ARRAY-P"), os_make_native_function((lisp_addr_t)(void *)primitive_basic_array_p), global_environment);
         // basic-array*-pとgeneral-array*-pは本実装では外延が一致するため実体を共用する
