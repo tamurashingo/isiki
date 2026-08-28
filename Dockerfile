@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     gcc \
     gcc-mingw-w64 \
     make \
+    dosfstools \
     && rm -rf /var/list/apt/lists/*
 
 RUN (getent group ${USER_GID} || groupadd -g ${USER_GID} builder) > /dev/null \

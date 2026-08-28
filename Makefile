@@ -255,6 +255,26 @@ $(IDE_DISK_IMG): | $(BUILD_TMPDIR)
 	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
 	printf '%s' '$(IDE_TEST_MAGIC)' | dd of=$@ conv=notrunc bs=1 seek=0 2>/dev/null
 
+# FAT16読み書き実装(documents/fs.md FAT16-M0(2))用の使い捨てテストイメージ。
+# mkfs.vfat -F 16でFAT16フォーマットした後、loopマウントして既知内容のテスト
+# ファイル(空のHELLO.TXT、"Hello from FAT16!"を書いたTEST.LSP)を配置する。
+# loopマウントはCAP_SYS_ADMIN相当の権限を要するため、このルールのみ
+# --privilegedでdocker run する(他のビルド用ルールは
+# --user "$(id -u):$(id -g)"で非rootのまま)。
+FAT16_DISK_IMG = $(BUILD_TMPDIR)/fat16_test.img
+FAT16_TEST_STRING = Hello from FAT16!
+
+$(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			mkfs.vfat -F 16 $@; \
+			mkdir -p /mnt/fat16_test; \
+			mount -o loop $@ /mnt/fat16_test; \
+			touch /mnt/fat16_test/HELLO.TXT; \
+			printf "%s\n" "$(FAT16_TEST_STRING)" > /mnt/fat16_test/TEST.LSP; \
+			umount /mnt/fat16_test'
+
 run: $(IDE_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
