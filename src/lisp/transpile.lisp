@@ -179,7 +179,11 @@
     (%%logand . "cc_logand")
     (%%logior . "cc_logior")
     (%%logxor . "cc_logxor")
-    (%%ash . "cc_ash")))
+    (%%ash . "cc_ash")
+    ;; FAT16-M0(1)(documents/fs.md): char-code/code-charが使う。文字とFIXNUMの
+    ;; タグ付け替えのみを行うsubprimitive.cの関数
+    (%%char-code . "cc_char_code")
+    (%%code-char . "cc_code_char")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while

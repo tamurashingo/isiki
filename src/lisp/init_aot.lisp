@@ -663,6 +663,17 @@
 ;; (ash a count) : aをcount分シフトする。countが正なら左シフト、負なら右シフト。
 (defun ash (a count) (%%ash a count))
 
+;;; --- 文字コード変換 (FAT16-M0(1), documents/fs.md) ---
+;;;
+;;; %%CHAR-CODE/%%CODE-CHARはsubprimitive.cのCレベル関数で、文字とFIXNUMが
+;;; 同じ即値表現(下位3bitのタグのみ異なる)であることを利用したタグの付け替え。
+;;; FAT16のディレクトリエントリのバイト列(FIXNUMのリスト)から文字列を組み立てる
+;;; 用途。
+
+(defun char-code (c) (%%char-code c))
+
+(defun code-char (n) (%%code-char n))
+
 ;;; --- condition accessors (§29.3, M12 Phase 11 #27) ---
 ;;;
 ;;; init.lispからの移動。各アクセサは対象クラスでなければ<domain-error>をsignalする

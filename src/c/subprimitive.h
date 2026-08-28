@@ -83,7 +83,25 @@ lisp_val_t cc_logxor(lisp_val_t args, lisp_val_t env);
  */
 lisp_val_t cc_ash(lisp_val_t args, lisp_val_t env);
 
-/** %%IN-8/%%OUT-8/%%PEEK/%%POKE/%%IN-16/%%OUT-16/%%LOGAND/%%LOGIOR/%%LOGXOR/%%ASHをglobal_environmentに関数として登録する */
+/**
+ * 文字コード変換の組み込み関数%%CHAR-CODE。文字をタグ(TAG_CHAR)を外した文字コードの
+ * FIXNUMにする(文字はFIXNUMと同じ即値表現で下位3bitのタグのみ異なるため、タグの
+ * 付け替えだけで変換できる)。
+ * @param args (char) charはCHARACTER
+ * @param env 呼び出し時の環境(未使用)
+ * @return 文字コードのFIXNUM
+ */
+lisp_val_t cc_char_code(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 文字コード変換の組み込み関数%%CODE-CHAR。文字コードのFIXNUMをCHARACTER(TAG_CHAR)にする。
+ * @param args (code) codeはFIXNUM(文字コード)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 対応するCHARACTER
+ */
+lisp_val_t cc_code_char(lisp_val_t args, lisp_val_t env);
+
+/** %%IN-8/%%OUT-8/%%PEEK/%%POKE/%%IN-16/%%OUT-16/%%LOGAND/%%LOGIOR/%%LOGXOR/%%ASH/%%CHAR-CODE/%%CODE-CHARをglobal_environmentに関数として登録する */
 void os_register_subprimitives(void);
 
 #endif /* _SUBPRIMITIVE_H_ */
