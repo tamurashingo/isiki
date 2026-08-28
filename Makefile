@@ -272,12 +272,15 @@ $(IDE_DISK_IMG): | $(BUILD_TMPDIR)
 # --user "$(id -u):$(id -g)"で非rootのまま)。
 #
 # umount後、ホスト側でFATテーブル(1本目、reserved-sectors=4なのでLBA4=バイト
-# オフセット2048から開始)にクラスタ10→11→14→終端という非連続なチェインを直接
-# dd/printfで書き込む(FAT16-M3のfat16-cluster-chain確認用)。クラスタ10/11/14は
-# mkfs.vfat後は未使用(0x0000)で、TEST.LSP/BIG.TXTが使うクラスタとは重複しない
-# (xxd -g1で目視確認済み)ため、実ファイルの内容を破壊せずに合成チェインを作れる。
-# オフセットはreserved-sectors*bytes-per-sector(2048) + cluster-no*2で計算した
-# 固定値(2068/2070/2076)、値はLE u16(11=0x0B00/14=0x0E00/終端=0xFFFF)。printfの
+# オフセット2048から開始)にクラスタ40→41→44→終端という非連続なチェインを直接
+# dd/printfで書き込む(FAT16-M3のfat16-cluster-chain確認用)。クラスタ40/41/44は
+# mkfs.vfat後は未使用(0x0000)で、TEST.LSP/BIG.TXT/WRITE1.TXT/SUBDIR以下が使う
+# クラスタ(概ね3〜9番台、xxd -g1で目視確認済み)とは十分な余裕を持って重複しない
+# ため、実ファイル/ディレクトリの内容を破壊せずに合成チェインを作れる
+# (FAT16-M7aでSUBDIR以下を追加した際、元は10/11/14を使っていたが実クラスタ使用と
+# 衝突したため、余裕を持って40/41/44へ変更した)。オフセットは
+# reserved-sectors*bytes-per-sector(2048) + cluster-no*2で計算した固定値
+# (2128/2130/2136)、値はLE u16(41=0x2900/44=0x2C00/終端=0xFFFF)。printfの
 # エスケープは\xHH(16進)ではなく\0NNN(8進、POSIX printfが規定する形式)を使う。
 # \xHHはbash等の拡張でしかなく、GitHub Actions runner(Ubuntu)のmakeレシピが使う
 # /bin/sh=dashのprintf組み込みでは解釈されず、リテラル文字列"\x0b\x00"がそのまま
@@ -298,12 +301,16 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 			printf "%s\n" "$(FAT16_TEST_STRING)" > /mnt/fat16_test/TEST.LSP; \
 			printf "0123456789%.0s" {1..250} > /mnt/fat16_test/BIG.TXT; \
 			printf "A%.0s" {1..2048} > /mnt/fat16_test/WRITE1.TXT; \
+			mkdir /mnt/fat16_test/SUBDIR; \
+			printf "nested file content" > /mnt/fat16_test/SUBDIR/NESTED.TXT; \
+			mkdir /mnt/fat16_test/SUBDIR/DEEPER; \
+			touch /mnt/fat16_test/SUBDIR/DEEPER/DEEP.TXT; \
 			printf "will be deleted" > /mnt/fat16_test/DELETED.TXT; \
 			rm /mnt/fat16_test/DELETED.TXT; \
 			umount /mnt/fat16_test'
-	printf '\013\000' | dd of=$@ bs=1 seek=2068 count=2 conv=notrunc 2>/dev/null
-	printf '\016\000' | dd of=$@ bs=1 seek=2070 count=2 conv=notrunc 2>/dev/null
-	printf '\377\377' | dd of=$@ bs=1 seek=2076 count=2 conv=notrunc 2>/dev/null
+	printf '\051\000' | dd of=$@ bs=1 seek=2128 count=2 conv=notrunc 2>/dev/null
+	printf '\054\000' | dd of=$@ bs=1 seek=2130 count=2 conv=notrunc 2>/dev/null
+	printf '\377\377' | dd of=$@ bs=1 seek=2136 count=2 conv=notrunc 2>/dev/null
 
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
 # はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は

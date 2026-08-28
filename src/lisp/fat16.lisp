@@ -126,37 +126,11 @@
               ':start-cluster (%fat16-u16 bytes (+ offset 26))
               ':size (%fat16-u32 bytes (+ offset 28)))))))
 
-;; (%fat16-parse-sector-entries bytes entry-offset entries-remaining) : 1セクタ
-;; 分のディレクトリエントリ(entries-remaining個、通常16)を先頭から順にパースし、
-;; (entries . stopped)を返す。entriesは有効なdir-entryのリスト(削除済みは
-;; 除外済み)、stoppedは0x00終端に到達済みならt(この場合、呼び出し元は次の
-;; セクタへ進んではならない)。
-(defun %fat16-parse-sector-entries (bytes entry-offset entries-remaining)
-  (if (<= entries-remaining 0)
-      (cons nil nil)
-      (let ((parsed (%fat16-dir-entry-at bytes entry-offset)))
-        (if (eq parsed 'end)
-            (cons nil t)
-            (let ((rest (%fat16-parse-sector-entries bytes (+ entry-offset 32) (- entries-remaining 1))))
-              (cons (if (null parsed) (car rest) (cons parsed (car rest)))
-                    (cdr rest)))))))
-
-;; (%fat16-scan-root-dir device lba sectors-remaining) : lbaからsectors-remaining
-;; セクタ分のルートディレクトリを読み、有効なdir-entryのリストを返す。0x00終端に
-;; 到達した時点で残りのセクタは読まずに走査を終える。read-sectorが失敗した場合は
-;; それまでに集めたエントリは捨ててnilを返す(部分結果を返さない、既存のIDE層と
-;; 同じ「失敗時nil」の慣習)。
-(defun %fat16-scan-root-dir (device lba sectors-remaining)
-  (if (<= sectors-remaining 0)
-      nil
-      (let ((bytes (read-sector device lba)))
-        (if (null bytes)
-            nil
-            (let ((result (%fat16-parse-sector-entries bytes 0 16)))
-              (if (cdr result)
-                  (car result)
-                  (append (car result)
-                          (%fat16-scan-root-dir device (+ lba 1) (- sectors-remaining 1)))))))))
+;; セクタ単位のディレクトリエントリ走査本体(旧%fat16-parse-sector-entries/
+;; %fat16-scan-root-dir)はFAT16-M7aで%fat16-scan-dir-entries(このファイル末尾、
+;; サブディレクトリ対応の節)へ統合された。ルート専用の(lba, 残りセクタ数)引数を
+;; 「ディレクトリを構成するLBAのリスト」に一般化し、サブディレクトリ(クラスタ
+;; チェインでセクタ数が不定)でも同じ実装で安全に走査できるようにするため。
 
 ;; (%fat16-dir-entry-kind attr) : attrバイトのディレクトリ属性ビット(0x10)を見て
 ;; :fileまたは:dirを返す。
@@ -173,18 +147,18 @@
                   (slot-value (car entries) 'size))
             (%fat16-dir-entries-to-display-list (cdr entries)))))
 
-;; (fat16-read-dir device path) : ルートディレクトリ("/")のエントリ一覧を
-;; ("NAME" :file/:dir size)の形のリストで返す。pathは現状"/"固定でよく
-;; (サブディレクトリ対応はFAT16-M7、documents/fs.md)、引数として受け取るのみで
-;; 未使用。BPBが読めない場合はnil。
+;; (fat16-read-dir device path) : path("/"、または"/DOCS"のような多階層パス、
+;; FAT16-M7a)が指すディレクトリのエントリ一覧を("NAME" :file/:dir size)の形の
+;; リストで返す。パス解決の実体は%fat16-resolve-dir-lbas(このファイル末尾、
+;; FAT16-M7a節)。BPBが読めない・パスが解決できない場合はnil。
 (defun fat16-read-dir (device path)
   (let ((bpb (fat16-read-bpb device)))
     (if (null bpb)
         nil
-        (%fat16-dir-entries-to-display-list
-          (%fat16-scan-root-dir device
-                                 (fat16-root-dir-lba bpb)
-                                 (%fat16-root-dir-sector-count bpb))))))
+        (let ((lbas (%fat16-resolve-dir-lbas device bpb (%fat16-split-path path))))
+          (if (null lbas)
+              nil
+              (%fat16-dir-entries-to-display-list (%fat16-scan-dir-entries device lbas)))))))
 
 ;;; --- FAT16-M3: FATテーブルのクラスタチェイン追跡 ---
 
@@ -321,31 +295,34 @@
         (%fat16-reverse-iter rev-bytes)
         nil)))
 
-;; (fat16-read-file device path) : path("/NAME.EXT"形式、単一階層のみ)のファイル
-;; 本体をfixnum(0-255)のリストとして返す。read-sector/write-sectorと同じ
-;; バイト列表現(全体方針: FAT16層のバイト列操作はfixnumリストのまま行う、文字列化
-;; しない)。エントリが見つからない場合・クラスタ読み込みに失敗した場合はnil。
-;; 0byteファイル(size=0)はクラスタを辿らずそのままnil(=空リスト)を返す。
+;; (fat16-read-file device path) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"のような
+;; 多階層パス、FAT16-M7a)のファイル本体をfixnum(0-255)のリストとして返す。
+;; read-sector/write-sectorと同じバイト列表現(全体方針: FAT16層のバイト列操作は
+;; fixnumリストのまま行う、文字列化しない)。パスが解決できない・エントリが
+;; 見つからない場合・クラスタ読み込みに失敗した場合はnil。0byteファイル(size=0)
+;; はクラスタを辿らずそのままnil(=空リスト)を返す。パス解決の実体は
+;; %fat16-resolve-file(このファイル末尾、FAT16-M7a節)。
 (defun fat16-read-file (device path)
   (let ((bpb (fat16-read-bpb device)))
     (if (null bpb)
         nil
-        (let ((entry (%fat16-find-dir-entry
-                       (%fat16-scan-root-dir device
-                                              (fat16-root-dir-lba bpb)
-                                              (%fat16-root-dir-sector-count bpb))
-                       (%fat16-path-to-name path))))
-          (if (null entry)
+        (let ((resolved (%fat16-resolve-file device bpb path)))
+          (if (null resolved)
               nil
-              (let ((size (slot-value entry 'size)))
-                (if (= size 0)
+              (let ((entry (%fat16-find-dir-entry
+                             (%fat16-scan-dir-entries device (car resolved))
+                             (cdr resolved))))
+                (if (null entry)
                     nil
-                    (let ((bytes (%fat16-read-lba-list device
-                                   (%fat16-clusters-to-lbas bpb
-                                     (fat16-cluster-chain device bpb (slot-value entry 'start-cluster))))))
-                      (if (null bytes)
+                    (let ((size (slot-value entry 'size)))
+                      (if (= size 0)
                           nil
-                          (subseq bytes 0 size))))))))))
+                          (let ((bytes (%fat16-read-lba-list device
+                                         (%fat16-clusters-to-lbas bpb
+                                           (fat16-cluster-chain device bpb (slot-value entry 'start-cluster))))))
+                            (if (null bytes)
+                                nil
+                                (subseq bytes 0 size))))))))))))
 
 ;;; --- FAT16-M6a: 既存ファイルの同クラスタ数上書き ---
 
@@ -777,3 +754,113 @@
                                       (progn
                                         (%fat16-patch-bytes! slot-bytes slot-offset entry-bytes)
                                         (write-sector device slot-lba slot-bytes)))))))))))))))
+
+;;; --- FAT16-M7a: サブディレクトリ対応(読み込み・パス解決) ---
+;;
+;; ルートディレクトリは固定サイズ(セクタ数がbpbから一意に決まる)だが、
+;; サブディレクトリはクラスタチェインを持つ通常ファイルと同じ構造で、セクタ数が
+;; ディスク使用量に比例して増え得る。旧%fat16-scan-root-dir(セクタ数について
+;; Lisp再帰)は「ルートが小さい固定サイズだから安全」という前提の上に成り立って
+;; おり、この前提はサブディレクトリには通用しない(documents/fs.md、
+;; eval_no_tco_interpreter_stack_limit)。このため「ディレクトリ=セクタLBAの
+;; 平坦なリスト」という抽象に一般化し、走査の外側ループを常にwhileで書く。
+
+;; (%fat16-root-dir-lbas bpb) : ルートディレクトリを構成する全セクタのLBAリスト。
+(defun %fat16-root-dir-lbas (bpb)
+  (%fat16-lba-range (fat16-root-dir-lba bpb) (%fat16-root-dir-sector-count bpb)))
+
+;; (%fat16-subdir-lbas device bpb start-cluster) : start-clusterから始まるサブ
+;; ディレクトリを構成する全セクタのLBAリスト(クラスタチェインを辿って展開)。
+(defun %fat16-subdir-lbas (device bpb start-cluster)
+  (%fat16-clusters-to-lbas bpb (fat16-cluster-chain device bpb start-cluster)))
+
+;; (%fat16-scan-dir-entries device lbas) : lbas(ディレクトリを構成するセクタLBAの
+;; リスト、ルートの固定範囲でもサブディレクトリのクラスタチェイン展開でもよい)を
+;; 先頭からwhileで走査し、有効なdir-entryのリストを返す。0x00終端に到達した時点で
+;; 走査を止める。セクタ内(最大16エントリ)もwhileで走査し、有効エントリを
+;; consで逆順に積んでから最後に1回だけ%fat16-reverse-iterで正順化する
+;; (成長していく蓄積リストにappendで結合する実装は、セクタ数が多いサブ
+;; ディレクトリでコストが増えるため避ける)。read-sectorが失敗した場合はそれまでに
+;; 集めたエントリを捨ててnil(既存のIDE層と同じ「失敗時nil」の慣習)。
+(defun %fat16-scan-dir-entries (device lbas)
+  (let ((remaining-lbas lbas) (rev-entries nil) (stopped nil) (ok t))
+    (while (and ok remaining-lbas (not stopped))
+      (let ((bytes (read-sector device (car remaining-lbas))))
+        (if (null bytes)
+            (setq ok nil)
+            (progn
+              (let ((offset 0) (i 0))
+                (while (and (not stopped) (< i 16))
+                  (let ((parsed (%fat16-dir-entry-at bytes offset)))
+                    (if (eq parsed 'end)
+                        (setq stopped t)
+                        (progn
+                          (if (not (null parsed)) (setq rev-entries (cons parsed rev-entries)))
+                          (setq offset (+ offset 32))
+                          (setq i (+ i 1)))))))
+              (setq remaining-lbas (cdr remaining-lbas))))))
+    (if ok (%fat16-reverse-iter rev-entries) nil)))
+
+;; (%fat16-split-path path) : "/DOCS/SUB/README.TXT"のようなpathを"/"区切りで
+;; 非空要素のリスト("DOCS" "SUB" "README.TXT")に分解する。連続する"/"・先頭・
+;; 末尾の"/"は空要素として無視される。"/"のみのパスはnil(ルート自身)。パスの
+;; 深さは小さくデータサイズに比例しないため、whileで書くが再帰でも安全な範囲。
+(defun %fat16-split-path (path)
+  (let ((start 0) (len (length path)) (rev-parts nil))
+    (while (< start len)
+      (let* ((slash-pos (char-index #\/ path start))
+             (end (if slash-pos slash-pos len)))
+        (if (> end start)
+            (setq rev-parts (cons (subseq path start end) rev-parts)))
+        (setq start (+ end 1))))
+    (%fat16-reverse-iter rev-parts)))
+
+;; (%fat16-butlast list) : listから末尾の要素を除いた部分を返す。パス要素の
+;; リスト(パスの階層数、小さい)に対して使うためLisp再帰でよい(ファイル/ディスク
+;; サイズに比例しないためeval_no_tco_interpreter_stack_limitの対象外)。
+(defun %fat16-butlast (list)
+  (if (or (null list) (null (cdr list)))
+      nil
+      (cons (car list) (%fat16-butlast (cdr list)))))
+
+;; (%fat16-resolve-dir device bpb components) : componentsをルートから順に
+;; サブディレクトリとして辿り、(最終ディレクトリのLBAリスト . 最終ディレクトリの
+;; start-cluster)を返す。componentsがnilならルート自身((ルートLBAリスト . 0))。
+;; 途中のいずれかの段でエントリが見つからない・ディレクトリでない(属性0x10無し)
+;; 場合、または読み込み失敗の場合はnil。ルートの「start-cluster」は本来存在しない
+;; ため0を使う(サブディレクトリの".."がルートを指す場合の規約と同じ、FAT16-M7c
+;; で利用)。
+(defun %fat16-resolve-dir (device bpb components)
+  (let ((lbas (%fat16-root-dir-lbas bpb)) (cluster 0) (remaining components) (ok t))
+    (while (and ok remaining)
+      (let ((entries (%fat16-scan-dir-entries device lbas)))
+        (if (null entries)
+            (setq ok nil)
+            (let ((entry (%fat16-find-dir-entry entries (car remaining))))
+              (if (or (null entry) (= (logand (slot-value entry 'attr) #x10) 0))
+                  (setq ok nil)
+                  (progn
+                    (setq cluster (slot-value entry 'start-cluster))
+                    (setq lbas (%fat16-subdir-lbas device bpb cluster))
+                    (setq remaining (cdr remaining))))))))
+    (if ok (cons lbas cluster) nil)))
+
+;; (%fat16-resolve-dir-lbas device bpb components) : %fat16-resolve-dirの結果から
+;; LBAリストのみを取り出す薄いラッパー(fat16-read-dir用)。
+(defun %fat16-resolve-dir-lbas (device bpb components)
+  (let ((resolved (%fat16-resolve-dir device bpb components)))
+    (if (null resolved) nil (car resolved))))
+
+;; (%fat16-resolve-file device bpb path) : pathを分解し、最後の要素をファイル名
+;; として残し、それ以前を%fat16-resolve-dir-lbasでディレクトリとして解決する。
+;; 戻り値は(親ディレクトリのLBAリスト . ファイル名)。パスが"/"のみ(ファイル名が
+;; 無い)、または親ディレクトリの解決に失敗した場合はnil。fat16-read-file/
+;; fat16-write-file/fat16-create-fileが共通で使う。
+(defun %fat16-resolve-file (device bpb path)
+  (let ((components (%fat16-split-path path)))
+    (if (null components)
+        nil
+        (let ((lbas (%fat16-resolve-dir-lbas device bpb (%fat16-butlast components))))
+          (if (null lbas)
+              nil
+              (cons lbas (%fat16-last-elt components)))))))
