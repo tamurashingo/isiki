@@ -58,10 +58,38 @@ lisp_val_t cc_poke(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(value);
 }
 
-/** %%IN-8/%%OUT-8/%%PEEK/%%POKEをglobal_environmentに関数として登録する */
+/**
+ * ハードウェア層の組み込み関数%%IN-16。第一引数のポート番号から2バイト読み込む。
+ * @param args (port) portはFIXNUM
+ * @param env 呼び出し時の環境(未使用)
+ * @return 読み込んだ値のFIXNUM
+ */
+lisp_val_t cc_in_16(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    uint16_t port = (uint16_t)(cc_car(args) >> 3);
+    return os_make_fixnum(inw(port));
+}
+
+/**
+ * ハードウェア層の組み込み関数%%OUT-16。第一引数のポート番号へ第二引数の2バイトを出力する。
+ * @param args (port value) port/valueはFIXNUM
+ * @param env 呼び出し時の環境(未使用)
+ * @return 出力した値のFIXNUM
+ */
+lisp_val_t cc_out_16(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    uint16_t port = (uint16_t)(cc_car(args) >> 3);
+    uint16_t value = (uint16_t)(cc_car(cc_cdr(args)) >> 3);
+    outw(port, value);
+    return os_make_fixnum(value);
+}
+
+/** %%IN-8/%%OUT-8/%%PEEK/%%POKE/%%IN-16/%%OUT-16をglobal_environmentに関数として登録する */
 void os_register_subprimitives(void) {
     os_set_function(os_make_symbol("%%IN-8"), os_make_native_function((lisp_addr_t)(void *)cc_in_8), global_environment);
     os_set_function(os_make_symbol("%%OUT-8"), os_make_native_function((lisp_addr_t)(void *)cc_out_8), global_environment);
     os_set_function(os_make_symbol("%%PEEK"), os_make_native_function((lisp_addr_t)(void *)cc_peek), global_environment);
     os_set_function(os_make_symbol("%%POKE"), os_make_native_function((lisp_addr_t)(void *)cc_poke), global_environment);
+    os_set_function(os_make_symbol("%%IN-16"), os_make_native_function((lisp_addr_t)(void *)cc_in_16), global_environment);
+    os_set_function(os_make_symbol("%%OUT-16"), os_make_native_function((lisp_addr_t)(void *)cc_out_16), global_environment);
 }

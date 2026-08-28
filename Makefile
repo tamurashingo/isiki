@@ -10,8 +10,8 @@ SRCDIR = src/c
 # トランスパイラ(transpileターゲット)の生成物。git管理対象外で、
 # buildやtest実行時にtranspileターゲット経由で都度生成される
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
-HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
+HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -77,6 +77,11 @@ TEST_BIN_VIRTIO9P = $(BUILD_TMPDIR)/virtio9p_test
 TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/print.c $(LISP_COMPILED) $(TESTDIR)/lisp_compiled_test.c
 TEST_BIN_LISP_COMPILED = $(BUILD_TMPDIR)/lisp_compiled_test
 
+# interrupt.cはリンクせず、ide_test.cが独自にinb/outb/inw/outwをfake定義して
+# レジスタ操作の順序・値を検証する(subprimitive_test.cと同じ方針)
+TEST_SRC_IDE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(TESTDIR)/ide_test.c
+TEST_BIN_IDE = $(BUILD_TMPDIR)/ide_test
+
 
 .PHONY: all setup image transpile build compile run test test-qemu clean
 
@@ -124,7 +129,7 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-o $@ $<
 
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(HDR) | $(BUILD_TMPDIR)
+test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
@@ -210,6 +215,11 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_LISP_COMPILED) $(TEST_SRC_LISP_COMPILED) -lm
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_IDE) $(TEST_SRC_IDE) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_RUNTIME) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_PROCESS) -v "$(PWD)":/workspace isiki-builder
@@ -227,24 +237,39 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_P9) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_VIRTIO9P) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP_COMPILED) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_IDE) -v "$(PWD)":/workspace isiki-builder
 
 clean:
 	rm -rf esp_dir $(BUILD_TMPDIR)
 	rm -f .qemu-test-trigger test-results.txt qemu.log
 
-run:
+# IDE/ATA PIO動作確認用の使い捨てディスクイメージ。qemu-imgはCI環境で未保証の
+# パッケージのため使わず、dd/printfのみで作成する。先頭にIDE_TEST_MAGICを書き込み、
+# read-sectorでのセクタ0読み込み確認に使う。Secondaryチャネル(bus=1,unit=0)の
+# masterとして明示的にアタッチする(Primaryは-drive ...,file=fat:rw:./esp_dirの
+# ESP起動ドライブがif=指定無しでデフォルト占有しているため触らない)
+IDE_DISK_IMG = $(BUILD_TMPDIR)/ide_disk.img
+IDE_TEST_MAGIC = ISIKIOS-IDE-TEST-SECTOR0-MAGIC!
+
+$(IDE_DISK_IMG): | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	printf '%s' '$(IDE_TEST_MAGIC)' | dd of=$@ conv=notrunc bs=1 seek=0 2>/dev/null
+
+run: $(IDE_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
 
-debug:
+debug: $(IDE_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-monitor stdio -serial null \
@@ -253,7 +278,7 @@ debug:
 # isiki_test.lispをQEMU上で全自動実行し、test-results.txtの結果でpass/failを判定する。
 # .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
 # ResetSystemでQEMUを電源断する
-test-qemu: build
+test-qemu: build $(IDE_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	rm -f .qemu-test-trigger test-results.txt
 	touch .qemu-test-trigger
@@ -262,6 +287,7 @@ test-qemu: build
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-no-reboot
@@ -279,7 +305,7 @@ test-qemu-stress:
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)
-test-qemu-milestone: build
+test-qemu-milestone: build $(IDE_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
 	rm -f .qemu-test-trigger test-results.txt
@@ -289,6 +315,7 @@ test-qemu-milestone: build
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-no-reboot

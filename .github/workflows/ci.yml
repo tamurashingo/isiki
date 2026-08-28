@@ -45,3 +45,7 @@ jobs:
       - name: "Run Lisp tests in QEMU (milestone 4: environment)"
         timeout-minutes: 10
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m4_environment.lisp
+
+      - name: "Run Lisp tests in QEMU (milestone 5: IDE/ATA PIO block device)"
+        timeout-minutes: 10
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m5_ide.lisp

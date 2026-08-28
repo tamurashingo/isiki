@@ -6,6 +6,7 @@
 #include "runtime.h"
 #include "repl.h"
 #include "subprimitive.h"
+#include "ide_subprimitive.h"
 #include "virtio9p.h"
 #include "load.h"
 #include "eval.h"
@@ -85,6 +86,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_heap_init(heap_base, heap_size);
     os_bootstrap();
     os_register_subprimitives();
+    os_register_ide_subprimitives();
     os_register_load();
     os_register_eval_primitives();
     os_register_streams();
