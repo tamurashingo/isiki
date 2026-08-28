@@ -126,3 +126,43 @@
 (assert-equal fat16-test-write1-2clusters (fat16-read-file *ide-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049))
               (fat16-read-dir *ide-device* "/"))
+
+;;; --- FAT16-M6c: 新規ファイル作成 ---
+;;
+;; Makefileのmkfs.vfat手順でDELETED.TXTを最後に作成後rmしているため、この時点で
+;; ルートディレクトリにはWRITE1.TXTの直後に0xE5(削除済み再利用可)スロットが1つ、
+;; その直後に終端(0x00)スロットが続く並びになっている(先頭のコメント参照)。
+;; fat16-create-fileは最初に見つかった空きスロットへ書き込むため、1つ目の新規
+;; ファイルはDELETED.TXTだったスロットを再利用し、2つ目は新しい終端スロットに
+;; 入る。よって作成後の一覧はHELLO.TXT/TEST.LSP/BIG.TXT/WRITE1.TXTの後に、作成した
+;; 順で並ぶ。
+
+;; 空ファイルの新規作成(クラスタ確保なし、start-cluster=0/size=0)
+(assert-equal t (if (fat16-create-file *ide-device* "/NEW1.TXT" nil) t nil))
+(assert-equal nil (fat16-read-file *ide-device* "/NEW1.TXT"))
+
+;; 1クラスタに収まる非空ファイルの新規作成
+(defglobal fat16-test-new2 (%fat16-test-make-byte-list 100 67)) ;; 全要素67('C')
+
+(assert-equal t (if (fat16-create-file *ide-device* "/NEW2.TXT" fat16-test-new2) t nil))
+(assert-equal fat16-test-new2 (fat16-read-file *ide-device* "/NEW2.TXT"))
+
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
+              (fat16-read-dir *ide-device* "/"))
+
+;; 同名エントリが既に存在する場合はnil(上書きはfat16-write-fileの役割)。
+;; 既存のTEST.LSPの内容/一覧が変更されていないことも確認する。
+(assert-equal nil (fat16-create-file *ide-device* "/TEST.LSP" fat16-test-new2))
+(assert-equal 18 (length (fat16-read-file *ide-device* "/TEST.LSP")))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
+              (fat16-read-dir *ide-device* "/"))
+
+;; 8.3形式で表現できない名前(複数ドット、またはbase/extが長すぎる)はnil。
+;; いずれもスロット確保より前段の名前変換で失敗するため、一覧は変化しない。
+(assert-equal nil (fat16-create-file *ide-device* "/A.B.C" fat16-test-new2))
+(assert-equal nil (fat16-create-file *ide-device* "/TOOLONGNAME.TXT" fat16-test-new2))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
+              (fat16-read-dir *ide-device* "/"))
