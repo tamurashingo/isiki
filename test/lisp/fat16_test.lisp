@@ -237,3 +237,54 @@
 ;; 2階層下(/SUBDIR/DEEPER)への新規作成も往復一致することを確認する
 (assert-equal t (if (fat16-create-file *ide-device* "/SUBDIR/DEEPER/NEW4.TXT" fat16-test-subdir-new3) t nil))
 (assert-equal fat16-test-subdir-new3 (fat16-read-file *ide-device* "/SUBDIR/DEEPER/NEW4.TXT"))
+
+;;; --- FAT16-M7c: fat16-create-directory(mkdir)新設 ---
+;;
+;; fat16-create-directoryでルート直下・サブディレクトリ配下それぞれに新規
+;; ディレクトリを作成し、"."/".."エントリのstart-clusterが正しいこと(ルート直下
+;; なら".."は規約通り0)、作成したディレクトリの中でfat16-create-file/
+;; fat16-read-fileが正常に動くこと(mkdir→create→readのライフサイクル)、
+;; 同名重複・8.3非対応名の失敗ケースを確認する。
+
+;; ルート直下への新規ディレクトリ作成
+(assert-equal t (if (fat16-create-directory *ide-device* "/NEWDIR") t nil))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
+                     (list "SUBDIR" ':dir 0)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100)
+                     (list "NEWDIR" ':dir 0))
+              (fat16-read-dir *ide-device* "/"))
+
+;; 作成したディレクトリの内側は"."/".."のみ、".."はルート直下なので規約通り
+;; start-cluster=0(fat16-read-dirの一覧にはstart-clusterが出ないため、ここでは
+;; 一覧の名前・種別・sizeのみ確認する。start-clusterの規約自体は%fat16-resolve-dir
+;; がルートを(lbas . 0)として扱う既存の仕組みに依存している)。
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
+              (fat16-read-dir *ide-device* "/NEWDIR"))
+
+;; 作成したディレクトリの中への新規ファイル作成→読み込みの往復一致
+(assert-equal t (if (fat16-create-file *ide-device* "/NEWDIR/INSIDE.TXT" fat16-test-subdir-new3) t nil))
+(assert-equal fat16-test-subdir-new3 (fat16-read-file *ide-device* "/NEWDIR/INSIDE.TXT"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "INSIDE.TXT" ':file 50))
+              (fat16-read-dir *ide-device* "/NEWDIR"))
+
+;; 既存サブディレクトリ(/SUBDIR)の配下への新規ディレクトリ作成
+;; (".."が親=SUBDIRのstart-clusterを指すことを確認するため、SUBDIR内に別の
+;; ファイルを作ってから対象ディレクトリのfat16-read-dirで一覧を確認する)
+(assert-equal t (if (fat16-create-directory *ide-device* "/SUBDIR/NEWSUB") t nil))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
+              (fat16-read-dir *ide-device* "/SUBDIR/NEWSUB"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0)
+                     (list "NEW3.TXT" ':file 50)
+                     (list "NEWSUB" ':dir 0))
+              (fat16-read-dir *ide-device* "/SUBDIR"))
+
+;; 同名エントリが既に存在する場合はnil(親ディレクトリの一覧は変化しない)
+(assert-equal nil (fat16-create-directory *ide-device* "/SUBDIR"))
+(assert-equal nil (fat16-create-directory *ide-device* "/NEWDIR"))
+
+;; 8.3形式で表現できない名前はnil
+(assert-equal nil (fat16-create-directory *ide-device* "/A.B.C"))
+(assert-equal nil (fat16-create-directory *ide-device* "/TOOLONGDIRNAME"))
+
+;; 存在しない親ディレクトリの下へのmkdirもnil
+(assert-equal nil (fat16-create-directory *ide-device* "/NOSUCHDIR/CHILD"))
