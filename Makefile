@@ -275,21 +275,27 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 			printf "%s\n" "$(FAT16_TEST_STRING)" > /mnt/fat16_test/TEST.LSP; \
 			umount /mnt/fat16_test'
 
-run: $(IDE_DISK_IMG)
+# Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
+# はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は
+# FAT16_DISK_IMGを、run/debug/test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で
+# 上書きして使う。既定値はIDE_DISK_IMGなので既存ターゲットの挙動は変わらない。
+QEMU_DISK_IMG = $(IDE_DISK_IMG)
+
+run: $(QEMU_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
 
-debug: $(IDE_DISK_IMG)
+debug: $(QEMU_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-monitor stdio -serial null \
@@ -298,7 +304,7 @@ debug: $(IDE_DISK_IMG)
 # isiki_test.lispをQEMU上で全自動実行し、test-results.txtの結果でpass/failを判定する。
 # .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
 # ResetSystemでQEMUを電源断する
-test-qemu: build $(IDE_DISK_IMG)
+test-qemu: build $(QEMU_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	rm -f .qemu-test-trigger test-results.txt
 	touch .qemu-test-trigger
@@ -307,7 +313,7 @@ test-qemu: build $(IDE_DISK_IMG)
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-no-reboot
@@ -325,7 +331,7 @@ test-qemu-stress:
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)
-test-qemu-milestone: build $(IDE_DISK_IMG)
+test-qemu-milestone: build $(QEMU_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
 	rm -f .qemu-test-trigger test-results.txt
@@ -335,7 +341,7 @@ test-qemu-milestone: build $(IDE_DISK_IMG)
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(IDE_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-no-reboot
