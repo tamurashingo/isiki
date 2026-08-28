@@ -103,11 +103,26 @@
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 10))
               (fat16-read-dir *ide-device* "/"))
 
-;; クラスタ数が変わる書き込みはFAT16-M6aの責務外としてnilを返す(2049byteは
-;; 1クラスタ=2048byteを超えるため2クラスタ必要になり、現在の1クラスタと
-;; 不一致になる)。拡張はFAT16-M6bの責務、documents/fs.md参照。
-(assert-equal nil (fat16-write-file *ide-device* "/WRITE1.TXT" (%fat16-test-make-byte-list 2049 66)))
+;;; --- FAT16-M6b: クラスタ追加を伴うファイル拡張 ---
+;;
+;; WRITE1.TXTは直前のM6a確認時点で1クラスタ(2048byte以内)のまま。2049byteは
+;; 1クラスタを超えるため2クラスタ必要になり、現在の1クラスタと不一致になる。
+;; FAT16-M6b実装により、必要クラスタ数が増える場合は新規クラスタを確保して
+;; 拡張書き込みが成功するようになった(M6a時点ではここはnilを期待していた)。
 
-;; 直前の(クラスタ数不一致で失敗した)呼び出しでデータ/ディレクトリエントリが
+(defglobal fat16-test-write1-2clusters (%fat16-test-make-byte-list 2049 66))
+
+(assert-equal t (if (fat16-write-file *ide-device* "/WRITE1.TXT" fat16-test-write1-2clusters) t nil))
+(assert-equal fat16-test-write1-2clusters (fat16-read-file *ide-device* "/WRITE1.TXT"))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049))
+              (fat16-read-dir *ide-device* "/"))
+
+;; クラスタ数が減る書き込み(縮小)はFAT16-M6bの対象外としてnilを返す(現在2
+;; クラスタ確保済みのWRITE1.TXTへ、1クラスタで収まる10byteを書こうとする)。
+(assert-equal nil (fat16-write-file *ide-device* "/WRITE1.TXT" fat16-test-write1-new))
+
+;; 直前の(クラスタ数減少で失敗した)呼び出しでデータ/ディレクトリエントリが
 ;; 変更されていないことを確認する
-(assert-equal fat16-test-write1-new (fat16-read-file *ide-device* "/WRITE1.TXT"))
+(assert-equal fat16-test-write1-2clusters (fat16-read-file *ide-device* "/WRITE1.TXT"))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049))
+              (fat16-read-dir *ide-device* "/"))

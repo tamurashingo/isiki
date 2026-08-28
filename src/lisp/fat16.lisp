@@ -472,14 +472,144 @@
              (chunks (%fat16-split-into-chunks bytes (slot-value bpb 'bytes-per-sector))))
         (%fat16-write-lba-list device lbas chunks))))
 
+;;; --- FAT16-M6b: クラスタ追加を伴うファイル拡張 ---
+
+;; (%fat16-total-cluster-count bpb) : データ領域が確保できるクラスタ総数。
+;; %fat16-find-free-clusterの探索上限を決めるために使う。
+(defun %fat16-total-cluster-count (bpb)
+  (div (- (slot-value bpb 'total-sectors) (%fat16-data-start-lba bpb))
+       (slot-value bpb 'sectors-per-cluster)))
+
+;; (%fat16-find-free-cluster device bpb) : クラスタ番号2から順にFATエントリが0
+;; (未使用)になる最初のクラスタ番号をwhileで探す。上限はクラスタ総数+2(クラスタ
+;; 番号は2始まりのため)。見つからなければ(ディスクフル)nil。データクラスタ数は
+;; 数千に達し得るため、再帰は使わずwhileで書く(documents/fs.md参照)。
+(defun %fat16-find-free-cluster (device bpb)
+  (let ((cluster-no 2) (limit (+ (%fat16-total-cluster-count bpb) 2)) (found nil))
+    (while (and (null found) (< cluster-no limit))
+      (let ((entry (fat16-fat-entry device bpb cluster-no)))
+        (if (and entry (= entry 0))
+            (setq found cluster-no)
+            (setq cluster-no (+ cluster-no 1)))))
+    found))
+
+;; (%fat16-set-fat-entry device bpb cluster-no value) : cluster-noのFATエントリを
+;; valueで上書きする。num-fats全コピーへ同じ内容を書く(documents/fs.md、書き込みは
+;; ミラー全体を更新する方針)。書き込んだセクタが%fat16-fat-sector-bytesの
+;; キャッシュ(*fat16-fat-cache-lba*)と一致する場合はキャッシュを無効化し、次回
+;; 読み込みで再読込させる。1つのコピーでも読み込み/書き込みに失敗したら残りは
+;; 処理せず中断してnil、全コピー成功でt。
+(defun %fat16-set-fat-entry (device bpb cluster-no value)
+  (let* ((byte-offset (* cluster-no 2))
+         (sector-offset (div byte-offset (slot-value bpb 'bytes-per-sector)))
+         (offset-in-sector (mod byte-offset (slot-value bpb 'bytes-per-sector)))
+         (value-bytes (%fat16-u16-to-bytes value)))
+    (let ((fat-index 0) (ok t))
+      (while (and ok (< fat-index (slot-value bpb 'num-fats)))
+        (let* ((lba (+ (slot-value bpb 'reserved-sectors)
+                        (* fat-index (slot-value bpb 'sectors-per-fat))
+                        sector-offset))
+               (sector-bytes (read-sector device lba)))
+          (if (null sector-bytes)
+              (setq ok nil)
+              (progn
+                (%fat16-patch-bytes! sector-bytes offset-in-sector value-bytes)
+                (if (write-sector device lba sector-bytes)
+                    (progn
+                      (if (and (dynamic *fat16-fat-cache-lba*) (= (dynamic *fat16-fat-cache-lba*) lba))
+                          (%%set-dynamic '*fat16-fat-cache-lba* nil))
+                      (setq fat-index (+ fat-index 1)))
+                    (setq ok nil))))))
+      ok)))
+
+;; (%fat16-allocate-clusters device bpb count) : 空きクラスタをcount個確保し、
+;; 発見順のクラスタ番号リストを返す。確保したクラスタは次の探索で再び「空き」と
+;; 誤認されないよう、確保直後にFATエントリへ終端マーカー(#xFFFF)を仮に書き込む
+;; (呼び出し元が%fat16-link-clustersで実際のチェインへ後から繋ぎ直す前提)。
+;; count個確保できなかった場合(ディスクフル、または書き込み失敗)はnil。その
+;; 時点までに仮確保したクラスタの解放(フリーリストへ戻す)は行わない(ディスク
+;; フル時のクラスタリークは許容する簡略化、documents/fs.md参照)。
+(defun %fat16-allocate-clusters (device bpb count)
+  (let ((i 0) (rev-clusters nil) (ok t))
+    (while (and ok (< i count))
+      (let ((cluster (%fat16-find-free-cluster device bpb)))
+        (if (null cluster)
+            (setq ok nil)
+            (if (%fat16-set-fat-entry device bpb cluster #xFFFF)
+                (progn
+                  (setq rev-clusters (cons cluster rev-clusters))
+                  (setq i (+ i 1)))
+                (setq ok nil)))))
+    (if ok
+        (%fat16-reverse-iter rev-clusters)
+        nil)))
+
+;; (%fat16-last-elt list) : listの最後の要素をwhileで辿って返す(既存クラスタ
+;; チェインの末尾クラスタ番号を得るために使う、要素数はファイルのクラスタ数に
+;; 比例するためwhileで書く)。
+(defun %fat16-last-elt (list)
+  (let ((cell list))
+    (while (cdr cell)
+      (setq cell (cdr cell)))
+    (car cell)))
+
+;; (%fat16-link-clusters device bpb clusters) : clustersを先頭から順にFATエントリで
+;; チェインする(各要素→次要素)。最後の要素のFATエントリは変更しない(呼び出し元が
+;; %fat16-allocate-clustersで既に終端マーカーを設定済みという前提)。1つでも失敗
+;; したら中断してnil、全部成功(または要素が1個以下で変更不要)ならt。
+(defun %fat16-link-clusters (device bpb clusters)
+  (let ((remaining clusters) (ok t))
+    (while (and ok remaining (cdr remaining))
+      (if (%fat16-set-fat-entry device bpb (car remaining) (car (cdr remaining)))
+          (setq remaining (cdr remaining))
+          (setq ok nil)))
+    ok))
+
+;; (%fat16-extend-file device bpb start-cluster old-cluster-count new-cluster-count
+;;  bytes) : start-clusterから始まる既存チェイン(old-cluster-count個、0なら
+;; まだクラスタ未確保=旧サイズ0)を、new-cluster-count個になるよう新規クラスタを
+;; 確保・接続し、bytes全体を書き込む。呼び出し元はnew-cluster-count >
+;; old-cluster-countであることを保証する前提(縮小はFAT16-M6bの対象外、
+;; documents/fs.md参照)。成功時は新しいstart-cluster(旧チェインがあった場合は
+;; 変化しないstart-cluster自身、旧チェインが無かった場合は新規確保した先頭クラスタ)
+;; を返す。失敗時はnil。
+(defun %fat16-extend-file (device bpb start-cluster old-cluster-count new-cluster-count bytes)
+  (let ((new-clusters (%fat16-allocate-clusters device bpb (- new-cluster-count old-cluster-count))))
+    (if (null new-clusters)
+        nil
+        (if (not (%fat16-link-clusters device bpb new-clusters))
+            nil
+            (let* ((had-old-chain (> old-cluster-count 0))
+                   (linked-to-old (if had-old-chain
+                                       (%fat16-set-fat-entry device bpb
+                                         (%fat16-last-elt (fat16-cluster-chain device bpb start-cluster))
+                                         (car new-clusters))
+                                       t))
+                   (first-cluster (if had-old-chain start-cluster (car new-clusters))))
+              (if (not linked-to-old)
+                  nil
+                  (if (%fat16-write-file-data device bpb first-cluster bytes)
+                      first-cluster
+                      nil)))))))
+
+;; (%fat16-finish-directory-update device dir-lba dir-bytes dir-offset
+;;  new-start-cluster new-size) : ディレクトリエントリのstart-cluster(offset+26)と
+;; size(offset+28)フィールドを書き換えてセクタを書き込む。M6a(サイズのみ変化、
+;; start-clusterは同じ値を渡せば実質変更なし)・M6b(start-clusterも変わり得る)の
+;; 両方から共通で使う。
+(defun %fat16-finish-directory-update (device dir-lba dir-bytes dir-offset new-start-cluster new-size)
+  (progn
+    (%fat16-patch-bytes! dir-bytes (+ dir-offset 26) (%fat16-u16-to-bytes new-start-cluster))
+    (%fat16-patch-bytes! dir-bytes (+ dir-offset 28) (%fat16-u32-to-bytes new-size))
+    (write-sector device dir-lba dir-bytes)))
+
 ;; (fat16-write-file device path bytes) : path("/NAME.EXT"形式)の既存ファイルへ
-;; bytes(fixnum 0-255のリスト)を上書きする。FAT16-M6a: 書き込み後に必要な
-;; クラスタ数が現在のクラスタ数と変わらない場合のみ対応する。クラスタ数が
-;; 変わる場合(拡張が必要)はnilを返し、既存データ/ディレクトリエントリは
-;; 変更しない(拡張はFAT16-M6bの責務、documents/fs.md参照。呼び出し側で
-;; フォールバックするかどうかを判断する)。書き込み順序はデータ→ディレクトリ
-;; エントリのsizeフィールドの順(M6aはFATチェイン自体を変更しないためFAT更新は
-;; 不要)。エントリが見つからない・データ書き込みに失敗した場合もnil、成功時はt。
+;; bytes(fixnum 0-255のリスト)を上書きする。必要クラスタ数が現在のクラスタ数と
+;; 同じ場合はFAT16-M6aの経路(データ→sizeフィールドのみ更新)、必要クラスタ数が
+;; 増える場合はFAT16-M6bの経路(新規クラスタ確保・FATチェイン延長→データ→
+;; start-cluster/sizeフィールド更新)で書き込む。必要クラスタ数が減る場合(縮小)は
+;; FAT16-M6bの対象外としてnilを返し、既存データ/ディレクトリエントリは変更しない。
+;; エントリが見つからない・各段階の書き込みに失敗した場合もnil、成功時はt。
 (defun fat16-write-file (device path bytes)
   (let* ((bpb (fat16-read-bpb device)))
     (if (null bpb)
@@ -499,10 +629,14 @@
                                                         0
                                                         (length (fat16-cluster-chain device bpb start-cluster))))
                            (required-cluster-count (%fat16-cluster-count-for-bytes (length bytes) cluster-bytes)))
-                      (if (/= required-cluster-count current-cluster-count)
-                          nil
-                          (if (%fat16-write-file-data device bpb start-cluster bytes)
-                              (progn
-                                (%fat16-patch-bytes! dir-bytes (+ dir-offset 28) (%fat16-u32-to-bytes (length bytes)))
-                                (write-sector device dir-lba dir-bytes))
-                              nil))))))))))
+                      (cond
+                        ((= required-cluster-count current-cluster-count)
+                         (if (%fat16-write-file-data device bpb start-cluster bytes)
+                             (%fat16-finish-directory-update device dir-lba dir-bytes dir-offset start-cluster (length bytes))
+                             nil))
+                        ((> required-cluster-count current-cluster-count)
+                         (let ((new-start-cluster (%fat16-extend-file device bpb start-cluster current-cluster-count required-cluster-count bytes)))
+                           (if (null new-start-cluster)
+                               nil
+                               (%fat16-finish-directory-update device dir-lba dir-bytes dir-offset new-start-cluster (length bytes)))))
+                        (t nil))))))))))
