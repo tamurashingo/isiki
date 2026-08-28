@@ -185,3 +185,49 @@
           (%fat16-scan-root-dir device
                                  (fat16-root-dir-lba bpb)
                                  (%fat16-root-dir-sector-count bpb))))))
+
+;;; --- FAT16-M3: FATテーブルのクラスタチェイン追跡 ---
+
+;; 直前に読んだFATセクタの(lba . bytes)キャッシュ。init.lispの*classes*と同じ理由
+;; (defglobal+setqはsetqが関数呼び出し内のenvironmentにしか書き込めず、呼び出し元に
+;; 見えない)でdefdynamic+%%set-dynamicを使う。隣接クラスタへの連続アクセスでの
+;; 重複読み込みを避けるための、1セクタ分のみの軽量キャッシュ(過剰最適化はしない)。
+(defdynamic *fat16-fat-cache-lba* nil)
+(defdynamic *fat16-fat-cache-bytes* nil)
+
+;; (%fat16-fat-sector-bytes device lba) : FATテーブル中のlbaセクタの内容(512byte)
+;; を返す。直前に読んだセクタと同じlbaならキャッシュを再利用する。
+(defun %fat16-fat-sector-bytes (device lba)
+  (if (and (dynamic *fat16-fat-cache-lba*) (= (dynamic *fat16-fat-cache-lba*) lba))
+      (dynamic *fat16-fat-cache-bytes*)
+      (let ((bytes (read-sector device lba)))
+        (progn
+          (%%set-dynamic '*fat16-fat-cache-lba* lba)
+          (%%set-dynamic '*fat16-fat-cache-bytes* bytes)
+          bytes))))
+
+;; (fat16-fat-entry device bpb cluster-no) : FATテーブル中のcluster-noに対応する
+;; 16bit値を返す。FATテーブル(1本目)はreserved-sectors番目のセクタから始まり、
+;; cluster-no*2byte目の位置にLE u16として格納されている。read-sectorが失敗した
+;; 場合はnil。
+(defun fat16-fat-entry (device bpb cluster-no)
+  (let ((byte-offset (* cluster-no 2)))
+    (let ((sector-offset (div byte-offset (slot-value bpb 'bytes-per-sector)))
+          (offset-in-sector (mod byte-offset (slot-value bpb 'bytes-per-sector))))
+      (let ((bytes (%fat16-fat-sector-bytes device (+ (slot-value bpb 'reserved-sectors) sector-offset))))
+        (if (null bytes)
+            nil
+            (%fat16-u16 bytes offset-in-sector))))))
+
+;; (fat16-cluster-chain device bpb start-cluster) : start-clusterから始まるクラスタ
+;; チェインを、FATエントリを辿って訪問順のリストで返す(例: (3 4 7))。エントリ値が
+;; 0xFFF8以上(0xFFFFの正規終端マーカーを含む、documents/fs.mdの簡略化した扱いに
+;; 従いbad-cluster等も終端として扱う)なら終端、それ未満は次クラスタへの参照として
+;; 辿る。fat16-fat-entryがnilを返した(読み込み失敗)場合もそこで打ち切る。
+(defun fat16-cluster-chain (device bpb start-cluster)
+  (let ((entry (fat16-fat-entry device bpb start-cluster)))
+    (if (null entry)
+        (list start-cluster)
+        (if (>= entry #xFFF8)
+            (list start-cluster)
+            (cons start-cluster (fat16-cluster-chain device bpb entry))))))

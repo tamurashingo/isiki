@@ -32,3 +32,17 @@
 
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18))
               (fat16-read-dir *ide-device* "/"))
+
+;;; --- FAT16-M3: FATテーブルのクラスタチェイン追跡 ---
+;;
+;; MakefileのFAT16_DISK_IMGルールが、mkfs.vfat後にホスト側でFATテーブル(1本目)へ
+;; 直接dd/printfし、クラスタ10→11→14→終端(0xFFFF)という非連続なチェインを合成
+;; している(クラスタ3はTEST.LSPが使用中のため避けている)。
+
+(defglobal fat16-test-bpb-m3 (fat16-read-bpb *ide-device*))
+
+(assert-equal 11 (fat16-fat-entry *ide-device* fat16-test-bpb-m3 10))
+(assert-equal 14 (fat16-fat-entry *ide-device* fat16-test-bpb-m3 11))
+(assert-equal #xFFFF (fat16-fat-entry *ide-device* fat16-test-bpb-m3 14))
+
+(assert-equal (list 10 11 14) (fat16-cluster-chain *ide-device* fat16-test-bpb-m3 10))
