@@ -173,7 +173,13 @@
     (%%heap-total-bytes . "primitive_heap_total_bytes")
     (%%heap-used-bytes . "primitive_heap_used_bytes")
     (%%imm-space-total-bytes . "primitive_imm_space_total_bytes")
-    (%%imm-space-used-bytes . "primitive_imm_space_used_bytes")))
+    (%%imm-space-used-bytes . "primitive_imm_space_used_bytes")
+    ;; FAT16-M0(0)(documents/fs.md): logand/logior/logxor/ashが使う。subprimitive.c
+    ;; にcc_in_8等と同じパターンで実装されたビット演算プリミティブ
+    (%%logand . "cc_logand")
+    (%%logior . "cc_logior")
+    (%%logxor . "cc_logxor")
+    (%%ash . "cc_ash")))
 
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
@@ -1408,7 +1414,9 @@
       ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。
       ;; M14基盤E: open-input-stream/close(cc_open_input_stream/cc_close)はstream_lisp.hで
       ;; 宣言されているため、同じ理由でstream_lisp.hも必要
-      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%~%")
+      ;; FAT16-M0(0): logand/logior/logxor/ash(cc_logand等)はsubprimitive.hで
+      ;; 宣言されているため、同じ理由でsubprimitive.hも必要
+      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%#include \"subprimitive.h\"~%~%")
       ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
       ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
       ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)

@@ -211,6 +211,37 @@ void test_cc_out_16() {
     assert(v == os_make_fixnum(0x5678), "cc_out_16は書き込んだ値をfixnumで返す");
 }
 
+void test_cc_logand() {
+    lisp_val_t args[2] = { os_make_fixnum(0xF0F0), os_make_fixnum(0xFF00) };
+    lisp_val_t v = cc_logand(make_args(2, args), nil);
+
+    assert(v == os_make_fixnum(0xF000), "cc_logandは2引数のビットごとのANDをfixnumで返す");
+}
+
+void test_cc_logior() {
+    lisp_val_t args[2] = { os_make_fixnum(0xF0F0), os_make_fixnum(0x0F0F) };
+    lisp_val_t v = cc_logior(make_args(2, args), nil);
+
+    assert(v == os_make_fixnum(0xFFFF), "cc_logiorは2引数のビットごとのORをfixnumで返す");
+}
+
+void test_cc_logxor() {
+    lisp_val_t args[2] = { os_make_fixnum(0xFF00), os_make_fixnum(0xF0F0) };
+    lisp_val_t v = cc_logxor(make_args(2, args), nil);
+
+    assert(v == os_make_fixnum(0x0FF0), "cc_logxorは2引数のビットごとのXORをfixnumで返す");
+}
+
+void test_cc_ash() {
+    lisp_val_t left_args[2] = { os_make_fixnum(0x01), os_make_fixnum(8) };
+    lisp_val_t left = cc_ash(make_args(2, left_args), nil);
+    assert(left == os_make_fixnum(0x100), "cc_ashは正のcountで左シフトする");
+
+    lisp_val_t right_args[2] = { os_make_fixnum(0x100), os_make_fixnum_signed(1, 8) };
+    lisp_val_t right = cc_ash(make_args(2, right_args), nil);
+    assert(right == os_make_fixnum(0x01), "cc_ashは負のcountで右シフトする");
+}
+
 void test_os_register_subprimitives() {
     os_register_subprimitives();
 
@@ -220,6 +251,10 @@ void test_os_register_subprimitives() {
     lisp_val_t out16 = os_get_function(os_make_symbol("%%OUT-16"), global_environment);
     lisp_val_t peek = os_get_function(os_make_symbol("%%PEEK"), global_environment);
     lisp_val_t poke = os_get_function(os_make_symbol("%%POKE"), global_environment);
+    lisp_val_t logand = os_get_function(os_make_symbol("%%LOGAND"), global_environment);
+    lisp_val_t logior = os_get_function(os_make_symbol("%%LOGIOR"), global_environment);
+    lisp_val_t logxor = os_get_function(os_make_symbol("%%LOGXOR"), global_environment);
+    lisp_val_t ash = os_get_function(os_make_symbol("%%ASH"), global_environment);
 
     assert(in8 != nil, "os_register_subprimitives後は%%IN-8がglobal_environmentから引ける");
     assert(out8 != nil, "os_register_subprimitives後は%%OUT-8がglobal_environmentから引ける");
@@ -227,6 +262,10 @@ void test_os_register_subprimitives() {
     assert(out16 != nil, "os_register_subprimitives後は%%OUT-16がglobal_environmentから引ける");
     assert(peek != nil, "os_register_subprimitives後は%%PEEKがglobal_environmentから引ける");
     assert(poke != nil, "os_register_subprimitives後は%%POKEがglobal_environmentから引ける");
+    assert(logand != nil, "os_register_subprimitives後は%%LOGANDがglobal_environmentから引ける");
+    assert(logior != nil, "os_register_subprimitives後は%%LOGIORがglobal_environmentから引ける");
+    assert(logxor != nil, "os_register_subprimitives後は%%LOGXORがglobal_environmentから引ける");
+    assert(ash != nil, "os_register_subprimitives後は%%ASHがglobal_environmentから引ける");
 }
 
 int main(int argc, char** argv) {
@@ -241,6 +280,10 @@ int main(int argc, char** argv) {
     test_cc_out_16();
     test_cc_peek();
     test_cc_poke();
+    test_cc_logand();
+    test_cc_logior();
+    test_cc_logxor();
+    test_cc_ash();
     test_os_register_subprimitives();
 
     return g_test_failed ? 1 : 0;

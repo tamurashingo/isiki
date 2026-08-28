@@ -648,6 +648,21 @@
       (%%apply #'format (cons str (cons continue-string objs)))
       (get-output-stream-string str))))
 
+;;; --- ビット演算 (FAT16-M0(0), documents/fs.md) ---
+;;;
+;;; %%LOGAND/%%LOGIOR/%%LOGXOR/%%ASHはsubprimitive.cのCレベル関数で、いずれも
+;;; 非負のFIXNUMを対象とする(署名付き整数や多倍長は未対応)。FAT16のBPB/
+;;; ディレクトリエントリのようなLE多バイトフィールド合成・属性ビット判定用途。
+
+(defun logand (a b) (%%logand a b))
+
+(defun logior (a b) (%%logior a b))
+
+(defun logxor (a b) (%%logxor a b))
+
+;; (ash a count) : aをcount分シフトする。countが正なら左シフト、負なら右シフト。
+(defun ash (a count) (%%ash a count))
+
 ;;; --- condition accessors (§29.3, M12 Phase 11 #27) ---
 ;;;
 ;;; init.lispからの移動。各アクセサは対象クラスでなければ<domain-error>をsignalする

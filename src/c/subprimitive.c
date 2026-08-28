@@ -84,7 +84,62 @@ lisp_val_t cc_out_16(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(value);
 }
 
-/** %%IN-8/%%OUT-8/%%PEEK/%%POKE/%%IN-16/%%OUT-16をglobal_environmentに関数として登録する */
+/**
+ * ビット演算の組み込み関数%%LOGAND。第一引数と第二引数のビットごとのANDを取る。
+ * @param args (a b) a/bは非負のFIXNUM
+ * @param env 呼び出し時の環境(未使用)
+ * @return a AND bのFIXNUM
+ */
+lisp_val_t cc_logand(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    uint64_t a = (uint64_t)(cc_car(args) >> 3);
+    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> 3);
+    return os_make_fixnum(a & b);
+}
+
+/**
+ * ビット演算の組み込み関数%%LOGIOR。第一引数と第二引数のビットごとのORを取る。
+ * @param args (a b) a/bは非負のFIXNUM
+ * @param env 呼び出し時の環境(未使用)
+ * @return a OR bのFIXNUM
+ */
+lisp_val_t cc_logior(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    uint64_t a = (uint64_t)(cc_car(args) >> 3);
+    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> 3);
+    return os_make_fixnum(a | b);
+}
+
+/**
+ * ビット演算の組み込み関数%%LOGXOR。第一引数と第二引数のビットごとのXORを取る。
+ * @param args (a b) a/bは非負のFIXNUM
+ * @param env 呼び出し時の環境(未使用)
+ * @return a XOR bのFIXNUM
+ */
+lisp_val_t cc_logxor(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    uint64_t a = (uint64_t)(cc_car(args) >> 3);
+    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> 3);
+    return os_make_fixnum(a ^ b);
+}
+
+/**
+ * ビット演算の組み込み関数%%ASH。第一引数を第二引数の分だけシフトする。
+ * countが非負(符号ビット0)なら左シフト、負(符号ビット1)なら絶対値分の右シフトを行う。
+ * @param args (a count) aは非負のFIXNUM、countは符号付きFIXNUM
+ * @param env 呼び出し時の環境(未使用)
+ * @return シフト後の値のFIXNUM
+ */
+lisp_val_t cc_ash(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    uint64_t value = (uint64_t)(cc_car(args) >> 3);
+    lisp_val_t count_val = cc_car(cc_cdr(args));
+    UINT64 magnitude = os_fixnum_magnitude(count_val);
+    uint64_t result = os_fixnum_is_negative(count_val) ? (value >> magnitude) : (value << magnitude);
+    return os_make_fixnum(result);
+}
+
+/** %%IN-8/%%OUT-8/%%PEEK/%%POKE/%%IN-16/%%OUT-16/%%LOGAND/%%LOGIOR/%%LOGXOR/%%ASHをglobal_environmentに関数として登録する */
 void os_register_subprimitives(void) {
     os_set_function(os_make_symbol("%%IN-8"), os_make_native_function((lisp_addr_t)(void *)cc_in_8), global_environment);
     os_set_function(os_make_symbol("%%OUT-8"), os_make_native_function((lisp_addr_t)(void *)cc_out_8), global_environment);
@@ -92,4 +147,8 @@ void os_register_subprimitives(void) {
     os_set_function(os_make_symbol("%%POKE"), os_make_native_function((lisp_addr_t)(void *)cc_poke), global_environment);
     os_set_function(os_make_symbol("%%IN-16"), os_make_native_function((lisp_addr_t)(void *)cc_in_16), global_environment);
     os_set_function(os_make_symbol("%%OUT-16"), os_make_native_function((lisp_addr_t)(void *)cc_out_16), global_environment);
+    os_set_function(os_make_symbol("%%LOGAND"), os_make_native_function((lisp_addr_t)(void *)cc_logand), global_environment);
+    os_set_function(os_make_symbol("%%LOGIOR"), os_make_native_function((lisp_addr_t)(void *)cc_logior), global_environment);
+    os_set_function(os_make_symbol("%%LOGXOR"), os_make_native_function((lisp_addr_t)(void *)cc_logxor), global_environment);
+    os_set_function(os_make_symbol("%%ASH"), os_make_native_function((lisp_addr_t)(void *)cc_ash), global_environment);
 }
