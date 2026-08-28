@@ -82,6 +82,18 @@ static int ide_wait_drq(UINT16 io_base) {
     }
 }
 
+/** コマンドレジスタへoutbした直後、statusが実際に更新されるまでの実機ドライバ定石の
+ * 遅延。Alternate Status(ctrl_base)を4回捨て読みする(いわゆる400ns delay、OSDev
+ * wikiのIDEドライバでも標準的に使われる手法)。これが無いと、コマンド発行直後の
+ * 一瞬だけ前回転送のBSY/DRQが残っていて、そのままDRQ=1と誤認して前回の転送結果を
+ * 読んでしまう競合が起こり得る */
+static void ide_delay400ns(UINT16 ctrl_base) {
+    inb(ctrl_base + IDE_REG_CONTROL);
+    inb(ctrl_base + IDE_REG_CONTROL);
+    inb(ctrl_base + IDE_REG_CONTROL);
+    inb(ctrl_base + IDE_REG_CONTROL);
+}
+
 /** lba(28bit)/countをコマンドブロックレジスタへセットし、drive選択も行う */
 static void ide_setup_lba(os_ide_device *dev, UINT32 lba, UINT16 count) {
     UINT8 lba_top = (UINT8)((lba >> 24) & 0x0Fu);
@@ -109,6 +121,7 @@ int os_ide_identify(os_ide_device *dev, UINT16 io_base, UINT16 ctrl_base, UINT8 
     outb(io_base + IDE_REG_LBA_MID, 0);
     outb(io_base + IDE_REG_LBA_HIGH, 0);
     outb(io_base + IDE_REG_COMMAND, IDE_CMD_IDENTIFY);
+    ide_delay400ns(ctrl_base);
 
     UINT8 status = inb(io_base + IDE_REG_STATUS);
     if (status == 0x00u || status == 0xFFu) {
@@ -152,6 +165,7 @@ int os_ide_read_sectors(os_ide_device *dev, UINT32 lba, UINT16 count, UINT8 *buf
 
     ide_setup_lba(dev, lba, count);
     outb(dev->io_base + IDE_REG_COMMAND, IDE_CMD_READ_SECTORS);
+    ide_delay400ns(dev->ctrl_base);
 
     UINT16 sectors = count == 0 ? 256 : count;
     UINT16 *words = (UINT16 *)buf;
@@ -180,6 +194,7 @@ int os_ide_write_sectors(os_ide_device *dev, UINT32 lba, UINT16 count, const UIN
 
     ide_setup_lba(dev, lba, count);
     outb(dev->io_base + IDE_REG_COMMAND, IDE_CMD_WRITE_SECTORS);
+    ide_delay400ns(dev->ctrl_base);
 
     UINT16 sectors = count == 0 ? 256 : count;
     const UINT16 *words = (const UINT16 *)buf;
@@ -194,6 +209,7 @@ int os_ide_write_sectors(os_ide_device *dev, UINT32 lba, UINT16 count, const UIN
     }
 
     outb(dev->io_base + IDE_REG_COMMAND, IDE_CMD_CACHE_FLUSH);
+    ide_delay400ns(dev->ctrl_base);
     if (!ide_wait_not_busy(dev->io_base)) {
         set_err(err_msg, err_msg_cap, "ide: cache flush timed out");
         return 0;
