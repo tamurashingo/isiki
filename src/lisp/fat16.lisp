@@ -53,3 +53,135 @@
                                  (%fat16-u32 bytes 32)
                                  total-sectors-16)
             ':sectors-per-fat (%fat16-u16 bytes 22))))))
+
+;;; --- FAT16-M2: ルートディレクトリエントリの列挙 ---
+
+;; (fat16-root-dir-lba bpb) : ルートディレクトリの開始LBA。予約セクタの直後に
+;; num-fats個のFATテーブルが並ぶため、その合計を予約セクタ数に足したものになる。
+(defun fat16-root-dir-lba (bpb)
+  (+ (slot-value bpb 'reserved-sectors)
+     (* (slot-value bpb 'num-fats) (slot-value bpb 'sectors-per-fat))))
+
+;; (%fat16-root-dir-sector-count bpb) : ルートディレクトリが占有するセクタ数。
+;; FAT16の仕様上root-entry-count*32は必ずbytes-per-sectorの倍数になる
+;; (ルートディレクトリはセクタ境界に揃えて確保される)。
+(defun %fat16-root-dir-sector-count (bpb)
+  (div (* (slot-value bpb 'root-entry-count) 32) (slot-value bpb 'bytes-per-sector)))
+
+;; (defclass dir-entry ...) : ディレクトリエントリ1件のパース結果。nameは
+;; %fat16-bytes-to-stringで組み立てた表示用文字列(8.3名、拡張子が空なら"."無し)。
+(defclass dir-entry ()
+  ((name :initarg :name :initform nil)
+   (attr :initarg :attr :initform nil)
+   (size :initarg :size :initform nil)
+   (start-cluster :initarg :start-cluster :initform nil)))
+
+;; (%fat16-drop-leading-spaces bytes) : bytes先頭の連続するASCIIスペース(32)を
+;; 取り除いた残りを返す(string-trimが存在しないための自前ヘルパー)。
+(defun %fat16-drop-leading-spaces (bytes)
+  (if (and (not (null bytes)) (= (car bytes) 32))
+      (%fat16-drop-leading-spaces (cdr bytes))
+      bytes))
+
+;; (%fat16-rtrim-spaces bytes) : bytes末尾の連続するASCIIスペースを取り除いた
+;; 残りを返す(reverseして先頭を落とし、reverseで戻す)。
+(defun %fat16-rtrim-spaces (bytes)
+  (reverse (%fat16-drop-leading-spaces (reverse bytes))))
+
+;; (%fat16-bytes-to-string bytes) : ASCIIコードのfixnumリストbytesから、対応する
+;; 文字を1文字ずつ持つLisp文字列を組み立てる(FAT16-M0(1)で確認したcode-char+
+;; create-string+set-eltの手順)。
+(defun %fat16-bytes-to-string (bytes)
+  (let ((s (create-string (length bytes))))
+    (progn
+      (for ((b bytes (cdr b))
+            (i 0 (+ i 1)))
+          ((null b) nil)
+        (set-elt (code-char (car b)) s i))
+      s)))
+
+;; (%fat16-dir-entry-name bytes offset) : offsetにある32byteエントリの8+3byte名
+;; フィールドから表示用文字列("HELLO.TXT"、拡張子が空なら"HELLO"のように"."無し)
+;; を組み立てる。
+(defun %fat16-dir-entry-name (bytes offset)
+  (let ((name-bytes (%fat16-rtrim-spaces (%ide-take (%ide-drop bytes offset) 8)))
+        (ext-bytes (%fat16-rtrim-spaces (%ide-take (%ide-drop bytes (+ offset 8)) 3))))
+    (if (null ext-bytes)
+        (%fat16-bytes-to-string name-bytes)
+        (string-append (%fat16-bytes-to-string name-bytes) "." (%fat16-bytes-to-string ext-bytes)))))
+
+;; (%fat16-dir-entry-at bytes offset) : bytes(1セクタ512byte分)のoffsetにある
+;; 32byteディレクトリエントリをパースする。先頭バイトが0x00ならシンボル'endを
+;; (ルートディレクトリの走査終了、以降は未使用領域)、0xE5(削除済み)ならnilを、
+;; それ以外はdir-entryインスタンスを返す。
+(defun %fat16-dir-entry-at (bytes offset)
+  (let ((first-byte (elt bytes offset)))
+    (if (= first-byte 0)
+        'end
+        (if (= first-byte #xE5)
+            nil
+            (make-instance 'dir-entry
+              ':name (%fat16-dir-entry-name bytes offset)
+              ':attr (elt bytes (+ offset 11))
+              ':start-cluster (%fat16-u16 bytes (+ offset 26))
+              ':size (%fat16-u32 bytes (+ offset 28)))))))
+
+;; (%fat16-parse-sector-entries bytes entry-offset entries-remaining) : 1セクタ
+;; 分のディレクトリエントリ(entries-remaining個、通常16)を先頭から順にパースし、
+;; (entries . stopped)を返す。entriesは有効なdir-entryのリスト(削除済みは
+;; 除外済み)、stoppedは0x00終端に到達済みならt(この場合、呼び出し元は次の
+;; セクタへ進んではならない)。
+(defun %fat16-parse-sector-entries (bytes entry-offset entries-remaining)
+  (if (<= entries-remaining 0)
+      (cons nil nil)
+      (let ((parsed (%fat16-dir-entry-at bytes entry-offset)))
+        (if (eq parsed 'end)
+            (cons nil t)
+            (let ((rest (%fat16-parse-sector-entries bytes (+ entry-offset 32) (- entries-remaining 1))))
+              (cons (if (null parsed) (car rest) (cons parsed (car rest)))
+                    (cdr rest)))))))
+
+;; (%fat16-scan-root-dir device lba sectors-remaining) : lbaからsectors-remaining
+;; セクタ分のルートディレクトリを読み、有効なdir-entryのリストを返す。0x00終端に
+;; 到達した時点で残りのセクタは読まずに走査を終える。read-sectorが失敗した場合は
+;; それまでに集めたエントリは捨ててnilを返す(部分結果を返さない、既存のIDE層と
+;; 同じ「失敗時nil」の慣習)。
+(defun %fat16-scan-root-dir (device lba sectors-remaining)
+  (if (<= sectors-remaining 0)
+      nil
+      (let ((bytes (read-sector device lba)))
+        (if (null bytes)
+            nil
+            (let ((result (%fat16-parse-sector-entries bytes 0 16)))
+              (if (cdr result)
+                  (car result)
+                  (append (car result)
+                          (%fat16-scan-root-dir device (+ lba 1) (- sectors-remaining 1)))))))))
+
+;; (%fat16-dir-entry-kind attr) : attrバイトのディレクトリ属性ビット(0x10)を見て
+;; :fileまたは:dirを返す。
+(defun %fat16-dir-entry-kind (attr)
+  (if (= (logand attr #x10) 0) ':file ':dir))
+
+;; (%fat16-dir-entries-to-display-list entries) : dir-entryのリストを
+;; ("NAME" :file/:dir size)の3要素リストのリストに変換する。
+(defun %fat16-dir-entries-to-display-list (entries)
+  (if (null entries)
+      nil
+      (cons (list (slot-value (car entries) 'name)
+                  (%fat16-dir-entry-kind (slot-value (car entries) 'attr))
+                  (slot-value (car entries) 'size))
+            (%fat16-dir-entries-to-display-list (cdr entries)))))
+
+;; (fat16-read-dir device path) : ルートディレクトリ("/")のエントリ一覧を
+;; ("NAME" :file/:dir size)の形のリストで返す。pathは現状"/"固定でよく
+;; (サブディレクトリ対応はFAT16-M7、documents/fs.md)、引数として受け取るのみで
+;; 未使用。BPBが読めない場合はnil。
+(defun fat16-read-dir (device path)
+  (let ((bpb (fat16-read-bpb device)))
+    (if (null bpb)
+        nil
+        (%fat16-dir-entries-to-display-list
+          (%fat16-scan-root-dir device
+                                 (fat16-root-dir-lba bpb)
+                                 (%fat16-root-dir-sector-count bpb))))))

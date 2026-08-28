@@ -21,3 +21,14 @@
 (assert-equal 512 (slot-value fat16-test-bpb 'root-entry-count))
 (assert-equal 32768 (slot-value fat16-test-bpb 'total-sectors))
 (assert-equal 32 (slot-value fat16-test-bpb 'sectors-per-fat))
+
+;;; --- FAT16-M2: ルートディレクトリエントリの列挙 ---
+;;
+;; $(FAT16_DISK_IMG)のルートディレクトリは、作成順にHELLO.TXT(空ファイル)→
+;; TEST.LSP(18byte)→DELETED.TXT(作成後にrm、先頭バイトが0xE5になる)→
+;; 残りは0x00の空き終端、という並びになっている(Makefileのmkfs.vfat手順を参照)。
+;; 削除済みエントリはスキップされ、走査は0x00終端で止まるため、戻り値は
+;; HELLO.TXTとTEST.LSPの2件のみになるはず。
+
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18))
+              (fat16-read-dir *ide-device* "/"))

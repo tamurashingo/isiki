@@ -255,9 +255,12 @@ $(IDE_DISK_IMG): | $(BUILD_TMPDIR)
 	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
 	printf '%s' '$(IDE_TEST_MAGIC)' | dd of=$@ conv=notrunc bs=1 seek=0 2>/dev/null
 
-# FAT16読み書き実装(documents/fs.md FAT16-M0(2))用の使い捨てテストイメージ。
+# FAT16読み書き実装(documents/fs.md FAT16-M0(2)/FAT16-M2)用の使い捨てテストイメージ。
 # mkfs.vfat -F 16でFAT16フォーマットした後、loopマウントして既知内容のテスト
 # ファイル(空のHELLO.TXT、"Hello from FAT16!"を書いたTEST.LSP)を配置する。
+# DELETED.TXTは作成後にrmすることでルートディレクトリエントリの先頭バイトが
+# 0xE5(削除済みマーカー)になった状態を作る(FAT16-M2の削除済みエントリスキップ
+# 確認用、通常ファイル2件+削除済み1件+残りは0x00の空き終端という並びになる)。
 # loopマウントはCAP_SYS_ADMIN相当の権限を要するため、このルールのみ
 # --privilegedでdocker run する(他のビルド用ルールは
 # --user "$(id -u):$(id -g)"で非rootのまま)。
@@ -273,6 +276,8 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 			mount -o loop $@ /mnt/fat16_test; \
 			touch /mnt/fat16_test/HELLO.TXT; \
 			printf "%s\n" "$(FAT16_TEST_STRING)" > /mnt/fat16_test/TEST.LSP; \
+			printf "will be deleted" > /mnt/fat16_test/DELETED.TXT; \
+			rm /mnt/fat16_test/DELETED.TXT; \
 			umount /mnt/fat16_test'
 
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
