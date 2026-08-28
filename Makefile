@@ -274,7 +274,13 @@ $(IDE_DISK_IMG): | $(BUILD_TMPDIR)
 # mkfs.vfat後は未使用(0x0000)で、TEST.LSP/BIG.TXTが使うクラスタとは重複しない
 # (xxd -g1で目視確認済み)ため、実ファイルの内容を破壊せずに合成チェインを作れる。
 # オフセットはreserved-sectors*bytes-per-sector(2048) + cluster-no*2で計算した
-# 固定値(2068/2070/2076)、値はLE u16(11=0x0B00/14=0x0E00/終端=0xFFFF)。
+# 固定値(2068/2070/2076)、値はLE u16(11=0x0B00/14=0x0E00/終端=0xFFFF)。printfの
+# エスケープは\xHH(16進)ではなく\0NNN(8進、POSIX printfが規定する形式)を使う。
+# \xHHはbash等の拡張でしかなく、GitHub Actions runner(Ubuntu)のmakeレシピが使う
+# /bin/sh=dashのprintf組み込みでは解釈されず、リテラル文字列"\x0b\x00"がそのまま
+# 出力されてしまう(ddのcount=2はその先頭2byte、つまり'\','x'=0x5C,0x78を書き込む
+# ことになり、意図した値と全く異なるゴミがFATに書かれる)。macOSの/bin/sh(bash)では
+# \xHHが解釈されるため、ここはローカルとCIで結果が分かれる典型的なシェル差異だった。
 FAT16_DISK_IMG = $(BUILD_TMPDIR)/fat16_test.img
 FAT16_TEST_STRING = Hello from FAT16!
 
@@ -291,9 +297,9 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 			printf "will be deleted" > /mnt/fat16_test/DELETED.TXT; \
 			rm /mnt/fat16_test/DELETED.TXT; \
 			umount /mnt/fat16_test'
-	printf '\x0b\x00' | dd of=$@ bs=1 seek=2068 count=2 conv=notrunc 2>/dev/null
-	printf '\x0e\x00' | dd of=$@ bs=1 seek=2070 count=2 conv=notrunc 2>/dev/null
-	printf '\xff\xff' | dd of=$@ bs=1 seek=2076 count=2 conv=notrunc 2>/dev/null
+	printf '\013\000' | dd of=$@ bs=1 seek=2068 count=2 conv=notrunc 2>/dev/null
+	printf '\016\000' | dd of=$@ bs=1 seek=2070 count=2 conv=notrunc 2>/dev/null
+	printf '\377\377' | dd of=$@ bs=1 seek=2076 count=2 conv=notrunc 2>/dev/null
 
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
 # はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は
