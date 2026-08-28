@@ -231,3 +231,118 @@
         (if (>= entry #xFFF8)
             (list start-cluster)
             (cons start-cluster (fat16-cluster-chain device bpb entry))))))
+
+;;; --- FAT16-M4: クラスタ→セクタ変換とファイル本体読み込み ---
+
+;; (%fat16-data-start-lba bpb) : データ領域の開始LBA。ルートディレクトリの直後。
+(defun %fat16-data-start-lba (bpb)
+  (+ (fat16-root-dir-lba bpb) (%fat16-root-dir-sector-count bpb)))
+
+;; (fat16-cluster-to-lba bpb cluster-no) : cluster-noに対応するデータ領域内の
+;; LBAを返す。FAT16の仕様上クラスタ番号2がデータ領域の先頭に対応する
+;; (0/1は予約、通常のデータクラスタは2始まり)。
+(defun fat16-cluster-to-lba (bpb cluster-no)
+  (+ (%fat16-data-start-lba bpb)
+     (* (- cluster-no 2) (slot-value bpb 'sectors-per-cluster))))
+
+;; (%fat16-path-to-name path) : "/NAME.EXT"形式のpathから先頭の"/"を除いた名前を
+;; 取り出す。サブディレクトリ対応はFAT16-M7、現状は"/"直下の単一階層のみ想定。
+(defun %fat16-path-to-name (path)
+  (subseq path 1 (length path)))
+
+;; (%fat16-find-dir-entry entries name) : dir-entryのリストentriesからnameと
+;; (拡張子まで含めた)8.3名が一致するものを探す。見つからなければnil。
+(defun %fat16-find-dir-entry (entries name)
+  (if (null entries)
+      nil
+      (if (string= (slot-value (car entries) 'name) name)
+          (car entries)
+          (%fat16-find-dir-entry (cdr entries) name))))
+
+;; (%fat16-lba-range start-lba count) : start-lbaからcount個の連続したLBA番号を
+;; 並べたリストを返す(バイト列ではなくLBA番号自体の小さいリスト。1クラスタ分=
+;; sectors-per-cluster個程度なので、これをappendしてもスタックを圧迫しない)。
+(defun %fat16-lba-range (start-lba count)
+  (if (<= count 0)
+      nil
+      (cons start-lba (%fat16-lba-range (+ start-lba 1) (- count 1)))))
+
+;; (%fat16-clusters-to-lbas bpb clusters) : clusters(クラスタ番号のリスト、
+;; fat16-cluster-chainの戻り値)を、各クラスタを構成する全セクタのLBA番号を
+;; 順に並べた1本のリストへ展開する。appendの第一引数は常に1クラスタ分
+;; (sectors-per-cluster個、小さい)なので、クラスタ数に関わらずスタックが
+;; 深くならない。
+(defun %fat16-clusters-to-lbas (bpb clusters)
+  (if (null clusters)
+      nil
+      (append (%fat16-lba-range (fat16-cluster-to-lba bpb (car clusters))
+                                 (slot-value bpb 'sectors-per-cluster))
+              (%fat16-clusters-to-lbas bpb (cdr clusters)))))
+
+;; (%fat16-reverse-iter list) : listを反転して返す。init_aot.lispのreverse/nreverse
+;; はLisp関数呼び出し1回につきC呼び出しスタックを1段消費する再帰実装であり
+;; (このインタプリタにはTCOが無いため、末尾再帰であってもスタックは消費される)、
+;; 要素数が数千に及ぶとtriple faultする。whileマクロ(tagbody/goベース、
+;; src/lisp/init.lisp)はgoでの繰り込みがeval_tagbodyの同じCスタックフレーム内の
+;; whileループで処理されるため、繰り返し回数に関わらずCスタックが一定に留まる。
+;; %fat16-read-lba-listから使うため、ここではreverse/nreverseを使わずこの
+;; while版で反転する。
+(defun %fat16-reverse-iter (list)
+  (let ((remaining list) (acc nil))
+    (while remaining
+      (setq acc (cons (car remaining) acc))
+      (setq remaining (cdr remaining)))
+    acc))
+
+;; (%fat16-read-lba-list device lbas) : lbasの順にセクタを読み、連結したbyteリスト
+;; を返す。read-sectorが失敗した場合はそれまでに読んだ分は捨ててnil(既存のIDE層と
+;; 同じ「失敗時nil」の慣習)。
+;;
+;; 以前はappendの第一引数を1セクタ分(512byte)に留める再帰実装だったが、
+;; セクタ数(=defun呼び出しの再帰深さ)がファイルサイズに比例して増えると、
+;; append自体を直さずともこのインタプリタにTCOが無いこと自体が原因で
+;; triple faultした(BIG.TXTの2クラスタ=8セクタで再現、TEST.LSPの1クラスタ=
+;; 4セクタでは再現しなかった)。このためセクタ・バイト単位の繰り込みを
+;; while(tagbody/goベース、Cスタックを消費しない)へ置き換え、再帰を
+;; 一切使わずにファイル全体を読む。
+(defun %fat16-read-lba-list (device lbas)
+  (let ((remaining-lbas lbas) (rev-bytes nil) (ok t))
+    (while (and ok remaining-lbas)
+      (let ((sector-bytes (read-sector device (car remaining-lbas))))
+        (if (null sector-bytes)
+            (setq ok nil)
+            (progn
+              (let ((remaining-bytes sector-bytes))
+                (while remaining-bytes
+                  (setq rev-bytes (cons (car remaining-bytes) rev-bytes))
+                  (setq remaining-bytes (cdr remaining-bytes))))
+              (setq remaining-lbas (cdr remaining-lbas))))))
+    (if ok
+        (%fat16-reverse-iter rev-bytes)
+        nil)))
+
+;; (fat16-read-file device path) : path("/NAME.EXT"形式、単一階層のみ)のファイル
+;; 本体をfixnum(0-255)のリストとして返す。read-sector/write-sectorと同じ
+;; バイト列表現(全体方針: FAT16層のバイト列操作はfixnumリストのまま行う、文字列化
+;; しない)。エントリが見つからない場合・クラスタ読み込みに失敗した場合はnil。
+;; 0byteファイル(size=0)はクラスタを辿らずそのままnil(=空リスト)を返す。
+(defun fat16-read-file (device path)
+  (let ((bpb (fat16-read-bpb device)))
+    (if (null bpb)
+        nil
+        (let ((entry (%fat16-find-dir-entry
+                       (%fat16-scan-root-dir device
+                                              (fat16-root-dir-lba bpb)
+                                              (%fat16-root-dir-sector-count bpb))
+                       (%fat16-path-to-name path))))
+          (if (null entry)
+              nil
+              (let ((size (slot-value entry 'size)))
+                (if (= size 0)
+                    nil
+                    (let ((bytes (%fat16-read-lba-list device
+                                   (%fat16-clusters-to-lbas bpb
+                                     (fat16-cluster-chain device bpb (slot-value entry 'start-cluster))))))
+                      (if (null bytes)
+                          nil
+                          (subseq bytes 0 size))))))))))

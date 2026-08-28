@@ -255,23 +255,26 @@ $(IDE_DISK_IMG): | $(BUILD_TMPDIR)
 	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
 	printf '%s' '$(IDE_TEST_MAGIC)' | dd of=$@ conv=notrunc bs=1 seek=0 2>/dev/null
 
-# FAT16読み書き実装(documents/fs.md FAT16-M0(2)/FAT16-M2/FAT16-M3)用の使い捨て
-# テストイメージ。mkfs.vfat -F 16でFAT16フォーマットした後、loopマウントして
-# 既知内容のテストファイル(空のHELLO.TXT、"Hello from FAT16!"を書いたTEST.LSP)を
-# 配置する。DELETED.TXTは作成後にrmすることでルートディレクトリエントリの先頭
-# バイトが0xE5(削除済みマーカー)になった状態を作る(FAT16-M2の削除済みエントリ
-# スキップ確認用、通常ファイル2件+削除済み1件+残りは0x00の空き終端という並びに
-# なる)。loopマウントはCAP_SYS_ADMIN相当の権限を要するため、このルールのみ
-# --privilegedでdocker run する(他のビルド用ルールは
+# FAT16読み書き実装(documents/fs.md FAT16-M0(2)/FAT16-M2/FAT16-M3/FAT16-M4)用の
+# 使い捨てテストイメージ。mkfs.vfat -F 16でFAT16フォーマットした後、loopマウント
+# して既知内容のテストファイル(空のHELLO.TXT、"Hello from FAT16!"を書いたTEST.LSP、
+# "0123456789"を250回(2500byte、クラスタサイズ2048byteを超えるので2クラスタに
+# 分割される)繰り返したBIG.TXT)を配置する。DELETED.TXTは最後に作成してからrmする
+# ことでルートディレクトリエントリの先頭バイトが0xE5(削除済みマーカー)になった
+# 状態を作る(FAT16-M2の削除済みエントリスキップ確認用)。DELETED.TXTを最後に
+# 作る/消すのは、それより前に作るとカーネルのvfatドライバが後続ファイル作成時に
+# 空いた0xE5スロットを再利用してしまい(実機確認済み)、削除済みマーカーが
+# 消えてしまうため。loopマウントはCAP_SYS_ADMIN相当の権限を要するため、この
+# ルールのみ--privilegedでdocker run する(他のビルド用ルールは
 # --user "$(id -u):$(id -g)"で非rootのまま)。
 #
 # umount後、ホスト側でFATテーブル(1本目、reserved-sectors=4なのでLBA4=バイト
 # オフセット2048から開始)にクラスタ10→11→14→終端という非連続なチェインを直接
 # dd/printfで書き込む(FAT16-M3のfat16-cluster-chain確認用)。クラスタ10/11/14は
-# mkfs.vfat後は未使用(0x0000)で、TEST.LSPが使うクラスタ3とは重複しないため、
-# 実ファイルの内容を破壊せずに合成チェインを作れる。オフセットは
-# reserved-sectors*bytes-per-sector(2048) + cluster-no*2で計算した固定値
-# (2068/2070/2076)、値はLE u16(11=0x0B00/14=0x0E00/終端=0xFFFF)。
+# mkfs.vfat後は未使用(0x0000)で、TEST.LSP/BIG.TXTが使うクラスタとは重複しない
+# (xxd -g1で目視確認済み)ため、実ファイルの内容を破壊せずに合成チェインを作れる。
+# オフセットはreserved-sectors*bytes-per-sector(2048) + cluster-no*2で計算した
+# 固定値(2068/2070/2076)、値はLE u16(11=0x0B00/14=0x0E00/終端=0xFFFF)。
 FAT16_DISK_IMG = $(BUILD_TMPDIR)/fat16_test.img
 FAT16_TEST_STRING = Hello from FAT16!
 
@@ -284,6 +287,7 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 			mount -o loop $@ /mnt/fat16_test; \
 			touch /mnt/fat16_test/HELLO.TXT; \
 			printf "%s\n" "$(FAT16_TEST_STRING)" > /mnt/fat16_test/TEST.LSP; \
+			printf "0123456789%.0s" {1..250} > /mnt/fat16_test/BIG.TXT; \
 			printf "will be deleted" > /mnt/fat16_test/DELETED.TXT; \
 			rm /mnt/fat16_test/DELETED.TXT; \
 			umount /mnt/fat16_test'
