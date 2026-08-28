@@ -259,7 +259,10 @@ $(IDE_DISK_IMG): | $(BUILD_TMPDIR)
 # 使い捨てテストイメージ。mkfs.vfat -F 16でFAT16フォーマットした後、loopマウント
 # して既知内容のテストファイル(空のHELLO.TXT、"Hello from FAT16!"を書いたTEST.LSP、
 # "0123456789"を250回(2500byte、クラスタサイズ2048byteを超えるので2クラスタに
-# 分割される)繰り返したBIG.TXT)を配置する。DELETED.TXTは最後に作成してからrmする
+# 分割される)繰り返したBIG.TXT、"A"を2048回(ちょうど1クラスタ)繰り返した
+# WRITE1.TXT(FAT16-M6書き込みテスト専用、他のテストは読み込み専用のまま変更しない
+# ため書き込み対象はこのファイルのみに限定する)を配置する。DELETED.TXTは
+# 最後に作成してからrmする
 # ことでルートディレクトリエントリの先頭バイトが0xE5(削除済みマーカー)になった
 # 状態を作る(FAT16-M2の削除済みエントリスキップ確認用)。DELETED.TXTを最後に
 # 作る/消すのは、それより前に作るとカーネルのvfatドライバが後続ファイル作成時に
@@ -294,6 +297,7 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 			touch /mnt/fat16_test/HELLO.TXT; \
 			printf "%s\n" "$(FAT16_TEST_STRING)" > /mnt/fat16_test/TEST.LSP; \
 			printf "0123456789%.0s" {1..250} > /mnt/fat16_test/BIG.TXT; \
+			printf "A%.0s" {1..2048} > /mnt/fat16_test/WRITE1.TXT; \
 			printf "will be deleted" > /mnt/fat16_test/DELETED.TXT; \
 			rm /mnt/fat16_test/DELETED.TXT; \
 			umount /mnt/fat16_test'

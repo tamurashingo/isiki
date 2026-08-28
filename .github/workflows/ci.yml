@@ -54,6 +54,6 @@ jobs:
         timeout-minutes: 10
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat16_m0.lisp
 
-      - name: "Run Lisp tests in QEMU (FAT16-M1/M2/M3/M4: BPB parse / root dir / cluster chain / file read)"
+      - name: "Run Lisp tests in QEMU (FAT16-M1/M2/M3/M4/M6a: BPB parse / root dir / cluster chain / file read / write)"
         timeout-minutes: 10
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img

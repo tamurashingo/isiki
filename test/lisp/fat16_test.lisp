@@ -25,14 +25,15 @@
 ;;; --- FAT16-M2: ルートディレクトリエントリの列挙 ---
 ;;
 ;; $(FAT16_DISK_IMG)のルートディレクトリは、作成順にHELLO.TXT(空ファイル)→
-;; TEST.LSP(18byte)→BIG.TXT(2500byte)→DELETED.TXT(最後に作成後にrm、先頭バイトが
-;; 0xE5になる)→残りは0x00の空き終端、という並びになっている(Makefileのmkfs.vfat
-;; 手順を参照。DELETED.TXTを最後に作る/消すのは、それより前に作るとカーネルの
-;; vfatドライバが後続ファイル作成時に空いた0xE5スロットを再利用してしまうため)。
-;; 削除済みエントリはスキップされ、走査は0x00終端で止まるため、戻り値は
-;; HELLO.TXT/TEST.LSP/BIG.TXTの3件のみになるはず。
+;; TEST.LSP(18byte)→BIG.TXT(2500byte)→WRITE1.TXT(2048byte、FAT16-M6書き込み
+;; テスト専用)→DELETED.TXT(最後に作成後にrm、先頭バイトが0xE5になる)→残りは
+;; 0x00の空き終端、という並びになっている(Makefileのmkfs.vfat手順を参照。
+;; DELETED.TXTを最後に作る/消すのは、それより前に作るとカーネルのvfatドライバが
+;; 後続ファイル作成時に空いた0xE5スロットを再利用してしまうため)。削除済み
+;; エントリはスキップされ、走査は0x00終端で止まるため、戻り値はHELLO.TXT/
+;; TEST.LSP/BIG.TXT/WRITE1.TXTの4件のみになるはず。
 
-(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2048))
               (fat16-read-dir *ide-device* "/"))
 
 ;;; --- FAT16-M4: クラスタ→セクタ変換とファイル本体読み込み ---
@@ -70,3 +71,43 @@
 (assert-equal #xFFFF (fat16-fat-entry *ide-device* fat16-test-bpb-m3 14))
 
 (assert-equal (list 10 11 14) (fat16-cluster-chain *ide-device* fat16-test-bpb-m3 10))
+
+;;; --- FAT16-M6a: 既存ファイルの同クラスタ数上書き ---
+;;
+;; WRITE1.TXT(Makefile参照、mkfs.vfat作成時に"A"を2048回=ちょうど1クラスタ分
+;; 書き込んだ書き込みテスト専用ファイル)に対して同じ1クラスタ以内に収まる別内容を
+;; 書き込み、読み込みで一致することを確認する。他の既存ファイル(TEST.LSP/BIG.TXT/
+;; HELLO.TXT)は読み込み専用のまま変更しないため、書き込みはこのファイルにのみ行う。
+
+;; (%fat16-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumリストを
+;; 作るテスト専用ヘルパー。init_aot.lispのcreate-listはこのマイルストンの起動
+;; スクリプト(init.lispのみload)からは使えないため自前で用意する。再帰は使わず
+;; whileで組み立てる(nがファイルサイズに比例して大きくなり得るため、
+;; eval_no_tco_interpreter_stack_limitと同じ理由でLisp再帰を避ける)。
+(defun %fat16-test-make-byte-list (n value)
+  (let ((i 0) (acc nil))
+    (while (< i n)
+      (setq acc (cons value acc))
+      (setq i (+ i 1)))
+    acc))
+
+;; 書き込み前の内容確認(念のため)
+(assert-equal 2048 (length (fat16-read-file *ide-device* "/WRITE1.TXT")))
+(assert-equal 65 (elt (fat16-read-file *ide-device* "/WRITE1.TXT") 0))
+(assert-equal 65 (elt (fat16-read-file *ide-device* "/WRITE1.TXT") 2047))
+
+(defglobal fat16-test-write1-new (list 87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
+
+(assert-equal t (if (fat16-write-file *ide-device* "/WRITE1.TXT" fat16-test-write1-new) t nil))
+(assert-equal fat16-test-write1-new (fat16-read-file *ide-device* "/WRITE1.TXT"))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 10))
+              (fat16-read-dir *ide-device* "/"))
+
+;; クラスタ数が変わる書き込みはFAT16-M6aの責務外としてnilを返す(2049byteは
+;; 1クラスタ=2048byteを超えるため2クラスタ必要になり、現在の1クラスタと
+;; 不一致になる)。拡張はFAT16-M6bの責務、documents/fs.md参照。
+(assert-equal nil (fat16-write-file *ide-device* "/WRITE1.TXT" (%fat16-test-make-byte-list 2049 66)))
+
+;; 直前の(クラスタ数不一致で失敗した)呼び出しでデータ/ディレクトリエントリが
+;; 変更されていないことを確認する
+(assert-equal fat16-test-write1-new (fat16-read-file *ide-device* "/WRITE1.TXT"))
