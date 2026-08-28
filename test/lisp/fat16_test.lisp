@@ -205,3 +205,35 @@
 ;; (中間パス要素・最終要素のいずれの場合も属性チェックで失敗する)
 (assert-equal nil (fat16-read-dir *ide-device* "/TEST.LSP"))
 (assert-equal nil (fat16-read-file *ide-device* "/TEST.LSP/X.TXT"))
+
+;;; --- FAT16-M7b: サブディレクトリ対応(書き込み・新規作成) ---
+;;
+;; fat16-write-file/fat16-create-fileが%fat16-resolve-fileで多階層パスを解決する
+;; ようになったことを、/SUBDIR/NESTED.TXTへの上書きと/SUBDIR/NEW3.TXTの新規作成で
+;; 確認する(ルート直下に対する既存のM6a/M6b/M6cテストは無変更のまま上でも回帰
+;; 確認済み)。
+
+;; 既存ファイル(/SUBDIR/NESTED.TXT、19byte)への同クラスタ内上書き
+(defglobal fat16-test-nested-new (list 78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
+
+(assert-equal t (if (fat16-write-file *ide-device* "/SUBDIR/NESTED.TXT" fat16-test-nested-new) t nil))
+(assert-equal fat16-test-nested-new (fat16-read-file *ide-device* "/SUBDIR/NESTED.TXT"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0))
+              (fat16-read-dir *ide-device* "/SUBDIR"))
+
+;; サブディレクトリ内への新規ファイル作成(1クラスタに収まる非空ファイル)
+(defglobal fat16-test-subdir-new3 (%fat16-test-make-byte-list 50 68)) ;; 全要素68('D')
+
+(assert-equal t (if (fat16-create-file *ide-device* "/SUBDIR/NEW3.TXT" fat16-test-subdir-new3) t nil))
+(assert-equal fat16-test-subdir-new3 (fat16-read-file *ide-device* "/SUBDIR/NEW3.TXT"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0)
+                     (list "NEW3.TXT" ':file 50))
+              (fat16-read-dir *ide-device* "/SUBDIR"))
+
+;; 存在しないディレクトリの下への書き込み・新規作成はいずれもnil
+(assert-equal nil (fat16-write-file *ide-device* "/NOSUCHDIR/X.TXT" fat16-test-subdir-new3))
+(assert-equal nil (fat16-create-file *ide-device* "/NOSUCHDIR/X.TXT" fat16-test-subdir-new3))
+
+;; 2階層下(/SUBDIR/DEEPER)への新規作成も往復一致することを確認する
+(assert-equal t (if (fat16-create-file *ide-device* "/SUBDIR/DEEPER/NEW4.TXT" fat16-test-subdir-new3) t nil))
+(assert-equal fat16-test-subdir-new3 (fat16-read-file *ide-device* "/SUBDIR/DEEPER/NEW4.TXT"))

@@ -219,11 +219,6 @@
   (+ (%fat16-data-start-lba bpb)
      (* (- cluster-no 2) (slot-value bpb 'sectors-per-cluster))))
 
-;; (%fat16-path-to-name path) : "/NAME.EXT"形式のpathから先頭の"/"を除いた名前を
-;; 取り出す。サブディレクトリ対応はFAT16-M7、現状は"/"直下の単一階層のみ想定。
-(defun %fat16-path-to-name (path)
-  (subseq path 1 (length path)))
-
 ;; (%fat16-find-dir-entry entries name) : dir-entryのリストentriesからnameと
 ;; (拡張子まで含めた)8.3名が一致するものを探す。見つからなければnil。
 (defun %fat16-find-dir-entry (entries name)
@@ -404,29 +399,25 @@
                 entry-offset
                 (%fat16-find-entry-in-sector bytes (+ entry-offset 32) (- entries-remaining 1) name))))))
 
-;; (%fat16-find-entry-location-scan device lba sectors-remaining name) : lbaから
-;; sectors-remaining分のルートディレクトリをセクタ単位に走査し、nameと一致する
-;; エントリの(lba . offset-in-sector)を返す。見つからなければnil。
-;; %fat16-scan-root-dir(M2)と同じセクタ間再帰構造(最大32段程度、既に安全性
-;; 実績あり)。
-(defun %fat16-find-entry-location-scan (device lba sectors-remaining name)
-  (if (<= sectors-remaining 0)
-      nil
-      (let ((bytes (read-sector device lba)))
+;; (%fat16-find-entry-location-scan device lbas name) : lbas(ディレクトリを構成する
+;; セクタLBAのリスト、ルート・サブディレクトリのいずれでもよい)を先頭からwhileで
+;; 走査し、nameと一致するエントリの(lba . offset-in-sector)を返す。0x00終端に
+;; 到達するか読み込みに失敗した時点で走査を止める。見つからなければnil。
+;; FAT16-M7bで(lba, 残りセクタ数)引数からLBAリスト+whileへ一般化した
+;; (%fat16-scan-dir-entriesと同じ外側ループの一般化理由、documents/fs.md参照)。
+(defun %fat16-find-entry-location-scan (device lbas name)
+  (let ((remaining-lbas lbas) (result nil) (stopped nil))
+    (while (and remaining-lbas (null result) (not stopped))
+      (let ((bytes (read-sector device (car remaining-lbas))))
         (if (null bytes)
-            nil
+            (setq stopped t)
             (let ((found (%fat16-find-entry-in-sector bytes 0 16 name)))
               (if (eq found 'end)
-                  nil
+                  (setq stopped t)
                   (if (null found)
-                      (%fat16-find-entry-location-scan device (+ lba 1) (- sectors-remaining 1) name)
-                      (cons lba found))))))))
-
-;; (%fat16-find-entry-location device bpb name) : ルートディレクトリからnameと
-;; (拡張子まで含めた)8.3名が一致するエントリの(lba . offset-in-sector)を返す。
-;; 見つからなければnil。
-(defun %fat16-find-entry-location (device bpb name)
-  (%fat16-find-entry-location-scan device (fat16-root-dir-lba bpb) (%fat16-root-dir-sector-count bpb) name))
+                      (setq remaining-lbas (cdr remaining-lbas))
+                      (setq result (cons (car remaining-lbas) found))))))))
+    result))
 
 ;; (%fat16-cluster-count-for-bytes byte-length cluster-bytes) : byte-length分の
 ;; データを格納するのに必要なクラスタ数(切り上げ)。0byteなら0。
@@ -580,19 +571,23 @@
     (%fat16-patch-bytes! dir-bytes (+ dir-offset 28) (%fat16-u32-to-bytes new-size))
     (write-sector device dir-lba dir-bytes)))
 
-;; (fat16-write-file device path bytes) : path("/NAME.EXT"形式)の既存ファイルへ
-;; bytes(fixnum 0-255のリスト)を上書きする。必要クラスタ数が現在のクラスタ数と
-;; 同じ場合はFAT16-M6aの経路(データ→sizeフィールドのみ更新)、必要クラスタ数が
-;; 増える場合はFAT16-M6bの経路(新規クラスタ確保・FATチェイン延長→データ→
-;; start-cluster/sizeフィールド更新)で書き込む。必要クラスタ数が減る場合(縮小)は
-;; FAT16-M6bの対象外としてnilを返し、既存データ/ディレクトリエントリは変更しない。
-;; エントリが見つからない・各段階の書き込みに失敗した場合もnil、成功時はt。
+;; (fat16-write-file device path bytes) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"
+;; のような多階層パス、FAT16-M7b)の既存ファイルへbytes(fixnum 0-255のリスト)を
+;; 上書きする。必要クラスタ数が現在のクラスタ数と同じ場合はFAT16-M6aの経路
+;; (データ→sizeフィールドのみ更新)、必要クラスタ数が増える場合はFAT16-M6bの経路
+;; (新規クラスタ確保・FATチェイン延長→データ→start-cluster/sizeフィールド更新)で
+;; 書き込む。必要クラスタ数が減る場合(縮小)はFAT16-M6bの対象外としてnilを返し、
+;; 既存データ/ディレクトリエントリは変更しない。パスが解決できない・エントリが
+;; 見つからない・各段階の書き込みに失敗した場合もnil、成功時はt。パス解決の実体は
+;; %fat16-resolve-file(FAT16-M7a節)。
 (defun fat16-write-file (device path bytes)
   (let* ((bpb (fat16-read-bpb device)))
     (if (null bpb)
         nil
-        (let* ((name (%fat16-path-to-name path))
-               (loc (%fat16-find-entry-location device bpb name)))
+        (let* ((resolved (%fat16-resolve-file device bpb path))
+               (loc (if (null resolved)
+                        nil
+                        (%fat16-find-entry-location-scan device (car resolved) (cdr resolved)))))
           (if (null loc)
               nil
               (let* ((dir-lba (car loc))
@@ -679,28 +674,24 @@
             entry-offset
             (%fat16-find-free-slot-in-sector bytes (+ entry-offset 32) (- entries-remaining 1))))))
 
-;; (%fat16-find-free-slot-scan device lba sectors-remaining) : lbaからsectors-
-;; remaining分のルートディレクトリをセクタ単位に走査し、最初の空きスロットの
-;; (lba . offset-in-sector)を返す。見つからなければ(ディレクトリ満杯)nil。
-;; %fat16-find-entry-location-scanと同じセクタ間再帰構造(最大32段程度、既に
-;; 安全性実績あり)。
-(defun %fat16-find-free-slot-scan (device lba sectors-remaining)
-  (if (<= sectors-remaining 0)
-      nil
-      (let ((bytes (read-sector device lba)))
+;; (%fat16-find-free-slot-scan device lbas) : lbas(ディレクトリを構成するセクタ
+;; LBAのリスト、ルート・サブディレクトリのいずれでもよい)を先頭からwhileで走査し、
+;; 最初の空きスロット(削除済み0xE5、または終端0x00)の(lba . offset-in-sector)を
+;; 返す。見つからなければ(ディレクトリ満杯)nil。0x00スロットを再利用しても、
+;; 直後のエントリは元から0x00のままなので走査の終端条件は保たれる(0x00の直前に
+;; 別の0x00は存在しないため、特別な後始末は不要)。FAT16-M7bで(lba, 残りセクタ数)
+;; 引数からLBAリスト+whileへ一般化した。
+(defun %fat16-find-free-slot-scan (device lbas)
+  (let ((remaining-lbas lbas) (result nil))
+    (while (and remaining-lbas (null result))
+      (let ((bytes (read-sector device (car remaining-lbas))))
         (if (null bytes)
-            nil
+            (setq remaining-lbas nil)
             (let ((found (%fat16-find-free-slot-in-sector bytes 0 16)))
               (if (null found)
-                  (%fat16-find-free-slot-scan device (+ lba 1) (- sectors-remaining 1))
-                  (cons lba found)))))))
-
-;; (%fat16-find-free-slot device bpb) : ルートディレクトリ中の最初の空きスロット
-;; (削除済み0xE5、または終端0x00)の(lba . offset-in-sector)を返す。0x00スロットを
-;; 再利用しても、直後のエントリは元から0x00のままなので走査の終端条件は保たれる
-;; (0x00の直前に別の0x00は存在しないため、特別な後始末は不要)。
-(defun %fat16-find-free-slot (device bpb)
-  (%fat16-find-free-slot-scan device (fat16-root-dir-lba bpb) (%fat16-root-dir-sector-count bpb)))
+                  (setq remaining-lbas (cdr remaining-lbas))
+                  (setq result (cons (car remaining-lbas) found)))))))
+    result))
 
 ;; (%fat16-build-dir-entry-bytes name-bytes attr start-cluster size) : 32byteの
 ;; 新規ディレクトリエントリ全体を構築する。name-bytesは%fat16-name-to-8.3の戻り値
@@ -721,39 +712,45 @@
       0
       (%fat16-extend-file device bpb 0 0 required-cluster-count bytes)))
 
-;; (fat16-create-file device path bytes) : path("/NAME.EXT"形式)に新規ファイルを
-;; 作成しbytes(fixnum 0-255のリスト、空ならnil)を書き込む。同名エントリが既に
-;; 存在する場合(上書きはfat16-write-fileの役割)、8.3名変換に失敗した場合
-;; (ロングファイルネーム相当)、空きディレクトリスロットが無い場合(ディレクトリ
-;; 満杯)、クラスタ確保に失敗した場合(ディスクフル)はいずれもnilを返し、
-;; 何も変更しない。属性は#x20(ARCHIVE、通常ファイルの標準値)固定。
+;; (fat16-create-file device path bytes) : path("/NAME.EXT"、または
+;; "/DOCS/NAME.EXT"のような多階層パス、FAT16-M7b)に新規ファイルを作成しbytes
+;; (fixnum 0-255のリスト、空ならnil)を書き込む。親ディレクトリが解決できない場合、
+;; 同名エントリが既に存在する場合(上書きはfat16-write-fileの役割)、8.3名変換に
+;; 失敗した場合(ロングファイルネーム相当)、空きディレクトリスロットが無い場合
+;; (ディレクトリ満杯)、クラスタ確保に失敗した場合(ディスクフル)はいずれもnilを
+;; 返し、何も変更しない。属性は#x20(ARCHIVE、通常ファイルの標準値)固定。パス
+;; 解決の実体は%fat16-resolve-file(FAT16-M7a節)。
 (defun fat16-create-file (device path bytes)
   (let* ((bpb (fat16-read-bpb device)))
     (if (null bpb)
         nil
-        (let ((name (%fat16-path-to-name path)))
-          (if (%fat16-find-entry-location device bpb name)
+        (let ((resolved (%fat16-resolve-file device bpb path)))
+          (if (null resolved)
               nil
-              (let ((name-bytes (%fat16-name-to-8.3 name)))
-                (if (null name-bytes)
+              (let* ((lbas (car resolved))
+                     (name (cdr resolved)))
+                (if (%fat16-find-entry-location-scan device lbas name)
                     nil
-                    (let ((slot (%fat16-find-free-slot device bpb)))
-                      (if (null slot)
+                    (let ((name-bytes (%fat16-name-to-8.3 name)))
+                      (if (null name-bytes)
                           nil
-                          (let* ((cluster-bytes (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
-                                 (required-cluster-count (%fat16-cluster-count-for-bytes (length bytes) cluster-bytes))
-                                 (start-cluster (%fat16-allocate-new-file-data device bpb required-cluster-count bytes)))
-                            (if (null start-cluster)
+                          (let ((slot (%fat16-find-free-slot-scan device lbas)))
+                            (if (null slot)
                                 nil
-                                (let* ((slot-lba (car slot))
-                                       (slot-offset (cdr slot))
-                                       (slot-bytes (read-sector device slot-lba))
-                                       (entry-bytes (%fat16-build-dir-entry-bytes name-bytes #x20 start-cluster (length bytes))))
-                                  (if (null slot-bytes)
+                                (let* ((cluster-bytes (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+                                       (required-cluster-count (%fat16-cluster-count-for-bytes (length bytes) cluster-bytes))
+                                       (start-cluster (%fat16-allocate-new-file-data device bpb required-cluster-count bytes)))
+                                  (if (null start-cluster)
                                       nil
-                                      (progn
-                                        (%fat16-patch-bytes! slot-bytes slot-offset entry-bytes)
-                                        (write-sector device slot-lba slot-bytes)))))))))))))))
+                                      (let* ((slot-lba (car slot))
+                                             (slot-offset (cdr slot))
+                                             (slot-bytes (read-sector device slot-lba))
+                                             (entry-bytes (%fat16-build-dir-entry-bytes name-bytes #x20 start-cluster (length bytes))))
+                                        (if (null slot-bytes)
+                                            nil
+                                            (progn
+                                              (%fat16-patch-bytes! slot-bytes slot-offset entry-bytes)
+                                              (write-sector device slot-lba slot-bytes)))))))))))))))))
 
 ;;; --- FAT16-M7a: サブディレクトリ対応(読み込み・パス解決) ---
 ;;
