@@ -125,6 +125,22 @@ uint8_t inb(uint16_t port) {
     return g_next_in_val;
 }
 
+// cc_in_16/cc_out_16(%%IN-16/%%OUT-16)用のoutb/inbと対になるモック
+static uint16_t g_last_out16_port = 0;
+static uint16_t g_last_out16_val = 0;
+static uint16_t g_last_in16_port = 0;
+static uint16_t g_next_in16_val = 0;
+
+void outw(uint16_t port, uint16_t val) {
+    g_last_out16_port = port;
+    g_last_out16_val = val;
+}
+
+uint16_t inw(uint16_t port) {
+    g_last_in16_port = port;
+    return g_next_in16_val;
+}
+
 #define HEAP_SIZE (1024 * 1024)
 
 static void setup_heap() {
@@ -177,18 +193,98 @@ void test_cc_poke() {
     assert(v == os_make_fixnum(0xCD), "cc_pokeは書き込んだ値をfixnumで返す");
 }
 
+void test_cc_in_16() {
+    g_next_in16_val = 0x1234;
+    lisp_val_t args[1] = { os_make_fixnum(0x170) };
+    lisp_val_t v = cc_in_16(make_args(1, args), nil);
+
+    assert(g_last_in16_port == 0x170, "cc_in_16はポート0x170でinwを呼ぶ");
+    assert(v == os_make_fixnum(0x1234), "cc_in_16はinwが返した0x1234をfixnumで返す");
+}
+
+void test_cc_out_16() {
+    lisp_val_t args[2] = { os_make_fixnum(0x170), os_make_fixnum(0x5678) };
+    lisp_val_t v = cc_out_16(make_args(2, args), nil);
+
+    assert(g_last_out16_port == 0x170, "cc_out_16はポート0x170でoutwを呼ぶ");
+    assert(g_last_out16_val == 0x5678, "cc_out_16は値0x5678でoutwを呼ぶ");
+    assert(v == os_make_fixnum(0x5678), "cc_out_16は書き込んだ値をfixnumで返す");
+}
+
+void test_cc_logand() {
+    lisp_val_t args[2] = { os_make_fixnum(0xF0F0), os_make_fixnum(0xFF00) };
+    lisp_val_t v = cc_logand(make_args(2, args), nil);
+
+    assert(v == os_make_fixnum(0xF000), "cc_logandは2引数のビットごとのANDをfixnumで返す");
+}
+
+void test_cc_logior() {
+    lisp_val_t args[2] = { os_make_fixnum(0xF0F0), os_make_fixnum(0x0F0F) };
+    lisp_val_t v = cc_logior(make_args(2, args), nil);
+
+    assert(v == os_make_fixnum(0xFFFF), "cc_logiorは2引数のビットごとのORをfixnumで返す");
+}
+
+void test_cc_logxor() {
+    lisp_val_t args[2] = { os_make_fixnum(0xFF00), os_make_fixnum(0xF0F0) };
+    lisp_val_t v = cc_logxor(make_args(2, args), nil);
+
+    assert(v == os_make_fixnum(0x0FF0), "cc_logxorは2引数のビットごとのXORをfixnumで返す");
+}
+
+void test_cc_ash() {
+    lisp_val_t left_args[2] = { os_make_fixnum(0x01), os_make_fixnum(8) };
+    lisp_val_t left = cc_ash(make_args(2, left_args), nil);
+    assert(left == os_make_fixnum(0x100), "cc_ashは正のcountで左シフトする");
+
+    lisp_val_t right_args[2] = { os_make_fixnum(0x100), os_make_fixnum_signed(1, 8) };
+    lisp_val_t right = cc_ash(make_args(2, right_args), nil);
+    assert(right == os_make_fixnum(0x01), "cc_ashは負のcountで右シフトする");
+}
+
+void test_cc_char_code() {
+    lisp_val_t args[1] = { ((lisp_val_t)0x41 << 3) | TAG_CHAR };
+    lisp_val_t v = cc_char_code(make_args(1, args), nil);
+
+    assert(v == os_make_fixnum(0x41), "cc_char_codeは文字'A'(0x41)のタグを外した文字コードをfixnumで返す");
+}
+
+void test_cc_code_char() {
+    lisp_val_t args[1] = { os_make_fixnum(0x41) };
+    lisp_val_t v = cc_code_char(make_args(1, args), nil);
+
+    assert((v & TAG_MASK) == TAG_CHAR, "cc_code_charはTAG_CHARタグ付きの値を返す");
+    assert((v >> 3) == 0x41, "cc_code_charは文字コード0x41をタグ付けした値を返す");
+}
+
 void test_os_register_subprimitives() {
     os_register_subprimitives();
 
     lisp_val_t in8 = os_get_function(os_make_symbol("%%IN-8"), global_environment);
     lisp_val_t out8 = os_get_function(os_make_symbol("%%OUT-8"), global_environment);
+    lisp_val_t in16 = os_get_function(os_make_symbol("%%IN-16"), global_environment);
+    lisp_val_t out16 = os_get_function(os_make_symbol("%%OUT-16"), global_environment);
     lisp_val_t peek = os_get_function(os_make_symbol("%%PEEK"), global_environment);
     lisp_val_t poke = os_get_function(os_make_symbol("%%POKE"), global_environment);
+    lisp_val_t logand = os_get_function(os_make_symbol("%%LOGAND"), global_environment);
+    lisp_val_t logior = os_get_function(os_make_symbol("%%LOGIOR"), global_environment);
+    lisp_val_t logxor = os_get_function(os_make_symbol("%%LOGXOR"), global_environment);
+    lisp_val_t ash = os_get_function(os_make_symbol("%%ASH"), global_environment);
+    lisp_val_t char_code = os_get_function(os_make_symbol("%%CHAR-CODE"), global_environment);
+    lisp_val_t code_char = os_get_function(os_make_symbol("%%CODE-CHAR"), global_environment);
 
     assert(in8 != nil, "os_register_subprimitives後は%%IN-8がglobal_environmentから引ける");
     assert(out8 != nil, "os_register_subprimitives後は%%OUT-8がglobal_environmentから引ける");
+    assert(in16 != nil, "os_register_subprimitives後は%%IN-16がglobal_environmentから引ける");
+    assert(out16 != nil, "os_register_subprimitives後は%%OUT-16がglobal_environmentから引ける");
     assert(peek != nil, "os_register_subprimitives後は%%PEEKがglobal_environmentから引ける");
     assert(poke != nil, "os_register_subprimitives後は%%POKEがglobal_environmentから引ける");
+    assert(logand != nil, "os_register_subprimitives後は%%LOGANDがglobal_environmentから引ける");
+    assert(logior != nil, "os_register_subprimitives後は%%LOGIORがglobal_environmentから引ける");
+    assert(logxor != nil, "os_register_subprimitives後は%%LOGXORがglobal_environmentから引ける");
+    assert(ash != nil, "os_register_subprimitives後は%%ASHがglobal_environmentから引ける");
+    assert(char_code != nil, "os_register_subprimitives後は%%CHAR-CODEがglobal_environmentから引ける");
+    assert(code_char != nil, "os_register_subprimitives後は%%CODE-CHARがglobal_environmentから引ける");
 }
 
 int main(int argc, char** argv) {
@@ -199,8 +295,16 @@ int main(int argc, char** argv) {
 
     test_cc_in_8();
     test_cc_out_8();
+    test_cc_in_16();
+    test_cc_out_16();
     test_cc_peek();
     test_cc_poke();
+    test_cc_logand();
+    test_cc_logior();
+    test_cc_logxor();
+    test_cc_ash();
+    test_cc_char_code();
+    test_cc_code_char();
     test_os_register_subprimitives();
 
     return g_test_failed ? 1 : 0;

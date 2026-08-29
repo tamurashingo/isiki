@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,7 @@
 #include "process.h"
 #include "lisp.h"
 #include "eval.h"
+#include "subprimitive.h"
 
 // runtime.c/process.c/za.c/reader.c/stream.c/stream_lisp.cをリンクするため、それらが
 // 参照するハードウェア/REPL依存の関数のダミー実装が必要になる(runtime_test.cと同じ
@@ -94,6 +96,29 @@ const void *get_fpu_default_state(void) {
 
 void os_repl_step(process_t *proc) {
     (void)proc;
+}
+
+// subprimitive.c(logand/logior/logxor/ashが呼ぶcc_logand等、FAT16-M0(0))が
+// 参照するinterrupt.cの実I/O命令のダミー実装。このテストではポートI/Oを
+// 実際には行わないため、subprimitive_test.cと同じ方針で最低限のスタブを置く
+void outb(uint16_t port, uint8_t val) {
+    (void)port;
+    (void)val;
+}
+
+uint8_t inb(uint16_t port) {
+    (void)port;
+    return 0;
+}
+
+void outw(uint16_t port, uint16_t val) {
+    (void)port;
+    (void)val;
+}
+
+uint16_t inw(uint16_t port) {
+    (void)port;
+    return 0;
 }
 
 void os_wait_for_more_input(process_t *proc) {

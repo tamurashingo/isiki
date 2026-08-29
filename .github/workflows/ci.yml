@@ -45,3 +45,15 @@ jobs:
       - name: "Run Lisp tests in QEMU (milestone 4: environment)"
         timeout-minutes: 10
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m4_environment.lisp
+
+      - name: "Run Lisp tests in QEMU (milestone 5: IDE/ATA PIO block device)"
+        timeout-minutes: 10
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
+
+      - name: "Run Lisp tests in QEMU (FAT16-M0: bitwise ops / char-code subprimitives)"
+        timeout-minutes: 10
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat16_m0.lisp
+
+      - name: "Run Lisp tests in QEMU (FAT16-M1/M2/M3/M4/M6a/M6b/M6c/M7a/M7b/M7c: BPB parse / root dir / cluster chain / file read / write / extend / create / subdirectories / mkdir)"
+        timeout-minutes: 10
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img

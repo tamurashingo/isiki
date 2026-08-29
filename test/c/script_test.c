@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include "eval.h"
 #include "stream_lisp.h"
 #include "format.h"
+#include "subprimitive.h"
 
 // src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
 // gitignore対象のビルド成果物)で定義される。init.lispから移動したmember/assoc等を
@@ -108,6 +110,29 @@ const void *get_fpu_default_state(void) {
 
 void os_repl_step(process_t *proc) {
     (void)proc;
+}
+
+// subprimitive.c(logand/logior/logxor/ashが呼ぶcc_logand等、FAT16-M0(0))が
+// 参照するinterrupt.cの実I/O命令のダミー実装。このテストではポートI/Oを
+// 実際には行わないため、subprimitive_test.cと同じ方針で最低限のスタブを置く
+void outb(uint16_t port, uint8_t val) {
+    (void)port;
+    (void)val;
+}
+
+uint8_t inb(uint16_t port) {
+    (void)port;
+    return 0;
+}
+
+void outw(uint16_t port, uint16_t val) {
+    (void)port;
+    (void)val;
+}
+
+uint16_t inw(uint16_t port) {
+    (void)port;
+    return 0;
 }
 
 // os_repl_stepは本来呼び出し前にproc->envを遅延生成するが、上のダミー実装は何もしないため、

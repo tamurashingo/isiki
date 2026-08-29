@@ -6,6 +6,7 @@
 #include "runtime.h"
 #include "repl.h"
 #include "subprimitive.h"
+#include "ide_subprimitive.h"
 #include "virtio9p.h"
 #include "load.h"
 #include "eval.h"
@@ -85,6 +86,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_heap_init(heap_base, heap_size);
     os_bootstrap();
     os_register_subprimitives();
+    os_register_ide_subprimitives();
     os_register_load();
     os_register_eval_primitives();
     os_register_streams();
@@ -113,7 +115,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     // (test/lisp/qemu_boot_test.lisp、全milestoneを通しで実行する)をそのまま使う。
     // kernel_mainのブート時スタック上で直接cc_loadを呼ぶとスタックサイズ不足で
     // クラッシュするため、process 0がタイマー割り込み経由で最初に起動される際に
-    // (16KBの専用スタック上で)実行させる(process_trampoline_c参照)
+    // (process 0専用のスタック(STACK_SIZE、process.c参照)上で)実行させる(process_trampoline_c参照)
     os_stream_t trigger_probe;
     char trigger_err[64];
     int qemu_test_mode = 0;
