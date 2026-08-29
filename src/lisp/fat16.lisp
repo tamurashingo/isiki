@@ -198,13 +198,23 @@
 ;; 0xFFF8以上(0xFFFFの正規終端マーカーを含む、documents/fs.mdの簡略化した扱いに
 ;; 従いbad-cluster等も終端として扱う)なら終端、それ未満は次クラスタへの参照として
 ;; 辿る。fat16-fat-entryがnilを返した(読み込み失敗)場合もそこで打ち切る。
+;; クラスタ数に比例して深くなるためLisp再帰ではなくwhileで書く(%fat16-find-free-cluster
+;; と同じ理由、documents/fs.md参照)。上限は%fat16-total-cluster-count+2(クラスタ番号は
+;; 2始まり)とし、万一FATが破損して自己参照/循環したチェインになっていても無限ループ
+;; せず打ち切る(eval.cにはTCOもスタックガードも無いため、再帰実装だと破損チェインが
+;; そのままハング/メモリ破損につながり得る)。
 (defun fat16-cluster-chain (device bpb start-cluster)
-  (let ((entry (fat16-fat-entry device bpb start-cluster)))
-    (if (null entry)
-        (list start-cluster)
-        (if (>= entry #xFFF8)
-            (list start-cluster)
-            (cons start-cluster (fat16-cluster-chain device bpb entry))))))
+  (let ((cluster start-cluster) (count 0)
+        (limit (+ (%fat16-total-cluster-count bpb) 2))
+        (rev-chain nil) (done nil))
+    (while (and (not done) (< count limit))
+      (setq rev-chain (cons cluster rev-chain))
+      (setq count (+ count 1))
+      (let ((entry (fat16-fat-entry device bpb cluster)))
+        (if (or (null entry) (>= entry #xFFF8))
+            (setq done t)
+            (setq cluster entry))))
+    (%fat16-reverse-iter rev-chain)))
 
 ;;; --- FAT16-M4: クラスタ→セクタ変換とファイル本体読み込み ---
 
@@ -238,15 +248,19 @@
 
 ;; (%fat16-clusters-to-lbas bpb clusters) : clusters(クラスタ番号のリスト、
 ;; fat16-cluster-chainの戻り値)を、各クラスタを構成する全セクタのLBA番号を
-;; 順に並べた1本のリストへ展開する。appendの第一引数は常に1クラスタ分
-;; (sectors-per-cluster個、小さい)なので、クラスタ数に関わらずスタックが
-;; 深くならない。
+;; 順に並べた1本のリストへ展開する。clustersの要素数に比例して深くなるため、
+;; 外側はwhileで辿る(1クラスタ分のLBA展開自体は%fat16-lba-range、既存のまま
+;; 小さい再帰で安全)。
 (defun %fat16-clusters-to-lbas (bpb clusters)
-  (if (null clusters)
-      nil
-      (append (%fat16-lba-range (fat16-cluster-to-lba bpb (car clusters))
-                                 (slot-value bpb 'sectors-per-cluster))
-              (%fat16-clusters-to-lbas bpb (cdr clusters)))))
+  (let ((remaining clusters) (rev-lbas nil))
+    (while remaining
+      (let ((lba-range (%fat16-lba-range (fat16-cluster-to-lba bpb (car remaining))
+                                          (slot-value bpb 'sectors-per-cluster))))
+        (while lba-range
+          (setq rev-lbas (cons (car lba-range) rev-lbas))
+          (setq lba-range (cdr lba-range))))
+      (setq remaining (cdr remaining)))
+    (%fat16-reverse-iter rev-lbas)))
 
 ;; (%fat16-reverse-iter list) : listを反転して返す。init_aot.lispのreverse/nreverse
 ;; はLisp関数呼び出し1回につきC呼び出しスタックを1段消費する再帰実装であり
