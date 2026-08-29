@@ -97,7 +97,7 @@ void process_scheduler_start(void);
 /**
  * make test-qemu用の自動テストモードを有効化する。有効化後、process_scheduler_start
  * によりprocess 0が最初にタイマー割り込み経由で起動された際、通常のREPLループの代わりに
- * test_entryを呼ぶ(process 0専用の16KBスタック上で実行することで、kernel_mainの
+ * test_entryを呼ぶ(process 0専用のスタック(STACK_SIZE、process.c参照)上で実行することで、kernel_mainの
  * ブート時スタック上で直接cc_loadを実行した場合に発生するクラッシュを避ける)。
  * @param test_entry process 0の初回起動時に呼ぶ関数(戻ってきた場合は通常のREPLループへ
  *   フォールバックする)
