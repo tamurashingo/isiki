@@ -357,6 +357,8 @@ double os_heap_used_ratio(void) {
  * @return From空間の総バイト数のfixnum
  */
 lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     return os_make_fixnum((UINT64)(g_from_end - g_from_start));
 }
 
@@ -368,6 +370,8 @@ lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env) {
  * @return From空間の使用バイト数のfixnum
  */
 lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     return os_make_fixnum((UINT64)(g_from_ptr - g_from_start));
 }
 
@@ -417,6 +421,8 @@ UINT64 os_imm_pages_used_for_test(void) {
  * @return Immobilized Spaceの総バイト数のfixnum
  */
 lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     return os_make_fixnum((UINT64)IMM_SPACE_SIZE);
 }
 
@@ -429,6 +435,8 @@ lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env) {
  * @return Immobilized Spaceの使用バイト数のfixnum
  */
 lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     return os_make_fixnum((UINT64)(g_imm_bump - g_imm_space));
 }
 
@@ -2628,6 +2636,7 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
  * @return 第一引数のcar
  */
 lisp_val_t primitive_car(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t target = cc_car(args); // 第一引数
     return cc_car(target);
 }
@@ -2639,6 +2648,7 @@ lisp_val_t primitive_car(lisp_val_t args, lisp_val_t env) {
  * @return 第一引数のcdr
  */
 lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t target = cc_car(args); // 第一引数
     return cc_cdr(target);
 }
@@ -2654,6 +2664,7 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
  * @return 合計値の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     if (any_float(args)) {
         double sum = 0.0;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
@@ -2759,6 +2770,7 @@ lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
  * @return 減算結果の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t first = cc_car(args);
 
     if (any_float(args)) {
@@ -2850,6 +2862,7 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
  * @return 新しく作られたCONS
  */
 lisp_val_t primitive_cons(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t car = cc_car(args);
     lisp_val_t cdr = cc_car(cc_cdr(args));
     return os_make_cons(car, cdr);
@@ -2862,6 +2875,7 @@ lisp_val_t primitive_cons(lisp_val_t args, lisp_val_t env) {
  * @return 同一ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_eq(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t a = cc_car(args);
     lisp_val_t b = cc_car(cc_cdr(args));
     return a == b ? g_sym_t : nil;
@@ -2886,6 +2900,7 @@ lisp_val_t primitive_eq2(lisp_val_t a, lisp_val_t b) {
  * @return nilならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_null(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     return cc_car(args) == nil ? g_sym_t : nil;
 }
 
@@ -2909,6 +2924,7 @@ lisp_val_t primitive_null1(lisp_val_t a) {
  * @return 積の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     if (any_float(args)) {
         double product = 1.0;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
@@ -2991,6 +3007,7 @@ lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
  * @return 除算結果の数値。floatが絡まず0除算の場合はg_sym_eval_error
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t first = cc_car(args);
 
     if (any_float(args)) {
@@ -3063,6 +3080,7 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
  * @return 単調増加ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
             return nil;
@@ -3092,6 +3110,7 @@ lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
  * @return 単調減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
             return nil;
@@ -3121,6 +3140,7 @@ lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
  * @return すべて等しいならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
             return nil;
@@ -3152,6 +3172,7 @@ lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
  * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
             return nil;
@@ -3167,6 +3188,7 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
  * @return 単調非増加ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
             return nil;
@@ -3196,6 +3218,7 @@ lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
  * @return 単調非減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
             return nil;
@@ -3225,6 +3248,7 @@ lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
  * @return 最大の要素
  */
 lisp_val_t primitive_max(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t best = cc_car(args);
     for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
         lisp_val_t v = cc_car(rest);
@@ -3242,6 +3266,7 @@ lisp_val_t primitive_max(lisp_val_t args, lisp_val_t env) {
  * @return 最小の要素
  */
 lisp_val_t primitive_min(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t best = cc_car(args);
     for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
         lisp_val_t v = cc_car(rest);
@@ -3260,6 +3285,7 @@ lisp_val_t primitive_min(lisp_val_t args, lisp_val_t env) {
  * @return 絶対値の整数
  */
 lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) == TAG_FIXNUM) {
         if (!os_fixnum_is_negative(val)) {
@@ -3284,6 +3310,7 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
  * @return floor除算の商。z2が0の場合はg_sym_eval_error
  */
 lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
 
@@ -3304,6 +3331,7 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
  * @return floor除算の余り。z2が0の場合はg_sym_eval_error
  */
 lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
 
@@ -3323,6 +3351,7 @@ lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
  * @return 最大公約数(非負整数)
  */
 lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
     return mag_gcd(z1, z2);
@@ -3336,6 +3365,7 @@ lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env) {
  * @return 最小公倍数(非負整数)
  */
 lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
     GC_PROTECT(z1);
@@ -3382,6 +3412,7 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
  * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
  */
 lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     signed_mag_t m;
     decompose(val, &m);
@@ -3418,6 +3449,7 @@ static double sqrt_fpu(double d) {
  * @return 平方根。負数が渡された場合はsignal_domain_errorの戻り値
  */
 lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
 
     if (is_float(val)) {
@@ -3558,6 +3590,7 @@ static double exp_fpu(double x) {
  * @return e^x
  */
 lisp_val_t primitive_exp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     return os_make_float(exp_fpu(to_double(cc_car(args))));
 }
 
@@ -3591,6 +3624,7 @@ static double sin_fpu(double x) {
  * @return sin(x)
  */
 lisp_val_t primitive_sin(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     return os_make_float(sin_fpu(to_double(cc_car(args))));
 }
 
@@ -3623,6 +3657,7 @@ static double cos_fpu(double x) {
  * @return cos(x)
  */
 lisp_val_t primitive_cos(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     return os_make_float(cos_fpu(to_double(cc_car(args))));
 }
 
@@ -3659,6 +3694,7 @@ static double atan2_fpu(double y, double x) {
  * @return atan2(y, x)
  */
 lisp_val_t primitive_atan2(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     double y = to_double(cc_car(args));
     double x = to_double(cc_car(cc_cdr(args)));
     return os_make_float(atan2_fpu(y, x));
@@ -3759,6 +3795,7 @@ static double round_via_x87(double x, UINT16 rc_bits) {
  * @return floor(x)
  */
 lisp_val_t primitive_floor(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (!is_float(val)) {
         return val;
@@ -3774,6 +3811,7 @@ lisp_val_t primitive_floor(lisp_val_t args, lisp_val_t env) {
  * @return ceiling(x)
  */
 lisp_val_t primitive_ceiling(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (!is_float(val)) {
         return val;
@@ -3789,6 +3827,7 @@ lisp_val_t primitive_ceiling(lisp_val_t args, lisp_val_t env) {
  * @return truncate(x)
  */
 lisp_val_t primitive_truncate(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (!is_float(val)) {
         return val;
@@ -3805,6 +3844,7 @@ lisp_val_t primitive_truncate(lisp_val_t args, lisp_val_t env) {
  * @return round(x)
  */
 lisp_val_t primitive_round(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (!is_float(val)) {
         return val;
@@ -3831,6 +3871,7 @@ lisp_val_t primitive_parse_number(lisp_val_t args, lisp_val_t env) {
  * @return 数値ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) == TAG_FIXNUM) {
         return g_sym_t;
@@ -3851,6 +3892,7 @@ lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
  * @return FIXNUMならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     return (val & TAG_MASK) == TAG_FIXNUM ? g_sym_t : nil;
 }
@@ -3862,6 +3904,7 @@ lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env) {
  * @return bignumならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_BIGNUM) {
         return g_sym_t;
@@ -3876,6 +3919,7 @@ lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env) {
  * @return floatならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     return is_float(cc_car(args)) ? g_sym_t : nil;
 }
 
@@ -3886,6 +3930,7 @@ lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env) {
  * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
  */
 lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t x = cc_car(args);
     if (is_float(x)) {
         return x;
@@ -3905,6 +3950,7 @@ lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
  * @return symbolならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (val == nil) {
         return g_sym_t;
@@ -3920,6 +3966,7 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env) {
  * @return consならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (val == nil) {
         return nil;
@@ -3947,6 +3994,7 @@ lisp_val_t primitive_atom1(lisp_val_t val) {
  * @return consでなければg_sym_t、consならnil
  */
 lisp_val_t primitive_atom(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     return primitive_atom1(cc_car(args));
 }
 
@@ -3962,6 +4010,7 @@ lisp_val_t primitive_atom(lisp_val_t args, lisp_val_t env) {
  * @return 同一ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_eql(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t a = cc_car(args);
     lisp_val_t b = cc_car(cc_cdr(args));
     if (a == b) {
@@ -4074,6 +4123,7 @@ static int values_equal(lisp_val_t a, lisp_val_t b) {
  * @return 構造的に同値ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t a = cc_car(args);
     lisp_val_t b = cc_car(cc_cdr(args));
     return values_equal(a, b) ? g_sym_t : nil;
@@ -4086,6 +4136,7 @@ lisp_val_t primitive_equal(lisp_val_t args, lisp_val_t env) {
  * @return listならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (val == nil) {
         return g_sym_t;
@@ -4100,6 +4151,7 @@ lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env) {
  * @return characterならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_characterp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     return (val & TAG_MASK) == TAG_CHAR ? g_sym_t : nil;
 }
@@ -4122,6 +4174,7 @@ static int char_compare(lisp_val_t a, lisp_val_t b) {
  * @return すべて等しいならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_char_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
             return nil;
@@ -4139,6 +4192,7 @@ lisp_val_t primitive_char_equal(lisp_val_t args, lisp_val_t env) {
  * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_char_not_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
             return nil;
@@ -4154,6 +4208,7 @@ lisp_val_t primitive_char_not_equal(lisp_val_t args, lisp_val_t env) {
  * @return 単調増加ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_char_less_than(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
             return nil;
@@ -4169,6 +4224,7 @@ lisp_val_t primitive_char_less_than(lisp_val_t args, lisp_val_t env) {
  * @return 単調減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_char_greater_than(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
             return nil;
@@ -4184,6 +4240,7 @@ lisp_val_t primitive_char_greater_than(lisp_val_t args, lisp_val_t env) {
  * @return 単調非減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_char_less_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
             return nil;
@@ -4199,6 +4256,7 @@ lisp_val_t primitive_char_less_equal(lisp_val_t args, lisp_val_t env) {
  * @return 単調非増加ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_char_greater_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (char_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
             return nil;
@@ -4237,6 +4295,7 @@ static int string_compare(lisp_val_t a, lisp_val_t b) {
  * @return すべて等しいならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_string_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
             return nil;
@@ -4253,6 +4312,7 @@ lisp_val_t primitive_string_equal(lisp_val_t args, lisp_val_t env) {
  * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_string_not_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
             return nil;
@@ -4268,6 +4328,7 @@ lisp_val_t primitive_string_not_equal(lisp_val_t args, lisp_val_t env) {
  * @return 単調増加ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_string_less_than(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
             return nil;
@@ -4283,6 +4344,7 @@ lisp_val_t primitive_string_less_than(lisp_val_t args, lisp_val_t env) {
  * @return 単調減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_string_greater_than(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
             return nil;
@@ -4298,6 +4360,7 @@ lisp_val_t primitive_string_greater_than(lisp_val_t args, lisp_val_t env) {
  * @return 単調非減少ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_string_less_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
             return nil;
@@ -4313,6 +4376,7 @@ lisp_val_t primitive_string_less_equal(lisp_val_t args, lisp_val_t env) {
  * @return 単調非増加ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_string_greater_equal(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (string_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
             return nil;
@@ -4329,6 +4393,7 @@ lisp_val_t primitive_string_greater_equal(lisp_val_t args, lisp_val_t env) {
  * @return 見つかった位置(FIXNUM)、見つからなければnil
  */
 lisp_val_t primitive_char_index(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t ch = cc_car(args);
     lisp_val_t str = cc_car(cc_cdr(args));
     lisp_val_t rest = cc_cdr(cc_cdr(args));
@@ -4355,6 +4420,7 @@ lisp_val_t primitive_char_index(lisp_val_t args, lisp_val_t env) {
  * @return 見つかった位置(FIXNUM)、見つからなければnil
  */
 lisp_val_t primitive_string_index(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t sub = cc_car(args);
     lisp_val_t str = cc_car(cc_cdr(args));
     lisp_val_t rest = cc_cdr(cc_cdr(args));
@@ -4392,6 +4458,7 @@ lisp_val_t primitive_string_index(lisp_val_t args, lisp_val_t env) {
  * @return 連結結果のSTRING
  */
 lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     GC_PROTECT(args);
     UINT64 total_len = 0;
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
@@ -4422,6 +4489,7 @@ lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env) {
  * @return stringならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     return (val & TAG_MASK) == TAG_STRING ? g_sym_t : nil;
 }
@@ -4434,6 +4502,7 @@ lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env) {
  * @return 関数ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
@@ -4451,6 +4520,7 @@ lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env) {
  * @return JITコンパイル済みならg_sym_t、インタプリタ実行(またはそれ以外)ならnil
  */
 lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
@@ -4460,12 +4530,15 @@ lisp_val_t primitive_za_compiled_p(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t primitive_make_environment(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t name = cc_car(args);
     lisp_val_t parent_env = cc_car(cc_cdr(args));
     return os_make_environment(name, parent_env);
 }
 
 lisp_val_t primitive_current_environment(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     process_t *proc = get_current_process();
     // envの遅延生成(repl.c os_repl_stepと同じos_make_process_environmentを使う)。
     // REPL経由の実行ではos_repl_stepが初回呼び出し時に生成するが、cc_load経由
@@ -4522,6 +4595,8 @@ lisp_val_t primitive_eval_in_environment(lisp_val_t args, lisp_val_t env) {
  * @return 常にnil
  */
 lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     return nil;
 }
 
@@ -4532,6 +4607,7 @@ lisp_val_t primitive_generic_function_p(lisp_val_t args, lisp_val_t env) {
  * @return basic-arrayならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     UINT64 tag = val & TAG_MASK;
     return (is_vector(val) || tag == TAG_STRING) ? g_sym_t : nil;
@@ -4546,6 +4622,7 @@ lisp_val_t primitive_basic_array_p(lisp_val_t args, lisp_val_t env) {
  * @return rank!=1のVECTORならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (!is_vector(val)) {
         return nil;
@@ -4562,6 +4639,7 @@ lisp_val_t primitive_array_star_p(lisp_val_t args, lisp_val_t env) {
  * @return basic-vectorならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_basic_vector_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) == TAG_STRING) {
         return g_sym_t;
@@ -4581,6 +4659,7 @@ lisp_val_t primitive_basic_vector_p(lisp_val_t args, lisp_val_t env) {
  * @return general-vectorならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_general_vector_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if (!is_vector(val)) {
         return nil;
@@ -4596,6 +4675,7 @@ lisp_val_t primitive_general_vector_p(lisp_val_t args, lisp_val_t env) {
  * @return streamならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_streamp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
@@ -4611,6 +4691,7 @@ lisp_val_t primitive_streamp(lisp_val_t args, lisp_val_t env) {
  * @return symbol名のSTRING
  */
 lisp_val_t primitive_symbol_name(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t sym = cc_car(args);
     lisp_addr_t addr = sym & ~TAG_MASK;
     return ((lisp_val_t *)addr)[0];
@@ -4623,6 +4704,7 @@ lisp_val_t primitive_symbol_name(lisp_val_t args, lisp_val_t env) {
  * @return internされたSYMBOL
  */
 lisp_val_t primitive_string_to_symbol(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t str = cc_car(args);
     char buf[256];
     os_string_to_cstr(str, buf, sizeof(buf));
@@ -4642,6 +4724,8 @@ static UINT64 g_gensym_counter = 0;
  * @return 新しく作られたuninterned SYMBOL
  */
 lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     UINT64 n = g_gensym_counter++;
     char buf[24];
     buf[0] = 'G';
@@ -4780,6 +4864,7 @@ lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
  * @return 確保したVECTOR
  */
 lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t dims_arg = cc_car(args);
 
     UINT64 dims[MAX_ARRAY_RANK];
@@ -4841,6 +4926,7 @@ static UINT64 array_offset(lisp_val_t *header, UINT64 rank, lisp_val_t cur, int 
  * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
  */
 lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t array = cc_car(args);
     lisp_val_t *header = vector_header(array);
     UINT64 rank = header[0];
@@ -4865,6 +4951,7 @@ lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
  * @return 各次元のサイズ(FIXNUM)のリスト
  */
 lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t array = cc_car(args);
     GC_PROTECT(array);
 
@@ -4897,6 +4984,7 @@ lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
  * @return 書き込んだ値(第二引数)
  */
 lisp_val_t primitive_set_car(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t target = cc_car(args);
     lisp_val_t val = cc_car(cc_cdr(args));
     cc_set_car(target, val);
@@ -4910,6 +4998,7 @@ lisp_val_t primitive_set_car(lisp_val_t args, lisp_val_t env) {
  * @return 書き込んだ値(第二引数)
  */
 lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t target = cc_car(args);
     lisp_val_t val = cc_car(cc_cdr(args));
     cc_set_cdr(target, val);
@@ -4923,6 +5012,7 @@ lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env) {
  * @return 書き込んだ値(最後の引数)。範囲外の添字が指定された場合はg_sym_eval_error
  */
 lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t array = cc_car(args);
     lisp_val_t *header = vector_header(array);
     UINT64 rank = header[0];
@@ -4953,6 +5043,7 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
  * @return 確保したSTRING
  */
 lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     UINT64 len = cc_car(args) >> 3;
     lisp_val_t char_arg = cc_cdr(args);
     UINT8 fill = ' ';
@@ -4977,6 +5068,7 @@ lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
  * @return 添字が指す文字(CHAR)。範囲外の添字が指定された場合はg_sym_eval_error
  */
 lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t str = cc_car(args);
     UINT64 idx = cc_car(cc_cdr(args)) >> 3;
 
@@ -4997,6 +5089,7 @@ lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
  * @return 要素数(FIXNUM)
  */
 lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t seq = cc_car(args);
     if (seq == nil) {
         return os_make_fixnum(0);
@@ -5226,6 +5319,7 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
  * @return 確保したクラスオブジェクト
  */
 lisp_val_t primitive_make_class_raw(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t name = cc_car(args);
     lisp_val_t supers = cc_car(cc_cdr(args));
     lisp_val_t slots = cc_car(cc_cdr(cc_cdr(args)));
@@ -5239,6 +5333,7 @@ lisp_val_t primitive_make_class_raw(lisp_val_t args, lisp_val_t env) {
  * @return 確保したクラスオブジェクト
  */
 lisp_val_t primitive_make_builtin_class_raw(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t name = cc_car(args);
     lisp_val_t supers = cc_car(cc_cdr(args));
     lisp_val_t slots = cc_car(cc_cdr(cc_cdr(args)));
@@ -5252,6 +5347,7 @@ lisp_val_t primitive_make_builtin_class_raw(lisp_val_t args, lisp_val_t env) {
  * @return name(symbol)
  */
 lisp_val_t primitive_class_name(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
     return obj[1];
 }
@@ -5263,6 +5359,7 @@ lisp_val_t primitive_class_name(lisp_val_t args, lisp_val_t env) {
  * @return superclasses(クラスオブジェクトのlist)
  */
 lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
     return obj[2];
 }
@@ -5274,6 +5371,7 @@ lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env) {
  * @return slots(スロット記述子のlist)
  */
 lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
     return obj[3];
 }
@@ -5285,6 +5383,7 @@ lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env) {
  * @return クラスオブジェクトならt、それ以外ならnil
  */
 lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
@@ -5300,6 +5399,7 @@ lisp_val_t primitive_classp(lisp_val_t args, lisp_val_t env) {
  * @return 組み込みクラスオブジェクトならt、それ以外ならnil
  */
 lisp_val_t primitive_builtin_classp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
@@ -5315,6 +5415,7 @@ lisp_val_t primitive_builtin_classp(lisp_val_t args, lisp_val_t env) {
  * @return 標準クラスオブジェクトならt、それ以外ならnil
  */
 lisp_val_t primitive_standard_classp(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
@@ -5330,6 +5431,7 @@ lisp_val_t primitive_standard_classp(lisp_val_t args, lisp_val_t env) {
  * @return 確保したクラスインスタンス
  */
 lisp_val_t primitive_make_instance_raw(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t class_obj = cc_car(args);
     lisp_val_t slots_vector = cc_car(cc_cdr(args));
     return os_make_instance(MAGIC_CLASS_INSTANCE, class_obj, slots_vector, nil);
@@ -5342,6 +5444,7 @@ lisp_val_t primitive_make_instance_raw(lisp_val_t args, lisp_val_t env) {
  * @return class(クラスオブジェクト)
  */
 lisp_val_t primitive_instance_class(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
     return obj[1];
 }
@@ -5353,6 +5456,7 @@ lisp_val_t primitive_instance_class(lisp_val_t args, lisp_val_t env) {
  * @return slots-vector(MAGIC_VECTOR)
  */
 lisp_val_t primitive_instance_slots(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
     return obj[2];
 }
@@ -5364,6 +5468,7 @@ lisp_val_t primitive_instance_slots(lisp_val_t args, lisp_val_t env) {
  * @return クラスインスタンスならt、それ以外ならnil
  */
 lisp_val_t primitive_class_instance_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t val = cc_car(args);
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
@@ -5381,6 +5486,7 @@ lisp_val_t primitive_class_instance_p(lisp_val_t args, lisp_val_t env) {
  * @return 書き込んだvalue
  */
 lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t name = cc_car(args);
     lisp_val_t val = cc_car(cc_cdr(args));
     return os_set_dynamic(name, val);

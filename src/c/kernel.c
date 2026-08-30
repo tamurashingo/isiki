@@ -98,8 +98,6 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);
 
-    volatile UINT32 *buf = (volatile UINT32 *)fb_base;
-
     fb->clear_screen(fb);
     fb->draw_cursor(fb);
 

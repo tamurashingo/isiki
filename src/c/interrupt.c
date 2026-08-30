@@ -161,7 +161,7 @@ void asm_pf_handler(void);
  * @param ctx 割り込み発生時のレジスタ・実行コンテキスト一式
  * @param fault_addr GPFでは未使用の引数(esiに載る値、現状は捨てている)
  */
-void __attribute__((sysv_abi)) c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr);
+void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr);
 
 // asm_gpf_handler/asm_pf_handlerの共通後続処理。15汎用レジスタとexceptionのコンテキストを
 // ExceptionContextとしてスタックに積み、c_cpu_exception_handlerを呼ぶ(戻ってこない)
@@ -276,7 +276,7 @@ void c_keyboard_handler(uint8_t scancode) {
 }
 
 /** asm_keyboard_handlerから呼ばれるC本体。scancodeを読んでc_keyboard_handlerへ渡し、最後にEOIを送る */
-void __attribute__((sysv_abi)) c_keyboard_isr(void);
+void SYSV_ABI c_keyboard_isr(void);
 
 /**
  * キーボード割り込み(IRQ1)のエントリポイント。__attribute__((interrupt))は使わない:
@@ -340,7 +340,7 @@ asm(
     "    iretq\n"
 );
 
-void __attribute__((sysv_abi)) c_keyboard_isr(void) {
+void SYSV_ABI c_keyboard_isr(void) {
     uint8_t scancode = inb(0x60);
     c_keyboard_handler(scancode);
     outb(0x20, 0x20); // EOI
@@ -362,7 +362,7 @@ void asm_timer_handler(void);
  * @param current_rsp 割り込み発生時にasm_timer_handlerが積んだ15レジスタの先頭アドレス
  * @return 次に実行するプロセスのsaved_rsp
  */
-UINT64 __attribute__((sysv_abi)) c_timer_switch(UINT64 current_rsp);
+UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp);
 // GPR15個のpush/popの外側でFXSAVE/FXRSTORによりFPU/SSEレジスタ(x87/xmm0-15/MXCSR)も
 // 保存・復元する。fxsave/fxrstorは対象アドレスが16byte境界であることを要求するが、
 // 割り込み発生時のrsp(=IRETQフレームのすぐ上)は「実行中のプロセスがどの命令の直後で
@@ -428,7 +428,7 @@ UINT64 get_tick_counter(void) {
     return g_tick_counter;
 }
 
-UINT64 __attribute__((sysv_abi)) c_timer_switch(UINT64 current_rsp) {
+UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     outb(0x20, 0x20); // EOI を先に返す
     g_tick_counter++;
 
@@ -447,7 +447,7 @@ UINT64 __attribute__((sysv_abi)) c_timer_switch(UINT64 current_rsp) {
 }
 
 /**
- * IRQ0(PIT)のマスクだけを解除する。process_scheduler_startが全PCB/*RUN-QUEUE*を
+ * IRQ0(PIT)のマスクだけを解除する。process_scheduler_startが全PCB / *RUN-QUEUE*を
  * 構築した後に呼ぶことで、初期化中にタイマーが暴発するのを防ぐ
  */
 void enable_timer_irq(void) {
@@ -499,7 +499,7 @@ static void diag_write_string(frame_buffer *fb, const char *s) {
  * まま無限loopするため)問題そのものは今回のスコープ外だが、原因調査のため
  * 表示内容だけ拡張する
  */
-void __attribute__((sysv_abi)) c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr) {
+void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr) {
     (void)fault_addr;
     frame_buffer *fb = get_active_frame_buffer();
 

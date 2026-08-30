@@ -185,6 +185,27 @@
     (%%char-code . "cc_char_code")
     (%%code-char . "cc_code_char")))
 
+(defun str->fn (fn-str)
+  "文字列から関数オブジェクトを得る。関数が未定義だが alist に登録するための処置"
+  (symbol-function (intern (string-upcase fn-str))))
+
+(defparameter *macro-expanders*
+  (list (cons 'let "expand-let")
+        (cons 'let* "expand-let*")
+        (cons 'cond "expand-cond")
+        (cons 'case "expand-case")
+        (cons 'case-using "expand-case-using")
+        (cons 'setf "expand-setf")
+        (cons 'for "expand-for")
+        (cons 'while "expand-while")
+        (cons 'with-open-input-stream "expand-with-open-input-stream")
+        (cons 'with-open-input-file "expand-with-open-input-file")
+        (cons 'with-open-output-stream "expand-with-open-output-stream")
+        (cons 'with-open-output-file "expand-with-open-output-file"))
+  "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
+   (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
+   これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
+
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
    展開が使う%FOR-NEXT-VALUES等の%接頭辞(Lisp側の内部変数マーカーで、Cの識別子
@@ -371,8 +392,22 @@
     ((and (eq (car form) 'lambda) (= (length form) 3))
      (list (first form) (second form) (macroexpand-all (third form))))
     ((and (symbolp (car form)) (assoc (car form) *macro-expanders*))
-     (macroexpand-all (funcall (cdr (assoc (car form) *macro-expanders*)) form)))
+     (macroexpand-all (funcall (str->fn (cdr (assoc (car form) *macro-expanders*))) form)))
     (t (cons (macroexpand-all (car form)) (mapcar #'macroexpand-all (cdr form))))))
+
+
+(defun call-target-c-name (name)
+  "呼び出し先シンボル名からC関数名を解決する。このファイル内でdefunされた
+   関数名(*known-function-names*、mainがdefun走査後に束縛する)を優先し、
+   次に算術/比較プリミティブのホワイトリスト(*primitive-c-names*)を見る。
+   za.cのようなランタイム上のシンボル->Function-Cell解決は行わず、AOTで
+   リンクされるC関数を名前で直接呼び出す(呼び出し先アドレスはリンク時に確定
+   するため、定義順に関わらず相互再帰も解決できる)"
+  (cond
+    ((member name *known-function-names*) (lisp-name-to-c-name name))
+    ((assoc name *primitive-c-names*) (cdr (assoc name *primitive-c-names*)))
+    (t (error "transpile-call: 未対応の呼び出し先です: ~S" name))))
+
 
 ;;; let/let*: init.lispのdefmacro let/let*(%let-vars/%let-inits)と同じ展開規則。
 ;;; bodyは&restで複数式を許すが、transpile-lambda/transpile-defunは単一の本体式
@@ -576,22 +611,6 @@
     `(with-open-output-stream (,(car binding) (open-output-file ,(car (cdr binding))))
        ,@body)))
 
-(defparameter *macro-expanders*
-  (list (cons 'let #'expand-let)
-        (cons 'let* #'expand-let*)
-        (cons 'cond #'expand-cond)
-        (cons 'case #'expand-case)
-        (cons 'case-using #'expand-case-using)
-        (cons 'setf #'expand-setf)
-        (cons 'for #'expand-for)
-        (cons 'while #'expand-while)
-        (cons 'with-open-input-stream #'expand-with-open-input-stream)
-        (cons 'with-open-input-file #'expand-with-open-input-file)
-        (cons 'with-open-output-stream #'expand-with-open-output-stream)
-        (cons 'with-open-output-file #'expand-with-open-output-file))
-  "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
-   (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
-   これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
 
 (declaim (ftype function transpile-quoted))
 (declaim (ftype function transpile-if))
@@ -606,12 +625,16 @@
 (declaim (ftype function transpile-tail-stmt))
 (declaim (ftype function transpile-tail-and))
 (declaim (ftype function transpile-tail-or))
+(declaim (ftype function transpile-tail-call-args-guarded))
 (declaim (ftype function transpile-tail-call))
 (declaim (ftype function transpile-go))
 (declaim (ftype function transpile-return-from))
 (declaim (ftype function transpile-block))
 (declaim (ftype function transpile-tagbody))
 (declaim (ftype function transpile-unwind-protect))
+(declaim (ftype function transpile-catch))
+(declaim (ftype function transpile-throw))
+
 
 (defun transpile-expr (expr &optional scope)
   "fixnum/string/nil/tの裸リテラルと、それらに対するquote、シンボルのquote、
@@ -686,6 +709,7 @@
     ((symbolp expr)
      (error "transpile-expr: 未束縛の変数参照です: ~S" expr))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
+
 
 (defparameter *ct-temp-counter* 0
   "M14基盤D: block/return-from/tagbody/go導入に伴い、testの結果や中間式の値を
@@ -1173,17 +1197,6 @@
           (push fn-text *lifted-lambda-decls*)
           closure-expr)))))
 
-(defun call-target-c-name (name)
-  "呼び出し先シンボル名からC関数名を解決する。このファイル内でdefunされた
-   関数名(*known-function-names*、mainがdefun走査後に束縛する)を優先し、
-   次に算術/比較プリミティブのホワイトリスト(*primitive-c-names*)を見る。
-   za.cのようなランタイム上のシンボル->Function-Cell解決は行わず、AOTで
-   リンクされるC関数を名前で直接呼び出す(呼び出し先アドレスはリンク時に確定
-   するため、定義順に関わらず相互再帰も解決できる)"
-  (cond
-    ((member name *known-function-names*) (lisp-name-to-c-name name))
-    ((assoc name *primitive-c-names*) (cdr (assoc name *primitive-c-names*)))
-    (t (error "transpile-call: 未対応の呼び出し先です: ~S" name))))
 
 (defun transpile-cons-chain (temps)
   "Cの一時変数名のリストから、末尾がnilのconsチェーンを組み立てるC式を作る
@@ -1350,6 +1363,7 @@
   (let ((c-name (lisp-name-to-c-name (second form))))
     (format nil "static tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);"
             c-name c-name)))
+
 
 (defun transpile-defun (form)
   "(defun name (param*) <本体1式>) に対応する。パラメータはシンボルのみ

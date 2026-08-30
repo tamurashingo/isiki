@@ -60,7 +60,7 @@ void os_set_qemu_test_mode(void (*test_entry)(void)) {
     g_qemu_test_entry = test_entry;
 }
 
-void __attribute__((sysv_abi)) process_trampoline_c(UINT64 proc_index) {
+void SYSV_ABI process_trampoline_c(UINT64 proc_index) {
     process_t *proc = get_process((UINT32)proc_index);
     if (proc_index == 0 && g_qemu_test_entry != 0) {
         g_qemu_test_entry();

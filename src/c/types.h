@@ -25,5 +25,12 @@ typedef struct _gc_rootnode {
     struct _gc_rootnode *next;
 } gc_rootnode;
 
+/** MS ABI(mingw)ターゲット向けにSysV ABIを強制する属性。ネイティブgcc(ISIKIOS_UNIT_TEST)では
+ * SysV ABIがデフォルトのため属性が無意味になり-Wattributes警告が出るので、その場合は無にする */
+#ifdef ISIKIOS_UNIT_TEST
+#define SYSV_ABI
+#else
+#define SYSV_ABI __attribute__((sysv_abi))
+#endif
 
 #endif /* _TYPES_H_ */

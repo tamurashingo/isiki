@@ -143,8 +143,11 @@ void test_os_make_cons() {
     assert(cell2[1] == cdr, "cons cellのword1はcdrと一致する");
 
     assert((str & TAG_MASK) == TAG_STRING, "word0はTAG_STRINGを持つ");
-    const char* s = (const char *)(str + 8);
-    assert(strncmp(s, "hello world", (UINT64 *)str), "word0のstringは\"hello world\"である");
+    lisp_val_t *str_cell = (lisp_val_t *)(str & ~TAG_MASK);
+    UINT64 str_len = str_cell[0];
+    assert(str_len == 11, "word0(長さ)は11(\"hello world\"の文字数)である");
+    const char *s = (const char *)(str_cell + 1);
+    assert(strncmp(s, "hello world", str_len) == 0, "word1以降のバイト列は\"hello world\"である");
 }
 
 void test_os_make_char() {
@@ -1869,6 +1872,8 @@ void test_gc_fires_during_string_append_and_result_is_correct() {
 }
 
 int main(int argc, char** argv) {
+   (void)argc;
+   (void)argv;
    test_os_make_fixnum();
 
    setup_heap();

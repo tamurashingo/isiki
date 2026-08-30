@@ -233,7 +233,7 @@ static void jit_mov_rdx_rax(void) { jit_emit8(0x48); jit_emit8(0x89); jit_emit8(
 // mov r13, rax (第1オペランドの値を第2オペランド計算中も保持するレジスタへ退避)
 static void jit_mov_r13_rax(void) { jit_emit8(0x49); jit_emit8(0x89); jit_emit8(0xC5); }
 // mov rcx, r13 (退避していた第1オペランドの値をMS ABI第1引数へ戻す)
-static void jit_mov_rcx_r13(void) { jit_emit8(0x4C); jit_emit8(0x89); jit_emit8(0xE9); }
+// static void jit_mov_rcx_r13(void) { jit_emit8(0x4C); jit_emit8(0x89); jit_emit8(0xE9); }
 
 // cmp rax, r11 (raxとr11を比較。ifのtestがnilかどうかの判定に使う)
 static void jit_cmp_rax_r11(void) { jit_emit8(0x4C); jit_emit8(0x39); jit_emit8(0xD8); }
@@ -983,7 +983,7 @@ static void za_gc_unlink_node(gc_rootnode *node) {
 #define ZA_OFF_CALL_BASE (ZA_OFF_LET_SAVED_HEAD_BASE + ZA_MAX_LET_DEPTH * 8)
 #define ZA_CALL_SLOT_SIZE (8 + ZA_MAX_OPERANDS * ZA_ARG_SLOT_SIZE)  /* SAVED_HEAD(8)+引数16本(24*16=384)=392 */
 /* 拡張16(算術/比較/car/cdr/null/atom/eq/consのオペランド位置への複合式ネスト対応):
- * fold(+/-/*)・binary(</=/>/<=/>=/eq/cons)がオペランド評価の合間に保持するアキュムレータ
+ * fold(+ /- / *)・binary(</=/>/<=/>=/eq/cons)がオペランド評価の合間に保持するアキュムレータ
  * (1呼び出しあたり値1個のみ)を、ZA_OFF_CALL_BASEと同じ「深さでインデックスする配列」で
  * 保護する。1深さあたり値1個で済むためZA_CALL_SLOT_SIZE(392、引数16本分)より
  * ずっと小さい単一スロット(24=値8+gc_rootnode16)で足りる。 */
@@ -2381,10 +2381,10 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * formを評価してraxに結果を残す機械語を出力する。対応するグラマーは
  * 「fixnumリテラル / params固定引数への参照 / (+ operand operand...) / (- operand) /
  * (- operand operand...) / (* operand operand...) / (< operand operand) /
- * (= operand operand) / (if test then else?) / (fn-sym arg arg...)」(if・+/-/*の
+ * (= operand operand) / (if test then else?) / (fn-sym arg arg...)」(if・+ / - / *の
  * test/then/else/operandそれぞれの位置には再帰的に上記のいずれかを許容する。拡張15
  * により、ifのtest位置・一般呼び出しの引数位置にも一般呼び出しをネストして書ける
- * ようになった(下記call_depth参照)。拡張16により、+/-/*・比較演算子・
+ * ようになった(下記call_depth参照)。拡張16により、+ / - / *・比較演算子・
  * car/cdr/null/atom/eq/consのoperand位置にも、leafに限定せず任意の式(一般呼び出し・
  * if・入れ子の算術/比較なども含む)をネストして書けるようになった(za_compile_operand
  * 経由、下記arith_depth参照。</、=はちょうど2オペランドのみ対応)。formおよびifの
@@ -2397,7 +2397,7 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * za_compile_call自身が自分の引数を評価する再帰にのみcall_depth+1を渡し、そのほかの
  * 経路(if/let/progn/block等)は素通しする。za_compile_callはこの値がZA_MAX_CALL_DEPTH
  * 以上ならコンパイルを断念する(拡張15、ZA_OFF_CALL_BASE参照)。
- * @param arith_depth 現在アクティブな未完了のfold/binary(+/-/*・比較・cons等)呼び出しの
+ * @param arith_depth 現在アクティブな未完了のfold/binary(+ / - / *・比較・cons等)呼び出しの
  * ネスト深さ。za_compile_fold/za_compile_binary自身が自分のオペランドを評価する再帰
  * (za_compile_operand経由)にのみarith_depth+1を渡し、call_depthと同様そのほかの経路は
  * 素通しする。この値がZA_MAX_ARITH_DEPTH以上ならコンパイルを断念する(拡張16、
@@ -4099,6 +4099,7 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
 static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_count, const za_local_scope_t *locals,
                                const za_syms_t *syms, lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx,
                                UINT64 call_depth, UINT64 trampoline_offset, UINT64 arith_depth) {
+    (void)tb_ctx;
     lisp_val_t body = cc_cdr(form);
 
     za_tagbody_ctx_t new_ctx;

@@ -54,6 +54,7 @@ os_stream_t *os_stream_from_lisp(lisp_val_t stream) {
 }
 
 lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     char path[STREAM_PATH_MAX];
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 
@@ -66,17 +67,21 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t cc_open_output_stream(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
     os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
     os_stream_open_screen_output(raw, get_current_process()->stdout_buffer);
     return os_make_stream(raw);
 }
 
 lisp_val_t cc_close(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     os_stream_close(stream_raw(cc_car(args)));
     return nil;
 }
 
 lisp_val_t cc_read_char(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     os_stream_t *raw = stream_raw(cc_car(args));
     char ch;
     if (!os_stream_read_char(raw, &ch)) {
@@ -86,6 +91,7 @@ lisp_val_t cc_read_char(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t cc_write_char(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     lisp_val_t ch = cc_car(args);
     os_stream_t *raw = stream_raw(cc_car(cc_cdr(args)));
     os_stream_write_char(raw, (char)(ch >> 3));
@@ -93,6 +99,7 @@ lisp_val_t cc_write_char(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t cc_read(lisp_val_t args, lisp_val_t env) {
+    (void)env;
     os_stream_t *raw = stream_raw(cc_car(args));
     return os_read_stream(raw);
 }

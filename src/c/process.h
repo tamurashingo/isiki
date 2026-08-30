@@ -85,7 +85,7 @@ void os_process_set_saved_rsp(lisp_val_t pcb, UINT64 rsp);
  * SysV ABI(rdi渡し)を前提に組んだ偽フレームから直接RIPとして使われるため、
  * MS ABI(mingw)側とズレないようsysv_abiを強制する
  */
-void __attribute__((sysv_abi)) process_trampoline_c(UINT64 proc_index);
+void SYSV_ABI process_trampoline_c(UINT64 proc_index);
 
 /**
  * PROCESS_COUNT個のPCBをspawnし、*RUN-QUEUE*を構築した上でタイマー割り込みを
