@@ -6,11 +6,15 @@
 ;; 期待値はホスト上でxxd -g1 tmp/fat16_test.imgのセクタ0を目視確認して得たもの
 ;; (mkfs.fat 4.2、16MBイメージのデフォルト値)。
 ;;
-;; 本ファイルはtest/lisp/test_framework.lisp(assert-equal)とsrc/lisp/ide.lisp
-;; (*ide-device*)とsrc/lisp/fat16.lisp(fat16-read-bpb)を、本ファイルより先に
-;; boot-entryスクリプトがloadしている前提で書かれている。
+;; 本ファイルはtest/lisp/test_framework.lisp(assert-equal)とsrc/lisp/device.lisp+
+;; src/lisp/ide.lisp(*devices*)とsrc/lisp/fat16.lisp(fat16-read-bpb)を、本ファイルより
+;; 先にboot-entryスクリプトがloadしている前提で書かれている。
 
-(defglobal fat16-test-bpb (fat16-read-bpb *ide-device*))
+;; *devices*からblk0(Secondary IDEチャネルのデバイス)のハンドルを取り出す。
+;; *test-device*のような単一デバイス専用グローバルは廃止し、*devices*経由に統一する。
+(defglobal *test-device* (%device-handle 'blk0))
+
+(defglobal fat16-test-bpb (fat16-read-bpb *test-device*))
 
 (assert-equal t (if fat16-test-bpb t nil))
 
@@ -36,7 +40,7 @@
 
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2048)
                      (list "SUBDIR" ':dir 0))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;;; --- FAT16-M4: クラスタ→セクタ変換とファイル本体読み込み ---
 ;;
@@ -48,17 +52,17 @@
 ;; BIG.TXTの内容は"0123456789"の繰り返しなので、インデックスiの値は(i mod 10)+48
 ;; (ASCIIコード)になる。
 
-(assert-equal (list 72 101 108 108 111) (subseq (fat16-read-file *ide-device* "/TEST.LSP") 0 5))
-(assert-equal 18 (length (fat16-read-file *ide-device* "/TEST.LSP")))
+(assert-equal (list 72 101 108 108 111) (subseq (fat16-read-file *test-device* "/TEST.LSP") 0 5))
+(assert-equal 18 (length (fat16-read-file *test-device* "/TEST.LSP")))
 
-(defglobal fat16-test-big (fat16-read-file *ide-device* "/BIG.TXT"))
+(defglobal fat16-test-big (fat16-read-file *test-device* "/BIG.TXT"))
 (assert-equal 2500 (length fat16-test-big))
 (assert-equal 48 (elt fat16-test-big 0))
 (assert-equal 55 (elt fat16-test-big 2047))
 (assert-equal 56 (elt fat16-test-big 2048))
 (assert-equal 57 (elt fat16-test-big 2499))
 
-(assert-equal nil (fat16-read-file *ide-device* "/HELLO.TXT"))
+(assert-equal nil (fat16-read-file *test-device* "/HELLO.TXT"))
 
 ;;; --- FAT16-M3: FATテーブルのクラスタチェイン追跡 ---
 ;;
@@ -68,13 +72,13 @@
 ;; から十分離しており衝突しない。FAT16-M7aでSUBDIR以下を追加した際、元は
 ;; 10/11/14だったが実クラスタ使用と衝突するため40/41/44へ変更した)。
 
-(defglobal fat16-test-bpb-m3 (fat16-read-bpb *ide-device*))
+(defglobal fat16-test-bpb-m3 (fat16-read-bpb *test-device*))
 
-(assert-equal 41 (fat16-fat-entry *ide-device* fat16-test-bpb-m3 40))
-(assert-equal 44 (fat16-fat-entry *ide-device* fat16-test-bpb-m3 41))
-(assert-equal #xFFFF (fat16-fat-entry *ide-device* fat16-test-bpb-m3 44))
+(assert-equal 41 (fat16-fat-entry *test-device* fat16-test-bpb-m3 40))
+(assert-equal 44 (fat16-fat-entry *test-device* fat16-test-bpb-m3 41))
+(assert-equal #xFFFF (fat16-fat-entry *test-device* fat16-test-bpb-m3 44))
 
-(assert-equal (list 40 41 44) (fat16-cluster-chain *ide-device* fat16-test-bpb-m3 40))
+(assert-equal (list 40 41 44) (fat16-cluster-chain *test-device* fat16-test-bpb-m3 40))
 
 ;;; --- FAT16-M6a: 既存ファイルの同クラスタ数上書き ---
 ;;
@@ -96,17 +100,17 @@
     acc))
 
 ;; 書き込み前の内容確認(念のため)
-(assert-equal 2048 (length (fat16-read-file *ide-device* "/WRITE1.TXT")))
-(assert-equal 65 (elt (fat16-read-file *ide-device* "/WRITE1.TXT") 0))
-(assert-equal 65 (elt (fat16-read-file *ide-device* "/WRITE1.TXT") 2047))
+(assert-equal 2048 (length (fat16-read-file *test-device* "/WRITE1.TXT")))
+(assert-equal 65 (elt (fat16-read-file *test-device* "/WRITE1.TXT") 0))
+(assert-equal 65 (elt (fat16-read-file *test-device* "/WRITE1.TXT") 2047))
 
 (defglobal fat16-test-write1-new (list 87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
 
-(assert-equal t (if (fat16-write-file *ide-device* "/WRITE1.TXT" fat16-test-write1-new) t nil))
-(assert-equal fat16-test-write1-new (fat16-read-file *ide-device* "/WRITE1.TXT"))
+(assert-equal t (if (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-new) t nil))
+(assert-equal fat16-test-write1-new (fat16-read-file *test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 10)
                      (list "SUBDIR" ':dir 0))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;;; --- FAT16-M6b: クラスタ追加を伴うファイル拡張 ---
 ;;
@@ -117,22 +121,22 @@
 
 (defglobal fat16-test-write1-2clusters (%fat16-test-make-byte-list 2049 66))
 
-(assert-equal t (if (fat16-write-file *ide-device* "/WRITE1.TXT" fat16-test-write1-2clusters) t nil))
-(assert-equal fat16-test-write1-2clusters (fat16-read-file *ide-device* "/WRITE1.TXT"))
+(assert-equal t (if (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-2clusters) t nil))
+(assert-equal fat16-test-write1-2clusters (fat16-read-file *test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;; クラスタ数が減る書き込み(縮小)はFAT16-M6bの対象外としてnilを返す(現在2
 ;; クラスタ確保済みのWRITE1.TXTへ、1クラスタで収まる10byteを書こうとする)。
-(assert-equal nil (fat16-write-file *ide-device* "/WRITE1.TXT" fat16-test-write1-new))
+(assert-equal nil (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-new))
 
 ;; 直前の(クラスタ数減少で失敗した)呼び出しでデータ/ディレクトリエントリが
 ;; 変更されていないことを確認する
-(assert-equal fat16-test-write1-2clusters (fat16-read-file *ide-device* "/WRITE1.TXT"))
+(assert-equal fat16-test-write1-2clusters (fat16-read-file *test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;;; --- FAT16-M6c: 新規ファイル作成 ---
 ;;
@@ -146,37 +150,37 @@
 ;; TEST.LSP/BIG.TXT/WRITE1.TXT/SUBDIRの後に、作成した順で並ぶ。
 
 ;; 空ファイルの新規作成(クラスタ確保なし、start-cluster=0/size=0)
-(assert-equal t (if (fat16-create-file *ide-device* "/NEW1.TXT" nil) t nil))
-(assert-equal nil (fat16-read-file *ide-device* "/NEW1.TXT"))
+(assert-equal t (if (fat16-create-file *test-device* "/NEW1.TXT" nil) t nil))
+(assert-equal nil (fat16-read-file *test-device* "/NEW1.TXT"))
 
 ;; 1クラスタに収まる非空ファイルの新規作成
 (defglobal fat16-test-new2 (%fat16-test-make-byte-list 100 67)) ;; 全要素67('C')
 
-(assert-equal t (if (fat16-create-file *ide-device* "/NEW2.TXT" fat16-test-new2) t nil))
-(assert-equal fat16-test-new2 (fat16-read-file *ide-device* "/NEW2.TXT"))
+(assert-equal t (if (fat16-create-file *test-device* "/NEW2.TXT" fat16-test-new2) t nil))
+(assert-equal fat16-test-new2 (fat16-read-file *test-device* "/NEW2.TXT"))
 
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0)
                      (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;; 同名エントリが既に存在する場合はnil(上書きはfat16-write-fileの役割)。
 ;; 既存のTEST.LSPの内容/一覧が変更されていないことも確認する。
-(assert-equal nil (fat16-create-file *ide-device* "/TEST.LSP" fat16-test-new2))
-(assert-equal 18 (length (fat16-read-file *ide-device* "/TEST.LSP")))
+(assert-equal nil (fat16-create-file *test-device* "/TEST.LSP" fat16-test-new2))
+(assert-equal 18 (length (fat16-read-file *test-device* "/TEST.LSP")))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0)
                      (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;; 8.3形式で表現できない名前(複数ドット、またはbase/extが長すぎる)はnil。
 ;; いずれもスロット確保より前段の名前変換で失敗するため、一覧は変化しない。
-(assert-equal nil (fat16-create-file *ide-device* "/A.B.C" fat16-test-new2))
-(assert-equal nil (fat16-create-file *ide-device* "/TOOLONGNAME.TXT" fat16-test-new2))
+(assert-equal nil (fat16-create-file *test-device* "/A.B.C" fat16-test-new2))
+(assert-equal nil (fat16-create-file *test-device* "/TOOLONGNAME.TXT" fat16-test-new2))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0)
                      (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;;; --- FAT16-M7a: サブディレクトリ対応(読み込み・パス解決) ---
 ;;
@@ -187,24 +191,24 @@
 ;; サブディレクトリでも返すことを確認する。
 
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 19) (list "DEEPER" ':dir 0))
-              (fat16-read-dir *ide-device* "/SUBDIR"))
+              (fat16-read-dir *test-device* "/SUBDIR"))
 
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "DEEP.TXT" ':file 0))
-              (fat16-read-dir *ide-device* "/SUBDIR/DEEPER"))
+              (fat16-read-dir *test-device* "/SUBDIR/DEEPER"))
 
 (assert-equal (list 110 101 115 116 101 100 32 102 105 108 101 32 99 111 110 116 101 110 116)
-              (fat16-read-file *ide-device* "/SUBDIR/NESTED.TXT"))
+              (fat16-read-file *test-device* "/SUBDIR/NESTED.TXT"))
 
-(assert-equal nil (fat16-read-file *ide-device* "/SUBDIR/DEEPER/DEEP.TXT"))
+(assert-equal nil (fat16-read-file *test-device* "/SUBDIR/DEEPER/DEEP.TXT"))
 
 ;; 存在しないディレクトリ/ファイルはnil
-(assert-equal nil (fat16-read-dir *ide-device* "/NOSUCHDIR"))
-(assert-equal nil (fat16-read-file *ide-device* "/SUBDIR/NOSUCH.TXT"))
+(assert-equal nil (fat16-read-dir *test-device* "/NOSUCHDIR"))
+(assert-equal nil (fat16-read-file *test-device* "/SUBDIR/NOSUCH.TXT"))
 
 ;; ファイル(ディレクトリでないエントリ)をディレクトリとして辿ろうとした場合はnil
 ;; (中間パス要素・最終要素のいずれの場合も属性チェックで失敗する)
-(assert-equal nil (fat16-read-dir *ide-device* "/TEST.LSP"))
-(assert-equal nil (fat16-read-file *ide-device* "/TEST.LSP/X.TXT"))
+(assert-equal nil (fat16-read-dir *test-device* "/TEST.LSP"))
+(assert-equal nil (fat16-read-file *test-device* "/TEST.LSP/X.TXT"))
 
 ;;; --- FAT16-M7b: サブディレクトリ対応(書き込み・新規作成) ---
 ;;
@@ -216,27 +220,27 @@
 ;; 既存ファイル(/SUBDIR/NESTED.TXT、19byte)への同クラスタ内上書き
 (defglobal fat16-test-nested-new (list 78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
 
-(assert-equal t (if (fat16-write-file *ide-device* "/SUBDIR/NESTED.TXT" fat16-test-nested-new) t nil))
-(assert-equal fat16-test-nested-new (fat16-read-file *ide-device* "/SUBDIR/NESTED.TXT"))
+(assert-equal t (if (fat16-write-file *test-device* "/SUBDIR/NESTED.TXT" fat16-test-nested-new) t nil))
+(assert-equal fat16-test-nested-new (fat16-read-file *test-device* "/SUBDIR/NESTED.TXT"))
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0))
-              (fat16-read-dir *ide-device* "/SUBDIR"))
+              (fat16-read-dir *test-device* "/SUBDIR"))
 
 ;; サブディレクトリ内への新規ファイル作成(1クラスタに収まる非空ファイル)
 (defglobal fat16-test-subdir-new3 (%fat16-test-make-byte-list 50 68)) ;; 全要素68('D')
 
-(assert-equal t (if (fat16-create-file *ide-device* "/SUBDIR/NEW3.TXT" fat16-test-subdir-new3) t nil))
-(assert-equal fat16-test-subdir-new3 (fat16-read-file *ide-device* "/SUBDIR/NEW3.TXT"))
+(assert-equal t (if (fat16-create-file *test-device* "/SUBDIR/NEW3.TXT" fat16-test-subdir-new3) t nil))
+(assert-equal fat16-test-subdir-new3 (fat16-read-file *test-device* "/SUBDIR/NEW3.TXT"))
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0)
                      (list "NEW3.TXT" ':file 50))
-              (fat16-read-dir *ide-device* "/SUBDIR"))
+              (fat16-read-dir *test-device* "/SUBDIR"))
 
 ;; 存在しないディレクトリの下への書き込み・新規作成はいずれもnil
-(assert-equal nil (fat16-write-file *ide-device* "/NOSUCHDIR/X.TXT" fat16-test-subdir-new3))
-(assert-equal nil (fat16-create-file *ide-device* "/NOSUCHDIR/X.TXT" fat16-test-subdir-new3))
+(assert-equal nil (fat16-write-file *test-device* "/NOSUCHDIR/X.TXT" fat16-test-subdir-new3))
+(assert-equal nil (fat16-create-file *test-device* "/NOSUCHDIR/X.TXT" fat16-test-subdir-new3))
 
 ;; 2階層下(/SUBDIR/DEEPER)への新規作成も往復一致することを確認する
-(assert-equal t (if (fat16-create-file *ide-device* "/SUBDIR/DEEPER/NEW4.TXT" fat16-test-subdir-new3) t nil))
-(assert-equal fat16-test-subdir-new3 (fat16-read-file *ide-device* "/SUBDIR/DEEPER/NEW4.TXT"))
+(assert-equal t (if (fat16-create-file *test-device* "/SUBDIR/DEEPER/NEW4.TXT" fat16-test-subdir-new3) t nil))
+(assert-equal fat16-test-subdir-new3 (fat16-read-file *test-device* "/SUBDIR/DEEPER/NEW4.TXT"))
 
 ;;; --- FAT16-M7c: fat16-create-directory(mkdir)新設 ---
 ;;
@@ -247,44 +251,44 @@
 ;; 同名重複・8.3非対応名の失敗ケースを確認する。
 
 ;; ルート直下への新規ディレクトリ作成
-(assert-equal t (if (fat16-create-directory *ide-device* "/NEWDIR") t nil))
+(assert-equal t (if (fat16-create-directory *test-device* "/NEWDIR") t nil))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0)
                      (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100)
                      (list "NEWDIR" ':dir 0))
-              (fat16-read-dir *ide-device* "/"))
+              (fat16-read-dir *test-device* "/"))
 
 ;; 作成したディレクトリの内側は"."/".."のみ、".."はルート直下なので規約通り
 ;; start-cluster=0(fat16-read-dirの一覧にはstart-clusterが出ないため、ここでは
 ;; 一覧の名前・種別・sizeのみ確認する。start-clusterの規約自体は%fat16-resolve-dir
 ;; がルートを(lbas . 0)として扱う既存の仕組みに依存している)。
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
-              (fat16-read-dir *ide-device* "/NEWDIR"))
+              (fat16-read-dir *test-device* "/NEWDIR"))
 
 ;; 作成したディレクトリの中への新規ファイル作成→読み込みの往復一致
-(assert-equal t (if (fat16-create-file *ide-device* "/NEWDIR/INSIDE.TXT" fat16-test-subdir-new3) t nil))
-(assert-equal fat16-test-subdir-new3 (fat16-read-file *ide-device* "/NEWDIR/INSIDE.TXT"))
+(assert-equal t (if (fat16-create-file *test-device* "/NEWDIR/INSIDE.TXT" fat16-test-subdir-new3) t nil))
+(assert-equal fat16-test-subdir-new3 (fat16-read-file *test-device* "/NEWDIR/INSIDE.TXT"))
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "INSIDE.TXT" ':file 50))
-              (fat16-read-dir *ide-device* "/NEWDIR"))
+              (fat16-read-dir *test-device* "/NEWDIR"))
 
 ;; 既存サブディレクトリ(/SUBDIR)の配下への新規ディレクトリ作成
 ;; (".."が親=SUBDIRのstart-clusterを指すことを確認するため、SUBDIR内に別の
 ;; ファイルを作ってから対象ディレクトリのfat16-read-dirで一覧を確認する)
-(assert-equal t (if (fat16-create-directory *ide-device* "/SUBDIR/NEWSUB") t nil))
+(assert-equal t (if (fat16-create-directory *test-device* "/SUBDIR/NEWSUB") t nil))
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
-              (fat16-read-dir *ide-device* "/SUBDIR/NEWSUB"))
+              (fat16-read-dir *test-device* "/SUBDIR/NEWSUB"))
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0)
                      (list "NEW3.TXT" ':file 50)
                      (list "NEWSUB" ':dir 0))
-              (fat16-read-dir *ide-device* "/SUBDIR"))
+              (fat16-read-dir *test-device* "/SUBDIR"))
 
 ;; 同名エントリが既に存在する場合はnil(親ディレクトリの一覧は変化しない)
-(assert-equal nil (fat16-create-directory *ide-device* "/SUBDIR"))
-(assert-equal nil (fat16-create-directory *ide-device* "/NEWDIR"))
+(assert-equal nil (fat16-create-directory *test-device* "/SUBDIR"))
+(assert-equal nil (fat16-create-directory *test-device* "/NEWDIR"))
 
 ;; 8.3形式で表現できない名前はnil
-(assert-equal nil (fat16-create-directory *ide-device* "/A.B.C"))
-(assert-equal nil (fat16-create-directory *ide-device* "/TOOLONGDIRNAME"))
+(assert-equal nil (fat16-create-directory *test-device* "/A.B.C"))
+(assert-equal nil (fat16-create-directory *test-device* "/TOOLONGDIRNAME"))
 
 ;; 存在しない親ディレクトリの下へのmkdirもnil
-(assert-equal nil (fat16-create-directory *ide-device* "/NOSUCHDIR/CHILD"))
+(assert-equal nil (fat16-create-directory *test-device* "/NOSUCHDIR/CHILD"))

@@ -110,6 +110,7 @@ int os_ide_identify(os_ide_device *dev, UINT16 io_base, UINT16 ctrl_base, UINT8 
     dev->ctrl_base = ctrl_base;
     dev->drive_select = (UINT8)(IDE_DRIVE_HEAD_BASE | (drive ? IDE_DRIVE_HEAD_SLAVE : 0));
     dev->total_sectors = 0;
+    dev->model[0] = '\0';
     dev->present = 0;
 
     /* 割込みを電気的にも出させない(PIC側は元々マスク済みだが二重の安全策) */
@@ -148,6 +149,20 @@ int os_ide_identify(os_ide_device *dev, UINT16 io_base, UINT16 ctrl_base, UINT8 
 
     UINT32 lba28 = ((UINT32)identify_data[61] << 16) | (UINT32)identify_data[60];
     dev->total_sectors = lba28;
+
+    /* word27-46(モデル名)は1wordに2文字、上位byteが先に来る(byte-swapped) */
+    for (int i = 0; i < 20; i++) {
+        UINT16 word = identify_data[27 + i];
+        dev->model[2 * i] = (char)((word >> 8) & 0xFFu);
+        dev->model[2 * i + 1] = (char)(word & 0xFFu);
+    }
+    dev->model[40] = '\0';
+    int end = 40;
+    while (end > 0 && (dev->model[end - 1] == ' ' || dev->model[end - 1] == '\0')) {
+        end--;
+    }
+    dev->model[end] = '\0';
+
     dev->present = 1;
     return 1;
 }

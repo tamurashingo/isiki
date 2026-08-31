@@ -4,6 +4,7 @@
 #include "framebuffer.h"
 #include "process.h"
 #include "runtime.h"
+#include "block_device.h"
 #include "repl.h"
 #include "subprimitive.h"
 #include "ide_subprimitive.h"
@@ -84,6 +85,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     g_boot_epoch_seconds = boot_epoch_seconds;
 
     os_boot_alloc_init(heap_base, heap_size);
+    os_block_device_probe_all();
     UINT64 lisp_heap_base, lisp_heap_size;
     os_boot_alloc_finalize(&lisp_heap_base, &lisp_heap_size);
 

@@ -2,16 +2,38 @@
 ;;;; Lisp側API。ファイルシステムは実装しない(セクタ単位の読み書きのみ)。
 ;;;;
 ;;;; utility.lisp/init_aot.lispとは異なりAOTトランスパイル対象外の、通常のload形式
-;;;; の(インタプリタ実行専用)ファイル。REPLから(load "src/lisp/ide.lisp")で明示的に
-;;;; 読み込む。文字リテラル(#\X)はAOTトランスパイラでは未対応だが、このファイルは
-;;;; インタプリタ実行のみなので使用できる。動作確認が完了したら、utility.lisp/
-;;;; init_aot.lispと同様にAOTトランスパイル対象へ移行しImmobilized Spaceを節約する
-;;;; (transpile.lispの制約=単一式body・仮引数はシンボルのみ、に合わせて書き直しが
-;;;; 必要な後続タスクとして別途行う)。
+;;;; の(インタプリタ実行専用)ファイル。REPLから(load "src/lisp/device.lisp")の後に
+;;;; (load "src/lisp/ide.lisp")で明示的に読み込む。文字リテラル(#\X)はAOT
+;;;; トランスパイラでは未対応だが、このファイルはインタプリタ実行のみなので
+;;;; 使用できる。動作確認が完了したら、utility.lisp/init_aot.lispと同様にAOT
+;;;; トランスパイル対象へ移行しImmobilized Spaceを節約する(transpile.lispの制約=
+;;;; 単一式body・仮引数はシンボルのみ、に合わせて書き直しが必要な後続タスクとして
+;;;; 別途行う)。
 
-;; *ide-device* : Secondary IDEチャネルのblock_device_t*(TAG_RAW_POINTER付き)。
-;; デバイス非搭載時はnil。
-(defglobal *ide-device* (%%ide-init))
+;; os_block_device_probe_all(C側、kernel_main内でLisp起動前に実行済み)が検出した
+;; Secondary IDEチャネルのデバイスを、*devices*(device.lisp)へblk0,blk1,...として
+;; 登録する。個々のデバイスへは*devices*/(%device-handle 'blk0)経由でアクセスする
+;; (*ide-device*のような単一デバイス専用のグローバルは持たない)。
+(defun %ide-register-devices ()
+  (%ide-register-devices-loop 0 (%%ide-device-count)))
+
+;; (%ide-register-devices-loop i count) : C側レジストリのindex iからcountまでを
+;; 順に%device-register-blkへ渡す再帰ヘルパー。デバイス数は現状最大2台なので
+;; 素の再帰で十分(eval.cはTCO非対応だが、この程度の深さはスタックに問題ない)。
+(defun %ide-register-devices-loop (i count)
+  (if (>= i count)
+      nil
+      (progn
+        (%device-register-blk
+          (let ((dev (%%ide-device-at i)))
+            (list ':type 'blk
+                  ':handle dev
+                  ':name (%%ide-device-name dev)
+                  ':model (%%ide-device-model dev)
+                  ':total-sectors (%%ide-total-sectors dev))))
+        (%ide-register-devices-loop (+ i 1) count))))
+
+(%ide-register-devices)
 
 ;; (%ide-bytes-from-addr addr offset count) : addr+offsetを先頭にcount byte分を
 ;; %%peekで読み、0番目が先頭になるfixnum(0-255)のリストを返す。

@@ -83,7 +83,7 @@ TEST_SRC_IDE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/e
 TEST_BIN_IDE = $(BUILD_TMPDIR)/ide_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu clean
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean
 
 all: build
 
@@ -359,6 +359,18 @@ test-qemu: build $(QEMU_DISK_IMG)
 	test -f test-results.txt
 	cat test-results.txt
 	grep -q " 0 failed" test-results.txt
+
+# test-qemu(デフォルトのqemu_boot_test.lisp)はdevice.lisp/ide.lisp/fat16.lispを
+# loadしないため、IDE/FAT16milestoneはtest-qemuだけでは検証されない。この3つを
+# 順に実行してまとめて検証する(いずれかが失敗すればmakeはそこで停止する)。
+# fat16_test.lispはディスク上にファイルを作成・書き込みする破壊的なテストのため、
+# 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
+# (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする
+test-qemu-all:
+	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG)
+	$(MAKE) test-qemu
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
