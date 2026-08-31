@@ -315,25 +315,32 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
 # はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は
-# FAT16_DISK_IMGを、run/debug/test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で
-# 上書きして使う。既定値はIDE_DISK_IMGなので既存ターゲットの挙動は変わらない。
+# FAT16_DISK_IMGを、test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で上書きして
+# 使う。既定値はIDE_DISK_IMGなので既存ターゲットの挙動は変わらない。
 QEMU_DISK_IMG = $(IDE_DISK_IMG)
 
-run: $(QEMU_DISK_IMG)
+# run/debug(対話的なQEMU起動)はfat16.lisp/ide.lispを手元で試せるよう、既定で
+# FAT16フォーマット済みのFAT16_DISK_IMGをアタッチする。QEMU_DISK_IMGとは別の変数に
+# しているのは、test-qemu/test-qemu-milestoneの既定値(IDE_DISK_IMG、IDE milestoneの
+# magic文字列前提)に影響を与えないため。`make run RUN_DISK_IMG=...`で個別に
+# 上書きできる。
+RUN_DISK_IMG ?= $(FAT16_DISK_IMG)
+
+run: $(RUN_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
 
-debug: $(QEMU_DISK_IMG)
+debug: $(RUN_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-monitor stdio -serial null \
