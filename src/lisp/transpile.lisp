@@ -174,6 +174,7 @@
     (%%heap-used-bytes . "primitive_heap_used_bytes")
     (%%imm-space-total-bytes . "primitive_imm_space_total_bytes")
     (%%imm-space-used-bytes . "primitive_imm_space_used_bytes")
+    (%%boot-alloc-used-bytes . "primitive_boot_alloc_used_bytes")
     ;; FAT16-M0(0)(documents/fs.md): logand/logior/logxor/ashが使う。subprimitive.c
     ;; にcc_in_8等と同じパターンで実装されたビット演算プリミティブ
     (%%logand . "cc_logand")

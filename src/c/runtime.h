@@ -193,6 +193,37 @@ lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env);
 
 /**
+ * boot直後からLisp起動(os_heap_init)までの間だけ使えるbumpアロケータを、
+ * base〜base+sizeの範囲で初期化する。os_heap_initより前に呼ぶこと。
+ * @param base アロケータが使える領域の先頭アドレス
+ * @param size アロケータが使える領域のサイズ(バイト)
+ */
+void os_boot_alloc_init(UINT64 base, UINT64 size);
+
+/**
+ * os_boot_alloc_initで初期化した領域からsizeバイトをalign境界に揃えて確保する。
+ * 確保した領域はLispのGCヒープの外にあり、GCによって移動・破棄されない。
+ * 解放はできない(OS生存期間中保持される前提)。alignは2のべき乗であること。
+ * 領域が枯渇した場合は復帰不能なため停止する。
+ * @param size 確保するバイト数
+ * @param align アライメント(2のべき乗)
+ * @return 確保した領域の先頭アドレス
+ */
+void *os_boot_alloc(UINT64 size, UINT64 align);
+
+/**
+ * boot allocatorの使用を確定し、残りの領域をLispのGCヒープ(os_heap_init)へ
+ * 渡せる形で返す。呼び出し後はos_boot_allocを呼ばないこと。
+ * @param out_heap_base 残り領域の先頭アドレス(8byte境界)の書き込み先
+ * @param out_heap_size 残り領域のサイズ(バイト)の書き込み先
+ * @return それまでにos_boot_allocで確保した延べバイト数
+ */
+UINT64 os_boot_alloc_finalize(UINT64 *out_heap_base, UINT64 *out_heap_size);
+
+/** 組み込み関数%%BOOT-ALLOC-USED-BYTES。os_boot_alloc_finalize確定時点でのboot allocator使用バイト数を返す */
+lisp_val_t primitive_boot_alloc_used_bytes(lisp_val_t args, lisp_val_t env);
+
+/**
  * Cheney方式のコピーGCを1回実行する。global_environment・g_dynamic_bindings・
  * g_symbol_table・キャッシュ済みg_sym_*・各プロセスのenv・全プロセスのshadow stack
  * (GC_PROTECTされたCローカル変数)をルートとして生存オブジェクトをTo空間へコピーし、

@@ -125,6 +125,46 @@ void test_os_make_fixnum() {
     assert(f1 >> 3 == 42, "os_make_fixnum(42)は3bit右シフトで42に戻る");
 }
 
+#define BOOT_ALLOC_TEST_SIZE (64 * 1024)
+
+void test_os_boot_alloc_advances_bump_pointer_with_alignment() {
+    void *region = malloc(BOOT_ALLOC_TEST_SIZE);
+    assert(region != NULL, "boot allocatorのテスト用領域をmallocで確保できる");
+    os_boot_alloc_init((UINT64)region, BOOT_ALLOC_TEST_SIZE);
+
+    void *a = os_boot_alloc(3, 8);
+    assert((UINT64)a % 8 == 0, "os_boot_allocは要求したalignに揃えたアドレスを返す");
+    assert((UINT64)a == (UINT64)region, "1回目の確保は領域の先頭から始まる");
+
+    void *b = os_boot_alloc(5, 8);
+    assert((UINT64)b % 8 == 0, "2回目の確保もalignに揃う");
+    assert((UINT64)b >= (UINT64)a + 3, "2回目の確保は1回目の直後以降から始まる(重ならない)");
+
+    free(region);
+}
+
+void test_os_boot_alloc_finalize_returns_remaining_region_after_usage() {
+    void *region = malloc(BOOT_ALLOC_TEST_SIZE);
+    assert(region != NULL, "boot allocatorのテスト用領域をmallocで確保できる");
+    os_boot_alloc_init((UINT64)region, BOOT_ALLOC_TEST_SIZE);
+
+    os_boot_alloc(100, 8);
+    os_boot_alloc(200, 8);
+
+    UINT64 out_base, out_size;
+    UINT64 used = os_boot_alloc_finalize(&out_base, &out_size);
+
+    assert(used >= 300, "finalizeが返す使用量は、それまでのos_boot_alloc要求の合計以上である");
+    assert(out_base >= (UINT64)region + used, "残り領域の先頭は使用済み分より後ろにある");
+    assert(out_base % 8 == 0, "残り領域の先頭は8byte境界に整列される");
+    assert(out_base + out_size == (UINT64)region + BOOT_ALLOC_TEST_SIZE,
+           "残り領域は元の領域の末尾まで隙間なく続く");
+
+    free(region);
+}
+
+#undef BOOT_ALLOC_TEST_SIZE
+
 void test_os_make_cons() {
     lisp_val_t car = os_make_fixnum(1);
     lisp_val_t cdr = os_make_fixnum(2);
@@ -1875,6 +1915,8 @@ int main(int argc, char** argv) {
    (void)argc;
    (void)argv;
    test_os_make_fixnum();
+   test_os_boot_alloc_advances_bump_pointer_with_alignment();
+   test_os_boot_alloc_finalize_returns_remaining_region_after_usage();
 
    setup_heap();
    test_os_make_cons();
