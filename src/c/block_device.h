@@ -17,6 +17,8 @@ struct _block_device {
     UINT32 sector_size;
     /** 総セクタ数(0の場合は未初期化またはサイズ不明) */
     UINT32 total_sectors;
+    /** IDENTIFY等で得たASCIIモデル名(末尾空白除去済み、NUL終端、未対応時は空文字列) */
+    char model[41];
     /** デバイスの初期化/検出を行う */
     int (*init)(block_device_t *self, char *err_msg, UINT32 err_msg_cap);
     /** lbaを起点にcount個のセクタをbufへ読み込む(bufはcount*sector_size byte以上) */
@@ -30,15 +32,22 @@ struct _block_device {
 };
 
 /**
- * Secondary IDEチャネルのblock_device_tシングルトンを返す。初回呼び出し時のみ
- * initを実行してIDENTIFYをプローブし、以後は結果をキャッシュして返す
- * (transport_virtio9pのensure_readyパターンと同じ)。
- * @return デバイス検出に成功していればblock_device_t*、失敗していれば0
+ * 全チャネルをプローブしてblock_device_tのレジストリを構築する。GCヒープが
+ * まだ存在しない起動直後、os_boot_alloc_init後・os_boot_alloc_finalize前に
+ * 1回だけ呼ぶこと(検出した各デバイスの実体はos_boot_allocで確保する)。
  */
-block_device_t *os_block_device_ide_instance(void);
+void os_block_device_probe_all(void);
+
+/** os_block_device_probe_allで検出されたデバイス数を返す */
+UINT32 os_block_device_count(void);
 
 /**
- * os_block_device_ide_instanceが読み書きに使う共有セクタバッファの先頭アドレスを
+ * 検出順(0起点)でindex番目のblock_device_t*を返す。範囲外の場合は0。
+ */
+block_device_t *os_block_device_at(UINT32 index);
+
+/**
+ * read_sectors/write_sectorsが読み書きに使う共有セクタバッファの先頭アドレスを
  * 返す(GCヒープ外の静的配列)。read_sectors/write_sectorsを呼ぶ前後でLisp側が
  * このアドレスを介してバイト単位に%%peek/%%pokeする想定。
  */

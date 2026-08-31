@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include "test_assert.h"
 #include "types.h"
 #include "runtime.h"
@@ -118,6 +119,25 @@ static void fake_push_status(UINT8 s) {
     g_status_queue[g_status_queue_len++] = s;
 }
 
+// data_in(g_data_inの一部)のword27-46へmodelをbyte-swapped(上位byteが先)で書き込み、
+// 40byteに満たない分は' '(空白)で埋める。os_ide_identifyの実装(ide.c)と対になる
+// エンコード側のヘルパー
+static void fake_set_model_words(UINT16 *data_in, const char *model) {
+    char padded[40];
+    int len = 0;
+    while (model[len] != '\0' && len < 40) {
+        len++;
+    }
+    for (int i = 0; i < 40; i++) {
+        padded[i] = (i < len) ? model[i] : ' ';
+    }
+    for (int w = 0; w < 20; w++) {
+        UINT8 hi = (UINT8)padded[2 * w];
+        UINT8 lo = (UINT8)padded[2 * w + 1];
+        data_in[27 + w] = (UINT16)(((UINT16)hi << 8) | (UINT16)lo);
+    }
+}
+
 void outb(uint16_t port, uint8_t val) {
     if (port == FAKE_CTRL_BASE) {
         g_ctrl_value = val;
@@ -185,6 +205,7 @@ void test_os_ide_identify_success() {
     fake_push_status(0x08); // wait_drq 2周目: BSYクリア+DRQセット
     g_data_in[60] = 100;
     g_data_in[61] = 0;
+    fake_set_model_words(g_data_in, "QEMU HARDDISK");
 
     os_ide_device dev;
     char err[128];
@@ -193,6 +214,7 @@ void test_os_ide_identify_success() {
     assert(ok == 1, "os_ide_identifyはPATA HDD検出時に1を返す");
     assert(dev.present == 1, "os_ide_identify成功時はpresentが1になる");
     assert(dev.total_sectors == 100, "os_ide_identifyはword60-61からLBA28の総セクタ数を得る");
+    assert(strcmp(dev.model, "QEMU HARDDISK") == 0, "os_ide_identifyはword27-46から末尾空白除去済みのモデル名を得る");
     assert(dev.io_base == FAKE_IO_BASE, "os_ide_identifyはio_baseを保持する");
     assert(dev.drive_select == 0xE0, "os_ide_identifyはmaster選択時drive_selectを0xE0にする");
     assert(g_out_drive_head == 0xE0, "os_ide_identifyはdrive/headレジスタへ0xE0を書く");
@@ -318,30 +340,84 @@ void test_os_ide_write_sectors_busy_timeout() {
     assert(ok == 0, "os_ide_write_sectorsはBSYスピンキャップ超過時に0を返す(ハングしない)");
 }
 
-void test_cc_ide_init_and_singleton() {
-    // block_device.cのos_block_device_ide_instanceはSecondaryチャネル
-    // (0x170/0x376)を対象にした遅延初期化シングルトンで、初回呼び出し時にのみ
-    // IDENTIFYを実行する。以後このプロセス内では結果がキャッシュされ続けるため、
-    // 他のcc_ide_*テストより先に一度だけ成功パターンで初期化させる
+// os_block_device_probe_allはOS生存期間中1度だけ呼ばれる想定の登録処理で、
+// 検出結果はg_block_devices(block_device.c内のstatic)に積み上げられる一方
+// (リセット手段が無い)なため、このテストバイナリ内では一度だけ呼び、その結果を
+// 後続のtest_cc_ide_device_primitivesと共有する
+static block_device_t *g_test_master_dev = 0;
+static block_device_t *g_test_slave_dev = 0;
+
+void test_os_block_device_probe_all_two_drives() {
     fake_reset();
+
+    // master(Secondary channel drive=0): floating busではなく、IDENTIFYが成功する
+    fake_push_status(0x80); // floating bus check: not floating
+    fake_push_status(0x80); // wait_drq 1周目: BSYがまだ立っている
+    fake_push_status(0x08); // wait_drq 2周目: BSYクリア+DRQセット
+    g_data_in[60] = 300;
+    g_data_in[61] = 0;
+    fake_set_model_words(g_data_in, "QEMU HARDDISK MASTER");
+
+    // slave(drive=1): g_data_in_pos/g_status_queue_posはmasterの分だけ既に進んでいる
+    // ため、続けてslave分を積む(256語目以降がslaveのIDENTIFY応答になる)
+    fake_push_status(0x80);
     fake_push_status(0x80);
     fake_push_status(0x08);
-    g_data_in[60] = 200;
-    g_data_in[61] = 0;
+    g_data_in[256 + 60] = 500;
+    g_data_in[256 + 61] = 0;
+    fake_set_model_words(&g_data_in[256], "QEMU HARDDISK SLAVE");
 
-    lisp_val_t result = cc_ide_init(nil, nil);
+    void *boot_mem = malloc(4096);
+    assert(boot_mem != NULL, "os_boot_alloc用のスクラッチ領域をmallocできる");
+    os_boot_alloc_init((UINT64)boot_mem, 4096);
 
-    assert(result != nil, "cc_ide_initはIDENTIFY成功時にnil以外を返す");
-    assert((result & TAG_MASK) == TAG_RAW_POINTER, "cc_ide_initはblock_device_t*をTAG_RAW_POINTER付きで返す");
+    os_block_device_probe_all();
 
-    block_device_t *dev = (block_device_t *)(lisp_addr_t)(result & ~TAG_MASK);
-    assert(dev->total_sectors == 200, "cc_ide_initが返すblock_device_tのtotal_sectorsはIDENTIFYの結果と一致する");
+    assert(os_block_device_count() == 2, "master+slave両方present時、検出device数は2になる");
 
-    lisp_val_t args[1] = { result };
-    lisp_val_t total = cc_ide_total_sectors(make_args(1, args), nil);
-    assert(total == os_make_fixnum(200), "cc_ide_total_sectorsはtotal_sectorsをfixnumで返す");
+    g_test_master_dev = os_block_device_at(0);
+    g_test_slave_dev = os_block_device_at(1);
+    assert(g_test_master_dev != 0, "os_block_device_at(0)はmasterのblock_device_tを返す");
+    assert(g_test_slave_dev != 0, "os_block_device_at(1)はslaveのblock_device_tを返す");
+    assert(g_test_master_dev->total_sectors == 300, "master(index0)のtotal_sectorsはIDENTIFYの結果と一致する");
+    assert(g_test_slave_dev->total_sectors == 500, "slave(index1)のtotal_sectorsはIDENTIFYの結果と一致する");
+    assert(strcmp(g_test_master_dev->model, "QEMU HARDDISK MASTER") == 0, "master(index0)のmodelはIDENTIFYの結果と一致する");
+    assert(strcmp(g_test_slave_dev->model, "QEMU HARDDISK SLAVE") == 0, "slave(index1)のmodelはIDENTIFYの結果と一致する");
+    assert(strcmp(g_test_master_dev->name, "ide-secondary-master") == 0, "検出順(index0)はSecondary masterである");
+    assert(strcmp(g_test_slave_dev->name, "ide-secondary-slave") == 0, "検出順(index1)はSecondary slaveである");
+    assert(os_block_device_at(2) == 0, "範囲外のindexはNULLを返す");
+}
 
-    lisp_val_t addr = cc_ide_sector_buffer_address(make_args(1, args), nil);
+void test_cc_ide_device_primitives() {
+    // 直前のtest_os_block_device_probe_all_two_drivesで登録済みの2台のレジストリを
+    // %%IDE-DEVICE-*primitiveから読めることを確認する
+    lisp_val_t count = cc_ide_device_count(nil, nil);
+    assert(count == os_make_fixnum(2), "cc_ide_device_countは検出済みデバイス数をfixnumで返す");
+
+    lisp_val_t at0_args[1] = { os_make_fixnum(0) };
+    lisp_val_t dev0 = cc_ide_device_at(make_args(1, at0_args), nil);
+    assert(dev0 != nil, "cc_ide_device_at(0)はnil以外を返す");
+    assert((dev0 & TAG_MASK) == TAG_RAW_POINTER, "cc_ide_device_atはblock_device_t*をTAG_RAW_POINTER付きで返す");
+    assert((block_device_t *)(lisp_addr_t)(dev0 & ~TAG_MASK) == g_test_master_dev, "cc_ide_device_at(0)はos_block_device_at(0)と同じポインタを返す");
+
+    lisp_val_t out_of_range_args[1] = { os_make_fixnum(2) };
+    lisp_val_t dev_out_of_range = cc_ide_device_at(make_args(1, out_of_range_args), nil);
+    assert(dev_out_of_range == nil, "cc_ide_device_atは範囲外のindexに対しnilを返す");
+
+    lisp_val_t dev0_args[1] = { dev0 };
+    lisp_val_t name0 = cc_ide_device_name(make_args(1, dev0_args), nil);
+    lisp_val_t model0 = cc_ide_device_model(make_args(1, dev0_args), nil);
+    char name0_buf[64];
+    char model0_buf[64];
+    os_string_to_cstr(name0, name0_buf, sizeof(name0_buf));
+    os_string_to_cstr(model0, model0_buf, sizeof(model0_buf));
+    assert(strcmp(name0_buf, "ide-secondary-master") == 0, "cc_ide_device_nameはdeviceのnameを文字列で返す");
+    assert(strcmp(model0_buf, "QEMU HARDDISK MASTER") == 0, "cc_ide_device_modelはdeviceのmodelを文字列で返す");
+
+    lisp_val_t total = cc_ide_total_sectors(make_args(1, dev0_args), nil);
+    assert(total == os_make_fixnum(300), "cc_ide_total_sectorsはtotal_sectorsをfixnumで返す");
+
+    lisp_val_t addr = cc_ide_sector_buffer_address(make_args(1, dev0_args), nil);
     assert((addr & TAG_MASK) == TAG_FIXNUM, "cc_ide_sector_buffer_addressは素のFIXNUMを返す(TAG_RAW_POINTERではない)");
     assert((UINT8 *)(lisp_addr_t)(addr >> 3) == os_block_device_ide_sector_buffer(), "cc_ide_sector_buffer_addressは共有バッファの先頭アドレスを返す");
 
@@ -351,7 +427,7 @@ void test_cc_ide_init_and_singleton() {
     for (int i = 0; i < 256; i++) {
         g_data_in[i] = (UINT16)(0x2000 + i);
     }
-    lisp_val_t read_args[2] = { result, os_make_fixnum(3) };
+    lisp_val_t read_args[2] = { dev0, os_make_fixnum(3) };
     lisp_val_t read_ok = cc_ide_read_sector(make_args(2, read_args), nil);
     assert(read_ok == g_sym_t, "cc_ide_read_sectorは成功時tを返す");
 
@@ -366,7 +442,7 @@ void test_cc_ide_init_and_singleton() {
 
     fake_reset();
     fake_push_status(0x21); // ERRビット -> 読み込み失敗
-    lisp_val_t read_fail_args[2] = { result, os_make_fixnum(4) };
+    lisp_val_t read_fail_args[2] = { dev0, os_make_fixnum(4) };
     lisp_val_t read_fail = cc_ide_read_sector(make_args(2, read_fail_args), nil);
     assert(read_fail == nil, "cc_ide_read_sectorは失敗時nilを返す");
 
@@ -374,7 +450,7 @@ void test_cc_ide_init_and_singleton() {
     fake_push_status(0x00);
     fake_push_status(0x08);
     fake_push_status(0x00);
-    lisp_val_t write_args[2] = { result, os_make_fixnum(7) };
+    lisp_val_t write_args[2] = { dev0, os_make_fixnum(7) };
     lisp_val_t write_ok = cc_ide_write_sector(make_args(2, write_args), nil);
     assert(write_ok == g_sym_t, "cc_ide_write_sectorは成功時tを返す");
 
@@ -390,13 +466,19 @@ void test_cc_ide_init_and_singleton() {
 void test_os_register_ide_subprimitives() {
     os_register_ide_subprimitives();
 
-    lisp_val_t init_fn = os_get_function(os_make_symbol("%%IDE-INIT"), global_environment);
+    lisp_val_t count_fn = os_get_function(os_make_symbol("%%IDE-DEVICE-COUNT"), global_environment);
+    lisp_val_t at_fn = os_get_function(os_make_symbol("%%IDE-DEVICE-AT"), global_environment);
+    lisp_val_t name_fn = os_get_function(os_make_symbol("%%IDE-DEVICE-NAME"), global_environment);
+    lisp_val_t model_fn = os_get_function(os_make_symbol("%%IDE-DEVICE-MODEL"), global_environment);
     lisp_val_t addr_fn = os_get_function(os_make_symbol("%%IDE-SECTOR-BUFFER-ADDRESS"), global_environment);
     lisp_val_t read_fn = os_get_function(os_make_symbol("%%IDE-READ-SECTOR"), global_environment);
     lisp_val_t write_fn = os_get_function(os_make_symbol("%%IDE-WRITE-SECTOR"), global_environment);
     lisp_val_t total_fn = os_get_function(os_make_symbol("%%IDE-TOTAL-SECTORS"), global_environment);
 
-    assert(init_fn != nil, "os_register_ide_subprimitives後は%%IDE-INITがglobal_environmentから引ける");
+    assert(count_fn != nil, "os_register_ide_subprimitives後は%%IDE-DEVICE-COUNTがglobal_environmentから引ける");
+    assert(at_fn != nil, "os_register_ide_subprimitives後は%%IDE-DEVICE-ATがglobal_environmentから引ける");
+    assert(name_fn != nil, "os_register_ide_subprimitives後は%%IDE-DEVICE-NAMEがglobal_environmentから引ける");
+    assert(model_fn != nil, "os_register_ide_subprimitives後は%%IDE-DEVICE-MODELがglobal_environmentから引ける");
     assert(addr_fn != nil, "os_register_ide_subprimitives後は%%IDE-SECTOR-BUFFER-ADDRESSがglobal_environmentから引ける");
     assert(read_fn != nil, "os_register_ide_subprimitives後は%%IDE-READ-SECTORがglobal_environmentから引ける");
     assert(write_fn != nil, "os_register_ide_subprimitives後は%%IDE-WRITE-SECTORがglobal_environmentから引ける");
@@ -417,7 +499,8 @@ int main(int argc, char** argv) {
     test_os_ide_read_sectors_not_present();
     test_os_ide_write_sectors_success();
     test_os_ide_write_sectors_busy_timeout();
-    test_cc_ide_init_and_singleton();
+    test_os_block_device_probe_all_two_drives();
+    test_cc_ide_device_primitives();
     test_os_register_ide_subprimitives();
 
     return g_test_failed ? 1 : 0;

@@ -1,8 +1,9 @@
 ;;;; FAT16ファイルシステムの読み込みAPI。
 ;;;; ide.lispと同じ理由でAOTトランスパイル対象外の、通常のload形式(インタプリタ
-;;;; 実行専用)ファイル。src/lisp/ide.lisp(*ide-device*/read-sector)のロードを
-;;;; 前提とする。REPLから(load "src/lisp/ide.lisp")→(load "src/lisp/fat16.lisp")
-;;;; の順に明示的に読み込む。
+;;;; 実行専用)ファイル。各関数はdeviceハンドル(*devices*/(%device-handle 'blk0)
+;;;; 等で得られるblock_device_t*)を引数に取り、read-sector(src/lisp/ide.lisp)経由
+;;;; で読み込む。REPLから(load "src/lisp/device.lisp")→(load "src/lisp/ide.lisp")→
+;;;; (load "src/lisp/fat16.lisp")の順に明示的に読み込む。
 ;;;;
 ;;;; FAT16-M1: BPB(Boot Sector)パースのみを実装する(documents/fs.md)。
 

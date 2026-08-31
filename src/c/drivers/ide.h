@@ -20,17 +20,19 @@ typedef struct {
     UINT8 drive_select;
     /** IDENTIFY DEVICEのword60-61から得たLBA28の総セクタ数 */
     UINT32 total_sectors;
+    /** IDENTIFY DEVICEのword27-46から得たASCIIモデル名(末尾空白除去済み、NUL終端) */
+    char model[41];
     /** IDENTIFYに成功した場合1 */
     int present;
 } os_ide_device;
 
 /**
  * io_base/ctrl_base上のdrive(0=master,1=slave)へIDENTIFY DEVICE(0xEC)を送り、
- * デバイスの有無とLBA28の総セクタ数を調べる。デバイス非搭載(floating bus、
- * status読み込みが0x00/0xFF)の場合はBSY待ちに入らず即座に0を返す(ハング防止)。
- * ATAPI/SATAブリッジのsignature(LBA_MID/LBA_HIGHが0x14/0xEBまたは0x69/0x96)を
- * 検出した場合も、PATA HDD以外はスコープ外として0を返す。
- * モデル名(word27-46)やLBA48対応(word83 bit10)は解析しない(明示的に対象外)。
+ * デバイスの有無・LBA28の総セクタ数・モデル名(word27-46)を調べる。デバイス非搭載
+ * (floating bus、status読み込みが0x00/0xFF)の場合はBSY待ちに入らず即座に0を返す
+ * (ハング防止)。ATAPI/SATAブリッジのsignature(LBA_MID/LBA_HIGHが0x14/0xEBまたは
+ * 0x69/0x96)を検出した場合も、PATA HDD以外はスコープ外として0を返す。
+ * LBA48対応(word83 bit10)は解析しない(明示的に対象外)。
  * @param dev 初期化対象。成功時にio_base/ctrl_base/drive_select/total_sectors/presentが設定される
  * @param io_base コマンドブロックレジスタのベースポート
  * @param ctrl_base コントロールブロックレジスタのベースポート

@@ -3,8 +3,17 @@
 
 #include "runtime.h"
 
-/** (%%ide-init) 引数無し。Secondary IDEチャネルをプローブし、成功時block_device_t*をTAG_RAW_POINTER付きで、失敗時nilを返す */
-lisp_val_t cc_ide_init(lisp_val_t args, lisp_val_t env);
+/** (%%ide-device-count) 引数無し。os_block_device_probe_allで検出済みのblock_device数をfixnumで返す */
+lisp_val_t cc_ide_device_count(lisp_val_t args, lisp_val_t env);
+
+/** (%%ide-device-at index) 検出順index番目のblock_device_t*をTAG_RAW_POINTER付きで返す。範囲外はnil */
+lisp_val_t cc_ide_device_at(lisp_val_t args, lisp_val_t env);
+
+/** (%%ide-device-name device) デバイス名(例: "ide-secondary-master")を文字列で返す */
+lisp_val_t cc_ide_device_name(lisp_val_t args, lisp_val_t env);
+
+/** (%%ide-device-model device) IDENTIFYで得たモデル名を文字列で返す(未対応時は空文字列) */
+lisp_val_t cc_ide_device_model(lisp_val_t args, lisp_val_t env);
 
 /** (%%ide-sector-buffer-address device) 共有セクタバッファの先頭アドレスを素のFIXNUMで返す(deviceは未使用、将来のマルチデバイス対応用に引数だけ確保) */
 lisp_val_t cc_ide_sector_buffer_address(lisp_val_t args, lisp_val_t env);

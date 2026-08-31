@@ -83,7 +83,7 @@ TEST_SRC_IDE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/e
 TEST_BIN_IDE = $(BUILD_TMPDIR)/ide_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu clean
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean
 
 all: build
 
@@ -315,25 +315,32 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
 # はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は
-# FAT16_DISK_IMGを、run/debug/test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で
-# 上書きして使う。既定値はIDE_DISK_IMGなので既存ターゲットの挙動は変わらない。
+# FAT16_DISK_IMGを、test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で上書きして
+# 使う。既定値はIDE_DISK_IMGなので既存ターゲットの挙動は変わらない。
 QEMU_DISK_IMG = $(IDE_DISK_IMG)
 
-run: $(QEMU_DISK_IMG)
+# run/debug(対話的なQEMU起動)はfat16.lisp/ide.lispを手元で試せるよう、既定で
+# FAT16フォーマット済みのFAT16_DISK_IMGをアタッチする。QEMU_DISK_IMGとは別の変数に
+# しているのは、test-qemu/test-qemu-milestoneの既定値(IDE_DISK_IMG、IDE milestoneの
+# magic文字列前提)に影響を与えないため。`make run RUN_DISK_IMG=...`で個別に
+# 上書きできる。
+RUN_DISK_IMG ?= $(FAT16_DISK_IMG)
+
+run: $(RUN_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
 
-debug: $(QEMU_DISK_IMG)
+debug: $(RUN_DISK_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:./esp_dir \
-		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		-monitor stdio -serial null \
@@ -359,6 +366,18 @@ test-qemu: build $(QEMU_DISK_IMG)
 	test -f test-results.txt
 	cat test-results.txt
 	grep -q " 0 failed" test-results.txt
+
+# test-qemu(デフォルトのqemu_boot_test.lisp)はdevice.lisp/ide.lisp/fat16.lispを
+# loadしないため、IDE/FAT16milestoneはtest-qemuだけでは検証されない。この3つを
+# 順に実行してまとめて検証する(いずれかが失敗すればmakeはそこで停止する)。
+# fat16_test.lispはディスク上にファイルを作成・書き込みする破壊的なテストのため、
+# 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
+# (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする
+test-qemu-all:
+	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG)
+	$(MAKE) test-qemu
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック

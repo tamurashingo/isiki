@@ -3,14 +3,34 @@
 #include "lisp.h"
 #include "block_device.h"
 
-lisp_val_t cc_ide_init(lisp_val_t args, lisp_val_t env) {
+lisp_val_t cc_ide_device_count(lisp_val_t args, lisp_val_t env) {
     (void)args;
     (void)env;
-    block_device_t *dev = os_block_device_ide_instance();
+    return os_make_fixnum(os_block_device_count());
+}
+
+lisp_val_t cc_ide_device_at(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT32 index = (UINT32)(cc_car(args) >> 3);
+    block_device_t *dev = os_block_device_at(index);
     if (dev == 0) {
         return nil;
     }
     return ((lisp_val_t)(lisp_addr_t)dev) | TAG_RAW_POINTER;
+}
+
+lisp_val_t cc_ide_device_name(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t device = cc_car(args);
+    block_device_t *dev = (block_device_t *)(lisp_addr_t)(device & ~TAG_MASK);
+    return os_make_string(dev->name);
+}
+
+lisp_val_t cc_ide_device_model(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t device = cc_car(args);
+    block_device_t *dev = (block_device_t *)(lisp_addr_t)(device & ~TAG_MASK);
+    return os_make_string(dev->model);
 }
 
 lisp_val_t cc_ide_sector_buffer_address(lisp_val_t args, lisp_val_t env) {
@@ -59,7 +79,10 @@ lisp_val_t cc_ide_total_sectors(lisp_val_t args, lisp_val_t env) {
 }
 
 void os_register_ide_subprimitives(void) {
-    os_set_function(os_make_symbol("%%IDE-INIT"), os_make_native_function((lisp_addr_t)(void *)cc_ide_init), global_environment);
+    os_set_function(os_make_symbol("%%IDE-DEVICE-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_ide_device_count), global_environment);
+    os_set_function(os_make_symbol("%%IDE-DEVICE-AT"), os_make_native_function((lisp_addr_t)(void *)cc_ide_device_at), global_environment);
+    os_set_function(os_make_symbol("%%IDE-DEVICE-NAME"), os_make_native_function((lisp_addr_t)(void *)cc_ide_device_name), global_environment);
+    os_set_function(os_make_symbol("%%IDE-DEVICE-MODEL"), os_make_native_function((lisp_addr_t)(void *)cc_ide_device_model), global_environment);
     os_set_function(os_make_symbol("%%IDE-SECTOR-BUFFER-ADDRESS"), os_make_native_function((lisp_addr_t)(void *)cc_ide_sector_buffer_address), global_environment);
     os_set_function(os_make_symbol("%%IDE-READ-SECTOR"), os_make_native_function((lisp_addr_t)(void *)cc_ide_read_sector), global_environment);
     os_set_function(os_make_symbol("%%IDE-WRITE-SECTOR"), os_make_native_function((lisp_addr_t)(void *)cc_ide_write_sector), global_environment);
