@@ -382,6 +382,63 @@ UINT64 os_gc_collect_count(void) {
     return g_gc_collect_count;
 }
 
+/* ============================== Boot Allocator ==============================
+ * boot直後からLisp起動(os_heap_init)までの間だけ使えるbumpアロケータ。
+ * UEFIから渡された単一の空き領域(heap_base/heap_size)の先頭から必要な分だけ
+ * 切り出す。ここで確保された領域はLispのcopy GCヒープ(From/To空間)の外にあり、
+ * GCが移動・スキャンすることはない(immobilized spaceと同様の性質)。
+ * 解放は提供しない。ここで確保するものはOSの生存期間中保持され続ける前提であり、
+ * 途中で不要になって再利用したいユースケースは今のところない。
+ * os_boot_alloc_finalizeを呼んだ後は、残りの領域がLispのGCヒープになる
+ * (os_heap_initへそのまま渡す)。
+ */
+
+static UINT8 *g_boot_alloc_base = 0;
+static UINT8 *g_boot_alloc_bump = 0;
+static UINT8 *g_boot_alloc_end = 0;
+/** os_boot_alloc_finalize確定時の使用バイト数。roomから%%BOOT-ALLOC-USED-BYTES経由で読める */
+static UINT64 g_boot_alloc_used_at_finalize = 0;
+
+void os_boot_alloc_init(UINT64 base, UINT64 size) {
+    g_boot_alloc_base = (UINT8 *)base;
+    g_boot_alloc_bump = (UINT8 *)base;
+    g_boot_alloc_end = (UINT8 *)(base + size);
+}
+
+void *os_boot_alloc(UINT64 size, UINT64 align) {
+    UINT64 addr = ((UINT64)g_boot_alloc_bump + align - 1) & ~(align - 1);
+    if ((UINT8 *)(addr + size) > g_boot_alloc_end) {
+        frame_buffer *fb = get_active_frame_buffer();
+        fb->write_string(fb, "boot_alloc: space exhausted...");
+        for (;;) {
+        }
+    }
+    g_boot_alloc_bump = (UINT8 *)(addr + size);
+    return (void *)addr;
+}
+
+UINT64 os_boot_alloc_finalize(UINT64 *out_heap_base, UINT64 *out_heap_size) {
+    UINT64 used = (UINT64)(g_boot_alloc_bump - g_boot_alloc_base);
+    UINT64 aligned_base = ((UINT64)g_boot_alloc_bump + 7) & ~7ULL;
+    *out_heap_base = aligned_base;
+    *out_heap_size = (UINT64)g_boot_alloc_end - aligned_base;
+    g_boot_alloc_used_at_finalize = used;
+    return used;
+}
+
+/**
+ * 組み込み関数%%BOOT-ALLOC-USED-BYTES。os_boot_alloc_finalize確定時点でboot
+ * allocatorが使用していたバイト数を返す(finalize前は常に0)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return boot allocatorの使用バイト数のfixnum
+ */
+lisp_val_t primitive_boot_alloc_used_bytes(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(g_boot_alloc_used_at_finalize);
+}
+
 /* ============================== Immobilized Space ==============================
  * GCが移動・破棄しない固定領域。JITコード(za.c)や、後続フェーズで導入するFunction Cell
  * など、Cヘのポインタとして直接掴んでおきたいデータの置き場所として使う。
@@ -1069,6 +1126,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
+        os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
         os_set_function(os_make_symbol("GENERIC-FUNCTION-P"), os_make_native_function((lisp_addr_t)(void *)primitive_generic_function_p), global_environment);
         os_set_function(os_make_symbol("BASIC-ARRAY-P"), os_make_native_function((lisp_addr_t)(void *)primitive_basic_array_p), global_environment);
         // basic-array*-pとgeneral-array*-pは本実装では外延が一致するため実体を共用する

@@ -10,8 +10,9 @@
 ;;; --- room ---
 ;;;
 ;;; CommonLispのroomコマンド相当。heapの全体量(From空間、コピーGC用に確保している
-;;; ヒープ全体の半分)・使用量と、Immobilized Spaceの全体量・使用量を、いずれも
-;;; 生バイト数を3桁区切りのカンマ付きで"1,234,567 byte"のように表示する。
+;;; ヒープ全体の半分)・使用量と、Immobilized Spaceの全体量・使用量、boot allocator
+;;; (boot直後からLisp起動前までにCが確保した領域)の使用量を、いずれも生バイト数を
+;;; 3桁区切りのカンマ付きで"1,234,567 byte"のように表示する。
 
 ;; (%room-digit-string n) : 非負整数nを10進文字列に変換する。文字リテラルが
 ;; トランスパイラ未対応のため、create-string-output-stream+format "~D"経由で
@@ -61,8 +62,9 @@
       (dynamic *standard-output*)
       (open-output-stream)))
 
-;; (room) : heapの全体量・使用量、Immobilized Spaceの全体量・使用量を、いずれも
-;; 3桁区切りカンマ付きのバイト数で表示する。
+;; (room) : heapの全体量・使用量、Immobilized Spaceの全体量・使用量、boot allocator
+;; (boot直後からLisp起動前までにCが確保した領域)の使用量を、いずれも3桁区切り
+;; カンマ付きのバイト数で表示する。
 (defun room ()
   (let ((out (%room-output-stream)))
     (progn
@@ -70,4 +72,5 @@
       (format out "Heap used: ~A~%" (%room-format-bytes (%%heap-used-bytes)))
       (format out "Immobilized space total: ~A~%" (%room-format-bytes (%%imm-space-total-bytes)))
       (format out "Immobilized space used: ~A~%" (%room-format-bytes (%%imm-space-used-bytes)))
+      (format out "Boot allocator used: ~A~%" (%room-format-bytes (%%boot-alloc-used-bytes)))
       nil)))
