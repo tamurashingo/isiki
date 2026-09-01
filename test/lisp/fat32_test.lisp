@@ -74,3 +74,122 @@
 
 (assert-equal (list 110 101 115 116 101) (subseq (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT") 0 5))
 (assert-equal 19 (length (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT")))
+
+;;; --- FAT32-M6a: 既存ファイルの同クラスタ数上書き ---
+;;
+;; WRITE1.TXT(Makefile参照、mkfs.vfat作成時に"A"を512回=ちょうど1クラスタ分
+;; 書き込んだ書き込みテスト専用ファイル、sectors-per-cluster=1なので1クラスタ=
+;; 512byte)に対して同じ1クラスタ以内に収まる別内容を書き込み、読み込みで一致する
+;; ことを確認する。他の既存ファイルは読み込み専用のまま変更しないため、書き込みは
+;; このファイルにのみ行う。
+
+;; (%fat32-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumリストを
+;; 作るテスト専用ヘルパー。再帰は使わずwhileで組み立てる(nがファイルサイズに
+;; 比例して大きくなり得るため)。
+(defun %fat32-test-make-byte-list (n value)
+  (let ((i 0) (acc nil))
+    (while (< i n)
+      (setq acc (cons value acc))
+      (setq i (+ i 1)))
+    acc))
+
+;; 書き込み前の内容確認(念のため)
+(assert-equal 512 (length (fat32-read-file *fat32-test-device* "/WRITE1.TXT")))
+(assert-equal 65 (elt (fat32-read-file *fat32-test-device* "/WRITE1.TXT") 0))
+(assert-equal 65 (elt (fat32-read-file *fat32-test-device* "/WRITE1.TXT") 511))
+
+(defglobal fat32-test-write1-new (list 87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
+
+(assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new) t nil))
+(assert-equal fat32-test-write1-new (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 10)
+                     (list "SUBDIR" ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;;; --- FAT32-M6b: クラスタ追加を伴うファイル拡張 ---
+;;
+;; WRITE1.TXTは直前のM6a確認時点で1クラスタ(512byte以内)のまま。513byteは1
+;; クラスタを超えるため2クラスタ必要になり、現在の1クラスタと不一致になる。
+;; 必要クラスタ数が増える場合は新規クラスタを確保して拡張書き込みが成功する。
+
+(defglobal fat32-test-write1-2clusters (%fat32-test-make-byte-list 513 66))
+
+(assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-2clusters) t nil))
+(assert-equal fat32-test-write1-2clusters (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "SUBDIR" ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;; クラスタ数が減る書き込み(縮小)は対象外としてnilを返す(現在2クラスタ確保済みの
+;; WRITE1.TXTへ、1クラスタで収まる10byteを書こうとする)。直前の(失敗した)呼び出し
+;; でデータ/ディレクトリエントリが変更されていないことも確認する。
+(assert-equal nil (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new))
+(assert-equal fat32-test-write1-2clusters (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "SUBDIR" ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;;; --- FAT32-M6c: 新規ファイル作成 ---
+;;
+;; Makefileのmkfs.vfat手順でDELETED.TXTを最後に作成後rmしているため、この時点で
+;; ルートディレクトリにはWRITE1.TXT/SUBDIRの直後に0xE5(削除済み再利用可)スロットが
+;; 1つ、その直後に終端(0x00)スロットが続く並びになっている。fat32-create-fileは
+;; 最初に見つかった空きスロットへ書き込むため、1つ目の新規ファイルはDELETED.TXT
+;; だったスロットを再利用し、2つ目は新しい終端スロットに入る。
+
+;; 空ファイルの新規作成(クラスタ確保なし、start-cluster=0/size=0)
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/NEW1.TXT" nil) t nil))
+(assert-equal nil (fat32-read-file *fat32-test-device* "/NEW1.TXT"))
+
+;; 1クラスタに収まる非空ファイルの新規作成
+(defglobal fat32-test-new2 (%fat32-test-make-byte-list 100 67)) ;; 全要素67('C')
+
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/NEW2.TXT" fat32-test-new2) t nil))
+(assert-equal fat32-test-new2 (fat32-read-file *fat32-test-device* "/NEW2.TXT"))
+
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "SUBDIR" ':dir 0)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;; 同名エントリが既に存在する場合はnil(上書きはfat32-write-fileの役割)。既存の
+;; TEST.LSPの内容/一覧が変更されていないことも確認する。
+(assert-equal nil (fat32-create-file *fat32-test-device* "/TEST.LSP" fat32-test-new2))
+(assert-equal 18 (length (fat32-read-file *fat32-test-device* "/TEST.LSP")))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "SUBDIR" ':dir 0)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;; 8.3形式で表現できない名前(複数ドット、またはbase/extが長すぎる)はnil。いずれも
+;; スロット確保より前段の名前変換で失敗するため、一覧は変化しない。
+(assert-equal nil (fat32-create-file *fat32-test-device* "/A.B.C" fat32-test-new2))
+(assert-equal nil (fat32-create-file *fat32-test-device* "/TOOLONGNAME.TXT" fat32-test-new2))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "SUBDIR" ':dir 0)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;; サブディレクトリ内への書き込み・新規作成(多階層パス解決の回帰確認)
+(defglobal fat32-test-nested-new (list 78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
+
+(assert-equal t (if (fat32-write-file *fat32-test-device* "/SUBDIR/NESTED.TXT" fat32-test-nested-new) t nil))
+(assert-equal fat32-test-nested-new (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/SUBDIR"))
+
+(defglobal fat32-test-subdir-new3 (%fat32-test-make-byte-list 50 68)) ;; 全要素68('D')
+
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/SUBDIR/NEW3.TXT" fat32-test-subdir-new3) t nil))
+(assert-equal fat32-test-subdir-new3 (fat32-read-file *fat32-test-device* "/SUBDIR/NEW3.TXT"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0)
+                     (list "NEW3.TXT" ':file 50))
+              (fat32-read-dir *fat32-test-device* "/SUBDIR"))
+
+;; 存在しないディレクトリの下への書き込み・新規作成はいずれもnil
+(assert-equal nil (fat32-write-file *fat32-test-device* "/NOSUCHDIR/X.TXT" fat32-test-subdir-new3))
+(assert-equal nil (fat32-create-file *fat32-test-device* "/NOSUCHDIR/X.TXT" fat32-test-subdir-new3))
+
+;; 2階層下(/SUBDIR/DEEPER)への新規作成も往復一致することを確認する
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/SUBDIR/DEEPER/NEW4.TXT" fat32-test-subdir-new3) t nil))
+(assert-equal fat32-test-subdir-new3 (fat32-read-file *fat32-test-device* "/SUBDIR/DEEPER/NEW4.TXT"))
