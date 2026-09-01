@@ -51,12 +51,14 @@
       (dynamic *standard-output*)
       (open-output-stream)))
 
-;;; --- FAT16 Volume ID -> UUID ---
+;;; --- FAT16/FAT32 Volume ID -> UUID ---
 ;;;
-;;; BPB上のBS_FilSysType(offset 0x36, 8byte)が"FAT16"で始まるかを検出信号とし、
-;;; 一致した場合のみVolumeID(offset 0x27, 4byte little-endian)をXXXX-XXXX形式の
-;;; 大文字16進文字列にする(Windowsのvolコマンドと同じ、上位16bit-下位16bitの split)。
-;;; FAT32は他のどこにも実装されていないため、ここでも対象外。
+;;; FAT16はBPB上のBS_FilSysType(offset 0x36, 8byte)が"FAT16"、FAT32は拡張BPB上の
+;;; BS_FilSysType(offset 0x52, 8byte)が"FAT32"で始まるかをそれぞれ検出信号とする。
+;;; 一致した場合のみVolumeID(FAT16はoffset 0x27、FAT32はoffset 0x43、いずれも
+;;; 4byte little-endian)をXXXX-XXXX形式の大文字16進文字列にする(Windowsのvol
+;;; コマンドと同じ、上位16bit-下位16bitのsplit)。整数->文字列の書式化自体はFAT16/
+;;; FAT32で共通のため%device-volume-id-uuid-stringとして共有する。
 
 ;; (%device-list-nth lst n) : lst(0起点)のn番目の要素を返す。
 (defun %device-list-nth (lst n)
@@ -97,9 +99,10 @@
         (%device-hex-write-digits out (div value 16) (- ndigits 1))
         (format out "~C" (%device-hex-nibble-code (mod value 16))))))
 
-;; (%device-fat16-uuid-string volume-id) : volume-id(32bit非負整数)を
-;; "XXXX-XXXX"形式の大文字16進文字列にする。
-(defun %device-fat16-uuid-string (volume-id)
+;; (%device-volume-id-uuid-string volume-id) : volume-id(32bit非負整数)を
+;; "XXXX-XXXX"形式の大文字16進文字列にする。FAT16/FAT32のいずれのVolumeIDに対しても
+;; 同じ書式なので共通化する。
+(defun %device-volume-id-uuid-string (volume-id)
   (let ((out (create-string-output-stream)))
     (progn
       (%device-hex-write-digits out (div volume-id 65536) 4)
@@ -112,23 +115,58 @@
 (defun %device-fat16-uuid (handle)
   (let ((bytes (read-sector handle 0)))
     (if (and bytes (%device-fat16-signature-p bytes))
-        (%device-fat16-uuid-string (%device-fat16-volume-id bytes))
+        (%device-volume-id-uuid-string (%device-fat16-volume-id bytes))
+        nil)))
+
+;; (%device-fat32-signature-p bytes) : bytes(read-sectorの返す512要素リスト)の
+;; offset 0x52(82)から"FAT32"のASCIIコード列が続いているかを調べる(FAT32の
+;; BS_FilSysTypeは拡張BPB側にあるためFAT16とオフセットが異なる、実測して確認
+;; したオフセット)。
+(defun %device-fat32-signature-p (bytes)
+  (and (= (%device-list-nth bytes 82) 70)
+       (= (%device-list-nth bytes 83) 65)
+       (= (%device-list-nth bytes 84) 84)
+       (= (%device-list-nth bytes 85) 51)
+       (= (%device-list-nth bytes 86) 50)))
+
+;; (%device-fat32-volume-id bytes) : offset 0x43(67)から4byte little-endianで
+;; VolumeID(BS_VolID)を読み、非負整数にする。
+(defun %device-fat32-volume-id (bytes)
+  (+ (%device-list-nth bytes 67)
+     (* (%device-list-nth bytes 68) 256)
+     (* (%device-list-nth bytes 69) 65536)
+     (* (%device-list-nth bytes 70) 16777216)))
+
+;; (%device-fat32-uuid handle) : handleのセクタ0を読み、FAT32と判定できた場合は
+;; UUID文字列を、そうでなければnilを返す。
+(defun %device-fat32-uuid (handle)
+  (let ((bytes (read-sector handle 0)))
+    (if (and bytes (%device-fat32-signature-p bytes))
+        (%device-volume-id-uuid-string (%device-fat32-volume-id bytes))
         nil)))
 
 ;;; --- describe ---
 
 ;; (%device-describe-blk out info) : ブロックデバイスの詳細情報(name/model/
-;; total-sectors、FAT16なら追加でuuid)をoutへ書き出す。
+;; total-sectors、FAT16/FAT32なら追加でuuid)をoutへ書き出す。セクタ0の内容は
+;; FAT16/FAT32どちらか一方の署名にしか一致しないため、両方試して見つかった方だけ
+;; 出力する(両方出ることはない)。
 (defun %device-describe-blk (out info)
   (progn
     (format out "  type: block~%")
     (format out "  name: ~A~%" (%plist-get info ':name ""))
     (format out "  model: ~A~%" (%plist-get info ':model ""))
     (format out "  total-sectors: ~D~%" (%plist-get info ':total-sectors 0))
-    (let ((uuid (%device-fat16-uuid (%plist-get info ':handle nil))))
-      (if uuid
-          (format out "  fat16-uuid: ~A~%" uuid)
-          nil))))
+    (let ((handle (%plist-get info ':handle nil)))
+      (progn
+        (let ((uuid16 (%device-fat16-uuid handle)))
+          (if uuid16
+              (format out "  fat16-uuid: ~A~%" uuid16)
+              nil))
+        (let ((uuid32 (%device-fat32-uuid handle)))
+          (if uuid32
+              (format out "  fat32-uuid: ~A~%" uuid32)
+              nil))))))
 
 ;; (%device-describe-info out name info) : :typeで分岐してdescribeの本体を出力する。
 (defun %device-describe-info (out name info)
