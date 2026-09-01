@@ -826,3 +826,91 @@
                                             (progn
                                               (%fat32-patch-bytes! slot-bytes slot-offset entry-bytes)
                                               (write-sector device slot-lba slot-bytes)))))))))))))))))
+
+;;; --- FAT32-M7: fat32-create-directory(mkdir)新設 ---
+;;
+;; 新規サブディレクトリは確保直後のクラスタなので、ディスク上の残存データが誤って
+;; 有効なディレクトリエントリと誤認されないよう"."/".."エントリ以外を明示的に
+;; ゼロ埋めしてから書き込む(fat16.lispのFAT16-M7cと同じ理由・同じ構成)。
+
+;; (%fat32-zero-byte-list n) : 長さnの、全要素が0のfixnumリストをwhileで構築する。
+(defun %fat32-zero-byte-list (n)
+  (let ((i 0) (acc nil))
+    (while (< i n)
+      (setq acc (cons 0 acc))
+      (setq i (+ i 1)))
+    acc))
+
+;; (%fat32-dot-entry-name-bytes) : "."エントリの11byte名フィールド("."+空白10個)。
+(defun %fat32-dot-entry-name-bytes ()
+  (list 46 32 32 32 32 32 32 32 32 32 32))
+
+;; (%fat32-dotdot-entry-name-bytes) : ".."エントリの11byte名フィールド(".."+空白9個)。
+(defun %fat32-dotdot-entry-name-bytes ()
+  (list 46 46 32 32 32 32 32 32 32 32 32))
+
+;; (%fat32-init-dir-cluster-bytes bpb own-cluster parent-cluster) : 新規ディレクトリ用
+;; に確保した1クラスタ分の初期化バイト列を構築する。先頭32byteが"."エントリ
+;; (start-cluster=own-cluster)、続く32byteが".."エントリ(start-cluster=
+;; parent-cluster)、残りは%fat32-zero-byte-listでゼロ埋め。FAT16と異なり、親が
+;; ルートの場合でもparent-clusterは0のような特別値ではなく実際のroot-cluster
+;; (%fat32-resolve-dirの戻り値そのまま)になる点に注意(FAT32はルート自体が実
+;; クラスタ番号を持つ構造上の違い、上のFAT32-M7ヘッダコメント・
+;; %fat32-resolve-dirのコメント参照)。start-clusterは%fat32-build-dir-entry-bytes
+;; 側で高16bit/低16bitに分割されるため、ここではown-cluster/parent-clusterを
+;; そのまま渡すだけでよい。
+(defun %fat32-init-dir-cluster-bytes (bpb own-cluster parent-cluster)
+  (let* ((cluster-bytes (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+         (dot-entry (%fat32-build-dir-entry-bytes (%fat32-dot-entry-name-bytes) #x10 own-cluster 0))
+         (dotdot-entry (%fat32-build-dir-entry-bytes (%fat32-dotdot-entry-name-bytes) #x10 parent-cluster 0))
+         (padding (%fat32-zero-byte-list (- cluster-bytes 64))))
+    (append dot-entry dotdot-entry padding)))
+
+;; (fat32-create-directory device path) : path("/NAME"、または"/DOCS/NAME"のような
+;; 多階層パス)に新規サブディレクトリを作成する。親ディレクトリが解決できない場合、
+;; 同名エントリが既に存在する場合、8.3名変換に失敗した場合、空きディレクトリ
+;; スロットが無い場合(ディレクトリ満杯)、クラスタ確保に失敗した場合(ディスク
+;; フル)、確保したクラスタへの初期化データ書き込みに失敗した場合はいずれもnilを
+;; 返し、何も変更しない。属性は#x10(ディレクトリ)固定。fat32-create-file(M6c)と
+;; 同じ失敗伝播パターンで、新規クラスタ確保後は%fat32-init-dir-cluster-bytesで
+;; "."/".."エントリを構築してから書き込む点のみが異なる。パスが"/"自身(ルートの
+;; 作成、componentsがnil)の場合もnil。
+(defun fat32-create-directory (device path)
+  (let* ((bpb (fat32-read-bpb device)))
+    (if (null bpb)
+        nil
+        (let ((components (%fat32-split-path path)))
+          (if (null components)
+              nil
+              (let* ((name (%fat32-last-elt components))
+                     (resolved-parent (%fat32-resolve-dir device bpb (%fat32-butlast components))))
+                (if (null resolved-parent)
+                    nil
+                    (let* ((parent-lbas (car resolved-parent))
+                           (parent-cluster (cdr resolved-parent)))
+                      (if (%fat32-find-entry-location-scan device parent-lbas name)
+                          nil
+                          (let ((name-bytes (%fat32-name-to-8.3 name)))
+                            (if (null name-bytes)
+                                nil
+                                (let ((slot (%fat32-find-free-slot-scan device parent-lbas)))
+                                  (if (null slot)
+                                      nil
+                                      (let ((new-clusters (%fat32-allocate-clusters device bpb 1)))
+                                        (if (null new-clusters)
+                                            nil
+                                            (let* ((new-cluster (car new-clusters))
+                                                   (cluster-bytes-list (%fat32-init-dir-cluster-bytes bpb new-cluster parent-cluster))
+                                                   (new-lbas (%fat32-clusters-to-lbas bpb new-clusters))
+                                                   (chunks (%fat32-split-into-chunks cluster-bytes-list (slot-value bpb 'bytes-per-sector))))
+                                              (if (not (%fat32-write-lba-list device new-lbas chunks))
+                                                  nil
+                                                  (let* ((slot-lba (car slot))
+                                                         (slot-offset (cdr slot))
+                                                         (slot-bytes (read-sector device slot-lba))
+                                                         (entry-bytes (%fat32-build-dir-entry-bytes name-bytes #x10 new-cluster 0)))
+                                                    (if (null slot-bytes)
+                                                        nil
+                                                        (progn
+                                                          (%fat32-patch-bytes! slot-bytes slot-offset entry-bytes)
+                                                          (write-sector device slot-lba slot-bytes)))))))))))))))))))))

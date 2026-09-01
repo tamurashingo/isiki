@@ -193,3 +193,53 @@
 ;; 2階層下(/SUBDIR/DEEPER)への新規作成も往復一致することを確認する
 (assert-equal t (if (fat32-create-file *fat32-test-device* "/SUBDIR/DEEPER/NEW4.TXT" fat32-test-subdir-new3) t nil))
 (assert-equal fat32-test-subdir-new3 (fat32-read-file *fat32-test-device* "/SUBDIR/DEEPER/NEW4.TXT"))
+
+;;; --- FAT32-M7: fat32-create-directory(mkdir) ---
+;;
+;; fat32-create-directoryでルート直下・サブディレクトリ配下それぞれに新規
+;; ディレクトリを作成し、作成したディレクトリの中でfat32-create-file/
+;; fat32-read-fileが正常に動くこと(mkdir→create→readのライフサイクル)、
+;; 同名重複・8.3非対応名・存在しない親ディレクトリの失敗ケースを確認する。
+;; FAT16と異なり".."がルートを指す場合でも0のような特別値ではなく実際の
+;; root-clusterを書き込む設計だが、fat32-read-dirの一覧にはstart-clusterが
+;; 出ないため(FAT16テストと同じ理由)、ここでは名前・種別・sizeのみ確認する。
+
+;; ルート直下への新規ディレクトリ作成
+(assert-equal t (if (fat32-create-directory *fat32-test-device* "/NEWDIR") t nil))
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "SUBDIR" ':dir 0)
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100)
+                     (list "NEWDIR" ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;; 作成したディレクトリの内側は"."/".."のみ
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/NEWDIR"))
+
+;; 作成したディレクトリの中への新規ファイル作成→読み込みの往復一致
+(defglobal fat32-test-inside (%fat32-test-make-byte-list 30 69)) ;; 全要素69('E')
+
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/NEWDIR/INSIDE.TXT" fat32-test-inside) t nil))
+(assert-equal fat32-test-inside (fat32-read-file *fat32-test-device* "/NEWDIR/INSIDE.TXT"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "INSIDE.TXT" ':file 30))
+              (fat32-read-dir *fat32-test-device* "/NEWDIR"))
+
+;; 既存サブディレクトリ(/SUBDIR)配下への新規ディレクトリ作成
+(assert-equal t (if (fat32-create-directory *fat32-test-device* "/SUBDIR/NEWSUB") t nil))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/SUBDIR/NEWSUB"))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "NESTED.TXT" ':file 10) (list "DEEPER" ':dir 0)
+                     (list "NEW3.TXT" ':file 50)
+                     (list "NEWSUB" ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/SUBDIR"))
+
+;; 同名エントリが既に存在する場合はnil(親ディレクトリの一覧は変化しない)
+(assert-equal nil (fat32-create-directory *fat32-test-device* "/SUBDIR"))
+(assert-equal nil (fat32-create-directory *fat32-test-device* "/NEWDIR"))
+
+;; 8.3形式で表現できない名前はnil
+(assert-equal nil (fat32-create-directory *fat32-test-device* "/A.B.C"))
+(assert-equal nil (fat32-create-directory *fat32-test-device* "/TOOLONGDIRNAME"))
+
+;; 存在しない親ディレクトリの下へのmkdirもnil
+(assert-equal nil (fat32-create-directory *fat32-test-device* "/NOSUCHDIR/CHILD"))
