@@ -1,4 +1,4 @@
-;;;; Secondary IDEチャネル(0x170-0x177)のIDE/ATA HDDをPIOモードで読み書きするための
+;;;; Secondary/Primary IDEチャネルのIDE/ATA HDDをPIOモードで読み書きするための
 ;;;; Lisp側API。ファイルシステムは実装しない(セクタ単位の読み書きのみ)。
 ;;;;
 ;;;; utility.lisp/init_aot.lispとは異なりAOTトランスパイル対象外の、通常のload形式
@@ -11,14 +11,14 @@
 ;;;; 別途行う)。
 
 ;; os_block_device_probe_all(C側、kernel_main内でLisp起動前に実行済み)が検出した
-;; Secondary IDEチャネルのデバイスを、*devices*(device.lisp)へblk0,blk1,...として
+;; Secondary/Primary IDEチャネルのデバイスを、*devices*(device.lisp)へblk0,blk1,...として
 ;; 登録する。個々のデバイスへは*devices*/(%device-handle 'blk0)経由でアクセスする
 ;; (*ide-device*のような単一デバイス専用のグローバルは持たない)。
 (defun %ide-register-devices ()
   (%ide-register-devices-loop 0 (%%ide-device-count)))
 
 ;; (%ide-register-devices-loop i count) : C側レジストリのindex iからcountまでを
-;; 順に%device-register-blkへ渡す再帰ヘルパー。デバイス数は現状最大2台なので
+;; 順に%device-register-blkへ渡す再帰ヘルパー。デバイス数は現状最大4台なので
 ;; 素の再帰で十分(eval.cはTCO非対応だが、この程度の深さはスタックに問題ない)。
 (defun %ide-register-devices-loop (i count)
   (if (>= i count)

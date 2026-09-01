@@ -8,13 +8,14 @@
 
 /**
  * IDE/ATAチャネル1台のATAデバイスのハンドル。Secondaryチャネル(0x170-0x177,
- * control 0x376)のmasterを対象とする(Primary channelはESP起動用vvfatドライブが
- * 占有しているため触らない。詳細はdocuments参照)。
+ * control 0x376)とPrimaryチャネル(0x1F0-0x1F7, control 0x3F6)の両方を対象と
+ * する(io_base/ctrl_baseは呼び出し側が渡すため本ドライバ自体はチャネルに依らない。
+ * 詳細はdocuments/fat32.md FAT32-M9参照)。
  */
 typedef struct {
-    /** コマンドブロックレジスタのベースポート(Secondary: 0x170) */
+    /** コマンドブロックレジスタのベースポート(Secondary: 0x170, Primary: 0x1F0) */
     UINT16 io_base;
-    /** コントロールブロックレジスタのベースポート(Secondary: 0x376) */
+    /** コントロールブロックレジスタのベースポート(Secondary: 0x376, Primary: 0x3F6) */
     UINT16 ctrl_base;
     /** drive/headレジスタに立てるdrive選択ビット(0xA0=master, 0xB0=slave) */
     UINT8 drive_select;

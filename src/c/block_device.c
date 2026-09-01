@@ -2,11 +2,14 @@
 #include "drivers/ide.h"
 #include "runtime.h"
 
-/* Secondaryチャネル(0x170-0x177, control 0x376)のみ扱う。Primaryチャネル
- * (0x1F0-0x1F7, control 0x3F6)はQEMUのデフォルトESP起動ドライブ(vvfat)が
- * 占有しているため、意図的にプローブしない(UEFI起動用に予約、サポート対象外)。 */
+/* Secondaryチャネル(0x170-0x177, control 0x376)とPrimaryチャネル
+ * (0x1F0-0x1F7, control 0x3F6)の両方を扱う。Primaryチャネルは起動用の
+ * GPT+ESP+FAT32イメージ(BOOT_FAT32_IMG、documents/fat32.md FAT32-M9)が
+ * masterとして占有している。 */
 #define IDE_SECONDARY_IO_BASE   0x170
 #define IDE_SECONDARY_CTRL_BASE 0x376
+#define IDE_PRIMARY_IO_BASE     0x1F0
+#define IDE_PRIMARY_CTRL_BASE   0x3F6
 
 #define IDE_SECTOR_BUFFER_SIZE 512
 static UINT8 g_ide_sector_buffer[IDE_SECTOR_BUFFER_SIZE] __attribute__((aligned(8)));
@@ -20,8 +23,8 @@ typedef struct {
     os_ide_device dev;
 } ide_bd_slot_t;
 
-/* Secondary master+slaveの最大2台のみ実際には検出されるが、将来他コントローラ
- * (NVMe/AHCI等)を追加する余地として少し余裕を持たせる。テーブル自体は固定長の
+/* Secondary/Primaryのmaster+slave、最大4台のみ実際には検出されるが、将来他
+ * コントローラ(NVMe/AHCI等)を追加する余地として少し余裕を持たせる。テーブル自体は固定長の
  * 静的配列だが、各デバイスの実体(ide_bd_slot_t/block_device_t)はos_boot_allocで
  * 動的に確保するため、"デバイス1台固定"にはならない */
 #define MAX_BLOCK_DEVICES 8
@@ -99,9 +102,16 @@ static void ide_probe_one(UINT16 io_base, UINT16 ctrl_base, UINT8 drive, const c
      * 現状最大でもslave 1台のみなので許容する */
 }
 
+/* Primaryチャネルのプローブは必ずSecondaryチャネルの後(末尾)に追加すること。
+ * test/lisp/fat16_test.lisp/fat32_test.lispは(%device-handle 'blk0)のように
+ * 登録順インデックス0=ide-secondary-masterであることを前提にしている
+ * (src/lisp/ide.lispの%ide-register-devices-loopがこのC側の登録順そのままに
+ * blk0, blk1, ...と振るため)。 */
 void os_block_device_probe_all(void) {
     ide_probe_one(IDE_SECONDARY_IO_BASE, IDE_SECONDARY_CTRL_BASE, 0, "ide-secondary-master");
     ide_probe_one(IDE_SECONDARY_IO_BASE, IDE_SECONDARY_CTRL_BASE, 1, "ide-secondary-slave");
+    ide_probe_one(IDE_PRIMARY_IO_BASE, IDE_PRIMARY_CTRL_BASE, 0, "ide-primary-master");
+    ide_probe_one(IDE_PRIMARY_IO_BASE, IDE_PRIMARY_CTRL_BASE, 1, "ide-primary-slave");
 }
 
 UINT32 os_block_device_count(void) {

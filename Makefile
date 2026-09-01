@@ -7,8 +7,9 @@ OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
 
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
-# トランスパイラ(transpileターゲット)の生成物。git管理対象外で、
-# buildやtest実行時にtranspileターゲット経由で都度生成される
+# トランスパイラ(transpileターゲット)の生成物。git管理対象外で、これらの
+# 入力Lispファイルが変更された時だけ再生成される(下記$(LISP_COMPILED)ルール)
+TRANSPILE_LISP_SRC = src/lisp/transpile.lisp src/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
 HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
@@ -18,6 +19,10 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 BUILD_TMPDIR = tmp
 OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
+
+# fat16_test.img/fat32_test.imgのような固定テストフィクスチャはtmp/に置くが、
+# ブート用イメージ(boot_fat32.img)はビルド成果物なのでimages/に分けて置く
+IMAGES_DIR = images
 
 TESTDIR = test/c
 TEST_COMMON_SRC = $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c
@@ -95,14 +100,22 @@ image:
 # --entrypoint bashで明示的に上書きしないと引数がsbclへ直接渡ってしまう。
 # imageターゲットでホストのUID/GIDと同じbuilderユーザーを作成し、
 # そのユーザーにroswellをインストール済みのため、--userを指定しても
-# $HOMEが正しく解決され動作する。
-transpile:
+# $HOMEが正しく解決され動作する。$(TRANSPILE_LISP_SRC)への依存により、
+# トランスパイラ自体または入力Lispファイルが変更された時だけ再生成される
+# (以前はphonyなtranspileへの無条件依存だったため、buildをファイル依存化しても
+# lisp_compiled.cが毎回再生成されmtimeが更新され続け、結局$(TARGET)/
+# BOOT_FAT32_IMGが常に再ビルドされてしまっていた)。
+$(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
 		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
 
-$(LISP_COMPILED): transpile
+transpile: $(LISP_COMPILED)
 
-build: $(SRC) $(HDR)
+# $(TARGET)をファイル依存(SRC/HDR)で追跡することで、BOOT_FAT32_IMG(後述)が
+# 「実際にソース/ヘッダが変更された時だけ」再生成されるようにする土台になる
+# (buildをphonyのままにしていると、buildを経由するあらゆる後続ターゲットが
+# 常に再実行されてしまう)。
+$(TARGET): $(SRC) $(HDR)
 	mkdir -p esp_dir/EFI/BOOT
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
 		-nostdlib -mno-red-zone -O1 -shared \
@@ -112,6 +125,8 @@ build: $(SRC) $(HDR)
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
+
+build: $(TARGET)
 
 # ファイル単体のコンパイルチェック用。リンクは行わず、生成した .o は tmp/ に捨てる
 compile: $(OBJ)
@@ -241,14 +256,14 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_IDE) -v "$(PWD)":/workspace isiki-builder
 
 clean:
-	rm -rf esp_dir $(BUILD_TMPDIR)
+	rm -rf esp_dir $(BUILD_TMPDIR) $(IMAGES_DIR)
 	rm -f .qemu-test-trigger test-results.txt qemu.log
 
 # IDE/ATA PIO動作確認用の使い捨てディスクイメージ。qemu-imgはCI環境で未保証の
 # パッケージのため使わず、dd/printfのみで作成する。先頭にIDE_TEST_MAGICを書き込み、
 # read-sectorでのセクタ0読み込み確認に使う。Secondaryチャネル(bus=1,unit=0)の
-# masterとして明示的にアタッチする(Primaryは-drive ...,file=fat:rw:./esp_dirの
-# ESP起動ドライブがif=指定無しでデフォルト占有しているため触らない)
+# masterとして明示的にアタッチする(Primaryチャネルは起動用のBOOT_FAT32_IMG
+# (images/boot_fat32.img)が占有する)
 IDE_DISK_IMG = $(BUILD_TMPDIR)/ide_disk.img
 IDE_TEST_MAGIC = ISIKIOS-IDE-TEST-SECTOR0-MAGIC!
 
@@ -357,6 +372,55 @@ $(FAT32_DISK_IMG): | $(BUILD_TMPDIR)
 	printf '\054\000\000\000' | dd of=$@ bs=1 seek=16548 count=4 conv=notrunc 2>/dev/null
 	printf '\377\377\377\017' | dd of=$@ bs=1 seek=16560 count=4 conv=notrunc 2>/dev/null
 
+# Primary IDE HDD(if=ide,bus=0,unit=0)から起動するための、実際にGPT+EFI System
+# Partition(ESP)+FAT32でフォーマットした起動イメージ(documents/fat32.md
+# FAT32-M9)。従来のQEMU vvfatドライバ(-drive format=raw,file=fat:rw:./esp_dir)は
+# :floppy:を指定しない場合に内部で偽のMBRパーティションテーブルを合成しており、
+# それによって初めてOVMFがfixed disk(removable=off)上のFATを認識してブート
+# できていた。パーティションテーブルの無い生FAT32(FAT32_DISK_IMGと同じ構成)を
+# そのままPrimary IDE HDDへアタッチしても、UEFI仕様上fixed diskはパーティション
+# テーブルを要求するためOVMFがブートできない。そのため実機のUEFI起動メディアと
+# 同じレイアウト(GPT + ESP用パーティション(タイプGUID C12A7328-...、sgdiskの
+# type code EF00) + FAT32)を作る。
+#
+# パーティションは1MiB境界(セクタ2048、バイトオフセット1048576)から開始し、
+# サイズは60MiB(バイト62914560)に固定する。イメージ全体は64MiBとし、末尾に
+# 約3MiBの余裕(バックアップGPT用、規格上必要なのは末尾34セクタ=17KB程度)を
+# 持たせている。パーティション部分だけをmkfs.vfat/mountの対象にするため、
+# losetup -o <開始バイトオフセット> --sizelimit <サイズbyte>でパーティション専用の
+# loopデバイスを作る(GPTパーティションテーブル自体はmkfs.vfatの対象に含めない)。
+# ビルド済みのesp_dir/EFI/BOOT/BOOTX64.EFIをコピーするだけの内容。$(TARGET)
+# ($(SRC)/$(HDR)に依存するファイルターゲット)と$(SRC)/$(HDR)自体を直接の依存に
+# することで、ソース/ヘッダが実際に変更された時だけ再生成される(FAT16_DISK_IMG/
+# FAT32_DISK_IMGはビルド結果と無関係な固定テストフィクスチャのためSRC/HDRに
+# 依存しない、という違いがある)。tmp/はfat16_test.img/fat32_test.imgのような
+# 使い捨てテストフィクスチャ用ディレクトリなので、ビルド成果物であるこのイメージは
+# 区別してimages/(IMAGES_DIR)に置く。loopマウント/losetupはCAP_SYS_ADMIN相当の
+# 権限を要するため、FAT16_DISK_IMG/FAT32_DISK_IMGと同様--privilegedでdocker runする。
+BOOT_FAT32_IMG = $(IMAGES_DIR)/boot_fat32.img
+BOOT_FAT32_IMG_SIZE_MB = 64
+BOOT_FAT32_PART_SIZE_MB = 60
+BOOT_FAT32_PART_START_BYTES = 1048576
+BOOT_FAT32_PART_SIZE_BYTES = 62914560
+
+$(IMAGES_DIR):
+	mkdir -p $(IMAGES_DIR)
+
+$(BOOT_FAT32_IMG): $(TARGET) $(SRC) $(HDR) | $(IMAGES_DIR)
+	dd if=/dev/zero of=$@ bs=1M count=$(BOOT_FAT32_IMG_SIZE_MB) 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			sgdisk -o $@; \
+			sgdisk -n 1:2048:+$(BOOT_FAT32_PART_SIZE_MB)M -t 1:EF00 -c 1:"EFI System" $@; \
+			LOOPDEV=$$(losetup -o $(BOOT_FAT32_PART_START_BYTES) --sizelimit $(BOOT_FAT32_PART_SIZE_BYTES) -f --show $@); \
+			mkfs.vfat -F 32 $$LOOPDEV; \
+			mkdir -p /mnt/boot_fat32; \
+			mount $$LOOPDEV /mnt/boot_fat32; \
+			mkdir -p /mnt/boot_fat32/EFI/BOOT; \
+			cp esp_dir/EFI/BOOT/BOOTX64.EFI /mnt/boot_fat32/EFI/BOOT/BOOTX64.EFI; \
+			umount /mnt/boot_fat32; \
+			losetup -d $$LOOPDEV'
+
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
 # はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は
 # FAT16_DISK_IMGを、test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で上書きして
@@ -371,20 +435,20 @@ QEMU_DISK_IMG = $(IDE_DISK_IMG)
 # (FAT32_DISK_IMGの実体、無ければ自動生成される)。
 RUN_DISK_IMG ?= $(FAT16_DISK_IMG)
 
-run: $(RUN_DISK_IMG)
+run: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
 
-debug: $(RUN_DISK_IMG)
+debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 	qemu-system-x86_64 \
 		-m 256M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
@@ -394,7 +458,7 @@ debug: $(RUN_DISK_IMG)
 # isiki_test.lispをQEMU上で全自動実行し、test-results.txtの結果でpass/failを判定する。
 # .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
 # ResetSystemでQEMUを電源断する
-test-qemu: build $(QEMU_DISK_IMG)
+test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	rm -f .qemu-test-trigger test-results.txt
 	touch .qemu-test-trigger
@@ -402,7 +466,7 @@ test-qemu: build $(QEMU_DISK_IMG)
 		-m 256M \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
@@ -419,11 +483,12 @@ test-qemu: build $(QEMU_DISK_IMG)
 # 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
 # (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする
 test-qemu-all:
-	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG)
+	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG)
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
@@ -434,7 +499,7 @@ test-qemu-stress:
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)
-test-qemu-milestone: build $(QEMU_DISK_IMG)
+test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
 	rm -f .qemu-test-trigger test-results.txt
@@ -443,7 +508,7 @@ test-qemu-milestone: build $(QEMU_DISK_IMG)
 		-m 256M \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive format=raw,file=fat:rw:./esp_dir \
+		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
