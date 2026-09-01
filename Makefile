@@ -367,7 +367,8 @@ QEMU_DISK_IMG = $(IDE_DISK_IMG)
 # FAT16フォーマット済みのFAT16_DISK_IMGをアタッチする。QEMU_DISK_IMGとは別の変数に
 # しているのは、test-qemu/test-qemu-milestoneの既定値(IDE_DISK_IMG、IDE milestoneの
 # magic文字列前提)に影響を与えないため。`make run RUN_DISK_IMG=...`で個別に
-# 上書きできる。
+# 上書きできる。FAT32を試す場合は`make run RUN_DISK_IMG=tmp/fat32_test.img`
+# (FAT32_DISK_IMGの実体、無ければ自動生成される)。
 RUN_DISK_IMG ?= $(FAT16_DISK_IMG)
 
 run: $(RUN_DISK_IMG)

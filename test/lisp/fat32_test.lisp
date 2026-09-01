@@ -26,6 +26,20 @@
 (assert-equal 630 (slot-value fat32-test-bpb 'fat-size-32))
 (assert-equal 2 (slot-value fat32-test-bpb 'root-cluster))
 
+;;; --- device.lispのFAT32 UUID検出(describe用) ---
+;;
+;; FAT32フォーマット済みディスクのため、blk0のUUIDはXXXX-XXXX形式で検出できる
+;; (device_test.lispのFAT16版アサーションと同型)。逆に%device-fat16-uuidは
+;; このディスクに対してはFAT16署名が一致せずnilを返すはず。
+
+(defglobal fat32-test-uuid32 (%device-fat32-uuid *fat32-test-device*))
+
+(assert-equal t (if fat32-test-uuid32 t nil))
+(assert-equal 9 (length fat32-test-uuid32))
+(assert-equal 45 (char-code (string-elt fat32-test-uuid32 4))) ; '-'
+
+(assert-equal nil (%device-fat16-uuid *fat32-test-device*))
+
 ;;; --- FAT32-M2: ルート/サブディレクトリ統一エントリ列挙 ---
 ;;
 ;; $(FAT32_DISK_IMG)のルートディレクトリは、作成順にHELLO.TXT(空ファイル)→
