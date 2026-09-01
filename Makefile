@@ -418,10 +418,11 @@ test-qemu: build $(QEMU_DISK_IMG)
 # 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
 # (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする
 test-qemu-all:
-	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG)
+	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG)
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
