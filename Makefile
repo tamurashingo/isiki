@@ -313,6 +313,50 @@ $(FAT16_DISK_IMG): | $(BUILD_TMPDIR)
 	printf '\054\000' | dd of=$@ bs=1 seek=2130 count=2 conv=notrunc 2>/dev/null
 	printf '\377\377' | dd of=$@ bs=1 seek=2136 count=2 conv=notrunc 2>/dev/null
 
+# FAT32読み書き実装用の使い捨てテストイメージ。FAT16_DISK_IMGと同じ構成・同じ理由
+# (loopマウントでの内容配置、DELETED.TXTを最後に作成/削除して0xE5マーカーを作る、
+# --privilegedでのみdocker runする)だが、以下の点がFAT16と異なる:
+#   - イメージサイズは40MB(16MBだとmkfs.vfat -F 32が「クラスタ数が
+#     推奨最小値未満」というwarningを出すため、実測で確認した安全マージン)。
+#   - このフォーマットではsectors-per-cluster=1(512byte/cluster、FAT16は4=2048byte)
+#     になるため、512byteを超えるファイルは自動的に複数クラスタへ分割される。
+#     BIG.TXTは1000byte("0123456789"を100回)で3クラスタに、WRITE1.TXTは
+#     512byte("A"を512回)でちょうど1クラスタになるようサイズを合わせている。
+#   - FATエントリが4byte/entry(FAT16は2byte)のため、後述の合成チェイン用オフセット
+#     計算がcluster-no*4になる。
+#
+# umount後、ホスト側でFATテーブル(1本目、reserved-sectors=32なのでバイトオフセット
+# 32*512=16384から開始)にクラスタ40→41→44→終端という非連続なチェインを直接
+# dd/printfで書き込む(fat32-cluster-chain確認用)。クラスタ40/41/44はmkfs.vfat後は
+# 未使用で、TEST.LSP/BIG.TXT/WRITE1.TXT/SUBDIR以下が使う実クラスタとは十分な余裕を
+# 持って重複しない(xxd -g1で目視確認済み)。オフセットは16384 + cluster-no*4で計算
+# した固定値(16544/16548/16560)、値はLE u32(41=0x00000029/44=0x0000002C/
+# 終端=0x0FFFFFFF)。FAT16と同じ理由でエスケープは\xHHではなく\0NNN(8進)を使う。
+FAT32_DISK_IMG = $(BUILD_TMPDIR)/fat32_test.img
+FAT32_TEST_STRING = Hello from FAT32!
+
+$(FAT32_DISK_IMG): | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=40 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			mkfs.vfat -F 32 $@; \
+			mkdir -p /mnt/fat32_test; \
+			mount -o loop $@ /mnt/fat32_test; \
+			touch /mnt/fat32_test/HELLO.TXT; \
+			printf "%s\n" "$(FAT32_TEST_STRING)" > /mnt/fat32_test/TEST.LSP; \
+			printf "0123456789%.0s" {1..100} > /mnt/fat32_test/BIG.TXT; \
+			printf "A%.0s" {1..512} > /mnt/fat32_test/WRITE1.TXT; \
+			mkdir /mnt/fat32_test/SUBDIR; \
+			printf "nested file content" > /mnt/fat32_test/SUBDIR/NESTED.TXT; \
+			mkdir /mnt/fat32_test/SUBDIR/DEEPER; \
+			touch /mnt/fat32_test/SUBDIR/DEEPER/DEEP.TXT; \
+			printf "will be deleted" > /mnt/fat32_test/DELETED.TXT; \
+			rm /mnt/fat32_test/DELETED.TXT; \
+			umount /mnt/fat32_test'
+	printf '\051\000\000\000' | dd of=$@ bs=1 seek=16544 count=4 conv=notrunc 2>/dev/null
+	printf '\054\000\000\000' | dd of=$@ bs=1 seek=16548 count=4 conv=notrunc 2>/dev/null
+	printf '\377\377\377\017' | dd of=$@ bs=1 seek=16560 count=4 conv=notrunc 2>/dev/null
+
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
 # はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は
 # FAT16_DISK_IMGを、test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で上書きして
