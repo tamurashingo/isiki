@@ -65,3 +65,11 @@ jobs:
       - name: "Run Lisp tests in QEMU (FAT32-M9: boot from GPT+ESP+FAT32 image on primary IDE HDD)"
         timeout-minutes: 10
         run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
+
+      - name: "Run Lisp tests in QEMU (PART: GPT multi-partition slice registration)"
+        timeout-minutes: 10
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
+
+      - name: "Run Lisp tests in QEMU (PART: legacy MBR multi-partition slice registration)"
+        timeout-minutes: 10
+        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img

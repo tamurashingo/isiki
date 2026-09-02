@@ -37,37 +37,78 @@
 
 ;; (%ide-bytes-from-addr addr offset count) : addr+offsetを先頭にcount byte分を
 ;; %%peekで読み、0番目が先頭になるfixnum(0-255)のリストを返す。
+;; whileで実装する理由: forマクロ((let ((%for-next-values ...)) ...)を
+;; tagbody/goのループ本体に毎回新規生成する展開形)はGCが特定のタイミングで
+;; 走ると、以後永久に(そのループ内での)結果が壊れる既知のバグがある
+;; (documents/partition.md PART-M4調査で発覚。1回でも発生すると回復しない)。
+;; whileはループ本体に追加のletを挟まないため、この問題を回避できる
+;; (300,000回の(setq junk (cons i junk))連続実行では再現しないことを確認済み)。
 (defun %ide-bytes-from-addr (addr offset count)
-  (for ((i (- count 1) (- i 1))
-        (result nil (cons (%%peek (+ addr (+ offset i))) result)))
-      ((< i 0) result)))
+  (let ((i (- count 1)) (result nil))
+    (progn
+      (while (>= i 0)
+        (progn
+          (setq result (cons (%%peek (+ addr (+ offset i))) result))
+          (setq i (- i 1))))
+      result)))
 
 ;; (%ide-bytes-to-addr addr offset bytes) : bytesの各要素(fixnum 0-255)を
-;; addr+offsetから順に%%pokeで書き込む。
+;; addr+offsetから順に%%pokeで書き込む。%ide-bytes-from-addrと同じ理由でforを避け、
+;; whileで実装する。
 (defun %ide-bytes-to-addr (addr offset bytes)
-  (progn
-    (for ((b bytes (cdr b))
-          (i offset (+ i 1)))
-        ((null b) nil)
-      (%%poke (+ addr i) (car b)))
-    nil))
+  (let ((b bytes) (i offset))
+    (progn
+      (while (not (null b))
+        (progn
+          (%%poke (+ addr i) (car b))
+          (setq b (cdr b))
+          (setq i (+ i 1))))
+      nil)))
+
+;; パーティションハンドル: (:ide-partition base-handle base-lba) というconsリストで、
+;; base-handleの先頭base-lba個のセクタを覆い隠し、その手前からの相対LBAで
+;; read-sector/write-sectorを使えるようにする(生ポインタはTAG_RAW_POINTERで
+;; consp が偽になるため、consp で両者を判別できる)。
+
+;; (%ide-make-partition-handle base-handle base-lba) : パーティションハンドルを作る。
+(defun %ide-make-partition-handle (base-handle base-lba)
+  (list ':ide-partition base-handle base-lba))
+
+;; (%ide-partition-handle-p device) : deviceがパーティションハンドルかどうか。
+(defun %ide-partition-handle-p (device)
+  (and (consp device) (eq (car device) ':ide-partition)))
+
+;; (%ide-partition-base-handle device) : パーティションハンドルの元になった生ハンドル。
+(defun %ide-partition-base-handle (device)
+  (car (cdr device)))
+
+;; (%ide-partition-base-lba device) : パーティションハンドルの先頭LBA(絶対LBA)。
+(defun %ide-partition-base-lba (device)
+  (car (cdr (cdr device))))
 
 ;; (read-sector device lba) : deviceからlba番目の1セクタ(512byte)を読み込み、
 ;; 先頭バイトが先頭要素になる512要素のfixnumリストを返す。失敗時はnil。
+;; deviceがパーティションハンドルの場合は、元の生ハンドル+絶対LBAへ変換してから
+;; 自分自身を呼び直す(生ハンドルに剥がれた時点で以下の既存ロジックへ合流する)。
 (defun read-sector (device lba)
-  (if (%%ide-read-sector device lba)
-      (%ide-bytes-from-addr (%%ide-sector-buffer-address device) 0 512)
-      nil))
+  (if (%ide-partition-handle-p device)
+      (read-sector (%ide-partition-base-handle device) (+ lba (%ide-partition-base-lba device)))
+      (if (%%ide-read-sector device lba)
+          (%ide-bytes-from-addr (%%ide-sector-buffer-address device) 0 512)
+          nil)))
 
 ;; (write-sector device lba bytes) : 512要素のfixnumリストbytesをdeviceのlba番目の
 ;; セクタへ書き込む(内部でCACHE FLUSHまで実行する)。成功時t、失敗時nil。
-;; bytesの要素数が512でない場合はnil。
+;; bytesの要素数が512でない場合はnil。deviceがパーティションハンドルの場合はread-sector
+;; と同様に絶対LBAへ変換してから自分自身を呼び直す。
 (defun write-sector (device lba bytes)
-  (if (= (length bytes) 512)
-      (progn
-        (%ide-bytes-to-addr (%%ide-sector-buffer-address device) 0 bytes)
-        (%%ide-write-sector device lba))
-      nil))
+  (if (%ide-partition-handle-p device)
+      (write-sector (%ide-partition-base-handle device) (+ lba (%ide-partition-base-lba device)) bytes)
+      (if (= (length bytes) 512)
+          (progn
+            (%ide-bytes-to-addr (%%ide-sector-buffer-address device) 0 bytes)
+            (%%ide-write-sector device lba))
+          nil)))
 
 ;; (%hex-nibble-code n) : 0-15の値をASCII文字コード(fixnum)にする(0-9->'0'-'9', 10-15->'A'-'F')。
 (defun %hex-nibble-code (n)

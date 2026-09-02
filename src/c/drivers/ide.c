@@ -173,6 +173,7 @@ int os_ide_read_sectors(os_ide_device *dev, UINT32 lba, UINT16 count, UINT8 *buf
         set_err(err_msg, err_msg_cap, "ide: device not present");
         return 0;
     }
+
     if (!ide_wait_not_busy(dev->io_base)) {
         set_err(err_msg, err_msg_cap, "ide: device busy, timed out");
         return 0;
@@ -202,8 +203,18 @@ int os_ide_write_sectors(os_ide_device *dev, UINT32 lba, UINT16 count, const UIN
         set_err(err_msg, err_msg_cap, "ide: device not present");
         return 0;
     }
+
+    /* コマンド発行〜CACHE FLUSH完了まで割込みを禁止する(ネイティブホストでの
+     * ユニットテストではcli/sti自体が無効な命令のため、実機ビルドのみで有効にする) */
+#ifndef ISIKIOS_UNIT_TEST
+    __asm__ __volatile__ ("cli");
+#endif
+
     if (!ide_wait_not_busy(dev->io_base)) {
         set_err(err_msg, err_msg_cap, "ide: device busy, timed out");
+#ifndef ISIKIOS_UNIT_TEST
+        __asm__ __volatile__ ("sti");
+#endif
         return 0;
     }
 
@@ -216,6 +227,9 @@ int os_ide_write_sectors(os_ide_device *dev, UINT32 lba, UINT16 count, const UIN
     for (UINT16 s = 0; s < sectors; s++) {
         if (!ide_wait_drq(dev->io_base)) {
             set_err(err_msg, err_msg_cap, "ide: write failed or timed out");
+#ifndef ISIKIOS_UNIT_TEST
+            __asm__ __volatile__ ("sti");
+#endif
             return 0;
         }
         for (int i = 0; i < 256; i++) {
@@ -227,7 +241,13 @@ int os_ide_write_sectors(os_ide_device *dev, UINT32 lba, UINT16 count, const UIN
     ide_delay400ns(dev->ctrl_base);
     if (!ide_wait_not_busy(dev->io_base)) {
         set_err(err_msg, err_msg_cap, "ide: cache flush timed out");
+#ifndef ISIKIOS_UNIT_TEST
+        __asm__ __volatile__ ("sti");
+#endif
         return 0;
     }
+#ifndef ISIKIOS_UNIT_TEST
+    __asm__ __volatile__ ("sti");
+#endif
     return 1;
 }

@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     make \
     dosfstools \
     gdisk \
+    fdisk \
     && rm -rf /var/list/apt/lists/*
 
 RUN (getent group ${USER_GID} || groupadd -g ${USER_GID} builder) > /dev/null \

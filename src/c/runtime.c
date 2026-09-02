@@ -874,6 +874,39 @@ static void gc_scan_queue(void) {
 }
 
 /**
+ * envの`cells`スロット(Function Cell、os_get_function_cell/os_set_function参照)が
+ * キャッシュしている関数オブジェクトのアドレスを、今回のGCで確定した転送先へ
+ * 更新する。Function Cell自身(TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)
+ * はgc_copy_valueが素通しするためcellsのalist構造自体は通常のcons走査
+ * (gc_scan_queue)で正しく再配置されるが、各セルが指す先の中身(fn_obj)はImmobilized
+ * Spaceという生メモリに生ポインタ越しに保存されているためgc_scan_queueの走査対象に
+ * 含まれず、その関数オブジェクトが本来のfunctionsスロット経由で移動された後も
+ * セル側だけが古いFrom空間アドレス(=移動後はTAG_FORWARDの転送ポインタが書き込まれた
+ * 場所)を指し続けてしまう。放置すると、is_macro/apply_functionがこの転送ポインタを
+ * 関数オブジェクトのマジックナンバーと誤読し、EVAL-ERRORを誤って生成する
+ * (PART-M4調査で特定)。
+ * @param env cellsスロットを持つ環境(nilなら何もしない)
+ */
+static void gc_fixup_environment_cells(lisp_val_t env) {
+    // env==0はheadless実行でF2〜F4のようにまだos_evalを一度も通っていない
+    // プロセスのenv初期値(process.cのproc->env=0)。nil(タグ付きシンボルの実アドレス、
+    // 0ではない)とは別物であり、この生の0をcc_car/cc_cdrへそのまま渡すと低位メモリを
+    // consとして辿ってしまい、実測でGCサイクル依存の無限ループ(ハング)を引き起こした
+    if (env == nil || env == 0) {
+        return;
+    }
+    lisp_val_t cells_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))));
+    lisp_val_t cells_alist = cc_cdr(cells_slot);
+    while (cells_alist != nil) {
+        lisp_val_t pair = cc_car(cells_alist);
+        lisp_val_t cell_tagged = cc_cdr(pair);
+        lisp_val_t *cell_ptr = (lisp_val_t *)(lisp_addr_t)(cell_tagged & ~TAG_MASK);
+        *cell_ptr = gc_copy_value(*cell_ptr);
+        cells_alist = cc_cdr(cells_alist);
+    }
+}
+
+/**
  * Cheney方式のコピーGCを1回実行する。global_environment・g_dynamic_bindings・
  * g_symbol_table・キャッシュ済みg_sym_*・os_gc_register_rootで登録されたroot・
  * 全プロセスのshadow stack(GC_PROTECTされたCローカル変数)をルートとして
@@ -954,6 +987,18 @@ void os_gc_collect(void) {
         }
     }
 
+    gc_scan_queue();
+
+    // Function Cell(cellsスロット)の中身の再配置。global_environmentと各プロセスの
+    // env(上のg_gc_extra_rootsループで既にTo空間上の最新アドレスに更新済み)、いずれも
+    // 通常のcons構造としてはここまでで再配置済みだが、cellsが指す先のfn_objは
+    // Immobilized Space上の生メモリなのでgc_scan_queueの走査対象外のため個別に修正する。
+    // gc_copy_valueが未発見のオブジェクトを新たにキューへ積む可能性に備え、直後に
+    // 再度gc_scan_queueでキューを空にする
+    gc_fixup_environment_cells(global_environment);
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        gc_fixup_environment_cells(get_process(i)->env);
+    }
     gc_scan_queue();
 
     UINT8 *new_from_start = g_to_start;
