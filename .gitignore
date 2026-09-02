@@ -1,6 +1,6 @@
 esp_dir/
 tmp/
-images/
+./images/
 .DS_Store
 *.swp
 .qemu-test-trigger
