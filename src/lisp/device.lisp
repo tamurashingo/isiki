@@ -40,6 +40,18 @@
 (defun %device-register-blk (info)
   (%device-register (%device-blk-name (%device-count-of-type 'blk (dynamic *devices*))) info))
 
+;; (%device-blk-slice-name parent-name slice-index) : parent-name(blk0等のシンボル)+
+;; "S"+slice-index(fixnum)を"BLK0S0"のようなシンボルにする。パーティション名は
+;; %device-count-of-typeによる連番を使わず、呼び出し側が明示的にslice-indexを渡す
+;; (親ディスクの連番ロジックに影響を与えないため)。
+(defun %device-blk-slice-name (parent-name slice-index)
+  (string-to-symbol (string-append (symbol-name parent-name) (string-append "S" (%room-digit-string slice-index)))))
+
+;; (%device-register-blk-slice parent-name slice-index info) : infoに
+;; parent-name+S+slice-indexの名前を割り振って*devices*へ登録する。
+(defun %device-register-blk-slice (parent-name slice-index info)
+  (%device-register (%device-blk-slice-name parent-name slice-index) info))
+
 ;; (%device-handle name) : *devices*からnameエントリの:handleを取り出す(無ければnil)。
 (defun %device-handle (name)
   (%plist-get (cdr (assoc name (dynamic *devices*))) ':handle nil))

@@ -329,6 +329,15 @@ void test_primitive_global_environment_returns_global_environment_regardless_of_
 // 出力が大量になるため変更した)、および環境として妥当でない値(nil、cons以外)を渡した
 // 場合は切り替えを行わずnilを返すことを確認する。
 void test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid_env() {
+    // process_init(process.c)は生成する全プロセスのproc->envを直ちにos_gc_register_rootで
+    // GCのrootとして登録するが、このテストはprocess_initを経由せずget_current_process()を
+    // 直接使うため、その登録が行われていない。ここで明示的に登録しないと、
+    // primitive_set_current_environmentが書き込んだproc->envはGCで再配置対象にならず、
+    // 以降のGCでFrom空間の古いアドレスを指したまま残り、他のテストのos_gc_collectが
+    // gc_fixup_environment_cells経由でその古いアドレスを環境として辿った際に
+    // 未定義動作(実測でSEGV)を起こす
+    os_gc_register_root(&get_current_process()->env);
+
     lisp_val_t env1 = os_make_environment(os_make_symbol("SET-CUR-ENV-1"), nil);
     lisp_val_t env2 = os_make_environment(os_make_symbol("SET-CUR-ENV-2"), nil);
 
@@ -351,6 +360,11 @@ void test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid
     lisp_val_t r4 = primitive_set_current_environment(args2, nil);
     assert(r4 == g_sym_t, "2回目の妥当な切り替えもtが返る");
     assert(get_current_process()->env == env2, "実際にproc->envがenv2へ切り替わっている");
+
+    // このテスト用に登録したrootを片付け、proc->envも他のテストが前提とする初期値
+    // (process.cのproc->env=0と同じ、rootでない生の0)へ戻す
+    os_gc_unregister_root(&get_current_process()->env);
+    get_current_process()->env = 0;
 }
 
 // Phase2動作確認: Function Cellのアドレスは再defunしても不変であること(呼び出し側は

@@ -372,6 +372,80 @@ $(FAT32_DISK_IMG): | $(BUILD_TMPDIR)
 	printf '\054\000\000\000' | dd of=$@ bs=1 seek=16548 count=4 conv=notrunc 2>/dev/null
 	printf '\377\377\377\017' | dd of=$@ bs=1 seek=16560 count=4 conv=notrunc 2>/dev/null
 
+# src/lisp/partition.lisp(PART-M2)確認用、GPTで2パーティション(FAT16+FAT32)に
+# 分割したディスクイメージ。パーティション1(FAT16、16MiB、開始セクタ2048=1MiB境界、
+# FAT16_DISK_IMGと同じサイズ。8MiBではmkfs.vfat -F 16が総セクタ数の境界条件によって
+# 「too small or too large filesystem」を不安定に報告することを実機確認したため避けた)・
+# パーティション2(FAT32、40MiB、開始セクタ34816=17MiB境界、mkfs.vfat -F 32が
+# 「クラスタ数が推奨最小値未満」を警告しない安全マージン、FAT32_DISK_IMGと同じ理由)。
+# 各パーティションにTEST.LSPを1つだけ置き、%device-fat16-uuid/%device-fat32-uuidが
+# パーティションハンドル経由でも機能することの確認に使う(ファイル読み込み自体の
+# 確認はPART-M4でimages/boot_fat32.imgのESPを使う)。type GUIDはpartition.lispの
+# GPT登録ロジックが特定のtypeでフィルタしない(全ゼロ=未使用スロットのみ判定)ため
+# 汎用のLinux filesystem(8300)のままで良い。BOOT_FAT32_IMGと同様、sgdisk/losetupに
+# CAP_SYS_ADMIN相当の権限を要するため--privilegedでdocker runする。
+GPT_MULTI_DISK_IMG = $(BUILD_TMPDIR)/gpt_multi_test.img
+GPT_MULTI_IMG_SIZE_MB = 64
+GPT_MULTI_PART1_START_SECTOR = 2048
+GPT_MULTI_PART2_START_SECTOR = 34816
+
+$(GPT_MULTI_DISK_IMG): | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=$(GPT_MULTI_IMG_SIZE_MB) 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			sgdisk -o $@; \
+			sgdisk -n 1:$(GPT_MULTI_PART1_START_SECTOR):+16M -t 1:8300 -c 1:"ISIKI-P1" $@; \
+			sgdisk -n 2:$(GPT_MULTI_PART2_START_SECTOR):+40M -t 2:8300 -c 2:"ISIKI-P2" $@; \
+			LOOPDEV1=$$(losetup -o $$(($(GPT_MULTI_PART1_START_SECTOR)*512)) --sizelimit $$((16*1024*1024)) -f --show $@); \
+			mkfs.vfat -F 16 $$LOOPDEV1; \
+			mkdir -p /mnt/gpt_multi_p1; \
+			mount $$LOOPDEV1 /mnt/gpt_multi_p1; \
+			printf "%s\n" "Hello from GPT partition 1 (FAT16)!" > /mnt/gpt_multi_p1/TEST.LSP; \
+			umount /mnt/gpt_multi_p1; \
+			losetup -d $$LOOPDEV1; \
+			LOOPDEV2=$$(losetup -o $$(($(GPT_MULTI_PART2_START_SECTOR)*512)) --sizelimit $$((40*1024*1024)) -f --show $@); \
+			mkfs.vfat -F 32 $$LOOPDEV2; \
+			mkdir -p /mnt/gpt_multi_p2; \
+			mount $$LOOPDEV2 /mnt/gpt_multi_p2; \
+			printf "%s\n" "Hello from GPT partition 2 (FAT32)!" > /mnt/gpt_multi_p2/TEST.LSP; \
+			umount /mnt/gpt_multi_p2; \
+			losetup -d $$LOOPDEV2'
+
+# src/lisp/partition.lisp(PART-M3)確認用、レガシーMBR(DOSパーティションテーブル)で
+# 2パーティション(FAT16+FAT32)に分割したディスクイメージ。サイズ・開始セクタ・
+# ファイルシステムはGPT_MULTI_DISK_IMGと完全に同じレイアウトにして、GPT版・MBR版で
+# パーティション検出以外の差異が出ないようにする。sgdisk(GPTのみ対応)ではなく
+# sfdisk(util-linuxのfdiskパッケージ、Dockerfileへ追加)のスクリプト入力形式で
+# MBRパーティションテーブルを作る。typeはFAT16(6)/W95 FAT32 LBA(c)を指定するが、
+# partition.lispのMBR登録ロジックはtypeを0x00(未使用)/0xEE(GPTプロテクティブ)/
+# 0x05・0x0F(拡張、スコープ外)以外は無条件に登録するため、typeの値自体は
+# 検出結果に影響しない。losetup/mountはCAP_SYS_ADMIN相当の権限を要するため
+# --privilegedでdocker runする。
+MBR_MULTI_DISK_IMG = $(BUILD_TMPDIR)/mbr_multi_test.img
+MBR_MULTI_IMG_SIZE_MB = 64
+MBR_MULTI_PART1_START_SECTOR = 2048
+MBR_MULTI_PART2_START_SECTOR = 34816
+
+$(MBR_MULTI_DISK_IMG): | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=$(MBR_MULTI_IMG_SIZE_MB) 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			printf "label: dos\nunit: sectors\nstart=$(MBR_MULTI_PART1_START_SECTOR), size=32768, type=6\nstart=$(MBR_MULTI_PART2_START_SECTOR), size=81920, type=c\n" | sfdisk $@; \
+			LOOPDEV1=$$(losetup -o $$(($(MBR_MULTI_PART1_START_SECTOR)*512)) --sizelimit $$((16*1024*1024)) -f --show $@); \
+			mkfs.vfat -F 16 $$LOOPDEV1; \
+			mkdir -p /mnt/mbr_multi_p1; \
+			mount $$LOOPDEV1 /mnt/mbr_multi_p1; \
+			printf "%s\n" "Hello from MBR partition 1 (FAT16)!" > /mnt/mbr_multi_p1/TEST.LSP; \
+			umount /mnt/mbr_multi_p1; \
+			losetup -d $$LOOPDEV1; \
+			LOOPDEV2=$$(losetup -o $$(($(MBR_MULTI_PART2_START_SECTOR)*512)) --sizelimit $$((40*1024*1024)) -f --show $@); \
+			mkfs.vfat -F 32 $$LOOPDEV2; \
+			mkdir -p /mnt/mbr_multi_p2; \
+			mount $$LOOPDEV2 /mnt/mbr_multi_p2; \
+			printf "%s\n" "Hello from MBR partition 2 (FAT32)!" > /mnt/mbr_multi_p2/TEST.LSP; \
+			umount /mnt/mbr_multi_p2; \
+			losetup -d $$LOOPDEV2'
+
 # Primary IDE HDD(if=ide,bus=0,unit=0)から起動するための、実際にGPT+EFI System
 # Partition(ESP)+FAT32でフォーマットした起動イメージ(documents/fat32.md
 # FAT32-M9)。従来のQEMU vvfatドライバ(-drive format=raw,file=fat:rw:./esp_dir)は
@@ -483,12 +557,14 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
 # (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする
 test-qemu-all:
-	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG)
+	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック

@@ -115,17 +115,21 @@
 ;; Lisp再帰ではなくwhileで書く(eval_no_tco_interpreter_stack_limit、FAT16と同じ理由)。
 ;; 上限は%fat32-total-cluster-count+2(クラスタ番号は2始まり)とし、FATが破損して
 ;; 自己参照/循環したチェインになっていても無限ループせず打ち切る。
+;; whileループ本体で毎回新規のletを生成しない理由: %ide-bytes-from-addrと同じ
+;; (ide.lispのコメント参照、PART-M4調査で発覚したGC下永続破損バグの回避。forマクロに
+;; 限らず、tagbody/goのループ本体内で毎回新規に評価・確保されるletバインディングは
+;; 同種のリスクを持つため、entry等をループ外のletへ引き上げてsetqで更新する)。
 (defun fat32-cluster-chain (device bpb start-cluster)
   (let ((cluster start-cluster) (count 0)
         (limit (+ (%fat32-total-cluster-count bpb) 2))
-        (rev-chain nil) (done nil))
+        (rev-chain nil) (done nil) (entry nil))
     (while (and (not done) (< count limit))
       (setq rev-chain (cons cluster rev-chain))
       (setq count (+ count 1))
-      (let ((entry (fat32-fat-entry device bpb cluster)))
-        (if (or (null entry) (>= entry #x0FFFFFF8))
-            (setq done t)
-            (setq cluster entry))))
+      (setq entry (fat32-fat-entry device bpb cluster))
+      (if (or (null entry) (>= entry #x0FFFFFF8))
+          (setq done t)
+          (setq cluster entry)))
     (%fat32-reverse-iter rev-chain)))
 
 ;; (%fat32-reverse-iter list) : listを反転して返す。fat16.lispの%fat16-reverse-iter
@@ -165,14 +169,16 @@
 ;; fat32-cluster-chainの戻り値)を、各クラスタを構成する全セクタのLBA番号を順に
 ;; 並べた1本のリストへ展開する。要素数に比例して深くなるためwhileで辿る
 ;; (fat16.lispの%fat16-clusters-to-lbasと同じ)。
+;; whileループ本体で毎回新規のletを生成しない理由: fat32-cluster-chainと同じ
+;; (PART-M4調査、ide.lispのコメント参照)。lba-rangeをループ外のletへ引き上げる。
 (defun %fat32-clusters-to-lbas (bpb clusters)
-  (let ((remaining clusters) (rev-lbas nil))
+  (let ((remaining clusters) (rev-lbas nil) (lba-range nil))
     (while remaining
-      (let ((lba-range (%fat32-lba-range (fat32-cluster-to-lba bpb (car remaining))
-                                          (slot-value bpb 'sectors-per-cluster))))
-        (while lba-range
-          (setq rev-lbas (cons (car lba-range) rev-lbas))
-          (setq lba-range (cdr lba-range))))
+      (setq lba-range (%fat32-lba-range (fat32-cluster-to-lba bpb (car remaining))
+                                         (slot-value bpb 'sectors-per-cluster)))
+      (while lba-range
+        (setq rev-lbas (cons (car lba-range) rev-lbas))
+        (setq lba-range (cdr lba-range)))
       (setq remaining (cdr remaining)))
     (%fat32-reverse-iter rev-lbas)))
 
@@ -227,13 +233,16 @@
 
 ;; (%fat32-bytes-to-string bytes) : ASCIIコードのfixnumリストbytesから対応する
 ;; 文字を1文字ずつ持つLisp文字列を組み立てる。
+;; whileで実装する理由: %ide-bytes-from-addrと同じ(ide.lispのコメント参照、
+;; PART-M4調査で発覚したforマクロのGC下永続破損バグの回避)。
 (defun %fat32-bytes-to-string (bytes)
-  (let ((s (create-string (length bytes))))
+  (let ((s (create-string (length bytes))) (b bytes) (i 0))
     (progn
-      (for ((b bytes (cdr b))
-            (i 0 (+ i 1)))
-          ((null b) nil)
-        (set-elt (code-char (car b)) s i))
+      (while (not (null b))
+        (progn
+          (set-elt (code-char (car b)) s i)
+          (setq b (cdr b))
+          (setq i (+ i 1))))
       s)))
 
 ;; (%fat32-dir-entry-name bytes offset) : offsetにある32byteエントリの8+3byte名
@@ -249,23 +258,29 @@
 ;; リスト)を先頭からwhileで走査し、有効なdir-entry32のリストを返す。0x00終端に
 ;; 到達した時点で走査を止める(fat16.lispの%fat16-scan-dir-entriesと同じ構造)。
 ;; read-sectorが失敗した場合はそれまでに集めたエントリを捨ててnil。
+;; whileループ本体で毎回新規のletを生成しない理由: fat32-cluster-chainと同じ
+;; (PART-M4調査、ide.lispのコメント参照)。bytes/offset/i/parsedをループ外のletへ
+;; 引き上げる(内側のwhileも同様、外側の1回のイテレーションにつき複数回巻き戻る
+;; ため特にリスクが高い)。
 (defun %fat32-scan-dir-entries (device lbas)
-  (let ((remaining-lbas lbas) (rev-entries nil) (stopped nil) (ok t))
+  (let ((remaining-lbas lbas) (rev-entries nil) (stopped nil) (ok t)
+        (bytes nil) (offset 0) (i 0) (parsed nil))
     (while (and ok remaining-lbas (not stopped))
-      (let ((bytes (read-sector device (car remaining-lbas))))
-        (if (null bytes)
-            (setq ok nil)
-            (progn
-              (let ((offset 0) (i 0))
-                (while (and (not stopped) (< i 16))
-                  (let ((parsed (%fat32-dir-entry-at bytes offset)))
-                    (if (eq parsed 'end)
-                        (setq stopped t)
-                        (progn
-                          (if (not (null parsed)) (setq rev-entries (cons parsed rev-entries)))
-                          (setq offset (+ offset 32))
-                          (setq i (+ i 1)))))))
-              (setq remaining-lbas (cdr remaining-lbas))))))
+      (setq bytes (read-sector device (car remaining-lbas)))
+      (if (null bytes)
+          (setq ok nil)
+          (progn
+            (setq offset 0)
+            (setq i 0)
+            (while (and (not stopped) (< i 16))
+              (setq parsed (%fat32-dir-entry-at bytes offset))
+              (if (eq parsed 'end)
+                  (setq stopped t)
+                  (progn
+                    (if (not (null parsed)) (setq rev-entries (cons parsed rev-entries)))
+                    (setq offset (+ offset 32))
+                    (setq i (+ i 1)))))
+            (setq remaining-lbas (cdr remaining-lbas)))))
     (if ok (%fat32-reverse-iter rev-entries) nil)))
 
 ;; (%fat32-dir-entry-kind attr) : attrバイトのディレクトリ属性ビット(0x10)を見て
@@ -297,14 +312,16 @@
 ;; (%fat32-split-path path) : "/DOCS/SUB/README.TXT"のようなpathを"/"区切りで
 ;; 非空要素のリスト("DOCS" "SUB" "README.TXT")に分解する。"/"のみのパスはnil
 ;; (ルート自身)。fat16.lispの%fat16-split-pathと同じ。
+;; whileループ本体で毎回新規のletを生成しない理由: fat32-cluster-chainと同じ
+;; (PART-M4調査、ide.lispのコメント参照)。slash-pos/endをループ外のletへ引き上げる。
 (defun %fat32-split-path (path)
-  (let ((start 0) (len (length path)) (rev-parts nil))
+  (let ((start 0) (len (length path)) (rev-parts nil) (slash-pos nil) (end nil))
     (while (< start len)
-      (let* ((slash-pos (char-index #\/ path start))
-             (end (if slash-pos slash-pos len)))
-        (if (> end start)
-            (setq rev-parts (cons (subseq path start end) rev-parts)))
-        (setq start (+ end 1))))
+      (setq slash-pos (char-index #\/ path start))
+      (setq end (if slash-pos slash-pos len))
+      (if (> end start)
+          (setq rev-parts (cons (subseq path start end) rev-parts)))
+      (setq start (+ end 1)))
     (%fat32-reverse-iter rev-parts)))
 
 ;; (%fat32-butlast list) : listから末尾の要素を除いた部分を返す。パス要素の
@@ -326,21 +343,24 @@
 ;; 注意(ルート自体がクラスタ番号を持つFAT32の構造上の違い、後続の".."実装で
 ;; 重要になる)。途中のいずれかの段でエントリが見つからない・ディレクトリでない
 ;; 場合、または読み込み失敗の場合はnil。
+;; whileループ本体で毎回新規のletを生成しない理由: fat32-cluster-chainと同じ
+;; (PART-M4調査、ide.lispのコメント参照)。entries/entryをループ外のletへ引き上げる。
 (defun %fat32-resolve-dir (device bpb components)
   (let ((cluster (slot-value bpb 'root-cluster))
         (lbas (%fat32-dir-lbas-for-cluster device bpb (slot-value bpb 'root-cluster)))
-        (remaining components) (ok t))
+        (remaining components) (ok t) (entries nil) (entry nil))
     (while (and ok remaining)
-      (let ((entries (%fat32-scan-dir-entries device lbas)))
-        (if (null entries)
-            (setq ok nil)
-            (let ((entry (%fat32-find-dir-entry entries (car remaining))))
-              (if (or (null entry) (= (logand (slot-value entry 'attr) #x10) 0))
-                  (setq ok nil)
-                  (progn
-                    (setq cluster (slot-value entry 'start-cluster))
-                    (setq lbas (%fat32-dir-lbas-for-cluster device bpb cluster))
-                    (setq remaining (cdr remaining))))))))
+      (setq entries (%fat32-scan-dir-entries device lbas))
+      (if (null entries)
+          (setq ok nil)
+          (progn
+            (setq entry (%fat32-find-dir-entry entries (car remaining)))
+            (if (or (null entry) (= (logand (slot-value entry 'attr) #x10) 0))
+                (setq ok nil)
+                (progn
+                  (setq cluster (slot-value entry 'start-cluster))
+                  (setq lbas (%fat32-dir-lbas-for-cluster device bpb cluster))
+                  (setq remaining (cdr remaining)))))))
     (if ok (cons lbas cluster) nil)))
 
 ;; (%fat32-resolve-dir-lbas device bpb components) : %fat32-resolve-dirの結果から
@@ -380,18 +400,21 @@
 ;; を返す。read-sectorが失敗した場合はそれまでに読んだ分は捨ててnil。セクタ数に
 ;; 比例して深くなるためwhileで書く(fat16.lispの%fat16-read-lba-listと同じ理由、
 ;; eval_no_tco_interpreter_stack_limit)。
+;; sector-bytes/remaining-bytesをループ外のletへ引き上げているのは、whileループ
+;; 本体で毎回新規のletを生成しない一般的な流儀(fat32-cluster-chain等と同じ)に
+;; 揃えたもの。
 (defun %fat32-read-lba-list (device lbas)
-  (let ((remaining-lbas lbas) (rev-bytes nil) (ok t))
+  (let ((remaining-lbas lbas) (rev-bytes nil) (ok t) (sector-bytes nil) (remaining-bytes nil))
     (while (and ok remaining-lbas)
-      (let ((sector-bytes (read-sector device (car remaining-lbas))))
-        (if (null sector-bytes)
-            (setq ok nil)
-            (progn
-              (let ((remaining-bytes sector-bytes))
-                (while remaining-bytes
-                  (setq rev-bytes (cons (car remaining-bytes) rev-bytes))
-                  (setq remaining-bytes (cdr remaining-bytes))))
-              (setq remaining-lbas (cdr remaining-lbas))))))
+      (setq sector-bytes (read-sector device (car remaining-lbas)))
+      (if (null sector-bytes)
+          (setq ok nil)
+          (progn
+            (setq remaining-bytes sector-bytes)
+            (while remaining-bytes
+              (setq rev-bytes (cons (car remaining-bytes) rev-bytes))
+              (setq remaining-bytes (cdr remaining-bytes)))
+            (setq remaining-lbas (cdr remaining-lbas)))))
     (if ok
         (%fat32-reverse-iter rev-bytes)
         nil)))

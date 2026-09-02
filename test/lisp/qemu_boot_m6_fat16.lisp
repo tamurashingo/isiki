@@ -2,6 +2,7 @@
 (load "test/lisp/test_framework.lisp")
 (load "src/lisp/device.lisp")
 (load "src/lisp/ide.lisp")
+(load "src/lisp/partition.lisp")
 (load "src/lisp/fat16.lisp")
 (load "test/lisp/fat16_test.lisp")
 (load "test/lisp/device_test.lisp")

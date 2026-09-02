@@ -92,13 +92,16 @@
 ;; (%fat16-bytes-to-string bytes) : ASCIIコードのfixnumリストbytesから、対応する
 ;; 文字を1文字ずつ持つLisp文字列を組み立てる(FAT16-M0(1)で確認したcode-char+
 ;; create-string+set-eltの手順)。
+;; whileで実装する理由: ide.lispの%ide-bytes-from-addrのコメント参照
+;; (PART-M4調査で発覚したforマクロのGC下永続破損バグの回避)。
 (defun %fat16-bytes-to-string (bytes)
-  (let ((s (create-string (length bytes))))
+  (let ((s (create-string (length bytes))) (b bytes) (i 0))
     (progn
-      (for ((b bytes (cdr b))
-            (i 0 (+ i 1)))
-          ((null b) nil)
-        (set-elt (code-char (car b)) s i))
+      (while (not (null b))
+        (progn
+          (set-elt (code-char (car b)) s i)
+          (setq b (cdr b))
+          (setq i (+ i 1))))
       s)))
 
 ;; (%fat16-dir-entry-name bytes offset) : offsetにある32byteエントリの8+3byte名
