@@ -46,3 +46,33 @@
 (defglobal *partition-test-whole-disk* (%device-handle 'blk0))
 (assert-equal nil (%device-fat16-uuid *partition-test-whole-disk*))
 (assert-equal nil (%device-fat32-uuid *partition-test-whole-disk*))
+
+;;; --- 5. パーティションスライス(blk0s1、FAT32)経由でもLFN(ロングファイル名、
+;;; FAT32-M10)が有効であること ---
+;;
+;; fat32.lispのfat32-create-file/fat32-read-file/fat32-create-directory/
+;; fat32-read-dirは、生ディスクハンドルと同じくパーティションハンドル
+;; (%ide-partition-handle-p、read-sector/write-sectorがLBAへオフセットを加算する)
+;; に対しても差異なく動くはずだが、これまでのテストはblk0上(パーティション
+;; テーブル無しの生ディスク)でのみLFNを確認していた。パーティション2(blk0s1)は
+;; TEST.LSPのみを持つ空のFAT32なので、ここで8.3に収まらない長い名前の
+;; ファイル・ディレクトリを新規作成し、往復一致することを実証する
+;; (既存のTEST.LSPは短名のためLFNの検証にはならない)。
+
+;; 8.3に収まらない長いファイル名での新規作成→読み込みの往復一致。
+(defglobal *partition-test-lfn-content* (list 83 76 73 67 69 45 76 70 78)) ;; "SLICE-LFN"
+
+(assert-equal t (if (fat32-create-file *partition-test-p2* "/Partition_Slice_LFN_File.txt" *partition-test-lfn-content*) t nil))
+(assert-equal *partition-test-lfn-content* (fat32-read-file *partition-test-p2* "/Partition_Slice_LFN_File.txt"))
+;; 大文字小文字を変えたパスでも表示名経由で同一エントリを読める
+;; (LFN表示名の大文字小文字非依存マッチの回帰確認)。
+(assert-equal *partition-test-lfn-content* (fat32-read-file *partition-test-p2* "/partition_slice_lfn_file.txt"))
+(assert-equal (list (list "TEST.LSP" ':file 36) (list "Partition_Slice_LFN_File.txt" ':file 9))
+              (fat32-read-dir *partition-test-p2* "/"))
+
+;; 8.3に収まらない長いディレクトリ名での新規作成→内部へのファイル作成の往復一致。
+(assert-equal t (if (fat32-create-directory *partition-test-p2* "/Partition_Slice_LFN_Dir") t nil))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
+              (fat32-read-dir *partition-test-p2* "/Partition_Slice_LFN_Dir"))
+(assert-equal t (if (fat32-create-file *partition-test-p2* "/Partition_Slice_LFN_Dir/INSIDE.TXT" *partition-test-lfn-content*) t nil))
+(assert-equal *partition-test-lfn-content* (fat32-read-file *partition-test-p2* "/Partition_Slice_LFN_Dir/INSIDE.TXT"))

@@ -3,6 +3,7 @@
 (load "src/lisp/device.lisp")
 (load "src/lisp/ide.lisp")
 (load "src/lisp/partition.lisp")
+(load "src/lisp/fat32.lisp")
 (load "test/lisp/partition_test.lisp")
 
 (isiki-test-report)
