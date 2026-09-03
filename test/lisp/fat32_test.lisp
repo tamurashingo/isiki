@@ -47,9 +47,10 @@
 ;; テスト専用)→SUBDIR(NESTED.TXT/DEEPER/DEEP.TXTを持つ)→DELETED.TXT(最後に
 ;; 作成後にrm、先頭バイトが0xE5になる)という並び(Makefile参照)。削除済み
 ;; エントリはスキップされるため、戻り値はHELLO.TXT/TEST.LSP/BIG.TXT/WRITE1.TXT/
-;; SUBDIRの5件のみになるはず。
+;; Long_File_Name.txt/This_Is_A_Very_Long_File_Name.txt/SUBDIRの7件のみになるはず。
 
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 512)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0))
               (fat32-read-dir *fat32-test-device* "/"))
 
@@ -78,6 +79,12 @@
 ;; (ASCIIコード)になる。
 
 (assert-equal (list 72 101 108 108 111) (subseq (fat32-read-file *fat32-test-device* "/TEST.LSP") 0 5))
+
+;;; --- FAT32-M10: VFAT Long File Name (LFN) ---
+
+(assert-equal (list 108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/Long_File_Name.txt") 0 4))
+(assert-equal (list 108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/long_file_name.txt") 0 4))
+(assert-equal 1 (length (fat32-read-file *fat32-test-device* "/This_Is_A_Very_Long_File_Name.txt")))
 (assert-equal 18 (length (fat32-read-file *fat32-test-device* "/TEST.LSP")))
 
 (defglobal fat32-test-big (fat32-read-file *fat32-test-device* "/BIG.TXT"))
@@ -117,6 +124,7 @@
 (assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new) t nil))
 (assert-equal fat32-test-write1-new (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 10)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0))
               (fat32-read-dir *fat32-test-device* "/"))
 
@@ -130,7 +138,8 @@
 
 (assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-2clusters) t nil))
 (assert-equal fat32-test-write1-2clusters (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
-(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000)                      (list "WRITE1.TXT" ':file 513)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0))
               (fat32-read-dir *fat32-test-device* "/"))
 
@@ -139,7 +148,8 @@
 ;; でデータ/ディレクトリエントリが変更されていないことも確認する。
 (assert-equal nil (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new))
 (assert-equal fat32-test-write1-2clusters (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
-(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000)                      (list "WRITE1.TXT" ':file 513)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0))
               (fat32-read-dir *fat32-test-device* "/"))
 
@@ -162,6 +172,7 @@
 (assert-equal fat32-test-new2 (fat32-read-file *fat32-test-device* "/NEW2.TXT"))
 
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0)
                      (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
               (fat32-read-dir *fat32-test-device* "/"))
@@ -171,17 +182,23 @@
 (assert-equal nil (fat32-create-file *fat32-test-device* "/TEST.LSP" fat32-test-new2))
 (assert-equal 18 (length (fat32-read-file *fat32-test-device* "/TEST.LSP")))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0)
                      (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
               (fat32-read-dir *fat32-test-device* "/"))
 
-;; 8.3形式で表現できない名前(複数ドット、またはbase/extが長すぎる)はnil。いずれも
-;; スロット確保より前段の名前変換で失敗するため、一覧は変化しない。
-(assert-equal nil (fat32-create-file *fat32-test-device* "/A.B.C" fat32-test-new2))
-(assert-equal nil (fat32-create-file *fat32-test-device* "/TOOLONGNAME.TXT" fat32-test-new2))
+;; LFN対応後は8.3に収まらない名前でも作成できる。
+(defglobal fat32-test-lfn-create (%fat32-test-make-byte-list 20 76)) ;; 全要素76('L')
+
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/A.B.C" fat32-test-lfn-create) t nil))
+(assert-equal fat32-test-lfn-create (fat32-read-file *fat32-test-device* "/A.B.C"))
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/TOOLONGNAME.TXT" fat32-test-lfn-create) t nil))
+(assert-equal fat32-test-lfn-create (fat32-read-file *fat32-test-device* "/TOOLONGNAME.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0)
-                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100))
+                     (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100)
+                     (list "A.B.C" ':file 20) (list "TOOLONGNAME.TXT" ':file 20))
               (fat32-read-dir *fat32-test-device* "/"))
 
 ;; サブディレクトリ内への書き込み・新規作成(多階層パス解決の回帰確認)
@@ -221,8 +238,10 @@
 ;; ルート直下への新規ディレクトリ作成
 (assert-equal t (if (fat32-create-directory *fat32-test-device* "/NEWDIR") t nil))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000) (list "WRITE1.TXT" ':file 513)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
                      (list "SUBDIR" ':dir 0)
                      (list "NEW1.TXT" ':file 0) (list "NEW2.TXT" ':file 100)
+                     (list "A.B.C" ':file 20) (list "TOOLONGNAME.TXT" ':file 20)
                      (list "NEWDIR" ':dir 0))
               (fat32-read-dir *fat32-test-device* "/"))
 
@@ -251,9 +270,13 @@
 (assert-equal nil (fat32-create-directory *fat32-test-device* "/SUBDIR"))
 (assert-equal nil (fat32-create-directory *fat32-test-device* "/NEWDIR"))
 
-;; 8.3形式で表現できない名前はnil
-(assert-equal nil (fat32-create-directory *fat32-test-device* "/A.B.C"))
-(assert-equal nil (fat32-create-directory *fat32-test-device* "/TOOLONGDIRNAME"))
+;; LFN名でのディレクトリ作成
+(assert-equal t (if (fat32-create-directory *fat32-test-device* "/Long_Directory_Name") t nil))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/Long_Directory_Name"))
+(assert-equal t (if (fat32-create-directory *fat32-test-device* "/MULTI.PART.NAME") t nil))
+(assert-equal (list (list "." ':dir 0) (list ".." ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/MULTI.PART.NAME"))
 
 ;; 存在しない親ディレクトリの下へのmkdirもnil
 (assert-equal nil (fat32-create-directory *fat32-test-device* "/NOSUCHDIR/CHILD"))

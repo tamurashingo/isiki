@@ -254,6 +254,125 @@
         (%fat32-bytes-to-string name-bytes)
         (string-append (%fat32-bytes-to-string name-bytes) "." (%fat32-bytes-to-string ext-bytes)))))
 
+;;; --- FAT32-M10: VFAT Long File Name (LFN) ---
+
+;; (%fat32-upcase-char-code code) : 小文字ASCII(97-122)のcode(char-codeの戻り値)を
+;; 大文字(-32)に変換する。それ以外のコードはそのまま返す(8.3名/LFN照合で使用)。
+(defun %fat32-upcase-char-code (code)
+  (if (and (>= code 97) (<= code 122))
+      (- code 32)
+      code))
+
+;; (%fat32-is-lfn-entry? bytes offset) : offsetの32byteエントリがVFAT LFNスロット
+;; (attr=0x0F)かどうかを返す。削除済み(0xE5)・終端(0x00)は呼び出し元で除外済み。
+(defun %fat32-is-lfn-entry? (bytes offset)
+  (= (elt bytes (+ offset 11)) #x0F))
+
+;; (%fat32-lfn-checksum-for-bytes name-bytes) : 11byteの短名フィールドからVFAT
+;; LFN checksumを計算する。
+(defun %fat32-lfn-checksum-for-bytes (name-bytes)
+  (let ((sum 0) (remaining name-bytes))
+    (while remaining
+      (setq sum (mod (+ (if (= (logand sum 1) 1) 128 0) (ash sum -1) (car remaining)) 256))
+      (setq remaining (cdr remaining)))
+    sum))
+
+;; (%fat32-lfn-slot-positions entry-offset) : 1 LFNスロット内のUCS-2文字
+;; 先頭byte位置(最大13個)のリストを返す。
+(defun %fat32-lfn-slot-positions (entry-offset)
+  (list (+ entry-offset 1) (+ entry-offset 3) (+ entry-offset 5)
+        (+ entry-offset 7) (+ entry-offset 9)
+        (+ entry-offset 14) (+ entry-offset 16) (+ entry-offset 18)
+        (+ entry-offset 20) (+ entry-offset 22) (+ entry-offset 24)
+        (+ entry-offset 28) (+ entry-offset 30)))
+
+;; (%fat32-lfn-chars-at bytes entry-offset) : 1 LFNスロットから最大13文字分の
+;; code pointリストを返す。0x0000/0xFFFFパディングに到達したら打ち切る。
+(defun %fat32-lfn-chars-at (bytes entry-offset)
+  (let ((remaining (%fat32-lfn-slot-positions entry-offset))
+        (rev-codes nil)
+        (pos 0)
+        (code 0))
+    (while remaining
+      (setq pos (car remaining))
+      (setq code (%fat32-u16 bytes pos))
+      (if (or (= code #xFFFF) (= code 0))
+          (setq remaining nil)
+          (progn
+            (setq rev-codes (cons code rev-codes))
+            (setq remaining (cdr remaining)))))
+    (%fat32-reverse-iter rev-codes)))
+
+;; (%fat32-ucs2-codes-to-string codes) : code pointのfixnumリストからLisp文字列を
+;; 組み立てる。
+(defun %fat32-ucs2-codes-to-string (codes)
+  (let ((remaining codes) (result ""))
+    (while remaining
+      (setq result (string-append result (%fat32-bytes-to-string (list (car remaining)))))
+      (setq remaining (cdr remaining)))
+    result))
+
+;; (%fat32-lfn-chain-valid? bytes pending-lfn checksum) : pending-lfn(同一セクタ内の
+;; LFNスロットoffsetのリスト、走査順=ディスク上の昇順でconsされている)が、直後の
+;; 短名エントリとchecksumで対応付け可能かを返す。
+(defun %fat32-lfn-chain-valid? (bytes pending-lfn checksum)
+  (let ((count (length pending-lfn)))
+    (if (= count 0)
+        nil
+        (let ((first-off (car (%fat32-reverse-iter pending-lfn)))
+              (last-off (car pending-lfn)))
+          (and (= count (logand (elt bytes first-off) #x3F))
+               (= (elt bytes (+ last-off 11)) #x0F)
+               (= (elt bytes (+ last-off 13)) checksum))))))
+
+;; (%fat32-reconstruct-lfn-name bytes pending-lfn) : 検証済みのLFNスロット群から
+;; 表示用の長いファイル名を復元する。
+(defun %fat32-reconstruct-lfn-name (bytes pending-lfn)
+  (let ((result "")
+        (remaining pending-lfn)
+        (chunk nil)
+        (part ""))
+    (while remaining
+      (setq chunk (%fat32-lfn-chars-at bytes (car remaining)))
+      (setq part (%fat32-ucs2-codes-to-string chunk))
+      (setq result (string-append result part))
+      (setq remaining (cdr remaining)))
+    (if (= (length result) 0)
+        nil
+        result)))
+
+;; (%fat32-make-short-dir-entry bytes offset display-name) : 短名エントリ1件を
+;; dir-entry32へ変換する。display-nameは8.3表示名または復元したLFN。
+(defun %fat32-make-short-dir-entry (bytes offset display-name)
+  (make-instance 'dir-entry32
+    ':name display-name
+    ':attr (elt bytes (+ offset 11))
+    ':start-cluster (logior (%fat32-u16 bytes (+ offset 26))
+                             (ash (%fat32-u16 bytes (+ offset 20)) 16))
+    ':size (%fat32-u32 bytes (+ offset 28))))
+
+;; (%fat32-dir-entry-display-name bytes offset pending-lfn) : 短名スロットと直前の
+;; LFN群から一覧/検索用の表示名を決定する。
+(defun %fat32-dir-entry-display-name (bytes offset pending-lfn)
+  (if (null pending-lfn)
+      (%fat32-dir-entry-name bytes offset)
+      (let ((lfn-name (%fat32-reconstruct-lfn-name bytes pending-lfn)))
+        (if (or (null lfn-name) (= (length lfn-name) 0))
+            (%fat32-dir-entry-name bytes offset)
+            lfn-name))))
+
+;; (%fat32-name-equal? a b) : VFAT互換の大文字小文字無視名前照合(ASCIIのみ)。
+(defun %fat32-name-equal? (a b)
+  (let ((len-a (length a)) (len-b (length b)) (i 0))
+    (if (/= len-a len-b)
+        nil
+        (progn
+          (while (and (< i len-a)
+                      (= (%fat32-upcase-char-code (char-code (elt a i)))
+                         (%fat32-upcase-char-code (char-code (elt b i)))))
+            (setq i (+ i 1)))
+          (= i len-a)))))
+
 ;; (%fat32-scan-dir-entries device lbas) : lbas(ディレクトリを構成するセクタLBAの
 ;; リスト)を先頭からwhileで走査し、有効なdir-entry32のリストを返す。0x00終端に
 ;; 到達した時点で走査を止める(fat16.lispの%fat16-scan-dir-entriesと同じ構造)。
@@ -264,7 +383,8 @@
 ;; ため特にリスクが高い)。
 (defun %fat32-scan-dir-entries (device lbas)
   (let ((remaining-lbas lbas) (rev-entries nil) (stopped nil) (ok t)
-        (bytes nil) (offset 0) (i 0) (parsed nil))
+        (pending-lfn nil)
+        (bytes nil) (offset 0) (i 0) (first-byte 0) (display-name nil))
     (while (and ok remaining-lbas (not stopped))
       (setq bytes (read-sector device (car remaining-lbas)))
       (if (null bytes)
@@ -273,13 +393,25 @@
             (setq offset 0)
             (setq i 0)
             (while (and (not stopped) (< i 16))
-              (setq parsed (%fat32-dir-entry-at bytes offset))
-              (if (eq parsed 'end)
+              (setq first-byte (elt bytes offset))
+              (if (= first-byte 0)
                   (setq stopped t)
-                  (progn
-                    (if (not (null parsed)) (setq rev-entries (cons parsed rev-entries)))
-                    (setq offset (+ offset 32))
-                    (setq i (+ i 1)))))
+                  (if (= first-byte #xE5)
+                      (progn
+                        (setq pending-lfn nil)
+                        (setq offset (+ offset 32))
+                        (setq i (+ i 1)))
+                      (if (%fat32-is-lfn-entry? bytes offset)
+                          (progn
+                            (setq pending-lfn (cons offset pending-lfn))
+                            (setq offset (+ offset 32))
+                            (setq i (+ i 1)))
+                          (progn
+                            (setq display-name (%fat32-dir-entry-display-name bytes offset pending-lfn))
+                            (setq rev-entries (cons (%fat32-make-short-dir-entry bytes offset display-name) rev-entries))
+                            (setq pending-lfn nil)
+                            (setq offset (+ offset 32))
+                            (setq i (+ i 1)))))))
             (setq remaining-lbas (cdr remaining-lbas)))))
     (if ok (%fat32-reverse-iter rev-entries) nil)))
 
@@ -299,11 +431,11 @@
             (%fat32-dir-entries-to-display-list (cdr entries)))))
 
 ;; (%fat32-find-dir-entry entries name) : dir-entry32のリストentriesからnameと
-;; (拡張子まで含めた)8.3名が一致するものを探す。見つからなければnil。
+;; 一致するものを探す(大文字小文字無視)。見つからなければnil。
 (defun %fat32-find-dir-entry (entries name)
   (if (null entries)
       nil
-      (if (string= (slot-value (car entries) 'name) name)
+      (if (%fat32-name-equal? (slot-value (car entries) 'name) name)
           (car entries)
           (%fat32-find-dir-entry (cdr entries) name))))
 
@@ -381,6 +513,20 @@
           (if (null lbas)
               nil
               (cons lbas (%fat32-last-elt components)))))))
+
+;; (%fat32-resolve-file-dir device bpb path) : %fat32-resolve-fileと同じだが、親
+;; ディレクトリの解決に%fat32-resolve-dir(cluster付き)を使い、親ディレクトリの
+;; start-clusterも併せて返す(fat32-create-fileがディレクトリ拡張時に必要)。
+;; 戻り値は(list 親ディレクトリのLBAリスト 親ディレクトリのstart-cluster
+;; ファイル名)。パスが"/"のみ、または親ディレクトリの解決に失敗した場合はnil。
+(defun %fat32-resolve-file-dir (device bpb path)
+  (let ((components (%fat32-split-path path)))
+    (if (null components)
+        nil
+        (let ((resolved (%fat32-resolve-dir device bpb (%fat32-butlast components))))
+          (if (null resolved)
+              nil
+              (list (car resolved) (cdr resolved) (%fat32-last-elt components)))))))
 
 ;; (fat32-read-dir device path) : path("/"、または"/DOCS"のような多階層パス)が
 ;; 指すディレクトリのエントリ一覧を("NAME" :file/:dir size)の形のリストで返す。
@@ -502,36 +648,46 @@
           (setq ok nil)))
     ok))
 
-;; (%fat32-find-entry-in-sector bytes entry-offset entries-remaining name) : 1セクタ
-;; 分のエントリをentry-offsetから順に調べ、名前がnameと一致する最初のエントリの
-;; offsetを返す。0x00終端に到達したらシンボル'end、削除済み(0xE5)はスキップし
-;; 次のエントリへ進む。entries-remainingを使い切ってもマッチしなければnil。
-(defun %fat32-find-entry-in-sector (bytes entry-offset entries-remaining name)
+;; (%fat32-find-entry-in-sector bytes entry-offset entries-remaining name pending-lfn)
+;; : 1セクタ分のエントリをentry-offsetから順に調べ、表示名がnameと一致する最初の
+;; 短名エントリのoffsetを返す。戻り値は(offset . pending-lfn)の新状態、見つから
+;; なければ(nil . pending-lfn)、0x00終端なら('end . pending-lfn)。
+(defun %fat32-find-entry-in-sector (bytes entry-offset entries-remaining name pending-lfn)
   (if (<= entries-remaining 0)
-      nil
+      (cons nil pending-lfn)
       (let ((first-byte (elt bytes entry-offset)))
         (if (= first-byte 0)
-            'end
-            (if (and (/= first-byte #xE5)
-                     (string= (%fat32-dir-entry-name bytes entry-offset) name))
-                entry-offset
-                (%fat32-find-entry-in-sector bytes (+ entry-offset 32) (- entries-remaining 1) name))))))
+            (cons 'end pending-lfn)
+            (if (= first-byte #xE5)
+                (%fat32-find-entry-in-sector bytes (+ entry-offset 32) (- entries-remaining 1) name nil)
+                (if (%fat32-is-lfn-entry? bytes entry-offset)
+                    (%fat32-find-entry-in-sector bytes (+ entry-offset 32) (- entries-remaining 1)
+                      name (cons entry-offset pending-lfn))
+                    (let ((display-name (%fat32-dir-entry-display-name bytes entry-offset pending-lfn)))
+                      (if (%fat32-name-equal? display-name name)
+                          (cons entry-offset nil)
+                          (%fat32-find-entry-in-sector bytes (+ entry-offset 32) (- entries-remaining 1) name nil)))))))))
 
 ;; (%fat32-find-entry-location-scan device lbas name) : lbasを先頭からwhileで走査し、
 ;; nameと一致するエントリの(lba . offset-in-sector)を返す。0x00終端に到達するか
 ;; 読み込みに失敗した時点で走査を止める。見つからなければnil。
 (defun %fat32-find-entry-location-scan (device lbas name)
-  (let ((remaining-lbas lbas) (result nil) (stopped nil))
+  (let ((remaining-lbas lbas) (result nil) (stopped nil) (pending-lfn nil)
+        (bytes nil) (found nil))
     (while (and remaining-lbas (null result) (not stopped))
-      (let ((bytes (read-sector device (car remaining-lbas))))
-        (if (null bytes)
-            (setq stopped t)
-            (let ((found (%fat32-find-entry-in-sector bytes 0 16 name)))
-              (if (eq found 'end)
-                  (setq stopped t)
-                  (if (null found)
-                      (setq remaining-lbas (cdr remaining-lbas))
-                      (setq result (cons (car remaining-lbas) found))))))))
+      (setq bytes (read-sector device (car remaining-lbas)))
+      (if (null bytes)
+          (setq stopped t)
+          (progn
+            (setq found (%fat32-find-entry-in-sector bytes 0 16 name pending-lfn))
+            (setq pending-lfn (cdr found))
+            (cond
+              ((eq (car found) 'end)
+               (setq stopped t))
+              ((null (car found))
+               (setq remaining-lbas (cdr remaining-lbas)))
+              (t
+               (setq result (cons (car remaining-lbas) (car found))))))))
     result))
 
 ;; (%fat32-cluster-count-for-bytes byte-length cluster-bytes) : byte-length分の
@@ -561,12 +717,12 @@
 ;; (未使用)になる最初のクラスタ番号をwhileで探す。上限はクラスタ総数+2(クラスタ
 ;; 番号は2始まりのため)。見つからなければ(ディスクフル)nil。
 (defun %fat32-find-free-cluster (device bpb)
-  (let ((cluster-no 2) (limit (+ (%fat32-total-cluster-count bpb) 2)) (found nil))
+  (let ((cluster-no 2) (limit (+ (%fat32-total-cluster-count bpb) 2)) (found nil) (entry nil))
     (while (and (null found) (< cluster-no limit))
-      (let ((entry (fat32-fat-entry device bpb cluster-no)))
-        (if (and entry (= entry 0))
-            (setq found cluster-no)
-            (setq cluster-no (+ cluster-no 1)))))
+      (setq entry (fat32-fat-entry device bpb cluster-no))
+      (if (and entry (= entry 0))
+          (setq found cluster-no)
+          (setq cluster-no (+ cluster-no 1))))
     found))
 
 ;; (%fat32-set-fat-entry device bpb cluster-no value) : cluster-noのFATエントリを
@@ -581,27 +737,28 @@
 (defun %fat32-set-fat-entry (device bpb cluster-no value)
   (let* ((byte-offset (* cluster-no 4))
          (sector-offset (div byte-offset (slot-value bpb 'bytes-per-sector)))
-         (offset-in-sector (mod byte-offset (slot-value bpb 'bytes-per-sector))))
-    (let ((fat-index 0) (ok t))
-      (while (and ok (< fat-index (slot-value bpb 'num-fats)))
-        (let* ((lba (+ (slot-value bpb 'reserved-sectors)
-                        (* fat-index (slot-value bpb 'fat-size-32))
-                        sector-offset))
-               (sector-bytes (read-sector device lba)))
-          (if (null sector-bytes)
-              (setq ok nil)
-              (let* ((existing (%fat32-u32 sector-bytes offset-in-sector))
-                     (new-value (logior (logand existing #xF0000000) (logand value #x0FFFFFFF)))
-                     (value-bytes (%fat32-u32-to-bytes new-value)))
+         (offset-in-sector (mod byte-offset (slot-value bpb 'bytes-per-sector)))
+         (fat-index 0) (ok t)
+         (lba 0) (sector-bytes nil) (existing 0) (new-value 0) (value-bytes nil))
+    (while (and ok (< fat-index (slot-value bpb 'num-fats)))
+      (setq lba (+ (slot-value bpb 'reserved-sectors)
+                   (* fat-index (slot-value bpb 'fat-size-32))
+                   sector-offset))
+      (setq sector-bytes (read-sector device lba))
+      (if (null sector-bytes)
+          (setq ok nil)
+          (progn
+            (setq existing (%fat32-u32 sector-bytes offset-in-sector))
+            (setq new-value (logior (logand existing #xF0000000) (logand value #x0FFFFFFF)))
+            (setq value-bytes (%fat32-u32-to-bytes new-value))
+            (%fat32-patch-bytes! sector-bytes offset-in-sector value-bytes)
+            (if (write-sector device lba sector-bytes)
                 (progn
-                  (%fat32-patch-bytes! sector-bytes offset-in-sector value-bytes)
-                  (if (write-sector device lba sector-bytes)
-                      (progn
-                        (if (and (dynamic *fat32-fat-cache-lba*) (= (dynamic *fat32-fat-cache-lba*) lba))
-                            (%%set-dynamic '*fat32-fat-cache-lba* nil))
-                        (setq fat-index (+ fat-index 1)))
-                      (setq ok nil)))))))
-      ok)))
+                  (if (and (dynamic *fat32-fat-cache-lba*) (= (dynamic *fat32-fat-cache-lba*) lba))
+                      (%%set-dynamic '*fat32-fat-cache-lba* nil))
+                  (setq fat-index (+ fat-index 1)))
+                (setq ok nil)))))
+    ok))
 
 ;; (%fat32-allocate-clusters device bpb count) : 空きクラスタをcount個確保し、
 ;; 発見順のクラスタ番号リストを返す。確保したクラスタは次の探索で再び「空き」と
@@ -609,16 +766,16 @@
 ;; (呼び出し元が%fat32-link-clustersで実際のチェインへ後から繋ぎ直す前提)。
 ;; count個確保できなかった場合(ディスクフル、または書き込み失敗)はnil。
 (defun %fat32-allocate-clusters (device bpb count)
-  (let ((i 0) (rev-clusters nil) (ok t))
+  (let ((i 0) (rev-clusters nil) (ok t) (cluster nil))
     (while (and ok (< i count))
-      (let ((cluster (%fat32-find-free-cluster device bpb)))
-        (if (null cluster)
-            (setq ok nil)
-            (if (%fat32-set-fat-entry device bpb cluster #x0FFFFFFF)
-                (progn
-                  (setq rev-clusters (cons cluster rev-clusters))
-                  (setq i (+ i 1)))
-                (setq ok nil)))))
+      (setq cluster (%fat32-find-free-cluster device bpb))
+      (if (null cluster)
+          (setq ok nil)
+          (if (%fat32-set-fat-entry device bpb cluster #x0FFFFFFF)
+              (progn
+                (setq rev-clusters (cons cluster rev-clusters))
+                (setq i (+ i 1)))
+              (setq ok nil))))
     (if ok
         (%fat32-reverse-iter rev-clusters)
         nil)))
@@ -634,6 +791,30 @@
           (setq remaining (cdr remaining))
           (setq ok nil)))
     ok))
+
+;; (%fat32-grow-dir-chain device bpb dir-cluster) : dir-clusterから始まるディレクトリ
+;; チェイン(ルート・サブディレクトリ共通)の末尾に新規クラスタを1個確保・連結し、
+;; 全体をゼロ埋めして書き込む。%fat32-init-dir-cluster-bytesと異なり、末尾への
+;; 追加クラスタは"."/".."エントリを持たない(それらは各ディレクトリの先頭クラスタ
+;; にのみ存在する)ため全ゼロでよい。成功時は新クラスタのLBAリスト(呼び出し元が
+;; 元のlbasリストへ末尾追加して使う)、失敗時(チェイン取得失敗・空きクラスタなし・
+;; 接続失敗・書き込み失敗)はnil。
+(defun %fat32-grow-dir-chain (device bpb dir-cluster)
+  (let* ((chain (fat32-cluster-chain device bpb dir-cluster))
+         (last-cluster (if chain (%fat32-last-elt chain) nil)))
+    (if (null last-cluster)
+        nil
+        (let ((new-clusters (%fat32-allocate-clusters device bpb 1)))
+          (if (null new-clusters)
+              nil
+              (if (not (%fat32-set-fat-entry device bpb last-cluster (car new-clusters)))
+                  nil
+                  (let* ((new-lbas (%fat32-clusters-to-lbas bpb new-clusters))
+                         (zero-bytes (%fat32-zero-byte-list (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector))))
+                         (chunks (%fat32-split-into-chunks zero-bytes (slot-value bpb 'bytes-per-sector))))
+                    (if (%fat32-write-lba-list device new-lbas chunks)
+                        new-lbas
+                        nil))))))))
 
 ;; (%fat32-extend-file device bpb start-cluster old-cluster-count new-cluster-count
 ;;  bytes) : start-clusterから始まる既存チェイン(old-cluster-count個、0なら
@@ -718,12 +899,13 @@
 
 ;;; --- FAT32-M6c: 新規ファイル作成 ---
 
-;; (%fat32-upcase-char-code code) : 小文字ASCII(97-122)のcode(char-codeの戻り値)を
-;; 大文字(-32)に変換する。それ以外のコードはそのまま返す(8.3名は大文字が規約)。
-(defun %fat32-upcase-char-code (code)
-  (if (and (>= code 97) (<= code 122))
-      (- code 32)
-      code))
+;; (%fat32-zero-byte-list n) : 長さnの、全要素が0のfixnumリストをwhileで構築する。
+(defun %fat32-zero-byte-list (n)
+  (let ((i 0) (acc nil))
+    (while (< i n)
+      (setq acc (cons 0 acc))
+      (setq i (+ i 1)))
+    acc))
 
 ;; (%fat32-8.3-field-bytes s field-len) : 文字列sを大文字化してfield-len(8か3)byte
 ;; の固定長フィールドへ変換する。sがfield-lenを超えるとnil(ロングファイルネーム
@@ -761,6 +943,368 @@
                    (ext-bytes (%fat32-8.3-field-bytes ext 3)))
               (if (and base-bytes ext-bytes) (append base-bytes ext-bytes) nil))))))
 
+;; (%fat32-string-to-ucs2-codes name) : Lisp文字列をUTF-16LE code pointのリストへ
+;; 変換する(BMP範囲のみ、サロゲートペアは非対応)。
+(defun %fat32-string-to-ucs2-codes (name)
+  (let ((i 0) (n (length name)) (rev-codes nil))
+    (while (< i n)
+      (setq rev-codes (cons (char-code (elt name i)) rev-codes))
+      (setq i (+ i 1)))
+    (%fat32-reverse-iter rev-codes)))
+
+;; (%fat32-lfn-entry-count-for-name name) : nameに必要なLFNスロット数(1〜20)。
+(defun %fat32-lfn-entry-count-for-name (name)
+  (let ((char-count (length name)))
+    (if (= char-count 0)
+        1
+        (+ (div (- char-count 1) 13) 1))))
+
+;; (%fat32-pad-lfn-codes codes) : LFN1スロット(13文字)分になるよう末尾を0xFFFFで
+;; パディングする。
+(defun %fat32-pad-lfn-codes-to-13 (codes)
+  (let ((remaining 13) (rev codes) (acc nil))
+    (while (and (> remaining 0) rev)
+      (setq acc (cons (car rev) acc))
+      (setq rev (cdr rev))
+      (setq remaining (- remaining 1)))
+    (while (> remaining 0)
+      (setq acc (cons #xFFFF acc))
+      (setq remaining (- remaining 1)))
+    (%fat32-reverse-iter acc)))
+
+;; (%fat32-split-lfn-codes codes entry-count) : code pointリストをentry-count個の
+;; 13文字チャンクへ分割する(最後のチャンクは0xFFFFパディング済み)。
+(defun %fat32-split-lfn-codes (codes entry-count)
+  (let ((remaining codes) (rev-chunks nil) (i 0) (chunk nil) (j 0))
+    (while (< i entry-count)
+      (setq chunk nil)
+      (setq j 0)
+      (while (and (< j 13) remaining)
+        (setq chunk (cons (car remaining) chunk))
+        (setq remaining (cdr remaining))
+        (setq j (+ j 1)))
+      (setq rev-chunks (cons (%fat32-pad-lfn-codes-to-13 (%fat32-reverse-iter chunk)) rev-chunks))
+      (setq i (+ i 1)))
+    (%fat32-reverse-iter rev-chunks)))
+
+;; (%fat32-ucs2-code-to-bytes code) : 1 code pointをUTF-16LEの2byteリストへ変換する。
+(defun %fat32-ucs2-code-to-bytes (code)
+  (list (logand code #xFF) (logand (ash code -8) #xFF)))
+
+;; (%fat32-build-lfn-entry-bytes seq checksum codes) : 1 LFNスロット(32byte)を構築
+;; する。codesは13要素(code pointまたは#xFFFF)。
+(defun %fat32-build-lfn-entry-bytes (seq checksum codes)
+  (let ((entry (%fat32-zero-byte-list 32))
+        (remaining codes)
+        (slot-indices (list 1 3 5 7 9 14 16 18 20 22 24 28 30))
+        (code 0) (idx 0) (bytes nil))
+    (progn
+      (%fat32-patch-bytes! entry 0 (list seq))
+      (%fat32-patch-bytes! entry 11 (list #x0F))
+      (%fat32-patch-bytes! entry 13 (list checksum))
+      (while (and remaining slot-indices)
+        (setq code (car remaining))
+        (setq idx (car slot-indices))
+        (setq bytes (if (= code #xFFFF) (list #xFF #xFF) (%fat32-ucs2-code-to-bytes code)))
+        (%fat32-patch-bytes! entry idx bytes)
+        (setq remaining (cdr remaining))
+        (setq slot-indices (cdr slot-indices)))
+      entry)))
+
+;; (%fat32-build-lfn-entries name short-name-bytes) : nameのLFNスロット群(古い順)と
+;; 短名エントリ用checksumを返す(checksum . entries)。
+(defun %fat32-build-lfn-entries (name short-name-bytes)
+  (let* ((codes (%fat32-string-to-ucs2-codes name))
+         (entry-count (%fat32-lfn-entry-count-for-name name))
+         (chunks (%fat32-split-lfn-codes codes entry-count))
+         (checksum (%fat32-lfn-checksum-for-bytes short-name-bytes))
+         (seq entry-count)
+         (rev-entries nil)
+         (remaining (%fat32-reverse-iter chunks))
+         (seq-byte 0))
+    (while remaining
+      (setq seq-byte (if (= seq entry-count) (logior seq #x40) seq))
+      (setq rev-entries (cons (%fat32-build-lfn-entry-bytes seq-byte checksum (car remaining)) rev-entries))
+      (setq seq (- seq 1))
+      (setq remaining (cdr remaining)))
+    (cons checksum (%fat32-reverse-iter rev-entries))))
+
+;; (%fat32-last-dot-pos name) : name内の最後の'.'の位置。無ければnil。
+(defun %fat32-last-dot-pos (name)
+  (let* ((len (length name)) (i (- len 1)) (found nil))
+    (while (and (null found) (>= i 0))
+      (if (= (char-code (elt name i)) 46)
+          (setq found i)
+          (setq i (- i 1))))
+    found))
+
+;; (%fat32-short-alias-base name n) : 長い名前から~N付き短名のbase部(最大8文字)を
+;; 返す。
+(defun %fat32-short-alias-base (name n)
+  (let* ((dot-pos (%fat32-last-dot-pos name))
+         (stem-end (if dot-pos dot-pos (length name)))
+         (stem-len (if (> stem-end 6) 6 stem-end))
+         (tilde (if (< n 10) (code-char (+ 48 n)) (code-char (+ 48 (mod n 10)))))
+         (s (create-string (+ stem-len 2)))
+         (i 0))
+    (while (< i stem-len)
+      (set-elt (code-char (%fat32-upcase-char-code (char-code (elt name i)))) s i)
+      (setq i (+ i 1)))
+    (set-elt #\~ s stem-len)
+    (set-elt tilde s (+ stem-len 1))
+    s))
+
+;; (%fat32-short-alias-ext name) : 最後の'.'以降を拡張子(最大3文字)として返す。
+(defun %fat32-short-alias-ext (name)
+  (let ((dot-pos (%fat32-last-dot-pos name)))
+    (if (null dot-pos)
+        ""
+        (let* ((ext-start (+ dot-pos 1))
+               (ext-len (- (length name) ext-start))
+               (use-len (if (> ext-len 3) 3 ext-len))
+               (s (create-string use-len))
+               (i 0))
+          (while (< i use-len)
+            (set-elt (code-char (%fat32-upcase-char-code (char-code (elt name (+ ext-start i))))) s i)
+            (setq i (+ i 1)))
+          s))))
+
+;; (%fat32-short-name-bytes-at bytes offset) : 短名エントリの11byte名フィールドを
+;; そのまま返す。
+(defun %fat32-short-name-bytes-at (bytes offset)
+  (%ide-take (%ide-drop bytes offset) 11))
+
+;; (%fat32-byte-list-equal? a b) : 同じ長さのfixnumリストが要素ごとに等しいかを返す。
+(defun %fat32-byte-list-equal? (a b)
+  (if (or (null a) (null b))
+      (and (null a) (null b))
+      (if (/= (car a) (car b))
+          nil
+          (%fat32-byte-list-equal? (cdr a) (cdr b)))))
+
+;; (%fat32-sector-short-name-taken? bytes entry-offset entries-remaining alias-bytes)
+;; : 1セクタ内にalias-bytesと同じ11byte短名を持つエントリがあるかを返す。
+(defun %fat32-sector-short-name-taken? (bytes entry-offset entries-remaining alias-bytes)
+  (if (<= entries-remaining 0)
+      nil
+      (let ((first-byte (elt bytes entry-offset)))
+        (if (= first-byte 0)
+            nil
+            (if (or (= first-byte #xE5) (%fat32-is-lfn-entry? bytes entry-offset))
+                (%fat32-sector-short-name-taken? bytes (+ entry-offset 32) (- entries-remaining 1) alias-bytes)
+                (if (%fat32-byte-list-equal? (%fat32-short-name-bytes-at bytes entry-offset) alias-bytes)
+                    t
+                    (%fat32-sector-short-name-taken? bytes (+ entry-offset 32) (- entries-remaining 1) alias-bytes)))))))
+
+;; (%fat32-short-name-bytes-taken? device lbas alias-bytes) : ディレクトリ内に同じ
+;; 11byte短名を持つエントリが既に存在するかを返す。
+(defun %fat32-short-name-bytes-taken? (device lbas alias-bytes)
+  (let ((remaining-lbas lbas) (found nil) (bytes nil))
+    (while (and remaining-lbas (not found))
+      (setq bytes (read-sector device (car remaining-lbas)))
+      (if (null bytes)
+          (setq remaining-lbas nil)
+          (if (%fat32-sector-short-name-taken? bytes 0 16 alias-bytes)
+              (setq found t)
+              (setq remaining-lbas (cdr remaining-lbas)))))
+    found))
+
+;; (%fat32-short-alias-candidate name n) : ~N付き短名の11byte候補を返す。base部に
+;; '.'が含まれる場合(例"A.B.C")は%fat32-name-to-8.3(最初の'.'で分割)が使えないため、
+;; base/extを8.3フィールドへ個別変換して連結する。
+(defun %fat32-short-alias-candidate (name n)
+  (let ((ext (%fat32-short-alias-ext name))
+        (base (%fat32-short-alias-base name n)))
+    (if (= (length ext) 0)
+        (%fat32-name-to-8.3 base)
+        (let ((base-bytes (%fat32-8.3-field-bytes base 8))
+              (ext-bytes (%fat32-8.3-field-bytes ext 3)))
+          (if (and base-bytes ext-bytes)
+              (append base-bytes ext-bytes)
+              nil)))))
+
+;; (%fat32-generate-short-alias device lbas name) : name用の一意な8.3短名alias
+;; (11byteリスト)を返す。~1〜~9で衝突を回避する。
+(defun %fat32-generate-short-alias (device lbas name)
+  (let ((n 1) (alias-bytes nil) (candidate nil))
+    (while (and (< n 10) (null alias-bytes))
+      (setq candidate (%fat32-short-alias-candidate name n))
+      (if (and candidate (not (%fat32-short-name-bytes-taken? device lbas candidate)))
+          (setq alias-bytes candidate)
+          (setq n (+ n 1))))
+    alias-bytes))
+
+;; (%fat32-slot-free? bytes offset) : offsetのスロットが空き(0x00/0xE5)かを返す。
+(defun %fat32-slot-free? (bytes offset)
+  (let ((b (elt bytes offset)))
+    (or (= b 0) (= b #xE5))))
+
+;; (%fat32-advance-dir-slot lbas lba offset) : ディレクトリ内の次スロット
+;; (lba . offset)を返す。ディレクトリ終端ならnil。
+(defun %fat32-advance-dir-slot (lbas lba offset)
+  (if (< (+ offset 32) 512)
+      (cons lba (+ offset 32))
+      (let ((remaining-lbas lbas) (found-next nil))
+        (while (and remaining-lbas (not found-next))
+          (if (= (car remaining-lbas) lba)
+              (if (null (cdr remaining-lbas))
+                  (setq found-next t)
+                  (setq found-next (cons (car (cdr remaining-lbas)) 0)))
+              (setq remaining-lbas (cdr remaining-lbas))))
+        (if (and found-next (consp found-next)) found-next nil))))
+
+;; (%fat32-try-consecutive-from device lbas lba offset needed) : (lba . offset)から
+;; needed個の連続空きスロットがあるかを検証し、あれば開始位置を返す。
+(defun %fat32-try-consecutive-from (device lbas lba offset needed)
+  (let ((cur-lba lba) (cur-offset offset) (left needed) (ok t) (bytes nil) (next nil))
+    (while (and ok (> left 0))
+      (setq bytes (read-sector device cur-lba))
+      (if (or (null bytes) (not (%fat32-slot-free? bytes cur-offset)))
+          (setq ok nil)
+          (progn
+            (setq left (- left 1))
+            (if (> left 0)
+                (progn
+                  (setq next (%fat32-advance-dir-slot lbas cur-lba cur-offset))
+                  (if (null next)
+                      (setq ok nil)
+                      (progn
+                        (setq cur-lba (car next))
+                        (setq cur-offset (cdr next)))))))))
+    (if ok (cons lba offset) nil)))
+
+;; (%fat32-find-consecutive-free-slots device lbas needed) : needed個の連続空き
+;; ディレクトリスロットの(lba . offset)を返す(セクタ境界を跨いでよい)。
+(defun %fat32-find-consecutive-free-slots (device lbas needed)
+  (let ((remaining-lbas lbas) (result nil) (bytes nil) (entry-offset 0) (i 0))
+    (while (and remaining-lbas (null result))
+      (setq bytes (read-sector device (car remaining-lbas)))
+      (if (null bytes)
+          (setq remaining-lbas nil)
+          (progn
+            (setq entry-offset 0)
+            (setq i 0)
+            (while (and (null result) (< i 16))
+              (if (%fat32-slot-free? bytes entry-offset)
+                  (setq result (%fat32-try-consecutive-from device lbas (car remaining-lbas) entry-offset needed)))
+              (if (and (null result) (= (elt bytes entry-offset) 0))
+                  (setq i 16)
+                  (progn
+                    (setq entry-offset (+ entry-offset 32))
+                    (setq i (+ i 1)))))
+            (setq remaining-lbas (cdr remaining-lbas)))))
+    result))
+
+;; (%fat32-write-entry-at-slot device lba offset entry-bytes) : 1スロット(32byte)を
+;; 書き込む。
+(defun %fat32-write-entry-at-slot (device lba offset entry-bytes)
+  (let ((sector-bytes (read-sector device lba)))
+    (if (null sector-bytes)
+        nil
+        (progn
+          (%fat32-patch-bytes! sector-bytes offset entry-bytes)
+          (write-sector device lba sector-bytes)))))
+
+;; (%fat32-write-dir-slots device lbas start-lba start-offset entry-bytes-list) :
+;; entry-bytes-listの各32byteエントリをstart位置から連続して書き込む。
+(defun %fat32-write-dir-slots (device lbas start-lba start-offset entry-bytes-list)
+  (let ((lba start-lba)
+        (offset start-offset)
+        (remaining entry-bytes-list)
+        (ok t)
+        (next nil))
+    (while (and ok remaining)
+      (if (not (%fat32-write-entry-at-slot device lba offset (car remaining)))
+          (setq ok nil)
+          (progn
+            (setq remaining (cdr remaining))
+            (if remaining
+                (progn
+                  (setq next (%fat32-advance-dir-slot lbas lba offset))
+                  (if (null next)
+                      (setq ok nil)
+                      (progn
+                        (setq lba (car next))
+                        (setq offset (cdr next)))))))))
+    ok))
+
+;; (%fat32-ensure-consecutive-free-slots device bpb lbas dir-cluster needed) :
+;; lbas内にneeded個の連続空きスロットを探す。見つからなければ%fat32-grow-dir-chain
+;; でディレクトリチェインへ新規クラスタを1個追加してlbasを延長し、再探索する
+;; (needed個分の連続空きが複数クラスタに跨る場合も、空きクラスタがなくなるまで
+;; 成長を繰り返すことで対応する)。成功時は(拡張後のlbas . (lba . offset))、
+;; 成長できなくなった(ディスクフル)場合はnil。
+(defun %fat32-ensure-consecutive-free-slots (device bpb lbas dir-cluster needed)
+  (let ((cur-lbas lbas) (slot nil) (done nil) (grown nil))
+    (while (not done)
+      (setq slot (%fat32-find-consecutive-free-slots device cur-lbas needed))
+      (if slot
+          (setq done t)
+          (progn
+            (setq grown (%fat32-grow-dir-chain device bpb dir-cluster))
+            (if (null grown)
+                (setq done t)
+                (setq cur-lbas (append cur-lbas grown))))))
+    (if slot (cons cur-lbas slot) nil)))
+
+;; (%fat32-ensure-free-slot device bpb lbas dir-cluster) :
+;; %fat32-ensure-consecutive-free-slotsの単一スロット版(短名のみのエントリ用)。
+(defun %fat32-ensure-free-slot (device bpb lbas dir-cluster)
+  (let ((cur-lbas lbas) (slot nil) (done nil) (grown nil))
+    (while (not done)
+      (setq slot (%fat32-find-free-slot-scan device cur-lbas))
+      (if slot
+          (setq done t)
+          (progn
+            (setq grown (%fat32-grow-dir-chain device bpb dir-cluster))
+            (if (null grown)
+                (setq done t)
+                (setq cur-lbas (append cur-lbas grown))))))
+    (if slot (cons cur-lbas slot) nil)))
+
+;; (%fat32-create-lfn-dir-entries device bpb lbas dir-cluster name attr
+;;  start-cluster size) : 8.3に収まらないname向けにLFN+短名aliasのディレクトリ
+;; エントリを作成する。dir-clusterはlbasが属するディレクトリ自身のstart-cluster
+;; (満杯時に%fat32-ensure-consecutive-free-slots経由でチェインを延長するために
+;; 必要)。
+(defun %fat32-create-lfn-dir-entries (device bpb lbas dir-cluster name attr start-cluster size)
+  (let ((alias-bytes (%fat32-generate-short-alias device lbas name)))
+    (if (null alias-bytes)
+        nil
+        (let* ((lfn-pair (%fat32-build-lfn-entries name alias-bytes))
+               (lfn-entries (cdr lfn-pair))
+               (slot-count (+ (length lfn-entries) 1))
+               (found (%fat32-ensure-consecutive-free-slots device bpb lbas dir-cluster slot-count)))
+          (if (null found)
+              nil
+              (let* ((new-lbas (car found))
+                     (slot (cdr found))
+                     (entries (append lfn-entries
+                               (list (%fat32-build-dir-entry-bytes alias-bytes attr start-cluster size)))))
+                (%fat32-write-dir-slots device new-lbas (car slot) (cdr slot) entries)))))))
+
+;; (%fat32-create-dir-entries device bpb lbas dir-cluster name attr start-cluster
+;;  size) : nameが8.3に収まれば短名のみ、収まらなければLFN+短名aliasでディレクトリ
+;; エントリを作成する。dir-clusterは%fat32-create-lfn-dir-entriesと同じ用途
+;; (ディレクトリ拡張用)。成功時はt、失敗時はnil。
+(defun %fat32-create-dir-entries (device bpb lbas dir-cluster name attr start-cluster size)
+  (let ((name-bytes (%fat32-name-to-8.3 name)))
+    (if name-bytes
+        (let ((found (%fat32-ensure-free-slot device bpb lbas dir-cluster)))
+          (if (null found)
+              nil
+              (let* ((slot (cdr found))
+                     (slot-lba (car slot))
+                     (slot-offset (cdr slot))
+                     (slot-bytes (read-sector device slot-lba))
+                     (entry-bytes (%fat32-build-dir-entry-bytes name-bytes attr start-cluster size)))
+                (if (null slot-bytes)
+                    nil
+                    (progn
+                      (%fat32-patch-bytes! slot-bytes slot-offset entry-bytes)
+                      (write-sector device slot-lba slot-bytes))))))
+        (%fat32-create-lfn-dir-entries device bpb lbas dir-cluster name attr start-cluster size))))
+
 ;; (%fat32-find-free-slot-in-sector bytes entry-offset entries-remaining) : 1セクタ
 ;; 分のエントリをentry-offsetから順に調べ、先頭バイトが0x00(終端)または0xE5
 ;; (削除済み、再利用可)の最初のエントリのoffsetを返す。見つからなければnil。
@@ -777,15 +1321,16 @@
 ;; 見つからなければ(ディレクトリ満杯)nil。0x00スロットを再利用しても、直後の
 ;; エントリは元から0x00のままなので走査の終端条件は保たれる。
 (defun %fat32-find-free-slot-scan (device lbas)
-  (let ((remaining-lbas lbas) (result nil))
+  (let ((remaining-lbas lbas) (result nil) (bytes nil) (found nil))
     (while (and remaining-lbas (null result))
-      (let ((bytes (read-sector device (car remaining-lbas))))
-        (if (null bytes)
-            (setq remaining-lbas nil)
-            (let ((found (%fat32-find-free-slot-in-sector bytes 0 16)))
-              (if (null found)
-                  (setq remaining-lbas (cdr remaining-lbas))
-                  (setq result (cons (car remaining-lbas) found)))))))
+      (setq bytes (read-sector device (car remaining-lbas)))
+      (if (null bytes)
+          (setq remaining-lbas nil)
+          (progn
+            (setq found (%fat32-find-free-slot-in-sector bytes 0 16))
+            (if (null found)
+                (setq remaining-lbas (cdr remaining-lbas))
+                (setq result (cons (car remaining-lbas) found))))))
     result))
 
 ;; (%fat32-build-dir-entry-bytes name-bytes attr start-cluster size) : 32byteの
@@ -822,23 +1367,30 @@
   (let* ((bpb (fat32-read-bpb device)))
     (if (null bpb)
         nil
-        (let ((resolved (%fat32-resolve-file device bpb path)))
+        (let ((resolved (%fat32-resolve-file-dir device bpb path)))
           (if (null resolved)
               nil
               (let* ((lbas (car resolved))
-                     (name (cdr resolved)))
+                     (dir-cluster (car (cdr resolved)))
+                     (name (car (cdr (cdr resolved)))))
                 (if (%fat32-find-entry-location-scan device lbas name)
                     nil
                     (let ((name-bytes (%fat32-name-to-8.3 name)))
                       (if (null name-bytes)
-                          nil
-                          (let ((slot (%fat32-find-free-slot-scan device lbas)))
-                            (if (null slot)
+                          (let* ((cluster-bytes (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+                                 (required-cluster-count (%fat32-cluster-count-for-bytes (length bytes) cluster-bytes))
+                                 (start-cluster (%fat32-allocate-new-file-data device bpb required-cluster-count bytes)))
+                            (if (and (> required-cluster-count 0) (null start-cluster))
                                 nil
-                                (let* ((cluster-bytes (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+                                (%fat32-create-lfn-dir-entries device bpb lbas dir-cluster name #x20 start-cluster (length bytes))))
+                          (let ((found (%fat32-ensure-free-slot device bpb lbas dir-cluster)))
+                            (if (null found)
+                                nil
+                                (let* ((slot (cdr found))
+                                       (cluster-bytes (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
                                        (required-cluster-count (%fat32-cluster-count-for-bytes (length bytes) cluster-bytes))
                                        (start-cluster (%fat32-allocate-new-file-data device bpb required-cluster-count bytes)))
-                                  (if (null start-cluster)
+                                  (if (and (> required-cluster-count 0) (null start-cluster))
                                       nil
                                       (let* ((slot-lba (car slot))
                                              (slot-offset (cdr slot))
@@ -855,14 +1407,6 @@
 ;; 新規サブディレクトリは確保直後のクラスタなので、ディスク上の残存データが誤って
 ;; 有効なディレクトリエントリと誤認されないよう"."/".."エントリ以外を明示的に
 ;; ゼロ埋めしてから書き込む(fat16.lispのFAT16-M7cと同じ理由・同じ構成)。
-
-;; (%fat32-zero-byte-list n) : 長さnの、全要素が0のfixnumリストをwhileで構築する。
-(defun %fat32-zero-byte-list (n)
-  (let ((i 0) (acc nil))
-    (while (< i n)
-      (setq acc (cons 0 acc))
-      (setq i (+ i 1)))
-    acc))
 
 ;; (%fat32-dot-entry-name-bytes) : "."エントリの11byte名フィールド("."+空白10個)。
 (defun %fat32-dot-entry-name-bytes ()
@@ -913,27 +1457,13 @@
                            (parent-cluster (cdr resolved-parent)))
                       (if (%fat32-find-entry-location-scan device parent-lbas name)
                           nil
-                          (let ((name-bytes (%fat32-name-to-8.3 name)))
-                            (if (null name-bytes)
+                          (let ((new-clusters (%fat32-allocate-clusters device bpb 1)))
+                            (if (null new-clusters)
                                 nil
-                                (let ((slot (%fat32-find-free-slot-scan device parent-lbas)))
-                                  (if (null slot)
+                                (let* ((new-cluster (car new-clusters))
+                                       (cluster-bytes-list (%fat32-init-dir-cluster-bytes bpb new-cluster parent-cluster))
+                                       (new-lbas (%fat32-clusters-to-lbas bpb new-clusters))
+                                       (chunks (%fat32-split-into-chunks cluster-bytes-list (slot-value bpb 'bytes-per-sector))))
+                                  (if (not (%fat32-write-lba-list device new-lbas chunks))
                                       nil
-                                      (let ((new-clusters (%fat32-allocate-clusters device bpb 1)))
-                                        (if (null new-clusters)
-                                            nil
-                                            (let* ((new-cluster (car new-clusters))
-                                                   (cluster-bytes-list (%fat32-init-dir-cluster-bytes bpb new-cluster parent-cluster))
-                                                   (new-lbas (%fat32-clusters-to-lbas bpb new-clusters))
-                                                   (chunks (%fat32-split-into-chunks cluster-bytes-list (slot-value bpb 'bytes-per-sector))))
-                                              (if (not (%fat32-write-lba-list device new-lbas chunks))
-                                                  nil
-                                                  (let* ((slot-lba (car slot))
-                                                         (slot-offset (cdr slot))
-                                                         (slot-bytes (read-sector device slot-lba))
-                                                         (entry-bytes (%fat32-build-dir-entry-bytes name-bytes #x10 new-cluster 0)))
-                                                    (if (null slot-bytes)
-                                                        nil
-                                                        (progn
-                                                          (%fat32-patch-bytes! slot-bytes slot-offset entry-bytes)
-                                                          (write-sector device slot-lba slot-bytes)))))))))))))))))))))
+                                      (%fat32-create-dir-entries device bpb parent-lbas parent-cluster name #x10 new-cluster 0))))))))))))))
