@@ -361,6 +361,8 @@ $(FAT32_DISK_IMG): | $(BUILD_TMPDIR)
 			printf "%s\n" "$(FAT32_TEST_STRING)" > /mnt/fat32_test/TEST.LSP; \
 			printf "0123456789%.0s" {1..100} > /mnt/fat32_test/BIG.TXT; \
 			printf "A%.0s" {1..512} > /mnt/fat32_test/WRITE1.TXT; \
+			printf "long name content" > /mnt/fat32_test/Long_File_Name.txt; \
+			printf "x" > /mnt/fat32_test/This_Is_A_Very_Long_File_Name.txt; \
 			mkdir /mnt/fat32_test/SUBDIR; \
 			printf "nested file content" > /mnt/fat32_test/SUBDIR/NESTED.TXT; \
 			mkdir /mnt/fat32_test/SUBDIR/DEEPER; \

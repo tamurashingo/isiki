@@ -1,7 +1,7 @@
 #ifndef _VERSION_H_
 #define _VERSION_H_
 
-#define ISIKIOS_VERSION "0.0.11"
+#define ISIKIOS_VERSION "0.0.12"
 
 #ifndef ISIKIOS_BUILD_HASH
 #define ISIKIOS_BUILD_HASH "unknown"

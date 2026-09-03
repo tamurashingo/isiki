@@ -170,6 +170,9 @@ see [LICENSE](./assets/fonts/LICENSE)
 
 ## screen shot
 
+version 0.0.12
+![version_0.0.12](./documents/images/version_0_0_12.png)
+
 version 0.0.11
 ![version_0.0.11](./documents/images/version_0_0_11.png)
 
