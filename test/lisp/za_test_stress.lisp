@@ -21,23 +21,23 @@
 
 ;; 大量にconsを呼び続けてGC(os_gc_collect)を誘発しても、za生成コードが結果を破壊
 ;; しないことを確認する(os_make_cons自身のGC_PROTECTだけで安全という設計の裏付け)。
-(close (open-output-file "tmp/ckpt-8-before-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-8-before-chain.txt"))
 
 (assert-equal 50000 (length (isiki-za-test-cons-chain 50000)))
-(close (open-output-file "tmp/ckpt-9-after-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-9-after-chain.txt"))
 (assert-equal 49999 (car (isiki-za-test-cons-chain 50000)))
-(close (open-output-file "tmp/ckpt-10-final.txt"))
+(close (open-output-file "/9p/tmp/ckpt-10-final.txt"))
 
 ;; 大量にクロージャを生成し続けてGC(os_gc_collect)を誘発しても、古いクロージャ・
 ;; 新しいクロージャどちらも正しい値を返すことを確認する
-(close (open-output-file "tmp/ckpt-17-before-closure-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-17-before-closure-chain.txt"))
 
 (assert-equal 50000 (length (isiki-za-test-adder-chain 50000)))
-(close (open-output-file "tmp/ckpt-18-after-closure-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-18-after-closure-chain.txt"))
 
 ;; sum_{i=0}^{49999} (i+1) = sum_{i=0}^{49999} i + 50000 = 49999*50000/2 + 50000 = 1250025000
 (assert-equal 1250025000 (isiki-za-test-sum-closure-chain (isiki-za-test-adder-chain 50000)))
-(close (open-output-file "tmp/ckpt-19-final.txt"))
+(close (open-output-file "/9p/tmp/ckpt-19-final.txt"))
 
 ;; 大量にdefdynamicを呼び続けてGC(os_gc_collect)を誘発しても、戻り値(name)が
 ;; コンパイル時に埋め込んだシンボルとeqであり続けること(os_set_dynamic呼び出しを
@@ -45,16 +45,16 @@
 (assert-equal 50000 (length (isiki-za-test-dyn-stress 50000)))
 (assert-equal t (isiki-za-test-all-eq-sym (isiki-za-test-dyn-stress 50000) '*iza-test-dyn2*))
 (assert-equal 49999 (dynamic *iza-test-dyn2*))
-(close (open-output-file "tmp/ckpt-20-defdynamic.txt"))
+(close (open-output-file "/9p/tmp/ckpt-20-defdynamic.txt"))
 
 ;; 大量にbox化された変数(setqされ、かつ2つのクロージャに捕捉されるlet-local)を含む
 ;; クロージャ対を生成し続けてGC(os_gc_collect)を誘発しても、それぞれのペアが自分自身の
 ;; boxだけを参照し続け、他のペアと混線しないことを確認する
-(close (open-output-file "tmp/ckpt-21-before-box-counter-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-21-before-box-counter-chain.txt"))
 
 (assert-equal 50000 (length (isiki-za-test-box-counter-chain 50000)))
-(close (open-output-file "tmp/ckpt-22-after-box-counter-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-22-after-box-counter-chain.txt"))
 
 ;; sum_{i=0}^{49999} (i+2) = 49999*50000/2 + 2*50000 = 1249975000 + 100000 = 1250075000
 (assert-equal 1250075000 (isiki-za-test-sum-box-counters (isiki-za-test-box-counter-chain 50000)))
-(close (open-output-file "tmp/ckpt-23-box-counter-final.txt"))
+(close (open-output-file "/9p/tmp/ckpt-23-box-counter-final.txt"))

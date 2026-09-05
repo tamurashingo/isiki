@@ -89,7 +89,7 @@
     (isiki-za-test-echo2 (return-from done x) 99)))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-block-return-in-callarg)))
 (assert-equal 7 (isiki-za-test-block-return-in-callarg 7))
-(close (open-output-file "tmp/ckpt-20-block.txt"))
+(close (open-output-file "/9p/tmp/ckpt-20-block.txt"))
 
 ;; --- catch/throw ---
 
@@ -127,7 +127,7 @@
 (defun isiki-za-test-throw-standalone (tag val) (throw tag val))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-throw-standalone)))
 (assert-equal 99 (catch 'isiki-za-test-tag-d (isiki-za-test-throw-standalone 'isiki-za-test-tag-d 99)))
-(close (open-output-file "tmp/ckpt-21-catch-throw.txt"))
+(close (open-output-file "/9p/tmp/ckpt-21-catch-throw.txt"))
 
 ;; --- unwind-protect ---
 
@@ -166,7 +166,7 @@
 (assert-equal 1 *isiki-za-test-cleanup-count*)
 (assert-equal 11 (isiki-za-test-uw-throw 'isiki-za-test-tag-e 10))
 (assert-equal 2 *isiki-za-test-cleanup-count*)
-(close (open-output-file "tmp/ckpt-22-unwind-protect.txt"))
+(close (open-output-file "/9p/tmp/ckpt-22-unwind-protect.txt"))
 
 ;; --- tagbody/go ---
 
@@ -231,7 +231,7 @@
 (assert-equal t (isiki-za-test-tagbody-inside-catch 'isiki-za-test-tag-f 4))
 (assert-equal 4 *isiki-za-test-loop-i*)
 (assert-equal 6 *isiki-za-test-loop-sum*)
-(close (open-output-file "tmp/ckpt-23-tagbody.txt"))
+(close (open-output-file "/9p/tmp/ckpt-23-tagbody.txt"))
 
 ;; --- フォールバック確認 ---
 
@@ -296,4 +296,4 @@
 (setq *isiki-za-test-log* nil)
 (assert-equal nil (isiki-za-test-go-cross-uw-fallback nil))
 (assert-equal '(2 1) *isiki-za-test-log*)
-(close (open-output-file "tmp/ckpt-24-final.txt"))
+(close (open-output-file "/9p/tmp/ckpt-24-final.txt"))

@@ -208,7 +208,7 @@ void test_open_input_stream_read_char_reads_fake_data() {
     reset_fake_state();
     set_fake_data("hi");
 
-    lisp_val_t path = os_make_string("fake/path");
+    lisp_val_t path = os_make_string("/9p/fake/path");
     lisp_val_t stream = cc_open_input_stream(os_make_cons(path, nil), nil);
     assert((stream & TAG_MASK) == TAG_INSTANCE, "open-input-streamはINSTANCEを返す");
 
@@ -229,7 +229,7 @@ void test_open_input_stream_open_failure_returns_eval_error() {
     reset_fake_state();
     g_fake_open_fail = 1;
 
-    lisp_val_t path = os_make_string("fake/missing");
+    lisp_val_t path = os_make_string("/9p/fake/missing");
     lisp_val_t result = cc_open_input_stream(os_make_cons(path, nil), nil);
     assert(result == g_sym_eval_error, "openに失敗したらg_sym_eval_errorが返る");
 }
@@ -238,7 +238,7 @@ void test_close_then_read_char_returns_nil() {
     reset_fake_state();
     set_fake_data("xyz");
 
-    lisp_val_t path = os_make_string("fake/path");
+    lisp_val_t path = os_make_string("/9p/fake/path");
     lisp_val_t stream = cc_open_input_stream(os_make_cons(path, nil), nil);
     lisp_val_t args = os_make_cons(stream, nil);
 
@@ -251,7 +251,7 @@ void test_read_parses_sexpr_from_stream() {
     reset_fake_state();
     set_fake_data("(1 2 3)");
 
-    lisp_val_t path = os_make_string("fake/path");
+    lisp_val_t path = os_make_string("/9p/fake/path");
     lisp_val_t stream = cc_open_input_stream(os_make_cons(path, nil), nil);
     lisp_val_t args = os_make_cons(stream, nil);
 
@@ -268,7 +268,7 @@ void test_open_stream_p_input_stream_p_output_stream_p() {
     reset_fake_state();
     set_fake_data("hi");
 
-    lisp_val_t in_stream = cc_open_input_stream(os_make_cons(os_make_string("fake/path"), nil), nil);
+    lisp_val_t in_stream = cc_open_input_stream(os_make_cons(os_make_string("/9p/fake/path"), nil), nil);
     lisp_val_t out_stream = cc_open_output_stream(nil, nil);
 
     assert(cc_open_stream_p(os_make_cons(in_stream, nil), nil) == g_sym_t, "open直後のstreamはopen-stream-pが真");
@@ -284,16 +284,16 @@ void test_open_stream_p_input_stream_p_output_stream_p() {
 void test_open_output_file_and_io_file_use_open_then_create_fallback() {
     reset_fake_state();
 
-    lisp_val_t stream1 = cc_open_output_file(os_make_cons(os_make_string("fake/existing"), nil), nil);
+    lisp_val_t stream1 = cc_open_output_file(os_make_cons(os_make_string("/9p/fake/existing"), nil), nil);
     assert((stream1 & TAG_MASK) == TAG_INSTANCE, "既存ファイルへのopen-output-fileはSTREAMを返す");
     cc_close(os_make_cons(stream1, nil), nil);
 
     g_fake_open_fail = 1; // open失敗→createへフォールバック(os_virtio9p_createは常に成功するフェイク)
-    lisp_val_t stream2 = cc_open_output_file(os_make_cons(os_make_string("fake/new"), nil), nil);
+    lisp_val_t stream2 = cc_open_output_file(os_make_cons(os_make_string("/9p/fake/new"), nil), nil);
     assert((stream2 & TAG_MASK) == TAG_INSTANCE, "新規ファイルへのopen-output-fileはcreateにフォールバックしてSTREAMを返す");
     cc_close(os_make_cons(stream2, nil), nil);
 
-    lisp_val_t stream3 = cc_open_io_file(os_make_cons(os_make_string("fake/new-io"), nil), nil);
+    lisp_val_t stream3 = cc_open_io_file(os_make_cons(os_make_string("/9p/fake/new-io"), nil), nil);
     assert((stream3 & TAG_MASK) == TAG_INSTANCE, "open-io-fileも同様にcreateへフォールバックしてSTREAMを返す");
     cc_close(os_make_cons(stream3, nil), nil);
 
@@ -303,7 +303,7 @@ void test_open_output_file_and_io_file_use_open_then_create_fallback() {
 void test_finish_output_flushes_and_returns_nil() {
     reset_fake_state();
 
-    lisp_val_t stream = cc_open_output_file(os_make_cons(os_make_string("fake/path"), nil), nil);
+    lisp_val_t stream = cc_open_output_file(os_make_cons(os_make_string("/9p/fake/path"), nil), nil);
     lisp_val_t args = os_make_cons(stream, nil);
     cc_write_char(os_make_cons(os_make_char('A'), os_make_cons(stream, nil)), nil);
     cc_write_char(os_make_cons(os_make_char('B'), os_make_cons(stream, nil)), nil);
@@ -397,11 +397,11 @@ void test_read_byte_and_write_byte_wrap_char_ops() {
 
 void test_probe_file_reflects_open_success() {
     reset_fake_state();
-    assert(cc_probe_file(os_make_cons(os_make_string("fake/exists"), nil), nil) == g_sym_t,
+    assert(cc_probe_file(os_make_cons(os_make_string("/9p/fake/exists"), nil), nil) == g_sym_t,
            "openできるパスはprobe-fileが真");
 
     g_fake_open_fail = 1;
-    assert(cc_probe_file(os_make_cons(os_make_string("fake/missing"), nil), nil) == nil,
+    assert(cc_probe_file(os_make_cons(os_make_string("/9p/fake/missing"), nil), nil) == nil,
            "openできないパスはprobe-fileが偽");
     reset_fake_state();
 }
@@ -424,7 +424,7 @@ void test_file_length_counts_bytes_by_reading_whole_file() {
     reset_fake_state();
     set_fake_data("hello");
 
-    lisp_val_t result = cc_file_length(os_make_cons(os_make_string("fake/path"), nil), nil);
+    lisp_val_t result = cc_file_length(os_make_cons(os_make_string("/9p/fake/path"), nil), nil);
     assert(result == os_make_fixnum(5), "file-lengthは全部読み切ったバイト数を返す");
 }
 

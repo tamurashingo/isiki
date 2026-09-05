@@ -5,10 +5,21 @@
 #include "types.h"
 #include "stream.h"
 
-// stream.cはos_alloc_raw(runtime.c)を参照するが、このテストはruntime.cをリンクしない
-// (stream.cのみを対象とするため)。mallocへの薄い委譲で置き換える
+// stream.cはos_alloc_raw/nil/os_gc_register_root/os_gc_unregister_root(いずれも
+// runtime.c)を参照するが、このテストはruntime.cをリンクしない(stream.cのみを
+// 対象とするため)。mallocへの薄い委譲、および固定値・no-opのフェイクに置き換える
 lisp_addr_t os_alloc_raw(UINT64 n) {
     return (lisp_addr_t)malloc(n);
+}
+
+lisp_val_t nil = 0;
+
+void os_gc_register_root(lisp_val_t *root_ptr) {
+    (void)root_ptr;
+}
+
+void os_gc_unregister_root(lisp_val_t *root_ptr) {
+    (void)root_ptr;
 }
 
 // virtio9p.c/p9.c/drivers/*.c はリンクしない(9Pプロトコルの実通信は
@@ -119,6 +130,20 @@ int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
     (void)fid;
     (void)err_msg;
     (void)err_msg_cap;
+    return 1;
+}
+
+// mount.c(*mounts*経由のFATドライバ呼び出し)はリンクしない(stream.cのみを対象と
+// するため)。os_stream_close内でSTREAM_FAT_FILE_WRITE/IOの場合にのみ呼ばれる
+// os_mount_fat_write_fileをフェイクに差し替える(このテストはFAT系streamを
+// 開かないため呼ばれることはないが、リンクを通すために必要)
+int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *relative_path,
+                             const UINT8 *data, UINT32 len) {
+    (void)kind;
+    (void)device;
+    (void)relative_path;
+    (void)data;
+    (void)len;
     return 1;
 }
 

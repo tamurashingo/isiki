@@ -3,9 +3,7 @@
 #include "lisp.h"
 #include "process.h"
 #include "reader.h"
-
-/** LOADのLOAD_PATH_MAXと同じ規約: OPEN-INPUT-STREAMに渡せるパスの最大長(NUL終端込み) */
-#define STREAM_PATH_MAX 256
+#include "mount.h"
 
 /** stream(TAG_INSTANCE, MAGIC_STREAM)のword1に埋め込んだ生ポインタを取り出す */
 static os_stream_t *stream_raw(lisp_val_t stream) {
@@ -16,13 +14,15 @@ static os_stream_t *stream_raw(lisp_val_t stream) {
 
 /** kindが入力可能(READ-CHAR等が使える)なストリーム種別かどうかを判定する */
 static int stream_kind_is_input(stream_kind_t kind) {
-    return kind == STREAM_9P_FILE_READ || kind == STREAM_9P_FILE_IO || kind == STREAM_STRING_INPUT;
+    return kind == STREAM_9P_FILE_READ || kind == STREAM_9P_FILE_IO || kind == STREAM_STRING_INPUT
+        || kind == STREAM_FAT_FILE_IO;
 }
 
 /** kindが出力可能(WRITE-CHAR等が使える)なストリーム種別かどうかを判定する */
 static int stream_kind_is_output(stream_kind_t kind) {
     return kind == STREAM_9P_FILE_WRITE || kind == STREAM_9P_FILE_IO
-        || kind == STREAM_OUTPUT_SCREEN || kind == STREAM_STRING_OUTPUT;
+        || kind == STREAM_OUTPUT_SCREEN || kind == STREAM_STRING_OUTPUT
+        || kind == STREAM_FAT_FILE_WRITE || kind == STREAM_FAT_FILE_IO;
 }
 
 /** STRINGオブジェクトのレイアウト([len(8byte)][chars...])からデータ先頭とバイト数を取り出す */
@@ -58,12 +58,31 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
     char path[STREAM_PATH_MAX];
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 
+    char relative[STREAM_PATH_MAX];
+    lisp_val_t device;
+    mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
+
     os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-    char err_msg[128];
-    if (!os_stream_open_9p_file(raw, path, err_msg, sizeof(err_msg))) {
-        return g_sym_eval_error;
+
+    if (kind == MOUNT_KIND_9P) {
+        char err_msg[128];
+        if (!os_stream_open_9p_file(raw, relative, err_msg, sizeof(err_msg))) {
+            return g_sym_eval_error;
+        }
+        return os_make_stream(raw);
     }
-    return os_make_stream(raw);
+
+    if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
+        UINT8 *data;
+        UINT32 len;
+        if (!os_mount_fat_read_file(kind, device, relative, &data, &len)) {
+            return g_sym_eval_error;
+        }
+        os_stream_open_string_input(raw, (const char *)data, len);
+        return os_make_stream(raw);
+    }
+
+    return g_sym_eval_error;
 }
 
 lisp_val_t cc_open_output_stream(lisp_val_t args, lisp_val_t env) {
@@ -148,12 +167,26 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
     char path[STREAM_PATH_MAX];
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 
+    char relative[STREAM_PATH_MAX];
+    lisp_val_t device;
+    mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
+
     os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-    char err_msg[128];
-    if (!os_stream_open_9p_file_write(raw, path, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
-        return g_sym_eval_error;
+
+    if (kind == MOUNT_KIND_9P) {
+        char err_msg[128];
+        if (!os_stream_open_9p_file_write(raw, relative, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
+            return g_sym_eval_error;
+        }
+        return os_make_stream(raw);
     }
-    return os_make_stream(raw);
+
+    if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
+        os_stream_open_fat_file_write(raw, kind, device, relative);
+        return os_make_stream(raw);
+    }
+
+    return g_sym_eval_error;
 }
 
 lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
@@ -161,12 +194,26 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
     char path[STREAM_PATH_MAX];
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 
+    char relative[STREAM_PATH_MAX];
+    lisp_val_t device;
+    mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
+
     os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-    char err_msg[128];
-    if (!os_stream_open_9p_file_io(raw, path, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
-        return g_sym_eval_error;
+
+    if (kind == MOUNT_KIND_9P) {
+        char err_msg[128];
+        if (!os_stream_open_9p_file_io(raw, relative, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
+            return g_sym_eval_error;
+        }
+        return os_make_stream(raw);
     }
-    return os_make_stream(raw);
+
+    if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
+        os_stream_open_fat_file_io(raw, kind, device, relative);
+        return os_make_stream(raw);
+    }
+
+    return g_sym_eval_error;
 }
 
 lisp_val_t cc_finish_output(lisp_val_t args, lisp_val_t env) {
@@ -267,22 +314,38 @@ lisp_val_t cc_probe_file(lisp_val_t args, lisp_val_t env) {
     char path[STREAM_PATH_MAX];
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 
-    os_stream_t tmp;
-    char err_msg[128];
-    if (!os_stream_open_9p_file(&tmp, path, err_msg, sizeof(err_msg))) {
-        return nil;
+    char relative[STREAM_PATH_MAX];
+    lisp_val_t device;
+    mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
+
+    if (kind == MOUNT_KIND_9P) {
+        os_stream_t tmp;
+        char err_msg[128];
+        if (!os_stream_open_9p_file(&tmp, relative, err_msg, sizeof(err_msg))) {
+            return nil;
+        }
+        os_stream_close(&tmp);
+        return g_sym_t;
     }
-    os_stream_close(&tmp);
-    return g_sym_t;
+
+    if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
+        // FAT32/FAT16のread-fileはファイル無し・空ファイルのいずれもnilを返すため、
+        // 中身が空の既存ファイルは無しと誤判定される既知の制約がある
+        UINT8 *data;
+        UINT32 len;
+        return os_mount_fat_read_file(kind, device, relative, &data, &len) ? g_sym_t : nil;
+    }
+
+    return nil;
 }
 
 lisp_val_t cc_file_position(lisp_val_t args, lisp_val_t env) {
     (void)env;
     os_stream_t *raw = stream_raw(cc_car(args));
-    if (raw->kind == STREAM_STRING_INPUT) {
+    if (raw->kind == STREAM_STRING_INPUT || raw->kind == STREAM_FAT_FILE_IO) {
         return os_make_fixnum(raw->str_pos);
     }
-    if (raw->kind == STREAM_STRING_OUTPUT) {
+    if (raw->kind == STREAM_STRING_OUTPUT || raw->kind == STREAM_FAT_FILE_WRITE) {
         return os_make_fixnum(raw->str_len);
     }
     return os_make_fixnum(raw->next_offset);
@@ -296,9 +359,9 @@ lisp_val_t cc_set_file_position(lisp_val_t args, lisp_val_t env) {
 
     raw->has_lookahead = 0;
     raw->eof = 0;
-    if (raw->kind == STREAM_STRING_INPUT) {
+    if (raw->kind == STREAM_STRING_INPUT || raw->kind == STREAM_FAT_FILE_IO) {
         raw->str_pos = (UINT32)newpos;
-    } else if (raw->kind == STREAM_STRING_OUTPUT) {
+    } else if (raw->kind == STREAM_STRING_OUTPUT || raw->kind == STREAM_FAT_FILE_WRITE) {
         raw->str_len = (UINT32)newpos;
     } else {
         raw->next_offset = newpos;
@@ -313,18 +376,35 @@ lisp_val_t cc_file_length(lisp_val_t args, lisp_val_t env) {
     char path[STREAM_PATH_MAX];
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 
-    os_stream_t tmp;
-    char err_msg[128];
-    if (!os_stream_open_9p_file(&tmp, path, err_msg, sizeof(err_msg))) {
-        return g_sym_eval_error;
+    char relative[STREAM_PATH_MAX];
+    lisp_val_t device;
+    mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
+
+    if (kind == MOUNT_KIND_9P) {
+        os_stream_t tmp;
+        char err_msg[128];
+        if (!os_stream_open_9p_file(&tmp, relative, err_msg, sizeof(err_msg))) {
+            return g_sym_eval_error;
+        }
+        UINT64 count = 0;
+        char ch;
+        while (os_stream_read_char(&tmp, &ch)) {
+            count++;
+        }
+        os_stream_close(&tmp);
+        return os_make_fixnum(count);
     }
-    UINT64 count = 0;
-    char ch;
-    while (os_stream_read_char(&tmp, &ch)) {
-        count++;
+
+    if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
+        UINT8 *data;
+        UINT32 len;
+        if (!os_mount_fat_read_file(kind, device, relative, &data, &len)) {
+            return g_sym_eval_error;
+        }
+        return os_make_fixnum(len);
     }
-    os_stream_close(&tmp);
-    return os_make_fixnum(count);
+
+    return g_sym_eval_error;
 }
 
 void os_register_streams(void) {

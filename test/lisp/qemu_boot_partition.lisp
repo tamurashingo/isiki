@@ -4,6 +4,7 @@
 (load "src/lisp/ide.lisp")
 (load "src/lisp/partition.lisp")
 (load "src/lisp/fat32.lisp")
+(load "src/lisp/mount.lisp")
 (load "test/lisp/partition_test.lisp")
 
 (isiki-test-report)

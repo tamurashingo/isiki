@@ -268,7 +268,7 @@
 ;; 経由しない直接比較)、consのみヒープ確保を伴う(os_make_cons自身がGC_PROTECTで
 ;; 自分の2引数を保護するため、za側で追加のshadow stack link/unlinkは不要)。
 ;; いずれもleaf限定のexprとして+/-/*/</=/ifと同じ位置制約でコンパイルされる。
-(close (open-output-file "tmp/ckpt-0-start.txt"))
+(close (open-output-file "/9p/tmp/ckpt-0-start.txt"))
 
 ;; (car x) / (cdr x) : leafのcar/cdrはzaでコンパイルされる
 (defun isiki-za-test-car (x) (car x))
@@ -277,7 +277,7 @@
 (defun isiki-za-test-cdr (x) (cdr x))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-cdr)))
 (assert-equal 2 (isiki-za-test-cdr (cons 1 2)))
-(close (open-output-file "tmp/ckpt-1-carcdr.txt"))
+(close (open-output-file "/9p/tmp/ckpt-1-carcdr.txt"))
 
 ;; (atom x) : fixnum/symbol/nilはatom、consはatomでない
 (defun isiki-za-test-atom (x) (atom x))
@@ -289,14 +289,14 @@
 ;; ATOMはインタプリタ側でも(za未対応のフォールバック経路でも)使える正式な組み込み関数
 (assert-equal t (atom 1))
 (assert-equal nil (atom (cons 1 2)))
-(close (open-output-file "tmp/ckpt-2-atom.txt"))
+(close (open-output-file "/9p/tmp/ckpt-2-atom.txt"))
 
 ;; (null x) : nilならt、それ以外はnil
 (defun isiki-za-test-null (x) (null x))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-null)))
 (assert-equal t (isiki-za-test-null nil))
 (assert-equal nil (isiki-za-test-null 1))
-(close (open-output-file "tmp/ckpt-3-null.txt"))
+(close (open-output-file "/9p/tmp/ckpt-3-null.txt"))
 
 ;; (eq x y) : ポインタ同一性比較
 (defun isiki-za-test-eq (x y) (eq x y))
@@ -304,21 +304,21 @@
 (assert-equal t (isiki-za-test-eq 3 3))
 (assert-equal nil (isiki-za-test-eq 3 4))
 (assert-equal t (isiki-za-test-eq nil nil))
-(close (open-output-file "tmp/ckpt-4-eq.txt"))
+(close (open-output-file "/9p/tmp/ckpt-4-eq.txt"))
 
 ;; (cons x y) : ヒープ確保を伴うがleafオペランドのみでzaでコンパイルされる
 (defun isiki-za-test-cons (x y) (cons x y))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-cons)))
 (assert-equal 3 (car (isiki-za-test-cons 3 4)))
 (assert-equal 4 (cdr (isiki-za-test-cons 3 4)))
-(close (open-output-file "tmp/ckpt-5-cons.txt"))
+(close (open-output-file "/9p/tmp/ckpt-5-cons.txt"))
 
 ;; ifのthen/elseの中にcar/cons等を書いてもzaでコンパイルされる
 (defun isiki-za-test-car-if (x y) (if x (cons x y) (car y)))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-car-if)))
 (assert-equal 5 (car (isiki-za-test-car-if 5 6)))
 (assert-equal 9 (isiki-za-test-car-if nil (cons 9 10)))
-(close (open-output-file "tmp/ckpt-6-carif.txt"))
+(close (open-output-file "/9p/tmp/ckpt-6-carif.txt"))
 
 ;; car/cdr/cons/atom/null/eqはza_compile_unary/za_compile_binaryを経由するため、
 ;; 拡張15(一般呼び出しza_compile_call側のcall_depth配列化)の対象外だったが、
@@ -329,7 +329,7 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-cons-nested-fallback)))
 (assert-equal 1 (car (isiki-za-test-cons-nested-fallback (cons 1 2))))
 (assert-equal 2 (cdr (isiki-za-test-cons-nested-fallback (cons 1 2))))
-(close (open-output-file "tmp/ckpt-7-nested.txt"))
+(close (open-output-file "/9p/tmp/ckpt-7-nested.txt"))
 
 ;; isiki-za-test-cons-chain自身はlet/for/setqを含むためza非対応(フォールバック)だが、
 ;; ループ本体で呼ぶisiki-za-test-consはza機械語として繰り返し実行される。GC誘発を伴う
@@ -339,12 +339,12 @@
   (let ((acc nil))
     (for ((i 0 (+ i 1))) ((= i n) acc)
       (setq acc (isiki-za-test-cons i acc)))))
-(close (open-output-file "tmp/ckpt-8-before-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-8-before-chain.txt"))
 
 (assert-equal 5 (length (isiki-za-test-cons-chain 5)))
-(close (open-output-file "tmp/ckpt-9-after-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-9-after-chain.txt"))
 (assert-equal 4 (car (isiki-za-test-cons-chain 5)))
-(close (open-output-file "tmp/ckpt-10-final.txt"))
+(close (open-output-file "/9p/tmp/ckpt-10-final.txt"))
 
 ;;; --- 拡張4: クロージャ・lambda ---
 ;;
@@ -358,19 +358,19 @@
 (defun isiki-za-test-make-const (x) (lambda () x))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-make-const)))
 (assert-equal 42 (funcall (isiki-za-test-make-const 42)))
-(close (open-output-file "tmp/ckpt-11-const.txt"))
+(close (open-output-file "/9p/tmp/ckpt-11-const.txt"))
 
 ;; 1引数を捕捉するアダー・クロージャ
 (defun isiki-za-test-make-adder (x) (lambda (y) (+ x y)))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-make-adder)))
 (assert-equal 7 (funcall (isiki-za-test-make-adder 3) 4))
-(close (open-output-file "tmp/ckpt-12-adder.txt"))
+(close (open-output-file "/9p/tmp/ckpt-12-adder.txt"))
 
 ;; 複数の固定引数を捕捉するクロージャ
 (defun isiki-za-test-make-combo (x y) (lambda (z) (+ x (+ y z))))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-make-combo)))
 (assert-equal 6 (funcall (isiki-za-test-make-combo 1 2) 3))
-(close (open-output-file "tmp/ckpt-13-combo.txt"))
+(close (open-output-file "/9p/tmp/ckpt-13-combo.txt"))
 
 ;; 独立性: isiki-za-test-make-adder(za機械語として実行される)を異なる引数で2回呼び、
 ;; 両方のクロージャを同時に保持しても互いに影響されず独立した値を保持すること
@@ -379,14 +379,14 @@
   (assert-equal 15 (funcall c1 5))
   (assert-equal 25 (funcall c2 5))
   (assert-equal 15 (funcall c1 5)))
-(close (open-output-file "tmp/ckpt-14-independence.txt"))
+(close (open-output-file "/9p/tmp/ckpt-14-independence.txt"))
 
 ;; if分岐内のlambda: どちらの分岐でクロージャが作られても正しく捕捉される
 (defun isiki-za-test-maybe (x) (if (< x 0) (lambda () -1) (lambda () 1)))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-maybe)))
 (assert-equal (- 1) (funcall (isiki-za-test-maybe (- 5))))
 (assert-equal 1 (funcall (isiki-za-test-maybe 5)))
-(close (open-output-file "tmp/ckpt-15-maybe.txt"))
+(close (open-output-file "/9p/tmp/ckpt-15-maybe.txt"))
 
 ;; lambdaを引数位置に置くが、呼び出し先はfuncall(組み込みnative)ではなく
 ;; JIT/インタプリタのユーザ定義関数(引数をそのまま返すだけ)にするケース
@@ -404,14 +404,14 @@
 (assert-equal t (functionp (isiki-za-test-lambda-as-arg-diag 5)))
 (assert-equal nil (consp (isiki-za-test-lambda-as-arg-diag 5)))
 (assert-equal 105 (funcall (isiki-za-test-lambda-as-arg-diag 5) 100))
-(close (open-output-file "tmp/ckpt-15c-lambda-as-arg-diag.txt"))
+(close (open-output-file "/9p/tmp/ckpt-15c-lambda-as-arg-diag.txt"))
 
 ;; 呼び出しの引数位置に直接lambdaが現れるケース(ZA_OFF_LAMBDA_SAVED_HEADが
 ;; ZA_OFF_CALL_SAVED_HEADと衝突しないことの確認): funcallは既存の組み込み関数
 (defun isiki-za-test-apply-it (x) (funcall (lambda (y) (+ x y)) 100))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-apply-it)))
 (assert-equal 105 (isiki-za-test-apply-it 5))
-(close (open-output-file "tmp/ckpt-16-apply-it.txt"))
+(close (open-output-file "/9p/tmp/ckpt-16-apply-it.txt"))
 
 ;; 古いクロージャ・新しいクロージャどちらも正しい値を返すことを確認する。GC誘発を
 ;; 伴う大量ループでの負荷確認はtest/lisp/za_test_stress.lispへ分離した。ここでは
@@ -420,7 +420,7 @@
   (let ((acc nil))
     (for ((i 0 (+ i 1))) ((= i n) acc)
       (setq acc (cons (isiki-za-test-make-adder i) acc)))))
-(close (open-output-file "tmp/ckpt-17-before-closure-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-17-before-closure-chain.txt"))
 
 (defun isiki-za-test-sum-closure-chain (lst)
   (let ((acc 0))
@@ -428,11 +428,11 @@
       (setq acc (+ acc (funcall (car rest) 1))))))
 
 (assert-equal 5 (length (isiki-za-test-adder-chain 5)))
-(close (open-output-file "tmp/ckpt-18-after-closure-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-18-after-closure-chain.txt"))
 
 ;; sum_{i=0}^{4} (i+1) = 1+2+3+4+5 = 15
 (assert-equal 15 (isiki-za-test-sum-closure-chain (isiki-za-test-adder-chain 5)))
-(close (open-output-file "tmp/ckpt-19-final.txt"))
+(close (open-output-file "/9p/tmp/ckpt-19-final.txt"))
 
 ;;; --- 拡張6: 動的変数(defdynamic/dynamic) ---
 
@@ -481,7 +481,7 @@
 (assert-equal 5 (length (isiki-za-test-dyn-stress 5)))
 (assert-equal t (isiki-za-test-all-eq-sym (isiki-za-test-dyn-stress 5) '*iza-test-dyn2*))
 (assert-equal 4 (dynamic *iza-test-dyn2*))
-(close (open-output-file "tmp/ckpt-20-defdynamic.txt"))
+(close (open-output-file "/9p/tmp/ckpt-20-defdynamic.txt"))
 
 ;;; --- 拡張7: let-local変数のbox化(setq x エスケープするlambdaの捕捉) ---
 ;;
@@ -520,7 +520,7 @@
       (funcall f))))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-box-captured-and-assigned)))
 (assert-equal 99 (isiki-za-test-box-captured-and-assigned 0))
-(close (open-output-file "tmp/ckpt-21-box-basic.txt"))
+(close (open-output-file "/9p/tmp/ckpt-21-box-basic.txt"))
 
 ;; 複数のクロージャが同じboxを共有すること: 片方(g)でsetqした変更が、もう片方(f)の
 ;; 読み込みにも反映される(fとgが同一の束縛consを共有している証拠)
@@ -532,7 +532,7 @@
       (funcall f))))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-box-shared)))
 (assert-equal 1 (isiki-za-test-box-shared 0))
-(close (open-output-file "tmp/ckpt-22-box-shared.txt"))
+(close (open-output-file "/9p/tmp/ckpt-22-box-shared.txt"))
 
 ;; box化された変数を含むクロージャ対を多数生成してもGC(os_gc_collect)を誘発しても
 ;; 破壊されないことの確認。N=5でロジックのみ確認する。大量N版はza_test_stress.lispへ分離した。
@@ -557,8 +557,8 @@
         (setq acc (+ acc (funcall (cdr pair))))))))
 
 (assert-equal 5 (length (isiki-za-test-box-counter-chain 5)))
-(close (open-output-file "tmp/ckpt-23-box-counter-chain.txt"))
+(close (open-output-file "/9p/tmp/ckpt-23-box-counter-chain.txt"))
 
 ;; sum_{i=0}^{4} (i+2) = (0+1+2+3+4) + 2*5 = 10+10 = 20
 (assert-equal 20 (isiki-za-test-sum-box-counters (isiki-za-test-box-counter-chain 5)))
-(close (open-output-file "tmp/ckpt-24-box-counter-final.txt"))
+(close (open-output-file "/9p/tmp/ckpt-24-box-counter-final.txt"))

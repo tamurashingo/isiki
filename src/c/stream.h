@@ -3,6 +3,11 @@
 
 #include "types.h"
 #include "framebuffer.h"
+#include "mount.h"
+
+/** OPEN-INPUT-STREAM等に渡せるパスの最大長(NUL終端込み)。stream_lisp.c/load.c/
+    mount.cで共有する規約 */
+#define STREAM_PATH_MAX 256
 
 /** ストリームの種別 */
 typedef enum {
@@ -11,8 +16,15 @@ typedef enum {
     STREAM_9P_FILE_IO,
     STREAM_OUTPUT_SCREEN,
     STREAM_STRING_INPUT,
-    STREAM_STRING_OUTPUT
+    STREAM_STRING_OUTPUT,
+    STREAM_FAT_FILE_WRITE,
+    STREAM_FAT_FILE_IO
 } stream_kind_t;
+
+/** STREAM_FAT_FILE_WRITE/IOの書き込みバッファ容量。os_alloc_rawはreallocできない
+    ため固定容量で確保する(STREAM_STRING_OUTPUT_CAPと同じ制約)。この容量を超える
+    ファイルはマウント経由では書き込めない既知の制限とする */
+#define STREAM_FAT_FILE_CAP 65536
 
 /**
  * 9Pのバイト列をバッファリングしながら1文字ずつ切り出す、文字列バッファ、または
@@ -60,6 +72,12 @@ typedef struct {
 
     /** os_stream_closeを呼んだ後は1になり、以後の読み書きを禁止する */
     int closed;
+
+    /** STREAM_FAT_FILE_WRITE/IO専用: os_stream_closeで(fat32|fat16)-write-file等を
+        呼ぶために必要な情報(mount_kind_t. MOUNT_KIND_FAT32/FAT16のいずれか) */
+    mount_kind_t mount_fs_kind;
+    lisp_val_t mount_device;
+    char mount_relative_path[STREAM_PATH_MAX];
 } os_stream_t;
 
 /** STREAM_STRING_OUTPUTの固定バッファ容量(realloc不可のため) */
@@ -119,6 +137,29 @@ void os_stream_open_string_input(os_stream_t *stream, const char *data, UINT32 l
  * @param stream 初期化先
  */
 void os_stream_open_string_output(os_stream_t *stream);
+
+/**
+ * マウントされたFAT32/FAT16デバイスへの書き込み専用ストリームとして初期化する。
+ * 書き込み内容は固定容量(STREAM_FAT_FILE_CAP)のバッファに溜め、os_stream_close時に
+ * まとめて(fat32|fat16)-write-file(無ければ...-create-file)へ渡す。
+ * @param stream 初期化先
+ * @param kind MOUNT_KIND_FAT32またはMOUNT_KIND_FAT16
+ * @param device deviceシンボル
+ * @param relative_path close時にFATドライバへ渡す相対パス(NUL終端)
+ */
+void os_stream_open_fat_file_write(os_stream_t *stream, mount_kind_t kind, lisp_val_t device, const char *relative_path);
+
+/**
+ * マウントされたFAT32/FAT16デバイスへの読み書き両用ストリームとして初期化する。
+ * open時点では空のバッファから始まる(9PのSTREAM_9P_FILE_IOと同様、open=truncate
+ * 相当)。書き込んだ内容はos_stream_close時にos_stream_open_fat_file_writeと
+ * 同様にflushされる。
+ * @param stream 初期化先
+ * @param kind MOUNT_KIND_FAT32またはMOUNT_KIND_FAT16
+ * @param device deviceシンボル
+ * @param relative_path close時にFATドライバへ渡す相対パス(NUL終端)
+ */
+void os_stream_open_fat_file_io(os_stream_t *stream, mount_kind_t kind, lisp_val_t device, const char *relative_path);
 
 /**
  * streamから1文字読み込む。内部バッファが尽きていれば9PのTreadで再充填する。
