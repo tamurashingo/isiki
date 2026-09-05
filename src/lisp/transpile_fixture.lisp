@@ -328,7 +328,7 @@
   ;; transportはtest/c/lisp_compiled_test.cでos_virtio9p_openが常に成功する
   ;; よう差し替え済み)
   (let ((captured nil))
-    (with-open-input-stream (s (open-input-stream "fake/path"))
+    (with-open-input-stream (s (open-input-stream "/9p/fake/path"))
       (setq captured s))
     (open-stream-p captured)))
 
@@ -340,7 +340,7 @@
   (let ((captured nil))
     (cons
      (block %%fixture-wois-block
-       (with-open-input-stream (s (open-input-stream "fake/path"))
+       (with-open-input-stream (s (open-input-stream "/9p/fake/path"))
          (setq captured s)
          (return-from %%fixture-wois-block 42)))
      (open-stream-p captured))))
@@ -350,7 +350,7 @@
   ;; stream呼び出しを差し込むだけの薄いラッパー)経由でも同じくcloseが保証
   ;; されることを確認する
   (let ((captured nil))
-    (with-open-input-file (s "fake/path")
+    (with-open-input-file (s "/9p/fake/path")
       (setq captured s))
     (open-stream-p captured)))
 
@@ -362,7 +362,7 @@
   (let ((captured nil))
     (cons
      (block %%fixture-wos-block
-       (with-open-output-stream (s (open-output-file "fake/path"))
+       (with-open-output-stream (s (open-output-file "/9p/fake/path"))
          (setq captured s)
          (return-from %%fixture-wos-block 42)))
      (open-stream-p captured))))
@@ -371,7 +371,7 @@
   ;; M14: with-open-output-fileの検証。open-output-file(cc_open_output_file)
   ;; がwith-open-output-stream経由でcloseされることを確認する
   (let ((captured nil))
-    (with-open-output-file (s "fake/path")
+    (with-open-output-file (s "/9p/fake/path")
       (setq captured s))
     (open-stream-p captured)))
 

@@ -2,6 +2,7 @@
 #include "virtio9p.h"
 #include "p9.h"
 #include "runtime.h"
+#include "mount.h"
 
 /** 1回のTreadで要求するバイト数(P9_MSIZE未満であれば十分) */
 #define STREAM_READ_CHUNK 1024
@@ -26,6 +27,19 @@ static void stream_init_common(os_stream_t *stream, stream_kind_t kind) {
     stream->lookahead = 0;
     stream->column = 0;
     stream->closed = 0;
+    stream->mount_fs_kind = MOUNT_KIND_NONE;
+    stream->mount_device = nil;
+    stream->mount_relative_path[0] = '\0';
+}
+
+/** relative_pathをstream->mount_relative_pathへコピーする(STREAM_PATH_MAX境界内) */
+static void set_mount_relative_path(os_stream_t *stream, const char *relative_path) {
+    UINT32 i = 0;
+    while (relative_path[i] != '\0' && i + 1 < STREAM_PATH_MAX) {
+        stream->mount_relative_path[i] = relative_path[i];
+        i++;
+    }
+    stream->mount_relative_path[i] = '\0';
 }
 
 /** write_bufに溜まっている内容をTwriteで送出し、成功したらnext_offsetを進める */
@@ -111,6 +125,34 @@ void os_stream_open_string_output(os_stream_t *stream) {
     stream->str_len = 0;
 }
 
+/**
+ * mount_deviceはos_alloc_raw確保のos_stream_t(GCの走査対象外の生メモリ)内に置く
+ * lisp_val_tフィールドなので、GCが動くたびに追跡・更新されるようos_gc_register_root
+ * で明示的にrootへ加える(process.cの各プロセスenvと同じ理由。os_stream_close側で
+ * os_gc_unregister_rootする)。
+ */
+void os_stream_open_fat_file_write(os_stream_t *stream, mount_kind_t kind, lisp_val_t device, const char *relative_path) {
+    stream_init_common(stream, STREAM_FAT_FILE_WRITE);
+    stream->mount_fs_kind = kind;
+    stream->mount_device = device;
+    os_gc_register_root(&stream->mount_device);
+    set_mount_relative_path(stream, relative_path);
+    stream->str_buf = (UINT8 *)os_alloc_raw(STREAM_FAT_FILE_CAP);
+    stream->str_cap = STREAM_FAT_FILE_CAP;
+    stream->str_len = 0;
+}
+
+void os_stream_open_fat_file_io(os_stream_t *stream, mount_kind_t kind, lisp_val_t device, const char *relative_path) {
+    stream_init_common(stream, STREAM_FAT_FILE_IO);
+    stream->mount_fs_kind = kind;
+    stream->mount_device = device;
+    os_gc_register_root(&stream->mount_device);
+    set_mount_relative_path(stream, relative_path);
+    stream->str_buf = (UINT8 *)os_alloc_raw(STREAM_FAT_FILE_CAP);
+    stream->str_cap = STREAM_FAT_FILE_CAP;
+    stream->str_len = 0;
+}
+
 int os_stream_read_char(os_stream_t *stream, char *out_ch) {
     if (stream->closed || stream->eof || stream->error) {
         return 0;
@@ -158,7 +200,7 @@ int os_stream_read_char(os_stream_t *stream, char *out_ch) {
         return 1;
     }
 
-    if (stream->kind == STREAM_STRING_INPUT) {
+    if (stream->kind == STREAM_STRING_INPUT || stream->kind == STREAM_FAT_FILE_IO) {
         if (stream->str_pos >= stream->str_len) {
             stream->eof = 1;
             return 0;
@@ -221,7 +263,7 @@ int os_stream_write_char(os_stream_t *stream, char ch) {
         return !stream->error;
     }
 
-    if (stream->kind == STREAM_STRING_OUTPUT) {
+    if (stream->kind == STREAM_STRING_OUTPUT || stream->kind == STREAM_FAT_FILE_WRITE || stream->kind == STREAM_FAT_FILE_IO) {
         if (stream->str_len < stream->str_cap) {
             stream->str_buf[stream->str_len] = (UINT8)ch;
             stream->str_len++;
@@ -246,6 +288,11 @@ void os_stream_close(os_stream_t *stream) {
     if (is_9p_read_kind(stream->kind) || is_9p_write_kind(stream->kind)) {
         char err_msg[128];
         os_virtio9p_close(stream->fid, err_msg, sizeof(err_msg));
+    }
+    if (stream->kind == STREAM_FAT_FILE_WRITE || stream->kind == STREAM_FAT_FILE_IO) {
+        os_mount_fat_write_file(stream->mount_fs_kind, stream->mount_device,
+                                 stream->mount_relative_path, stream->str_buf, stream->str_len);
+        os_gc_unregister_root(&stream->mount_device);
     }
     stream->closed = 1;
 }

@@ -8,7 +8,7 @@
 ;; ケースで*isiki-test-stream*が再オープンされてtest-results.txtの上書き・
 ;; カウンタリセットが起きるため)。
 
-(defglobal *isiki-test-stream* (open-output-file "test-results.txt"))
+(defglobal *isiki-test-stream* (open-output-file "/9p/test-results.txt"))
 (defglobal *isiki-test-pass* 0)
 (defglobal *isiki-test-fail* 0)
 

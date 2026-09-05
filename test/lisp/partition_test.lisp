@@ -76,3 +76,23 @@
               (fat32-read-dir *partition-test-p2* "/Partition_Slice_LFN_Dir"))
 (assert-equal t (if (fat32-create-file *partition-test-p2* "/Partition_Slice_LFN_Dir/INSIDE.TXT" *partition-test-lfn-content*) t nil))
 (assert-equal *partition-test-lfn-content* (fat32-read-file *partition-test-p2* "/Partition_Slice_LFN_Dir/INSIDE.TXT"))
+
+;;; --- 6. mount経由のopen-input-streamがfat32-read-fileと同じ内容を読めること ---
+;;
+;; (mount "/" 'blk0s1 ':fat32)でパーティション2(blk0s1)をルートへマウントし、
+;; open-input-streamへ渡す絶対パスがマウント解決→fat32-read-fileへ橋渡しされる
+;; ことを確認する(9P経由ではなくFAT32ドライバ経由で読めていることの実証)。
+
+(mount "/" 'blk0s1 ':fat32)
+
+;; streamからEOFまで1byteずつ読み、fixnumのリストにする(read-byteの戻り値は
+;; fixnumまたはEOFでnil)。
+(defun %partition-test-read-all-bytes (stream)
+  (let ((b (read-byte stream)))
+    (if (null b)
+        nil
+        (cons b (%partition-test-read-all-bytes stream)))))
+
+(defglobal *partition-test-mount-stream* (open-input-stream "/Partition_Slice_LFN_File.txt"))
+(assert-equal *partition-test-lfn-content* (%partition-test-read-all-bytes *partition-test-mount-stream*))
+(close *partition-test-mount-stream*)

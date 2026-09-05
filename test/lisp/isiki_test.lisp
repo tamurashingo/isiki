@@ -790,12 +790,12 @@
 ;; 確認済みのプリミティブ署名(src/c/stream_lisp.c)に基づき記述するが、実機
 ;; (QEMU + 9p)での動作確認が別途必要であることをユーザーへ報告する。
 (assert-equal t
-  (with-open-output-file (isiki-test-outf "isiki-test-p112.txt")
+  (with-open-output-file (isiki-test-outf "/9p/isiki-test-p112.txt")
     (format isiki-test-outf "hello")
     (finish-output isiki-test-outf)
     t))
 (assert-equal "hello"
-  (with-open-input-file (isiki-test-inf "isiki-test-p112.txt")
+  (with-open-input-file (isiki-test-inf "/9p/isiki-test-p112.txt")
     (read-line isiki-test-inf)))
 
 
@@ -869,10 +869,10 @@ line2"))
 ;; cf. p.113 の例。p.105と同様の理由(hostビルドでは実ファイルI/Oが常に失敗する
 ;; スタブのため)で動的に検証できない。確認済みのプリミティブ署名に基づき記述するが、
 ;; 実機(QEMU + 9p)での動作確認が別途必要であることをユーザーへ報告する。
-(assert-equal nil (probe-file "isiki-test-p120-nonexistent.txt"))
-(with-open-output-file (isiki-test-p120-f "isiki-test-p120.txt")
+(assert-equal nil (probe-file "/9p/isiki-test-p120-nonexistent.txt"))
+(with-open-output-file (isiki-test-p120-f "/9p/isiki-test-p120.txt")
   (format isiki-test-p120-f "x"))
-(assert-equal t (probe-file "isiki-test-p120.txt"))
+(assert-equal t (probe-file "/9p/isiki-test-p120.txt"))
 
 ;; p.115-117 (§29 Conditions) には with-handler/signal-condition/error/ignore-errors の
 ;; 構文・意味の説明と、simple-error を自分で create する例(p.117)はあるが、以下のような
