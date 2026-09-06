@@ -192,17 +192,16 @@
 
 ;;; --- ディレクトリエントリの列挙 ---
 
-;; dir-entry32 : ディレクトリエントリ1件のパース結果。fat16.lispのdir-entryとの
-;; 違いはstart-clusterの取り出し方のみ(下記%fat32-dir-entry-at参照)。
-(defclass dir-entry32 ()
-  ((name :initarg :name :initform nil)
-   (attr :initarg :attr :initform nil)
-   (size :initarg :size :initform nil)
-   (start-cluster :initarg :start-cluster :initform nil)))
+;; <fat32-file-node> : ディレクトリエントリ1件のパース結果。fat16.lispの
+;; <fat16-file-node>との違いはstart-clusterの取り出し方のみ
+;; (下記%fat32-dir-entry-at参照)。name/attr/size/start-clusterスロットは
+;; 共通の抽象クラス<file-node>(file-node.lisp、[ファイルI/O]#45)から継承する。
+;; 旧名dir-entry32([ファイルI/O]刷新前の名前)。
+(defclass <fat32-file-node> (<file-node>) ())
 
 ;; (%fat32-dir-entry-at bytes offset) : bytes(1セクタ512byte分)のoffsetにある
 ;; 32byteディレクトリエントリをパースする。先頭バイトが0x00ならシンボル'endを、
-;; 0xE5(削除済み)ならnilを、それ以外はdir-entry32インスタンスを返す
+;; 0xE5(削除済み)ならnilを、それ以外は<fat32-file-node>インスタンスを返す
 ;; (fat16.lispの%fat16-dir-entry-atと同じ判定)。開始クラスタのみFAT16と異なり、
 ;; 高16bit(offset 20)と低16bit(offset 26)に分割されているため
 ;; (logior low (ash high 16))で合成する(このコードベース最大の相違点)。
@@ -212,7 +211,7 @@
         'end
         (if (= first-byte #xE5)
             nil
-            (make-instance 'dir-entry32
+            (make-instance '<fat32-file-node>
               ':name (%fat32-dir-entry-name bytes offset)
               ':attr (elt bytes (+ offset 11))
               ':start-cluster (logior (%fat32-u16 bytes (+ offset 26))
@@ -342,9 +341,9 @@
         result)))
 
 ;; (%fat32-make-short-dir-entry bytes offset display-name) : 短名エントリ1件を
-;; dir-entry32へ変換する。display-nameは8.3表示名または復元したLFN。
+;; <fat32-file-node>へ変換する。display-nameは8.3表示名または復元したLFN。
 (defun %fat32-make-short-dir-entry (bytes offset display-name)
-  (make-instance 'dir-entry32
+  (make-instance '<fat32-file-node>
     ':name display-name
     ':attr (elt bytes (+ offset 11))
     ':start-cluster (logior (%fat32-u16 bytes (+ offset 26))
@@ -374,7 +373,7 @@
           (= i len-a)))))
 
 ;; (%fat32-scan-dir-entries device lbas) : lbas(ディレクトリを構成するセクタLBAの
-;; リスト)を先頭からwhileで走査し、有効なdir-entry32のリストを返す。0x00終端に
+;; リスト)を先頭からwhileで走査し、有効な<fat32-file-node>のリストを返す。0x00終端に
 ;; 到達した時点で走査を止める(fat16.lispの%fat16-scan-dir-entriesと同じ構造)。
 ;; read-sectorが失敗した場合はそれまでに集めたエントリを捨ててnil。
 ;; whileループ本体で毎回新規のletを生成しない理由: fat32-cluster-chainと同じ
@@ -420,7 +419,7 @@
 (defun %fat32-dir-entry-kind (attr)
   (if (= (logand attr #x10) 0) ':file ':dir))
 
-;; (%fat32-dir-entries-to-display-list entries) : dir-entry32のリストを
+;; (%fat32-dir-entries-to-display-list entries) : <fat32-file-node>のリストを
 ;; ("NAME" :file/:dir size)の3要素リストのリストに変換する。
 (defun %fat32-dir-entries-to-display-list (entries)
   (if (null entries)
@@ -430,7 +429,7 @@
                   (slot-value (car entries) 'size))
             (%fat32-dir-entries-to-display-list (cdr entries)))))
 
-;; (%fat32-find-dir-entry entries name) : dir-entry32のリストentriesからnameと
+;; (%fat32-find-dir-entry entries name) : <fat32-file-node>のリストentriesからnameと
 ;; 一致するものを探す(大文字小文字無視)。見つからなければnil。
 (defun %fat32-find-dir-entry (entries name)
   (if (null entries)

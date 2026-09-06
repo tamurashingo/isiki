@@ -69,13 +69,12 @@
 (defun %fat16-root-dir-sector-count (bpb)
   (div (* (slot-value bpb 'root-entry-count) 32) (slot-value bpb 'bytes-per-sector)))
 
-;; (defclass dir-entry ...) : ディレクトリエントリ1件のパース結果。nameは
+;; (defclass <fat16-file-node> ...) : ディレクトリエントリ1件のパース結果。nameは
 ;; %fat16-bytes-to-stringで組み立てた表示用文字列(8.3名、拡張子が空なら"."無し)。
-(defclass dir-entry ()
-  ((name :initarg :name :initform nil)
-   (attr :initarg :attr :initform nil)
-   (size :initarg :size :initform nil)
-   (start-cluster :initarg :start-cluster :initform nil)))
+;; name/attr/size/start-clusterスロットは共通の抽象クラス<file-node>
+;; (file-node.lisp、[ファイルI/O]#45)から継承する。旧名dir-entry
+;; ([ファイルI/O]刷新前の名前)。
+(defclass <fat16-file-node> (<file-node>) ())
 
 ;; (%fat16-drop-leading-spaces bytes) : bytes先頭の連続するASCIIスペース(32)を
 ;; 取り除いた残りを返す(string-trimが存在しないための自前ヘルパー)。
@@ -117,14 +116,14 @@
 ;; (%fat16-dir-entry-at bytes offset) : bytes(1セクタ512byte分)のoffsetにある
 ;; 32byteディレクトリエントリをパースする。先頭バイトが0x00ならシンボル'endを
 ;; (ルートディレクトリの走査終了、以降は未使用領域)、0xE5(削除済み)ならnilを、
-;; それ以外はdir-entryインスタンスを返す。
+;; それ以外は<fat16-file-node>インスタンスを返す。
 (defun %fat16-dir-entry-at (bytes offset)
   (let ((first-byte (elt bytes offset)))
     (if (= first-byte 0)
         'end
         (if (= first-byte #xE5)
             nil
-            (make-instance 'dir-entry
+            (make-instance '<fat16-file-node>
               ':name (%fat16-dir-entry-name bytes offset)
               ':attr (elt bytes (+ offset 11))
               ':start-cluster (%fat16-u16 bytes (+ offset 26))
@@ -141,7 +140,7 @@
 (defun %fat16-dir-entry-kind (attr)
   (if (= (logand attr #x10) 0) ':file ':dir))
 
-;; (%fat16-dir-entries-to-display-list entries) : dir-entryのリストを
+;; (%fat16-dir-entries-to-display-list entries) : <fat16-file-node>のリストを
 ;; ("NAME" :file/:dir size)の3要素リストのリストに変換する。
 (defun %fat16-dir-entries-to-display-list (entries)
   (if (null entries)
@@ -233,7 +232,7 @@
   (+ (%fat16-data-start-lba bpb)
      (* (- cluster-no 2) (slot-value bpb 'sectors-per-cluster))))
 
-;; (%fat16-find-dir-entry entries name) : dir-entryのリストentriesからnameと
+;; (%fat16-find-dir-entry entries name) : <fat16-file-node>のリストentriesからnameと
 ;; (拡張子まで含めた)8.3名が一致するものを探す。見つからなければnil。
 (defun %fat16-find-dir-entry (entries name)
   (if (null entries)
@@ -791,7 +790,7 @@
 
 ;; (%fat16-scan-dir-entries device lbas) : lbas(ディレクトリを構成するセクタLBAの
 ;; リスト、ルートの固定範囲でもサブディレクトリのクラスタチェイン展開でもよい)を
-;; 先頭からwhileで走査し、有効なdir-entryのリストを返す。0x00終端に到達した時点で
+;; 先頭からwhileで走査し、有効な<fat16-file-node>のリストを返す。0x00終端に到達した時点で
 ;; 走査を止める。セクタ内(最大16エントリ)もwhileで走査し、有効エントリを
 ;; consで逆順に積んでから最後に1回だけ%fat16-reverse-iterで正順化する
 ;; (成長していく蓄積リストにappendで結合する実装は、セクタ数が多いサブ

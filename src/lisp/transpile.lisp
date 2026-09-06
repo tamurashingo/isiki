@@ -54,6 +54,7 @@
     "src/lisp/ide.lisp"
     "src/lisp/partition.lisp"
     "src/lisp/mount.lisp"
+    "src/lisp/file-node.lisp"
     "src/lisp/fat16.lisp"
     "src/lisp/fat32.lisp"
     "src/lisp/file-cmd.lisp")
@@ -65,7 +66,13 @@
    トップレベルフォーム(defclass/defdynamic/起動時に一度だけ実行する副作用の
    ある呼び出し)も持つため、mainではdefunとそれ以外を別々に集める。依存関係の
    順(device->ide->partition->mount->fat16/fat32->file-cmd)で1ファイルずつ
-   追加・検証したため、この順序のまま保つ")
+   追加・検証したため、この順序のまま保つ。file-node.lisp([ファイルI/O]#45)は
+   fat16.lisp/fat32.lispの<fat16-file-node>/<fat32-file-node>が継承する
+   <file-node>を定義するため、この2ファイルより前に置く必要がある(defclassの
+   スーパークラス解決は%register-class経由の実行時ルックアップなので、
+   *fs-lisp-paths*内での並び順=実際の登録順を守らないと未登録エラーになる)。
+   このリストの並び順とMakefileのTRANSPILE_LISP_SRCの並び順は同期を保つ共通の
+   ソースが無いため、どちらかにファイルを追加する際は両方を手動で更新すること")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
 (defparameter *fixture-output-c-path* "test/c/lisp_compiled_fixture.c"
   "*runtime-lisp-path*(テスト専用フィクスチャ)のコンパイル結果の出力先。
