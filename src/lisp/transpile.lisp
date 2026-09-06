@@ -33,7 +33,11 @@
 ;;;; 束縛されているため、ループが何回回ってもリークしない)。プリミティブ呼び出し
 ;;;; は再帰しないstep関数を持たないため、末尾位置でも即時評価して確定値を返す。
 
-(defparameter *runtime-lisp-path* "src/lisp/transpile_fixture.lisp")
+(defparameter *runtime-lisp-path* "test/lisp/transpile_fixture.lisp"
+  "トランスパイラの動作確認用フィクスチャ(transpile_fixture.lisp参照、全関数が
+   %%transpile-fixture-接頭辞を持ちglobal_environmentへ登録もされない、テスト
+   専用コード)。本番のAOTコードと一切混ざらないよう、生成先も*output-c-path*
+   ではなく*fixture-output-c-path*という別ファイルにする")
 (defparameter *aot-lisp-path* "src/lisp/init_aot.lisp"
   "init.lispから移動した、AOTトランスパイル対象の本番関数を置くファイル(M13)。
    transpile_fixture.lispと違い、ここでdefunされた関数はos_register_aot_init_functions
@@ -63,6 +67,10 @@
    順(device->ide->partition->mount->fat16/fat32->file-cmd)で1ファイルずつ
    追加・検証したため、この順序のまま保つ")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
+(defparameter *fixture-output-c-path* "test/c/lisp_compiled_fixture.c"
+  "*runtime-lisp-path*(テスト専用フィクスチャ)のコンパイル結果の出力先。
+   本番のカーネルバイナリ(*output-c-path*)には一切含めず、テストビルド時だけ
+   このファイルを追加でコンパイル・リンクする")
 
 (defparameter *known-function-names* nil
   "現在のトランスパイル対象ファイル内でdefunされている関数名の一覧。mainが
@@ -1226,7 +1234,7 @@
    束縛した全変数(パラメータ+自由変数)を含むalist"
   (let ((tail-stmt (transpile-tail-stmt body-form scope)))
     (with-output-to-string (out)
-      (format out "static tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
+      (format out "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
       (when (null params)
         (format out "    (void)evaluated_args;~%"))
       (dolist (stmt preamble-stmts)
@@ -1482,10 +1490,15 @@
 (defun transpile-prototype (form)
   "(defun name (param*) body) から、mainがbody生成前に出力する前方宣言を作る。
    相互再帰時、defunの並び順に関わらずどちらのC関数からも他方を呼べるようにする
-   (za.cのシンボル解決に頼らない代わりに、AOTのC前方宣言で解決する)。__step版は
-   ファイル内実装詳細(トランポリンのジャンプ先)なのでstaticにする"
+   (za.cのシンボル解決に頼らない代わりに、AOTのC前方宣言で解決する)。M15:
+   *output-c-path*/*fixture-output-c-path*の2ファイルに分かれた後も、フィクスチャ
+   側からAOT側の関数を末尾呼び出しする場合に.fn = 対象__stepという形でファイルを
+   跨いで関数ポインタを取る必要があるため、__step版もstaticにはしない(以前は
+   ファイル内実装詳細としてstaticにしていたが、ファイル分割に伴い外部リンケージが
+   必須になった)。全既知関数の前方宣言を両ファイルへ共通で出力する(自分の
+   ファイルで定義されない関数は本体無しの宣言のみになるが、Cとして正しい)"
   (let ((c-name (lisp-name-to-c-name (second form))))
-    (format nil "static tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);"
+    (format nil "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);"
             c-name c-name)))
 
 
@@ -1570,9 +1583,40 @@
                     (list (symbol-name (second form)) (lisp-name-to-c-name (second form))))
                   aot-defuns)))
 
+(defun emit-c-file (out-path prototypes bodies tail-text)
+  "prototypes(全既知関数分、この呼び出しのファイルに定義が無いものも含む)と
+   bodies(このファイルが実際に定義する関数の本体)を、共通のヘッダ(#include/
+   tco_result_t型定義)と共に1つのCファイルout-pathへ書き出す。tail-textは
+   bodiesの後に追加でそのまま書き出す文字列(registration/toplevel-runner等、
+   不要なら空文字列)。M15: *output-c-path*(本番AOT)と*fixture-output-c-path*
+   (テスト専用フィクスチャ)の2ファイルから共通で呼ばれる"
+  (with-open-file (out out-path :direction :output :if-exists :supersede)
+    ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
+    ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。
+    ;; M14基盤E: open-input-stream/close(cc_open_input_stream/cc_close)はstream_lisp.hで
+    ;; 宣言されているため、同じ理由でstream_lisp.hも必要
+    ;; FAT16-M0(0): logand/logior/logxor/ash(cc_logand等)はsubprimitive.hで
+    ;; 宣言されているため、同じ理由でsubprimitive.hも必要
+    ;; M15: %%ide-*(cc_ide_*)はide_subprimitive.hで宣言されているため、
+    ;; 同じ理由でide_subprimitive.hも必要
+    (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%#include \"subprimitive.h\"~%#include \"ide_subprimitive.h\"~%~%")
+    ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
+    ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
+    ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)。
+    ;; M15: 2ファイルそれぞれが独立してこの型定義を持つ(Cにtypeのリンケージは
+    ;; 無く、同じレイアウトの型を各翻訳単位が個別に定義するだけなので問題ない)
+    (format out "typedef struct tco_result tco_result_t;~%")
+    (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
+    (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%};~%~%")
+    (dolist (p prototypes)
+      (format out "~A~%" p))
+    (format out "~%")
+    (dolist (b bodies)
+      (format out "~A~%" b))
+    (format out "~%~A" tail-text)))
+
 (defun main ()
-  (let* ((fixture-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
-                                         (read-all-forms *runtime-lisp-path*)))
+  (let* ((fixture-defuns (remove-if-not #'toplevel-defun-p (read-all-forms *runtime-lisp-path*)))
          (aot-all-forms (read-all-forms *aot-lisp-path*))
          (aot-defuns (remove-if-not #'toplevel-defun-p aot-all-forms))
          (aot-toplevel-forms (remove-if #'toplevel-defun-p aot-all-forms))
@@ -1582,35 +1626,26 @@
          (fs-all-forms (mapcan #'read-all-forms *fs-lisp-paths*))
          (fs-defuns (remove-if-not #'toplevel-defun-p fs-all-forms))
          (fs-toplevel-forms (remove-if #'toplevel-defun-p fs-all-forms))
-         (defuns (append fixture-defuns aot-defuns utility-defuns fs-defuns))
-         (*known-function-names* (mapcar #'second defuns))
-         (prototypes (mapcar #'transpile-prototype defuns))
-         (bodies (mapcar #'transpile-defun defuns))
-         (registration (emit-aot-registration (append aot-defuns utility-defuns fs-defuns)))
+         ;; M15: main-defunsが本番のカーネルバイナリ(*output-c-path*)へ実際に
+         ;; 定義を出力する関数群。fixture-defuns(テスト専用)はここに含めない
+         (main-defuns (append aot-defuns utility-defuns fs-defuns))
+         (all-defuns (append fixture-defuns main-defuns))
+         (*known-function-names* (mapcar #'second all-defuns))
+         ;; フィクスチャ側からAOT関数を(直接/末尾)呼び出すケースがあるため、
+         ;; 前方宣言だけは両ファイルへ全既知関数分を共通で出力する(定義が無い
+         ;; 側ではただのextern宣言になるだけで、Cとして問題ない)
+         (all-prototypes (mapcar #'transpile-prototype all-defuns))
+         (main-bodies (mapcar #'transpile-defun main-defuns))
+         (fixture-bodies (mapcar #'transpile-defun fixture-defuns))
+         (registration (emit-aot-registration main-defuns))
          ;; init_aot.lisp(*classes*のdefdynamic+21個の%register-builtin-class呼び出し)
          ;; -> utility.lisp -> fs-lisp-paths(依存関係の順)の順序で実行する必要がある
          ;; (fat16.lisp/fat32.lispのdefclassが<standard-object>等の組み込みクラスに
          ;; 依存するため)。この3ファイル群の読み込み順がそのまま実行順になる
          (toplevel-runner (emit-toplevel-forms-runner (append aot-toplevel-forms utility-toplevel-forms fs-toplevel-forms))))
-    (with-open-file (out *output-c-path* :direction :output :if-exists :supersede)
-      ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
-      ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。
-      ;; M14基盤E: open-input-stream/close(cc_open_input_stream/cc_close)はstream_lisp.hで
-      ;; 宣言されているため、同じ理由でstream_lisp.hも必要
-      ;; FAT16-M0(0): logand/logior/logxor/ash(cc_logand等)はsubprimitive.hで
-      ;; 宣言されているため、同じ理由でsubprimitive.hも必要
-      ;; M15: %%ide-*(cc_ide_*)はide_subprimitive.hで宣言されているため、
-      ;; 同じ理由でide_subprimitive.hも必要
-      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%#include \"subprimitive.h\"~%#include \"ide_subprimitive.h\"~%~%")
-      ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
-      ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
-      ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)
-      (format out "typedef struct tco_result tco_result_t;~%")
-      (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
-      (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%};~%~%")
-      (dolist (p prototypes)
-        (format out "~A~%" p))
-      (format out "~%")
-      (dolist (b bodies)
-        (format out "~A~%" b))
-      (format out "~%~A~%~A" registration toplevel-runner))))
+    (emit-c-file *output-c-path* all-prototypes main-bodies
+                 (format nil "~A~%~A" registration toplevel-runner))
+    ;; M15: フィクスチャは登録(emit-aot-registration)もtoplevel-runnerも不要
+    ;; (テスト専用でglobal_environmentへは登録しない、transpile_fixture.lisp
+    ;; 自体もdefun以外のトップレベルフォームを持たない)
+    (emit-c-file *fixture-output-c-path* all-prototypes fixture-bodies "")))
