@@ -52,7 +52,7 @@
 ;; BIG.TXTの内容は"0123456789"の繰り返しなので、インデックスiの値は(i mod 10)+48
 ;; (ASCIIコード)になる。
 
-(assert-equal (list 72 101 108 108 111) (subseq (fat16-read-file *test-device* "/TEST.LSP") 0 5))
+(assert-equal #(72 101 108 108 111) (subseq (fat16-read-file *test-device* "/TEST.LSP") 0 5))
 (assert-equal 18 (length (fat16-read-file *test-device* "/TEST.LSP")))
 
 (defglobal fat16-test-big (fat16-read-file *test-device* "/BIG.TXT"))
@@ -87,24 +87,20 @@
 ;; 書き込み、読み込みで一致することを確認する。他の既存ファイル(TEST.LSP/BIG.TXT/
 ;; HELLO.TXT)は読み込み専用のまま変更しないため、書き込みはこのファイルにのみ行う。
 
-;; (%fat16-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumリストを
-;; 作るテスト専用ヘルパー。init_aot.lispのcreate-listはこのマイルストンの起動
-;; スクリプト(init.lispのみload)からは使えないため自前で用意する。再帰は使わず
-;; whileで組み立てる(nがファイルサイズに比例して大きくなり得るため、
-;; eval_no_tco_interpreter_stack_limitと同じ理由でLisp再帰を避ける)。
+;; (%fat16-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumの
+;; general-vectorを作るテスト専用ヘルパー。[ファイルI/O]#46(M3)でfat16-write-file/
+;; fat16-create-fileの契約がconsリストからvectorへ変更されたのに合わせ、
+;; create-vector(第二引数で全要素を初期化できる既存プリミティブ)を使うよう変更
+;; した(関数名は既存の呼び出し箇所を変えずに済むようそのまま残す)。
 (defun %fat16-test-make-byte-list (n value)
-  (let ((i 0) (acc nil))
-    (while (< i n)
-      (setq acc (cons value acc))
-      (setq i (+ i 1)))
-    acc))
+  (create-vector n value))
 
 ;; 書き込み前の内容確認(念のため)
 (assert-equal 2048 (length (fat16-read-file *test-device* "/WRITE1.TXT")))
 (assert-equal 65 (elt (fat16-read-file *test-device* "/WRITE1.TXT") 0))
 (assert-equal 65 (elt (fat16-read-file *test-device* "/WRITE1.TXT") 2047))
 
-(defglobal fat16-test-write1-new (list 87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
+(defglobal fat16-test-write1-new #(87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
 
 (assert-equal t (if (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-new) t nil))
 (assert-equal fat16-test-write1-new (fat16-read-file *test-device* "/WRITE1.TXT"))
@@ -196,7 +192,7 @@
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "DEEP.TXT" ':file 0))
               (fat16-read-dir *test-device* "/SUBDIR/DEEPER"))
 
-(assert-equal (list 110 101 115 116 101 100 32 102 105 108 101 32 99 111 110 116 101 110 116)
+(assert-equal #(110 101 115 116 101 100 32 102 105 108 101 32 99 111 110 116 101 110 116)
               (fat16-read-file *test-device* "/SUBDIR/NESTED.TXT"))
 
 (assert-equal nil (fat16-read-file *test-device* "/SUBDIR/DEEPER/DEEP.TXT"))
@@ -218,7 +214,7 @@
 ;; 確認済み)。
 
 ;; 既存ファイル(/SUBDIR/NESTED.TXT、19byte)への同クラスタ内上書き
-(defglobal fat16-test-nested-new (list 78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
+(defglobal fat16-test-nested-new #(78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
 
 (assert-equal t (if (fat16-write-file *test-device* "/SUBDIR/NESTED.TXT" fat16-test-nested-new) t nil))
 (assert-equal fat16-test-nested-new (fat16-read-file *test-device* "/SUBDIR/NESTED.TXT"))

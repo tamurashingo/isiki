@@ -78,12 +78,12 @@
 ;; 内容は"0123456789"の繰り返しなので、インデックスiの値は(i mod 10)+48
 ;; (ASCIIコード)になる。
 
-(assert-equal (list 72 101 108 108 111) (subseq (fat32-read-file *fat32-test-device* "/TEST.LSP") 0 5))
+(assert-equal #(72 101 108 108 111) (subseq (fat32-read-file *fat32-test-device* "/TEST.LSP") 0 5))
 
 ;;; --- FAT32-M10: VFAT Long File Name (LFN) ---
 
-(assert-equal (list 108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/Long_File_Name.txt") 0 4))
-(assert-equal (list 108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/long_file_name.txt") 0 4))
+(assert-equal #(108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/Long_File_Name.txt") 0 4))
+(assert-equal #(108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/long_file_name.txt") 0 4))
 (assert-equal 1 (length (fat32-read-file *fat32-test-device* "/This_Is_A_Very_Long_File_Name.txt")))
 (assert-equal 18 (length (fat32-read-file *fat32-test-device* "/TEST.LSP")))
 
@@ -93,7 +93,7 @@
 (assert-equal 49 (elt fat32-test-big 511))
 (assert-equal 50 (elt fat32-test-big 512))
 
-(assert-equal (list 110 101 115 116 101) (subseq (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT") 0 5))
+(assert-equal #(110 101 115 116 101) (subseq (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT") 0 5))
 (assert-equal 19 (length (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT")))
 
 ;;; --- FAT32-M6a: 既存ファイルの同クラスタ数上書き ---
@@ -104,22 +104,20 @@
 ;; ことを確認する。他の既存ファイルは読み込み専用のまま変更しないため、書き込みは
 ;; このファイルにのみ行う。
 
-;; (%fat32-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumリストを
-;; 作るテスト専用ヘルパー。再帰は使わずwhileで組み立てる(nがファイルサイズに
-;; 比例して大きくなり得るため)。
+;; (%fat32-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumの
+;; general-vectorを作るテスト専用ヘルパー。[ファイルI/O]#46(M3)でfat32-write-file/
+;; fat32-create-fileの契約がconsリストからvectorへ変更されたのに合わせ、
+;; create-vectorを使うよう変更した(関数名は既存の呼び出し箇所を変えずに済むよう
+;; そのまま残す)。
 (defun %fat32-test-make-byte-list (n value)
-  (let ((i 0) (acc nil))
-    (while (< i n)
-      (setq acc (cons value acc))
-      (setq i (+ i 1)))
-    acc))
+  (create-vector n value))
 
 ;; 書き込み前の内容確認(念のため)
 (assert-equal 512 (length (fat32-read-file *fat32-test-device* "/WRITE1.TXT")))
 (assert-equal 65 (elt (fat32-read-file *fat32-test-device* "/WRITE1.TXT") 0))
 (assert-equal 65 (elt (fat32-read-file *fat32-test-device* "/WRITE1.TXT") 511))
 
-(defglobal fat32-test-write1-new (list 87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
+(defglobal fat32-test-write1-new #(87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
 
 (assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new) t nil))
 (assert-equal fat32-test-write1-new (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
@@ -202,7 +200,7 @@
               (fat32-read-dir *fat32-test-device* "/"))
 
 ;; サブディレクトリ内への書き込み・新規作成(多階層パス解決の回帰確認)
-(defglobal fat32-test-nested-new (list 78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
+(defglobal fat32-test-nested-new #(78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
 
 (assert-equal t (if (fat32-write-file *fat32-test-device* "/SUBDIR/NESTED.TXT" fat32-test-nested-new) t nil))
 (assert-equal fat32-test-nested-new (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT"))

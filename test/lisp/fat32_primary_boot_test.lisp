@@ -48,12 +48,14 @@
     (assert-equal t (if esp-handle t nil))
     (assert-equal t (if (%device-fat32-uuid esp-handle) t nil))
     ;; ESPスライス経由でfat32-read-fileが実際にBOOTX64.EFI(PE実行ファイル、
-    ;; 先頭2byteは"MZ"=77,90)を読めること。
+    ;; 先頭2byteは"MZ"=77,90)を読めること。[ファイルI/O]#46(M3)でfat32-read-file
+    ;; の戻り値がconsリストからgeneral-vectorへ変わったため、car/cdrではなくelt
+    ;; で読む。
     (let ((bytes (fat32-read-file esp-handle "/EFI/BOOT/BOOTX64.EFI")))
       (progn
         (assert-equal t (if bytes t nil))
-        (assert-equal 77 (car bytes))
-        (assert-equal 90 (car (cdr bytes)))))
+        (assert-equal 77 (elt bytes 0))
+        (assert-equal 90 (elt bytes 1))))
     ;; 親の生ディスクハンドル(ide-primary-master自身)は、LBA0がGPTのプロテクティブ
     ;; MBRであるためFAT16/FAT32どちらでもない(「ディスク全体はFAT16/FAT32では
     ;; アクセスできない」、documents/devices.mdの実証)。

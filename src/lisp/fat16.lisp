@@ -280,39 +280,43 @@
       (setq remaining (cdr remaining)))
     acc))
 
-;; (%fat16-read-lba-list device lbas) : lbasの順にセクタを読み、連結したbyteリスト
-;; を返す。read-sectorが失敗した場合はそれまでに読んだ分は捨ててnil(既存のIDE層と
-;; 同じ「失敗時nil」の慣習)。
+;; (%fat16-read-lba-list device lbas) : lbasの順にセクタを読み、連結したbyteの
+;; general-vectorを返す。read-sectorが失敗した場合はそれまでに読んだ分は捨てて
+;; nil(既存のIDE層と同じ「失敗時nil」の慣習)。
 ;;
-;; 以前はappendの第一引数を1セクタ分(512byte)に留める再帰実装だったが、
-;; セクタ数(=defun呼び出しの再帰深さ)がファイルサイズに比例して増えると、
-;; append自体を直さずともこのインタプリタにTCOが無いこと自体が原因で
-;; triple faultした(BIG.TXTの2クラスタ=8セクタで再現、TEST.LSPの1クラスタ=
-;; 4セクタでは再現しなかった)。このためセクタ・バイト単位の繰り込みを
-;; while(tagbody/goベース、Cスタックを消費しない)へ置き換え、再帰を
-;; 一切使わずにファイル全体を読む。
+;; [ファイルI/O]#46(M3): 以前はconsリストへ1byteずつ逆順に積んでから
+;; %fat16-reverse-iterで正順化する実装だったが、ファイルサイズに比例した数の
+;; consセルを生成し、コピーGCのコストがその生存ヒープサイズに比例して増える
+;; ため、大きいファイル(カーネル自身のブートバイナリ等)の読み込みが著しく
+;; 遅くなっていた(#41)。あらかじめ必要な長さのvectorを1回だけ確保し、
+;; 各セクタのバイトをset-eltでO(1)に直接書き込む方式に変更した(以前はappend/
+;; consリスト構築を避けるためにwhileを使っていたが、ここでもconsセルを一切
+;; 生成しない点が異なる)。read-sector自体は1セクタ(512byte)分のfixnumリストを
+;; 返す既存の契約のまま変更しない(ide.lisp側の変更は不要、影響はFAT層の
+;; ファイル全体バッファの表現のみ)。
 (defun %fat16-read-lba-list (device lbas)
-  (let ((remaining-lbas lbas) (rev-bytes nil) (ok t))
+  (let ((buf (create-vector (* (length lbas) 512) 0)) (remaining-lbas lbas) (base 0) (ok t))
     (while (and ok remaining-lbas)
       (let ((sector-bytes (read-sector device (car remaining-lbas))))
         (if (null sector-bytes)
             (setq ok nil)
             (progn
-              (let ((remaining-bytes sector-bytes))
+              (let ((remaining-bytes sector-bytes) (i 0))
                 (while remaining-bytes
-                  (setq rev-bytes (cons (car remaining-bytes) rev-bytes))
-                  (setq remaining-bytes (cdr remaining-bytes))))
-              (setq remaining-lbas (cdr remaining-lbas))))))
+                  (set-elt (car remaining-bytes) buf (+ base i))
+                  (setq remaining-bytes (cdr remaining-bytes))
+                  (setq i (+ i 1))))
+              (setq remaining-lbas (cdr remaining-lbas))
+              (setq base (+ base 512))))))
     (if ok
-        (%fat16-reverse-iter rev-bytes)
+        buf
         nil)))
 
 ;; (fat16-read-file device path) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"のような
-;; 多階層パス、FAT16-M7a)のファイル本体をfixnum(0-255)のリストとして返す。
-;; read-sector/write-sectorと同じバイト列表現(全体方針: FAT16層のバイト列操作は
-;; fixnumリストのまま行う、文字列化しない)。パスが解決できない・エントリが
-;; 見つからない場合・クラスタ読み込みに失敗した場合はnil。0byteファイル(size=0)
-;; はクラスタを辿らずそのままnil(=空リスト)を返す。パス解決の実体は
+;; 多階層パス、FAT16-M7a)のファイル本体をfixnum(0-255)のgeneral-vectorとして
+;; 返す([ファイルI/O]#46(M3)でconsリストから変更、#41対応)。パスが解決できない・
+;; エントリが見つからない場合・クラスタ読み込みに失敗した場合はnil。0byteファイル
+;; (size=0)はクラスタを辿らずそのままnilを返す。パス解決の実体は
 ;; %fat16-resolve-file(このファイル末尾、FAT16-M7a節)。
 (defun fat16-read-file (device path)
   (let ((bpb (fat16-read-bpb device)))
@@ -367,23 +371,27 @@
         (setq values (cdr values))))
     list))
 
-;; (%fat16-split-into-chunks bytes chunk-size) : bytesをchunk-sizeごとのリストの
-;; リストに分割する。最終チャンクが足りない分は0でパディングする。
-;; %fat16-read-lba-list(M4)と同じ理由で、外側・内側ともLisp再帰を使わずwhileで
-;; 書く(バイト数がファイルサイズに比例して増えるため)。%fat16-reverse-iterを
-;; 再利用する。
+;; (%fat16-split-into-chunks bytes chunk-size) : bytes(general-vector、
+;; [ファイルI/O]#46(M3)でconsリストから変更)をchunk-sizeごとのfixnumリストの
+;; リストに分割する。最終チャンクが足りない分は0でパディングする。write-sectorは
+;; 1セクタ分(512要素)のfixnumリストを引数に取る既存の契約のままなので、各チャンク
+;; 自体は従来通りリストとして組み立てる(1チャンクはchunk-size個に固定長で
+;; ファイルサイズに比例しないため、consリスト構築のコストは無視できる)。
+;; 外側・内側ともLisp再帰を使わずwhileで書く(チャンク数自体はファイルサイズに
+;; 比例して増えるため)。%fat16-reverse-iterを再利用する。
 (defun %fat16-split-into-chunks (bytes chunk-size)
-  (let ((remaining bytes) (chunks nil))
-    (while remaining
-      (let ((rev-chunk nil) (count 0))
-        (while (and remaining (< count chunk-size))
-          (setq rev-chunk (cons (car remaining) rev-chunk))
-          (setq remaining (cdr remaining))
+  (let ((total (length bytes)) (offset 0) (chunks nil))
+    (while (< offset total)
+      (let ((rev-chunk nil) (count 0) (i offset))
+        (while (and (< i total) (< count chunk-size))
+          (setq rev-chunk (cons (elt bytes i) rev-chunk))
+          (setq i (+ i 1))
           (setq count (+ count 1)))
         (while (< count chunk-size)
           (setq rev-chunk (cons 0 rev-chunk))
           (setq count (+ count 1)))
-        (setq chunks (cons (%fat16-reverse-iter rev-chunk) chunks))))
+        (setq chunks (cons (%fat16-reverse-iter rev-chunk) chunks))
+        (setq offset (+ offset chunk-size))))
     (%fat16-reverse-iter chunks)))
 
 ;; (%fat16-write-lba-list device lbas chunks) : lbasとchunks(同じ長さ)を並行して
@@ -589,8 +597,8 @@
     (write-sector device dir-lba dir-bytes)))
 
 ;; (fat16-write-file device path bytes) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"
-;; のような多階層パス、FAT16-M7b)の既存ファイルへbytes(fixnum 0-255のリスト)を
-;; 上書きする。必要クラスタ数が現在のクラスタ数と同じ場合はFAT16-M6aの経路
+;; のような多階層パス、FAT16-M7b)の既存ファイルへbytes(fixnum 0-255の
+;; general-vector、[ファイルI/O]#46(M3)でconsリストから変更)を上書きする。必要クラスタ数が現在のクラスタ数と同じ場合はFAT16-M6aの経路
 ;; (データ→sizeフィールドのみ更新)、必要クラスタ数が増える場合はFAT16-M6bの経路
 ;; (新規クラスタ確保・FATチェイン延長→データ→start-cluster/sizeフィールド更新)で
 ;; 書き込む。必要クラスタ数が減る場合(縮小)はFAT16-M6bの対象外としてnilを返し、
@@ -731,7 +739,8 @@
 
 ;; (fat16-create-file device path bytes) : path("/NAME.EXT"、または
 ;; "/DOCS/NAME.EXT"のような多階層パス、FAT16-M7b)に新規ファイルを作成しbytes
-;; (fixnum 0-255のリスト、空ならnil)を書き込む。親ディレクトリが解決できない場合、
+;; (fixnum 0-255のgeneral-vector、[ファイルI/O]#46(M3)でconsリストから変更、
+;; 空ならnil)を書き込む。親ディレクトリが解決できない場合、
 ;; 同名エントリが既に存在する場合(上書きはfat16-write-fileの役割)、8.3名変換に
 ;; 失敗した場合(ロングファイルネーム相当)、空きディレクトリスロットが無い場合
 ;; (ディレクトリ満杯)、クラスタ確保に失敗した場合(ディスクフル)はいずれもnilを

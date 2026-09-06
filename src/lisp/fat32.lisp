@@ -541,33 +541,40 @@
 
 ;;; --- ファイル本体の読み込み ---
 
-;; (%fat32-read-lba-list device lbas) : lbasの順にセクタを読み、連結したbyteリスト
-;; を返す。read-sectorが失敗した場合はそれまでに読んだ分は捨ててnil。セクタ数に
-;; 比例して深くなるためwhileで書く(fat16.lispの%fat16-read-lba-listと同じ理由、
-;; eval_no_tco_interpreter_stack_limit)。
+;; (%fat32-read-lba-list device lbas) : lbasの順にセクタを読み、連結したbyteの
+;; general-vectorを返す。read-sectorが失敗した場合はそれまでに読んだ分は捨てて
+;; nil。[ファイルI/O]#46(M3): fat16.lispの%fat16-read-lba-listと同じ理由
+;; (#41、コピーGCの生存ヒープサイズに比例したコスト対策)で、consリストへ逆順に
+;; 積んでから正順化する実装から、あらかじめ確保したvectorへset-eltで直接書き込む
+;; 実装に変更した。read-sector自体は1セクタ(512byte)分のfixnumリストを返す既存の
+;; 契約のまま変更しない。
 ;; sector-bytes/remaining-bytesをループ外のletへ引き上げているのは、whileループ
 ;; 本体で毎回新規のletを生成しない一般的な流儀(fat32-cluster-chain等と同じ)に
 ;; 揃えたもの。
 (defun %fat32-read-lba-list (device lbas)
-  (let ((remaining-lbas lbas) (rev-bytes nil) (ok t) (sector-bytes nil) (remaining-bytes nil))
+  (let ((buf (create-vector (* (length lbas) 512) 0)) (remaining-lbas lbas) (base 0) (ok t) (sector-bytes nil) (remaining-bytes nil) (i 0))
     (while (and ok remaining-lbas)
       (setq sector-bytes (read-sector device (car remaining-lbas)))
       (if (null sector-bytes)
           (setq ok nil)
           (progn
             (setq remaining-bytes sector-bytes)
+            (setq i 0)
             (while remaining-bytes
-              (setq rev-bytes (cons (car remaining-bytes) rev-bytes))
-              (setq remaining-bytes (cdr remaining-bytes)))
-            (setq remaining-lbas (cdr remaining-lbas)))))
+              (set-elt (car remaining-bytes) buf (+ base i))
+              (setq remaining-bytes (cdr remaining-bytes))
+              (setq i (+ i 1)))
+            (setq remaining-lbas (cdr remaining-lbas))
+            (setq base (+ base 512)))))
     (if ok
-        (%fat32-reverse-iter rev-bytes)
+        buf
         nil)))
 
 ;; (fat32-read-file device path) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"のような
-;; 多階層パス)のファイル本体をfixnum(0-255)のリストとして返す。パスが解決できない・
+;; 多階層パス)のファイル本体をfixnum(0-255)のgeneral-vectorとして返す
+;; ([ファイルI/O]#46(M3)でconsリストから変更、#41対応)。パスが解決できない・
 ;; エントリが見つからない場合・クラスタ読み込みに失敗した場合はnil。0byteファイル
-;; (size=0)はクラスタを辿らずそのままnil(=空リスト)を返す。
+;; (size=0)はクラスタを辿らずそのままnilを返す。
 (defun fat32-read-file (device path)
   (let ((bpb (fat32-read-bpb device)))
     (if (null bpb)
@@ -617,21 +624,25 @@
         (setq values (cdr values))))
     list))
 
-;; (%fat32-split-into-chunks bytes chunk-size) : bytesをchunk-sizeごとのリストの
-;; リストに分割する。最終チャンクが足りない分は0でパディングする。fat16.lispの
-;; %fat16-split-into-chunksと同じ理由でwhileベース。
+;; (%fat32-split-into-chunks bytes chunk-size) : bytes(general-vector、
+;; [ファイルI/O]#46(M3)でconsリストから変更)をchunk-sizeごとのfixnumリストの
+;; リストに分割する。最終チャンクが足りない分は0でパディングする。write-sectorが
+;; 1セクタ分(512要素)のfixnumリストを引数に取る既存の契約のままなので、各チャンク
+;; 自体はfat16.lispの%fat16-split-into-chunksと同じ理由(固定長でファイルサイズに
+;; 比例しない)で従来通りリストとして組み立てる。外側・内側ともwhileベース。
 (defun %fat32-split-into-chunks (bytes chunk-size)
-  (let ((remaining bytes) (chunks nil))
-    (while remaining
-      (let ((rev-chunk nil) (count 0))
-        (while (and remaining (< count chunk-size))
-          (setq rev-chunk (cons (car remaining) rev-chunk))
-          (setq remaining (cdr remaining))
+  (let ((total (length bytes)) (offset 0) (chunks nil))
+    (while (< offset total)
+      (let ((rev-chunk nil) (count 0) (i offset))
+        (while (and (< i total) (< count chunk-size))
+          (setq rev-chunk (cons (elt bytes i) rev-chunk))
+          (setq i (+ i 1))
           (setq count (+ count 1)))
         (while (< count chunk-size)
           (setq rev-chunk (cons 0 rev-chunk))
           (setq count (+ count 1)))
-        (setq chunks (cons (%fat32-reverse-iter rev-chunk) chunks))))
+        (setq chunks (cons (%fat32-reverse-iter rev-chunk) chunks))
+        (setq offset (+ offset chunk-size))))
     (%fat32-reverse-iter chunks)))
 
 ;; (%fat32-write-lba-list device lbas chunks) : lbasとchunks(同じ長さ)を並行して
@@ -855,7 +866,8 @@
     (write-sector device dir-lba dir-bytes)))
 
 ;; (fat32-write-file device path bytes) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"
-;; のような多階層パス)の既存ファイルへbytes(fixnum 0-255のリスト)を上書きする。
+;; のような多階層パス)の既存ファイルへbytes(fixnum 0-255のgeneral-vector、
+;; [ファイルI/O]#46(M3)でconsリストから変更)を上書きする。
 ;; 必要クラスタ数が現在のクラスタ数と同じ場合はFAT32-M6aの経路(データ→sizeフィールド
 ;; のみ更新)、必要クラスタ数が増える場合はFAT32-M6bの経路(新規クラスタ確保・FAT
 ;; チェイン延長→データ→start-cluster/sizeフィールド更新)で書き込む。必要クラスタ数
@@ -1357,7 +1369,8 @@
 
 ;; (fat32-create-file device path bytes) : path("/NAME.EXT"、または
 ;; "/DOCS/NAME.EXT"のような多階層パス)に新規ファイルを作成しbytes(fixnum 0-255の
-;; リスト、空ならnil)を書き込む。親ディレクトリが解決できない場合、同名エントリが
+;; general-vector、[ファイルI/O]#46(M3)でconsリストから変更、空ならnil)を
+;; 書き込む。親ディレクトリが解決できない場合、同名エントリが
 ;; 既に存在する場合(上書きはfat32-write-fileの役割)、8.3名変換に失敗した場合
 ;; (ロングファイルネーム相当)、空きディレクトリスロットが無い場合(ディレクトリ
 ;; 満杯)、クラスタ確保に失敗した場合(ディスクフル)はいずれもnilを返し、何も

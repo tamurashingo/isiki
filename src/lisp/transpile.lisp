@@ -247,7 +247,11 @@
     (<= . "primitive_less_equal")
     ;; M15: ide.lispが%ide-bytes-to-addrのwhile条件に使う(NOTはnullと同じ
     ;; primitive_nullとしてos_bootstrap内で登録済み)
-    (not . "primitive_null")))
+    (not . "primitive_null")
+    ;; [ファイルI/O]#46(M3): %fat16-read-lba-list/%fat32-read-lba-list相当が
+    ;; ファイル全体のバイト列バッファをconsリストではなくgeneral-vectorとして
+    ;; 確保するのに使う(elt/set-elt/length/subseqは既に登録済み)
+    (create-vector . "primitive_create_vector")))
 
 (defun str->fn (fn-str)
   "文字列から関数オブジェクトを得る。関数が未定義だが alist に登録するための処置"

@@ -60,7 +60,7 @@
 ;; (既存のTEST.LSPは短名のためLFNの検証にはならない)。
 
 ;; 8.3に収まらない長いファイル名での新規作成→読み込みの往復一致。
-(defglobal *partition-test-lfn-content* (list 83 76 73 67 69 45 76 70 78)) ;; "SLICE-LFN"
+(defglobal *partition-test-lfn-content* #(83 76 73 67 69 45 76 70 78)) ;; "SLICE-LFN"
 
 (assert-equal t (if (fat32-create-file *partition-test-p2* "/Partition_Slice_LFN_File.txt" *partition-test-lfn-content*) t nil))
 (assert-equal *partition-test-lfn-content* (fat32-read-file *partition-test-p2* "/Partition_Slice_LFN_File.txt"))
@@ -94,5 +94,8 @@
         (cons b (%partition-test-read-all-bytes stream)))))
 
 (defglobal *partition-test-mount-stream* (open-input-stream "/Partition_Slice_LFN_File.txt"))
-(assert-equal *partition-test-lfn-content* (%partition-test-read-all-bytes *partition-test-mount-stream*))
+;; %partition-test-read-all-bytesはread-byte経由でリストを組み立てるが、
+;; *partition-test-lfn-content*は[ファイルI/O]#46(M3)でvectorになったため、
+;; #'vectorへapplyして型を揃えてから比較する。
+(assert-equal *partition-test-lfn-content* (apply #'vector (%partition-test-read-all-bytes *partition-test-mount-stream*)))
 (close *partition-test-mount-stream*)
