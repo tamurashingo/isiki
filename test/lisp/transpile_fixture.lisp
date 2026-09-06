@@ -683,3 +683,48 @@
               (setq total (+ total doubled)))
             (setq i (+ i 1)))))
       total)))
+
+;; M1([ファイルI/O]#44): defgeneric/defmethodのトランスパイラ対応の検証。総称関数
+;; ディスパッチの実行時基盤自体(%register-method/%generic-call/%order-methods/
+;; %invoke-method-chain/next-method-p/call-next-method)はM12 Phase5(#27、上記
+;; %%transpile-fixture-generic-dispatch等)で既に手動呼び出しとして検証済みなので、
+;; ここではdefgeneric/defmethodというマクロ構文がその基盤へ正しく展開されることだけを
+;; 検証する。
+
+;; defgenericの展開は普通のdefunになる(main側のtoplevel-defun-p判定前のプリパス
+;; %%expand-defgenerics-in-formsで展開される、transpile.lisp参照)。この
+;; トップレベルformだけで%%transpile-fixture-macro-gfという通常のdefunが1つ
+;; 生成され、C側から直接呼び出せる
+(defgeneric %%transpile-fixture-macro-gf (x))
+
+;; メソッドを1つも登録しない総称関数。%generic-callの「適用可能メソッド無し」
+;; 分岐(%%funcall-by-name経由でg_sym_eval_errorへフォールバック)が
+;; defgeneric経由でも変わらず動くことを検証する
+(defgeneric %%transpile-fixture-macro-gf-no-methods (x))
+
+;; defmethodの展開はトップレベルの%register-method呼び出し(defclassの
+;; %register-class呼び出しと同じ形の、ただの式)になるが、このフィクスチャ
+;; ファイルには本番のfs-lisp-paths等と違ってdefun以外のトップレベルフォームを
+;; 実行するrunnerが無い(main参照、fixture-defunsはtoplevel-defun-pで残った
+;; defunしか集めない)。そのため、上の%%transpile-fixture-make-instance等
+;; 既存の手動%register-method呼び出しパターンと同じく、defmethodを普通の
+;; defunの本体内にネストして書き、C側テストからこのdefunを明示的に1回呼び
+;; 出すことで登録する。これによりdefmethodの展開結果(%register-methodへの
+;; 呼び出し+ネストしたlambda)がプログラム中の任意の式位置でも正しく
+;; トランスパイルされること(M10のクロージャリフティング経由)を検証できる
+(defun %%transpile-fixture-register-macro-gf-methods ()
+  (progn
+    ;; class-ofはconsでない引数(fixnum)に対して(%find-class '<integer>)を返す
+    ;; (init_aot.lisp参照)。%method-applicable-pは非specializer指定のconsでない
+    ;; 側のメソッドを弾く際にも(subclassp (class-of arg) <cons>-class)を評価する
+    ;; ため、<integer>も<cons>と同様に事前登録しておく必要がある(未登録だと
+    ;; %find-classがnilを返し、subclassp経由で%%class-supersがnilを渡されて
+    ;; 境界外アクセスになる)
+    (%register-builtin-class '<integer> nil)
+    (%register-builtin-class '<cons> nil)
+    (defmethod %%transpile-fixture-macro-gf (x) (cons 'general x))
+    (defmethod %%transpile-fixture-macro-gf ((x <cons>))
+      (if (next-method-p)
+          (cons 'specific (call-next-method))
+          'specific-no-next))
+    t))

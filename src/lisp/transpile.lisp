@@ -259,7 +259,8 @@
         (cons 'with-open-input-file "expand-with-open-input-file")
         (cons 'with-open-output-stream "expand-with-open-output-stream")
         (cons 'with-open-output-file "expand-with-open-output-file")
-        (cons 'defclass "expand-defclass"))
+        (cons 'defclass "expand-defclass")
+        (cons 'defmethod "expand-defmethod"))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
@@ -729,6 +730,74 @@
          (%%make-class-raw ',name %supers
            (append (%merge-superclass-slots %supers)
                    (list ,@(%%defclass-slot-spec-forms slot-specs))))))))
+
+
+;;; defgeneric/defmethod: init.lispのdefmacro defgeneric/defmethod(init.lisp
+;;; 436-437行目/474-477行目)と同じ展開規則をホスト側に移植する。総称関数
+;;; ディスパッチの実行時基盤(%register-method/%generic-call/%applicable-methods/
+;;; %order-methods/%invoke-method-chain/next-method-p/call-next-method)は
+;;; 既にinit_aot.lispへ移動済み(M12 Phase5、#27)の普通のdefunであり、AOT側からも
+;;; 呼べる状態にある。そのためここで新規に追加するのはマクロ展開のグルーだけで
+;;; よい。interpreter側の(class ClassName)マクロは移植せず、既にAOT defunの
+;;; %find-classを直接呼ぶ(%find-class (quote ClassName))という形をemitする点だけが
+;;; interpreter版のdefmethod展開と異なる。
+;;;
+;;; defgenericの展開結果は(defclassの%register-class呼び出しと違って)ただの式では
+;;; なく普通のdefunなので、main側でtoplevel-defun-p判定(car formが'defunかどうかの
+;;; 生form判定)を行う前に先行展開しておく必要がある(下記%%expand-defgeneric-form/
+;;; %%expand-defgenerics-in-forms、mainから呼ぶ)。defmethodの展開結果は
+;;; %register-methodへのトップレベル呼び出し(defclassの%register-class呼び出しと
+;;; 同じ形の、ただの式)なので、*macro-expanders*経由でtranspile-toplevel-form/
+;;; emit-toplevel-forms-runnerに素直に乗る(fat16.lisp等、本番ファイルでの
+;;; 想定用途)。
+
+(defun %%first-param-specializer (param)
+  (if (consp param) (car (cdr param)) nil))
+
+(defun %%first-param-var (param)
+  (if (consp param) (car param) param))
+
+(defun %%lambda-list-specializers (lambda-list)
+  (if (null lambda-list)
+      nil
+      (cons (%%first-param-specializer (car lambda-list))
+            (%%lambda-list-specializers (cdr lambda-list)))))
+
+(defun %%method-plain-params (lambda-list)
+  (if (null lambda-list)
+      nil
+      (cons (%%first-param-var (car lambda-list))
+            (%%method-plain-params (cdr lambda-list)))))
+
+(defun %%specializer-forms (names)
+  (if (null names)
+      nil
+      (cons (if (car names) (list '%find-class (list 'quote (car names))) nil)
+            (%%specializer-forms (cdr names)))))
+
+(defun expand-defgeneric (form)
+  (destructuring-bind (defgeneric-kw name lambda-list &rest options) form
+    (declare (ignore defgeneric-kw lambda-list options))
+    `(defun ,name (&rest %generic-args) (%generic-call ',name %generic-args))))
+
+(defun expand-defmethod (form)
+  (destructuring-bind (defmethod-kw name lambda-list &rest body) form
+    (declare (ignore defmethod-kw))
+    `(%register-method ',name
+       (list ,@(%%specializer-forms (%%lambda-list-specializers lambda-list)))
+       (lambda ,(%%method-plain-params lambda-list)
+         ,(if (= (length body) 1) (car body) `(progn ,@body))))))
+
+(defun %%expand-defgeneric-form (form)
+  "formがdefgenericならこの1formをdefunへ展開し、それ以外はformをそのまま返す
+   (main側でtoplevel-defun-p判定を行う前に、ファイル内の全formへmapcarで適用する
+   プリパス用のヘルパー)"
+  (if (and (consp form) (eq (car form) 'defgeneric))
+      (expand-defgeneric form)
+      form))
+
+(defun %%expand-defgenerics-in-forms (forms)
+  (mapcar #'%%expand-defgeneric-form forms))
 
 
 (declaim (ftype function transpile-quoted))
@@ -1616,14 +1685,15 @@
     (format out "~%~A" tail-text)))
 
 (defun main ()
-  (let* ((fixture-defuns (remove-if-not #'toplevel-defun-p (read-all-forms *runtime-lisp-path*)))
-         (aot-all-forms (read-all-forms *aot-lisp-path*))
+  (let* ((fixture-defuns (remove-if-not #'toplevel-defun-p
+                            (%%expand-defgenerics-in-forms (read-all-forms *runtime-lisp-path*))))
+         (aot-all-forms (%%expand-defgenerics-in-forms (read-all-forms *aot-lisp-path*)))
          (aot-defuns (remove-if-not #'toplevel-defun-p aot-all-forms))
          (aot-toplevel-forms (remove-if #'toplevel-defun-p aot-all-forms))
-         (utility-all-forms (read-all-forms *utility-lisp-path*))
+         (utility-all-forms (%%expand-defgenerics-in-forms (read-all-forms *utility-lisp-path*)))
          (utility-defuns (remove-if-not #'toplevel-defun-p utility-all-forms))
          (utility-toplevel-forms (remove-if #'toplevel-defun-p utility-all-forms))
-         (fs-all-forms (mapcan #'read-all-forms *fs-lisp-paths*))
+         (fs-all-forms (%%expand-defgenerics-in-forms (mapcan #'read-all-forms *fs-lisp-paths*)))
          (fs-defuns (remove-if-not #'toplevel-defun-p fs-all-forms))
          (fs-toplevel-forms (remove-if #'toplevel-defun-p fs-all-forms))
          ;; M15: main-defunsが本番のカーネルバイナリ(*output-c-path*)へ実際に
