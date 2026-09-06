@@ -7,3 +7,4 @@ tmp/
 test-results.txt
 src/c/lisp_compiled.c
 
+.envrc

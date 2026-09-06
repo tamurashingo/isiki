@@ -42,9 +42,7 @@
     "Immobilized space total: " (%room-format-bytes (%%imm-space-total-bytes)) (create-string 1 #\Newline)
     "Immobilized space used: " (%room-format-bytes (%%imm-space-used-bytes)) (create-string 1 #\Newline)))
 
-(with-standard-output (create-string-output-stream)
-  (assert-equal nil (room))
-  (let ((actual (get-output-stream-string (standard-output))))
-    (progn
-      (assert-equal 0 (string-index (%room-test-expected-prefix) actual))
-      (assert-equal t (numberp (string-index (%room-test-expected-suffix) actual))))))
+(assert-output (result actual) (room)
+  (assert-equal nil result)
+  (assert-equal 0 (string-index (%room-test-expected-prefix) actual))
+  (assert-equal t (numberp (string-index (%room-test-expected-suffix) actual))))

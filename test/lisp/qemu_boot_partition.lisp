@@ -4,8 +4,11 @@
 (load "src/lisp/ide.lisp")
 (load "src/lisp/partition.lisp")
 (load "src/lisp/fat32.lisp")
+(load "src/lisp/fat16.lisp")
 (load "src/lisp/mount.lisp")
 (load "test/lisp/partition_test.lisp")
+(load "src/lisp/file-cmd.lisp")
+(load "test/lisp/file_cmd_test.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)
