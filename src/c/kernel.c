@@ -22,6 +22,15 @@
 // os_set_function経由でglobal_environmentへ登録する(M13)
 extern void os_register_aot_init_functions(void);
 
+// src/c/lisp_compiled.c(トランスパイラがsrc/lisp/device.lisp等から生成する)で
+// 定義される。device.lisp/ide.lisp等のdefun以外のトップレベルフォーム
+// (defdynamicの初期化・defclassのクラス登録・%ide-register-devices等の
+// 起動時に一度だけ実行すべき副作用)を、ソース上の順序のまま実行する(M15)。
+// os_register_aot_init_functionsの直後に呼ぶ必要がある(前者が全defunを
+// global_environmentへ登録し終えてから、それらを呼び出す副作用フォームを
+// 実行するため)
+extern void os_run_aot_toplevel_forms(void);
+
 /**
  * バージョン文字列・ビルド日時・ハッシュ・VirtIO-9pの検出結果をfbへ表示する
  * @param fb 表示先のframe buffer
@@ -100,6 +109,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_clock();
     os_register_za_primitives();
     os_register_aot_init_functions();
+    os_run_aot_toplevel_forms();
 
     frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);

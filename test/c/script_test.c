@@ -13,11 +13,24 @@
 #include "stream_lisp.h"
 #include "format.h"
 #include "subprimitive.h"
+#include "interrupt.h"
 
 // src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
 // gitignore対象のビルド成果物)で定義される。init.lispから移動したmember/assoc等を
 // os_set_function経由でglobal_environmentへ登録する(M13)
 extern void os_register_aot_init_functions(void);
+
+// src/c/lisp_compiled.c(device.lisp/ide.lisp等から生成される)で定義される。
+// defdynamicの初期化・%ide-register-devices等の起動時副作用を実行する(M15)。
+// kernel_mainと同じ順序(os_register_aot_init_functionsの直後)で呼ぶことで
+// 本番のトポロジーに合わせる
+extern void os_run_aot_toplevel_forms(void);
+
+// M15: device.lisp/ide.lisp(lisp_compiled.c)がcc_ide_*(ide_subprimitive.c)経由で
+// 参照するdrivers/ide.c/block_device.cをリンクするために必要。outb/inb/outw/inwの
+// ダミー実装は既にこのファイル下部にある(subprimitive.c用、同じ方針で流用できる)。
+// os_block_device_probe_allを呼ばないため%ide-register-devicesが登録するデバイス数は
+// 常に0になるだけで、実I/Oは発生しない
 
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
@@ -285,6 +298,7 @@ int main(int argc, char** argv) {
     os_register_streams();
     os_register_format();
     os_register_aot_init_functions();
+    os_run_aot_toplevel_forms();
 
     lisp_val_t env = os_make_environment(os_make_symbol("SCRIPT-TEST-ENV"), global_environment);
 

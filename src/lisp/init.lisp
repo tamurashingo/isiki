@@ -308,51 +308,19 @@
 ;;; 対象外とする。defgeneric/defmethod/call-next-method/next-method-pは後段
 ;;; (instancepの後)で実装する(単一dispatch・qualifier無しの最小実装)。
 
-;; *classes*はdefun(%register-class)の内側から書き換える必要があるため、
-;; defvar+setqではなくdefdynamic+%%set-dynamicを使う。setq(os_set_variable)は
-;; current environment自身にしか書き込めず、関数呼び出しは呼び出しごとに新しい
-;; environmentを作るため、defvar+setqでは%register-classの中でのsetqが
-;; 呼び出し元に見えない(冒頭の既知の制約と同じ理由)。defdynamicはレキシカルな
-;; 環境の親子関係と無関係なグローバルとして値を持つため、この制約を受けない。
-(defdynamic *classes* nil)
+;; *classes*自体のdefdynamicと、<object>以下の組み込みクラスをbootstrap登録する
+;; 21個の%register-builtin-class呼び出しはsrc/lisp/init_aot.lispへ移動した
+;; (M15: fat16.lisp/fat32.lispのdefclass(bpb/dir-entry等)がos_run_aot_toplevel_forms
+;; 経由でブート直後に実行されるため、*classes*と<standard-object>等の組み込み
+;; クラスもinit.lispのload(=インタプリタの初期化)を待たずブート時に用意する
+;; 必要が生じたため)。init.lisp常駐のままだと、ここで再度*classes*をnilに
+;; 戻してしまいブート時に登録済みのbpb/dir-entry等を消してしまうため、
+;; init.lisp側は完全に削除する(重複させない)。%find-class/%register-class/
+;; %resolve-supers/%register-builtin-class自体は既にM12基盤B/Cで移動済み。
 
-;; %find-class/%register-class/%resolve-supers/%register-builtin-classは
-;; src/lisp/init_aot.lispへ移動した(M12基盤B/C、#27)。*classes*自体の
-;; defdynamicと、直後の21個の%register-builtin-class呼び出しはmainがdefun
-;; 以外のトップレベルフォームを読まないためinit.lisp常駐のまま(AOT登録された
-;; ネイティブ関数はglobal_environmentへ通常のdefunと同じシンボル名で登録される
-;; ため、呼び出し側の実装場所に関わらずそのまま解決できる)。
-
-(%register-builtin-class '<object> nil)
-(%register-builtin-class '<basic-array> '(<object>))
-(%register-builtin-class '<basic-array*> '(<basic-array>))
-(%register-builtin-class '<general-array*> '(<basic-array*>))
-(%register-builtin-class '<basic-vector> '(<basic-array>))
-(%register-builtin-class '<general-vector> '(<basic-vector>))
-(%register-builtin-class '<string> '(<basic-vector>))
-(%register-builtin-class '<built-in-class> '(<object>))
-(%register-builtin-class '<character> '(<object>))
-(%register-builtin-class '<function> '(<object>))
-(%register-builtin-class '<generic-function> '(<function>))
-(%register-builtin-class '<standard-generic-function> '(<generic-function>))
-(%register-builtin-class '<list> '(<object>))
-(%register-builtin-class '<cons> '(<list>))
-(%register-builtin-class '<symbol> '(<object>))
-(%register-builtin-class '<null> '(<list> <symbol>))
-(%register-builtin-class '<number> '(<object>))
-(%register-builtin-class '<integer> '(<number>))
-(%register-builtin-class '<float> '(<number>))
-(%register-builtin-class '<standard-class> '(<object>))
-(%register-builtin-class '<standard-object> '(<object>))
-(%register-builtin-class '<stream> '(<object>))
-
-;; plistからkeyに対応する値を探す。見つからなければdefault
-(defun %plist-get (plist key default)
-  (if (null plist)
-      default
-      (if (eq (car plist) key)
-          (car (cdr plist))
-          (%plist-get (cdr (cdr plist)) key default))))
+;; %plist-getはsrc/lisp/init_aot.lispへ移動した(M15: device.lispが実行時に
+;; 直接呼ぶため、defclassマクロ展開時のホスト側ヘルパーとしてtranspile.lispへも
+;; 別途移植済み)。
 
 ;; (slot :initarg :key :initform expr) を、初期値をfuncallで取り出せる
 ;; thunk(引数無しlambda)付きの評価済みフォーム(list 'slot ':key (lambda () expr))
@@ -367,19 +335,12 @@
       nil
       (cons (%slot-spec-form (car specs)) (%slot-spec-forms (cdr specs)))))
 
-;; supersを指定しないdefclassは仕様上<standard-object>を暗黙に継承する
-;; (「A standard class defined with no direct superclasses is guaranteed to
-;; be disjoint from all of the classes in the figure, except for the classes
-;; named <standard-object> and <object>」)
-(defun %defclass-supers (super-names)
-  (if (null super-names)
-      (list (%find-class '<standard-object>))
-      (%resolve-supers super-names)))
-
-(defun %merge-superclass-slots (supers)
-  (if (null supers)
-      nil
-      (append (%%class-slots (car supers)) (%merge-superclass-slots (cdr supers)))))
+;; %defclass-supers/%merge-superclass-slotsはsrc/lisp/init_aot.lispへ移動した
+;; (M15: defclassマクロの展開結果に直接埋め込まれ実行時に呼ばれるため、
+;; fat16.lisp/fat32.lispのdefclassをos_run_aot_toplevel_forms経由でAOT実行
+;; できるようにするために移動)。AOT登録されたネイティブ関数はglobal_environment
+;; へ通常のdefunと同じシンボル名で登録されるため、この下のdefclassマクロ展開
+;; (インタプリタ実行のまま)からも変わらず解決できる。
 
 ;; (defclass name (super...) ((slot :initarg :key :initform expr) ...) options...)
 ;; supers/slot-specsはこの時点では評価しない(マクロなので)。実行時に親クラスを

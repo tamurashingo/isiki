@@ -10,6 +10,12 @@
 #include "lisp.h"
 #include "eval.h"
 #include "subprimitive.h"
+#include "interrupt.h"
+
+// M15: device.lisp/ide.lisp(lisp_compiled.c)がcc_ide_*(ide_subprimitive.c)経由で
+// 参照するdrivers/ide.c/block_device.cをリンクするために必要。outb/inb/outw/inwの
+// ダミー実装は既にこのファイル下部にある(subprimitive.c用、同じ方針で流用できる)。
+// このテストはread-sector等の実I/Oを伴う経路を呼ばない
 
 // runtime.c/process.c/za.c/reader.c/stream.c/stream_lisp.cをリンクするため、それらが
 // 参照するハードウェア/REPL依存の関数のダミー実装が必要になる(runtime_test.cと同じ
@@ -145,6 +151,9 @@ extern lisp_val_t lisp_ll_transpile_fixture_or_empty(lisp_val_t evaluated_args, 
 extern lisp_val_t lisp_ll_transpile_fixture_or_single(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_or_three(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_gc_protect(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_while_nested_let_boxed_sum(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_u16_to_bytes(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_patch_bytes(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_count_down(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_is_even(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_is_odd(lisp_val_t evaluated_args, lisp_val_t env);
@@ -1260,6 +1269,65 @@ static void test_transpile_fixture_gc_protect(void) {
            "GC_PROTECT: 内部GCを跨いでもxの指す文字列の内容は保たれる(パラメータが正しく追従している)");
 }
 
+static void test_transpile_fixture_while_nested_let_boxed_sum(void) {
+    // M15回帰テスト: fat16.lispの%fat16-split-into-chunksと同型の構造
+    // (外側whileの本体でbox化された変数をsetqするネストしたletを毎周新規生成する)を
+    // 再現し、n=5とn=2048の両方で正しい値になるか検証する
+    lisp_val_t result_small = lisp_ll_transpile_fixture_while_nested_let_boxed_sum(
+        os_make_cons(os_make_fixnum(5), nil), 0);
+    assert(result_small == os_make_fixnum(20),
+           "while+nested-let+boxed変数: n=5で合計0+2+4+6+8=20になる");
+
+    lisp_val_t result_large = lisp_ll_transpile_fixture_while_nested_let_boxed_sum(
+        os_make_cons(os_make_fixnum(2048), nil), 0);
+    UINT64 expected_large = 0;
+    for (UINT64 i = 0; i < 2048; i++) {
+        expected_large += i * 2;
+    }
+    assert(result_large == os_make_fixnum(expected_large),
+           "while+nested-let+boxed変数: n=2048でも繰り返し回数に関わらず正しい合計になる");
+}
+
+static void test_transpile_fixture_u16_to_bytes(void) {
+    // M15回帰テスト: transpile-exprが負の整数リテラル(ashの第二引数-8等)を
+    // os_make_fixnum(-8ULL)と誤って出力すると、Cの単項マイナスがunsigned long long
+    // リテラルへ適用され2の補数の巨大な値になり、本来の値と無関係なタグ付き値に
+    // なるバグがあった(os_make_fixnum_signedを使うよう修正済み)。0x1FF(511)を
+    // 2byteに分解して(255 1)になることを確認する
+    lisp_val_t result = lisp_ll_transpile_fixture_u16_to_bytes(
+        os_make_cons(os_make_fixnum(511), nil), 0);
+    assert(cc_car(result) == os_make_fixnum(255), "u16-to-bytes: 511の下位byteは255になる");
+    assert(cc_car(cc_cdr(result)) == os_make_fixnum(1), "u16-to-bytes: 511の上位byteは1になる(ash -8が正しく右シフトする)");
+}
+
+static void test_transpile_fixture_patch_bytes(void) {
+    // M15回帰テスト: fat16.lispの%fat16-patch-bytes!(sizeフィールド4byteの上書き)を
+    // 単離して再現する。32要素の0リストのoffset28から(1 8 0 0)を書き込み、
+    // 4要素すべてが反映されるか(offset28-31)を確認する
+    lisp_val_t list = nil;
+    for (int i = 0; i < 32; i++) {
+        list = os_make_cons(os_make_fixnum(0), list);
+    }
+    lisp_val_t value_list = os_make_cons(os_make_fixnum(1),
+                              os_make_cons(os_make_fixnum(8),
+                                os_make_cons(os_make_fixnum(0),
+                                  os_make_cons(os_make_fixnum(0), nil))));
+    lisp_val_t result = lisp_ll_transpile_fixture_patch_bytes(
+        os_make_cons(list, os_make_cons(os_make_fixnum(28), os_make_cons(value_list, nil))), 0);
+
+    lisp_val_t cell = result;
+    for (int i = 0; i < 28; i++) {
+        cell = cc_cdr(cell);
+    }
+    assert(cc_car(cell) == os_make_fixnum(1), "patch-bytes: offset28に1が書き込まれる");
+    cell = cc_cdr(cell);
+    assert(cc_car(cell) == os_make_fixnum(8), "patch-bytes: offset29に8が書き込まれる");
+    cell = cc_cdr(cell);
+    assert(cc_car(cell) == os_make_fixnum(0), "patch-bytes: offset30に0が書き込まれる(すでに0だが明示的に上書きされる)");
+    cell = cc_cdr(cell);
+    assert(cc_car(cell) == os_make_fixnum(0), "patch-bytes: offset31に0が書き込まれる(すでに0だが明示的に上書きされる)");
+}
+
 int main(void) {
     setup_heap();
     test_transpile_fixture_answer();
@@ -1353,6 +1421,9 @@ int main(void) {
     test_transpile_fixture_error();
     test_transpile_fixture_cerror_no_handler();
     test_transpile_fixture_cerror_with_handler();
+    test_transpile_fixture_while_nested_let_boxed_sum();
+    test_transpile_fixture_u16_to_bytes();
+    test_transpile_fixture_patch_bytes();
     // GC_PROTECT検証はos_reset_runtime_state_for_testでglobal_environment/symbol table等の
     // 状態を再初期化するため、他のテストに影響しないよう最後に実行する
     test_transpile_fixture_gc_protect();

@@ -9,7 +9,7 @@ TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
 # トランスパイラ(transpileターゲット)の生成物。git管理対象外で、これらの
 # 入力Lispファイルが変更された時だけ再生成される(下記$(LISP_COMPILED)ルール)
-TRANSPILE_LISP_SRC = src/lisp/transpile.lisp src/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp
+TRANSPILE_LISP_SRC = src/lisp/transpile.lisp src/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
 HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
@@ -51,7 +51,7 @@ TEST_BIN_REPL = $(BUILD_TMPDIR)/repl_test
 TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/subprimitive.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(TESTDIR)/subprimitive_test.c
 TEST_BIN_SUBPRIMITIVE = $(BUILD_TMPDIR)/subprimitive_test
 
-TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
+TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
 TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
@@ -79,7 +79,7 @@ TEST_BIN_P9 = $(BUILD_TMPDIR)/p9_test
 TEST_SRC_VIRTIO9P = $(SRCDIR)/p9.c $(SRCDIR)/virtio9p.c $(TESTDIR)/virtio9p_test.c
 TEST_BIN_VIRTIO9P = $(BUILD_TMPDIR)/virtio9p_test
 
-TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/print.c $(SRCDIR)/subprimitive.c $(LISP_COMPILED) $(TESTDIR)/lisp_compiled_test.c
+TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/print.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(TESTDIR)/lisp_compiled_test.c
 TEST_BIN_LISP_COMPILED = $(BUILD_TMPDIR)/lisp_compiled_test
 
 # interrupt.cはリンクせず、ide_test.cが独自にinb/outb/inw/outwをfake定義して

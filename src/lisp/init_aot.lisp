@@ -285,11 +285,30 @@
 ;;; クラスをbootstrap登録する21個の%register-builtin-class呼び出しは、
 ;;; mainがinit_aot.lisp中のdefun以外のトップレベルフォームを一切読まないため
 ;;; init.lisp常駐のまま(移動するとAOTコードから見えず単に死んだ定義になる)。
-;;; defclassマクロが展開時に呼ぶ%plist-get/%slot-spec-form(s)/
-;;; %defclass-supers/%merge-superclass-slotsは、defclass自体がトップレベル
-;;; マクロ呼び出しとして常にインタプリタ実行される(mainがdefun以外を無視する
-;;; ため)ことをgrepで確認した結果、AOTコードから呼ばれることが無いと判明した
-;;; ので、計画に反してここでは移動しない。
+;;; defclassマクロが展開時に(unquote-spliceで)呼ぶ%slot-spec-form(s)は
+;;; ホスト(transpile.lisp)側に移植した専用実装で完結するためinit.lisp常駐の
+;;; ままでよいが、%plist-get(device.lispが実行時に直接呼ぶ)と
+;;; %defclass-supers/%merge-superclass-slots(defclassの展開結果のコード自身に
+;;; 埋め込まれ実行時に呼ばれる)は、M15(documents/fs.md)でdevice.lisp/
+;;; fat16.lisp/fat32.lispをAOT化するため、ここへ移動する。
+
+;; plistからkeyに対応する値を探す。見つからなければdefault
+(defun %plist-get (plist key default)
+  (if (null plist)
+      default
+      (if (eq (car plist) key)
+          (car (cdr plist))
+          (%plist-get (cdr (cdr plist)) key default))))
+
+;; *classes*はdefun(%register-class)の内側から書き換える必要があるため、
+;; defvar+setqではなくdefdynamic+%%set-dynamicを使う(init.lispの元コメントと
+;; 同じ理由)。M15: fat16.lisp/fat32.lispのdefclass(bpb/dir-entry等)が
+;; os_run_aot_toplevel_forms経由でブート直後に実行されるため、init.lispのload
+;; (=インタプリタの初期化)を待たずここで用意する。main()がfs-lisp-pathsより
+;; 先にinit_aot.lispを読むため、このdefdynamicと直後の21個の
+;; %register-builtin-class呼び出しは常にfs-lisp-paths側のdefclassより先に
+;; 実行される(os_run_aot_toplevel_forms内の実行順はソース上の順序のまま)。
+(defdynamic *classes* nil)
 
 ;; nameで登録済みクラスを引く。未登録ならnil。
 (defun %find-class (name)
@@ -313,6 +332,46 @@
 ;; 親クラスが先に登録済みになる順序で呼ぶ必要がある(呼び出し元はinit.lisp常駐)。
 (defun %register-builtin-class (name super-names)
   (%register-class name (%%make-builtin-class-raw name (%resolve-supers super-names) nil)))
+
+;; <object>以下の組み込みクラスのbootstrap登録。init.lispからの移動(M15)。
+;; 親クラスが先に登録済みになる順序が必要(%register-builtin-classのコメント参照)。
+(%register-builtin-class '<object> nil)
+(%register-builtin-class '<basic-array> '(<object>))
+(%register-builtin-class '<basic-array*> '(<basic-array>))
+(%register-builtin-class '<general-array*> '(<basic-array*>))
+(%register-builtin-class '<basic-vector> '(<basic-array>))
+(%register-builtin-class '<general-vector> '(<basic-vector>))
+(%register-builtin-class '<string> '(<basic-vector>))
+(%register-builtin-class '<built-in-class> '(<object>))
+(%register-builtin-class '<character> '(<object>))
+(%register-builtin-class '<function> '(<object>))
+(%register-builtin-class '<generic-function> '(<function>))
+(%register-builtin-class '<standard-generic-function> '(<generic-function>))
+(%register-builtin-class '<list> '(<object>))
+(%register-builtin-class '<cons> '(<list>))
+(%register-builtin-class '<symbol> '(<object>))
+(%register-builtin-class '<null> '(<list> <symbol>))
+(%register-builtin-class '<number> '(<object>))
+(%register-builtin-class '<integer> '(<number>))
+(%register-builtin-class '<float> '(<number>))
+(%register-builtin-class '<standard-class> '(<object>))
+(%register-builtin-class '<standard-object> '(<object>))
+(%register-builtin-class '<stream> '(<object>))
+
+;; supersを指定しないdefclassは仕様上<standard-object>を暗黙に継承する。
+;; defclassマクロの展開結果に直接埋め込まれ実行時に呼ばれる(M15)。
+(defun %defclass-supers (super-names)
+  (if (null super-names)
+      (list (%find-class '<standard-object>))
+      (%resolve-supers super-names)))
+
+;; supers(登録済みクラスオブジェクトのリスト)それぞれのスロット定義を単純に
+;; 連結する(同名オーバーライドは行わない、既知の簡略化)。defclassマクロの
+;; 展開結果に直接埋め込まれ実行時に呼ばれる(M15)。
+(defun %merge-superclass-slots (supers)
+  (if (null supers)
+      nil
+      (append (%%class-slots (car supers)) (%merge-superclass-slots (cdr supers)))))
 
 ;;; --- スロットアクセスとインスタンス基礎 (M12 Phase 2, #27) ---
 ;;;
