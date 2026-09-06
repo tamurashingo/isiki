@@ -8,9 +8,14 @@ OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
 # トランスパイラ(transpileターゲット)の生成物。git管理対象外で、これらの
-# 入力Lispファイルが変更された時だけ再生成される(下記$(LISP_COMPILED)ルール)
-TRANSPILE_LISP_SRC = src/lisp/transpile.lisp src/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp
+# 入力Lispファイルが変更された時だけ再生成される(下記$(LISP_COMPILED)ルール)。
+# test/lisp/transpile_fixture.lispはトランスパイラの動作確認用フィクスチャ
+# (テスト専用、global_environmentへは登録されない)で、本番のカーネルバイナリには
+# 含めず$(LISP_COMPILED_FIXTURE)という別ファイルへコンパイルする(transpile.lispの
+# main参照)
+TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
+LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
 SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
 HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
@@ -51,7 +56,7 @@ TEST_BIN_REPL = $(BUILD_TMPDIR)/repl_test
 TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/subprimitive.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(TESTDIR)/subprimitive_test.c
 TEST_BIN_SUBPRIMITIVE = $(BUILD_TMPDIR)/subprimitive_test
 
-TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
+TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
 TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
@@ -79,7 +84,7 @@ TEST_BIN_P9 = $(BUILD_TMPDIR)/p9_test
 TEST_SRC_VIRTIO9P = $(SRCDIR)/p9.c $(SRCDIR)/virtio9p.c $(TESTDIR)/virtio9p_test.c
 TEST_BIN_VIRTIO9P = $(BUILD_TMPDIR)/virtio9p_test
 
-TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/print.c $(SRCDIR)/subprimitive.c $(LISP_COMPILED) $(TESTDIR)/lisp_compiled_test.c
+TEST_SRC_LISP_COMPILED = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/format.c $(SRCDIR)/print.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE) $(TESTDIR)/lisp_compiled_test.c
 TEST_BIN_LISP_COMPILED = $(BUILD_TMPDIR)/lisp_compiled_test
 
 # interrupt.cはリンクせず、ide_test.cが独自にinb/outb/inw/outwをfake定義して
@@ -112,7 +117,17 @@ $(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
 		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
 
-transpile: $(LISP_COMPILED)
+# (main)は$(LISP_COMPILED)と$(LISP_COMPILED_FIXTURE)を1回の実行で両方生成するが、
+# 独立したルールにしているため、両方が古い状態から`make test`のように両方を
+# 要求するターゲットを叩くと(main)が2回走ることがある(生成内容は毎回supersedeで
+# 上書きするため冪等、無駄ではあるが壊れはしない)。GNU Make 4.3+のグループ
+# ターゲット(&:)を使えば1回にできるが、古いmake(例: macOS標準の3.81)との
+# 互換性を優先しここでは使わない
+$(LISP_COMPILED_FIXTURE): $(TRANSPILE_LISP_SRC)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+
+transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 
 # $(TARGET)をファイル依存(SRC/HDR)で追跡することで、BOOT_FAT32_IMG(後述)が
 # 「実際にソース/ヘッダが変更された時だけ」再生成されるようにする土台になる
@@ -266,7 +281,7 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 
 clean:
 	rm -rf esp_dir $(BUILD_TMPDIR) $(IMAGES_DIR)
-	rm -f .qemu-test-trigger test-results.txt qemu.log
+	rm -f .qemu-test-trigger test-results.txt qemu.log $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 
 # IDE/ATA PIO動作確認用の使い捨てディスクイメージ。qemu-imgはCI環境で未保証の
 # パッケージのため使わず、dd/printfのみで作成する。先頭にIDE_TEST_MAGICを書き込み、

@@ -6,5 +6,6 @@ tmp/
 .qemu-test-trigger
 test-results.txt
 src/c/lisp_compiled.c
+test/c/lisp_compiled_fixture.c
 
 .envrc

@@ -1,13 +1,10 @@
 (load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
-(load "src/lisp/device.lisp")
-(load "src/lisp/ide.lisp")
-(load "src/lisp/partition.lisp")
-(load "src/lisp/fat32.lisp")
-(load "src/lisp/fat16.lisp")
-(load "src/lisp/mount.lisp")
+;; device.lisp/ide.lisp/partition.lisp/mount.lisp/fat16.lisp/fat32.lisp/
+;; file-cmd.lispはM15でAOTトランスパイル対象に移動し、ブート時に既に
+;; global_environmentへ登録・初期化済みのため、ここでのloadは不要になった
+;; (このテストがAOT側の経路を実際に検証する)
 (load "test/lisp/partition_test.lisp")
-(load "src/lisp/file-cmd.lisp")
 (load "test/lisp/file_cmd_test.lisp")
 
 (isiki-test-report)

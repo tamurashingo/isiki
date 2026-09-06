@@ -643,3 +643,43 @@
       (%%set-dynamic '*handlers*
         (cons (lambda (c) (cons 'handled (slot-value c 'format-string))) nil))
       (cerror continue-string error-string obj))))
+
+;; M15回帰テスト: 負の整数リテラル(例: (ash n -8)の-8)は、transpile-exprが
+;; 単純にos_make_fixnum(-8ULL)と出力すると、Cの単項マイナスがunsigned long long
+;; リテラルへ適用され2の補数の巨大な正の値になり、符号無し専用のos_make_fixnumへ
+;; そのまま渡ると本来の値と無関係なタグ付き値になるバグがあった(os_make_fixnum_signed
+;; を使うよう修正済み)。fat16.lispの%fat16-u16-to-bytesと同じ形(logand+ashで
+;; 16bit値を2byteに分解する)で正しく修正されているかを検証する。
+(defun %%transpile-fixture-u16-to-bytes (n)
+  (list (logand n #xFF) (logand (ash n -8) #xFF)))
+
+;; M15回帰テスト: src/lisp/fat16.lispの%fat16-patch-bytes!を単離して再現する。
+;; listのoffset位置からvalue-listの各要素をset-carで順に上書きする破壊的操作が、
+;; value-listの要素数分すべて反映されるかを検証する(offset=28、4byte書き換えの
+;; 実運用ケースに合わせる)。
+(defun %%transpile-fixture-patch-bytes (list offset value-list)
+  (let ((cell list) (n offset))
+    (while (> n 0)
+      (setq cell (cdr cell))
+      (setq n (- n 1)))
+    (let ((values value-list))
+      (while values
+        (set-car cell (car values))
+        (setq cell (cdr cell))
+        (setq values (cdr values))))
+    list))
+
+;; M15回帰テスト: src/lisp/fat16.lispの%fat16-split-into-chunksと同型の構造
+;; (外側のwhileループの本体に、外側のbox化された変数(total)をsetqする
+;; ネストしたlet(=即時lambda)を毎周新規生成して置く)を再現し、AOTトランスパイル後も
+;; 正しい値になるかを検証する。期待値: 0からn-1までの(* i 2)の総和。
+(defun %%transpile-fixture-while-nested-let-boxed-sum (n)
+  (let ((total 0))
+    (progn
+      (let ((i 0))
+        (while (< i n)
+          (progn
+            (let ((doubled (* i 2)))
+              (setq total (+ total doubled)))
+            (setq i (+ i 1)))))
+      total)))

@@ -33,7 +33,11 @@
 ;;;; 束縛されているため、ループが何回回ってもリークしない)。プリミティブ呼び出し
 ;;;; は再帰しないstep関数を持たないため、末尾位置でも即時評価して確定値を返す。
 
-(defparameter *runtime-lisp-path* "src/lisp/transpile_fixture.lisp")
+(defparameter *runtime-lisp-path* "test/lisp/transpile_fixture.lisp"
+  "トランスパイラの動作確認用フィクスチャ(transpile_fixture.lisp参照、全関数が
+   %%transpile-fixture-接頭辞を持ちglobal_environmentへ登録もされない、テスト
+   専用コード)。本番のAOTコードと一切混ざらないよう、生成先も*output-c-path*
+   ではなく*fixture-output-c-path*という別ファイルにする")
 (defparameter *aot-lisp-path* "src/lisp/init_aot.lisp"
   "init.lispから移動した、AOTトランスパイル対象の本番関数を置くファイル(M13)。
    transpile_fixture.lispと違い、ここでdefunされた関数はos_register_aot_init_functions
@@ -45,7 +49,28 @@
    init_aot.lispのdefunと同じ制約(パラメータはシンボルのみ、本体は単一の
    トップレベル式)に従う必要がある。init_aot.lispのdefunと合わせて同じ
    os_register_aot_init_functions経由でglobal_environmentへ登録される")
+(defparameter *fs-lisp-paths*
+  '("src/lisp/device.lisp"
+    "src/lisp/ide.lisp"
+    "src/lisp/partition.lisp"
+    "src/lisp/mount.lisp"
+    "src/lisp/fat16.lisp"
+    "src/lisp/fat32.lisp"
+    "src/lisp/file-cmd.lisp")
+  "M15(documents/fs.md): IDE/FAT16/FAT32/partition/mount/file-cmdレイヤーの
+   AOTトランスパイル対象ファイル。このレイヤー自体がファイルシステムの実装で
+   あるため、実機起動時にはファイルシステムからLispソースをloadする手段が
+   無く、init_aot.lisp/utility.lispと同じくos_register_aot_init_functions経由で
+   カーネルバイナリへ埋め込む必要がある。*aot-lisp-path*等と異なりdefun以外の
+   トップレベルフォーム(defclass/defdynamic/起動時に一度だけ実行する副作用の
+   ある呼び出し)も持つため、mainではdefunとそれ以外を別々に集める。依存関係の
+   順(device->ide->partition->mount->fat16/fat32->file-cmd)で1ファイルずつ
+   追加・検証したため、この順序のまま保つ")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
+(defparameter *fixture-output-c-path* "test/c/lisp_compiled_fixture.c"
+  "*runtime-lisp-path*(テスト専用フィクスチャ)のコンパイル結果の出力先。
+   本番のカーネルバイナリ(*output-c-path*)には一切含めず、テストビルド時だけ
+   このファイルを追加でコンパイル・リンクする")
 
 (defparameter *known-function-names* nil
   "現在のトランスパイル対象ファイル内でdefunされている関数名の一覧。mainが
@@ -184,7 +209,38 @@
     ;; FAT16-M0(1)(documents/fs.md): char-code/code-charが使う。文字とFIXNUMの
     ;; タグ付け替えのみを行うsubprimitive.cの関数
     (%%char-code . "cc_char_code")
-    (%%code-char . "cc_code_char")))
+    (%%code-char . "cc_code_char")
+    ;; M15(documents/fs.md): device.lisp/fat16.lisp/fat32.lisp/file-cmd.lispが
+    ;; 使う文字列/シンボル系プリミティブ。runtime.cのprimitive_*として既に
+    ;; 実装済みでos_bootstrap内でglobal_environmentへ登録済み
+    (subseq . "primitive_subseq")
+    (char-index . "primitive_char_index")
+    (string= . "primitive_string_equal")
+    (symbol-name . "primitive_symbol_name")
+    (string-to-symbol . "primitive_string_to_symbol")
+    ;; M15: ide.lispがセクタバッファの読み書きに使う生メモリアクセス
+    ;; (subprimitive.cにcc_in_8等と同じパターンで実装済み)
+    (%%peek . "cc_peek")
+    (%%poke . "cc_poke")
+    ;; M15: ide.lispがIDEデバイスの列挙/セクタ読み書きに使う
+    ;; (ide_subprimitive.cにcc_ide_*として実装済み、os_register_ide_subprimitives
+    ;; 経由でglobal_environmentへ登録済み)
+    (%%ide-device-count . "cc_ide_device_count")
+    (%%ide-device-at . "cc_ide_device_at")
+    (%%ide-device-name . "cc_ide_device_name")
+    (%%ide-device-model . "cc_ide_device_model")
+    (%%ide-sector-buffer-address . "cc_ide_sector_buffer_address")
+    (%%ide-read-sector . "cc_ide_read_sector")
+    (%%ide-write-sector . "cc_ide_write_sector")
+    (%%ide-total-sectors . "cc_ide_total_sectors")
+    ;; M15: device.lispがVolume ID(4byte little-endian)の合成に使う
+    (* . "primitive_multiply")
+    ;; M15: fat16.lisp/fat32.lispが削除済みエントリ(0xE5)判定等に使う
+    (/= . "primitive_num_not_equal")
+    (<= . "primitive_less_equal")
+    ;; M15: ide.lispが%ide-bytes-to-addrのwhile条件に使う(NOTはnullと同じ
+    ;; primitive_nullとしてos_bootstrap内で登録済み)
+    (not . "primitive_null")))
 
 (defun str->fn (fn-str)
   "文字列から関数オブジェクトを得る。関数が未定義だが alist に登録するための処置"
@@ -202,7 +258,8 @@
         (cons 'with-open-input-stream "expand-with-open-input-stream")
         (cons 'with-open-input-file "expand-with-open-input-file")
         (cons 'with-open-output-stream "expand-with-open-output-stream")
-        (cons 'with-open-output-file "expand-with-open-output-file"))
+        (cons 'with-open-output-file "expand-with-open-output-file")
+        (cons 'defclass "expand-defclass"))
   "マクロ名(シンボル)から展開関数への alist。展開関数は元のフォーム全体
    (car=マクロ名を含む)を受け取り、展開後のフォームを返す。macroexpand-allが
    これを見てディスパッチする。各オペレータの実装コミットでここへ追加していく")
@@ -210,9 +267,11 @@
 (defun sanitize-c-ident (name)
   "MEM-REF-64 -> mem_ref_64 (Cの識別子として使える形にする)。M14基盤D: for/while
    展開が使う%FOR-NEXT-VALUES等の%接頭辞(Lisp側の内部変数マーカーで、Cの識別子
-   として不正な文字)も、!と同様に読み捨てる"
-  (remove-if (lambda (c) (member c '(#\! #\%)))
-             (substitute #\_ #\- (string-downcase name))))
+   として不正な文字)も、!と同様に読み捨てる。M15: %fat16-8.3-field-bytes等、
+   名前に'.'を含む関数名(Cの識別子として不正な文字)は'_'に変換し(-と同じ扱い)、
+   %fat32-name-equal?等、名前に'?'を含む関数名は!と同様に読み捨てる"
+  (remove-if (lambda (c) (member c '(#\! #\% #\?)))
+             (substitute #\_ #\. (substitute #\_ #\- (string-downcase name)))))
 
 (defun lisp-name-to-c-name (symbol)
   "MEMBER -> lisp_ll_member / %%mem-ref-64 -> lisp_ll_mem_ref_64。
@@ -232,9 +291,24 @@
          (body (sanitize-c-ident (subseq name prefix-len))))
     (concatenate 'string "lisp_ll_" body)))
 
+(defparameter *c-reserved-words*
+  '("auto" "break" "case" "char" "const" "continue" "default" "do" "double"
+    "else" "enum" "extern" "float" "for" "goto" "if" "inline" "int" "long"
+    "register" "restrict" "return" "short" "signed" "sizeof" "static" "struct"
+    "switch" "typedef" "union" "unsigned" "void" "volatile" "while" "_Bool"
+    "_Complex" "_Imaginary" "env" "nil")
+  "Cの予約語(+このファイルが生成するコードが暗黙に使うenv/nil)。M15:
+   %plist-getのdefaultパラメータのように、defunパラメータ名がそのままでは
+   Cの識別子として使えない場合があるため、param-symbol-to-c-nameがこれと
+   衝突する場合に接尾辞を付けて回避する")
+
 (defun param-symbol-to-c-name (symbol)
-  "defunパラメータ名 -> Cのローカル変数名。プレフィックスは付けない"
-  (sanitize-c-ident (symbol-name symbol)))
+  "defunパラメータ名 -> Cのローカル変数名。プレフィックスは付けないが、
+   Cの予約語(*c-reserved-words*)と衝突する場合のみ_paramを付けて回避する"
+  (let ((name (sanitize-c-ident (symbol-name symbol))))
+    (if (member name *c-reserved-words* :test #'string=)
+        (concatenate 'string name "_param")
+        name)))
 
 (defun c-string-literal (s)
   "CommonLisp文字列からCの文字列リテラル(ダブルクオート込み)を作る。
@@ -246,6 +320,15 @@
                (write-char #\\ out))
              (write-char ch out))
     (write-char #\" out)))
+
+(defun c-char-literal (ch)
+  "CommonLisp文字からCのchar literal(シングルクオート込み)を作る。\\と'の
+   みエスケープする(M15: fat16.lisp/fat32.lisp/file-cmd.lispが使うのは
+   '/'や'.'等のASCII印字可能文字のみのため十分)"
+  (cond
+    ((char= ch #\\) "'\\\\'")
+    ((char= ch #\') "'\\''")
+    (t (format nil "'~A'" ch))))
 
 ;;; M10: lambdaの自由変数解析。let等の追加束縛フォームが無い現時点では、
 ;;; 式木の中で新たに変数を束縛できるのはlambda自身のパラメータだけなので、
@@ -612,6 +695,41 @@
     `(with-open-output-stream (,(car binding) (open-output-file ,(car (cdr binding))))
        ,@body)))
 
+;;; defclass: init.lispのdefmacro defclass(init.lisp参照)と同じ展開規則。
+;;; supers/slot-specsはマクロなので未評価のまま渡される。%slot-spec-form(s)/
+;;; %plist-getは展開結果の(list ,@...)部分をunquote-spliceで組み立てるための
+;;; 「マクロ展開時に(このホストSBCL上で)呼ばれる」ヘルパーなので、%%let-vars等と
+;;; 同じくホスト関数として移植する(init.lisp常駐の同名関数とは別物、衝突しない)。
+;;; 一方、展開結果に直接埋め込まれる%defclass-supers/%register-class/
+;;; %merge-superclass-slots/%%make-class-rawは「実行時に呼ばれる」コードなので、
+;;; init_aot.lispへ移動済みの関数/プリミティブとして解決される(call-target-c-name)。
+
+(defun %%defclass-plist-get (plist key default)
+  (if (null plist)
+      default
+      (if (eq (car plist) key)
+          (car (cdr plist))
+          (%%defclass-plist-get (cdr (cdr plist)) key default))))
+
+(defun %%defclass-slot-spec-form (spec)
+  (list 'list (list 'quote (car spec))
+              (list 'quote (%%defclass-plist-get (cdr spec) :initarg nil))
+              (list 'lambda nil (%%defclass-plist-get (cdr spec) :initform nil))))
+
+(defun %%defclass-slot-spec-forms (specs)
+  (if (null specs)
+      nil
+      (cons (%%defclass-slot-spec-form (car specs)) (%%defclass-slot-spec-forms (cdr specs)))))
+
+(defun expand-defclass (form)
+  (destructuring-bind (defclass-kw name supers slot-specs &rest options) form
+    (declare (ignore defclass-kw options))
+    `(let ((%supers (%defclass-supers ',supers)))
+       (%register-class ',name
+         (%%make-class-raw ',name %supers
+           (append (%merge-superclass-slots %supers)
+                   (list ,@(%%defclass-slot-spec-forms slot-specs))))))))
+
 
 (declaim (ftype function transpile-quoted))
 (declaim (ftype function transpile-if))
@@ -649,11 +767,24 @@
   transpile-defun/transpile-lambda参照)"
   (cond
     ((integerp expr)
-     (format nil "os_make_fixnum(~AULL)" expr))
+     ;; M15調査で発覚: 負の整数リテラル(例: (ash n -8)の-8)を単純に
+     ;; os_make_fixnum(-8ULL)と出力すると、Cの単項マイナスがunsigned long long
+     ;; リテラルへ適用され2の補数の巨大な正の値になり、符号無しのos_make_fixnumへ
+     ;; そのまま渡ると本来の値と無関係なタグ付き値になる(runtime.hのos_make_fixnumは
+     ;; 非負専用、符号付きの値はos_make_fixnum_signedを使う契約)。負の場合のみ
+     ;; magnitude(絶対値)を渡すos_make_fixnum_signedへ切り替える
+     (if (< expr 0)
+         (format nil "os_make_fixnum_signed(1, ~AULL)" (- expr))
+         (format nil "os_make_fixnum(~AULL)" expr)))
     ((stringp expr)
      (format nil "os_make_string(~A)" (c-string-literal expr)))
     ((null expr) "nil")
     ((eq expr t) "g_sym_t")
+    ((characterp expr)
+     ;; M15: fat16.lisp/fat32.lisp/file-cmd.lispが使う#\/等の文字リテラル。
+     ;; リーダは既にTAG_CHARの値へパース済み(reader.c)なので、os_make_charで
+     ;; そのままタグ付けするだけでよい
+     (format nil "os_make_char(~A)" (c-char-literal expr)))
     ((and (symbolp expr) (assoc expr scope))
      (let ((binding (cdr (assoc expr scope))))
        (if (cdr binding)
@@ -1103,7 +1234,7 @@
    束縛した全変数(パラメータ+自由変数)を含むalist"
   (let ((tail-stmt (transpile-tail-stmt body-form scope)))
     (with-output-to-string (out)
-      (format out "static tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
+      (format out "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
       (when (null params)
         (format out "    (void)evaluated_args;~%"))
       (dolist (stmt preamble-stmts)
@@ -1359,10 +1490,15 @@
 (defun transpile-prototype (form)
   "(defun name (param*) body) から、mainがbody生成前に出力する前方宣言を作る。
    相互再帰時、defunの並び順に関わらずどちらのC関数からも他方を呼べるようにする
-   (za.cのシンボル解決に頼らない代わりに、AOTのC前方宣言で解決する)。__step版は
-   ファイル内実装詳細(トランポリンのジャンプ先)なのでstaticにする"
+   (za.cのシンボル解決に頼らない代わりに、AOTのC前方宣言で解決する)。M15:
+   *output-c-path*/*fixture-output-c-path*の2ファイルに分かれた後も、フィクスチャ
+   側からAOT側の関数を末尾呼び出しする場合に.fn = 対象__stepという形でファイルを
+   跨いで関数ポインタを取る必要があるため、__step版もstaticにはしない(以前は
+   ファイル内実装詳細としてstaticにしていたが、ファイル分割に伴い外部リンケージが
+   必須になった)。全既知関数の前方宣言を両ファイルへ共通で出力する(自分の
+   ファイルで定義されない関数は本体無しの宣言のみになるが、Cとして正しい)"
   (let ((c-name (lisp-name-to-c-name (second form))))
-    (format nil "static tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);"
+    (format nil "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);"
             c-name c-name)))
 
 
@@ -1405,6 +1541,37 @@
           until (eq form :eof)
           collect form)))
 
+(defun toplevel-defun-p (form)
+  (and (consp form) (eq (car form) 'defun)))
+
+(defun transpile-toplevel-form (form)
+  "M15: device.lisp等のdefun以外のトップレベルフォーム(defclass/defdynamic/
+   起動時に一度だけ実行する副作用のある呼び出し)を1つのC文へ変換する。
+   マクロ展開後、パラメータもscopeも持たない非末尾位置の式としてtranspile-expr
+   に評価させ、戻り値は捨てる(呼び出し元のos_run_aot_toplevel_formsは副作用の
+   ためだけに1回呼ぶ)。本体中に直接またはネストしてlambdaが現れる場合は
+   *lifted-lambda-decls*へその定義をpushする(transpile-defunと同じ仕組みを
+   このフォーム単位で再利用する)"
+  (format nil "    (void)(~A);~%" (transpile-expr (macroexpand-all form) nil)))
+
+(defun emit-toplevel-forms-runner (forms)
+  "FORMS(main がファイル読み込み順に集めたdefun以外のトップレベルフォーム、
+   *fs-lisp-paths*の並び順=依存関係の順を保つ)から、起動時に一度だけ実行する
+   C関数os_run_aot_toplevel_formsを生成する。kernel_mainからos_register_aot_init_
+   functions(全defunの登録)の直後に呼ばれる想定で、defdynamicの初期化・
+   defclassのクラス登録・%ide-register-devices等の起動時副作用をソース上の
+   順序のまま実行する。formsが1つも無くても空の関数を出力する(fs-lisp-pathsが
+   空の間もビルドが壊れないように)"
+  (let* ((*lifted-lambda-decls* nil)
+         (stmts (mapcar #'transpile-toplevel-form forms)))
+    ;; transpile-call/transpile-expr(function特殊形式等)が生成するコードは、
+    ;; defun本体と同じくローカル変数envの存在を前提にしている(defunのstep関数
+    ;; ではパラメータとして渡ってくる)。ここではdefun呼び出しの連鎖の起点となる
+    ;; 環境が無いため、global_environment(全ての環境チェーンの根、
+    ;; emit-closure-creationの自由変数無しクロージャと同じ考え方)を束縛する
+    (format nil "~{~A~%~}void os_run_aot_toplevel_forms(void) {~%    lisp_val_t env = global_environment;~%    (void)env;~%~{~A~}}~%"
+            (reverse *lifted-lambda-decls*) stmts)))
+
 (defun emit-aot-registration (aot-defuns)
   "init_aot.lisp由来のdefun群それぞれについて、os_set_function/
    os_make_native_functionでglobal_environmentへ登録するC関数
@@ -1416,35 +1583,69 @@
                     (list (symbol-name (second form)) (lisp-name-to-c-name (second form))))
                   aot-defuns)))
 
+(defun emit-c-file (out-path prototypes bodies tail-text)
+  "prototypes(全既知関数分、この呼び出しのファイルに定義が無いものも含む)と
+   bodies(このファイルが実際に定義する関数の本体)を、共通のヘッダ(#include/
+   tco_result_t型定義)と共に1つのCファイルout-pathへ書き出す。tail-textは
+   bodiesの後に追加でそのまま書き出す文字列(registration/toplevel-runner等、
+   不要なら空文字列)。M15: *output-c-path*(本番AOT)と*fixture-output-c-path*
+   (テスト専用フィクスチャ)の2ファイルから共通で呼ばれる"
+  (with-open-file (out out-path :direction :output :if-exists :supersede)
+    ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
+    ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。
+    ;; M14基盤E: open-input-stream/close(cc_open_input_stream/cc_close)はstream_lisp.hで
+    ;; 宣言されているため、同じ理由でstream_lisp.hも必要
+    ;; FAT16-M0(0): logand/logior/logxor/ash(cc_logand等)はsubprimitive.hで
+    ;; 宣言されているため、同じ理由でsubprimitive.hも必要
+    ;; M15: %%ide-*(cc_ide_*)はide_subprimitive.hで宣言されているため、
+    ;; 同じ理由でide_subprimitive.hも必要
+    (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%#include \"subprimitive.h\"~%#include \"ide_subprimitive.h\"~%~%")
+    ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
+    ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
+    ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)。
+    ;; M15: 2ファイルそれぞれが独立してこの型定義を持つ(Cにtypeのリンケージは
+    ;; 無く、同じレイアウトの型を各翻訳単位が個別に定義するだけなので問題ない)
+    (format out "typedef struct tco_result tco_result_t;~%")
+    (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
+    (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%};~%~%")
+    (dolist (p prototypes)
+      (format out "~A~%" p))
+    (format out "~%")
+    (dolist (b bodies)
+      (format out "~A~%" b))
+    (format out "~%~A" tail-text)))
+
 (defun main ()
-  (let* ((fixture-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
-                                         (read-all-forms *runtime-lisp-path*)))
-         (aot-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
-                                     (read-all-forms *aot-lisp-path*)))
-         (utility-defuns (remove-if-not (lambda (form) (and (consp form) (eq (car form) 'defun)))
-                                     (read-all-forms *utility-lisp-path*)))
-         (defuns (append fixture-defuns aot-defuns utility-defuns))
-         (*known-function-names* (mapcar #'second defuns))
-         (prototypes (mapcar #'transpile-prototype defuns))
-         (bodies (mapcar #'transpile-defun defuns))
-         (registration (emit-aot-registration (append aot-defuns utility-defuns))))
-    (with-open-file (out *output-c-path* :direction :output :if-exists :supersede)
-      ;; funcall(primitive_funcall)はeval.hで宣言されているため、runtime.h/lisp.hだけでは
-      ;; 暗黙のint宣言(実体はlisp_val_t=64bitを返すため上位32bitが失われ得る)になってしまう。
-      ;; M14基盤E: open-input-stream/close(cc_open_input_stream/cc_close)はstream_lisp.hで
-      ;; 宣言されているため、同じ理由でstream_lisp.hも必要
-      ;; FAT16-M0(0): logand/logior/logxor/ash(cc_logand等)はsubprimitive.hで
-      ;; 宣言されているため、同じ理由でsubprimitive.hも必要
-      (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%#include \"subprimitive.h\"~%~%")
-      ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
-      ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
-      ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)
-      (format out "typedef struct tco_result tco_result_t;~%")
-      (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
-      (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%};~%~%")
-      (dolist (p prototypes)
-        (format out "~A~%" p))
-      (format out "~%")
-      (dolist (b bodies)
-        (format out "~A~%" b))
-      (format out "~%~A" registration))))
+  (let* ((fixture-defuns (remove-if-not #'toplevel-defun-p (read-all-forms *runtime-lisp-path*)))
+         (aot-all-forms (read-all-forms *aot-lisp-path*))
+         (aot-defuns (remove-if-not #'toplevel-defun-p aot-all-forms))
+         (aot-toplevel-forms (remove-if #'toplevel-defun-p aot-all-forms))
+         (utility-all-forms (read-all-forms *utility-lisp-path*))
+         (utility-defuns (remove-if-not #'toplevel-defun-p utility-all-forms))
+         (utility-toplevel-forms (remove-if #'toplevel-defun-p utility-all-forms))
+         (fs-all-forms (mapcan #'read-all-forms *fs-lisp-paths*))
+         (fs-defuns (remove-if-not #'toplevel-defun-p fs-all-forms))
+         (fs-toplevel-forms (remove-if #'toplevel-defun-p fs-all-forms))
+         ;; M15: main-defunsが本番のカーネルバイナリ(*output-c-path*)へ実際に
+         ;; 定義を出力する関数群。fixture-defuns(テスト専用)はここに含めない
+         (main-defuns (append aot-defuns utility-defuns fs-defuns))
+         (all-defuns (append fixture-defuns main-defuns))
+         (*known-function-names* (mapcar #'second all-defuns))
+         ;; フィクスチャ側からAOT関数を(直接/末尾)呼び出すケースがあるため、
+         ;; 前方宣言だけは両ファイルへ全既知関数分を共通で出力する(定義が無い
+         ;; 側ではただのextern宣言になるだけで、Cとして問題ない)
+         (all-prototypes (mapcar #'transpile-prototype all-defuns))
+         (main-bodies (mapcar #'transpile-defun main-defuns))
+         (fixture-bodies (mapcar #'transpile-defun fixture-defuns))
+         (registration (emit-aot-registration main-defuns))
+         ;; init_aot.lisp(*classes*のdefdynamic+21個の%register-builtin-class呼び出し)
+         ;; -> utility.lisp -> fs-lisp-paths(依存関係の順)の順序で実行する必要がある
+         ;; (fat16.lisp/fat32.lispのdefclassが<standard-object>等の組み込みクラスに
+         ;; 依存するため)。この3ファイル群の読み込み順がそのまま実行順になる
+         (toplevel-runner (emit-toplevel-forms-runner (append aot-toplevel-forms utility-toplevel-forms fs-toplevel-forms))))
+    (emit-c-file *output-c-path* all-prototypes main-bodies
+                 (format nil "~A~%~A" registration toplevel-runner))
+    ;; M15: フィクスチャは登録(emit-aot-registration)もtoplevel-runnerも不要
+    ;; (テスト専用でglobal_environmentへは登録しない、transpile_fixture.lisp
+    ;; 自体もdefun以外のトップレベルフォームを持たない)
+    (emit-c-file *fixture-output-c-path* all-prototypes fixture-bodies "")))
