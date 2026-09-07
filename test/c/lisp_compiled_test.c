@@ -215,6 +215,10 @@ extern lisp_val_t lisp_ll_transpile_fixture_make_instance(lisp_val_t evaluated_a
 extern lisp_val_t lisp_ll_transpile_fixture_macro_gf(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_macro_gf_no_methods(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_register_macro_gf_methods(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_toynode_gf(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_register_toynode_hierarchy(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_register_toynode_method(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_make_toynode(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_nested_let_dynamic_restore(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_signal_condition_like(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_error(lisp_val_t evaluated_args, lisp_val_t env);
@@ -957,6 +961,27 @@ static void test_transpile_fixture_macro_gf_no_methods(void) {
            "defgeneric: メソッド未登録の総称関数はg_sym_eval_errorへフォールバックする");
 }
 
+static void test_transpile_fixture_toynode_dispatch(void) {
+    /* M4診断([ファイルI/O]#47): defclassが生成するのと同じ形(supersを持つ
+       STANDARD-CLASS、%%class-instance-p経由)のクラスをspecializerとする
+       defmethodが正しくディスパッチされることを確認する。上のmacro_gfテストは
+       いずれも<cons>という組み込みクラス(%%builtin-classp経由)だけを
+       specializerにしていたため、fat16.lispの<fat16-file-node>のような
+       ユーザー定義クラスを使う経路はこのテストが初めてカバーする */
+    assert(lisp_ll_transpile_fixture_register_toynode_hierarchy(nil, 0) == g_sym_t,
+           "クラス階層(%%make-class-raw+%register-class)の登録が完了する");
+    assert(lisp_ll_transpile_fixture_register_toynode_method(nil, 0) == g_sym_t,
+           "defmethod: ユーザー定義クラスをspecializerとするメソッド登録が完了する");
+
+    lisp_val_t instance = lisp_ll_transpile_fixture_make_toynode(nil, 0);
+    /* GCで移動しうるinstanceを、cons作成〜総称関数呼び出しの間GC_PROTECTする
+       (test_transpile_fixture_call_next_methodと同じ理由) */
+    GC_PROTECT(instance);
+    lisp_val_t result = lisp_ll_transpile_fixture_toynode_gf(os_make_cons(instance, nil), 0);
+    assert(result == os_make_symbol("MATCHED"),
+           "defmethod: ユーザー定義クラス(defclass相当)をspecializerとするメソッドが正しくディスパッチされる");
+}
+
 // signal-conditionと同じ形の多段ネストclosure捕捉を再現するfuncall先。
 // outer/innerをそのままconsで返すことで、呼び出し時点でのouter/innerの値が
 // 正しく捕捉されているかを検証できる
@@ -1458,6 +1483,7 @@ int main(void) {
     test_transpile_fixture_make_instance();
     test_transpile_fixture_macro_gf();
     test_transpile_fixture_macro_gf_no_methods();
+    test_transpile_fixture_toynode_dispatch();
     test_transpile_fixture_nested_let_dynamic_restore();
     test_transpile_fixture_signal_condition_like();
     test_transpile_fixture_signal_condition_nonlocal();

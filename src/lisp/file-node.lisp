@@ -18,3 +18,12 @@
    (device :initarg :device :initform nil)
    (last-cluster-index :initarg :last-cluster-index :initform nil)
    (last-cluster-number :initarg :last-cluster-number :initform nil)))
+
+;;; --- [ファイルI/O]#47(M4): read-into!総称関数の宣言 ---
+;;; 実際のディスパッチ先(<fat16-file-node>/<fat32-file-node>用のdefmethod)は
+;;; それぞれfat16.lisp/fat32.lispで定義する(defgeneric/defmethodはM1で
+;;; トランスパイラに追加した機能、#44参照)。ここでは総称関数名だけを
+;;; ファイルシステム非依存のこのファイルで宣言しておく。
+;;; (node file-offsetバイト目からcountバイト分をbufferのbuffer-offset位置へ
+;;; 書き込み、実際に読めたバイト数を返す。EOFに達した場合は要求より少ない)
+(defgeneric read-into! (node buffer buffer-offset file-offset count))

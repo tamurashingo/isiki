@@ -96,6 +96,46 @@
 (assert-equal #(110 101 115 116 101) (subseq (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT") 0 5))
 (assert-equal 19 (length (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT")))
 
+;;; --- [ファイルI/O]#47(M4): read-into!の境界値テスト ---
+;;
+;; fat16_test.lispと同じ方針: fat32-test-big(BIG.TXT、1000byte、1クラスタ=
+;; 512byte)を正解データとして使い、read-into!が任意のオフセット・長さで
+;; 同じ内容を部分的に読めることを確認する。
+
+(defun %fat32-test-resolve-node (device path)
+  (let ((bpb (fat32-read-bpb device)))
+    (let ((resolved (%fat32-resolve-file device bpb path)))
+      (%fat32-find-dir-entry (%fat32-scan-dir-entries device (car resolved)) (cdr resolved)))))
+
+(defglobal fat32-test-big-node (%fat32-test-resolve-node *fat32-test-device* "/BIG.TXT"))
+
+;; 先頭10byte
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat32-test-big-node buf 0 0 10))
+  (assert-equal (subseq fat32-test-big 0 10) buf))
+
+;; クラスタ境界(512byte)をまたぐ範囲
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat32-test-big-node buf 0 507 10))
+  (assert-equal (subseq fat32-test-big 507 517) buf))
+
+;; ファイルサイズ(1000)ちょうどから読もうとするとEOFで0byte
+(let ((buf (create-vector 5 0)))
+  (assert-equal 0 (read-into! fat32-test-big-node buf 0 1000 5)))
+
+;; 末尾ちょうど: 995から10byte要求しても実際に読めるのは5byte(EOF)
+(let ((buf (create-vector 10 99)))
+  (assert-equal 5 (read-into! fat32-test-big-node buf 0 995 10))
+  (assert-equal (subseq fat32-test-big 995 1000) (subseq buf 0 5)))
+
+;; 前進シーク後の後退シーク(last-cluster-index/last-cluster-numberキャッシュの
+;; 後退分岐の確認)
+(let ((buf (create-vector 5 0)))
+  (assert-equal 5 (read-into! fat32-test-big-node buf 0 512 5))
+  (assert-equal (subseq fat32-test-big 512 517) buf)
+  (assert-equal 5 (read-into! fat32-test-big-node buf 0 0 5))
+  (assert-equal (subseq fat32-test-big 0 5) buf))
+
 ;;; --- FAT32-M6a: 既存ファイルの同クラスタ数上書き ---
 ;;
 ;; WRITE1.TXT(Makefile参照、mkfs.vfat作成時に"A"を512回=ちょうど1クラスタ分

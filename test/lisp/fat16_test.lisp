@@ -64,6 +64,75 @@
 
 (assert-equal nil (fat16-read-file *test-device* "/HELLO.TXT"))
 
+;;; --- [ファイルI/O]#47(M4): read-into!の境界値テスト ---
+;;
+;; fat16-test-big(直前のfat16-read-file経由で読み込み済みのBIG.TXT全内容、
+;; 既にテスト済み)を正解データとして使い、read-into!が任意のオフセット・長さで
+;; 同じ内容を部分的に読めることを確認する(期待値を手計算せず、既存の信頼できる
+;; データから導くことで算術ミスを避ける)。
+;;
+;; 既知の問題(未解決、#47コメント参照): QEMU実機上でこのファイルをloadした際、
+;; 以下のread-into!呼び出しを含む(let ...)フォーム自体が(pass/failいずれの
+;; カウントも増えずに)無反応でスキップされる現象を確認している。段階的な
+;; 切り分け調査により、read-into!が内部で呼ぶ各ステップ(%fat16-cluster-at-offset/
+;; %fat16-clusters-needed-from/%fat16-clusters-to-lbas/%fat16-read-lba-list)は
+;; それぞれ個別のトップレベルformとして呼べば正しい値を返すこと、
+;; %fat16-read-into-implの本体を定数42を返すだけの自明な実装に置き換えても
+;; 同じ現象が再現すること(=ロジックの中身ではなくread-into!の呼び出しそのものに
+;; 起因する)、let*の解消・defmethod本体の単純化(実装を普通のdefunへ委譲)・
+;; 末尾位置での呼び出し回避のいずれも解消しないことを確認済み。ネイティブの
+;; make test環境(lisp_compiled_test)では総称関数ディスパッチ自体は
+;; defclassベースのクラスに対しても正しく動作することを別途確認しており
+;; (test_transpile_fixture_toynode_dispatch)、ロジックそのものの誤りである
+;; 可能性は低いと判断しているが、根本原因は特定できていない。今後の調査課題
+;; として残す。
+
+;; パス解決だけを行いnode(<fat16-file-node>)を取得するテスト専用ヘルパー。
+;; fat16-read-fileと同じ解決ロジック(%fat16-resolve-file/%fat16-scan-dir-entries/
+;; %fat16-find-dir-entry)をそのまま使う。
+(defun %fat16-test-resolve-node (device path)
+  (let ((bpb (fat16-read-bpb device)))
+    (let ((resolved (%fat16-resolve-file device bpb path)))
+      (%fat16-find-dir-entry (%fat16-scan-dir-entries device (car resolved)) (cdr resolved)))))
+
+(defglobal fat16-test-big-node (%fat16-test-resolve-node *test-device* "/BIG.TXT"))
+
+;; 先頭10byte
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat16-test-big-node buf 0 0 10))
+  (assert-equal (subseq fat16-test-big 0 10) buf))
+
+;; クラスタ境界(2048byte、Makefile参照)をまたぐ範囲
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat16-test-big-node buf 0 2043 10))
+  (assert-equal (subseq fat16-test-big 2043 2053) buf))
+
+;; ファイルサイズ(2500)ちょうどから読もうとするとEOFで0byte
+(let ((buf (create-vector 5 0)))
+  (assert-equal 0 (read-into! fat16-test-big-node buf 0 2500 5)))
+
+;; ファイルサイズ+1から読もうとしても0byte
+(let ((buf (create-vector 5 0)))
+  (assert-equal 0 (read-into! fat16-test-big-node buf 0 2501 5)))
+
+;; 末尾ちょうど: 2495から10byte要求しても実際に読めるのは5byte(EOF)
+(let ((buf (create-vector 10 99)))
+  (assert-equal 5 (read-into! fat16-test-big-node buf 0 2495 10))
+  (assert-equal (subseq fat16-test-big 2495 2500) (subseq buf 0 5)))
+
+;; buffer-offset(書き込み先の途中位置)指定
+(let ((buf (create-vector 8 0)))
+  (assert-equal 3 (read-into! fat16-test-big-node buf 2 100 3))
+  (assert-equal (subseq fat16-test-big 100 103) (subseq buf 2 5)))
+
+;; 前進シーク後の後退シーク(<file-node>のlast-cluster-index/last-cluster-number
+;; キャッシュが後退時にstart-clusterから正しく辿り直すことを確認する)
+(let ((buf (create-vector 5 0)))
+  (assert-equal 5 (read-into! fat16-test-big-node buf 0 2048 5)) ;; 前進(クラスタ2)
+  (assert-equal (subseq fat16-test-big 2048 2053) buf)
+  (assert-equal 5 (read-into! fat16-test-big-node buf 0 0 5))    ;; 後退(クラスタ1)
+  (assert-equal (subseq fat16-test-big 0 5) buf))
+
 ;;; --- FAT16-M3: FATテーブルのクラスタチェイン追跡 ---
 ;;
 ;; MakefileのFAT16_DISK_IMGルールが、mkfs.vfat後にホスト側でFATテーブル(1本目)へ

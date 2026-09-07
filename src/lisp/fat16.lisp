@@ -113,11 +113,13 @@
         (%fat16-bytes-to-string name-bytes)
         (string-append (%fat16-bytes-to-string name-bytes) "." (%fat16-bytes-to-string ext-bytes)))))
 
-;; (%fat16-dir-entry-at bytes offset) : bytes(1セクタ512byte分)のoffsetにある
-;; 32byteディレクトリエントリをパースする。先頭バイトが0x00ならシンボル'endを
+;; (%fat16-dir-entry-at device bytes offset) : bytes(1セクタ512byte分)のoffsetに
+;; ある32byteディレクトリエントリをパースする。先頭バイトが0x00ならシンボル'endを
 ;; (ルートディレクトリの走査終了、以降は未使用領域)、0xE5(削除済み)ならnilを、
-;; それ以外は<fat16-file-node>インスタンスを返す。
-(defun %fat16-dir-entry-at (bytes offset)
+;; それ以外は<fat16-file-node>インスタンスを返す。deviceは[ファイルI/O]#47(M4)の
+;; read-into!がnodeだけからセクタを読めるようにするため、生成したインスタンスの
+;; deviceスロットへそのまま保持させる。
+(defun %fat16-dir-entry-at (device bytes offset)
   (let ((first-byte (elt bytes offset)))
     (if (= first-byte 0)
         'end
@@ -127,7 +129,8 @@
               ':name (%fat16-dir-entry-name bytes offset)
               ':attr (elt bytes (+ offset 11))
               ':start-cluster (%fat16-u16 bytes (+ offset 26))
-              ':size (%fat16-u32 bytes (+ offset 28)))))))
+              ':size (%fat16-u32 bytes (+ offset 28))
+              ':device device)))))
 
 ;; セクタ単位のディレクトリエントリ走査本体(旧%fat16-parse-sector-entries/
 ;; %fat16-scan-root-dir)はFAT16-M7aで%fat16-scan-dir-entries(このファイル末尾、
@@ -339,6 +342,107 @@
                             (if (null bytes)
                                 nil
                                 (subseq bytes 0 size))))))))))))
+
+;;; --- [ファイルI/O]#47(M4): read-into!総称関数 + オフセット→クラスタ探索 ---
+
+;; (%fat16-cluster-at-offset device bpb node byte-offset) : byte-offsetバイト目が
+;; 属するクラスタ番号を返す(現状どのFATファイルにも存在しない「シーク」相当の
+;; 処理)。floor(byte-offset/cluster-size)回だけFAT表を辿る必要があるが、
+;; node(<file-node>、file-node.lisp)のlast-cluster-index/last-cluster-number
+;; スロットに前回アクセス位置をキャッシュしておき、今回のアクセスが前回以降
+;; (前進)ならそこから継続することで、Cバッファのリフィル単位ごとに毎回
+;; start-clusterから辿り直すO(n²)化を避ける(既存の%fat16-fat-sector-bytesの
+;; 1セクタキャッシュと同じ「直前位置キャッシュ」の考え方を一段上に適用したもの)。
+;; 後退シーク・初回アクセスの場合のみstart-clusterから辿り直す。チェイン終端に
+;; 達した場合はnil。
+(defun %fat16-cluster-at-offset (device bpb node byte-offset)
+  (let* ((cluster-size (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+         (target-index (div byte-offset cluster-size))
+         (cached-index (slot-value node 'last-cluster-index))
+         (from-cache (and cached-index (>= target-index cached-index)))
+         (cluster (if from-cache (slot-value node 'last-cluster-number) (slot-value node 'start-cluster)))
+         (i (if from-cache cached-index 0))
+         (ok t))
+    (while (and ok cluster (< i target-index))
+      (let ((entry (fat16-fat-entry device bpb cluster)))
+        (if (or (null entry) (>= entry #xFFF8))
+            (setq ok nil)
+            (progn
+              (setq cluster entry)
+              (setq i (+ i 1))))))
+    (if (and ok cluster) cluster nil)))
+
+;; (%fat16-clusters-needed-from device bpb start-cluster count) : start-clusterから
+;; 始めて最大count個のクラスタ番号をリストで返す(チェイン終端に達したらそこで
+;; 打ち切る)。read-into!が触れる範囲のクラスタだけを列挙するのに使う
+;; (ファイル全体のチェインを辿るfat16-cluster-chainとは異なり、必要な範囲だけに
+;; 限定するのが目的)。
+(defun %fat16-clusters-needed-from (device bpb start-cluster count)
+  (let ((cluster start-cluster) (i 0) (rev nil))
+    (while (and cluster (< i count))
+      (setq rev (cons cluster rev))
+      (setq i (+ i 1))
+      (if (< i count)
+          (let ((entry (fat16-fat-entry device bpb cluster)))
+            (setq cluster (if (or (null entry) (>= entry #xFFF8)) nil entry)))))
+    (%fat16-reverse-iter rev)))
+
+;; (%fat16-read-into-impl node buffer buffer-offset file-offset count) :
+;; read-into!(<fat16-file-node>用メソッド、下記)の実体。nodeのfile-offset
+;; バイト目からcountバイト分をbufferのbuffer-offset位置へ書き込み、実際に
+;; 読めたバイト数を返す(EOFに達した場合は要求より少ない)。既存の
+;; %fat16-read-lba-list(M3でvector化済み)を、このアクセスに必要な範囲の
+;; クラスタだけに限定して呼ぶことで、ファイル全体を読まずに済ませる。
+;;
+;; [ファイルI/O]#47調査で発覚したトランスパイラの既知の問題への対応:
+;; defmethodのlambda本体に直接この(while/複数setqを含む)ロジックを書くと、
+;; QEMU実機上でread-into!呼び出しがLisp側のエラーとして扱われる(内部の
+;; 各ステップを個別のdefunとして呼べば正しく動く一方、defmethod自身のlambda
+;; 本体に組み込むと壊れる)ことをQEMU上の段階的な切り分けテストで確認した。
+;; defmethodのlambda(M10のクロージャリフティング経由でコンパイルされる)に
+;; 単純な単一関数呼び出し以外の複雑な本体(whileループや複数のsetqを含む
+;; 多文構成)を書いた場合のコード生成に何らかの問題がある可能性が高い
+;; (この問題を踏んだのは本プロジェクトでread-into!が初めてで、既存の
+;; defmethodは全て単一式の本体しか使っていなかった)。回避策として、実際の
+;; ロジックは普通のdefun(transpile-defunの通常の経路、既に堅牢性の実績がある)
+;; に切り出し、defmethodのlambda本体はその呼び出し1つだけにする。
+;; トランスパイラ自体の根本修正は別途検討する。
+(defun %fat16-read-into-impl (node buffer buffer-offset file-offset count)
+  (let ((device (slot-value node 'device)) (bpb nil) (size nil)
+        (actual-count 0) (cluster-size 0) (pos-in-cluster 0) (start-cluster nil)
+        (clusters-needed 0) (clusters nil) (lbas nil) (chunk nil) (i 0))
+    (setq bpb (fat16-read-bpb device))
+    (setq size (slot-value node 'size))
+    (if (or (null bpb) (null size) (>= file-offset size) (= count 0))
+        0
+        (progn
+          (setq actual-count (if (> (+ file-offset count) size) (- size file-offset) count))
+          (setq cluster-size (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+          (setq pos-in-cluster (mod file-offset cluster-size))
+          (setq start-cluster (%fat16-cluster-at-offset device bpb node file-offset))
+          (if (null start-cluster)
+              0
+              (progn
+                (setq clusters-needed (%fat16-cluster-count-for-bytes (+ pos-in-cluster actual-count) cluster-size))
+                (setq clusters (%fat16-clusters-needed-from device bpb start-cluster clusters-needed))
+                (setq lbas (%fat16-clusters-to-lbas bpb clusters))
+                (setq chunk (%fat16-read-lba-list device lbas))
+                (if (null chunk)
+                    0
+                    (progn
+                      (setq i 0)
+                      (while (< i actual-count)
+                        (set-elt (elt chunk (+ pos-in-cluster i)) buffer (+ buffer-offset i))
+                        (setq i (+ i 1)))
+                      (set-slot-value node 'last-cluster-index (+ (div file-offset cluster-size) (- (length clusters) 1)))
+                      (set-slot-value node 'last-cluster-number (%fat16-last-elt clusters))
+                      actual-count))))))))
+
+;; <fat16-file-node>用のread-into!メソッド(defgenericの宣言はfile-node.lisp参照)。
+;; 実装は%fat16-read-into-impl(上記)に切り出し、この本体は単一の呼び出しだけに
+;; 留める(上記コメント参照)。
+(defmethod read-into! ((node <fat16-file-node>) buffer buffer-offset file-offset count)
+  (%fat16-read-into-impl node buffer buffer-offset file-offset count))
 
 ;;; --- FAT16-M6a: 既存ファイルの同クラスタ数上書き ---
 
@@ -814,7 +918,7 @@
             (progn
               (let ((offset 0) (i 0))
                 (while (and (not stopped) (< i 16))
-                  (let ((parsed (%fat16-dir-entry-at bytes offset)))
+                  (let ((parsed (%fat16-dir-entry-at device bytes offset)))
                     (if (eq parsed 'end)
                         (setq stopped t)
                         (progn

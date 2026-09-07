@@ -340,15 +340,18 @@
         nil
         result)))
 
-;; (%fat32-make-short-dir-entry bytes offset display-name) : 短名エントリ1件を
-;; <fat32-file-node>へ変換する。display-nameは8.3表示名または復元したLFN。
-(defun %fat32-make-short-dir-entry (bytes offset display-name)
+;; (%fat32-make-short-dir-entry device bytes offset display-name) : 短名エントリ
+;; 1件を<fat32-file-node>へ変換する。display-nameは8.3表示名または復元したLFN。
+;; deviceは[ファイルI/O]#47(M4)のread-into!がnodeだけからセクタを読めるように
+;; するため、生成したインスタンスのdeviceスロットへそのまま保持させる。
+(defun %fat32-make-short-dir-entry (device bytes offset display-name)
   (make-instance '<fat32-file-node>
     ':name display-name
     ':attr (elt bytes (+ offset 11))
     ':start-cluster (logior (%fat32-u16 bytes (+ offset 26))
                              (ash (%fat32-u16 bytes (+ offset 20)) 16))
-    ':size (%fat32-u32 bytes (+ offset 28))))
+    ':size (%fat32-u32 bytes (+ offset 28))
+    ':device device))
 
 ;; (%fat32-dir-entry-display-name bytes offset pending-lfn) : 短名スロットと直前の
 ;; LFN群から一覧/検索用の表示名を決定する。
@@ -407,7 +410,7 @@
                             (setq i (+ i 1)))
                           (progn
                             (setq display-name (%fat32-dir-entry-display-name bytes offset pending-lfn))
-                            (setq rev-entries (cons (%fat32-make-short-dir-entry bytes offset display-name) rev-entries))
+                            (setq rev-entries (cons (%fat32-make-short-dir-entry device bytes offset display-name) rev-entries))
                             (setq pending-lfn nil)
                             (setq offset (+ offset 32))
                             (setq i (+ i 1)))))))
@@ -596,6 +599,83 @@
                             (if (null bytes)
                                 nil
                                 (subseq bytes 0 size))))))))))))
+
+;;; --- [ファイルI/O]#47(M4): read-into!総称関数 + オフセット→クラスタ探索 ---
+
+;; (%fat32-cluster-at-offset device bpb node byte-offset) : fat16.lispの
+;; %fat16-cluster-at-offsetと同じ考え方(直前アクセス位置のキャッシュによる
+;; O(n²)化の回避)をFAT32(32bit FATエントリ、終端判定#x0FFFFFF8)に適用したもの。
+(defun %fat32-cluster-at-offset (device bpb node byte-offset)
+  (let* ((cluster-size (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+         (target-index (div byte-offset cluster-size))
+         (cached-index (slot-value node 'last-cluster-index))
+         (from-cache (and cached-index (>= target-index cached-index)))
+         (cluster (if from-cache (slot-value node 'last-cluster-number) (slot-value node 'start-cluster)))
+         (i (if from-cache cached-index 0))
+         (ok t))
+    (while (and ok cluster (< i target-index))
+      (let ((entry (fat32-fat-entry device bpb cluster)))
+        (if (or (null entry) (>= entry #x0FFFFFF8))
+            (setq ok nil)
+            (progn
+              (setq cluster entry)
+              (setq i (+ i 1))))))
+    (if (and ok cluster) cluster nil)))
+
+;; (%fat32-clusters-needed-from device bpb start-cluster count) : fat16.lispの
+;; %fat16-clusters-needed-fromと同じ(read-into!が触れる範囲のクラスタだけを
+;; 列挙する)。
+(defun %fat32-clusters-needed-from (device bpb start-cluster count)
+  (let ((cluster start-cluster) (i 0) (rev nil))
+    (while (and cluster (< i count))
+      (setq rev (cons cluster rev))
+      (setq i (+ i 1))
+      (if (< i count)
+          (let ((entry (fat32-fat-entry device bpb cluster)))
+            (setq cluster (if (or (null entry) (>= entry #x0FFFFFF8)) nil entry)))))
+    (%fat32-reverse-iter rev)))
+
+;; (%fat32-read-into-impl node buffer buffer-offset file-offset count) :
+;; read-into!(<fat32-file-node>用メソッド、下記)の実体。fat16.lispの
+;; %fat16-read-into-implと同じ設計・同じ理由([ファイルI/O]#47調査、
+;; defmethodのlambda本体に複雑な多文構成を直接書くとQEMU実機上で壊れる
+;; ことを確認したため、実装を普通のdefunへ切り出す)。
+(defun %fat32-read-into-impl (node buffer buffer-offset file-offset count)
+  (let ((device (slot-value node 'device)) (bpb nil) (size nil)
+        (actual-count 0) (cluster-size 0) (pos-in-cluster 0) (start-cluster nil)
+        (clusters-needed 0) (clusters nil) (lbas nil) (chunk nil) (i 0))
+    (setq bpb (fat32-read-bpb device))
+    (setq size (slot-value node 'size))
+    (if (or (null bpb) (null size) (>= file-offset size) (= count 0))
+        0
+        (progn
+          (setq actual-count (if (> (+ file-offset count) size) (- size file-offset) count))
+          (setq cluster-size (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+          (setq pos-in-cluster (mod file-offset cluster-size))
+          (setq start-cluster (%fat32-cluster-at-offset device bpb node file-offset))
+          (if (null start-cluster)
+              0
+              (progn
+                (setq clusters-needed (%fat32-cluster-count-for-bytes (+ pos-in-cluster actual-count) cluster-size))
+                (setq clusters (%fat32-clusters-needed-from device bpb start-cluster clusters-needed))
+                (setq lbas (%fat32-clusters-to-lbas bpb clusters))
+                (setq chunk (%fat32-read-lba-list device lbas))
+                (if (null chunk)
+                    0
+                    (progn
+                      (setq i 0)
+                      (while (< i actual-count)
+                        (set-elt (elt chunk (+ pos-in-cluster i)) buffer (+ buffer-offset i))
+                        (setq i (+ i 1)))
+                      (set-slot-value node 'last-cluster-index (+ (div file-offset cluster-size) (- (length clusters) 1)))
+                      (set-slot-value node 'last-cluster-number (%fat32-last-elt clusters))
+                      actual-count))))))))
+
+;; <fat32-file-node>用のread-into!メソッド(defgenericの宣言はfile-node.lisp参照)。
+;; 実装は%fat32-read-into-impl(上記)に切り出し、この本体は単一の呼び出しだけに
+;; 留める(fat16.lispのread-into!のコメント参照)。
+(defmethod read-into! ((node <fat32-file-node>) buffer buffer-offset file-offset count)
+  (%fat32-read-into-impl node buffer buffer-offset file-offset count))
 
 ;;; --- FAT32-M6a: 既存ファイルの同クラスタ数上書き ---
 

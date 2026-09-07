@@ -728,3 +728,38 @@
           (cons 'specific (call-next-method))
           'specific-no-next))
     t))
+
+;; M4診断([ファイルI/O]#47): 上のテストはいずれも<cons>という組み込みクラス
+;; (%%builtin-classp/%register-builtin-class)をspecializerにしていたが、
+;; fat16.lispの<fat16-file-node>のようなユーザー定義クラス(defclass、
+;; %%class-instance-p/%%make-class-raw+supers経由)をspecializerにする経路は
+;; まだ検証していない。%register-builtin-classの代わりに%%make-class-raw+
+;; %register-classでdefclassと同じ形のクラス階層(supersを持つSTANDARD-CLASS)を
+;; 手動構築し、それをspecializerとするdefmethodが正しくディスパッチされることを
+;; 確認する
+(defgeneric %%transpile-fixture-toynode-gf (x))
+
+(defun %%transpile-fixture-register-toynode-hierarchy ()
+  ;; このC側テスト環境はos_bootstrap/init_aot.lispのトップレベルフォームを
+  ;; 実行しないため、本番では既に登録済みの<standard-object>もここで手動登録する
+  ;; 必要がある(未登録のまま%find-classした結果(nil)をsupersに含めると、
+  ;; subclassp経由の%%class-supersがnilを渡されて未定義動作になる)。
+  ;; M4診断: let*(2段の連鎖束縛)ではなくexpand-defclass自身と同じ単一letの形に
+  ;; 揃える(下記診断結果を踏まえた暫定回避)。
+  (progn
+    (%register-builtin-class '<standard-object> nil)
+    (let ((base (%%make-class-raw '%%transpile-fixture-toy-base
+                  (list (%find-class '<standard-object>)) nil)))
+      (progn
+        (%register-class '%%transpile-fixture-toy-base base)
+        (%register-class '%%transpile-fixture-toy-sub
+          (%%make-class-raw '%%transpile-fixture-toy-sub (list base) nil))
+        t))))
+
+(defun %%transpile-fixture-register-toynode-method ()
+  (progn
+    (defmethod %%transpile-fixture-toynode-gf ((x %%transpile-fixture-toy-sub)) 'matched)
+    t))
+
+(defun %%transpile-fixture-make-toynode ()
+  (make-instance '%%transpile-fixture-toy-sub))
