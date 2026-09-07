@@ -475,9 +475,8 @@
 
 ;;; --- 総称関数ディスパッチ機構(M12 Phase 5, #27) ---
 ;;;
-;;; init.lispからの移動。*generic-methods*/*next-methods*のdefdynamicフォーム
-;;; 自体、およびdefgeneric/defmethodマクロとそのマクロ展開時専用ヘルパ
-;;; (%first-param-specializer/%first-param-var/%lambda-list-specializers/
+;;; init.lispからの移動。defgeneric/defmethodマクロとそのマクロ展開時専用
+;;; ヘルパ(%first-param-specializer/%first-param-var/%lambda-list-specializers/
 ;;; %method-plain-params/%specializer-forms)は、Phase4のexpand-class同様、
 ;;; 展開結果がinit_aot.lisp中の静的テキストとして現れず、defmethod/defgeneric
 ;;; 呼び出し自体もmainがdefun以外を無視するためAOTから一切見えない
@@ -491,6 +490,22 @@
 ;;; os_get_function+os_apply_functionで対象関数を実行時に名前解決して呼ぶ)
 ;;;経由でerrorを呼ぶことで、Phaseの前後関係に関係なくerrorの実際の
 ;;; signal-condition経由の挙動を完全に保ったまま解決する。
+;;;
+;;; [ファイルI/O]#48調査(2026-09): *generic-methods*/*next-methods*の
+;;; defdynamicフォーム自体だけは、Phase5時点の想定(「AOTからは一切見えない」)
+;;; に反してinit.lispへ残したままにできなくなったため、ここ(init_aot.lisp)へ
+;;; 移動した。*classes*(311行目)と全く同じ理由: file-node.lisp/fat16.lisp/
+;;; fat32.lispのdefmethodがos_run_aot_toplevel_forms経由でブート直後に実行され
+;;; %register-methodを呼ぶため、init.lispのload(=インタプリタの初期化)を
+;;; 待たずここで先に用意しておく必要がある。旧来通りinit.lisp側に残したままだと、
+;;; init.lisp読み込み時の(defdynamic *generic-methods* nil)がeval_defdynamicの
+;;; 「既存の値の有無を確認せず無条件にos_set_dynamicで上書きする」仕様により、
+;;; AOTトップレベルform実行時に既に登録済みだったwrite-from!/read-into!等の
+;;; メソッドをnilで踏み潰して消してしまう(#48で発見した実際の障害)。
+;;; main()がfs-lisp-pathsより先にinit_aot.lispを読むため、この2つのdefdynamicは
+;;; 常にfs-lisp-paths側のdefmethodより先に実行される(*classes*と同じ保証)。
+(defdynamic *generic-methods* nil)
+(defdynamic *next-methods* nil)
 
 (defun %find-generic-methods (name)
   (cdr (assoc name (dynamic *generic-methods*))))

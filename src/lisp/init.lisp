@@ -413,16 +413,12 @@
 ;;; call-next-method/next-method-pは仕様上`labels`によりレキシカルに
 ;;; 束縛されるが、本実装では動的変数によるフレームスタックで代替する。
 
-;; *generic-methods*: alist、gf-name -> methods((specializers . fn)*)。
-;; specializersは引数位置ごとのクラス(またはnil=無指定)のリスト。
-;; *classes*/*handlers*と同じ理由でdefdynamic+%%set-dynamicを使う
-(defdynamic *generic-methods* nil)
-
-;; *next-methods*: call-next-method/next-method-pが参照する、現在呼び出し中の
-;; メソッド呼び出しごとの「残りメソッドリスト+呼び出し引数」のフレームスタック
-;; (内側の呼び出しが先頭)。with-handlerの*handlers*と同じ保存/復元パターン
-(defdynamic *next-methods* nil)
-
+;; *generic-methods*(alist、gf-name -> methods((specializers . fn)*))/
+;; *next-methods*(call-next-method/next-method-pが参照するフレームスタック)の
+;; defdynamicフォーム自体はsrc/lisp/init_aot.lispへ移動した([ファイルI/O]#48、
+;; *classes*と同じ理由: file-node.lisp/fat16.lisp/fat32.lispのdefmethodが
+;; os_run_aot_toplevel_forms経由でここより先に%register-methodを呼ぶため)。
+;;
 ;; %find-generic-methods/%specializers-equal-p/%remove-method-with-specializer/
 ;; %register-method/%method-applicable-p/%specializers-applicable-p/
 ;; %applicable-methods/%filter-applicable-methods/%specializers-more-specific-p/

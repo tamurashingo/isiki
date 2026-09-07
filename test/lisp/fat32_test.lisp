@@ -325,12 +325,48 @@
 ;; このディスクはsectors-per-cluster=1なのでクラスタサイズ=セクタサイズ=512byte
 ;; (fat32_test.lisp冒頭のBPBアサーション参照)。
 ;;
-;; 既知の問題(未解決、fat16_test.lispのwrite-from!テストのコメント参照):
-;; write-from!呼び出し自体はエラーなくtを返すが、実際のディスク書き込みが
-;; 行われないことをFAT16側で確認済み(read-into!(#47)と同種と見られる現象)。
-;; FAT32側の実装はFAT16と同じ設計のため同じ制約を受けると見て、内容検証は
-;; 現時点では実施せず、write-from!がエラー無く総称関数として呼び出せることの
-;; みを確認するに留める。
-(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5TEST.TXT" (create-vector 512 65)) t nil))
-(defglobal fat32-test-m5-node (%fat32-test-resolve-node *fat32-test-device* "/M5TEST.TXT"))
-(assert-equal t (write-from! fat32-test-m5-node (create-vector 10 66) 0 10 10))
+;; #47(read-into!)と同じ原因(*generic-methods*がinit.lispのdefdynamicで
+;; 上書き消去され、総称関数が「no applicable method」で無反応スキップになる
+;; 問題、詳細はfat16_test.lispのコメント参照)により、以前は実際のディスク
+;; 書き込み内容を検証できていなかった。原因を修正したので、通常通り書き込み後の
+;; 内容をfat32-read-fileで読み直して検証する。
+
+;; 1クラスタに収まる小さいファイルの一部を書き換える
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5SMALL.TXT" (create-vector 10 65)) t nil)) ;; 全byte'A'
+(defglobal fat32-test-small-node (%fat32-test-resolve-node *fat32-test-device* "/M5SMALL.TXT"))
+(assert-equal t (write-from! fat32-test-small-node (create-vector 3 66) 0 4 3)) ;; オフセット4から3byte'B'
+(defglobal fat32-test-small-after (fat32-read-file *fat32-test-device* "/M5SMALL.TXT"))
+(assert-equal 10 (length fat32-test-small-after))
+(assert-equal #(65 65 65 65 66 66 66 65 65 65) fat32-test-small-after)
+(assert-equal 10 (slot-value fat32-test-small-node 'size))
+
+;; ファイル末尾を越える範囲への書き込み(ファイルサイズの拡張、既存クラスタ内)
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5EXTEND.TXT" (create-vector 10 65)) t nil))
+(defglobal fat32-test-extend-node (%fat32-test-resolve-node *fat32-test-device* "/M5EXTEND.TXT"))
+(assert-equal t (write-from! fat32-test-extend-node (create-vector 5 67) 0 8 5)) ;; オフセット8から5byte'C'→サイズ13に拡張
+(defglobal fat32-test-extend-after (fat32-read-file *fat32-test-device* "/M5EXTEND.TXT"))
+(assert-equal 13 (length fat32-test-extend-after))
+(assert-equal #(65 65 65 65 65 65 65 65 67 67 67 67 67) fat32-test-extend-after)
+(assert-equal 13 (slot-value fat32-test-extend-node 'size))
+
+;; 複数クラスタにまたがる書き込み(sectors-per-cluster=1なのでクラスタ境界=512byte)
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5MULTI.TXT" (create-vector 512 65)) t nil))
+(defglobal fat32-test-multi-node (%fat32-test-resolve-node *fat32-test-device* "/M5MULTI.TXT"))
+(assert-equal t (write-from! fat32-test-multi-node (create-vector 10 68) 0 507 10)) ;; オフセット507から10byte'D'(507-516、クラスタ境界512をまたぐ)
+(defglobal fat32-test-multi-after (fat32-read-file *fat32-test-device* "/M5MULTI.TXT"))
+(assert-equal 517 (length fat32-test-multi-after)) ;; 507+10=517へ拡張
+(assert-equal 65 (elt fat32-test-multi-after 506))
+(assert-equal 68 (elt fat32-test-multi-after 507))
+(assert-equal 68 (elt fat32-test-multi-after 511))
+(assert-equal 68 (elt fat32-test-multi-after 512))
+(assert-equal 68 (elt fat32-test-multi-after 516))
+
+;; 新規クラスタ確保を伴う追記(既存チェイン長を超えるオフセットへの書き込み)
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5APPEND.TXT" (create-vector 512 65)) t nil)) ;; ちょうど1クラスタ
+(defglobal fat32-test-append-node (%fat32-test-resolve-node *fat32-test-device* "/M5APPEND.TXT"))
+(assert-equal t (write-from! fat32-test-append-node (create-vector 5 69) 0 512 5)) ;; 2クラスタ目に新規書き込み
+(defglobal fat32-test-append-after (fat32-read-file *fat32-test-device* "/M5APPEND.TXT"))
+(assert-equal 517 (length fat32-test-append-after))
+(assert-equal 65 (elt fat32-test-append-after 511))
+(assert-equal 69 (elt fat32-test-append-after 512))
+(assert-equal 69 (elt fat32-test-append-after 516))

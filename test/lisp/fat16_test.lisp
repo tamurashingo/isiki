@@ -71,21 +71,18 @@
 ;; 同じ内容を部分的に読めることを確認する(期待値を手計算せず、既存の信頼できる
 ;; データから導くことで算術ミスを避ける)。
 ;;
-;; 既知の問題(未解決、#47コメント参照): QEMU実機上でこのファイルをloadした際、
-;; 以下のread-into!呼び出しを含む(let ...)フォーム自体が(pass/failいずれの
-;; カウントも増えずに)無反応でスキップされる現象を確認している。段階的な
-;; 切り分け調査により、read-into!が内部で呼ぶ各ステップ(%fat16-cluster-at-offset/
-;; %fat16-clusters-needed-from/%fat16-clusters-to-lbas/%fat16-read-lba-list)は
-;; それぞれ個別のトップレベルformとして呼べば正しい値を返すこと、
-;; %fat16-read-into-implの本体を定数42を返すだけの自明な実装に置き換えても
-;; 同じ現象が再現すること(=ロジックの中身ではなくread-into!の呼び出しそのものに
-;; 起因する)、let*の解消・defmethod本体の単純化(実装を普通のdefunへ委譲)・
-;; 末尾位置での呼び出し回避のいずれも解消しないことを確認済み。ネイティブの
-;; make test環境(lisp_compiled_test)では総称関数ディスパッチ自体は
-;; defclassベースのクラスに対しても正しく動作することを別途確認しており
-;; (test_transpile_fixture_toynode_dispatch)、ロジックそのものの誤りである
-;; 可能性は低いと判断しているが、根本原因は特定できていない。今後の調査課題
-;; として残す。
+;; #48で判明した根本原因(修正済み): write-from!/read-into!等、AOTファイル
+;; (file-node.lisp/fat16.lisp/fat32.lisp)側のdefmethodがos_run_aot_toplevel_forms
+;; 実行中に%register-methodへ登録した内容が、その後にロードされるinit.lispの
+;; (defdynamic *generic-methods* nil)によって無条件に上書き消去され、実行時には
+;; 総称関数の呼び出し先が1件も見つからない状態になっていた。%generic-callが
+;; 「no applicable method」でerrorを呼び、ハンドラが無いためsignal-conditionが
+;; トップレベルへの非局所脱出(return-from %top-level)を起こし、read-into!/
+;; write-from!呼び出しを含むトップレベルform自体が(pass/failいずれのカウントも
+;; 増えずに)評価途中で中断されていた。*generic-methods*/*next-methods*の
+;; defdynamicをinit_aot.lisp側(%register-method定義の直前、*classes*と同じ
+;; 位置)へ移動し、fs-lisp-paths側のdefmethod登録より確実に先に初期化される
+;; ようにして解決した。
 
 ;; パス解決だけを行いnode(<fat16-file-node>)を取得するテスト専用ヘルパー。
 ;; fat16-read-fileと同じ解決ロジック(%fat16-resolve-file/%fat16-scan-dir-entries/
@@ -363,17 +360,61 @@
 ;; 他のテストの状態(WRITE1.TXT等の既存フィクスチャ)に影響しないよう、この
 ;; テスト専用の新規ファイルを作って使う。クラスタサイズは2048byte(Makefile参照)。
 ;;
-;; 既知の問題(未解決、#47のread-into!と同種と見られる現象、#48コメント参照):
-;; write-from!呼び出し自体はエラーなくtを返すが、実際のディスク書き込みが
-;; 行われない(ディレクトリエントリのsize/start-clusterも更新されない)ことを
-;; 確認した。デバッグ用dynamic変数への実行トレース記録により、write-from!内部の
-;; 「クラスタ拡張要否判定」より後のコード(実際の書き込みループ)に到達すら
-;; していないことを確認したが、その判定自体に使う個々の計算
-;; (%fat16-cluster-count-for-bytes/div/比較演算子/%fat16-cluster-at-offset)は
-;; いずれも個別のトップレベルformとして呼べば正しい値を返すことも確認して
-;; おり、read-into!(#47)の調査結果と一致する。そのため、実際のディスク書き込み
-;; を伴うQEMU上の内容検証は現時点では実施できず、write-from!がエラー無く
-;; 総称関数として呼び出せることのみを確認するに留める。
-(assert-equal t (if (fat16-create-file *test-device* "/M5TEST.TXT" (create-vector 2048 65)) t nil)) ;; 全byte 'A'
-(defglobal fat16-test-m5-node (%fat16-test-resolve-node *test-device* "/M5TEST.TXT"))
-(assert-equal t (write-from! fat16-test-m5-node (create-vector 10 66) 0 10 10))
+;; #47(read-into!)と同じ原因(*generic-methods*がinit.lispのdefdynamicで
+;; 上書き消去され、総称関数が「no applicable method」で無反応スキップになる
+;; 問題、詳細はread-into!境界値テストのコメント参照)により、以前は実際の
+;; ディスク書き込み内容を検証できていなかった。原因を修正したので、通常通り
+;; 書き込み後の内容をfat16-read-fileで読み直して検証する。
+
+;; パス解決だけを行いnode(<fat16-file-node>)を取得するテスト専用ヘルパー
+;; %fat16-test-resolve-node(read-into!境界値テストで定義済み)をそのまま使う。
+
+;; 1クラスタに収まる小さいファイルの一部を書き換える(セクタ境界をまたがない範囲)
+(assert-equal t (if (fat16-create-file *test-device* "/M5SMALL.TXT" (create-vector 10 65)) t nil)) ;; 全byte'A'
+(defglobal fat16-test-small-node (%fat16-test-resolve-node *test-device* "/M5SMALL.TXT"))
+(assert-equal t (write-from! fat16-test-small-node (create-vector 3 66) 0 4 3)) ;; オフセット4から3byte'B'
+(defglobal fat16-test-small-after (fat16-read-file *test-device* "/M5SMALL.TXT"))
+(assert-equal 10 (length fat16-test-small-after))
+(assert-equal #(65 65 65 65 66 66 66 65 65 65) fat16-test-small-after)
+(assert-equal 10 (slot-value fat16-test-small-node 'size)) ;; 既存範囲内の上書きなのでsizeは変化しない
+
+;; 3byteファイルへの1byte書き込み(できるだけ小さい規模での確認。クラスタサイズは
+;; 2048byteなので3byteファイルでも書き込みループが辿るセクタ数(1クラスタ=4セクタ)は
+;; 変わらないが、期待値の検証はしやすい)
+(assert-equal t (if (fat16-create-file *test-device* "/M5MICRO.TXT" (create-vector 3 65)) t nil))
+(defglobal fat16-test-micro-node (%fat16-test-resolve-node *test-device* "/M5MICRO.TXT"))
+(assert-equal t (write-from! fat16-test-micro-node (create-vector 1 90) 0 1 1)) ;; オフセット1に'Z'
+(defglobal fat16-test-micro-after (fat16-read-file *test-device* "/M5MICRO.TXT"))
+(assert-equal #(65 90 65) fat16-test-micro-after)
+
+;; ファイル末尾を越える範囲への書き込み(ファイルサイズの拡張、既存クラスタ内)
+(assert-equal t (if (fat16-create-file *test-device* "/M5EXTEND.TXT" (create-vector 10 65)) t nil))
+(defglobal fat16-test-extend-node (%fat16-test-resolve-node *test-device* "/M5EXTEND.TXT"))
+(assert-equal t (write-from! fat16-test-extend-node (create-vector 5 67) 0 8 5)) ;; オフセット8から5byte'C'→サイズ13に拡張
+(defglobal fat16-test-extend-after (fat16-read-file *test-device* "/M5EXTEND.TXT"))
+(assert-equal 13 (length fat16-test-extend-after))
+(assert-equal #(65 65 65 65 65 65 65 65 67 67 67 67 67) fat16-test-extend-after)
+(assert-equal 13 (slot-value fat16-test-extend-node 'size))
+
+;; 複数クラスタにまたがる書き込み(クラスタサイズ2048byteの境界をまたぐ範囲)
+(assert-equal t (if (fat16-create-file *test-device* "/M5MULTI.TXT" (create-vector 2048 65)) t nil))
+(defglobal fat16-test-multi-node (%fat16-test-resolve-node *test-device* "/M5MULTI.TXT"))
+(assert-equal t (write-from! fat16-test-multi-node (create-vector 10 68) 0 2043 10)) ;; オフセット2043から10byte'D'(2043-2052、クラスタ境界2048をまたぐ)
+(defglobal fat16-test-multi-after (fat16-read-file *test-device* "/M5MULTI.TXT"))
+(assert-equal 2053 (length fat16-test-multi-after)) ;; 2043+10=2053へ拡張
+(assert-equal 65 (elt fat16-test-multi-after 2042))
+(assert-equal 68 (elt fat16-test-multi-after 2043))
+(assert-equal 68 (elt fat16-test-multi-after 2047))
+(assert-equal 68 (elt fat16-test-multi-after 2048))
+(assert-equal 68 (elt fat16-test-multi-after 2052))
+
+;; 新規クラスタ確保を伴う追記(既存チェイン長を超えるオフセットへの書き込み)
+(assert-equal t (if (fat16-create-file *test-device* "/M5APPEND.TXT" (create-vector 2048 65)) t nil)) ;; ちょうど1クラスタ
+(defglobal fat16-test-append-node (%fat16-test-resolve-node *test-device* "/M5APPEND.TXT"))
+(assert-equal t (write-from! fat16-test-append-node (create-vector 5 69) 0 2048 5)) ;; 2クラスタ目に新規書き込み
+(defglobal fat16-test-append-after (fat16-read-file *test-device* "/M5APPEND.TXT"))
+(assert-equal 2053 (length fat16-test-append-after))
+(assert-equal 65 (elt fat16-test-append-after 2047))
+(assert-equal 69 (elt fat16-test-append-after 2048))
+(assert-equal 69 (elt fat16-test-append-after 2052))
+
