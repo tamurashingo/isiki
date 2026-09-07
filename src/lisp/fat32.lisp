@@ -606,6 +606,19 @@
                                 nil
                                 (subseq bytes 0 size))))))))))))
 
+;; (fat32-resolve-node device path) : fat16-resolve-nodeのFAT32版
+;; ([ファイルI/O]#49(M6)、fat16.lispの同名関数のコメント参照)。
+(defun fat32-resolve-node (device path)
+  (let ((bpb (fat32-read-bpb device)))
+    (if (null bpb)
+        nil
+        (let ((resolved (%fat32-resolve-file device bpb path)))
+          (if (null resolved)
+              nil
+              (%fat32-find-dir-entry
+                (%fat32-scan-dir-entries device (car resolved))
+                (cdr resolved)))))))
+
 ;;; --- [ファイルI/O]#47(M4): read-into!総称関数 + オフセット→クラスタ探索 ---
 
 ;; (%fat32-cluster-at-offset device bpb node byte-offset) : fat16.lispの

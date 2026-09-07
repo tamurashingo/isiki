@@ -418,3 +418,61 @@
 (assert-equal 69 (elt fat16-test-append-after 2048))
 (assert-equal 69 (elt fat16-test-append-after 2052))
 
+;;; --- [ファイルI/O]#49(M6): OPEN-OUTPUT-FILE/OPEN-IO-FILEのストリーミングI/O ---
+;; 旧STREAM_FAT_FILE_CAP(65536byte)を明確に超えるファイルの書き込み→クローズ→
+;; 再読み込みが欠落なく完走することを確認する(#39の直接的な解消確認)。
+;; マウントされたパス経由でOPEN-OUTPUT-FILE/OPEN-IO-FILEがFATストリームを
+;; 使うのはこのテストが初めてなので、専用に/mntへblk0(FAT16)をmountする。
+;;
+;; 書き込みループは(defun ...)に包んでza.cのJITコンパイル対象にする。トップ
+;; レベルのwhileフォームは(このOSの)ツリーウォーク型インタプリタで反復ごとに
+;; C側の再帰呼び出しとして評価され、TCOもスタックガードも無いため(eval.cの
+;; 既知の制約、fat16-cluster-chain等のコメント参照)、数万回級の反復では
+;; スタックオーバーフローで隣接メモリ(os_stream_t含む)を破損しうることが
+;; 調査で判明した(write-charがある時点からFAT分岐に到達しなくなり、
+;; ファイルサイズが非決定的に縮む形で顕在化した)。defun本体はza.cでJIT
+;; コンパイルされ実際のネイティブループになるため、この制約を受けない
+;; (za_test_stress.lispがisiki-za-test-cons-chain等をdefunとして定義し
+;; N=50000で安全に反復できているのと同じ理由)。
+(mount "/mnt" 'blk0 ':fat16)
+
+(defun %%fat16-test-write-n-chars (stream ch n)
+  (let ((i 0))
+    (while (< i n)
+      (write-char ch stream)
+      (setq i (+ i 1)))))
+
+(defglobal fat16-test-bigwrite-len 70000) ;; 65536byteの旧上限を明確に超える
+(defglobal fat16-test-bigwrite-stream (open-output-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat16-test-bigwrite-stream t nil))
+(%%fat16-test-write-n-chars fat16-test-bigwrite-stream #\A fat16-test-bigwrite-len) ;; 全byte'A'
+(close fat16-test-bigwrite-stream)
+
+(defglobal fat16-test-bigwrite-after (fat16-read-file *test-device* "/BIGWR.TXT"))
+(assert-equal t (if fat16-test-bigwrite-after t nil))
+(assert-equal fat16-test-bigwrite-len (length fat16-test-bigwrite-after))
+(assert-equal 65 (elt fat16-test-bigwrite-after 0))
+(assert-equal 65 (elt fat16-test-bigwrite-after 34999))
+(assert-equal 65 (elt fat16-test-bigwrite-after 69999))
+
+;; OPEN-IO-FILE: 既存ファイルに対してtruncateしない(#49で解消した既知の非対称性、
+;; 「常に空バッファから始まり書き込み前のreadが常にEOFになる」の確認)。
+;; 開いた直後にread-charで既存内容('A')が読めることを確認してから、
+;; オフセット50000へseekして1byteだけ上書きし、ファイル全体は壊れず
+;; サイズも変わらないことを確認する。
+(defglobal fat16-test-bigio-stream (open-io-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat16-test-bigio-stream t nil))
+(defglobal fat16-test-bigio-first-char (read-char fat16-test-bigio-stream))
+(assert-equal #\A fat16-test-bigio-first-char) ;; truncateされていれば即EOF(nil)のはず
+(set-file-position fat16-test-bigio-stream 50000)
+(write-char #\Z fat16-test-bigio-stream)
+(close fat16-test-bigio-stream)
+
+(defglobal fat16-test-bigio-after (fat16-read-file *test-device* "/BIGWR.TXT"))
+(assert-equal fat16-test-bigwrite-len (length fat16-test-bigio-after)) ;; サイズは変化しない
+(assert-equal 65 (elt fat16-test-bigio-after 0))
+(assert-equal 65 (elt fat16-test-bigio-after 49999))
+(assert-equal 90 (elt fat16-test-bigio-after 50000))
+(assert-equal 65 (elt fat16-test-bigio-after 50001))
+(assert-equal 65 (elt fat16-test-bigio-after 69999))
+

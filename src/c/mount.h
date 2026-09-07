@@ -58,4 +58,29 @@ int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *rel
 int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *relative_path,
                              const UINT8 *data, UINT32 len);
 
+/**
+ * pathを解決し、(fat32-resolve-node|fat16-resolve-node handle relative_path)で
+ * 得られる<file-node>インスタンス(<fat32-file-node>/<fat16-file-node>、
+ * read-into!/write-from!のディスパッチ先)を返す。[ファイルI/O]#49(M6)、
+ * os_stream_tのFAT系ストリームがos_mount_fat_read_file/os_mount_fat_write_file
+ * (ファイル全体の一括読み書き)ではなくこのnodeを保持し、read-into!/write-from!
+ * 経由でオンデマンドにrefill/flushするために使う。
+ * truncateが真の場合、既存ファイルは(fat32-write-file|fat16-write-file)へ
+ * 空vectorを渡して0byteへ切り詰めてから解決し直す(OPEN-OUTPUT-FILE相当、
+ * 9PのP9_OTRUNCと同じ意味論)。truncateが偽の場合は既存の内容をそのまま保持する
+ * (OPEN-IO-FILE用。旧実装が持っていた「IOストリームは常に空バッファから始まり
+ * 書き込み前のreadが常にEOFになる」既知の非対称性は、この分岐により解消される)。
+ * create_if_missingが真でファイルが存在しない場合は
+ * (fat32-create-file|fat16-create-file)で空ファイルを新規作成してから解決する。
+ * @param kind MOUNT_KIND_FAT32またはMOUNT_KIND_FAT16
+ * @param device deviceシンボル
+ * @param relative_path FATドライバへ渡す相対パス
+ * @param truncate 真なら既存ファイルを0byteへ切り詰めてから解決する
+ * @param create_if_missing 真ならファイルが存在しない場合に空ファイルを新規作成する
+ * @param out_node 解決できた場合に<file-node>インスタンスを格納する先
+ * @return 成功時1、失敗時0(パス解決不可・作成失敗等)
+ */
+int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
+                                    int truncate, int create_if_missing, lisp_val_t *out_node);
+
 #endif /* _MOUNT_H_ */

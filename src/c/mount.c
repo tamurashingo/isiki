@@ -210,3 +210,74 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
     lisp_val_t result2 = os_apply_function(create_fn, create_args, global_environment);
     return result2 != nil;
 }
+
+int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
+                                    int truncate, int create_if_missing, lisp_val_t *out_node) {
+    GC_PROTECT(device);
+
+    lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
+    if (handle_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(handle_fn);
+    lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
+    GC_PROTECT(handle);
+
+    const char *resolve_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-RESOLVE-NODE" : "FAT16-RESOLVE-NODE";
+    lisp_val_t resolve_fn = os_get_function(os_make_symbol(resolve_name), global_environment);
+    if (resolve_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(resolve_fn);
+
+    lisp_val_t path_str = os_make_string(relative_path);
+    GC_PROTECT(path_str);
+    lisp_val_t resolve_args = os_make_cons(handle, os_make_cons(path_str, nil));
+    GC_PROTECT(resolve_args);
+
+    lisp_val_t node = os_apply_function(resolve_fn, resolve_args, global_environment);
+    GC_PROTECT(node);
+
+    if (node != nil && truncate) {
+        const char *write_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-WRITE-FILE" : "FAT16-WRITE-FILE";
+        lisp_val_t write_fn = os_get_function(os_make_symbol(write_name), global_environment);
+        if (write_fn == nil) {
+            return 0;
+        }
+        GC_PROTECT(write_fn);
+        lisp_val_t empty_vec = os_make_vector_from_list(nil);
+        GC_PROTECT(empty_vec);
+        lisp_val_t write_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(empty_vec, nil)));
+        GC_PROTECT(write_args);
+        if (os_apply_function(write_fn, write_args, global_environment) == nil) {
+            return 0;
+        }
+        // 切り詰め後はdir-lba/start-cluster等が変わりうるため、nodeを解決し直す
+        node = os_apply_function(resolve_fn, resolve_args, global_environment);
+        GC_PROTECT(node);
+    }
+
+    if (node == nil && create_if_missing) {
+        const char *create_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-CREATE-FILE" : "FAT16-CREATE-FILE";
+        lisp_val_t create_fn = os_get_function(os_make_symbol(create_name), global_environment);
+        if (create_fn == nil) {
+            return 0;
+        }
+        GC_PROTECT(create_fn);
+        lisp_val_t empty_vec = os_make_vector_from_list(nil);
+        GC_PROTECT(empty_vec);
+        lisp_val_t create_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(empty_vec, nil)));
+        GC_PROTECT(create_args);
+        if (os_apply_function(create_fn, create_args, global_environment) == nil) {
+            return 0;
+        }
+        node = os_apply_function(resolve_fn, resolve_args, global_environment);
+        GC_PROTECT(node);
+    }
+
+    if (node == nil) {
+        return 0;
+    }
+    *out_node = node;
+    return 1;
+}

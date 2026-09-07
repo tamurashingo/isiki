@@ -347,6 +347,22 @@
                                 nil
                                 (subseq bytes 0 size))))))))))))
 
+;; (fat16-resolve-node device path) : pathを解決し、<fat16-file-node>インスタンス
+;; (fat16-read-file/write-file/create-fileが内部で使うのと同じdir-entry)を返す。
+;; パスが解決できない・エントリが見つからない場合はnil。[ファイルI/O]#49(M6)で
+;; mount.c(os_mount_fat_resolve_file_node)がread-into!/write-from!を使った
+;; ストリーミングI/Oのためにnodeを取得する際の唯一の入口として追加した。
+(defun fat16-resolve-node (device path)
+  (let ((bpb (fat16-read-bpb device)))
+    (if (null bpb)
+        nil
+        (let ((resolved (%fat16-resolve-file device bpb path)))
+          (if (null resolved)
+              nil
+              (%fat16-find-dir-entry
+                (%fat16-scan-dir-entries device (car resolved))
+                (cdr resolved)))))))
+
 ;;; --- [ファイルI/O]#47(M4): read-into!総称関数 + オフセット→クラスタ探索 ---
 
 ;; (%fat16-cluster-at-offset device bpb node byte-offset) : byte-offsetバイト目が
