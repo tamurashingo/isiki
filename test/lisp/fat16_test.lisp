@@ -476,3 +476,42 @@
 (assert-equal 65 (elt fat16-test-bigio-after 50001))
 (assert-equal 65 (elt fat16-test-bigio-after 69999))
 
+;;; --- [ファイルI/O]#50(M7): file-length高速パス + read-file-into-vector/write-vector-to-file ---
+
+;; fat16-file-sizeはディレクトリエントリの解決のみ(O(ディレクトリサイズ))で、
+;; fat16-read-file(ファイル全体読み込み)のような性能問題(#41)を引き継がない
+;; ことを、直前に作成済みのBIGWR.TXT(70000byte)に対する壁時計時間の相対比較で
+;; 確認する(絶対時間の閾値だとQEMU実行環境の速度差でフレーキーになりうるため、
+;; 同一環境内での相対比較にする)。#41の対象規模である1.76MBでの絶対時間の
+;; 実測はM9で別途行う。
+(defglobal fat16-test-filesize-t0 (get-internal-real-time))
+(defglobal fat16-test-filesize-result (fat16-file-size *test-device* "/BIGWR.TXT"))
+(defglobal fat16-test-filesize-t1 (get-internal-real-time))
+(assert-equal 70000 fat16-test-filesize-result)
+
+(defglobal fat16-test-readfile-t0 (get-internal-real-time))
+(defglobal fat16-test-readfile-result (fat16-read-file *test-device* "/BIGWR.TXT"))
+(defglobal fat16-test-readfile-t1 (get-internal-real-time))
+(assert-equal 70000 (length fat16-test-readfile-result))
+
+(assert-equal t (<= (- fat16-test-filesize-t1 fat16-test-filesize-t0)
+                     (- fat16-test-readfile-t1 fat16-test-readfile-t0)))
+
+;; FILE-LENGTH(cc_file_length, パス文字列引数)がマウント経由でもfat16-file-size
+;; と同じ高速パスを通ることを確認する。
+(assert-equal 70000 (file-length "/mnt/BIGWR.TXT"))
+(assert-equal 2500 (file-length "/mnt/BIG.TXT"))
+
+;; read-file-into-vector/write-vector-to-fileの往復(write→read一致)を確認する。
+(defglobal fat16-test-rfitv-vec (create-vector 300 0))
+(defglobal fat16-test-rfitv-fill-i 0)
+(while (< fat16-test-rfitv-fill-i 300)
+  (progn
+    (set-elt (mod fat16-test-rfitv-fill-i 256) fat16-test-rfitv-vec fat16-test-rfitv-fill-i)
+    (setq fat16-test-rfitv-fill-i (+ fat16-test-rfitv-fill-i 1))))
+(assert-equal t (if (write-vector-to-file "/mnt/RFITV.BIN" fat16-test-rfitv-vec) t nil))
+(defglobal fat16-test-rfitv-readback (read-file-into-vector "/mnt/RFITV.BIN"))
+(assert-equal t (if fat16-test-rfitv-readback t nil))
+(assert-equal fat16-test-rfitv-vec fat16-test-rfitv-readback)
+(assert-equal nil (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
+

@@ -370,3 +370,75 @@
 (assert-equal 65 (elt fat32-test-append-after 511))
 (assert-equal 69 (elt fat32-test-append-after 512))
 (assert-equal 69 (elt fat32-test-append-after 516))
+
+;;; --- [ファイルI/O]#49(M6): OPEN-OUTPUT-FILE/OPEN-IO-FILEのストリーミングI/O(FAT32) ---
+;; fat16_test.lispのBIGWRITEテストと同じ検証をFAT32側でも行う(M6コミット時に
+;; FAT16側でしか検証していなかったのを補う)。sectors-per-cluster=1(512byte
+;; クラスタ)のため、10000byteの書き込みだけでも約20クラスタの新規確保を伴い、
+;; self_handleのGC再配置漏れ(#49で発見・修正済み)のようなクラスタ拡張時の
+;; バグを十分に踏める規模になる。
+(mount "/mnt" 'blk0 ':fat32)
+
+(defun %%fat32-test-write-n-chars (stream ch n)
+  (let ((i 0))
+    (while (< i n)
+      (progn
+        (write-char ch stream)
+        (setq i (+ i 1))))))
+
+(defglobal fat32-test-bigwrite-len 10000)
+(defglobal fat32-test-bigwrite-stream (open-output-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat32-test-bigwrite-stream t nil))
+(%%fat32-test-write-n-chars fat32-test-bigwrite-stream #\A fat32-test-bigwrite-len)
+(close fat32-test-bigwrite-stream)
+
+(defglobal fat32-test-bigwrite-after (fat32-read-file *fat32-test-device* "/BIGWR.TXT"))
+(assert-equal t (if fat32-test-bigwrite-after t nil))
+(assert-equal fat32-test-bigwrite-len (length fat32-test-bigwrite-after))
+(assert-equal 65 (elt fat32-test-bigwrite-after 0))
+(assert-equal 65 (elt fat32-test-bigwrite-after 4999))
+(assert-equal 65 (elt fat32-test-bigwrite-after 9999))
+
+;; OPEN-IO-FILE: 既存ファイルに対してtruncateしない(FAT16側と同じ確認)。
+(defglobal fat32-test-bigio-stream (open-io-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat32-test-bigio-stream t nil))
+(defglobal fat32-test-bigio-first-char (read-char fat32-test-bigio-stream))
+(assert-equal #\A fat32-test-bigio-first-char)
+(set-file-position fat32-test-bigio-stream 5000)
+(write-char #\Z fat32-test-bigio-stream)
+(close fat32-test-bigio-stream)
+
+(defglobal fat32-test-bigio-after (fat32-read-file *fat32-test-device* "/BIGWR.TXT"))
+(assert-equal fat32-test-bigwrite-len (length fat32-test-bigio-after))
+(assert-equal 65 (elt fat32-test-bigio-after 4999))
+(assert-equal 90 (elt fat32-test-bigio-after 5000))
+(assert-equal 65 (elt fat32-test-bigio-after 5001))
+
+;;; --- [ファイルI/O]#50(M7): file-length高速パス + read-file-into-vector/write-vector-to-file(FAT32) ---
+
+(defglobal fat32-test-filesize-t0 (get-internal-real-time))
+(defglobal fat32-test-filesize-result (fat32-file-size *fat32-test-device* "/BIGWR.TXT"))
+(defglobal fat32-test-filesize-t1 (get-internal-real-time))
+(assert-equal 10000 fat32-test-filesize-result)
+
+(defglobal fat32-test-readfile-t0 (get-internal-real-time))
+(defglobal fat32-test-readfile-result (fat32-read-file *fat32-test-device* "/BIGWR.TXT"))
+(defglobal fat32-test-readfile-t1 (get-internal-real-time))
+(assert-equal 10000 (length fat32-test-readfile-result))
+
+(assert-equal t (<= (- fat32-test-filesize-t1 fat32-test-filesize-t0)
+                     (- fat32-test-readfile-t1 fat32-test-readfile-t0)))
+
+(assert-equal 10000 (file-length "/mnt/BIGWR.TXT"))
+
+(defglobal fat32-test-rfitv-vec (create-vector 300 0))
+(defglobal fat32-test-rfitv-fill-i 0)
+(while (< fat32-test-rfitv-fill-i 300)
+  (progn
+    (set-elt (mod fat32-test-rfitv-fill-i 256) fat32-test-rfitv-vec fat32-test-rfitv-fill-i)
+    (setq fat32-test-rfitv-fill-i (+ fat32-test-rfitv-fill-i 1))))
+(assert-equal t (if (write-vector-to-file "/mnt/RFITV.BIN" fat32-test-rfitv-vec) t nil))
+(defglobal fat32-test-rfitv-readback (read-file-into-vector "/mnt/RFITV.BIN"))
+(assert-equal t (if fat32-test-rfitv-readback t nil))
+(assert-equal fat32-test-rfitv-vec fat32-test-rfitv-readback)
+(assert-equal nil (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))

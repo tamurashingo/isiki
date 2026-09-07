@@ -619,6 +619,14 @@
                 (%fat32-scan-dir-entries device (car resolved))
                 (cdr resolved)))))))
 
+;; (fat32-file-size device path) : fat16-file-sizeのFAT32版
+;; ([ファイルI/O]#50(M7)、fat16.lispの同名関数のコメント参照)。
+(defun fat32-file-size (device path)
+  (let ((node (fat32-resolve-node device path)))
+    (if (null node)
+        nil
+        (slot-value node 'size))))
+
 ;;; --- [ファイルI/O]#47(M4): read-into!総称関数 + オフセット→クラスタ探索 ---
 
 ;; (%fat32-cluster-at-offset device bpb node byte-offset) : fat16.lispの

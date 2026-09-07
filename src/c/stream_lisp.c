@@ -442,9 +442,11 @@ lisp_val_t cc_file_length(lisp_val_t args, lisp_val_t env) {
     }
 
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
-        UINT8 *data;
+        // [ファイルI/O]#50(M7): os_mount_fat_read_file(ファイル全体読み込み)で
+        // サイズだけを得ようとすると#41と同じ性能問題を抱えるため、
+        // ディレクトリエントリの解決だけで済む軽量パスを使う
         UINT32 len;
-        if (!os_mount_fat_read_file(kind, device, relative, &data, &len)) {
+        if (!os_mount_fat_file_size(kind, device, relative, &len)) {
             return g_sym_eval_error;
         }
         return os_make_fixnum(len);

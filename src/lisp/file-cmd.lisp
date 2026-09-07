@@ -219,3 +219,47 @@
                   (%%set-dynamic '*cwd* target)
                   target)
                 (%filecmd-no-such-path (%device-output-stream) target)))))))
+
+;;; --- [ファイルI/O]#50(M7): read-file-into-vector / write-vector-to-file ---
+
+;; (read-file-into-vector path) : pathの内容全体を1byte=1要素のgeneral-vector
+;; として返す。open-input-stream/file-length/read-byteの上に立つ薄いラッパー
+;; (open-input-fileはinit.lisp側のインタプリタ層の別名で、AOTトランスパイラは
+;; そちらを解決できないため、file-cmd.lisp(AOT対象)からは同じ実装である
+;; open-input-streamを直接使う)。file-lengthで得たサイズ分だけvectorを事前
+;; 確保し、read-byteでオンデマンドに充填する。read-byteはC側のバッファ
+;; (stream.cのrefill_read_buf_fat、1024byte単位でread-into!経由の一括転送)を
+;; 通じて補充されるため、fat16-read-file/fat32-read-file(1byte=1consセル表現)
+;; のような#41の性能問題を引き継がない。*mounts*経由でのマウント解決自体が
+;; 失敗した場合はnil。
+(defun read-file-into-vector (path)
+  (let ((stream (open-input-stream path)))
+    (if (eq stream 'eval-error)
+        nil
+        (let ((len (file-length path)))
+          (if (or (null len) (eq len 'eval-error))
+              (progn (close stream) nil)
+              (let ((vec (create-vector len 0)) (i 0))
+                (progn
+                  (while (< i len)
+                    (progn
+                      (set-elt (read-byte stream) vec i)
+                      (setq i (+ i 1))))
+                  (close stream)
+                  vec)))))))
+
+;; (write-vector-to-file path vector) : vector(general-vector、1byte=1要素)の
+;; 内容全体をpathへ書き込む。open-output-file/write-byteの上に立つ薄い
+;; ラッパー(read-file-into-vectorの対称版)。成功時t、マウント解決失敗時nil。
+(defun write-vector-to-file (path vector)
+  (let ((stream (open-output-file path)))
+    (if (eq stream 'eval-error)
+        nil
+        (let ((len (length vector)) (i 0))
+          (progn
+            (while (< i len)
+              (progn
+                (write-byte (elt vector i) stream)
+                (setq i (+ i 1))))
+            (close stream)
+            t)))))

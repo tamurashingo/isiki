@@ -363,6 +363,18 @@
                 (%fat16-scan-dir-entries device (car resolved))
                 (cdr resolved)))))))
 
+;; (fat16-file-size device path) : pathのファイルサイズだけをfixnumで返す
+;; ([ファイルI/O]#50(M7))。fat16-resolve-nodeと同じくディレクトリエントリの
+;; 解決のみ(O(ディレクトリサイズ))で、ファイルデータには一切触れない。
+;; fat16-read-fileでサイズだけを得ようとすると全データを読んでしまう(#41と
+;; 同種の性能問題)ため、FILE-LENGTH(cc_file_length, stream_lisp.c)の高速パス
+;; として新設した。パスが解決できない場合はnil。
+(defun fat16-file-size (device path)
+  (let ((node (fat16-resolve-node device path)))
+    (if (null node)
+        nil
+        (slot-value node 'size))))
+
 ;;; --- [ファイルI/O]#47(M4): read-into!総称関数 + オフセット→クラスタ探索 ---
 
 ;; (%fat16-cluster-at-offset device bpb node byte-offset) : byte-offsetバイト目が

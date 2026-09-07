@@ -83,4 +83,20 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
 int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
                                     int truncate, int create_if_missing, lisp_val_t *out_node);
 
+/**
+ * pathを解決し、(fat32-file-size|fat16-file-size handle relative_path)経由で
+ * ファイルサイズだけを取得する。[ファイルI/O]#50(M7): os_mount_fat_read_file
+ * (ファイル全体読み込み)でサイズを得ようとすると#41と同じ性能問題を抱えるため、
+ * FILE-LENGTH(cc_file_length, stream_lisp.c)の高速パスとして使う
+ * (fat16-file-size/fat32-file-size自体はディレクトリエントリの解決のみで
+ * ファイルデータには一切触れない)。
+ * @param kind MOUNT_KIND_FAT32またはMOUNT_KIND_FAT16
+ * @param device deviceシンボル
+ * @param relative_path FATドライバへ渡す相対パス
+ * @param out_len 解決できた場合にファイルサイズを格納する先
+ * @return 成功時1、失敗時0(パス解決不可等)
+ */
+int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *relative_path,
+                            UINT32 *out_len);
+
 #endif /* _MOUNT_H_ */

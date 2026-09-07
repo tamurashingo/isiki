@@ -281,3 +281,35 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
     *out_node = node;
     return 1;
 }
+
+int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *relative_path,
+                            UINT32 *out_len) {
+    GC_PROTECT(device);
+
+    lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
+    if (handle_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(handle_fn);
+    lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
+    GC_PROTECT(handle);
+
+    const char *size_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-FILE-SIZE" : "FAT16-FILE-SIZE";
+    lisp_val_t size_fn = os_get_function(os_make_symbol(size_name), global_environment);
+    if (size_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(size_fn);
+
+    lisp_val_t path_str = os_make_string(relative_path);
+    GC_PROTECT(path_str);
+    lisp_val_t size_args = os_make_cons(handle, os_make_cons(path_str, nil));
+    GC_PROTECT(size_args);
+    lisp_val_t result = os_apply_function(size_fn, size_args, global_environment);
+
+    if (result == nil) {
+        return 0;
+    }
+    *out_len = (UINT32)os_fixnum_magnitude(result);
+    return 1;
+}

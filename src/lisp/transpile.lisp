@@ -136,6 +136,13 @@
     (open-stream-p . "cc_open_stream_p")
     ;; M14: with-open-output-fileの展開先(バインディングの初期値式)が使う
     (open-output-file . "cc_open_output_file")
+    ;; [ファイルI/O]#50(M7): read-file-into-vector/write-vector-to-file
+    ;; (file-cmd.lisp)が使う。いずれもstream_lisp.cのos_register_streamsで
+    ;; 登録される生のC関数(AOT側にdefunが無い)ため、*known-function-names*では
+    ;; 解決できずここへの追加が必要だった(open-input-stream等と同じ理由)
+    (read-byte . "cc_read_byte")
+    (write-byte . "cc_write_byte")
+    (file-length . "cc_file_length")
     ;; M12基盤C(#27): %register-classが*classes*を更新するのに使う。defdynamic
     ;; はシンボル名キーの動的束縛なので、変数ごとの追加登録は不要
     (%%set-dynamic . "primitive_set_dynamic")
