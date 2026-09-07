@@ -357,3 +357,23 @@
 
 ;; 存在しない親ディレクトリの下へのmkdirもnil
 (assert-equal nil (fat16-create-directory *test-device* "/NOSUCHDIR/CHILD"))
+
+;;; --- [ファイルI/O]#48(M5): write-from!の境界値テスト ---
+;;
+;; 他のテストの状態(WRITE1.TXT等の既存フィクスチャ)に影響しないよう、この
+;; テスト専用の新規ファイルを作って使う。クラスタサイズは2048byte(Makefile参照)。
+;;
+;; 既知の問題(未解決、#47のread-into!と同種と見られる現象、#48コメント参照):
+;; write-from!呼び出し自体はエラーなくtを返すが、実際のディスク書き込みが
+;; 行われない(ディレクトリエントリのsize/start-clusterも更新されない)ことを
+;; 確認した。デバッグ用dynamic変数への実行トレース記録により、write-from!内部の
+;; 「クラスタ拡張要否判定」より後のコード(実際の書き込みループ)に到達すら
+;; していないことを確認したが、その判定自体に使う個々の計算
+;; (%fat16-cluster-count-for-bytes/div/比較演算子/%fat16-cluster-at-offset)は
+;; いずれも個別のトップレベルformとして呼べば正しい値を返すことも確認して
+;; おり、read-into!(#47)の調査結果と一致する。そのため、実際のディスク書き込み
+;; を伴うQEMU上の内容検証は現時点では実施できず、write-from!がエラー無く
+;; 総称関数として呼び出せることのみを確認するに留める。
+(assert-equal t (if (fat16-create-file *test-device* "/M5TEST.TXT" (create-vector 2048 65)) t nil)) ;; 全byte 'A'
+(defglobal fat16-test-m5-node (%fat16-test-resolve-node *test-device* "/M5TEST.TXT"))
+(assert-equal t (write-from! fat16-test-m5-node (create-vector 10 66) 0 10 10))

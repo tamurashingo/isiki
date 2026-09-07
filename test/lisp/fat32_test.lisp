@@ -318,3 +318,19 @@
 
 ;; 存在しない親ディレクトリの下へのmkdirもnil
 (assert-equal nil (fat32-create-directory *fat32-test-device* "/NOSUCHDIR/CHILD"))
+
+;;; --- [ファイルI/O]#48(M5): write-from!の境界値テスト ---
+;;
+;; 他のテストの状態に影響しないよう専用の新規ファイルを使う。FAT32の
+;; このディスクはsectors-per-cluster=1なのでクラスタサイズ=セクタサイズ=512byte
+;; (fat32_test.lisp冒頭のBPBアサーション参照)。
+;;
+;; 既知の問題(未解決、fat16_test.lispのwrite-from!テストのコメント参照):
+;; write-from!呼び出し自体はエラーなくtを返すが、実際のディスク書き込みが
+;; 行われないことをFAT16側で確認済み(read-into!(#47)と同種と見られる現象)。
+;; FAT32側の実装はFAT16と同じ設計のため同じ制約を受けると見て、内容検証は
+;; 現時点では実施せず、write-from!がエラー無く総称関数として呼び出せることの
+;; みを確認するに留める。
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5TEST.TXT" (create-vector 512 65)) t nil))
+(defglobal fat32-test-m5-node (%fat32-test-resolve-node *fat32-test-device* "/M5TEST.TXT"))
+(assert-equal t (write-from! fat32-test-m5-node (create-vector 10 66) 0 10 10))

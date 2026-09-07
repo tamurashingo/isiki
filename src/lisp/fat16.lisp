@@ -113,13 +113,15 @@
         (%fat16-bytes-to-string name-bytes)
         (string-append (%fat16-bytes-to-string name-bytes) "." (%fat16-bytes-to-string ext-bytes)))))
 
-;; (%fat16-dir-entry-at device bytes offset) : bytes(1セクタ512byte分)のoffsetに
-;; ある32byteディレクトリエントリをパースする。先頭バイトが0x00ならシンボル'endを
-;; (ルートディレクトリの走査終了、以降は未使用領域)、0xE5(削除済み)ならnilを、
-;; それ以外は<fat16-file-node>インスタンスを返す。deviceは[ファイルI/O]#47(M4)の
-;; read-into!がnodeだけからセクタを読めるようにするため、生成したインスタンスの
-;; deviceスロットへそのまま保持させる。
-(defun %fat16-dir-entry-at (device bytes offset)
+;; (%fat16-dir-entry-at device lba bytes offset) : bytes(1セクタ512byte分)の
+;; offsetにある32byteディレクトリエントリをパースする。先頭バイトが0x00なら
+;; シンボル'endを(ルートディレクトリの走査終了、以降は未使用領域)、0xE5
+;; (削除済み)ならnilを、それ以外は<fat16-file-node>インスタンスを返す。
+;; deviceは[ファイルI/O]#47(M4)のread-into!がnodeだけからセクタを読めるように
+;; するため、lba/offsetは[ファイルI/O]#48(M5)のwrite-from!が書き込み後に
+;; ディレクトリエントリ自身(dir-lba/dir-offset)を更新できるようにするため、
+;; いずれも生成したインスタンスのスロットへそのまま保持させる。
+(defun %fat16-dir-entry-at (device lba bytes offset)
   (let ((first-byte (elt bytes offset)))
     (if (= first-byte 0)
         'end
@@ -130,7 +132,9 @@
               ':attr (elt bytes (+ offset 11))
               ':start-cluster (%fat16-u16 bytes (+ offset 26))
               ':size (%fat16-u32 bytes (+ offset 28))
-              ':device device)))))
+              ':device device
+              ':dir-lba lba
+              ':dir-offset offset)))))
 
 ;; セクタ単位のディレクトリエントリ走査本体(旧%fat16-parse-sector-entries/
 ;; %fat16-scan-root-dir)はFAT16-M7aで%fat16-scan-dir-entries(このファイル末尾、
@@ -443,6 +447,124 @@
 ;; 留める(上記コメント参照)。
 (defmethod read-into! ((node <fat16-file-node>) buffer buffer-offset file-offset count)
   (%fat16-read-into-impl node buffer buffer-offset file-offset count))
+
+;;; --- [ファイルI/O]#48(M5): write-from!総称関数 + バイト範囲拡張ロジック ---
+
+;; (%fat16-vector-range-to-list vec start len) : vec(general-vector)のstart位置
+;; からlen個の要素をfixnumリストとして返す。write-sector/%fat16-patch-bytes!が
+;; 引数に取るリスト形式へbufferの一部を変換するためのブリッジ。
+(defun %fat16-vector-range-to-list (vec start len)
+  (let ((i 0) (rev nil))
+    (while (< i len)
+      (setq rev (cons (elt vec (+ start i)) rev))
+      (setq i (+ i 1)))
+    (%fat16-reverse-iter rev)))
+
+;; (%fat16-write-into-impl node buffer buffer-offset file-offset count) :
+;; write-from!(<fat16-file-node>用メソッド、下記)の実体。bufferのbuffer-offset
+;; 位置からcountバイト分を読み、nodeのfile-offsetバイト目から書き込む。
+;; 既存のチェイン長(nodeのstart-clusterから辿った現在のクラスタ数)を、
+;; この書き込みで到達するバイト範囲(file-offset+count)が超える場合は、
+;; 不足分だけ新規クラスタを確保・連結する(fat16-write-fileの「ファイル全体を
+;; 新旧クラスタ数の比較で判断する」設計を、触れたバイト範囲だけに一般化した
+;; もの)。書き込み範囲が1セクタ全体を覆う場合はread-modify-writeを省略し、
+;; bufferの内容でそのまま上書きする。書き込み後、nodeのsize/dir-lba/dir-offset
+;; を使ってディレクトリエントリのsize/start-clusterフィールドも更新する。
+;; 成功時はt、失敗時はnil(nodeのsize/start-cluster等は更新しない)。
+;;
+;; [ファイルI/O]#47(M4)のread-into!と同じ理由で、let*/ネストしたletを避け
+;; 単一のletに統一している。defmethodの本体もこの実装を呼ぶだけの単一式に
+;; 留める(fat16.lispのread-into!のコメント参照)。
+(defun %fat16-write-into-impl (node buffer buffer-offset file-offset count)
+  (let ((device (slot-value node 'device)) (bpb nil) (cluster-size 0) (bytes-per-sector 0)
+        (start-cluster nil) (old-cluster-count 0) (end-offset 0) (required-cluster-count 0)
+        (ok t) (new-clusters nil) (start-cluster-idx 0) (clusters-needed 0)
+        (clusters nil) (lbas nil) (remaining-lbas nil) (cluster-idx 0) (sector-in-cluster 0)
+        (sector-base-offset 0) (lba 0) (overlap-start 0) (overlap-end 0) (overlap-len 0)
+        (sector-bytes nil) (new-size 0) (dir-bytes nil))
+    (setq bpb (fat16-read-bpb device))
+    (if (null bpb)
+        nil
+        (progn
+          (setq cluster-size (* (slot-value bpb 'sectors-per-cluster) (slot-value bpb 'bytes-per-sector)))
+          (setq bytes-per-sector (slot-value bpb 'bytes-per-sector))
+          (setq start-cluster (slot-value node 'start-cluster))
+          (setq old-cluster-count (if (or (null start-cluster) (= start-cluster 0))
+                                       0
+                                       (length (fat16-cluster-chain device bpb start-cluster))))
+          (setq end-offset (+ file-offset count))
+          (setq required-cluster-count (%fat16-cluster-count-for-bytes end-offset cluster-size))
+          (if (<= required-cluster-count old-cluster-count)
+              t
+              (progn
+                (setq new-clusters (%fat16-allocate-clusters device bpb (- required-cluster-count old-cluster-count)))
+                (if (null new-clusters)
+                    (setq ok nil)
+                    (if (not (%fat16-link-clusters device bpb new-clusters))
+                        (setq ok nil)
+                        (if (> old-cluster-count 0)
+                            (if (not (%fat16-set-fat-entry device bpb
+                                       (%fat16-last-elt (fat16-cluster-chain device bpb start-cluster))
+                                       (car new-clusters)))
+                                (setq ok nil))
+                            (progn
+                              (setq start-cluster (car new-clusters))
+                              (set-slot-value node 'start-cluster start-cluster)))))))
+          (if (not ok)
+              nil
+              (progn
+                (setq start-cluster-idx (div file-offset cluster-size))
+                (setq clusters-needed (- required-cluster-count start-cluster-idx))
+                (setq clusters (%fat16-clusters-needed-from device bpb
+                                 (%fat16-cluster-at-offset device bpb node file-offset) clusters-needed))
+                (setq lbas (%fat16-clusters-to-lbas bpb clusters))
+                (setq remaining-lbas lbas)
+                (setq cluster-idx start-cluster-idx)
+                (setq sector-in-cluster 0)
+                (while (and ok remaining-lbas)
+                  (setq lba (car remaining-lbas))
+                  (setq sector-base-offset (+ (* cluster-idx cluster-size) (* sector-in-cluster bytes-per-sector)))
+                  (setq overlap-start (if (> file-offset sector-base-offset) file-offset sector-base-offset))
+                  (setq overlap-end (if (< end-offset (+ sector-base-offset bytes-per-sector)) end-offset (+ sector-base-offset bytes-per-sector)))
+                  (if (> overlap-end overlap-start)
+                      (progn
+                        (setq overlap-len (- overlap-end overlap-start))
+                        (if (= overlap-len bytes-per-sector)
+                            (setq sector-bytes (%fat16-vector-range-to-list buffer (+ buffer-offset (- overlap-start file-offset)) bytes-per-sector))
+                            (progn
+                              (setq sector-bytes (read-sector device lba))
+                              (if (null sector-bytes)
+                                  (setq ok nil)
+                                  (%fat16-patch-bytes! sector-bytes (- overlap-start sector-base-offset)
+                                    (%fat16-vector-range-to-list buffer (+ buffer-offset (- overlap-start file-offset)) overlap-len)))))
+                        (if (and ok (not (write-sector device lba sector-bytes)))
+                            (setq ok nil))))
+                  (setq remaining-lbas (cdr remaining-lbas))
+                  (setq sector-in-cluster (+ sector-in-cluster 1))
+                  (if (>= sector-in-cluster (slot-value bpb 'sectors-per-cluster))
+                      (progn
+                        (setq sector-in-cluster 0)
+                        (setq cluster-idx (+ cluster-idx 1)))))
+                (if (not ok)
+                    nil
+                    (progn
+                      (setq new-size (if (> end-offset (slot-value node 'size)) end-offset (slot-value node 'size)))
+                      (set-slot-value node 'size new-size)
+                      (set-slot-value node 'last-cluster-index nil)
+                      (set-slot-value node 'last-cluster-number nil)
+                      (setq dir-bytes (read-sector device (slot-value node 'dir-lba)))
+                      (if (null dir-bytes)
+                          nil
+                          (progn
+                            (%fat16-patch-bytes! dir-bytes (+ (slot-value node 'dir-offset) 26) (%fat16-u16-to-bytes start-cluster))
+                            (%fat16-patch-bytes! dir-bytes (+ (slot-value node 'dir-offset) 28) (%fat16-u32-to-bytes new-size))
+                            (write-sector device (slot-value node 'dir-lba) dir-bytes)))))))))))
+
+;; <fat16-file-node>用のwrite-from!メソッド(defgenericの宣言はfile-node.lisp参照)。
+;; 実装は%fat16-write-into-impl(上記)に切り出し、この本体は単一の呼び出しだけに
+;; 留める(read-into!と同じ理由、上記コメント参照)。
+(defmethod write-from! ((node <fat16-file-node>) buffer buffer-offset file-offset count)
+  (%fat16-write-into-impl node buffer buffer-offset file-offset count))
 
 ;;; --- FAT16-M6a: 既存ファイルの同クラスタ数上書き ---
 
@@ -918,7 +1040,7 @@
             (progn
               (let ((offset 0) (i 0))
                 (while (and (not stopped) (< i 16))
-                  (let ((parsed (%fat16-dir-entry-at device bytes offset)))
+                  (let ((parsed (%fat16-dir-entry-at device (car remaining-lbas) bytes offset)))
                     (if (eq parsed 'end)
                         (setq stopped t)
                         (progn
