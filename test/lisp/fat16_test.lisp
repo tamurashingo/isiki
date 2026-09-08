@@ -531,28 +531,8 @@
     (cat "/mnt/NO-SUCH-FILE.TXT")
   (assert-equal nil fat16-test-cat-missing-result))
 
-;; 大きいファイル(CATBIG.BIN、1200000byte、全byte'A')。ここまでの全テストの
-;; 後(ディレクトリ一覧を検証する既存のテストがことごとく期待値に含めていない
-;; ため、ディスクイメージ作成時にMakefile側で最初から置いておくことはできず、
-;; ここで初めて作成する)でfat16-create-file(ファイル全体を1回で書く一括API)
-;; を使って作る。write-vector-to-file/write-charのような1byteずつの
-;; ストリーミング書き込みだと、%fat16-write-into-implが毎回チェイン全体を
-;; 辿り直す(old-cluster-countの再計算)ためO(フラッシュ回数の2乗)になり、
-;; 1200000byte(586クラスタ、512byte単位なら2344回のflush)では非現実的な
-;; 時間がかかる。fat16-create-fileは新規ファイルをold-cluster-count=0から
-;; 1回のクラスタ確保で書くため、この問題を踏まない。
-;; QEMU(TCG、KVM無し)ではIDEのPIO転送1回ごとのコストが大きく、1.2MB分の
-;; セクタ読み書きを何度も繰り返すと現実的な時間で終わらないことが実測で分かった
-;; ため、node解決とサイズ確認のみ行い(read-into!での全内容の別読み込みはしない)、
-;; catの内部が使うのと同じread-into!経路の検証はcat呼び出し自体(直後)に委ねる
-;; (1.2MB全体をread-into!で2回読むのではなく1回に留める)。#41の絶対的な性能
-;; (数十秒以内)の実測・検証はM9の専用マイルストーンで行う。
-(assert-equal t (if (fat16-create-file *test-device* "/CATBIG.BIN" (create-vector 1200000 65)) t nil))
-(defglobal fat16-test-catbig-node (%fat16-test-resolve-node *test-device* "/CATBIG.BIN"))
-(assert-equal 1200000 (slot-value fat16-test-catbig-node 'size))
-(assert-output (fat16-test-catbig-cat-result fat16-test-catbig-cat-output)
-    (cat "/mnt/CATBIG.BIN")
-  (assert-equal 1024 (length fat16-test-catbig-cat-output))
-  (assert-equal #\A (elt fat16-test-catbig-cat-output 0))
-  (assert-equal #\A (elt fat16-test-catbig-cat-output 1023)))
-
+;; 大きいファイル(1MB超)に対するcatの検証は、このファイル(CIの
+;; qemu_boot_m6_fat16.lispがtimeout-minutes: 10で実行する)に置くとQEMU
+;; (TCG、KVM無し)環境で時間がかかりすぎるため、M9(#52)のローカル専用
+;; マイルストーン(qemu_boot_perf_fat16.lisp)へ移した。カーネル自身の
+;; ブートバイナリ(#41)を使った実データでの検証も兼ねる。

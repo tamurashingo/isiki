@@ -1,11 +1,12 @@
 ;;;; PWD/CD/LSのLisp側API。*mounts*(src/lisp/mount.lisp)を使って絶対パスを
 ;;;; デバイス+相対パスへ解決し、fat16-read-dir/fat32-read-dirへ橋渡しする。
 ;;;;
-;;;; device.lisp/mount.lisp/fat16.lisp/fat32.lispと同様、AOTトランスパイル対象外の、
-;;;; 通常のload形式(インタプリタ実行専用)ファイル。REPLから
-;;;; (load "src/lisp/device.lisp")→(load "src/lisp/mount.lisp")→
-;;;; (load "src/lisp/fat16.lisp")→(load "src/lisp/fat32.lisp")(fat16/fat32は
-;;;; 順不同)の後に(load "src/lisp/file-cmd.lisp")で明示的に読み込む。
+;;;; device.lisp/mount.lisp/fat16.lisp/fat32.lispと同様、M15(#29)でAOT
+;;;; トランスパイル対象に移動済み。ビルド時にsrc/c/lisp_compiled.cへ変換され
+;;;; カーネルバイナリへ直接リンクされ、ブート時に既にglobal_environmentへ
+;;;; 登録・初期化済みのため、REPLからの明示的なloadは不要(このコメントは
+;;;; 移行前の記述が古いまま残っていたもので、[ファイルI/O]#52(M9)の調査で
+;;;; 発見・修正した)。
 ;;;;
 ;;;; ディレクトリ一覧をマウント経由で取るためのC↔Lisp橋渡し関数(src/c/mount.cの
 ;;;; os_mount_fat_read_file相当のread-dir版)は存在しないため、os_mount_resolve

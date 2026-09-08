@@ -455,18 +455,6 @@
     (cat "/mnt/NO-SUCH-FILE.TXT")
   (assert-equal nil fat32-test-cat-missing-result))
 
-;; 大きいファイル(CATBIG.BIN、1200000byte、全byte'A')。fat16_test.lispの同名
-;; テストと同じ理由でfat32-create-file(一括API)で作る(コメントはそちら参照)。
-;; read-into!での全内容の別読み込みはせず(catの内部が使うのと同じ経路を
-;; catの呼び出し自体で1回だけ検証する)、node解決とサイズ確認のみ行う理由も
-;; fat16_test.lisp参照。
-(assert-equal t (if (fat32-create-file *fat32-test-device* "/CATBIG.BIN" (create-vector 1200000 65)) t nil))
-(defglobal fat32-test-catbig-node (%fat32-test-resolve-node *fat32-test-device* "/CATBIG.BIN"))
-(assert-equal 1200000 (slot-value fat32-test-catbig-node 'size))
-;; 実画面出力はQEMU(TCG)では現実的な時間で終わらないため、標準出力を文字列
-;; ストリームへ差し替えて避ける(fat16_test.lispの同名テストのコメント参照)。
-(assert-output (fat32-test-catbig-cat-result fat32-test-catbig-cat-output)
-    (cat "/mnt/CATBIG.BIN")
-  (assert-equal 1024 (length fat32-test-catbig-cat-output))
-  (assert-equal #\A (elt fat32-test-catbig-cat-output 0))
-  (assert-equal #\A (elt fat32-test-catbig-cat-output 1023)))
+;; 大きいファイル(1MB超)に対するcatの検証は、fat16_test.lispと同じ理由で
+;; M9(#52)のローカル専用マイルストーン(qemu_boot_perf_fat32.lisp)へ移した
+;; (コメントはfat16_test.lisp参照)。

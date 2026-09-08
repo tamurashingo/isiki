@@ -598,6 +598,17 @@ test-qemu-all:
 test-qemu-stress:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m2_za_stress.lisp
 
+# [ファイルI/O]#52(M9): カーネル自身のブートバイナリ(約1.76MB)の読み込み(#41)と
+# 65536byte超の書き込み(#39)を実データ規模で検証する。test-qemu-stressと同じ理由
+# (KVM無しのQEMU/TCGでは1MB超のファイルI/Oが現実的な時間で終わらない)でローカル
+# 専用とし、test-qemu-all/CIには含めない。fat16_test.lisp/fat32_test.lispは
+# ディスクを共有しないため、それぞれ専用のディスクイメージを使う
+# (QEMU_DISK_IMGを上書きしなければFAT16_DISK_IMGとFAT32_DISK_IMGが衝突する)。
+test-qemu-perf:
+	rm -f $(FAT16_DISK_IMG) $(FAT32_DISK_IMG)
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
+
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)

@@ -619,19 +619,29 @@
 ;;; 未実装のprimitiveが必要なため対象外とし、errorを発生させる。
 
 ;; strから(文字idxから文字len-1までの)文字のリストを作る
-(defun %string-to-list-from (str idx len)
+;; (%sequence-to-list-from seq idx len) : seq(文字列/general-vector等の任意の
+;; シーケンス)のidx番目からlen個の要素をelt経由でリストへ変換する。elt/lengthは
+;; TAG_CONS/TAG_STRING/TAG_INSTANCE(vector)いずれも正しく分岐する汎用
+;; プリミティブ(runtime.cのprimitive_elt/primitive_length参照)なので、
+;; 文字列専用だったstring-eltと違いvectorにも安全に使える([ファイルI/O]#52
+;; (M9)で#11を修正した際に汎用化)。
+(defun %sequence-to-list-from (seq idx len)
   (if (= idx len)
       nil
-      (cons (string-elt str idx) (%string-to-list-from str (+ idx 1) len))))
+      (cons (elt seq idx) (%sequence-to-list-from seq (+ idx 1) len))))
 
-(defun %string-to-list (str)
-  (%string-to-list-from str 0 (length str)))
+;; (%sequence-to-list seq) : seqが既にリスト(consまたはnil)ならそのまま返し、
+;; それ以外(文字列/general-vector)はelt経由で新規リストに変換する。
+(defun %sequence-to-list (seq)
+  (if (or (consp seq) (null seq))
+      seq
+      (%sequence-to-list-from seq 0 (length seq))))
 
 (defun %convert (obj class-name)
   (case class-name
     ((<string>) (if (symbolp obj) (symbol-name obj) (error "convert: unsupported conversion to <string>" obj)))
     ((<symbol>) (string-to-symbol obj))
-    ((<list>) (%string-to-list obj))
+    ((<list>) (%sequence-to-list obj))
     (t (error "convert: unsupported target class" class-name))))
 
 ;; (convert obj class-name) : class-nameは評価しない
