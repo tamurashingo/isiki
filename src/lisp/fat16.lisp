@@ -105,10 +105,14 @@
 
 ;; (%fat16-dir-entry-name bytes offset) : offsetにある32byteエントリの8+3byte名
 ;; フィールドから表示用文字列("HELLO.TXT"、拡張子が空なら"HELLO"のように"."無し)
-;; を組み立てる。
+;; を組み立てる。[ファイルI/O]#50付随: bytesはread-sectorの戻り値(vector化済み、
+;; %ide-bytes-from-addrのコメント参照)なので、%ide-take/%ide-drop(cons専用、
+;; car/cdr前提)ではなく%fat16-vector-range-to-list(elt経由、O(1)ランダム
+;; アクセス)で部分列を取り出す。取り出した後の8/3要素の小さいリストに対する
+;; %fat16-rtrim-spacesはcar/cdrのままで問題ない(要素数が小さく固定長のため)。
 (defun %fat16-dir-entry-name (bytes offset)
-  (let ((name-bytes (%fat16-rtrim-spaces (%ide-take (%ide-drop bytes offset) 8)))
-        (ext-bytes (%fat16-rtrim-spaces (%ide-take (%ide-drop bytes (+ offset 8)) 3))))
+  (let ((name-bytes (%fat16-rtrim-spaces (%fat16-vector-range-to-list bytes offset 8)))
+        (ext-bytes (%fat16-rtrim-spaces (%fat16-vector-range-to-list bytes (+ offset 8) 3))))
     (if (null ext-bytes)
         (%fat16-bytes-to-string name-bytes)
         (string-append (%fat16-bytes-to-string name-bytes) "." (%fat16-bytes-to-string ext-bytes)))))
@@ -178,17 +182,59 @@
 ;; 重複読み込みを避けるための、1セクタ分のみの軽量キャッシュ(過剰最適化はしない)。
 (defdynamic *fat16-fat-cache-lba* nil)
 (defdynamic *fat16-fat-cache-bytes* nil)
+;; [ファイルI/O]#50付随の性能修正: *fat16-fat-cache-bytes*がディスク上の内容と
+;; 食い違っている(%fat16-set-fat-entryによる書き込みがまだwrite-sectorされて
+;; いない)ことを示すフラグ。%fat16-set-fat-entryが1エントリごとに
+;; read-sector+write-sector(num-fats分)をフルに行っていたため、大量のクラスタを
+;; 確保する際(%fat16-allocate-clusters/%fat16-link-clustersが数百回呼ぶ)、
+;; 同じFATセクタ(256エントリ/セクタ)へ何十〜何百回も冗長な読み書きが発生し、
+;; QEMU(TCG、KVM無し)のIDE PIOエミュレーションでは極めて遅くなっていた
+;; (実測: 1.2MBファイル1個の新規作成が現実的な時間で終わらなかった)。
+;; %fat16-fat-sector-bytesのキャッシュを書き込み側でも使い、同じセクタへの
+;; 連続書き込みをメモリ上でまとめ、セクタが切り替わる瞬間・処理完了時にだけ
+;; 実際にwrite-sectorする(%fat16-flush-fat-cache)よう変更した。
+(defdynamic *fat16-fat-cache-dirty* nil)
 
-;; (%fat16-fat-sector-bytes device lba) : FATテーブル中のlbaセクタの内容(512byte)
-;; を返す。直前に読んだセクタと同じlbaならキャッシュを再利用する。
-(defun %fat16-fat-sector-bytes (device lba)
+;; (%fat16-flush-fat-cache device bpb) : *fat16-fat-cache-dirty*が真なら、
+;; キャッシュ中のセクタ内容を全FATコピー(num-fats本、通常2)へwrite-sectorで
+;; 反映してからdirtyフラグを下ろす。dirtyでなければ何もせずt。いずれかのコピーへの
+;; 書き込みに失敗したら残りは試みずnil(%fat16-set-fat-entryの既存の失敗規約と
+;; 同じ)。%fat16-fat-sector-bytesが別セクタを読み込む前、および
+;; %fat16-allocate-clusters等の呼び出し元が処理を終える際に呼ぶ。
+(defun %fat16-flush-fat-cache (device bpb)
+  (if (not (dynamic *fat16-fat-cache-dirty*))
+      t
+      (let ((lba (dynamic *fat16-fat-cache-lba*))
+            (bytes (dynamic *fat16-fat-cache-bytes*))
+            (sectors-per-fat (slot-value bpb 'sectors-per-fat))
+            (num-fats (slot-value bpb 'num-fats)))
+        (let ((fat-index 0) (ok t))
+          (progn
+            (while (and ok (< fat-index num-fats))
+              (progn
+                (if (not (write-sector device (+ lba (* fat-index sectors-per-fat)) bytes))
+                    (setq ok nil))
+                (setq fat-index (+ fat-index 1))))
+            (if ok
+                (%%set-dynamic '*fat16-fat-cache-dirty* nil))
+            ok)))))
+
+;; (%fat16-fat-sector-bytes device bpb lba) : FATテーブル中のlbaセクタの内容
+;; (512byte)を返す。直前に読んだセクタと同じlbaならキャッシュを再利用する。
+;; キャッシュが別のセクタに対してdirty(%fat16-set-fat-entryによる書き込みが
+;; まだ反映されていない)な場合は、上書きする前に%fat16-flush-fat-cacheで
+;; 先に反映する(でなければ保留中の書き込みが失われる)。[ファイルI/O]#50付随で
+;; bpb引数を追加した(flush時にsectors-per-fat/num-fatsが必要なため)。
+(defun %fat16-fat-sector-bytes (device bpb lba)
   (if (and (dynamic *fat16-fat-cache-lba*) (= (dynamic *fat16-fat-cache-lba*) lba))
       (dynamic *fat16-fat-cache-bytes*)
-      (let ((bytes (read-sector device lba)))
-        (progn
-          (%%set-dynamic '*fat16-fat-cache-lba* lba)
-          (%%set-dynamic '*fat16-fat-cache-bytes* bytes)
-          bytes))))
+      (if (not (%fat16-flush-fat-cache device bpb))
+          nil
+          (let ((bytes (read-sector device lba)))
+            (progn
+              (%%set-dynamic '*fat16-fat-cache-lba* lba)
+              (%%set-dynamic '*fat16-fat-cache-bytes* bytes)
+              bytes)))))
 
 ;; (fat16-fat-entry device bpb cluster-no) : FATテーブル中のcluster-noに対応する
 ;; 16bit値を返す。FATテーブル(1本目)はreserved-sectors番目のセクタから始まり、
@@ -198,7 +244,7 @@
   (let ((byte-offset (* cluster-no 2)))
     (let ((sector-offset (div byte-offset (slot-value bpb 'bytes-per-sector)))
           (offset-in-sector (mod byte-offset (slot-value bpb 'bytes-per-sector))))
-      (let ((bytes (%fat16-fat-sector-bytes device (+ (slot-value bpb 'reserved-sectors) sector-offset))))
+      (let ((bytes (%fat16-fat-sector-bytes device bpb (+ (slot-value bpb 'reserved-sectors) sector-offset))))
         (if (null bytes)
             nil
             (%fat16-u16 bytes offset-in-sector))))))
@@ -308,11 +354,15 @@
         (if (null sector-bytes)
             (setq ok nil)
             (progn
-              (let ((remaining-bytes sector-bytes) (i 0))
-                (while remaining-bytes
-                  (set-elt (car remaining-bytes) buf (+ base i))
-                  (setq remaining-bytes (cdr remaining-bytes))
-                  (setq i (+ i 1))))
+              ;; [ファイルI/O]#50付随: sector-bytesはread-sectorの戻り値
+              ;; (vector化済み、%ide-bytes-from-addrのコメント参照)なので
+              ;; elt/set-eltで直接O(1)アクセスする(以前はcar/cdrで先頭から
+              ;; 辿っていた)。
+              (let ((i 0))
+                (while (< i 512)
+                  (progn
+                    (set-elt (elt sector-bytes i) buf (+ base i))
+                    (setq i (+ i 1)))))
               (setq remaining-lbas (cdr remaining-lbas))
               (setq base (+ base 512))))))
     (if ok
@@ -538,6 +588,8 @@
                             (progn
                               (setq start-cluster (car new-clusters))
                               (set-slot-value node 'start-cluster start-cluster)))))))
+          (if (and ok (not (%fat16-flush-fat-cache device bpb)))
+              (setq ok nil))
           (if (not ok)
               nil
               (progn
@@ -607,45 +659,47 @@
   (append (%fat16-u16-to-bytes (logand n #xFFFF))
           (%fat16-u16-to-bytes (logand (ash n -16) #xFFFF))))
 
-;; (%fat16-patch-bytes! list offset value-list) : listを破壊的にパッチする。
-;; cdrでoffset分whileで進めた後、value-listの各要素をset-carで先頭から順に
-;; 上書きしながらcdrで進む。戻り値はlist自体(呼び出し元が保持している変数は
-;; そのまま更新後の内容を指す)。offset/value-listの長さに関わらずCスタックを
-;; 消費しないwhileベースの実装(このインタプリタにTCOが無いことへの対応、
-;; documents/fs.md参照)。
-(defun %fat16-patch-bytes! (list offset value-list)
-  (let ((cell list) (n offset))
-    (while (> n 0)
-      (setq cell (cdr cell))
-      (setq n (- n 1)))
-    (let ((values value-list))
-      (while values
-        (set-car cell (car values))
-        (setq cell (cdr cell))
-        (setq values (cdr values))))
-    list))
+;; (%fat16-patch-bytes! vec offset value-list) : vec(セクタ内容、read-sectorが
+;; 返すgeneral-vector)をoffsetから順にvalue-list(小さい固定長のfixnumリストで
+;; 十分、%fat16-u16-to-bytes/%fat16-build-dir-entry-bytes等の出力)の内容で
+;; 破壊的にパッチする。戻り値はvec自体。[ファイルI/O]#50付随の性能修正:
+;; 以前はvec自体もconsリストの前提でcdrでoffset分スキップしてからset-carして
+;; いたが(offsetに比例したO(n)のスキップコスト)、read-sectorの戻り値をvectorへ
+;; 変更したのに合わせ、set-eltによるO(1)の直接書き込みに変更した
+;; (%ide-bytes-from-addrのコメント参照)。value-list側は小さく固定長のため
+;; car/cdrのままで問題ない。
+(defun %fat16-patch-bytes! (vec offset value-list)
+  (let ((values value-list) (i offset))
+    (while values
+      (progn
+        (set-elt (car values) vec i)
+        (setq values (cdr values))
+        (setq i (+ i 1))))
+    vec))
 
 ;; (%fat16-split-into-chunks bytes chunk-size) : bytes(general-vector、
-;; [ファイルI/O]#46(M3)でconsリストから変更)をchunk-sizeごとのfixnumリストの
-;; リストに分割する。最終チャンクが足りない分は0でパディングする。write-sectorは
-;; 1セクタ分(512要素)のfixnumリストを引数に取る既存の契約のままなので、各チャンク
-;; 自体は従来通りリストとして組み立てる(1チャンクはchunk-size個に固定長で
-;; ファイルサイズに比例しないため、consリスト構築のコストは無視できる)。
-;; 外側・内側ともLisp再帰を使わずwhileで書く(チャンク数自体はファイルサイズに
-;; 比例して増えるため)。%fat16-reverse-iterを再利用する。
+;; [ファイルI/O]#46(M3)でconsリストから変更)をchunk-sizeごとのgeneral-vectorの
+;; リストに分割する。最終チャンクが足りない分は0でパディングする(create-vectorの
+;; 初期値0のまま)。write-sectorは1セクタ分(512要素)のvectorを引数に取る契約に
+;; [ファイルI/O]#50付随で変更したため、各チャンク自体もvectorとして組み立てる
+;; (以前はconsリストだったが、read-sectorの戻り値をvector化したのに合わせた。
+;; %ide-bytes-from-addrのコメント参照)。チャンクのリスト自体(chunks、要素数は
+;; ファイルサイズ/chunk-size)はconsリストのまま(%fat16-write-lba-listが
+;; car/cdrで順に辿るだけなのでO(n)で問題ない)。外側ループはLisp再帰を使わず
+;; whileで書く(チャンク数自体はファイルサイズに比例して増えるため)。
+;; %fat16-reverse-iterを再利用する。
 (defun %fat16-split-into-chunks (bytes chunk-size)
   (let ((total (length bytes)) (offset 0) (chunks nil))
     (while (< offset total)
-      (let ((rev-chunk nil) (count 0) (i offset))
-        (while (and (< i total) (< count chunk-size))
-          (setq rev-chunk (cons (elt bytes i) rev-chunk))
-          (setq i (+ i 1))
-          (setq count (+ count 1)))
-        (while (< count chunk-size)
-          (setq rev-chunk (cons 0 rev-chunk))
-          (setq count (+ count 1)))
-        (setq chunks (cons (%fat16-reverse-iter rev-chunk) chunks))
-        (setq offset (+ offset chunk-size))))
+      (let ((chunk (create-vector chunk-size 0)) (count 0) (i offset))
+        (progn
+          (while (and (< i total) (< count chunk-size))
+            (progn
+              (set-elt (elt bytes i) chunk count)
+              (setq i (+ i 1))
+              (setq count (+ count 1))))
+          (setq chunks (cons chunk chunks))
+          (setq offset (+ offset chunk-size)))))
     (%fat16-reverse-iter chunks)))
 
 ;; (%fat16-write-lba-list device lbas chunks) : lbasとchunks(同じ長さ)を並行して
@@ -732,7 +786,21 @@
 ;; 番号は2始まりのため)。見つからなければ(ディスクフル)nil。データクラスタ数は
 ;; 数千に達し得るため、再帰は使わずwhileで書く(documents/fs.md参照)。
 (defun %fat16-find-free-cluster (device bpb)
-  (let ((cluster-no 2) (limit (+ (%fat16-total-cluster-count bpb) 2)) (found nil))
+  (%fat16-find-free-cluster-from device bpb 2))
+
+;; (%fat16-find-free-cluster-from device bpb start) : %fat16-find-free-clusterと
+;; 同じだが探索開始位置をstartから指定できる。[ファイルI/O]#50付随の性能修正:
+;; %fat16-allocate-clustersが複数クラスタをまとめて確保する際、%fat16-find-free-
+;; clusterを毎回クラスタ2から呼び直すとO(確保クラスタ数の2乗)になる
+;; (%fat16-set-fat-entryのI/O冗長性を解消した後もこの部分は残っていた。特に
+;; FAT32はクラスタサイズが小さく同じファイルサイズでもクラスタ数がFAT16の
+;; 数倍になるため、この2乗コストがより深刻に表面化した)。呼び出し元が
+;; 直前に見つけたクラスタ+1から続けて探せるようにし、1回のバッチ確保内では
+;; 全体でO(クラスタ総数)に収める。%fat16-allocate-clustersの呼び出しをまたいだ
+;; グローバルな状態は持たない(各バッチは常にstart=2から始め直せるため、
+;; 他の操作で空いたより若い番号のクラスタを見落とすことはない)。
+(defun %fat16-find-free-cluster-from (device bpb start)
+  (let ((cluster-no start) (limit (+ (%fat16-total-cluster-count bpb) 2)) (found nil))
     (while (and (null found) (< cluster-no limit))
       (let ((entry (fat16-fat-entry device bpb cluster-no)))
         (if (and entry (= entry 0))
@@ -750,24 +818,17 @@
   (let* ((byte-offset (* cluster-no 2))
          (sector-offset (div byte-offset (slot-value bpb 'bytes-per-sector)))
          (offset-in-sector (mod byte-offset (slot-value bpb 'bytes-per-sector)))
-         (value-bytes (%fat16-u16-to-bytes value)))
-    (let ((fat-index 0) (ok t))
-      (while (and ok (< fat-index (slot-value bpb 'num-fats)))
-        (let* ((lba (+ (slot-value bpb 'reserved-sectors)
-                        (* fat-index (slot-value bpb 'sectors-per-fat))
-                        sector-offset))
-               (sector-bytes (read-sector device lba)))
-          (if (null sector-bytes)
-              (setq ok nil)
-              (progn
-                (%fat16-patch-bytes! sector-bytes offset-in-sector value-bytes)
-                (if (write-sector device lba sector-bytes)
-                    (progn
-                      (if (and (dynamic *fat16-fat-cache-lba*) (= (dynamic *fat16-fat-cache-lba*) lba))
-                          (%%set-dynamic '*fat16-fat-cache-lba* nil))
-                      (setq fat-index (+ fat-index 1)))
-                    (setq ok nil))))))
-      ok)))
+         (value-bytes (%fat16-u16-to-bytes value))
+         (lba (+ (slot-value bpb 'reserved-sectors) sector-offset)))
+    (let ((sector-bytes (%fat16-fat-sector-bytes device bpb lba)))
+      (if (null sector-bytes)
+          nil
+          (progn
+            (%fat16-patch-bytes! sector-bytes offset-in-sector value-bytes)
+            (%%set-dynamic '*fat16-fat-cache-lba* lba)
+            (%%set-dynamic '*fat16-fat-cache-bytes* sector-bytes)
+            (%%set-dynamic '*fat16-fat-cache-dirty* t)
+            t)))))
 
 ;; (%fat16-allocate-clusters device bpb count) : 空きクラスタをcount個確保し、
 ;; 発見順のクラスタ番号リストを返す。確保したクラスタは次の探索で再び「空き」と
@@ -777,14 +838,18 @@
 ;; 時点までに仮確保したクラスタの解放(フリーリストへ戻す)は行わない(ディスク
 ;; フル時のクラスタリークは許容する簡略化、documents/fs.md参照)。
 (defun %fat16-allocate-clusters (device bpb count)
-  (let ((i 0) (rev-clusters nil) (ok t))
+  ;; [ファイルI/O]#50付随: search-fromで直前に見つけたクラスタの次から探索を
+  ;; 続ける(%fat16-find-free-cluster-fromのコメント参照)。このバッチ内でのみ
+  ;; 有効なローカル変数で、他の呼び出しには影響しない。
+  (let ((i 0) (rev-clusters nil) (ok t) (search-from 2))
     (while (and ok (< i count))
-      (let ((cluster (%fat16-find-free-cluster device bpb)))
+      (let ((cluster (%fat16-find-free-cluster-from device bpb search-from)))
         (if (null cluster)
             (setq ok nil)
             (if (%fat16-set-fat-entry device bpb cluster #xFFFF)
                 (progn
                   (setq rev-clusters (cons cluster rev-clusters))
+                  (setq search-from (+ cluster 1))
                   (setq i (+ i 1)))
                 (setq ok nil)))))
     (if ok
@@ -833,7 +898,7 @@
                                          (car new-clusters))
                                        t))
                    (first-cluster (if had-old-chain start-cluster (car new-clusters))))
-              (if (not linked-to-old)
+              (if (or (not linked-to-old) (not (%fat16-flush-fat-cache device bpb)))
                   nil
                   (if (%fat16-write-file-data device bpb first-cluster bytes)
                       first-cluster
@@ -1215,7 +1280,7 @@
                                   (if (null slot)
                                       nil
                                       (let ((new-clusters (%fat16-allocate-clusters device bpb 1)))
-                                        (if (null new-clusters)
+                                        (if (or (null new-clusters) (not (%fat16-flush-fat-cache device bpb)))
                                             nil
                                             (let* ((new-cluster (car new-clusters))
                                                    (cluster-bytes-list (%fat16-init-dir-cluster-bytes bpb new-cluster parent-cluster))

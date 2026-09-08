@@ -442,3 +442,31 @@
 (assert-equal t (if fat32-test-rfitv-readback t nil))
 (assert-equal fat32-test-rfitv-vec fat32-test-rfitv-readback)
 (assert-equal nil (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
+
+;;; --- [ファイルI/O]#51(M8): cat ---
+;; fat16_test.lispと同じ検証をFAT32側でも行う(コメントはfat16_test.lisp参照)。
+
+(assert-output (fat32-test-cat-small-result fat32-test-cat-small-output)
+    (cat "/mnt/TEST.LSP")
+  (assert-equal (string-append "Hello from FAT32!" (create-string 1 #\Newline))
+                fat32-test-cat-small-output))
+
+(assert-output (fat32-test-cat-missing-result fat32-test-cat-missing-output)
+    (cat "/mnt/NO-SUCH-FILE.TXT")
+  (assert-equal nil fat32-test-cat-missing-result))
+
+;; 大きいファイル(CATBIG.BIN、1200000byte、全byte'A')。fat16_test.lispの同名
+;; テストと同じ理由でfat32-create-file(一括API)で作る(コメントはそちら参照)。
+;; read-into!での全内容の別読み込みはせず(catの内部が使うのと同じ経路を
+;; catの呼び出し自体で1回だけ検証する)、node解決とサイズ確認のみ行う理由も
+;; fat16_test.lisp参照。
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/CATBIG.BIN" (create-vector 1200000 65)) t nil))
+(defglobal fat32-test-catbig-node (%fat32-test-resolve-node *fat32-test-device* "/CATBIG.BIN"))
+(assert-equal 1200000 (slot-value fat32-test-catbig-node 'size))
+;; 実画面出力はQEMU(TCG)では現実的な時間で終わらないため、標準出力を文字列
+;; ストリームへ差し替えて避ける(fat16_test.lispの同名テストのコメント参照)。
+(assert-output (fat32-test-catbig-cat-result fat32-test-catbig-cat-output)
+    (cat "/mnt/CATBIG.BIN")
+  (assert-equal 1024 (length fat32-test-catbig-cat-output))
+  (assert-equal #\A (elt fat32-test-catbig-cat-output 0))
+  (assert-equal #\A (elt fat32-test-catbig-cat-output 1023)))

@@ -43,25 +43,34 @@
 ;; (documents/partition.md PART-M4調査で発覚。1回でも発生すると回復しない)。
 ;; whileはループ本体に追加のletを挟まないため、この問題を回避できる
 ;; (300,000回の(setq junk (cons i junk))連続実行では再現しないことを確認済み)。
+;;
+;; [ファイルI/O]#50付随の性能修正: 以前はconsリストを構築して返していたが、
+;; read-sectorの戻り値(=このセクタバイト列)がconsリストのままだと、
+;; %fat16-u16/elt等によるインデックスアクセスが毎回先頭からのO(n)走査になり、
+;; 同じセクタへ繰り返しアクセスするコード(fat16-fat-entry経由の
+;; %fat16-find-free-cluster等)でO(n²)以上に膨れ上がる(#41でファイル内容
+;; 全体をconsリストからvectorへ変えたM3と同種の問題が、もう一段低い「セクタ
+;; 単体」のレベルに残っていた)。general-vectorを返すよう変更し、O(1)
+;; ランダムアクセスにする。
 (defun %ide-bytes-from-addr (addr offset count)
-  (let ((i (- count 1)) (result nil))
+  (let ((result (create-vector count 0)) (i 0))
     (progn
-      (while (>= i 0)
+      (while (< i count)
         (progn
-          (setq result (cons (%%peek (+ addr (+ offset i))) result))
-          (setq i (- i 1))))
+          (set-elt (%%peek (+ addr (+ offset i))) result i)
+          (setq i (+ i 1))))
       result)))
 
-;; (%ide-bytes-to-addr addr offset bytes) : bytesの各要素(fixnum 0-255)を
-;; addr+offsetから順に%%pokeで書き込む。%ide-bytes-from-addrと同じ理由でforを避け、
-;; whileで実装する。
+;; (%ide-bytes-to-addr addr offset bytes) : bytes(general-vector、fixnum 0-255の
+;; 各要素)をaddr+offsetから順に%%pokeで書き込む。%ide-bytes-from-addrと同じ理由で
+;; forを避け、whileで実装する。[ファイルI/O]#50付随でbytesの表現をconsリストから
+;; general-vectorへ変更した(コメントは%ide-bytes-from-addr参照)。
 (defun %ide-bytes-to-addr (addr offset bytes)
-  (let ((b bytes) (i offset))
+  (let ((len (length bytes)) (i 0))
     (progn
-      (while (not (null b))
+      (while (< i len)
         (progn
-          (%%poke (+ addr i) (car b))
-          (setq b (cdr b))
+          (%%poke (+ addr offset i) (elt bytes i))
           (setq i (+ i 1))))
       nil)))
 
