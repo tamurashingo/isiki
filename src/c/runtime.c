@@ -4146,7 +4146,16 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_consp1(cc_car(args));
+}
+
+/**
+ * primitive_conspの非allocatingな核ロジック(za向け)。nilはISLisp上consではないため
+ * val == nilは偽と判定する。
+ * @param val 判定対象
+ * @return consならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_consp1(lisp_val_t val) {
     if (val == nil) {
         return nil;
     }
@@ -4316,7 +4325,15 @@ lisp_val_t primitive_equal(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_listp1(cc_car(args));
+}
+
+/**
+ * primitive_listpの非allocatingな核ロジック(za向け)。nilはlist(空リスト)として扱う。
+ * @param val 判定対象
+ * @return listならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_listp1(lisp_val_t val) {
     if (val == nil) {
         return g_sym_t;
     }

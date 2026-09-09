@@ -819,6 +819,9 @@ typedef struct {
     lisp_val_t eqp;     /* "EQ" (ポインタ同一性比較) */
     lisp_val_t nullsym; /* "NULL" */
     lisp_val_t atom;    /* "ATOM" */
+    lisp_val_t notsym;  /* "NOT" (実体はnullsymと同一のprimitive_null1を共用) */
+    lisp_val_t consp;   /* "CONSP" */
+    lisp_val_t listp;   /* "LISTP" */
 } za_syms_t;
 
 /**
@@ -2488,9 +2491,23 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                                  call_depth, arith_depth, (void *)primitive_null1);
     }
+    if (head == syms->notsym) {
+        // NOTはnullとISLisp仕様上完全に同一(runtime.cのos_bootstrapがprimitive_null実体を
+        // 共用しているのと同じ理由)なので、za側もprimitive_null1をそのまま再利用する。
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_null1);
+    }
     if (head == syms->atom) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                                  call_depth, arith_depth, (void *)primitive_atom1);
+    }
+    if (head == syms->consp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_consp1);
+    }
+    if (head == syms->listp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_listp1);
     }
     if (head == syms->eqp) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
@@ -4240,6 +4257,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     syms.eqp = os_make_symbol("EQ");
     syms.nullsym = os_make_symbol("NULL");
     syms.atom = os_make_symbol("ATOM");
+    syms.notsym = os_make_symbol("NOT");
+    syms.consp = os_make_symbol("CONSP");
+    syms.listp = os_make_symbol("LISTP");
 
     g_jit_overflow = 0;
     g_za_saw_flet_labels_escape = 0;

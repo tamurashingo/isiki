@@ -562,3 +562,31 @@
 ;; sum_{i=0}^{4} (i+2) = (0+1+2+3+4) + 2*5 = 10+10 = 20
 (assert-equal 20 (isiki-za-test-sum-box-counters (isiki-za-test-box-counter-chain 5)))
 (close (open-output-file "/9p/tmp/ckpt-24-box-counter-final.txt"))
+
+;; ABI-M1: NOT/CONSP/LISTPをza_compile_unary経由の固定引数直接呼び出しへ追加。
+;; (not x) : nullと実体を共用するprimitive_null1を直接呼ぶ(runtime.c os_bootstrap参照)
+(defun isiki-za-test-not (x) (not x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-not)))
+(assert-equal t (isiki-za-test-not nil))
+(assert-equal nil (isiki-za-test-not 1))
+(assert-equal nil (isiki-za-test-not (cons 1 2)))
+;; NOTはインタプリタ側でも(za未対応のフォールバック経路でも)使える正式な組み込み関数
+(assert-equal t (not nil))
+(assert-equal nil (not 1))
+(close (open-output-file "/9p/tmp/ckpt-25-not.txt"))
+
+;; (consp x) : nilを除くconsのみt
+(defun isiki-za-test-consp (x) (consp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-consp)))
+(assert-equal t (isiki-za-test-consp (cons 1 2)))
+(assert-equal nil (isiki-za-test-consp nil))
+(assert-equal nil (isiki-za-test-consp 1))
+(close (open-output-file "/9p/tmp/ckpt-26-consp.txt"))
+
+;; (listp x) : nil(空リスト)またはconsならt
+(defun isiki-za-test-listp (x) (listp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-listp)))
+(assert-equal t (isiki-za-test-listp (cons 1 2)))
+(assert-equal t (isiki-za-test-listp nil))
+(assert-equal nil (isiki-za-test-listp 1))
+(close (open-output-file "/9p/tmp/ckpt-27-listp.txt"))
