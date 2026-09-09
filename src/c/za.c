@@ -822,6 +822,21 @@ typedef struct {
     lisp_val_t notsym;  /* "NOT" (実体はnullsymと同一のprimitive_null1を共用) */
     lisp_val_t consp;   /* "CONSP" */
     lisp_val_t listp;   /* "LISTP" */
+    /* ABI-M2: 未対応プリミティブへの固定引数ラッパー拡充(車輪の横展開)。
+     * いずれも1引数(型述語)または2引数(SET-CAR/SET-CDR、非allocating)で、
+     * primitive_atom1と同型の「非allocatingな核ロジック+n項版はそれへ委譲」
+     * パターンでruntime.c/runtime.hに_1/_2ラッパーを追加済み。 */
+    lisp_val_t numberp;
+    lisp_val_t fixnump;
+    lisp_val_t bignump;
+    lisp_val_t floatp;
+    lisp_val_t symbolp;
+    lisp_val_t stringp;
+    lisp_val_t functionp;
+    lisp_val_t characterp;
+    lisp_val_t streamp;
+    lisp_val_t setcar;
+    lisp_val_t setcdr;
 } za_syms_t;
 
 /**
@@ -2508,6 +2523,50 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     if (head == syms->listp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                                  call_depth, arith_depth, (void *)primitive_listp1);
+    }
+    if (head == syms->numberp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_numberp1);
+    }
+    if (head == syms->fixnump) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_fixnump1);
+    }
+    if (head == syms->bignump) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_bignump1);
+    }
+    if (head == syms->floatp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_floatp1);
+    }
+    if (head == syms->symbolp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_symbolp1);
+    }
+    if (head == syms->stringp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_stringp1);
+    }
+    if (head == syms->functionp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_functionp1);
+    }
+    if (head == syms->characterp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_characterp1);
+    }
+    if (head == syms->streamp) {
+        return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                 call_depth, arith_depth, (void *)primitive_streamp1);
+    }
+    if (head == syms->setcar) {
+        return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                  call_depth, arith_depth, (void *)primitive_set_car2);
+    }
+    if (head == syms->setcdr) {
+        return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                  call_depth, arith_depth, (void *)primitive_set_cdr2);
     }
     if (head == syms->eqp) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
@@ -4260,6 +4319,17 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     syms.notsym = os_make_symbol("NOT");
     syms.consp = os_make_symbol("CONSP");
     syms.listp = os_make_symbol("LISTP");
+    syms.numberp = os_make_symbol("NUMBERP");
+    syms.fixnump = os_make_symbol("FIXNUMP");
+    syms.bignump = os_make_symbol("BIGNUMP");
+    syms.floatp = os_make_symbol("FLOATP");
+    syms.symbolp = os_make_symbol("SYMBOLP");
+    syms.stringp = os_make_symbol("STRINGP");
+    syms.functionp = os_make_symbol("FUNCTIONP");
+    syms.characterp = os_make_symbol("CHARACTERP");
+    syms.streamp = os_make_symbol("STREAMP");
+    syms.setcar = os_make_symbol("SET-CAR");
+    syms.setcdr = os_make_symbol("SET-CDR");
 
     g_jit_overflow = 0;
     g_za_saw_flet_labels_escape = 0;

@@ -590,3 +590,73 @@
 (assert-equal t (isiki-za-test-listp nil))
 (assert-equal nil (isiki-za-test-listp 1))
 (close (open-output-file "/9p/tmp/ckpt-27-listp.txt"))
+
+;; ABI-M2: 未対応プリミティブへの固定引数ラッパー拡充(車輪の横展開)。
+;; いずれも1引数の型述語がza_compile_unary経由の固定引数直接呼び出しへ乗る。
+
+(defun isiki-za-test-numberp (x) (numberp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-numberp)))
+(assert-equal t (isiki-za-test-numberp 1))
+(assert-equal t (isiki-za-test-numberp 1152921504606846976)) ;; 2^60、bignum
+(assert-equal t (isiki-za-test-numberp 3.14))
+(assert-equal nil (isiki-za-test-numberp 'foo))
+
+(defun isiki-za-test-fixnump (x) (fixnump x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-fixnump)))
+(assert-equal t (isiki-za-test-fixnump 1))
+(assert-equal nil (isiki-za-test-fixnump 1152921504606846976))
+(assert-equal nil (isiki-za-test-fixnump 3.14))
+
+(defun isiki-za-test-bignump (x) (bignump x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bignump)))
+(assert-equal t (isiki-za-test-bignump 1152921504606846976))
+(assert-equal nil (isiki-za-test-bignump 1))
+
+(defun isiki-za-test-floatp (x) (floatp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-floatp)))
+(assert-equal t (isiki-za-test-floatp 3.14))
+(assert-equal nil (isiki-za-test-floatp 1))
+(close (open-output-file "/9p/tmp/ckpt-28-numeric-predicates.txt"))
+
+(defun isiki-za-test-symbolp (x) (symbolp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-symbolp)))
+(assert-equal t (isiki-za-test-symbolp 'foo))
+(assert-equal t (isiki-za-test-symbolp nil))
+(assert-equal nil (isiki-za-test-symbolp 1))
+
+(defun isiki-za-test-stringp (x) (stringp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-stringp)))
+(assert-equal t (isiki-za-test-stringp "abc"))
+(assert-equal nil (isiki-za-test-stringp 1))
+
+(defun isiki-za-test-functionp (x) (functionp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-functionp)))
+(assert-equal t (isiki-za-test-functionp (function isiki-za-test-symbolp)))
+(assert-equal nil (isiki-za-test-functionp 1))
+
+(defun isiki-za-test-characterp (x) (characterp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-characterp)))
+(assert-equal t (isiki-za-test-characterp #\A))
+(assert-equal nil (isiki-za-test-characterp 1))
+
+(defun isiki-za-test-streamp (x) (streamp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-streamp)))
+(assert-equal t (isiki-za-test-streamp (create-string-output-stream)))
+(assert-equal nil (isiki-za-test-streamp 1))
+(close (open-output-file "/9p/tmp/ckpt-29-type-predicates.txt"))
+
+;; (set-car x v)/(set-cdr x v) : 破壊的更新(非allocating、2引数固定)
+(defun isiki-za-test-set-car (c v) (set-car c v))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-set-car)))
+(let ((c (cons 1 2)))
+  (assert-equal 9 (isiki-za-test-set-car c 9))
+  (assert-equal 9 (car c))
+  (assert-equal 2 (cdr c)))
+
+(defun isiki-za-test-set-cdr (c v) (set-cdr c v))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-set-cdr)))
+(let ((c (cons 1 2)))
+  (assert-equal 9 (isiki-za-test-set-cdr c 9))
+  (assert-equal 1 (car c))
+  (assert-equal 9 (cdr c)))
+(close (open-output-file "/9p/tmp/ckpt-30-set-car-cdr.txt"))
