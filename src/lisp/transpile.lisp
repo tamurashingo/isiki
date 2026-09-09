@@ -550,7 +550,14 @@
     (characterp 1 . "primitive_characterp1")
     (stringp 1 . "primitive_stringp1")
     (functionp 1 . "primitive_functionp1")
-    (streamp 1 . "primitive_streamp1")))
+    (streamp 1 . "primitive_streamp1")
+    ;; read-file-into-vector(file-cmd.lisp)のような1byteずつread-byte/set-eltを
+    ;; 呼ぶホットループが、バイトごとにconsセルを構築するコストを避けるために追加
+    ;; (性能調査で判明。ABI-M1/M2で車輪の横展開をした際にはvector/streamの
+    ;; プリミティブまでは対象にしていなかった)。
+    (elt 2 . "primitive_elt2")
+    (set-elt 3 . "primitive_set_elt3")
+    (read-byte 1 . "cc_read_byte1")))
 
 (defun primitive-fixed-arity-c-name (name argc)
   "NAMEが*primitive-fixed-arity-c-names*に載っており、かつ実引数個数ARGCが

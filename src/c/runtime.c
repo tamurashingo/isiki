@@ -5468,18 +5468,15 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数ELT。第一引数のシーケンス(LIST/STRING/VECTOR)の第二引数(0起算)
- * 番目の要素を返す。VECTORの場合は次元に関わらずdata部を1次元配列とみなす
- * (LENGTHと同じ簡略化方針)。
- * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二引数はFIXNUM)
- * @param env 呼び出し時の環境(未使用)
+ * 組み込み関数ELTの共有実装。seq(LIST/STRING/VECTOR)のidx(0起算)番目の要素を
+ * 返す。VECTORの場合は次元に関わらずdata部を1次元配列とみなす(LENGTHと同じ
+ * 簡略化方針)。primitive_elt(consリスト版)/primitive_elt2(固定引数版)の
+ * どちらからも呼ばれる。
+ * @param seq LIST/STRING/VECTOR
+ * @param idx 0起算の添字(タグを外した生の値)
  * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
  */
-lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    lisp_val_t seq = cc_car(args);
-    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
-
+static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
         case TAG_CONS: {
             lisp_val_t cur = seq;
@@ -5522,20 +5519,33 @@ lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数SET-ELT。第二引数のシーケンス(LIST/STRING/VECTOR)の第三引数(0起算)
- * 番目の要素を第一引数で破壊的に書き換える。仕様上set-eltは「新しい値が最初」
- * という引数順である点に注意(SET-AREF/SET-CAR/SET-CDRとは逆順)。
- * @param args 評価済みの引数リスト(第一引数は新しい値、第二引数はLIST/STRING/VECTOR、
- *             第三引数はFIXNUM)
+ * 組み込み関数ELT本体(評価済みの引数リストからseq/idxを取り出しprimitive_elt_impl
+ * へ委譲する)。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二引数はFIXNUM)
  * @param env 呼び出し時の環境(未使用)
- * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
  */
-lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
+lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t obj = cc_car(args);
-    lisp_val_t seq = cc_car(cc_cdr(args));
-    UINT64 idx = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+    lisp_val_t seq = cc_car(args);
+    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
+    return primitive_elt_impl(seq, idx);
+}
 
+lisp_val_t primitive_elt2(lisp_val_t seq, lisp_val_t idx) {
+    return primitive_elt_impl(seq, idx >> 3);
+}
+
+/**
+ * 組み込み関数SET-ELTの共有実装。seq(LIST/STRING/VECTOR)のidx(0起算)番目の
+ * 要素をobjで破壊的に書き換える。primitive_set_elt(consリスト版)/
+ * primitive_set_elt3(固定引数版)のどちらからも呼ばれる。
+ * @param obj 新しい値
+ * @param seq LIST/STRING/VECTOR
+ * @param idx 0起算の添字(タグを外した生の値)
+ * @return 書き込んだ値(obj)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
         case TAG_CONS: {
             lisp_val_t cur = seq;
@@ -5578,6 +5588,26 @@ lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
         default:
             return g_sym_eval_error;
     }
+}
+
+/**
+ * 組み込み関数SET-ELT本体(評価済みの引数リストからobj/seq/idxを取り出し
+ * primitive_set_elt_implへ委譲する)。
+ * @param args 評価済みの引数リスト(第一引数は新しい値、第二引数はLIST/STRING/VECTOR、
+ *             第三引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t obj = cc_car(args);
+    lisp_val_t seq = cc_car(cc_cdr(args));
+    UINT64 idx = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+    return primitive_set_elt_impl(obj, seq, idx);
+}
+
+lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx) {
+    return primitive_set_elt_impl(obj, seq, idx >> 3);
 }
 
 /**

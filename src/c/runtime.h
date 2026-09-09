@@ -1792,6 +1792,16 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_eltの固定引数版(ABI検証: read-file-into-vector等のバイト単位ループが
+ * 1要素ごとにconsリストを構築するコストを避けるため、consチェーンを経由せず
+ * 直接呼べるようにする)。意味論はprimitive_eltと完全に同じ。
+ * @param seq LIST/STRING/VECTOR
+ * @param idx FIXNUM(0起算の添字)
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_elt2(lisp_val_t seq, lisp_val_t idx);
+
+/**
  * 組み込み関数SET-ELT。第二引数のシーケンス(LIST/STRING/VECTOR)の第三引数(0起算)
  * 番目の要素を第一引数で破壊的に書き換える。仕様上「新しい値が最初」という引数順
  * である点に注意(SET-AREF/SET-CAR/SET-CDRとは逆順)。
@@ -1801,6 +1811,16 @@ lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env);
  * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
  */
 lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_set_eltの固定引数版(primitive_elt2と同じ理由)。意味論は
+ * primitive_set_eltと完全に同じ。
+ * @param obj 新しい値
+ * @param seq LIST/STRING/VECTOR
+ * @param idx FIXNUM(0起算の添字)
+ * @return 書き込んだ値(obj)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx);
 
 /**
  * 組み込み関数SUBSEQ。第一引数のシーケンス(LIST/STRING/VECTOR)の[z1, z2)の
