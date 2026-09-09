@@ -413,16 +413,12 @@
 ;;; call-next-method/next-method-pは仕様上`labels`によりレキシカルに
 ;;; 束縛されるが、本実装では動的変数によるフレームスタックで代替する。
 
-;; *generic-methods*: alist、gf-name -> methods((specializers . fn)*)。
-;; specializersは引数位置ごとのクラス(またはnil=無指定)のリスト。
-;; *classes*/*handlers*と同じ理由でdefdynamic+%%set-dynamicを使う
-(defdynamic *generic-methods* nil)
-
-;; *next-methods*: call-next-method/next-method-pが参照する、現在呼び出し中の
-;; メソッド呼び出しごとの「残りメソッドリスト+呼び出し引数」のフレームスタック
-;; (内側の呼び出しが先頭)。with-handlerの*handlers*と同じ保存/復元パターン
-(defdynamic *next-methods* nil)
-
+;; *generic-methods*(alist、gf-name -> methods((specializers . fn)*))/
+;; *next-methods*(call-next-method/next-method-pが参照するフレームスタック)の
+;; defdynamicフォーム自体はsrc/lisp/init_aot.lispへ移動した([ファイルI/O]#48、
+;; *classes*と同じ理由: file-node.lisp/fat16.lisp/fat32.lispのdefmethodが
+;; os_run_aot_toplevel_forms経由でここより先に%register-methodを呼ぶため)。
+;;
 ;; %find-generic-methods/%specializers-equal-p/%remove-method-with-specializer/
 ;; %register-method/%method-applicable-p/%specializers-applicable-p/
 ;; %applicable-methods/%filter-applicable-methods/%specializers-more-specific-p/
@@ -623,19 +619,29 @@
 ;;; 未実装のprimitiveが必要なため対象外とし、errorを発生させる。
 
 ;; strから(文字idxから文字len-1までの)文字のリストを作る
-(defun %string-to-list-from (str idx len)
+;; (%sequence-to-list-from seq idx len) : seq(文字列/general-vector等の任意の
+;; シーケンス)のidx番目からlen個の要素をelt経由でリストへ変換する。elt/lengthは
+;; TAG_CONS/TAG_STRING/TAG_INSTANCE(vector)いずれも正しく分岐する汎用
+;; プリミティブ(runtime.cのprimitive_elt/primitive_length参照)なので、
+;; 文字列専用だったstring-eltと違いvectorにも安全に使える([ファイルI/O]#52
+;; (M9)で#11を修正した際に汎用化)。
+(defun %sequence-to-list-from (seq idx len)
   (if (= idx len)
       nil
-      (cons (string-elt str idx) (%string-to-list-from str (+ idx 1) len))))
+      (cons (elt seq idx) (%sequence-to-list-from seq (+ idx 1) len))))
 
-(defun %string-to-list (str)
-  (%string-to-list-from str 0 (length str)))
+;; (%sequence-to-list seq) : seqが既にリスト(consまたはnil)ならそのまま返し、
+;; それ以外(文字列/general-vector)はelt経由で新規リストに変換する。
+(defun %sequence-to-list (seq)
+  (if (or (consp seq) (null seq))
+      seq
+      (%sequence-to-list-from seq 0 (length seq))))
 
 (defun %convert (obj class-name)
   (case class-name
     ((<string>) (if (symbolp obj) (symbol-name obj) (error "convert: unsupported conversion to <string>" obj)))
     ((<symbol>) (string-to-symbol obj))
-    ((<list>) (%string-to-list obj))
+    ((<list>) (%sequence-to-list obj))
     (t (error "convert: unsupported target class" class-name))))
 
 ;; (convert obj class-name) : class-nameは評価しない

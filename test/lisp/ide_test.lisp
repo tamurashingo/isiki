@@ -29,10 +29,18 @@
 
 ;;; --- 3. sector1への書き込み→読み込みの往復一致 ---
 
+;; [ファイルI/O]#50でread-sectorがconsリストではなくgeneral-vectorを返すように
+;; なったため、比較対象のide-test-pattern-bytesもgeneral-vectorとして構築する
+;; (write-sectorのbytes引数はelt/length経由でconsリスト・vectorどちらも受け付ける
+;; が、read-sectorとの往復一致比較には同じ型でなければならない)。
 (defglobal ide-test-pattern-bytes
-  (for ((i 511 (- i 1))
-        (result nil (cons (mod i 256) result)))
-      ((< i 0) result)))
+  (let ((result (create-vector 512 0)) (i 0))
+    (progn
+      (while (< i 512)
+        (progn
+          (set-elt (mod i 256) result i)
+          (setq i (+ i 1))))
+      result)))
 
 (assert-equal t (if (write-sector *test-device* 1 ide-test-pattern-bytes) t nil))
 (assert-equal ide-test-pattern-bytes (read-sector *test-device* 1))

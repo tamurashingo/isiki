@@ -598,6 +598,17 @@
 (assert-equal nil (cdr (cdr (convert "ab" <list>))))
 (assert-equal nil (convert "" <list>))
 
+;; general-vector -> list(#11: 以前は文字列専用のstring-eltへ丸投げしており、
+;; vectorに対してはMAGIC_VECTORのタグ値や生ポインタのバイト列をゴミとして
+;; 読み出していた。elt/lengthベースの汎用実装に直してから追加した回帰テスト)
+(assert-equal 1 (car (convert #(1 2) <list>)))
+(assert-equal 2 (car (cdr (convert #(1 2) <list>))))
+(assert-equal nil (cdr (cdr (convert #(1 2) <list>))))
+(assert-equal nil (convert #() <list>))
+
+;; list -> list(既にリストの場合はそのまま返る)
+(assert-equal t (equal '(1 2) (convert (list 1 2) <list>)))
+
 ;; list -> stringは仕様上エラーを発生させる変換(表の該当欄が"–")なので未対応
 (assert-equal nil (ignore-errors (convert (cons #\a (cons #\b nil)) <string>)))
 

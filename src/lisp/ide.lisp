@@ -43,25 +43,34 @@
 ;; (documents/partition.md PART-M4調査で発覚。1回でも発生すると回復しない)。
 ;; whileはループ本体に追加のletを挟まないため、この問題を回避できる
 ;; (300,000回の(setq junk (cons i junk))連続実行では再現しないことを確認済み)。
+;;
+;; [ファイルI/O]#50付随の性能修正: 以前はconsリストを構築して返していたが、
+;; read-sectorの戻り値(=このセクタバイト列)がconsリストのままだと、
+;; %fat16-u16/elt等によるインデックスアクセスが毎回先頭からのO(n)走査になり、
+;; 同じセクタへ繰り返しアクセスするコード(fat16-fat-entry経由の
+;; %fat16-find-free-cluster等)でO(n²)以上に膨れ上がる(#41でファイル内容
+;; 全体をconsリストからvectorへ変えたM3と同種の問題が、もう一段低い「セクタ
+;; 単体」のレベルに残っていた)。general-vectorを返すよう変更し、O(1)
+;; ランダムアクセスにする。
 (defun %ide-bytes-from-addr (addr offset count)
-  (let ((i (- count 1)) (result nil))
+  (let ((result (create-vector count 0)) (i 0))
     (progn
-      (while (>= i 0)
+      (while (< i count)
         (progn
-          (setq result (cons (%%peek (+ addr (+ offset i))) result))
-          (setq i (- i 1))))
+          (set-elt (%%peek (+ addr (+ offset i))) result i)
+          (setq i (+ i 1))))
       result)))
 
-;; (%ide-bytes-to-addr addr offset bytes) : bytesの各要素(fixnum 0-255)を
-;; addr+offsetから順に%%pokeで書き込む。%ide-bytes-from-addrと同じ理由でforを避け、
-;; whileで実装する。
+;; (%ide-bytes-to-addr addr offset bytes) : bytes(general-vector、fixnum 0-255の
+;; 各要素)をaddr+offsetから順に%%pokeで書き込む。%ide-bytes-from-addrと同じ理由で
+;; forを避け、whileで実装する。[ファイルI/O]#50付随でbytesの表現をconsリストから
+;; general-vectorへ変更した(コメントは%ide-bytes-from-addr参照)。
 (defun %ide-bytes-to-addr (addr offset bytes)
-  (let ((b bytes) (i offset))
+  (let ((len (length bytes)) (i 0))
     (progn
-      (while (not (null b))
+      (while (< i len)
         (progn
-          (%%poke (+ addr i) (car b))
-          (setq b (cdr b))
+          (%%poke (+ addr offset i) (elt bytes i))
           (setq i (+ i 1))))
       nil)))
 
@@ -148,17 +157,37 @@
         (%hex-dump-row out (%ide-take bytes 16) offset)
         (%hex-dump-rows out (%ide-drop bytes 16) (+ offset 16)))))
 
-;; (%ide-take list n) : listの先頭n要素からなるリストを返す。
-(defun %ide-take (list n)
-  (if (or (null list) (= n 0))
-      nil
-      (cons (car list) (%ide-take (cdr list) (- n 1)))))
+;; (%ide-take vec n) : vec(read-sectorが返すgeneral-vector)の先頭n要素からなる
+;; consリストを返す。[ファイルI/O]#50でread-sector/%ide-bytes-from-addrがconsリスト
+;; ではなくgeneral-vectorを返すようになった際、本関数がcar/cdr前提(consリスト専用)
+;; のまま取り残されていた(cc_car/cc_cdrは型チェックをせずポインタ先を無条件に
+;; cons cellとして読むため、vectorに対して呼ぶと内部レイアウトを誤読して無意味な
+;; 値を返す)。elt/lengthでvecを走査するよう書き直す(戻り値は従来通りconsリストの
+;; まま。呼び出し元の%hex-dump-row・ide_test.lispのマジック文字列比較がいずれも
+;; リストを前提にしているため)。
+(defun %ide-take (vec n)
+  (let ((len (length vec)) (i 0) (rev nil))
+    (progn
+      (while (and (< i n) (< i len))
+        (progn
+          (setq rev (cons (elt vec i) rev))
+          (setq i (+ i 1))))
+      (reverse rev))))
 
-;; (%ide-drop list n) : listの先頭n要素を取り除いた残りを返す。
-(defun %ide-drop (list n)
-  (if (or (null list) (= n 0))
-      list
-      (%ide-drop (cdr list) (- n 1))))
+;; (%ide-drop vec n) : vec(general-vector)の先頭n要素を取り除いた残りを、
+;; 元と同じgeneral-vectorとして返す(%ide-takeと同じ理由でvector対応に書き直した)。
+;; 残りが0要素になったらnilを返す(%hex-dump-rowsのnull終端条件をそのまま使う)。
+(defun %ide-drop (vec n)
+  (let ((len (length vec)))
+    (if (>= n len)
+        nil
+        (let ((rest-len (- len n)) (result (create-vector (- len n) 0)) (i 0))
+          (progn
+            (while (< i rest-len)
+              (progn
+                (set-elt (elt vec (+ n i)) result i)
+                (setq i (+ i 1))))
+            result)))))
 
 ;; (%ide-output-stream) : *standard-output*が動的束縛されていれば(with-standard-output
 ;; 経由等)それを使い、なければ画面への新規出力ストリームを開く(utility.lispのroomと

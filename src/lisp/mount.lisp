@@ -1,11 +1,13 @@
 ;;;; マウントテーブル(*mounts*)のLisp側API。パスをマウントパスへ割り当てた
 ;;;; ブロックデバイス+ファイルシステム種別へ解決するための登録機能を提供する。
 ;;;;
-;;;; device.lisp/ide.lisp/partition.lisp等と同様、AOTトランスパイル対象外の、
-;;;; 通常のload形式(インタプリタ実行専用)ファイル。REPLから
-;;;; (load "src/lisp/device.lisp")→(load "src/lisp/ide.lisp")→
-;;;; (load "src/lisp/partition.lisp")の後に(load "src/lisp/mount.lisp")で
-;;;; 明示的に読み込む(fat16.lisp/fat32.lispより前後どちらでもよい)。
+;;;; device.lisp/ide.lisp/partition.lisp等と同様、M15(#29)でAOTトランスパイル
+;;;; 対象に移動済み。ビルド時にsrc/c/lisp_compiled.cへ
+;;;; 変換されカーネルバイナリへ直接リンクされ、ブート時に
+;;;; os_register_aot_init_functions()/os_run_aot_toplevel_forms()経由で既に
+;;;; global_environmentへ登録・初期化済みのため、REPLからの明示的なloadは不要
+;;;; (このコメントは移行前の記述が古いまま残っていたもので、[ファイルI/O]#52
+;;;; (M9)の調査で発見・修正した)。
 ;;;;
 ;;;; ホスト9P経由のファイルアクセス("/9p"配下)はここには登録しない。C側
 ;;;; (src/c/mount.c)が*mounts*に依存せず常に組み込みで解決するため、mount.lispが

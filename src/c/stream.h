@@ -21,11 +21,6 @@ typedef enum {
     STREAM_FAT_FILE_IO
 } stream_kind_t;
 
-/** STREAM_FAT_FILE_WRITE/IOの書き込みバッファ容量。os_alloc_rawはreallocできない
-    ため固定容量で確保する(STREAM_STRING_OUTPUT_CAPと同じ制約)。この容量を超える
-    ファイルはマウント経由では書き込めない既知の制限とする */
-#define STREAM_FAT_FILE_CAP 65536
-
 /**
  * 9Pのバイト列をバッファリングしながら1文字ずつ切り出す、文字列バッファ、または
  * 画面へ1文字ずつ書き出すためのストリーム。buf_data/buf_count/buf_posは
@@ -73,11 +68,28 @@ typedef struct {
     /** os_stream_closeを呼んだ後は1になり、以後の読み書きを禁止する */
     int closed;
 
-    /** STREAM_FAT_FILE_WRITE/IO専用: os_stream_closeで(fat32|fat16)-write-file等を
-        呼ぶために必要な情報(mount_kind_t. MOUNT_KIND_FAT32/FAT16のいずれか) */
-    mount_kind_t mount_fs_kind;
-    lisp_val_t mount_device;
-    char mount_relative_path[STREAM_PATH_MAX];
+    /** STREAM_FAT_FILE_WRITE/IO専用: read-into!/write-from!のディスパッチ先となる
+        <fat32-file-node>/<fat16-file-node>インスタンス([ファイルI/O]#49(M6))。
+        buf_data/write_buf(9Pと共用)でオンデマンドにrefill/flushする際、この
+        nodeそのものへ渡す。os_stream_t自体がGCのたびに別アドレスへ再配置される
+        (runtime.cのgc_relocate_stream参照)ため、cons cellのcar/cdrと同じ扱いで
+        gc_relocate_stream自身がコピー後にgc_copy_valueし直す(個別のGCルート登録は
+        不要、かつ以前そうしていたのは1回目のGC後にアドレスが無効化するバグだった) */
+    lisp_val_t mount_file_node;
+
+    /** os_make_stream(stream_lisp.c)がこのos_stream_tをラップして作った
+        MAGIC_STREAMインスタンス自身への参照([ファイルI/O]#49(M6))。
+        flush_write_buf_fat/refill_read_buf_fatはwrite-from!/read-into!の呼び出し
+        (os_apply_function、Lispコードの実行を伴いGCを誘発しうる)の間、自分が
+        受け取ったos_stream_t*という生ポインタを保持し続けるが、GCが起きると
+        os_stream_t本体はgc_relocate_stream(runtime.c)によって別アドレスへ
+        再配置されてしまうため、その生ポインタは古いまま(呼び出し前のアドレス)
+        になってしまう。self_handle(呼び出し前にローカル変数へ複製しGC_PROTECT
+        しておく)を使ってos_stream_from_lispで呼び出し後に生ポインタを取り直す
+        ことで、これを回避する(mount_file_nodeと同じ問題の別の顔で、あちらは
+        「フィールドの値」、こちらは「構造体そのものへのポインタ」が古くなる
+        ケース)。os_make_stream内で1回だけ設定する */
+    lisp_val_t self_handle;
 } os_stream_t;
 
 /** STREAM_STRING_OUTPUTの固定バッファ容量(realloc不可のため) */
@@ -125,41 +137,53 @@ int os_stream_open_9p_file_io(os_stream_t *stream, const char *path, int create_
 void os_stream_open_screen_output(os_stream_t *stream, frame_buffer *fb);
 
 /**
- * 文字列を読み込み専用ストリームとして初期化する。dataの内容をコピーして保持する。
+ * 文字列を読み込み専用ストリームとして初期化する。[ファイルI/O]#49で発覚したGC安全性
+ * バグへの対処として、バッファは呼び出し側が事前に確保・充填済みのものを受け取る
+ * (この関数自体はos_alloc_raw等のアロケーションを一切行わない)。streamがまだ
+ * MAGIC_STREAMとして包まれておらずGCから見て到達不能な間にアロケーションを挟むと、
+ * その後のGCでstreamの領域が「再配置不要な死んだメモリ」として扱われ、さらに後続の
+ * GCの複製先として上書きされうる(2回目以降のGCで無関係なメモリを踏む、
+ * mount_file_nodeのroot登録バグと同型の危険)。呼び出し側はbufをraw(このstream本体)
+ * より先に確保し、rawの確保からos_make_streamで包むまでの間に一切アロケーションを
+ * 挟まないこと。
  * @param stream 初期化先
- * @param data 読み込み元の文字列データ
- * @param len dataのバイト数
+ * @param buf 呼び出し側が確保・充填済みのバッファ(このstreamがそのまま所有する)
+ * @param len bufのバイト数
  */
-void os_stream_open_string_input(os_stream_t *stream, const char *data, UINT32 len);
+void os_stream_open_string_input(os_stream_t *stream, UINT8 *buf, UINT32 len);
 
 /**
- * 固定容量(STREAM_STRING_OUTPUT_CAP)の文字列出力ストリームとして初期化する。
+ * 文字列出力ストリームとして初期化する。os_stream_open_string_inputと同じ理由で、
+ * 容量STREAM_STRING_OUTPUT_CAPのバッファは呼び出し側が事前に確保済みのものを渡す
+ * (この関数自体はアロケーションを行わない)。
  * @param stream 初期化先
+ * @param buf 呼び出し側が確保済みの空バッファ(容量STREAM_STRING_OUTPUT_CAP)
+ * @param cap bufの容量(常にSTREAM_STRING_OUTPUT_CAP)
  */
-void os_stream_open_string_output(os_stream_t *stream);
+void os_stream_open_string_output(os_stream_t *stream, UINT8 *buf, UINT32 cap);
 
 /**
- * マウントされたFAT32/FAT16デバイスへの書き込み専用ストリームとして初期化する。
- * 書き込み内容は固定容量(STREAM_FAT_FILE_CAP)のバッファに溜め、os_stream_close時に
- * まとめて(fat32|fat16)-write-file(無ければ...-create-file)へ渡す。
+ * 既に解決済みの<file-node>インスタンス(os_mount_fat_resolve_file_node参照、
+ * truncate=1で呼び出し済みのはず)への書き込み専用ストリームとして初期化する。
+ * [ファイルI/O]#49(M6): 書き込み内容は9Pと共用の固定小容量write_buf(512byte)に
+ * 溜め、満杯またはclose/finish-output時にwrite-from!でnodeへflushする
+ * (旧STREAM_FAT_FILE_CAP=65536byteの上限は撤廃)。
  * @param stream 初期化先
- * @param kind MOUNT_KIND_FAT32またはMOUNT_KIND_FAT16
- * @param device deviceシンボル
- * @param relative_path close時にFATドライバへ渡す相対パス(NUL終端)
+ * @param file_node os_mount_fat_resolve_file_nodeで解決済みの<file-node>インスタンス
  */
-void os_stream_open_fat_file_write(os_stream_t *stream, mount_kind_t kind, lisp_val_t device, const char *relative_path);
+void os_stream_open_fat_file_write(os_stream_t *stream, lisp_val_t file_node);
 
 /**
- * マウントされたFAT32/FAT16デバイスへの読み書き両用ストリームとして初期化する。
- * open時点では空のバッファから始まる(9PのSTREAM_9P_FILE_IOと同様、open=truncate
- * 相当)。書き込んだ内容はos_stream_close時にos_stream_open_fat_file_writeと
- * 同様にflushされる。
+ * 既に解決済みの<file-node>インスタンス(os_mount_fat_resolve_file_node参照、
+ * truncate=0で呼び出し済みのはず)への読み書き両用ストリームとして初期化する。
+ * [ファイルI/O]#49(M6): open時点で既存の内容を保持したまま(旧実装の「常に空
+ * バッファから始まり書き込み前のreadが常にEOFになる」既知の非対称性を解消)、
+ * 読み込みはbuf_data(9Pと共用、1024byte)へread-into!でオンデマンドrefillし、
+ * 書き込みはwrite_bufへ溜めてwrite-from!でflushする。
  * @param stream 初期化先
- * @param kind MOUNT_KIND_FAT32またはMOUNT_KIND_FAT16
- * @param device deviceシンボル
- * @param relative_path close時にFATドライバへ渡す相対パス(NUL終端)
+ * @param file_node os_mount_fat_resolve_file_nodeで解決済みの<file-node>インスタンス
  */
-void os_stream_open_fat_file_io(os_stream_t *stream, mount_kind_t kind, lisp_val_t device, const char *relative_path);
+void os_stream_open_fat_file_io(os_stream_t *stream, lisp_val_t file_node);
 
 /**
  * streamから1文字読み込む。内部バッファが尽きていれば9PのTreadで再充填する。

@@ -4,6 +4,7 @@
 #include "test_assert.h"
 #include "types.h"
 #include "stream.h"
+#include "process.h"
 
 // stream.cはos_alloc_raw/nil/os_gc_register_root/os_gc_unregister_root(いずれも
 // runtime.c)を参照するが、このテストはruntime.cをリンクしない(stream.cのみを
@@ -20,6 +21,65 @@ void os_gc_register_root(lisp_val_t *root_ptr) {
 
 void os_gc_unregister_root(lisp_val_t *root_ptr) {
     (void)root_ptr;
+}
+
+// [ファイルI/O]#49(M6): stream.cのFAT分岐(flush_write_buf_fat/refill_read_buf_fat)は
+// read-into!/write-from!呼び出しのためruntime.c/eval.cのLisp実行機構
+// (os_get_function/os_apply_function/os_make_symbol/os_make_cons/os_make_fixnum/
+// os_fixnum_magnitude/os_vector_header/primitive_create_vector/global_environment)
+// を参照するが、このテストはstream.cのみを対象としruntime.c等をリンクしないため、
+// リンクを通すためだけのフェイクに置き換える(このテストはFAT分岐自体を呼ばないため
+// 中身は使われない)。
+lisp_val_t global_environment = 0;
+
+lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env) {
+    (void)sym; (void)env;
+    return 0;
+}
+
+lisp_val_t os_apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_t env) {
+    (void)fn; (void)evaluated_args; (void)env;
+    return 0;
+}
+
+lisp_val_t os_make_symbol(const char *name) {
+    (void)name;
+    return 0;
+}
+
+lisp_val_t os_make_cons(lisp_val_t car, lisp_val_t cdr) {
+    (void)car; (void)cdr;
+    return 0;
+}
+
+lisp_val_t os_make_fixnum(const UINT64 fixnum) {
+    (void)fixnum;
+    return 0;
+}
+
+UINT64 os_fixnum_magnitude(lisp_val_t val) {
+    (void)val;
+    return 0;
+}
+
+lisp_val_t *os_vector_header(lisp_val_t vec) {
+    (void)vec;
+    return 0;
+}
+
+lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return 0;
+}
+
+// GC_PROTECTマクロ(runtime.h、stream.cのFAT分岐で新規使用)がget_current_process()->
+// gc_rootsを参照するため、process.cをリンクしない代わりに固定の1プロセス分の
+// フェイクを返す(このテストのGC_PROTECT自体は経路上呼ばれるが、GCそのものは
+// 動かないためgc_rootsの中身は使われない)。
+static process_t g_fake_process;
+
+process_t *get_current_process(void) {
+    return &g_fake_process;
 }
 
 // virtio9p.c/p9.c/drivers/*.c はリンクしない(9Pプロトコルの実通信は

@@ -46,7 +46,13 @@ static lisp_val_t make_string_from_bytes(const UINT8 *data, UINT32 len) {
 }
 
 lisp_val_t os_make_stream(os_stream_t *raw) {
-    return os_make_instance(MAGIC_STREAM, (lisp_addr_t)(void *)raw, 0, 0);
+    // [ファイルI/O]#49(M6): raw->self_handleは、rawをまだどのMAGIC_STREAMも
+    // 参照していない(=GCから見て到達不能で、gc_relocate_streamが動きようが無い)
+    // この時点でだけ安全に生ポインタ経由で書き込める。os_make_instance自体が
+    // GCを誘発してもrawはまだ影響を受けない
+    lisp_val_t wrapper = os_make_instance(MAGIC_STREAM, (lisp_addr_t)(void *)raw, 0, 0);
+    raw->self_handle = wrapper;
+    return wrapper;
 }
 
 os_stream_t *os_stream_from_lisp(lisp_val_t stream) {
@@ -62,9 +68,14 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
     lisp_val_t device;
     mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
 
-    os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-
+    // [ファイルI/O]#49で発覚したGC安全性バグへの対処: os_stream_t(raw)は
+    // MAGIC_STREAMとして包まれるまでGCから到達不能なため、確保してから
+    // os_make_streamで包むまでの間に他のアロケーション(os_mount_fat_read_file内の
+    // 多数のLisp呼び出し等)を挟むと、2回以上のGCを跨いだ際にrawの領域が別オブジェクトの
+    // 複製先として上書きされうる。rawの確保はアロケーションを伴いうる処理をすべて
+    // 終えた後、os_make_streamの直前まで遅らせる
     if (kind == MOUNT_KIND_9P) {
+        os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
         char err_msg[128];
         if (!os_stream_open_9p_file(raw, relative, err_msg, sizeof(err_msg))) {
             return g_sym_eval_error;
@@ -78,7 +89,10 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
         if (!os_mount_fat_read_file(kind, device, relative, &data, &len)) {
             return g_sym_eval_error;
         }
-        os_stream_open_string_input(raw, (const char *)data, len);
+        // dataはos_mount_fat_read_file内でos_alloc_raw済みの専有バッファ(コピー元の
+        // Lisp vectorから既に切り離されている)なので、そのままstr_bufとして渡せる
+        os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
+        os_stream_open_string_input(raw, data, len);
         return os_make_stream(raw);
     }
 
@@ -171,9 +185,11 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
     lisp_val_t device;
     mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
 
-    os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-
+    // [ファイルI/O]#49で発覚したGC安全性バグへの対処(cc_open_input_streamと同じ理由):
+    // rawの確保はアロケーションを伴いうる処理(os_mount_fat_resolve_file_node)の後、
+    // os_make_streamの直前まで遅らせる
     if (kind == MOUNT_KIND_9P) {
+        os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
         char err_msg[128];
         if (!os_stream_open_9p_file_write(raw, relative, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
             return g_sym_eval_error;
@@ -182,7 +198,15 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
     }
 
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
-        os_stream_open_fat_file_write(raw, kind, device, relative);
+        lisp_val_t node;
+        if (!os_mount_fat_resolve_file_node(kind, device, relative, 1 /* truncate */, 1 /* create_if_missing */, &node)) {
+            return g_sym_eval_error;
+        }
+        // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
+        // ため、書き込み先(os_stream_open_fat_file_write)に渡すまでGC_PROTECTする
+        GC_PROTECT(node);
+        os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
+        os_stream_open_fat_file_write(raw, node);
         return os_make_stream(raw);
     }
 
@@ -198,9 +222,11 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
     lisp_val_t device;
     mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
 
-    os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-
+    // [ファイルI/O]#49で発覚したGC安全性バグへの対処(cc_open_input_streamと同じ理由):
+    // rawの確保はアロケーションを伴いうる処理(os_mount_fat_resolve_file_node)の後、
+    // os_make_streamの直前まで遅らせる
     if (kind == MOUNT_KIND_9P) {
+        os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
         char err_msg[128];
         if (!os_stream_open_9p_file_io(raw, relative, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
             return g_sym_eval_error;
@@ -209,7 +235,15 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
     }
 
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
-        os_stream_open_fat_file_io(raw, kind, device, relative);
+        lisp_val_t node;
+        if (!os_mount_fat_resolve_file_node(kind, device, relative, 0 /* truncate */, 1 /* create_if_missing */, &node)) {
+            return g_sym_eval_error;
+        }
+        // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
+        // ため、書き込み先(os_stream_open_fat_file_io)に渡すまでGC_PROTECTする
+        GC_PROTECT(node);
+        os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
+        os_stream_open_fat_file_io(raw, node);
         return os_make_stream(raw);
     }
 
@@ -228,16 +262,25 @@ lisp_val_t cc_create_string_input_stream(lisp_val_t args, lisp_val_t env) {
     UINT32 len;
     string_bytes(cc_car(args), &data, &len);
 
+    // [ファイルI/O]#49で発覚したGC安全性バグへの対処: dataは元のSTRINGオブジェクトの
+    // 内部を指す生ポインタなので、bufへコピーし終えるまでの間に他のアロケーションを
+    // 挟まない(コピー自体はos_alloc_rawを1回呼ぶのみで、その間dataは未使用)
+    UINT8 *buf = (UINT8 *)os_alloc_raw(len);
+    for (UINT32 i = 0; i < len; i++) {
+        buf[i] = data[i];
+    }
+
     os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-    os_stream_open_string_input(raw, (const char *)data, len);
+    os_stream_open_string_input(raw, buf, len);
     return os_make_stream(raw);
 }
 
 lisp_val_t cc_create_string_output_stream(lisp_val_t args, lisp_val_t env) {
     (void)args;
     (void)env;
+    UINT8 *buf = (UINT8 *)os_alloc_raw(STREAM_STRING_OUTPUT_CAP);
     os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
-    os_stream_open_string_output(raw);
+    os_stream_open_string_output(raw, buf, STREAM_STRING_OUTPUT_CAP);
     return os_make_stream(raw);
 }
 
@@ -342,10 +385,13 @@ lisp_val_t cc_probe_file(lisp_val_t args, lisp_val_t env) {
 lisp_val_t cc_file_position(lisp_val_t args, lisp_val_t env) {
     (void)env;
     os_stream_t *raw = stream_raw(cc_car(args));
-    if (raw->kind == STREAM_STRING_INPUT || raw->kind == STREAM_FAT_FILE_IO) {
+    // [ファイルI/O]#49(M6): STREAM_FAT_FILE_WRITE/IOはbuf_data/write_buf/next_offset
+    // (9Pと共用のバッファリング方式)へ移行したため、9Pのstream_9p_file系と同じ
+    // next_offset(最後にrefill/flushした位置)ベースの近似値を返す
+    if (raw->kind == STREAM_STRING_INPUT) {
         return os_make_fixnum(raw->str_pos);
     }
-    if (raw->kind == STREAM_STRING_OUTPUT || raw->kind == STREAM_FAT_FILE_WRITE) {
+    if (raw->kind == STREAM_STRING_OUTPUT) {
         return os_make_fixnum(raw->str_len);
     }
     return os_make_fixnum(raw->next_offset);
@@ -359,9 +405,9 @@ lisp_val_t cc_set_file_position(lisp_val_t args, lisp_val_t env) {
 
     raw->has_lookahead = 0;
     raw->eof = 0;
-    if (raw->kind == STREAM_STRING_INPUT || raw->kind == STREAM_FAT_FILE_IO) {
+    if (raw->kind == STREAM_STRING_INPUT) {
         raw->str_pos = (UINT32)newpos;
-    } else if (raw->kind == STREAM_STRING_OUTPUT || raw->kind == STREAM_FAT_FILE_WRITE) {
+    } else if (raw->kind == STREAM_STRING_OUTPUT) {
         raw->str_len = (UINT32)newpos;
     } else {
         raw->next_offset = newpos;
@@ -396,9 +442,11 @@ lisp_val_t cc_file_length(lisp_val_t args, lisp_val_t env) {
     }
 
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
-        UINT8 *data;
+        // [ファイルI/O]#50(M7): os_mount_fat_read_file(ファイル全体読み込み)で
+        // サイズだけを得ようとすると#41と同じ性能問題を抱えるため、
+        // ディレクトリエントリの解決だけで済む軽量パスを使う
         UINT32 len;
-        if (!os_mount_fat_read_file(kind, device, relative, &data, &len)) {
+        if (!os_mount_fat_file_size(kind, device, relative, &len)) {
             return g_sym_eval_error;
         }
         return os_make_fixnum(len);

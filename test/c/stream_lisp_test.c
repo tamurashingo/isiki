@@ -97,6 +97,76 @@ int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
     return 1;
 }
 
+// [ファイルI/O]#49(M6): READ-INTO!/WRITE-FROM!のフェイク実装。実際の
+// <file-node>/FATファイルシステムの代わりに、インメモリのバイト列
+// (g_fake_fat_data)へ読み書きする(nodeの中身は無視してよい、実際の
+// os_stream_open_fat_file_write/io呼び出し側が渡す値をそのまま素通しする
+// だけで十分)。os_stream_t側のbuf_data(1024byte)/write_buf(512byte)を
+// 大きく超えるバイト数でも欠落なく複数回のrefill/flushが行われることを
+// 検証するのが目的(旧STREAM_FAT_FILE_CAP=65536byte上限の撤廃を確認する)。
+#define FAKE_FAT_DATA_MAX 4096
+static UINT8 g_fake_fat_data[FAKE_FAT_DATA_MAX];
+static UINT32 g_fake_fat_len = 0;
+static UINT32 g_fake_read_into_calls = 0;
+static UINT32 g_fake_write_from_calls = 0;
+
+static void reset_fake_fat_state(void) {
+    g_fake_fat_len = 0;
+    g_fake_read_into_calls = 0;
+    g_fake_write_from_calls = 0;
+}
+
+static void set_fake_fat_data(const UINT8 *data, UINT32 len) {
+    for (UINT32 i = 0; i < len && i < FAKE_FAT_DATA_MAX; i++) {
+        g_fake_fat_data[i] = data[i];
+    }
+    g_fake_fat_len = len;
+}
+
+// (read-into! node buffer buffer-offset file-offset count) → 実際に読めたbyte数
+static lisp_val_t fake_read_into(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_fake_read_into_calls++;
+    lisp_val_t buffer = cc_car(cc_cdr(args));
+    lisp_val_t buffer_offset = cc_car(cc_cdr(cc_cdr(args)));
+    lisp_val_t file_offset = cc_car(cc_cdr(cc_cdr(cc_cdr(args))));
+    lisp_val_t count = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(args)))));
+    UINT64 boff = os_fixnum_magnitude(buffer_offset);
+    UINT64 foff = os_fixnum_magnitude(file_offset);
+    UINT64 cnt = os_fixnum_magnitude(count);
+    UINT64 avail = (foff < g_fake_fat_len) ? (g_fake_fat_len - foff) : 0;
+    UINT64 n = (cnt < avail) ? cnt : avail;
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)os_vector_header(buffer) + 16);
+    for (UINT64 i = 0; i < n; i++) {
+        data[boff + i] = os_make_fixnum(g_fake_fat_data[foff + i]);
+    }
+    return os_make_fixnum(n);
+}
+
+// (write-from! node buffer buffer-offset file-offset count) → 成功時t
+static lisp_val_t fake_write_from(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_fake_write_from_calls++;
+    lisp_val_t buffer = cc_car(cc_cdr(args));
+    lisp_val_t buffer_offset = cc_car(cc_cdr(cc_cdr(args)));
+    lisp_val_t file_offset = cc_car(cc_cdr(cc_cdr(cc_cdr(args))));
+    lisp_val_t count = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(args)))));
+    UINT64 boff = os_fixnum_magnitude(buffer_offset);
+    UINT64 foff = os_fixnum_magnitude(file_offset);
+    UINT64 cnt = os_fixnum_magnitude(count);
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)os_vector_header(buffer) + 16);
+    for (UINT64 i = 0; i < cnt; i++) {
+        UINT64 pos = foff + i;
+        if (pos < FAKE_FAT_DATA_MAX) {
+            g_fake_fat_data[pos] = (UINT8)os_fixnum_magnitude(data[boff + i]);
+            if (pos + 1 > g_fake_fat_len) {
+                g_fake_fat_len = (UINT32)(pos + 1);
+            }
+        }
+    }
+    return g_sym_t;
+}
+
 // runtime.c が参照する get_active_frame_buffer のダミー実装
 static void dummy_write_string(struct _frame_buffer *self, const char *s) {
     (void)self;
@@ -428,12 +498,106 @@ void test_file_length_counts_bytes_by_reading_whole_file() {
     assert(result == os_make_fixnum(5), "file-lengthは全部読み切ったバイト数を返す");
 }
 
+// [ファイルI/O]#49(M6): STREAM_FAT_FILE_WRITEの書き込みが、write_buf(512byte)の
+// 容量を大きく超える量でもwrite-from!への複数回のflushを通じて欠落なく行われる
+// ことを確認する(旧STREAM_FAT_FILE_CAP=65536byte上限の直接の解消確認)。
+void test_fat_file_write_flushes_across_multiple_write_buf_fills() {
+    reset_fake_fat_state();
+    os_stream_t stream;
+    os_stream_open_fat_file_write(&stream, os_make_fixnum(1) /* ダミーのfile-node */);
+
+    // write_bufの容量(512byte)を大きく超える1500byteを書き込む
+    #define WRITE_LEN 1500
+    for (UINT32 i = 0; i < WRITE_LEN; i++) {
+        int ok = os_stream_write_char(&stream, (char)('A' + (i % 26)));
+        assert(ok, "write_buf容量を超える書き込みでもos_stream_write_charは1を返し続ける");
+    }
+    // write_bufが満杯になるたびに自動flushされるはずなので、close前から複数回
+    // write-from!が呼ばれているはず(1500 / 512 = 2回のちょうど区切り+端数)
+    assert(g_fake_write_from_calls >= 2, "write_buf満杯のたびにwrite-from!が複数回呼ばれる");
+
+    os_stream_close(&stream);
+    assert(g_fake_fat_len == WRITE_LEN, "close後、書き込んだ全byte数がフェイクの記憶域に反映されている");
+    int mismatch = 0;
+    for (UINT32 i = 0; i < WRITE_LEN; i++) {
+        if (g_fake_fat_data[i] != (UINT8)('A' + (i % 26))) {
+            mismatch = 1;
+            break;
+        }
+    }
+    assert(!mismatch, "書き込んだ内容が欠落・破損なくフェイクの記憶域に反映されている(旧65536byte上限の撤廃確認)");
+    #undef WRITE_LEN
+}
+
+// [ファイルI/O]#49(M6): STREAM_FAT_FILE_IOで、open時点で既存の内容が保持されており
+// (旧実装の「常に空バッファから始まり書き込み前のreadが常にEOFになる」既知の
+// 非対称性の解消)、buf_data(1024byte)の容量を超える読み込みでも複数回のrefillを
+// 通じて欠落なく読めることを確認する。
+void test_fat_file_io_read_reflects_existing_content_across_multiple_refills() {
+    reset_fake_fat_state();
+    #define EXISTING_LEN 1500
+    UINT8 existing[EXISTING_LEN];
+    for (UINT32 i = 0; i < EXISTING_LEN; i++) {
+        existing[i] = (UINT8)('a' + (i % 26));
+    }
+    set_fake_fat_data(existing, EXISTING_LEN);
+
+    os_stream_t stream;
+    os_stream_open_fat_file_io(&stream, os_make_fixnum(1) /* ダミーのfile-node */);
+
+    // open直後、一切書き込んでいない状態でも既存の内容がそのまま読める
+    // (truncateするかどうかはmount.c/os_mount_fat_resolve_file_nodeの責務であり、
+    // stream.c自身はopen時に中身を空にしない)
+    int mismatch = 0;
+    for (UINT32 i = 0; i < EXISTING_LEN; i++) {
+        char ch;
+        int ok = os_stream_read_char(&stream, &ch);
+        if (!ok || (UINT8)ch != existing[i]) {
+            mismatch = 1;
+            break;
+        }
+    }
+    assert(!mismatch, "open直後から既存の内容をbuf_data容量(1024byte)を超えて欠落なく読める");
+    assert(g_fake_read_into_calls >= 2, "buf_data満杯のたびにread-into!が複数回(refill)呼ばれる");
+
+    char ch;
+    assert(!os_stream_read_char(&stream, &ch), "末尾まで読み切るとEOFになる");
+
+    os_stream_close(&stream);
+    #undef EXISTING_LEN
+}
+
+// [ファイルI/O]#49(M6): STREAM_FAT_FILE_IOで、読み込みバッファが残っている状態から
+// 書き込みへ切り替えた場合に読み込みバッファが無効化される(9PのSTREAM_9P_FILE_IOと
+// 全く同じ挙動、os_stream_write_char参照)ことを確認する。
+void test_fat_file_io_write_invalidates_pending_read_buf() {
+    reset_fake_fat_state();
+    UINT8 existing[8] = {'1', '2', '3', '4', '5', '6', '7', '8'};
+    set_fake_fat_data(existing, 8);
+
+    os_stream_t stream;
+    os_stream_open_fat_file_io(&stream, os_make_fixnum(1));
+
+    char ch;
+    assert(os_stream_read_char(&stream, &ch) && ch == '1', "1文字目'1'を読める");
+    assert(os_stream_read_char(&stream, &ch) && ch == '2', "2文字目'2'を読める");
+    assert(stream.buf_pos == 2 && stream.buf_count == 8, "書き込み前は読み込み済みバッファが残っている");
+
+    os_stream_write_char(&stream, 'X');
+    assert(stream.buf_pos == 0 && stream.buf_count == 0,
+           "write-charへ切り替えると読み込み済みバッファは無効化される(9PのSTREAM_9P_FILE_IOと同じ)");
+
+    os_stream_close(&stream);
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
     setup_heap();
     setup_buffers();
+    os_set_function(os_make_symbol("READ-INTO!"), os_make_native_function((lisp_addr_t)(void *)fake_read_into), global_environment);
+    os_set_function(os_make_symbol("WRITE-FROM!"), os_make_native_function((lisp_addr_t)(void *)fake_write_from), global_environment);
 
     test_open_output_stream_write_char_and_close();
     test_open_input_stream_read_char_reads_fake_data();
@@ -452,6 +616,9 @@ int main(int argc, char **argv) {
     test_probe_file_reflects_open_success();
     test_file_position_and_set_file_position_on_string_stream();
     test_file_length_counts_bytes_by_reading_whole_file();
+    test_fat_file_write_flushes_across_multiple_write_buf_fills();
+    test_fat_file_io_read_reflects_existing_content_across_multiple_refills();
+    test_fat_file_io_write_invalidates_pending_read_buf();
 
     return g_test_failed ? 1 : 0;
 }

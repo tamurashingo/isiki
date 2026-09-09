@@ -727,6 +727,18 @@ static void gc_relocate_vector_block(UINT64 *words) {
  * 本体に埋め込まれた配列なので構造体ごとコピーすれば移動する。out_fb(frame buffer)は
  * 常にLispヒープ外の静的領域を指すため素通しし、str_buf(STREAM_STRING_INPUT/OUTPUT
  * のみヒープ上)だけ追加で再配置する。
+ *
+ * [ファイルI/O]#49で発見・修正: mount_file_node(lisp_val_t型フィールド、
+ * STREAM_FAT_FILE_WRITE/IO専用)は、以前はos_gc_register_root(固定アドレスを
+ * g_gc_extra_rootsへ登録する仕組み)で保護していたが、この構造体自体がGCのたびに
+ * (以下のように)丸ごと別アドレスへ再配置されるため、1回目のGCの後は登録済みの
+ * アドレスが無効になり、2回目以降のGCで無関係なメモリを破壊する事故が起きていた
+ * (os_gc_register_rootは「アドレス自体が動く」ケースを想定していない、process.c
+ * の各プロセスenv/za.cのスロットプールのような「静的配列で永久に動かない」ケース
+ * 専用の仕組み)。cons cellのcar/cdrやvectorの各要素と同じく、「親オブジェクトの
+ * コピーが終わった直後に、コピー先の子フィールドをgc_copy_valueし直す」という
+ * 通常のパターンに合わせて修正した(構造体自体のコピーの一部として毎回正しい
+ * アドレスに対して処理されるため、再配置回数に関わらず安全)。
  */
 static void gc_relocate_stream(UINT64 *words) {
     os_stream_t *old_stream = (os_stream_t *)words[1];
@@ -745,6 +757,21 @@ static void gc_relocate_stream(UINT64 *words) {
         }
         new_stream->str_buf = buf_dst;
     }
+    // mount_file_nodeはold_stream(コピー元、以後は死んでいるメモリ)ではなく
+    // new_stream(コピー先、これから生き続ける方)に対して行う
+    new_stream->mount_file_node = gc_copy_value(new_stream->mount_file_node);
+
+    // [ファイルI/O]#49で発覚: self_handle(このos_stream_t自身を包むMAGIC_STREAM
+    // インスタンスへの参照、stream_lisp.cのos_make_stream参照)もmount_file_nodeと
+    // 全く同じ理由でgc_copy_valueし直す必要がある。self_handleが指すMAGIC_STREAM
+    // ラッパー自体が(他のroot経由で)別のタイミングで再配置されていた場合、
+    // このフィールドを素通しすると古いアドレスのまま残り、flush_write_buf_fat/
+    // refill_read_buf_fatがstream_from_handle(self_handle)で生ポインタを
+    // 取り直す際に「別の(死んだ)os_stream_t実体」を指してしまい、そちらへの
+    // 書き込みが本来読むべき実体(このstreamの新しいラッパーが指す方)に反映されない
+    // (next_offsetの更新が消える等)。mount_file_nodeが読み込み専用のシナリオでは
+    // 表面化しにくかった一方、write-from!経由の書き込みで顕在化した。
+    new_stream->self_handle = gc_copy_value(new_stream->self_handle);
 
     words[1] = (UINT64)new_stream;
 }
@@ -1567,12 +1594,61 @@ void os_string_to_cstr(lisp_val_t str, char *out, UINT32 out_cap) {
  */
 lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
     // w1/w2/w3はUINT64だが、呼び出し元によっては実体がタグ付きのlisp_val_t(生存中の
-    // ヒープオブジェクトへの参照)であることがある。os_alloc_bytesがOOM時にos_gc_collect
-    // を発火させうるため、GCで再配置されても追随できるよう確保前にGC_PROTECTする
-    GC_PROTECT(w1);
-    GC_PROTECT(w2);
-    GC_PROTECT(w3);
-    lisp_addr_t addr = os_alloc_bytes(32);
+    // ヒープオブジェクトへの参照)であることも、タグの付いていない生のCポインタ/
+    // ビットパターン(MAGIC_FUNCTION_NATIVEの関数ポインタ、MAGIC_BIGNUMのsign、
+    // MAGIC_FLOATのdoubleビットパターン等)であることもある。os_alloc_bytesが
+    // OOM時にos_gc_collectを発火させうるため、GCで再配置されても追随できるよう
+    // 確保前にGC_PROTECTする必要があるが、これは「実際にタグ付きlisp_val_tである
+    // フィールド」に限る。生のビットパターンをGC_PROTECTすると、たまたま下位3bitが
+    // 本物のタグ(TAG_CONS等、TAG_FIXNUM/TAG_CHAR/TAG_RAW_POINTER以外)と一致した
+    // 場合にgc_copy_valueがその生アドレスを誤ってヒープオブジェクトとして複製し、
+    // word0へ転送先アドレスを書き込んでしまう(関数ポインタなら実行コード自体を
+    // 破壊する致命的なバグ。[ファイルI/O]#49の調査で発覚。発生はw1のビットパターン
+    // 次第でビルドごと・ASLRごとに非決定的)。gc_scan_instance(このオブジェクトが
+    // 生き残った後のGCで実際に辿るフィールド)と同じ基準で、本当にタグ付き値である
+    // フィールドだけをGC_PROTECTする。
+    lisp_addr_t addr;
+    switch (magic) {
+        case MAGIC_FUNCTION_NATIVE: {
+            // word1は生の関数ポインタ、word2はfixnum。どちらもタグ無しの生データ。
+            // word3はword2がfixnum(2)(リフトされたクロージャ)の場合のみ捕捉環境
+            // (タグ付き)を持つ
+            if (w2 == os_make_fixnum(2)) {
+                GC_PROTECT(w3);
+                addr = os_alloc_bytes(32);
+            } else {
+                addr = os_alloc_bytes(32);
+            }
+            break;
+        }
+
+        case MAGIC_STREAM:
+            // word1は生のos_stream_t*(gc_relocate_stream側で個別に再配置する)
+        case MAGIC_BIGNUM:
+            // word1(sign)/word2(limb数)は生のint
+        case MAGIC_FLOAT:
+            // word1は生のdoubleビットパターン
+        case MAGIC_VECTOR:
+            // word1は配列本体ブロックへの生ポインタ、または未構築中のプレースホルダ0
+            addr = os_alloc_bytes(32);
+            break;
+
+        case MAGIC_PROCESS: {
+            // word2は生のsaved_rsp。word1(fixnum)は無条件で安全なのでそのまま、
+            // word3(state symbol)のみタグ付き値として保護する
+            GC_PROTECT(w3);
+            addr = os_alloc_bytes(32);
+            break;
+        }
+
+        default: {
+            GC_PROTECT(w1);
+            GC_PROTECT(w2);
+            GC_PROTECT(w3);
+            addr = os_alloc_bytes(32);
+            break;
+        }
+    }
     UINT64 *obj = (UINT64 *)addr;
     obj[0] = magic;
     obj[1] = w1;

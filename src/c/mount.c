@@ -141,19 +141,18 @@ int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *rel
         return 0;
     }
 
-    UINT32 len = 0;
-    lisp_val_t cursor = result;
-    GC_PROTECT(cursor);
-    while (cursor != nil) {
-        len++;
-        cursor = cc_cdr(cursor);
-    }
+    // [ファイルI/O]#46(M3): FAT32-READ-FILE/FAT16-READ-FILEの戻り値がconsリストから
+    // general-vectorへ変更されたため(#41、コピーGCの生存ヒープサイズに比例した
+    // コスト対策)、cc_car/cc_cdrによるリスト走査ではなくos_vector_header経由で
+    // 直接データ部を読む(rank1のgeneral-vector前提、header[0]=rank(1)、
+    // header[1]=要素数、header[2..]=データ)
+    lisp_val_t *header = os_vector_header(result);
+    UINT32 len = (UINT32)header[1];
+    lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 16);
 
     UINT8 *buf = (UINT8 *)os_alloc_raw(len);
-    cursor = result;
     for (UINT32 i = 0; i < len; i++) {
-        buf[i] = (UINT8)os_fixnum_magnitude(cc_car(cursor));
-        cursor = cc_cdr(cursor);
+        buf[i] = (UINT8)os_fixnum_magnitude(data[i]);
     }
 
     *out_data = buf;
@@ -173,11 +172,19 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
     lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
     GC_PROTECT(handle);
 
-    lisp_val_t bytes = nil;
-    GC_PROTECT(bytes);
+    // [ファイルI/O]#46(M3): FAT32-WRITE-FILE/FAT16-WRITE-FILE/*-CREATE-FILEが
+    // 受け取るbytesの契約がconsリストからgeneral-vectorへ変更されたため、
+    // 一旦consリストを組み立ててからos_make_vector_from_list(reader.cの
+    // #(...)リテラル/組み込み関数VECTORと共通のコンストラクタ)でvectorへ
+    // 変換する。この一時リストはmount.c境界だけで完結し、FAT層内部で保持され
+    // 続けるわけではないため#41のような生存ヒープ肥大化の問題は生じない
+    lisp_val_t bytes_list = nil;
+    GC_PROTECT(bytes_list);
     for (UINT32 i = len; i > 0; i--) {
-        bytes = os_make_cons(os_make_fixnum((UINT64)data[i - 1]), bytes);
+        bytes_list = os_make_cons(os_make_fixnum((UINT64)data[i - 1]), bytes_list);
     }
+    lisp_val_t bytes = os_make_vector_from_list(bytes_list);
+    GC_PROTECT(bytes);
 
     lisp_val_t path_str = os_make_string(relative_path);
     GC_PROTECT(path_str);
@@ -202,4 +209,107 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
     GC_PROTECT(create_args);
     lisp_val_t result2 = os_apply_function(create_fn, create_args, global_environment);
     return result2 != nil;
+}
+
+int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
+                                    int truncate, int create_if_missing, lisp_val_t *out_node) {
+    GC_PROTECT(device);
+
+    lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
+    if (handle_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(handle_fn);
+    lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
+    GC_PROTECT(handle);
+
+    const char *resolve_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-RESOLVE-NODE" : "FAT16-RESOLVE-NODE";
+    lisp_val_t resolve_fn = os_get_function(os_make_symbol(resolve_name), global_environment);
+    if (resolve_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(resolve_fn);
+
+    lisp_val_t path_str = os_make_string(relative_path);
+    GC_PROTECT(path_str);
+    lisp_val_t resolve_args = os_make_cons(handle, os_make_cons(path_str, nil));
+    GC_PROTECT(resolve_args);
+
+    lisp_val_t node = os_apply_function(resolve_fn, resolve_args, global_environment);
+    GC_PROTECT(node);
+
+    if (node != nil && truncate) {
+        const char *write_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-WRITE-FILE" : "FAT16-WRITE-FILE";
+        lisp_val_t write_fn = os_get_function(os_make_symbol(write_name), global_environment);
+        if (write_fn == nil) {
+            return 0;
+        }
+        GC_PROTECT(write_fn);
+        lisp_val_t empty_vec = os_make_vector_from_list(nil);
+        GC_PROTECT(empty_vec);
+        lisp_val_t write_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(empty_vec, nil)));
+        GC_PROTECT(write_args);
+        if (os_apply_function(write_fn, write_args, global_environment) == nil) {
+            return 0;
+        }
+        // 切り詰め後はdir-lba/start-cluster等が変わりうるため、nodeを解決し直す
+        node = os_apply_function(resolve_fn, resolve_args, global_environment);
+        GC_PROTECT(node);
+    }
+
+    if (node == nil && create_if_missing) {
+        const char *create_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-CREATE-FILE" : "FAT16-CREATE-FILE";
+        lisp_val_t create_fn = os_get_function(os_make_symbol(create_name), global_environment);
+        if (create_fn == nil) {
+            return 0;
+        }
+        GC_PROTECT(create_fn);
+        lisp_val_t empty_vec = os_make_vector_from_list(nil);
+        GC_PROTECT(empty_vec);
+        lisp_val_t create_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(empty_vec, nil)));
+        GC_PROTECT(create_args);
+        if (os_apply_function(create_fn, create_args, global_environment) == nil) {
+            return 0;
+        }
+        node = os_apply_function(resolve_fn, resolve_args, global_environment);
+        GC_PROTECT(node);
+    }
+
+    if (node == nil) {
+        return 0;
+    }
+    *out_node = node;
+    return 1;
+}
+
+int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *relative_path,
+                            UINT32 *out_len) {
+    GC_PROTECT(device);
+
+    lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
+    if (handle_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(handle_fn);
+    lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
+    GC_PROTECT(handle);
+
+    const char *size_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-FILE-SIZE" : "FAT16-FILE-SIZE";
+    lisp_val_t size_fn = os_get_function(os_make_symbol(size_name), global_environment);
+    if (size_fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(size_fn);
+
+    lisp_val_t path_str = os_make_string(relative_path);
+    GC_PROTECT(path_str);
+    lisp_val_t size_args = os_make_cons(handle, os_make_cons(path_str, nil));
+    GC_PROTECT(size_args);
+    lisp_val_t result = os_apply_function(size_fn, size_args, global_environment);
+
+    if (result == nil) {
+        return 0;
+    }
+    *out_len = (UINT32)os_fixnum_magnitude(result);
+    return 1;
 }

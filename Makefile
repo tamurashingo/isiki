@@ -13,7 +13,7 @@ SRCDIR = src/c
 # (テスト専用、global_environmentへは登録されない)で、本番のカーネルバイナリには
 # 含めず$(LISP_COMPILED_FIXTURE)という別ファイルへコンパイルする(transpile.lispの
 # main参照)
-TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp
+TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/file-node.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
 SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
@@ -597,6 +597,17 @@ test-qemu-all:
 # するため、この負荷テストはCIのmilestone 2(qemu_boot_m2_za.lisp)からは外してある
 test-qemu-stress:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m2_za_stress.lisp
+
+# [ファイルI/O]#52(M9): カーネル自身のブートバイナリ(約1.76MB)の読み込み(#41)と
+# 65536byte超の書き込み(#39)を実データ規模で検証する。test-qemu-stressと同じ理由
+# (KVM無しのQEMU/TCGでは1MB超のファイルI/Oが現実的な時間で終わらない)でローカル
+# 専用とし、test-qemu-all/CIには含めない。fat16_test.lisp/fat32_test.lispは
+# ディスクを共有しないため、それぞれ専用のディスクイメージを使う
+# (QEMU_DISK_IMGを上書きしなければFAT16_DISK_IMGとFAT32_DISK_IMGが衝突する)。
+test-qemu-perf:
+	rm -f $(FAT16_DISK_IMG) $(FAT32_DISK_IMG)
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する

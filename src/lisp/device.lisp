@@ -72,11 +72,12 @@
 ;;; コマンドと同じ、上位16bit-下位16bitのsplit)。整数->文字列の書式化自体はFAT16/
 ;;; FAT32で共通のため%device-volume-id-uuid-stringとして共有する。
 
-;; (%device-list-nth lst n) : lst(0起点)のn番目の要素を返す。
+;; (%device-list-nth lst n) : lst(0起点)のn番目の要素を返す。[ファイルI/O]#50
+;; 付随: 呼び出し元のbytesはread-sectorの戻り値(vector化済み、
+;; ide.lispの%ide-bytes-from-addrのコメント参照)なので、car/cdrの再帰では
+;; なくelt(vectorならO(1)ランダムアクセス)を使う。
 (defun %device-list-nth (lst n)
-  (if (= n 0)
-      (car lst)
-      (%device-list-nth (cdr lst) (- n 1))))
+  (elt lst n))
 
 ;; (%device-fat16-signature-p bytes) : bytes(read-sectorの返す512要素リスト)の
 ;; offset 0x36(54)から"FAT16"のASCIIコード列が続いているかを調べる。

@@ -78,12 +78,12 @@
 ;; 内容は"0123456789"の繰り返しなので、インデックスiの値は(i mod 10)+48
 ;; (ASCIIコード)になる。
 
-(assert-equal (list 72 101 108 108 111) (subseq (fat32-read-file *fat32-test-device* "/TEST.LSP") 0 5))
+(assert-equal #(72 101 108 108 111) (subseq (fat32-read-file *fat32-test-device* "/TEST.LSP") 0 5))
 
 ;;; --- FAT32-M10: VFAT Long File Name (LFN) ---
 
-(assert-equal (list 108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/Long_File_Name.txt") 0 4))
-(assert-equal (list 108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/long_file_name.txt") 0 4))
+(assert-equal #(108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/Long_File_Name.txt") 0 4))
+(assert-equal #(108 111 110 103) (subseq (fat32-read-file *fat32-test-device* "/long_file_name.txt") 0 4))
 (assert-equal 1 (length (fat32-read-file *fat32-test-device* "/This_Is_A_Very_Long_File_Name.txt")))
 (assert-equal 18 (length (fat32-read-file *fat32-test-device* "/TEST.LSP")))
 
@@ -93,8 +93,48 @@
 (assert-equal 49 (elt fat32-test-big 511))
 (assert-equal 50 (elt fat32-test-big 512))
 
-(assert-equal (list 110 101 115 116 101) (subseq (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT") 0 5))
+(assert-equal #(110 101 115 116 101) (subseq (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT") 0 5))
 (assert-equal 19 (length (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT")))
+
+;;; --- [ファイルI/O]#47(M4): read-into!の境界値テスト ---
+;;
+;; fat16_test.lispと同じ方針: fat32-test-big(BIG.TXT、1000byte、1クラスタ=
+;; 512byte)を正解データとして使い、read-into!が任意のオフセット・長さで
+;; 同じ内容を部分的に読めることを確認する。
+
+(defun %fat32-test-resolve-node (device path)
+  (let ((bpb (fat32-read-bpb device)))
+    (let ((resolved (%fat32-resolve-file device bpb path)))
+      (%fat32-find-dir-entry (%fat32-scan-dir-entries device (car resolved)) (cdr resolved)))))
+
+(defglobal fat32-test-big-node (%fat32-test-resolve-node *fat32-test-device* "/BIG.TXT"))
+
+;; 先頭10byte
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat32-test-big-node buf 0 0 10))
+  (assert-equal (subseq fat32-test-big 0 10) buf))
+
+;; クラスタ境界(512byte)をまたぐ範囲
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat32-test-big-node buf 0 507 10))
+  (assert-equal (subseq fat32-test-big 507 517) buf))
+
+;; ファイルサイズ(1000)ちょうどから読もうとするとEOFで0byte
+(let ((buf (create-vector 5 0)))
+  (assert-equal 0 (read-into! fat32-test-big-node buf 0 1000 5)))
+
+;; 末尾ちょうど: 995から10byte要求しても実際に読めるのは5byte(EOF)
+(let ((buf (create-vector 10 99)))
+  (assert-equal 5 (read-into! fat32-test-big-node buf 0 995 10))
+  (assert-equal (subseq fat32-test-big 995 1000) (subseq buf 0 5)))
+
+;; 前進シーク後の後退シーク(last-cluster-index/last-cluster-numberキャッシュの
+;; 後退分岐の確認)
+(let ((buf (create-vector 5 0)))
+  (assert-equal 5 (read-into! fat32-test-big-node buf 0 512 5))
+  (assert-equal (subseq fat32-test-big 512 517) buf)
+  (assert-equal 5 (read-into! fat32-test-big-node buf 0 0 5))
+  (assert-equal (subseq fat32-test-big 0 5) buf))
 
 ;;; --- FAT32-M6a: 既存ファイルの同クラスタ数上書き ---
 ;;
@@ -104,22 +144,20 @@
 ;; ことを確認する。他の既存ファイルは読み込み専用のまま変更しないため、書き込みは
 ;; このファイルにのみ行う。
 
-;; (%fat32-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumリストを
-;; 作るテスト専用ヘルパー。再帰は使わずwhileで組み立てる(nがファイルサイズに
-;; 比例して大きくなり得るため)。
+;; (%fat32-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumの
+;; general-vectorを作るテスト専用ヘルパー。[ファイルI/O]#46(M3)でfat32-write-file/
+;; fat32-create-fileの契約がconsリストからvectorへ変更されたのに合わせ、
+;; create-vectorを使うよう変更した(関数名は既存の呼び出し箇所を変えずに済むよう
+;; そのまま残す)。
 (defun %fat32-test-make-byte-list (n value)
-  (let ((i 0) (acc nil))
-    (while (< i n)
-      (setq acc (cons value acc))
-      (setq i (+ i 1)))
-    acc))
+  (create-vector n value))
 
 ;; 書き込み前の内容確認(念のため)
 (assert-equal 512 (length (fat32-read-file *fat32-test-device* "/WRITE1.TXT")))
 (assert-equal 65 (elt (fat32-read-file *fat32-test-device* "/WRITE1.TXT") 0))
 (assert-equal 65 (elt (fat32-read-file *fat32-test-device* "/WRITE1.TXT") 511))
 
-(defglobal fat32-test-write1-new (list 87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
+(defglobal fat32-test-write1-new #(87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
 
 (assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new) t nil))
 (assert-equal fat32-test-write1-new (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
@@ -202,7 +240,7 @@
               (fat32-read-dir *fat32-test-device* "/"))
 
 ;; サブディレクトリ内への書き込み・新規作成(多階層パス解決の回帰確認)
-(defglobal fat32-test-nested-new (list 78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
+(defglobal fat32-test-nested-new #(78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
 
 (assert-equal t (if (fat32-write-file *fat32-test-device* "/SUBDIR/NESTED.TXT" fat32-test-nested-new) t nil))
 (assert-equal fat32-test-nested-new (fat32-read-file *fat32-test-device* "/SUBDIR/NESTED.TXT"))
@@ -280,3 +318,143 @@
 
 ;; 存在しない親ディレクトリの下へのmkdirもnil
 (assert-equal nil (fat32-create-directory *fat32-test-device* "/NOSUCHDIR/CHILD"))
+
+;;; --- [ファイルI/O]#48(M5): write-from!の境界値テスト ---
+;;
+;; 他のテストの状態に影響しないよう専用の新規ファイルを使う。FAT32の
+;; このディスクはsectors-per-cluster=1なのでクラスタサイズ=セクタサイズ=512byte
+;; (fat32_test.lisp冒頭のBPBアサーション参照)。
+;;
+;; #47(read-into!)と同じ原因(*generic-methods*がinit.lispのdefdynamicで
+;; 上書き消去され、総称関数が「no applicable method」で無反応スキップになる
+;; 問題、詳細はfat16_test.lispのコメント参照)により、以前は実際のディスク
+;; 書き込み内容を検証できていなかった。原因を修正したので、通常通り書き込み後の
+;; 内容をfat32-read-fileで読み直して検証する。
+
+;; 1クラスタに収まる小さいファイルの一部を書き換える
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5SMALL.TXT" (create-vector 10 65)) t nil)) ;; 全byte'A'
+(defglobal fat32-test-small-node (%fat32-test-resolve-node *fat32-test-device* "/M5SMALL.TXT"))
+(assert-equal t (write-from! fat32-test-small-node (create-vector 3 66) 0 4 3)) ;; オフセット4から3byte'B'
+(defglobal fat32-test-small-after (fat32-read-file *fat32-test-device* "/M5SMALL.TXT"))
+(assert-equal 10 (length fat32-test-small-after))
+(assert-equal #(65 65 65 65 66 66 66 65 65 65) fat32-test-small-after)
+(assert-equal 10 (slot-value fat32-test-small-node 'size))
+
+;; ファイル末尾を越える範囲への書き込み(ファイルサイズの拡張、既存クラスタ内)
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5EXTEND.TXT" (create-vector 10 65)) t nil))
+(defglobal fat32-test-extend-node (%fat32-test-resolve-node *fat32-test-device* "/M5EXTEND.TXT"))
+(assert-equal t (write-from! fat32-test-extend-node (create-vector 5 67) 0 8 5)) ;; オフセット8から5byte'C'→サイズ13に拡張
+(defglobal fat32-test-extend-after (fat32-read-file *fat32-test-device* "/M5EXTEND.TXT"))
+(assert-equal 13 (length fat32-test-extend-after))
+(assert-equal #(65 65 65 65 65 65 65 65 67 67 67 67 67) fat32-test-extend-after)
+(assert-equal 13 (slot-value fat32-test-extend-node 'size))
+
+;; 複数クラスタにまたがる書き込み(sectors-per-cluster=1なのでクラスタ境界=512byte)
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5MULTI.TXT" (create-vector 512 65)) t nil))
+(defglobal fat32-test-multi-node (%fat32-test-resolve-node *fat32-test-device* "/M5MULTI.TXT"))
+(assert-equal t (write-from! fat32-test-multi-node (create-vector 10 68) 0 507 10)) ;; オフセット507から10byte'D'(507-516、クラスタ境界512をまたぐ)
+(defglobal fat32-test-multi-after (fat32-read-file *fat32-test-device* "/M5MULTI.TXT"))
+(assert-equal 517 (length fat32-test-multi-after)) ;; 507+10=517へ拡張
+(assert-equal 65 (elt fat32-test-multi-after 506))
+(assert-equal 68 (elt fat32-test-multi-after 507))
+(assert-equal 68 (elt fat32-test-multi-after 511))
+(assert-equal 68 (elt fat32-test-multi-after 512))
+(assert-equal 68 (elt fat32-test-multi-after 516))
+
+;; 新規クラスタ確保を伴う追記(既存チェイン長を超えるオフセットへの書き込み)
+(assert-equal t (if (fat32-create-file *fat32-test-device* "/M5APPEND.TXT" (create-vector 512 65)) t nil)) ;; ちょうど1クラスタ
+(defglobal fat32-test-append-node (%fat32-test-resolve-node *fat32-test-device* "/M5APPEND.TXT"))
+(assert-equal t (write-from! fat32-test-append-node (create-vector 5 69) 0 512 5)) ;; 2クラスタ目に新規書き込み
+(defglobal fat32-test-append-after (fat32-read-file *fat32-test-device* "/M5APPEND.TXT"))
+(assert-equal 517 (length fat32-test-append-after))
+(assert-equal 65 (elt fat32-test-append-after 511))
+(assert-equal 69 (elt fat32-test-append-after 512))
+(assert-equal 69 (elt fat32-test-append-after 516))
+
+;;; --- [ファイルI/O]#49(M6): OPEN-OUTPUT-FILE/OPEN-IO-FILEのストリーミングI/O(FAT32) ---
+;; fat16_test.lispのBIGWRITEテストと同じ検証をFAT32側でも行う(M6コミット時に
+;; FAT16側でしか検証していなかったのを補う)。sectors-per-cluster=1(512byte
+;; クラスタ)のため、10000byteの書き込みだけでも約20クラスタの新規確保を伴い、
+;; self_handleのGC再配置漏れ(#49で発見・修正済み)のようなクラスタ拡張時の
+;; バグを十分に踏める規模になる。
+(mount "/mnt" 'blk0 ':fat32)
+
+(defun %%fat32-test-write-n-chars (stream ch n)
+  (let ((i 0))
+    (while (< i n)
+      (progn
+        (write-char ch stream)
+        (setq i (+ i 1))))))
+
+(defglobal fat32-test-bigwrite-len 10000)
+(defglobal fat32-test-bigwrite-stream (open-output-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat32-test-bigwrite-stream t nil))
+(%%fat32-test-write-n-chars fat32-test-bigwrite-stream #\A fat32-test-bigwrite-len)
+(close fat32-test-bigwrite-stream)
+
+(defglobal fat32-test-bigwrite-after (fat32-read-file *fat32-test-device* "/BIGWR.TXT"))
+(assert-equal t (if fat32-test-bigwrite-after t nil))
+(assert-equal fat32-test-bigwrite-len (length fat32-test-bigwrite-after))
+(assert-equal 65 (elt fat32-test-bigwrite-after 0))
+(assert-equal 65 (elt fat32-test-bigwrite-after 4999))
+(assert-equal 65 (elt fat32-test-bigwrite-after 9999))
+
+;; OPEN-IO-FILE: 既存ファイルに対してtruncateしない(FAT16側と同じ確認)。
+(defglobal fat32-test-bigio-stream (open-io-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat32-test-bigio-stream t nil))
+(defglobal fat32-test-bigio-first-char (read-char fat32-test-bigio-stream))
+(assert-equal #\A fat32-test-bigio-first-char)
+(set-file-position fat32-test-bigio-stream 5000)
+(write-char #\Z fat32-test-bigio-stream)
+(close fat32-test-bigio-stream)
+
+(defglobal fat32-test-bigio-after (fat32-read-file *fat32-test-device* "/BIGWR.TXT"))
+(assert-equal fat32-test-bigwrite-len (length fat32-test-bigio-after))
+(assert-equal 65 (elt fat32-test-bigio-after 4999))
+(assert-equal 90 (elt fat32-test-bigio-after 5000))
+(assert-equal 65 (elt fat32-test-bigio-after 5001))
+
+;;; --- [ファイルI/O]#50(M7): file-length高速パス + read-file-into-vector/write-vector-to-file(FAT32) ---
+
+(defglobal fat32-test-filesize-t0 (get-internal-real-time))
+(defglobal fat32-test-filesize-result (fat32-file-size *fat32-test-device* "/BIGWR.TXT"))
+(defglobal fat32-test-filesize-t1 (get-internal-real-time))
+(assert-equal 10000 fat32-test-filesize-result)
+
+(defglobal fat32-test-readfile-t0 (get-internal-real-time))
+(defglobal fat32-test-readfile-result (fat32-read-file *fat32-test-device* "/BIGWR.TXT"))
+(defglobal fat32-test-readfile-t1 (get-internal-real-time))
+(assert-equal 10000 (length fat32-test-readfile-result))
+
+(assert-equal t (<= (- fat32-test-filesize-t1 fat32-test-filesize-t0)
+                     (- fat32-test-readfile-t1 fat32-test-readfile-t0)))
+
+(assert-equal 10000 (file-length "/mnt/BIGWR.TXT"))
+
+(defglobal fat32-test-rfitv-vec (create-vector 300 0))
+(defglobal fat32-test-rfitv-fill-i 0)
+(while (< fat32-test-rfitv-fill-i 300)
+  (progn
+    (set-elt (mod fat32-test-rfitv-fill-i 256) fat32-test-rfitv-vec fat32-test-rfitv-fill-i)
+    (setq fat32-test-rfitv-fill-i (+ fat32-test-rfitv-fill-i 1))))
+(assert-equal t (if (write-vector-to-file "/mnt/RFITV.BIN" fat32-test-rfitv-vec) t nil))
+(defglobal fat32-test-rfitv-readback (read-file-into-vector "/mnt/RFITV.BIN"))
+(assert-equal t (if fat32-test-rfitv-readback t nil))
+(assert-equal fat32-test-rfitv-vec fat32-test-rfitv-readback)
+(assert-equal nil (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
+
+;;; --- [ファイルI/O]#51(M8): cat ---
+;; fat16_test.lispと同じ検証をFAT32側でも行う(コメントはfat16_test.lisp参照)。
+
+(assert-output (fat32-test-cat-small-result fat32-test-cat-small-output)
+    (cat "/mnt/TEST.LSP")
+  (assert-equal (string-append "Hello from FAT32!" (create-string 1 #\Newline))
+                fat32-test-cat-small-output))
+
+(assert-output (fat32-test-cat-missing-result fat32-test-cat-missing-output)
+    (cat "/mnt/NO-SUCH-FILE.TXT")
+  (assert-equal nil fat32-test-cat-missing-result))
+
+;; 大きいファイル(1MB超)に対するcatの検証は、fat16_test.lispと同じ理由で
+;; M9(#52)のローカル専用マイルストーン(qemu_boot_perf_fat32.lisp)へ移した
+;; (コメントはfat16_test.lisp参照)。

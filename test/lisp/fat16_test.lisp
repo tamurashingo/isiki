@@ -52,7 +52,7 @@
 ;; BIG.TXTの内容は"0123456789"の繰り返しなので、インデックスiの値は(i mod 10)+48
 ;; (ASCIIコード)になる。
 
-(assert-equal (list 72 101 108 108 111) (subseq (fat16-read-file *test-device* "/TEST.LSP") 0 5))
+(assert-equal #(72 101 108 108 111) (subseq (fat16-read-file *test-device* "/TEST.LSP") 0 5))
 (assert-equal 18 (length (fat16-read-file *test-device* "/TEST.LSP")))
 
 (defglobal fat16-test-big (fat16-read-file *test-device* "/BIG.TXT"))
@@ -63,6 +63,72 @@
 (assert-equal 57 (elt fat16-test-big 2499))
 
 (assert-equal nil (fat16-read-file *test-device* "/HELLO.TXT"))
+
+;;; --- [ファイルI/O]#47(M4): read-into!の境界値テスト ---
+;;
+;; fat16-test-big(直前のfat16-read-file経由で読み込み済みのBIG.TXT全内容、
+;; 既にテスト済み)を正解データとして使い、read-into!が任意のオフセット・長さで
+;; 同じ内容を部分的に読めることを確認する(期待値を手計算せず、既存の信頼できる
+;; データから導くことで算術ミスを避ける)。
+;;
+;; #48で判明した根本原因(修正済み): write-from!/read-into!等、AOTファイル
+;; (file-node.lisp/fat16.lisp/fat32.lisp)側のdefmethodがos_run_aot_toplevel_forms
+;; 実行中に%register-methodへ登録した内容が、その後にロードされるinit.lispの
+;; (defdynamic *generic-methods* nil)によって無条件に上書き消去され、実行時には
+;; 総称関数の呼び出し先が1件も見つからない状態になっていた。%generic-callが
+;; 「no applicable method」でerrorを呼び、ハンドラが無いためsignal-conditionが
+;; トップレベルへの非局所脱出(return-from %top-level)を起こし、read-into!/
+;; write-from!呼び出しを含むトップレベルform自体が(pass/failいずれのカウントも
+;; 増えずに)評価途中で中断されていた。*generic-methods*/*next-methods*の
+;; defdynamicをinit_aot.lisp側(%register-method定義の直前、*classes*と同じ
+;; 位置)へ移動し、fs-lisp-paths側のdefmethod登録より確実に先に初期化される
+;; ようにして解決した。
+
+;; パス解決だけを行いnode(<fat16-file-node>)を取得するテスト専用ヘルパー。
+;; fat16-read-fileと同じ解決ロジック(%fat16-resolve-file/%fat16-scan-dir-entries/
+;; %fat16-find-dir-entry)をそのまま使う。
+(defun %fat16-test-resolve-node (device path)
+  (let ((bpb (fat16-read-bpb device)))
+    (let ((resolved (%fat16-resolve-file device bpb path)))
+      (%fat16-find-dir-entry (%fat16-scan-dir-entries device (car resolved)) (cdr resolved)))))
+
+(defglobal fat16-test-big-node (%fat16-test-resolve-node *test-device* "/BIG.TXT"))
+
+;; 先頭10byte
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat16-test-big-node buf 0 0 10))
+  (assert-equal (subseq fat16-test-big 0 10) buf))
+
+;; クラスタ境界(2048byte、Makefile参照)をまたぐ範囲
+(let ((buf (create-vector 10 0)))
+  (assert-equal 10 (read-into! fat16-test-big-node buf 0 2043 10))
+  (assert-equal (subseq fat16-test-big 2043 2053) buf))
+
+;; ファイルサイズ(2500)ちょうどから読もうとするとEOFで0byte
+(let ((buf (create-vector 5 0)))
+  (assert-equal 0 (read-into! fat16-test-big-node buf 0 2500 5)))
+
+;; ファイルサイズ+1から読もうとしても0byte
+(let ((buf (create-vector 5 0)))
+  (assert-equal 0 (read-into! fat16-test-big-node buf 0 2501 5)))
+
+;; 末尾ちょうど: 2495から10byte要求しても実際に読めるのは5byte(EOF)
+(let ((buf (create-vector 10 99)))
+  (assert-equal 5 (read-into! fat16-test-big-node buf 0 2495 10))
+  (assert-equal (subseq fat16-test-big 2495 2500) (subseq buf 0 5)))
+
+;; buffer-offset(書き込み先の途中位置)指定
+(let ((buf (create-vector 8 0)))
+  (assert-equal 3 (read-into! fat16-test-big-node buf 2 100 3))
+  (assert-equal (subseq fat16-test-big 100 103) (subseq buf 2 5)))
+
+;; 前進シーク後の後退シーク(<file-node>のlast-cluster-index/last-cluster-number
+;; キャッシュが後退時にstart-clusterから正しく辿り直すことを確認する)
+(let ((buf (create-vector 5 0)))
+  (assert-equal 5 (read-into! fat16-test-big-node buf 0 2048 5)) ;; 前進(クラスタ2)
+  (assert-equal (subseq fat16-test-big 2048 2053) buf)
+  (assert-equal 5 (read-into! fat16-test-big-node buf 0 0 5))    ;; 後退(クラスタ1)
+  (assert-equal (subseq fat16-test-big 0 5) buf))
 
 ;;; --- FAT16-M3: FATテーブルのクラスタチェイン追跡 ---
 ;;
@@ -87,24 +153,20 @@
 ;; 書き込み、読み込みで一致することを確認する。他の既存ファイル(TEST.LSP/BIG.TXT/
 ;; HELLO.TXT)は読み込み専用のまま変更しないため、書き込みはこのファイルにのみ行う。
 
-;; (%fat16-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumリストを
-;; 作るテスト専用ヘルパー。init_aot.lispのcreate-listはこのマイルストンの起動
-;; スクリプト(init.lispのみload)からは使えないため自前で用意する。再帰は使わず
-;; whileで組み立てる(nがファイルサイズに比例して大きくなり得るため、
-;; eval_no_tco_interpreter_stack_limitと同じ理由でLisp再帰を避ける)。
+;; (%fat16-test-make-byte-list n value) : 長さnの、全要素がvalueのfixnumの
+;; general-vectorを作るテスト専用ヘルパー。[ファイルI/O]#46(M3)でfat16-write-file/
+;; fat16-create-fileの契約がconsリストからvectorへ変更されたのに合わせ、
+;; create-vector(第二引数で全要素を初期化できる既存プリミティブ)を使うよう変更
+;; した(関数名は既存の呼び出し箇所を変えずに済むようそのまま残す)。
 (defun %fat16-test-make-byte-list (n value)
-  (let ((i 0) (acc nil))
-    (while (< i n)
-      (setq acc (cons value acc))
-      (setq i (+ i 1)))
-    acc))
+  (create-vector n value))
 
 ;; 書き込み前の内容確認(念のため)
 (assert-equal 2048 (length (fat16-read-file *test-device* "/WRITE1.TXT")))
 (assert-equal 65 (elt (fat16-read-file *test-device* "/WRITE1.TXT") 0))
 (assert-equal 65 (elt (fat16-read-file *test-device* "/WRITE1.TXT") 2047))
 
-(defglobal fat16-test-write1-new (list 87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
+(defglobal fat16-test-write1-new #(87 82 73 84 69 49 45 78 69 87)) ;; "WRITE1-NEW"
 
 (assert-equal t (if (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-new) t nil))
 (assert-equal fat16-test-write1-new (fat16-read-file *test-device* "/WRITE1.TXT"))
@@ -196,7 +258,7 @@
 (assert-equal (list (list "." ':dir 0) (list ".." ':dir 0) (list "DEEP.TXT" ':file 0))
               (fat16-read-dir *test-device* "/SUBDIR/DEEPER"))
 
-(assert-equal (list 110 101 115 116 101 100 32 102 105 108 101 32 99 111 110 116 101 110 116)
+(assert-equal #(110 101 115 116 101 100 32 102 105 108 101 32 99 111 110 116 101 110 116)
               (fat16-read-file *test-device* "/SUBDIR/NESTED.TXT"))
 
 (assert-equal nil (fat16-read-file *test-device* "/SUBDIR/DEEPER/DEEP.TXT"))
@@ -218,7 +280,7 @@
 ;; 確認済み)。
 
 ;; 既存ファイル(/SUBDIR/NESTED.TXT、19byte)への同クラスタ内上書き
-(defglobal fat16-test-nested-new (list 78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
+(defglobal fat16-test-nested-new #(78 69 83 84 69 68 45 78 69 87)) ;; "NESTED-NEW"
 
 (assert-equal t (if (fat16-write-file *test-device* "/SUBDIR/NESTED.TXT" fat16-test-nested-new) t nil))
 (assert-equal fat16-test-nested-new (fat16-read-file *test-device* "/SUBDIR/NESTED.TXT"))
@@ -292,3 +354,185 @@
 
 ;; 存在しない親ディレクトリの下へのmkdirもnil
 (assert-equal nil (fat16-create-directory *test-device* "/NOSUCHDIR/CHILD"))
+
+;;; --- [ファイルI/O]#48(M5): write-from!の境界値テスト ---
+;;
+;; 他のテストの状態(WRITE1.TXT等の既存フィクスチャ)に影響しないよう、この
+;; テスト専用の新規ファイルを作って使う。クラスタサイズは2048byte(Makefile参照)。
+;;
+;; #47(read-into!)と同じ原因(*generic-methods*がinit.lispのdefdynamicで
+;; 上書き消去され、総称関数が「no applicable method」で無反応スキップになる
+;; 問題、詳細はread-into!境界値テストのコメント参照)により、以前は実際の
+;; ディスク書き込み内容を検証できていなかった。原因を修正したので、通常通り
+;; 書き込み後の内容をfat16-read-fileで読み直して検証する。
+
+;; パス解決だけを行いnode(<fat16-file-node>)を取得するテスト専用ヘルパー
+;; %fat16-test-resolve-node(read-into!境界値テストで定義済み)をそのまま使う。
+
+;; 1クラスタに収まる小さいファイルの一部を書き換える(セクタ境界をまたがない範囲)
+(assert-equal t (if (fat16-create-file *test-device* "/M5SMALL.TXT" (create-vector 10 65)) t nil)) ;; 全byte'A'
+(defglobal fat16-test-small-node (%fat16-test-resolve-node *test-device* "/M5SMALL.TXT"))
+(assert-equal t (write-from! fat16-test-small-node (create-vector 3 66) 0 4 3)) ;; オフセット4から3byte'B'
+(defglobal fat16-test-small-after (fat16-read-file *test-device* "/M5SMALL.TXT"))
+(assert-equal 10 (length fat16-test-small-after))
+(assert-equal #(65 65 65 65 66 66 66 65 65 65) fat16-test-small-after)
+(assert-equal 10 (slot-value fat16-test-small-node 'size)) ;; 既存範囲内の上書きなのでsizeは変化しない
+
+;; 3byteファイルへの1byte書き込み(できるだけ小さい規模での確認。クラスタサイズは
+;; 2048byteなので3byteファイルでも書き込みループが辿るセクタ数(1クラスタ=4セクタ)は
+;; 変わらないが、期待値の検証はしやすい)
+(assert-equal t (if (fat16-create-file *test-device* "/M5MICRO.TXT" (create-vector 3 65)) t nil))
+(defglobal fat16-test-micro-node (%fat16-test-resolve-node *test-device* "/M5MICRO.TXT"))
+(assert-equal t (write-from! fat16-test-micro-node (create-vector 1 90) 0 1 1)) ;; オフセット1に'Z'
+(defglobal fat16-test-micro-after (fat16-read-file *test-device* "/M5MICRO.TXT"))
+(assert-equal #(65 90 65) fat16-test-micro-after)
+
+;; ファイル末尾を越える範囲への書き込み(ファイルサイズの拡張、既存クラスタ内)
+(assert-equal t (if (fat16-create-file *test-device* "/M5EXTEND.TXT" (create-vector 10 65)) t nil))
+(defglobal fat16-test-extend-node (%fat16-test-resolve-node *test-device* "/M5EXTEND.TXT"))
+(assert-equal t (write-from! fat16-test-extend-node (create-vector 5 67) 0 8 5)) ;; オフセット8から5byte'C'→サイズ13に拡張
+(defglobal fat16-test-extend-after (fat16-read-file *test-device* "/M5EXTEND.TXT"))
+(assert-equal 13 (length fat16-test-extend-after))
+(assert-equal #(65 65 65 65 65 65 65 65 67 67 67 67 67) fat16-test-extend-after)
+(assert-equal 13 (slot-value fat16-test-extend-node 'size))
+
+;; 複数クラスタにまたがる書き込み(クラスタサイズ2048byteの境界をまたぐ範囲)
+(assert-equal t (if (fat16-create-file *test-device* "/M5MULTI.TXT" (create-vector 2048 65)) t nil))
+(defglobal fat16-test-multi-node (%fat16-test-resolve-node *test-device* "/M5MULTI.TXT"))
+(assert-equal t (write-from! fat16-test-multi-node (create-vector 10 68) 0 2043 10)) ;; オフセット2043から10byte'D'(2043-2052、クラスタ境界2048をまたぐ)
+(defglobal fat16-test-multi-after (fat16-read-file *test-device* "/M5MULTI.TXT"))
+(assert-equal 2053 (length fat16-test-multi-after)) ;; 2043+10=2053へ拡張
+(assert-equal 65 (elt fat16-test-multi-after 2042))
+(assert-equal 68 (elt fat16-test-multi-after 2043))
+(assert-equal 68 (elt fat16-test-multi-after 2047))
+(assert-equal 68 (elt fat16-test-multi-after 2048))
+(assert-equal 68 (elt fat16-test-multi-after 2052))
+
+;; 新規クラスタ確保を伴う追記(既存チェイン長を超えるオフセットへの書き込み)
+(assert-equal t (if (fat16-create-file *test-device* "/M5APPEND.TXT" (create-vector 2048 65)) t nil)) ;; ちょうど1クラスタ
+(defglobal fat16-test-append-node (%fat16-test-resolve-node *test-device* "/M5APPEND.TXT"))
+(assert-equal t (write-from! fat16-test-append-node (create-vector 5 69) 0 2048 5)) ;; 2クラスタ目に新規書き込み
+(defglobal fat16-test-append-after (fat16-read-file *test-device* "/M5APPEND.TXT"))
+(assert-equal 2053 (length fat16-test-append-after))
+(assert-equal 65 (elt fat16-test-append-after 2047))
+(assert-equal 69 (elt fat16-test-append-after 2048))
+(assert-equal 69 (elt fat16-test-append-after 2052))
+
+;;; --- [ファイルI/O]#49(M6): OPEN-OUTPUT-FILE/OPEN-IO-FILEのストリーミングI/O ---
+;; 旧STREAM_FAT_FILE_CAP(65536byte)を明確に超えるファイルの書き込み→クローズ→
+;; 再読み込みが欠落なく完走することを確認する(#39の直接的な解消確認)。
+;; マウントされたパス経由でOPEN-OUTPUT-FILE/OPEN-IO-FILEがFATストリームを
+;; 使うのはこのテストが初めてなので、専用に/mntへblk0(FAT16)をmountする。
+;;
+;; 書き込みループは(defun ...)に包んでza.cのJITコンパイル対象にする。トップ
+;; レベルのwhileフォームは(このOSの)ツリーウォーク型インタプリタで反復ごとに
+;; C側の再帰呼び出しとして評価され、TCOもスタックガードも無いため(eval.cの
+;; 既知の制約、fat16-cluster-chain等のコメント参照)、数万回級の反復では
+;; スタックオーバーフローで隣接メモリ(os_stream_t含む)を破損しうることが
+;; 調査で判明した(write-charがある時点からFAT分岐に到達しなくなり、
+;; ファイルサイズが非決定的に縮む形で顕在化した)。defun本体はza.cでJIT
+;; コンパイルされ実際のネイティブループになるため、この制約を受けない
+;; (za_test_stress.lispがisiki-za-test-cons-chain等をdefunとして定義し
+;; N=50000で安全に反復できているのと同じ理由)。
+(mount "/mnt" 'blk0 ':fat16)
+
+(defun %%fat16-test-write-n-chars (stream ch n)
+  (let ((i 0))
+    (while (< i n)
+      (write-char ch stream)
+      (setq i (+ i 1)))))
+
+(defglobal fat16-test-bigwrite-len 70000) ;; 65536byteの旧上限を明確に超える
+(defglobal fat16-test-bigwrite-stream (open-output-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat16-test-bigwrite-stream t nil))
+(%%fat16-test-write-n-chars fat16-test-bigwrite-stream #\A fat16-test-bigwrite-len) ;; 全byte'A'
+(close fat16-test-bigwrite-stream)
+
+(defglobal fat16-test-bigwrite-after (fat16-read-file *test-device* "/BIGWR.TXT"))
+(assert-equal t (if fat16-test-bigwrite-after t nil))
+(assert-equal fat16-test-bigwrite-len (length fat16-test-bigwrite-after))
+(assert-equal 65 (elt fat16-test-bigwrite-after 0))
+(assert-equal 65 (elt fat16-test-bigwrite-after 34999))
+(assert-equal 65 (elt fat16-test-bigwrite-after 69999))
+
+;; OPEN-IO-FILE: 既存ファイルに対してtruncateしない(#49で解消した既知の非対称性、
+;; 「常に空バッファから始まり書き込み前のreadが常にEOFになる」の確認)。
+;; 開いた直後にread-charで既存内容('A')が読めることを確認してから、
+;; オフセット50000へseekして1byteだけ上書きし、ファイル全体は壊れず
+;; サイズも変わらないことを確認する。
+(defglobal fat16-test-bigio-stream (open-io-file "/mnt/BIGWR.TXT"))
+(assert-equal t (if fat16-test-bigio-stream t nil))
+(defglobal fat16-test-bigio-first-char (read-char fat16-test-bigio-stream))
+(assert-equal #\A fat16-test-bigio-first-char) ;; truncateされていれば即EOF(nil)のはず
+(set-file-position fat16-test-bigio-stream 50000)
+(write-char #\Z fat16-test-bigio-stream)
+(close fat16-test-bigio-stream)
+
+(defglobal fat16-test-bigio-after (fat16-read-file *test-device* "/BIGWR.TXT"))
+(assert-equal fat16-test-bigwrite-len (length fat16-test-bigio-after)) ;; サイズは変化しない
+(assert-equal 65 (elt fat16-test-bigio-after 0))
+(assert-equal 65 (elt fat16-test-bigio-after 49999))
+(assert-equal 90 (elt fat16-test-bigio-after 50000))
+(assert-equal 65 (elt fat16-test-bigio-after 50001))
+(assert-equal 65 (elt fat16-test-bigio-after 69999))
+
+;;; --- [ファイルI/O]#50(M7): file-length高速パス + read-file-into-vector/write-vector-to-file ---
+
+;; fat16-file-sizeはディレクトリエントリの解決のみ(O(ディレクトリサイズ))で、
+;; fat16-read-file(ファイル全体読み込み)のような性能問題(#41)を引き継がない
+;; ことを、直前に作成済みのBIGWR.TXT(70000byte)に対する壁時計時間の相対比較で
+;; 確認する(絶対時間の閾値だとQEMU実行環境の速度差でフレーキーになりうるため、
+;; 同一環境内での相対比較にする)。#41の対象規模である1.76MBでの絶対時間の
+;; 実測はM9で別途行う。
+(defglobal fat16-test-filesize-t0 (get-internal-real-time))
+(defglobal fat16-test-filesize-result (fat16-file-size *test-device* "/BIGWR.TXT"))
+(defglobal fat16-test-filesize-t1 (get-internal-real-time))
+(assert-equal 70000 fat16-test-filesize-result)
+
+(defglobal fat16-test-readfile-t0 (get-internal-real-time))
+(defglobal fat16-test-readfile-result (fat16-read-file *test-device* "/BIGWR.TXT"))
+(defglobal fat16-test-readfile-t1 (get-internal-real-time))
+(assert-equal 70000 (length fat16-test-readfile-result))
+
+(assert-equal t (<= (- fat16-test-filesize-t1 fat16-test-filesize-t0)
+                     (- fat16-test-readfile-t1 fat16-test-readfile-t0)))
+
+;; FILE-LENGTH(cc_file_length, パス文字列引数)がマウント経由でもfat16-file-size
+;; と同じ高速パスを通ることを確認する。
+(assert-equal 70000 (file-length "/mnt/BIGWR.TXT"))
+(assert-equal 2500 (file-length "/mnt/BIG.TXT"))
+
+;; read-file-into-vector/write-vector-to-fileの往復(write→read一致)を確認する。
+(defglobal fat16-test-rfitv-vec (create-vector 300 0))
+(defglobal fat16-test-rfitv-fill-i 0)
+(while (< fat16-test-rfitv-fill-i 300)
+  (progn
+    (set-elt (mod fat16-test-rfitv-fill-i 256) fat16-test-rfitv-vec fat16-test-rfitv-fill-i)
+    (setq fat16-test-rfitv-fill-i (+ fat16-test-rfitv-fill-i 1))))
+(assert-equal t (if (write-vector-to-file "/mnt/RFITV.BIN" fat16-test-rfitv-vec) t nil))
+(defglobal fat16-test-rfitv-readback (read-file-into-vector "/mnt/RFITV.BIN"))
+(assert-equal t (if fat16-test-rfitv-readback t nil))
+(assert-equal fat16-test-rfitv-vec fat16-test-rfitv-readback)
+(assert-equal nil (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
+
+;;; --- [ファイルI/O]#51(M8): cat ---
+
+;; 小さいファイル: with-standard-output+create-string-output-stream(test_framework
+;; .lispのassert-outputと同じパターン)でcatの出力を捕捉して内容を検証する
+;; (STREAM_STRING_OUTPUT_CAP=1024byteに収まる規模)。
+(assert-output (fat16-test-cat-small-result fat16-test-cat-small-output)
+    (cat "/mnt/TEST.LSP")
+  (assert-equal (string-append "Hello from FAT16!" (create-string 1 #\Newline))
+                fat16-test-cat-small-output))
+
+;; 存在しないパスに対してはエラーメッセージを表示してnilを返す(%filecmd-no-such-path
+;; と同じ、ls/cdの既存の挙動と同じ)。
+(assert-output (fat16-test-cat-missing-result fat16-test-cat-missing-output)
+    (cat "/mnt/NO-SUCH-FILE.TXT")
+  (assert-equal nil fat16-test-cat-missing-result))
+
+;; 大きいファイル(1MB超)に対するcatの検証は、このファイル(CIの
+;; qemu_boot_m6_fat16.lispがtimeout-minutes: 10で実行する)に置くとQEMU
+;; (TCG、KVM無し)環境で時間がかかりすぎるため、M9(#52)のローカル専用
+;; マイルストーン(qemu_boot_perf_fat16.lisp)へ移した。カーネル自身の
+;; ブートバイナリ(#41)を使った実データでの検証も兼ねる。
