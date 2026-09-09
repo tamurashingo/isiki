@@ -1905,6 +1905,21 @@ lisp_val_t os_make_jit_function(UINT64 fnptr) {
 }
 
 /**
+ * os_make_jit_functionのdual-entry版(ABI-M5)。meta->fixed_entry/arityを設定する
+ * 点のみがos_make_jit_functionと異なる。
+ * @param cons_entry 従来のconsリストABIのJITコンパイル済みアドレス
+ * @param fixed_entry 固定引数レジスタ渡しのJITコンパイル済みアドレス
+ * @param arity fixed_entryが受け取る固定引数の個数
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT64 arity) {
+    za_fn_meta_t *meta = os_fn_meta_alloc(cons_entry);
+    meta->fixed_entry = fixed_entry;
+    meta->arity = arity;
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), nil);
+}
+
+/**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
  * その定義時の捕捉環境として保持するTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すリフト済みlambda本体のC関数のアドレス

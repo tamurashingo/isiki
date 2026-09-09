@@ -1050,10 +1050,29 @@ static void za_gc_unlink_node(gc_rootnode *node) {
 #define ZA_OFF_SETQ_TMP_NODE (ZA_OFF_SETQ_TMP_VAL + 8)  /* 16バイト、24バイトで終わる */
 /* 24-31: 16バイト境界(sub rsp総量を8 mod 16に保つ、ZA_OFF_NLX_BASEの264-271と
  * 同じ考え方)を保つためのpadding */
-#define ZA_FRAME_EXTRA \
+#define ZA_OFF_SETQ_TMP_END \
     (ZA_OFF_SETQ_TMP_VAL + 32)
+/* ABI-M5: 固定引数エントリポイント(fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS、&restなし、
+ * lambda/flet/labelsを含まない関数のみ、za_form_disables_param_slots参照)専用の
+ * パラメータスロット。consリスト版/固定引数版どちらのプロローグも、それぞれの引数
+ * 受け渡し方式からこの固定本数のスロットへ一度だけ展開して書き込み、以降の
+ * op->is_literal==0(パラメータ参照)はza_emit_operandがconsリストを都度辿らず
+ * ここを直接読む(g_za_use_param_slots参照)。対象外の関数はこのスロットを一切
+ * 使わず、従来通りZA_OFF_ARGS_VALからのcc_car/cc_cdr都度読み直しのままにする。 */
+#define ZA_MAX_FIXED_ENTRY_PARAMS 3
+#define ZA_OFF_PARAM_BASE ZA_OFF_SETQ_TMP_END
+/* 3スロット*24byte(ZA_ARG_SLOT_SIZE)=72byteに8byte paddingを足し80byte(16の倍数)にする
+ * ことで、ZA_FRAME_EXTRA全体の16バイト境界に対する既存の関係を変えない。 */
+#define ZA_FRAME_EXTRA \
+    (ZA_OFF_PARAM_BASE + 80)
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
+
+/** ABI-M5: パラメータスロット方式(g_za_use_param_slots)が有効な関数における、
+ * インデックスiの固定パラメータの値/gc_rootnodeスロットのオフセット
+ * (za_arg_val_off/za_arg_node_offと同じ「配列インデックス」パターン)。 */
+static UINT32 za_param_val_off(UINT64 i) { return ZA_OFF_PARAM_BASE + (UINT32)i * ZA_ARG_SLOT_SIZE; }
+static UINT32 za_param_node_off(UINT64 i) { return za_param_val_off(i) + 8; }
 
 /** 深さdepth(0始まり)の一般呼び出しCALL_SAVED_HEADスロットのオフセット
  * (za_let_saved_head_offと同じ「配列インデックス」パターン)。 */
@@ -1137,6 +1156,15 @@ static void za_emit_gc_unlink_slot(UINT32 node_off) {
  * quoteシンボルオペランドのemit(za_emit_operand)が先に必要とするため前方宣言する。 */
 static UINT64 za_emit_symbol_name(lisp_val_t sym);
 
+/** ABI-M5: 現在コンパイル中の関数がパラメータスロット方式(za_param_val_off)を
+ * 使っているかどうかを、za_emit_operandのパラメータ参照コード生成が参照する
+ * グローバルフラグ。za_try_compile_defunの冒頭(実際のコード生成を始める前)で
+ * 一度だけ設定し、その1回のコンパイル呼び出しが終わるまで変化しない(この関数が
+ * lambda/flet/labelsを含まないことをza_form_disables_param_slotsで事前に
+ * 保証しているため、za_compile_lambda/za_compile_flet_labelsへ再入して別の
+ * params/fixed_countコンテキストへ切り替わるケース自体が発生しない)。 */
+static int g_za_use_param_slots = 0;
+
 /**
  * オペランド1個の値をraxへ計算する機械語を出力する。paramsへの参照であれば
  * ARGS_VALスロット(プロローグでリンク済みの元のevaluated_args先頭)から毎回読み直し、
@@ -1218,6 +1246,14 @@ static void za_emit_operand(const za_operand_t *op) {
         jit_mov_rcx_rax();
         jit_movabs_r11((UINT64)(void *)cc_cdr);
         jit_call_r11();
+        return;
+    }
+    if (op->is_literal == 0 && g_za_use_param_slots) {
+        // ABI-M5: パラメータスロット方式が有効な関数(za_form_disables_param_slotsで
+        // lambda/flet/labelsを含まないと確認済み、&restも無い)では、プロローグが
+        // 一度だけconsリスト(またはレジスタ)からza_param_val_off(param_index)へ
+        // 展開済みなので、都度cc_car/cc_cdrで辿らずスロットを直接読む。
+        za_load_slot(ZA_REG_RAX, za_param_val_off(op->param_index));
         return;
     }
     za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
@@ -1380,6 +1416,45 @@ static int za_is_iife_call(lisp_val_t form) {
  */
 static int za_is_raw_lambda(lisp_val_t form) {
     return (form & TAG_MASK) == TAG_CONS && cc_car(form) == g_sym_lambda;
+}
+
+/**
+ * ABI-M5: このコンパイル対象の関数がパラメータスロット方式(g_za_use_param_slots、
+ * za_param_val_off参照)を使ってよいかどうかを、コンパイル開始前に保守的に判定する
+ * ための事前スキャン。formの中(quoteの中も含めて区別せず)にlambda/flet/labelsが
+ * 1つでも現れれば1を返す。
+ *
+ * エスケープするクロージャ(za_compile_lambda)やflet/labels(za_compile_flet_labels)
+ * のボディは、外側関数とは別のparams/fixed_countコンテキストでza_classify_operandを
+ * 呼ぶため、そのop->param_indexはパラメータスロット方式が前提にする「外側関数の
+ * ZA_OFF_PARAM_VAL」とは無関係の値になる。let/let*はIIFE(即時適用されるlambda、
+ * za_is_iife_call)へマクロ展開されローカル変数スロット(za_local_scope_t)で解決
+ * されるため技術的には影響しないはずだが、この判定ではIIFEかどうかを区別せず
+ * 機械的にlambdaの出現だけを見て安全側に倒す(let/let*を使う関数もこの最適化の
+ * 対象から外れるが、誤って対象に含めてparam_indexを取り違えるよりはるかに安全)。
+ * @return lambda/flet/labelsが1つでも見つかれば1(=パラメータスロット方式は使えない)、
+ *         見つからなければ0
+ */
+static int za_form_disables_param_slots(lisp_val_t form) {
+    if ((form & TAG_MASK) != TAG_CONS) {
+        return 0;
+    }
+    // nilはTAG_CONS(g_nil_cellへの自己参照、za_compile_expr:2509-2510のコメント参照)
+    // であり、cc_cdr(nil)==nilかつcc_car(nil)==nilなので、ここで`rest != nil`を
+    // 継続条件に含めないとnilに到達した時点で無限ループ(かつelemもnilなので
+    // za_form_disables_param_slots(nil)への無限再帰、スタックオーバーフローで
+    // クラッシュする)になる。za_compile_progn等、他のコンスリスト走査箇所が
+    // 一貫して`rest != nil`をループ条件に使っているのと同じパターンに合わせる。
+    for (lisp_val_t rest = form; rest != nil && (rest & TAG_MASK) == TAG_CONS; rest = cc_cdr(rest)) {
+        lisp_val_t elem = cc_car(rest);
+        if (elem == g_sym_lambda || elem == g_sym_flet || elem == g_sym_labels) {
+            return 1;
+        }
+        if (elem != nil && (elem & TAG_MASK) == TAG_CONS && za_form_disables_param_slots(elem)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /** let-local変数1個分の静的使用状況(za_analyze_var_usage参照)。symが対象シンボル、
@@ -2723,6 +2798,34 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
 }
 
 /**
+ * za_compile_callの手順4(consリストfold構築)+手順5(fn/acc/引数のリンク解除)を
+ * 出力する。ABI-M5より前はこの2手順は呼び出しごとに1回、無条件に出力していたが、
+ * ABI-M5の高速path(固定引数レジスタ渡しでfixed_entryを直接call)はconsリストを
+ * 一切構築しない設計であるため、この2手順は「高速pathが使えないと実行時に判明した
+ * 場合」または「そもそも高速pathの対象外(argc>ZA_MAX_FIXED_ENTRY_PARAMS/末尾呼び出し)
+ * の場合」にのみ出力するよう、za_compile_call側で条件分岐した先から呼ぶ(za_compile_call
+ * のdoc comment、手順4/5参照)。
+ */
+static void za_emit_call_build_acc_and_unlink(UINT64 call_depth, UINT64 argc) {
+    // 4. accスロットをnilで初期化しlinkした後、右から左へos_make_consでfoldする。
+    jit_movabs_rax(nil);
+    za_store_slot(ZA_REG_RAX, ZA_OFF_ACC_VAL);
+    za_emit_gc_link_slot(ZA_OFF_ACC_VAL, ZA_OFF_ACC_NODE);
+    for (UINT64 i = argc; i > 0; i--) {
+        za_load_slot(ZA_REG_RCX, za_arg_val_off(call_depth, i - 1));
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ACC_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_cons);
+        jit_call_r11();
+        za_store_slot(ZA_REG_RAX, ZA_OFF_ACC_VAL);
+    }
+
+    // 5. fn/acc/引数のリンクをまとめて外す。
+    za_load_slot(ZA_REG_RCX, za_call_saved_head_off(call_depth));
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+}
+
+/**
  * 一般呼び出し「(fn_sym arg arg...)」をコンパイルする(呼び出しごとに以下の順で
  * 機械語を出力する)。
  *   1. 呼び出し前のgc_rootsをCALL_SAVED_HEADスロット(自分のcall_depth用)へ保存する。
@@ -2735,13 +2838,19 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  *      ない)をfnスロットへ書き込み、linkする(envはENV_VALスロットから読み直す)。
  *      FN_VAL/ACC_VALは引数loop完了後にしか書き込まれず直後に消費されるため、depth化
  *      せず単一スロットのままで安全。
- *   4. accスロットをnilで初期化しlinkした後、引数スロットを右から左へ
+ *   4. (ABI-M5により、高速pathの対象外と判明した経路でのみ出力: za_emit_call_build_acc_and_unlink
+ *      参照)accスロットをnilで初期化しlinkした後、引数スロットを右から左へ
  *      os_make_cons(argslot[i], accslot)で辿ってconsし、その都度accスロットを書き換える。
- *   5. CALL_SAVED_HEADでfn/acc/引数のリンクをまとめて外す。
- *   6. 非末尾ならos_apply_via_cell(cell, evaluated_args, env)を通常のcallで呼ぶ(内部で
- *      cellの中身を読んでos_apply_functionへ委譲する)。末尾ならenvのリンクも外し、
- *      自分のフレームを完全に畳んだ上で共有トランポリンへjmpする(トランポリンもr8に
- *      cellを受け取り、中身を読んでから既存の分岐に入る)。
+ *   5. (4と同じ経路でのみ出力)CALL_SAVED_HEADでfn/acc/引数のリンクをまとめて外す。
+ *   6. 非末尾かつargc<=ZA_MAX_FIXED_ENTRY_PARAMSの場合、consリスト構築より前に
+ *      cellの中身(fn_obj)がfixed_entryを持ちarityが一致するかを実行時に確認し、
+ *      一致すればconsリストを一切構築せずfixed_entry(env, arg0, ...)をレジスタ渡しで
+ *      直接callする(この場合のみ手順4/5はfn/引数だけのunlinkに縮退する)。それ以外の
+ *      非末尾呼び出しは手順4/5を経てos_apply_via_cell(cell, evaluated_args, env)を
+ *      通常のcallで呼ぶ(内部でcellの中身を読んでos_apply_functionへ委譲する)。
+ *      末尾なら手順4/5の後envのリンクも外し、自分のフレームを完全に畳んだ上で
+ *      共有トランポリンへjmpする(トランポリンもr8にcellを受け取り、中身を読んでから
+ *      既存の分岐に入る)。
  * @param call_depth 自分が使うCALL_SAVED_HEAD/引数スロットの深さ。ZA_MAX_CALL_DEPTH
  * 以上ならコンパイルを断念する(引数を評価する再帰にはcall_depth+1を渡す)。
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
@@ -2853,34 +2962,111 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     za_store_slot(ZA_REG_RAX, ZA_OFF_FN_VAL);
     za_emit_gc_link_slot(ZA_OFF_FN_VAL, ZA_OFF_FN_NODE);
 
-    // 4. accスロットをnilで初期化しlinkした後、右から左へos_make_consでfoldする。
-    jit_movabs_rax(nil);
-    za_store_slot(ZA_REG_RAX, ZA_OFF_ACC_VAL);
-    za_emit_gc_link_slot(ZA_OFF_ACC_VAL, ZA_OFF_ACC_NODE);
-    for (UINT64 i = argc; i > 0; i--) {
-        za_load_slot(ZA_REG_RCX, za_arg_val_off(call_depth, i - 1));
-        za_load_slot(ZA_REG_RDX, ZA_OFF_ACC_VAL);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_cons);
-        jit_call_r11();
-        za_store_slot(ZA_REG_RAX, ZA_OFF_ACC_VAL);
-    }
-
-    // 5. fn/acc/引数のリンクをまとめて外す。
-    za_load_slot(ZA_REG_RCX, za_call_saved_head_off(call_depth));
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
-    jit_call_r11();
-
     if (!is_tail) {
-        // 6a. 非末尾: os_apply_via_cell(cell, evaluated_args, env)を通常のcallで呼ぶ。
-        // FN_VALはos_get_function_cellが返したcellアドレスであり、fn_obj自体は
-        // 呼び出し先が都度cellの中身を読んで取得する(間接呼び出し化)。
+        // 6a. 非末尾。
+        // ABI-M5: argcがZA_MAX_FIXED_ENTRY_PARAMS以下の場合、consリスト構築
+        // (手順4)より前に、cellの現在の中身(fn_obj)が固定引数エントリポイント
+        // (meta->fixed_entry)を持ち、そのarityがちょうどargcと一致するかを
+        // 実行時に確認する(Function Cellは再定義により中身が変わりうるため、
+        // コンパイル時ではなく実行時に判定する必要がある。
+        // documents/abi-redesign.md「2-3. 関数再定義との整合性」参照)。一致すれば
+        // consリストを一切構築せず(=手順4を丸ごとスキップし、手順5相当のunlinkも
+        // fn/引数分だけに縮退させて)fixed_entry(env, arg0, ...)をレジスタ渡しで
+        // 直接callする。一致しなければ(または最初からargc>MAXで判定自体を
+        // 試みない場合)、手順4(consリスト構築)+手順5(unlink)を経て従来通り
+        // os_apply_via_cell経由(consリストABI)へフォールバックする。判定を
+        // consリスト構築より前に行うことで、高速pathでは本当にヒープ確保が
+        // 一切発生しないようにする(za_arg_val_off(call_depth, i)は手順2で
+        // 既に評価・GCリンク済みなので、そのままレジスタへ読み出せる)。
+        UINT64 fast_patches[4];
+        UINT64 fast_patch_count = 0;
+        UINT64 fast_done_patch = 0;
+        if (argc <= ZA_MAX_FIXED_ENTRY_PARAMS) {
+            // r10 = cell(FN_VAL、タグ付き)。nilならこの高速pathは使えない
+            // (os_apply_via_cellのnilチェックと同じ理由)。
+            za_load_slot(ZA_REG_R10, ZA_OFF_FN_VAL);
+            jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R10);
+            jit_movabs_rax(nil);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_je_rel32_placeholder();
+
+            // r10 = *cell(fn_obj、タグ付き)。さらにタグを外してr10=fn_objの生アドレス。
+            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+            jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);
+            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+
+            // obj[0](magic)がMAGIC_FUNCTION_NATIVEでなければ高速pathは使えない
+            // (MAGIC_FUNCTION_INTERPRETEDはword1がparamsリストでありmetaポインタ
+            // ではないため、この先で誤ってdereferenceしないよう先に弾く)。
+            jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 0);
+            jit_movabs_reg(ZA_REG_R11, MAGIC_FUNCTION_NATIVE);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_jne_rel32_placeholder();
+
+            // r13 = obj[1](meta、za_fn_meta_tへの生ポインタ)。meta->arity(offset 16)が
+            // argcと一致しなければ高速pathは使えない。
+            jit_mov_reg_from_mem_disp8(ZA_REG_R13, ZA_REG_R10, 8);
+            jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R13, 16);
+            jit_movabs_reg(ZA_REG_R11, argc);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_jne_rel32_placeholder();
+
+            // meta->fixed_entry(offset 8)が0(未対応)なら高速pathは使えない。
+            jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R13, 8);
+            jit_movabs_reg(ZA_REG_R11, 0);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_je_rel32_placeholder();
+            // ここまで全てのjcc(4つとも「不一致/不適合ならfallbackへ飛ぶ」条件)が
+            // 発火しなかった場合のみここへ素通しで到達する(=arity一致・
+            // fixed_entry設定済みを確認完了)。rax=fixed_entryのアドレスのまま。
+
+            // 高速path: consリスト(手順4)は一切構築しない。fixed_entryのアドレス
+            // (rax)は、この直後のza_gc_unlink呼び出し(volatileレジスタを破壊し
+            // うる通常のC呼び出し規約)を跨いで生き残る必要があるため、
+            // callee-savedなr13へ退避してから、fn/引数分のリンクだけをまとめて
+            // 外す(accは未構築のため、CALL_SAVED_HEAD以降で実際にlinkされて
+            // いるのはfn/引数のみ)。
+            jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+            za_load_slot(ZA_REG_RCX, za_call_saved_head_off(call_depth));
+            jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+            jit_call_r11();
+            jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R13);
+            za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
+            if (argc >= 1) {
+                za_load_slot(ZA_REG_RDX, za_arg_val_off(call_depth, 0));
+            }
+            if (argc >= 2) {
+                za_load_slot(ZA_REG_R8, za_arg_val_off(call_depth, 1));
+            }
+            if (argc >= 3) {
+                za_load_slot(ZA_REG_R9, za_arg_val_off(call_depth, 2));
+            }
+            jit_call_r11();
+            fast_done_patch = jit_emit_jmp_rel32_placeholder();
+        }
+
+        // フォールバック: argc>ZA_MAX_FIXED_ENTRY_PARAMSならここへ素通しで到達し、
+        // argc<=MAXならいずれかの判定に失敗した場合のみここへjmpしてくる。手順4
+        // (consリスト構築)+手順5(fn/acc/引数のunlink)を経てos_apply_via_cell
+        // (cell, evaluated_args, env)を通常のcallで呼ぶ。FN_VALはos_get_function_cell
+        // が返したcellアドレスであり、fn_obj自体は呼び出し先が都度cellの中身を
+        // 読んで取得する(間接呼び出し化)。
+        UINT64 fallback_offset = g_jit_used;
+        for (UINT64 i = 0; i < fast_patch_count; i++) {
+            jit_patch_rel32_target(fast_patches[i], fallback_offset);
+        }
+        za_emit_call_build_acc_and_unlink(call_depth, argc);
         za_load_slot(ZA_REG_RCX, ZA_OFF_FN_VAL);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ACC_VAL);
         za_load_slot(ZA_REG_R8, ZA_OFF_ENV_VAL);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_via_cell);
         jit_call_r11();
+        if (argc <= ZA_MAX_FIXED_ENTRY_PARAMS) {
+            jit_patch_rel32(fast_done_patch);
+        }
     } else {
-        // 6b. 末尾: envのリンクも外す。
+        // 6b. 末尾: 手順4(consリスト構築)+手順5(unlink)を経てから、envのリンクも外す。
+        za_emit_call_build_acc_and_unlink(call_depth, argc);
         za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
         jit_call_r11();
@@ -4343,6 +4529,16 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     // 一覧をリセットする。失敗exitではza_release_literal_slot_allocsで即座にフリーリストへ
     // 返却し、成功時はos_environment_register_literal_slotでenvへ登録する。
     g_za_literal_slot_alloc_count = 0;
+    // ABI-M5: パラメータスロット方式(固定引数レジスタ渡しエントリポイント)は
+    // fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS・&restなし・lambda/flet/labelsを
+    // 含まない関数のみに限定する(za_form_disables_param_slots参照)。この判定は
+    // コンパイル開始前に一度だけ行い、g_za_use_param_slotsへ設定してから
+    // za_compile_expr(za_emit_operand経由)を呼ぶ。
+    lisp_val_t dummy_rest_sym;
+    int use_param_slots = fixed_count <= ZA_MAX_FIXED_ENTRY_PARAMS &&
+                           !za_rest_param_symbol(params, fixed_count, &dummy_rest_sym) &&
+                           !za_form_disables_param_slots(form);
+    g_za_use_param_slots = use_param_slots;
     // トランポリンは全JIT関数で共有するため、今回のコンパイル対象用にentryを記録する
     // より前に確定させる(コンパイル失敗時のg_jit_used巻き戻しでスタブ自体が失われない
     // ようにするため)。
@@ -4352,7 +4548,45 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         return nil;
     }
 
+    // ABI-M5: use_param_slotsの場合、entryはこのコンパイル試行が出力する全機械語
+    // (固定引数エントリポイント+consリストエントリポイント+共有本体)の先頭を指す
+    // ように、fixed_entryの生成より前に確定させる(code_len/reloc patch計算の基準)。
     UINT64 entry = g_jit_used;
+
+    UINT64 fixed_entry_offset = 0;
+    UINT64 jmp_to_body_patch = 0;
+    if (use_param_slots) {
+        // 固定引数レジスタ渡しエントリポイント: rcx=env, rdx=arg0, r8=arg1, r9=arg2
+        // (MS x64呼び出し規約、documents/abi-redesign.md参照)。consリストエントリ
+        // ポイントと全く同じフレームレイアウトを使うが、ARGS_VAL/ARGS_NODEは
+        // リンクせず(&restが無いため以降参照されない)、受け取った各引数を直接
+        // za_param_val_off(i)へ書き込みリンクしてから、共有本体(jmp_to_body_patch)
+        // へ合流する。
+        fixed_entry_offset = g_jit_used;
+        jit_push_rbx();
+        jit_push_r13();
+        jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+        za_store_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
+        if (fixed_count >= 1) {
+            za_store_slot(ZA_REG_RDX, za_param_val_off(0));
+        }
+        if (fixed_count >= 2) {
+            za_store_slot(ZA_REG_R8, za_param_val_off(1));
+        }
+        if (fixed_count >= 3) {
+            za_store_slot(ZA_REG_R9, za_param_val_off(2));
+        }
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
+        jit_call_r11();
+        za_store_slot(ZA_REG_RAX, ZA_OFF_ENV_SAVED_HEAD);
+        za_emit_gc_link_slot(ZA_OFF_ENV_VAL, ZA_OFF_ENV_NODE);
+        for (UINT64 i = 0; i < fixed_count; i++) {
+            za_emit_gc_link_slot(za_param_val_off(i), za_param_node_off(i));
+        }
+        jmp_to_body_patch = jit_emit_jmp_rel32_placeholder();
+    }
+
+    UINT64 cons_entry_offset = g_jit_used;
 
     // プロローグ: rbx/r13を退避し、MS x64呼び出し規約のシャドウスペース+拡張3用の
     // フレーム(env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
@@ -4367,11 +4601,33 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     za_emit_gc_link_slot(ZA_OFF_ENV_VAL, ZA_OFF_ENV_NODE);
     za_emit_gc_link_slot(ZA_OFF_ARGS_VAL, ZA_OFF_ARGS_NODE);
 
+    if (use_param_slots) {
+        // ABI-M5: consリストエントリポイント側も、都度cc_car/cc_cdrで辿る代わりに
+        // 一度だけARGS_VALをfixed_count回分だけ展開してza_param_val_off(i)へ
+        // 書き込む(za_emit_operandがis_literal==0参照でここを直接読むようになる)。
+        for (UINT64 i = 0; i < fixed_count; i++) {
+            za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
+            jit_movabs_r11((UINT64)(void *)cc_car);
+            jit_call_r11();
+            za_store_slot(ZA_REG_RAX, za_param_val_off(i));
+            za_emit_gc_link_slot(za_param_val_off(i), za_param_node_off(i));
+            za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
+            jit_movabs_r11((UINT64)(void *)cc_cdr);
+            jit_call_r11();
+            za_store_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
+        }
+        jit_patch_rel32(jmp_to_body_patch);
+    }
+
     if (!za_compile_expr(form, params, fixed_count, 0, &syms, env, 1, trampoline_offset, 0, 0, 0, 0)) {
+        g_za_use_param_slots = 0;
         za_release_literal_slot_allocs();
         g_jit_used = entry;
         return nil;
     }
+    // body本体のコード生成(za_emit_operand)はここまでで完了しているため、以降は
+    // このコンパイル試行専用のフラグをリセットしてよい。
+    g_za_use_param_slots = 0;
 
     // エピローグ(末尾呼び出しでトランポリンへjmpせずここへ流れ落ちた場合のみ通る経路)。
     // za_gc_unlinkの呼び出し自体がrcxを使うため、本体の結果(rax)は先にr13へ退避してから
@@ -4463,7 +4719,17 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
 
     g_jit_used = entry;
 
-    return os_make_jit_function((lisp_addr_t)(void *)dest_bytes);
+    // ABI-M5: cons_entry/fixed_entryいずれもentry(このコンパイル試行が出力した
+    // 全機械語の先頭、g_jit_code内のオフセット)からの相対位置で、dest_bytes
+    // (Immobilized Spaceへのコピー後の先頭)からの同じ相対位置に存在する。
+    // use_param_slotsでない場合はcons_entry_offset==entryなので、
+    // dest_bytes+0==dest_bytesとなり従来と完全に同じアドレスになる。
+    lisp_addr_t cons_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (cons_entry_offset - entry));
+    if (use_param_slots) {
+        lisp_addr_t fixed_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (fixed_entry_offset - entry));
+        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count);
+    }
+    return os_make_jit_function(cons_entry_addr);
 }
 
 /**

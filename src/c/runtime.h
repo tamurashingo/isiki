@@ -723,6 +723,21 @@ lisp_val_t os_make_native_function(lisp_addr_t fnptr);
 lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
 
 /**
+ * os_make_jit_functionのdual-entry版(ABI-M5)。cons_entry(従来のconsリストABI
+ * fn(evaluated_args, env))に加え、fixed_entry(固定引数レジスタ渡し
+ * fn(env, arg0, ...)、za.cのza_try_compile_defunがパラメータスロット方式
+ * (fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS、&restなし、lambda/flet/labelsを
+ * 含まない関数のみ)で生成)とそのarityをza_fn_meta_tへ設定する。za_compile_call
+ * が実引数個数とarityが一致する静的呼び出しに対し、consリストを経由せず
+ * fixed_entryをレジスタ渡しで直接callできるようにする。
+ * @param cons_entry 従来のconsリストABIのJITコンパイル済みアドレス
+ * @param fixed_entry 固定引数レジスタ渡しのJITコンパイル済みアドレス
+ * @param arity fixed_entryが受け取る固定引数の個数
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_entry, UINT64 arity);
+
+/**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
  * その定義時の捕捉環境として保持するTAG_INSTANCEオブジェクトを作る。os_make_native_function/
  * os_make_jit_functionとの違いはword2にfixnum 2を立て、word3にcaptured_envを持つ点。
