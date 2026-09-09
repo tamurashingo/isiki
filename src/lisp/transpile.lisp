@@ -1394,6 +1394,33 @@
                   (format nil "lisp_val_t ~A = ~A; GC_PROTECT(~A);" c-var arg-c-name c-var))))
           params arg-c-names))
 
+(defun emit-trampoline-drive-loop (var-name env-c-name)
+  "tco_result_tを繰り返しトランポリンし切って最終値をVAR-NAMEに残すCの文列を作る
+   (defun/lambdaの公開ラッパー(name(evaluated_args,env))、ABI-M6のname__fixed
+   公開ラッパーのいずれも、この同じ文列を共有する)。
+   ABI-M8: is_tail_call==2(固定引数ABI継続、transpile-tail-call-fixed-args-guarded
+   参照)の場合は、fixed_fn(void*、実際の呼び出し先ごとに引数個数が異なる
+   name__step_fixedへの生ポインタ)をfixed_argc(0〜3)に応じた関数ポインタ型へ
+   キャストしてenv+arg0..2で直接call(consリストを一切構築しない)。
+   is_tail_call==1(従来のconsリストABI継続)の場合は従来通りfn(args, env)を呼ぶ"
+  (with-output-to-string (out)
+    (format out "    while (~A.is_tail_call) {~%" var-name)
+    (format out "        if (~A.is_tail_call == 2) {~%" var-name)
+    (format out "            switch (~A.fixed_argc) {~%" var-name)
+    (format out "            case 0: ~A = ((tco_result_t (*)(lisp_val_t))~A.fixed_fn)(~A); break;~%"
+            var-name var-name env-c-name)
+    (format out "            case 1: ~A = ((tco_result_t (*)(lisp_val_t, lisp_val_t))~A.fixed_fn)(~A, ~A.arg0); break;~%"
+            var-name var-name env-c-name var-name)
+    (format out "            case 2: ~A = ((tco_result_t (*)(lisp_val_t, lisp_val_t, lisp_val_t))~A.fixed_fn)(~A, ~A.arg0, ~A.arg1); break;~%"
+            var-name var-name env-c-name var-name var-name)
+    (format out "            default: ~A = ((tco_result_t (*)(lisp_val_t, lisp_val_t, lisp_val_t, lisp_val_t))~A.fixed_fn)(~A, ~A.arg0, ~A.arg1, ~A.arg2); break;~%"
+            var-name var-name env-c-name var-name var-name var-name)
+    (format out "            }~%")
+    (format out "        } else {~%")
+    (format out "            ~A = ~A.fn(~A.args, ~A);~%" var-name var-name var-name env-c-name)
+    (format out "        }~%")
+    (format out "    }~%")))
+
 (defun emit-function-body (c-name params preamble-stmts body-form scope &optional fixed-arity)
   "defun/lambdaのどちらにも共通のstep関数+公開ラッパーのC関数定義を組み立てる。
    PARAMSはevaluated_argsを消費するパラメータの並び(空ならevaluated_args自体が
@@ -1406,11 +1433,12 @@
    加えて固定引数レジスタ渡し版(__step_fixed/__fixed)も出力する。za.cの
    ABI-M5(パラメータスロット方式)と同じ「エントリの前段(パラメータ束縛)だけを
    複製し、tail-stmt(本体)のテキスト自体は1度生成したものを両エントリで
-   共有する」設計で、__step_fixedはこのファイル内のname__fixedからしか
-   呼ばれないためstaticにする(__step自身は末尾呼び出しトランポリンが
-   ファイルを跨いで関数ポインタを取るため、transpile-prototype同様static
-   にできない。__fixedは非末尾呼び出しのみが対象でトランポリンには乗らない
-   ため、__step_fixedはトランポリンの.fnとして外部から参照される心配が無い)"
+   共有する」設計。__step_fixedは当初「このファイル内のname__fixedからしか
+   呼ばれない」という想定でstaticにしていたが、ABI-M8(tco_result_tの固定引数
+   ABI継続、transpile-tail-call-fixed-args-guarded参照)により、他の(同一
+   ファイル内で前方参照になる、またはファイルを跨ぐ)関数の末尾呼び出しからも
+   fixed_fnとして直接参照されるようになったため、__step自身と同じ理由で
+   staticにできない(transpile-prototypeが両ファイルへ共通で前方宣言を出力する)"
   (let ((tail-stmt (transpile-tail-stmt body-form scope)))
     (with-output-to-string (out)
       (format out "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
@@ -1423,15 +1451,13 @@
       (format out "}~%~%")
       (format out "lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
       (format out "    tco_result_t __r = ~A__step(evaluated_args, env);~%" c-name)
-      (format out "    while (__r.is_tail_call) {~%")
-      (format out "        __r = __r.fn(__r.args, env);~%")
-      (format out "    }~%")
+      (format out "~A" (emit-trampoline-drive-loop "__r" "env"))
       (format out "    return __r.value;~%")
       (format out "}~%")
       (when fixed-arity
         (let* ((arg-c-names (fixed-entry-param-c-names fixed-arity))
                (direct-preamble (emit-direct-preamble-stmts params scope arg-c-names)))
-          (format out "~%static tco_result_t ~A__step_fixed(lisp_val_t env~{, lisp_val_t ~A~}) {~%"
+          (format out "~%tco_result_t ~A__step_fixed(lisp_val_t env~{, lisp_val_t ~A~}) {~%"
                   c-name arg-c-names)
           (dolist (stmt direct-preamble)
             (format out "    ~A~%" stmt))
@@ -1440,9 +1466,7 @@
           (format out "}~%~%")
           (format out "lisp_val_t ~A__fixed(lisp_val_t env~{, lisp_val_t ~A~}) {~%" c-name arg-c-names)
           (format out "    tco_result_t __r = ~A__step_fixed(env~{, ~A~});~%" c-name arg-c-names)
-          (format out "    while (__r.is_tail_call) {~%")
-          (format out "        __r = __r.fn(__r.args, env);~%")
-          (format out "    }~%")
+          (format out "~A" (emit-trampoline-drive-loop "__r" "env"))
           (format out "    return __r.value;~%")
           (format out "}~%"))))))
 
@@ -1622,6 +1646,21 @@
    終了させる)"
   (format nil "return (tco_result_t){.is_tail_call = 0, .value = (~A)};" c-expr))
 
+(defparameter *tco-max-fixed-argc* 3
+  "ABI-M8: tco_result_tの固定引数ABI継続(fixed_fn/fixed_argc/arg0..2)が
+   保持できる引数個数の上限。za.cのABI-M5/M7のZA_MAX_FIXED_ENTRY_PARAMSと
+   同じ値に揃えた(tco_result_tは全呼び出し先で共有する固定サイズのCの構造体
+   のため、フィールド数の上限をどこかで決める必要があり、za.c側との対応関係を
+   分かりやすくする目的でこの値を選んだ。AOTの非末尾呼び出し(ABI-M6の__fixed)
+   自体には technicalなレジスタ制約は無いが、末尾呼び出しのトランポリン継続は
+   1つの共有構造体を経由するためこの上限が必要になる)")
+
+(defun tco-fixed-arg-inits (temps)
+  "TEMPSの各要素を、tco_result_tの.arg0/.arg1/.arg2フィールド初期化子の
+   カンマ区切り文字列にする(transpile-tail-call-fixed-args-guarded参照)"
+  (format nil "~{~A~^, ~}"
+          (loop for i from 0 for temp in temps collect (format nil ".arg~D = ~A" i temp))))
+
 (defun transpile-tail-call (expr scope)
   "末尾位置の(name arg*)で、nameが*known-function-names*に含まれる(=この
    ファイル内でdefunされた)場合にのみ呼ばれる。transpile-callと同様にGC-safeな
@@ -1630,17 +1669,45 @@
    returnして消えるため、何段トランポリンが続いてもCスタックは伸びない。
    M12 Phase 9(#27): transpile-call-args-guardedと同じ短絡規則で、いずれかの
    引数が非局所脱出シグナルならトランポリン継続を組み立てず、そのシグナルを
-   確定値としてreturnする"
+   確定値としてreturnする。
+   ABI-M8: nameが&restを持たない既知関数で、実引数個数がそのarityとちょうど
+   一致し、かつ*tco-max-fixed-argc*以下の場合、consチェーン構築を経由せず
+   tco_result_tの固定引数ABI継続(fixed_fn=name__step_fixed、arg0..2に評価済みの
+   引数)を詰めてreturnする(emit-trampoline-drive-loop参照)。ABI-M6の非末尾
+   呼び出しと異なり実行時判定は不要(理由はABI-M6/M7の設計判断と同じ:
+   AOTの既知関数呼び出しはリンク時確定の直接呼び出しであり、za.cのような
+   Function Cell経由の間接呼び出しではないため)"
   (let* ((name (car expr))
          (args (cdr expr))
-         (c-name (lisp-name-to-c-name name)))
-    (if (null args)
-        (format nil "return (tco_result_t){.is_tail_call = 1, .fn = ~A__step, .args = nil};" c-name)
-        (let ((temps (mapcar (lambda (arg)
-                                (declare (ignore arg))
-                                (format nil "__call_arg_~A" (incf *call-temp-counter*)))
-                              args)))
-          (transpile-tail-call-args-guarded temps temps args scope c-name)))))
+         (argc (length args))
+         (c-name (lisp-name-to-c-name name))
+         (fixed-arity (known-function-fixed-arity name)))
+    (cond
+      ((and fixed-arity (= fixed-arity argc) (<= argc *tco-max-fixed-argc*))
+       (let ((temps (mapcar (lambda (arg)
+                               (declare (ignore arg))
+                               (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                             args)))
+         (transpile-tail-call-fixed-args-guarded temps temps args scope c-name)))
+      ((null args)
+       (format nil "return (tco_result_t){.is_tail_call = 1, .fn = ~A__step, .args = nil};" c-name))
+      (t
+       (let ((temps (mapcar (lambda (arg)
+                               (declare (ignore arg))
+                               (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                             args)))
+         (transpile-tail-call-args-guarded temps temps args scope c-name))))))
+
+(defun transpile-tail-call-fixed-args-guarded (all-temps remaining-temps remaining-args scope c-name)
+  "transpile-tail-call-args-guardedのABI-M8版。consチェーンを組み立てず、
+   評価済みの引数一時変数をtco_result_tの.arg0/.arg1/.arg2へ直接詰める"
+  (if (null remaining-temps)
+      (format nil "return (tco_result_t){.is_tail_call = 2, .fixed_fn = (void *)~A__step_fixed, .fixed_argc = ~D, ~A};"
+              c-name (length all-temps) (tco-fixed-arg-inits all-temps))
+      (let ((temp (car remaining-temps)))
+        (format nil "{ lisp_val_t ~A = (~A); GC_PROTECT(~A); if (os_is_control_transfer(~A)) { return (tco_result_t){.is_tail_call = 0, .value = (~A)}; } else { ~A } }"
+                temp (transpile-expr (car remaining-args) scope) temp temp temp
+                (transpile-tail-call-fixed-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope c-name)))))
 
 (defun transpile-tail-call-args-guarded (all-temps remaining-temps remaining-args scope c-name)
   "transpile-call-args-guardedの末尾呼び出し版。式ではなく完結したC文を返す
@@ -1738,15 +1805,18 @@
    必須になった)。全既知関数の前方宣言を両ファイルへ共通で出力する(自分の
    ファイルで定義されない関数は本体無しの宣言のみになるが、Cとして正しい)。
    ABI-M6: known-function-fixed-arityが非nilを返す(&restを持たない)関数のみ、
-   name__fixedの前方宣言も追加する(__step_fixedはstaticなためファイルを跨がず
-   前方宣言不要、emit-function-body参照)"
+   name__fixedの前方宣言も追加する。ABI-M8: __step_fixedもname__fixedと同じく
+   ファイルを跨いで(またはファイル内で前方参照として)tco_result_tの
+   fixed_fnから直接参照されるようになったため、__stepと同様前方宣言する
+   (emit-function-body参照)"
   (let* ((name (second form))
          (c-name (lisp-name-to-c-name name))
          (arity (known-function-fixed-arity name)))
     (format nil "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);~%~A"
             c-name c-name
             (if arity
-                (format nil "lisp_val_t ~A__fixed(lisp_val_t env~{, lisp_val_t ~A~});~%" c-name (fixed-entry-param-c-names arity))
+                (format nil "tco_result_t ~A__step_fixed(lisp_val_t env~{, lisp_val_t ~A~});~%lisp_val_t ~A__fixed(lisp_val_t env~{, lisp_val_t ~A~});~%"
+                        c-name (fixed-entry-param-c-names arity) c-name (fixed-entry-param-c-names arity))
                 ""))))
 
 
@@ -1852,13 +1922,21 @@
     ;; 同じ理由でide_subprimitive.hも必要
     (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%#include \"subprimitive.h\"~%#include \"ide_subprimitive.h\"~%~%")
     ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
-    ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
-    ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)。
+    ;; 1ならfn/argsが「次にこのstep関数をこの引数(consリスト)で呼ぶ」ことを表す
+    ;; (実際の呼び出しは各defunの公開ラッパーのwhileループが行う。ファイル先頭の
+    ;; コメント参照)。
+    ;; ABI-M8: is_tail_call=2はfixed_fn/fixed_argc/arg0..2が「次にこのstep_fixed
+    ;; 関数を(env, arg0, ...)で直接呼ぶ(consリストを構築しない)」ことを表す。
+    ;; fixed_fnは実際の呼び出し先ごとに引数個数が異なる(name__step_fixedの
+    ;; シグネチャはfixed_argc個)ため、汎用のvoid*として持ち、呼び出し側
+    ;; (emit-trampoline-drive-loop)がfixed_argcに応じたステップ関数ポインタ型へ
+    ;; キャストしてから呼ぶ。fixed_argcは3(ABI-M5/M7のZA_MAX_FIXED_ENTRY_PARAMSと
+    ;; 揃えた上限、known-function-fixed-arity/transpile-tail-callが保証)まで。
     ;; M15: 2ファイルそれぞれが独立してこの型定義を持つ(Cにtypeのリンケージは
     ;; 無く、同じレイアウトの型を各翻訳単位が個別に定義するだけなので問題ない)
     (format out "typedef struct tco_result tco_result_t;~%")
     (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
-    (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%};~%~%")
+    (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%    void *fixed_fn;~%    UINT64 fixed_argc;~%    lisp_val_t arg0;~%    lisp_val_t arg1;~%    lisp_val_t arg2;~%};~%~%")
     (dolist (p prototypes)
       (format out "~A~%" p))
     (format out "~%")
