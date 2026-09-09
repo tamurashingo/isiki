@@ -382,6 +382,18 @@ UINT64 os_gc_collect_count(void) {
     return g_gc_collect_count;
 }
 
+/**
+ * 組み込み関数%%GC-COLLECT-COUNT。os_gc_collect_countをfixnumで返す。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 累積GC発火回数のfixnum
+ */
+lisp_val_t primitive_gc_collect_count(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(os_gc_collect_count());
+}
+
 /* ============================== Boot Allocator ==============================
  * boot直後からLisp起動(os_heap_init)までの間だけ使えるbumpアロケータ。
  * UEFIから渡された単一の空き領域(heap_base/heap_size)の先頭から必要な分だけ
@@ -1196,6 +1208,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%EVAL-IN-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_eval_in_environment), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
+        os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);

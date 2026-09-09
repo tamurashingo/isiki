@@ -193,6 +193,14 @@ lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数%%GC-COLLECT-COUNT。os_gc_collect_count(累積GC発火回数)をfixnumで返す。
+ * ABI-M0: JIT実行下でのcons-list経由呼び出しのヒープ確保圧を計測するベンチマーク
+ * (test/lisp/abi_bench.lisp)が、ホットループの前後でこの値と%%HEAP-USED-BYTESの
+ * 差分を取るために使う。
+ */
+lisp_val_t primitive_gc_collect_count(lisp_val_t args, lisp_val_t env);
+
+/**
  * boot直後からLisp起動(os_heap_init)までの間だけ使えるbumpアロケータを、
  * base〜base+sizeの範囲で初期化する。os_heap_initより前に呼ぶこと。
  * @param base アロケータが使える領域の先頭アドレス
