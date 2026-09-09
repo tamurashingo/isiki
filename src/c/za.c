@@ -2838,19 +2838,22 @@ static void za_emit_call_build_acc_and_unlink(UINT64 call_depth, UINT64 argc) {
  *      ない)をfnスロットへ書き込み、linkする(envはENV_VALスロットから読み直す)。
  *      FN_VAL/ACC_VALは引数loop完了後にしか書き込まれず直後に消費されるため、depth化
  *      せず単一スロットのままで安全。
- *   4. (ABI-M5により、高速pathの対象外と判明した経路でのみ出力: za_emit_call_build_acc_and_unlink
- *      参照)accスロットをnilで初期化しlinkした後、引数スロットを右から左へ
- *      os_make_cons(argslot[i], accslot)で辿ってconsし、その都度accスロットを書き換える。
+ *   4. (ABI-M5/M7により、高速pathの対象外と判明した経路でのみ出力:
+ *      za_emit_call_build_acc_and_unlink参照)accスロットをnilで初期化しlinkした後、
+ *      引数スロットを右から左へos_make_cons(argslot[i], accslot)で辿ってconsし、
+ *      その都度accスロットを書き換える。
  *   5. (4と同じ経路でのみ出力)CALL_SAVED_HEADでfn/acc/引数のリンクをまとめて外す。
- *   6. 非末尾かつargc<=ZA_MAX_FIXED_ENTRY_PARAMSの場合、consリスト構築より前に
- *      cellの中身(fn_obj)がfixed_entryを持ちarityが一致するかを実行時に確認し、
- *      一致すればconsリストを一切構築せずfixed_entry(env, arg0, ...)をレジスタ渡しで
- *      直接callする(この場合のみ手順4/5はfn/引数だけのunlinkに縮退する)。それ以外の
- *      非末尾呼び出しは手順4/5を経てos_apply_via_cell(cell, evaluated_args, env)を
- *      通常のcallで呼ぶ(内部でcellの中身を読んでos_apply_functionへ委譲する)。
- *      末尾なら手順4/5の後envのリンクも外し、自分のフレームを完全に畳んだ上で
- *      共有トランポリンへjmpする(トランポリンもr8にcellを受け取り、中身を読んでから
- *      既存の分岐に入る)。
+ *   6. argc<=ZA_MAX_FIXED_ENTRY_PARAMSの場合(非末尾・末尾いずれも)、consリスト
+ *      構築より前にcellの中身(fn_obj)がfixed_entryを持ちarityが一致するかを
+ *      実行時に確認し、一致すればconsリストを一切構築せずfixed_entry(env, arg0,
+ *      ...)をレジスタ渡しで直接呼ぶ(この場合のみ手順4/5はfn/引数だけの
+ *      unlinkに縮退する。非末尾はcall+戻り値待ち、末尾は自分のフレームを
+ *      完全に畳んだ上でのjmp、ABI-M7)。一致しなければ(またはargc>MAXで
+ *      判定自体を試みない場合)手順4/5を経て、非末尾はos_apply_via_cell(cell,
+ *      evaluated_args, env)を通常のcallで呼び(内部でcellの中身を読んで
+ *      os_apply_functionへ委譲する)、末尾はさらにenvのリンクも外してから
+ *      自分のフレームを完全に畳んだ上で共有トランポリンへjmpする(トランポリンも
+ *      r8にcellを受け取り、中身を読んでから既存の分岐に入る)。
  * @param call_depth 自分が使うCALL_SAVED_HEAD/引数スロットの深さ。ZA_MAX_CALL_DEPTH
  * 以上ならコンパイルを断念する(引数を評価する再帰にはcall_depth+1を渡す)。
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
@@ -3065,7 +3068,99 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             jit_patch_rel32(fast_done_patch);
         }
     } else {
-        // 6b. 末尾: 手順4(consリスト構築)+手順5(unlink)を経てから、envのリンクも外す。
+        // 6b. 末尾。
+        // ABI-M7: 6a(非末尾、ABI-M5)と同じ実行時4条件判定を、consリスト構築
+        // (手順4)より前に行う。一致すればconsリストも共有トランポリン
+        // (za_ensure_trampoline)も一切経由せず、fixed_entry(env, arg0, ...)へ
+        // 自分のフレームを完全に畳んだ上で直接tail-jmpする。このjmp自体が
+        // 素のJMP命令(callではない)であり、jmp先のfixed_entryがさらに
+        // 末尾再帰してもCスタックは一切伸びない(=6aの非末尾直接callと違い、
+        // ここでの「呼び出し」はレジスタとjmp先アドレスの用意だけで完結し、
+        // 戻り先の管理が一切不要)。一致しなければ(またはargc>MAXで判定自体を
+        // 試みない場合)従来通りconsリスト構築+共有トランポリン経由
+        // (consリストABI)へフォールバックする。6aと違いここでは戻り値を待つ
+        // 必要が無いため「fast_done_patch」に相当するものは無い(fast path
+        // 自体がこの関数の実行をそこで完全に終える一方通行のjmpのため)。
+        UINT64 fast_patches[4];
+        UINT64 fast_patch_count = 0;
+        if (argc <= ZA_MAX_FIXED_ENTRY_PARAMS) {
+            // r10 = cell(FN_VAL、タグ付き)。nilならこの高速pathは使えない。
+            za_load_slot(ZA_REG_R10, ZA_OFF_FN_VAL);
+            jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R10);
+            jit_movabs_rax(nil);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_je_rel32_placeholder();
+
+            // r10 = *cell(fn_obj、タグ付き)。さらにタグを外してr10=fn_objの生アドレス。
+            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+            jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);
+            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+
+            // obj[0](magic)がMAGIC_FUNCTION_NATIVEでなければ高速pathは使えない。
+            jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 0);
+            jit_movabs_reg(ZA_REG_R11, MAGIC_FUNCTION_NATIVE);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_jne_rel32_placeholder();
+
+            // r13 = obj[1](meta)。meta->arity(offset 16)がargcと一致しなければ
+            // 高速pathは使えない。
+            jit_mov_reg_from_mem_disp8(ZA_REG_R13, ZA_REG_R10, 8);
+            jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R13, 16);
+            jit_movabs_reg(ZA_REG_R11, argc);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_jne_rel32_placeholder();
+
+            // meta->fixed_entry(offset 8)が0(未対応)なら高速pathは使えない。
+            jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R13, 8);
+            jit_movabs_reg(ZA_REG_R11, 0);
+            jit_cmp_rax_r11();
+            fast_patches[fast_patch_count++] = jit_emit_je_rel32_placeholder();
+            // ここまで全てのjcc(4つとも「不一致/不適合ならfallbackへ飛ぶ」条件)が
+            // 発火しなかった場合のみここへ素通しで到達する。rax=fixed_entryの
+            // アドレスのまま。
+
+            // 高速path: fixed_entryのアドレス(rax)を、この直後のza_gc_unlink
+            // 呼び出し(volatileレジスタを破壊しうる通常のC呼び出し規約)を
+            // 跨いで生き残らせるため、callee-savedなr13へ退避してから、
+            // fn/引数分・env分のリンクをそれぞれ外す(accは未構築のため
+            // za_call_saved_head_off以降で実際にlinkされているのはfn/引数のみ。
+            // env分は6b共通でここまで手を付けていないため、consリスト版と同じく
+            // 別途ZA_OFF_ENV_SAVED_HEAD経由で外す)。
+            jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+            za_load_slot(ZA_REG_RCX, za_call_saved_head_off(call_depth));
+            jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+            jit_call_r11();
+            za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
+            jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+            jit_call_r11();
+
+            // fixed_entryの呼び出し規約(rcx=env, rdx=arg0, r8=arg1, r9=arg2)に
+            // 沿って、フレームを解体する前に値スロットからレジスタへ読み出して
+            // おく(6a非末尾の直接call手順、既存のconsリスト版6bと同型)。
+            za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
+            if (argc >= 1) {
+                za_load_slot(ZA_REG_RDX, za_arg_val_off(call_depth, 0));
+            }
+            if (argc >= 2) {
+                za_load_slot(ZA_REG_R8, za_arg_val_off(call_depth, 1));
+            }
+            if (argc >= 3) {
+                za_load_slot(ZA_REG_R9, za_arg_val_off(call_depth, 2));
+            }
+            jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R13);
+            jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+            jit_pop_r13();
+            jit_pop_rbx();
+            jit_jmp_reg(ZA_REG_R11);
+        }
+
+        // フォールバック: argc>ZA_MAX_FIXED_ENTRY_PARAMSならここへ素通しで到達し、
+        // argc<=MAXならいずれかの判定に失敗した場合のみここへjmpしてくる。従来
+        // 通り手順4(consリスト構築)+手順5(unlink)を経てから、envのリンクも外す。
+        UINT64 fallback_offset = g_jit_used;
+        for (UINT64 i = 0; i < fast_patch_count; i++) {
+            jit_patch_rel32_target(fast_patches[i], fallback_offset);
+        }
         za_emit_call_build_acc_and_unlink(call_depth, argc);
         za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
