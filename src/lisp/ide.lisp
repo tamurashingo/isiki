@@ -157,17 +157,37 @@
         (%hex-dump-row out (%ide-take bytes 16) offset)
         (%hex-dump-rows out (%ide-drop bytes 16) (+ offset 16)))))
 
-;; (%ide-take list n) : listの先頭n要素からなるリストを返す。
-(defun %ide-take (list n)
-  (if (or (null list) (= n 0))
-      nil
-      (cons (car list) (%ide-take (cdr list) (- n 1)))))
+;; (%ide-take vec n) : vec(read-sectorが返すgeneral-vector)の先頭n要素からなる
+;; consリストを返す。[ファイルI/O]#50でread-sector/%ide-bytes-from-addrがconsリスト
+;; ではなくgeneral-vectorを返すようになった際、本関数がcar/cdr前提(consリスト専用)
+;; のまま取り残されていた(cc_car/cc_cdrは型チェックをせずポインタ先を無条件に
+;; cons cellとして読むため、vectorに対して呼ぶと内部レイアウトを誤読して無意味な
+;; 値を返す)。elt/lengthでvecを走査するよう書き直す(戻り値は従来通りconsリストの
+;; まま。呼び出し元の%hex-dump-row・ide_test.lispのマジック文字列比較がいずれも
+;; リストを前提にしているため)。
+(defun %ide-take (vec n)
+  (let ((len (length vec)) (i 0) (rev nil))
+    (progn
+      (while (and (< i n) (< i len))
+        (progn
+          (setq rev (cons (elt vec i) rev))
+          (setq i (+ i 1))))
+      (reverse rev))))
 
-;; (%ide-drop list n) : listの先頭n要素を取り除いた残りを返す。
-(defun %ide-drop (list n)
-  (if (or (null list) (= n 0))
-      list
-      (%ide-drop (cdr list) (- n 1))))
+;; (%ide-drop vec n) : vec(general-vector)の先頭n要素を取り除いた残りを、
+;; 元と同じgeneral-vectorとして返す(%ide-takeと同じ理由でvector対応に書き直した)。
+;; 残りが0要素になったらnilを返す(%hex-dump-rowsのnull終端条件をそのまま使う)。
+(defun %ide-drop (vec n)
+  (let ((len (length vec)))
+    (if (>= n len)
+        nil
+        (let ((rest-len (- len n)) (result (create-vector (- len n) 0)) (i 0))
+          (progn
+            (while (< i rest-len)
+              (progn
+                (set-elt (elt vec (+ n i)) result i)
+                (setq i (+ i 1))))
+            result)))))
 
 ;; (%ide-output-stream) : *standard-output*が動的束縛されていれば(with-standard-output
 ;; 経由等)それを使い、なければ画面への新規出力ストリームを開く(utility.lispのroomと
