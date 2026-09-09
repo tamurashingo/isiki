@@ -511,6 +511,50 @@
     ((assoc name *primitive-c-names*) (cdr (assoc name *primitive-c-names*)))
     (t (error "transpile-call: 未対応の呼び出し先です: ~S" name))))
 
+(defparameter *primitive-fixed-arity-c-names*
+  ;; ABI-M3: *primitive-c-names*に載っているn項/可変長版の呼び出し先のうち、
+  ;; ABI-M1/M2(documents/abi-redesign.md)でza.c向けにruntime.h/runtime.cへ
+  ;; 追加した固定引数版(_1/_2サフィックス、またはcar/cdr/consのように
+  ;; cc_car/cc_cdr/os_make_consを直接使えるもの)へ、実引数の個数がちょうど
+  ;; 一致する呼び出しに限って直接callできるようにする対応表。(name arity . c-name)
+  ;; の形。個数が一致しない呼び出し(例: (+ a b c)というn項和や単項の(- x))は
+  ;; ここに載らず*primitive-c-names*側のn項版へ従来通りフォールバックする
+  ;; (transpile-call参照)。固定引数版はいずれも「argsをconsリストとして
+  ;; 受け取らない」ため、呼び出し側もconsリスト構築(transpile-cons-chain)を
+  ;; 経由しない
+  '((car 1 . "cc_car")
+    (cdr 1 . "cc_cdr")
+    (cons 2 . "os_make_cons")
+    (eq 2 . "primitive_eq2")
+    (null 1 . "primitive_null1")
+    (= 2 . "primitive_num_equal2")
+    (< 2 . "primitive_less_than2")
+    (> 2 . "primitive_greater_than2")
+    (>= 2 . "primitive_greater_equal2")
+    (+ 2 . "primitive_add2")
+    (- 2 . "primitive_subtract2")
+    (set-car 2 . "primitive_set_car2")
+    (set-cdr 2 . "primitive_set_cdr2")
+    (numberp 1 . "primitive_numberp1")
+    (fixnump 1 . "primitive_fixnump1")
+    (bignump 1 . "primitive_bignump1")
+    (floatp 1 . "primitive_floatp1")
+    (symbolp 1 . "primitive_symbolp1")
+    (consp 1 . "primitive_consp1")
+    (characterp 1 . "primitive_characterp1")
+    (stringp 1 . "primitive_stringp1")
+    (functionp 1 . "primitive_functionp1")
+    (streamp 1 . "primitive_streamp1")))
+
+(defun primitive-fixed-arity-c-name (name argc)
+  "NAMEが*primitive-fixed-arity-c-names*に載っており、かつ実引数個数ARGCが
+   その固定arityと一致する場合、対応するC関数名を返す。一致しなければnil
+   (transpile-callがconsチェーン経由の従来呼び出しへフォールバックする合図)"
+  (let ((entry (assoc name *primitive-fixed-arity-c-names*)))
+    (if (and entry (= (cadr entry) argc))
+        (cddr entry)
+        nil)))
+
 
 ;;; let/let*: init.lispのdefmacro let/let*(%let-vars/%let-inits)と同じ展開規則。
 ;;; bodyは&restで複数式を許すが、transpile-lambda/transpile-defunは単一の本体式
@@ -1424,6 +1468,11 @@
       "nil"
       (format nil "os_make_cons(~A, ~A)" (car temps) (transpile-cons-chain (cdr temps)))))
 
+(defun transpile-c-arg-list (temps)
+  "Cの一時変数名のリストをカンマ区切りの引数並びへ整形する(ABI-M3の固定引数
+   直接呼び出し用。transpile-cons-chainと異なりconsチェーンを組み立てない)"
+  (format nil "~{~A~^, ~}" temps))
+
 (defparameter *call-temp-counter* 0)
 
 (defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr)
@@ -1450,18 +1499,38 @@
    指したままにならないようにするため)。引数が無い場合は一時変数もconsチェーンも
    不要なため、直接nilを渡す単純な呼び出し式にする。M12 Phase 9(#27):
    transpile-call-args-guarded参照、いずれかの引数が非局所脱出シグナルなら
-   呼び出し自体を行わずそのシグナルを伝播させる"
+   呼び出し自体を行わずそのシグナルを伝播させる。
+   ABI-M3: nameの実引数個数が*primitive-fixed-arity-c-names*の固定arityと
+   一致する場合は、consチェーン構築(transpile-cons-chain)を経由せず、
+   GC_PROTECT済みの引数一時変数をそのままカンマ区切りで固定引数版のC関数へ
+   渡す(primitive-fixed-arity-c-name参照)。ただしcall-target-c-nameと同じ
+   優先順位(*known-function-names*、つまりこのファイル内でユーザーが同名の
+   defunで再定義した場合はそちらを優先する)を保つため、nameが
+   *known-function-names*に載っている場合はこの高速パスを使わない。
+   一致しなければ従来通りcall-target-c-nameが解決するn項/可変長版へ
+   フォールバックする"
   (let* ((name (car expr))
          (args (cdr expr))
-         (c-name (call-target-c-name name)))
-    (if (null args)
-        (format nil "~A(nil, env)" c-name)
+         (argc (length args))
+         (fixed-c-name (if (member name *known-function-names*)
+                            nil
+                            (primitive-fixed-arity-c-name name argc))))
+    (if fixed-c-name
         (let ((temps (mapcar (lambda (arg)
                                 (declare (ignore arg))
                                 (format nil "__call_arg_~A" (incf *call-temp-counter*)))
                               args)))
           (transpile-call-args-guarded temps temps args scope
-            (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps))))))))
+            (lambda (all-temps) (format nil "~A(~A)" fixed-c-name (transpile-c-arg-list all-temps)))))
+        (let ((c-name (call-target-c-name name)))
+          (if (null args)
+              (format nil "~A(nil, env)" c-name)
+              (let ((temps (mapcar (lambda (arg)
+                                      (declare (ignore arg))
+                                      (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                                    args)))
+                (transpile-call-args-guarded temps temps args scope
+                  (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps))))))))))
 
 (defun tail-return-final (c-expr)
   "末尾位置で、既に確定したC式c-exprの値をそのままtco_result_tとしてreturnする
