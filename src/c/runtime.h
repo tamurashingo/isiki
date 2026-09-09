@@ -684,6 +684,31 @@ void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr)
 void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp_val_t *slot_addr));
 
 /**
+ * ABI-M4: MAGIC_FUNCTION_NATIVEのword1が指すメタデータ(dual-entry設計の土台)。
+ * Immobilized Space上に確保する生データ構造体で、フィールドはいずれもコード
+ * 領域を指す不変の生関数ポインタ(またはABI-M5用の未使用値0)のため、GCの
+ * スキャン対象にはならない(gc_scan_instanceがword1を素通しするのは従来通り、
+ * 「指す先の構造体の中身」もGC非対象という点が変わらない)。cons_entryを
+ * 先頭(offset 0)固定にしているのは、za.c(za_ensure_trampoline)が手書きの
+ * 機械語からシンボルオフセット無しで直接dereferenceできるようにするため。
+ * fixed_entry/arityは本マイルストンでは常に0(=未対応)で、ABI-M5で実際に
+ * 使われるようになるまで振る舞いに影響しない。
+ */
+typedef struct {
+    UINT64 cons_entry;  /* offset 0: 従来のconsリストABI fn(evaluated_args, env) */
+    UINT64 fixed_entry; /* offset 8: ABI-M5で使う固定引数エントリ(現状は常に0) */
+    UINT64 arity;       /* offset 16: ABI-M5で使う固定arity(現状は常に0) */
+} za_fn_meta_t;
+
+/**
+ * cons_entryを設定したza_fn_meta_tをImmobilized Spaceに確保する
+ * (fixed_entry/arityは0で初期化、ABI-M5まで未使用)。
+ * @param cons_entry 従来のconsリストABI(fn(evaluated_args, env))の関数ポインタ
+ * @return 確保したza_fn_meta_tへの生ポインタ(GC非対象の固定アドレス)
+ */
+za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry);
+
+/**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すC関数のアドレス
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)

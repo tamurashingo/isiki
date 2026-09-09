@@ -1284,9 +1284,13 @@ static UINT64 za_ensure_trampoline(void) {
     jit_mov_reg_from_mem_disp8(ZA_REG_RDX, ZA_REG_R10, 24); // rdx = obj[3] (captured env)
     jit_patch_rel32(jne_not_closure);
 
-    // native高速path: r11 = obj[1](生の関数アドレス)へ末尾jmp。rcx=argsは
-    // 呼び出し規約上すでに正しい位置にあるので、そのままneue関数の入口へ飛べる。
+    // native高速path: ABI-M4により、obj[1](word1)はza_fn_meta_tへの生ポインタに
+    // なった(直接の関数アドレスではない)。r11 = obj[1](meta)、続けて
+    // r11 = meta->cons_entry(offset 0、runtime.hのza_fn_meta_t参照)で実際の
+    // 関数アドレスを取り出してから末尾jmpする。rcx=argsは呼び出し規約上すでに
+    // 正しい位置にあるので、そのままneue関数の入口へ飛べる。
     jit_mov_reg_from_mem_disp8(ZA_REG_R11, ZA_REG_R10, 8);
+    jit_mov_reg_from_mem_disp8(ZA_REG_R11, ZA_REG_R11, 0);
     jit_jmp_reg(ZA_REG_R11);
 
     jit_patch_rel32(jne_patch);

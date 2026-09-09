@@ -72,7 +72,9 @@
  *  [ inst-addr(61bit) ................................ ][1 0 1]
  *    instanceへのアドレス
  *    - word0: このinstanceの種別を表わすMAGIC NUMBER
- *    - word1: MAGIC_FUNCTION_NATIVEの場合: cの関数のアドレス
+ *    - word1: MAGIC_FUNCTION_NATIVEの場合: za_fn_meta_t(ABI-M4、Immobilized Space上)
+ *             への生ポインタ。meta->cons_entryが従来通りのconsリストABI
+ *             fn(evaluated_args, env)の実体を指す(meta自体もGCのスキャン対象外)
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
  *    - word2: MAGIC_FUNCTION_NATIVEの場合: fixnum 1(za.cがコンパイルした関数)、
  *             fixnum 2(トランスパイラがリフトしたlambdaのクロージャ)、
@@ -557,6 +559,18 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
  * ページかを区別しない、Phase3でenvironmentごとの所有ページリストに置き換える予定) */
 static imm_slot_cursor_t g_function_cell_cursor = {0, 0};
 
+/** ABI-M4: za_fn_meta_t(os_fn_meta_alloc参照)の確保に使うバンプカーソル。
+ * Function Cellと同様、個別解放はせずOS生存期間中保持される前提 */
+static imm_slot_cursor_t g_fn_meta_cursor = {0, 0};
+
+za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
+    za_fn_meta_t *meta = (za_fn_meta_t *)os_imm_slot_alloc(&g_fn_meta_cursor, sizeof(za_fn_meta_t));
+    meta->cons_entry = cons_entry;
+    meta->fixed_entry = 0;
+    meta->arity = 0;
+    return meta;
+}
+
 /* ============================== GC (Cheney方式コピーGC) ============================== */
 
 /**
@@ -797,7 +811,9 @@ static void gc_scan_instance(UINT64 *words) {
 
     switch (magic) {
         case MAGIC_FUNCTION_NATIVE:
-            // word1はCコード領域への生の関数ポインタ(Lispヒープ外)。素通し
+            // word1はza_fn_meta_t(ABI-M4、Immobilized Space上)への生ポインタ
+            // (Lispヒープ外)。素通し(meta自体もGCが移動しない固定領域にあり、
+            // 中身の関数ポインタもコード領域を指す不変アドレスのためトレース不要)
             // word2がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)の場合のみ、
             // word3にGC管理下の捕捉環境を持つのでトレースする。それ以外(fixnum 1/NIL)は
             // word3を使わずNIL固定なので何もしなくてよい
@@ -1558,6 +1574,8 @@ void os_reset_runtime_state_for_test(void) {
     g_imm_free_list = 0;
     g_function_cell_cursor.page = 0;
     g_function_cell_cursor.offset = 0;
+    g_fn_meta_cursor.page = 0;
+    g_fn_meta_cursor.offset = 0;
 }
 
 
@@ -1623,7 +1641,10 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
     lisp_addr_t addr;
     switch (magic) {
         case MAGIC_FUNCTION_NATIVE: {
-            // word1は生の関数ポインタ、word2はfixnum。どちらもタグ無しの生データ。
+            // word1はza_fn_meta_t(ABI-M4、Immobilized Space上)への生ポインタ、
+            // word2はfixnum。どちらもタグ無しの生データ(呼び出し元のos_make_native_function
+            // 等が既にos_fn_meta_allocでmetaを確保済みであり、ここでは受け取った
+            // 生ポインタをそのままword1へ書き込むだけでよい)。
             // word3はword2がfixnum(2)(リフトされたクロージャ)の場合のみ捕捉環境
             // (タグ付き)を持つ
             if (w2 == os_make_fixnum(2)) {
@@ -1867,7 +1888,8 @@ lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val) {
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)
  */
 lisp_val_t os_make_native_function(UINT64 fnptr) {
-    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, nil, nil);
+    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, nil, nil);
 }
 
 /**
@@ -1878,7 +1900,8 @@ lisp_val_t os_make_native_function(UINT64 fnptr) {
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
 lisp_val_t os_make_jit_function(UINT64 fnptr) {
-    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(1), nil);
+    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), nil);
 }
 
 /**
@@ -1890,7 +1913,8 @@ lisp_val_t os_make_jit_function(UINT64 fnptr) {
  */
 lisp_val_t os_make_lifted_closure(UINT64 fnptr, lisp_val_t captured_env) {
     GC_PROTECT(captured_env);
-    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(2), captured_env);
+    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(2), captured_env);
 }
 
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
