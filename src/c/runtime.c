@@ -3243,6 +3243,14 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
  * @return primitive_multiplyと同じ規則で計算したa*b
  */
 lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
+    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
+        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
+        UINT64 mag_a = os_fixnum_magnitude(a);
+        UINT64 mag_b = os_fixnum_magnitude(b);
+        if (mag_a == 0 || mag_b <= FIXNUM_MAGNITUDE_MASK / mag_a) {
+            return os_make_fixnum(mag_a * mag_b);
+        }
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -3481,10 +3489,7 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
  * @return a<=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_less_equal(args, global_environment);
+    return number_compare(a, b) <= 0 ? g_sym_t : nil;
 }
 
 /**
