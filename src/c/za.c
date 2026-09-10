@@ -243,6 +243,16 @@ static void jit_mov_reg_from_mem_disp8(UINT8 dst, UINT8 base, UINT8 disp8) {
     jit_emit8(disp8);
 }
 
+/** mov [base+disp8], src (64bit書き込み、jit_mov_reg_from_mem_disp8の逆方向)。
+ * fn解決結果キャッシュへの格納に使う(baseはrsp/r12以外、SIBが必要になるため)。 */
+static void jit_mov_mem_disp8_from_reg(UINT8 base, UINT8 disp8, UINT8 src) {
+    UINT8 rex = (UINT8)(0x48 | (((src >> 3) & 1) << 2) | ((base >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x89);
+    jit_emit8((UINT8)(0x40 | ((src & 7) << 3) | (base & 7)));
+    jit_emit8(disp8);
+}
+
 static void jit_sub_rsp_imm32(UINT32 imm32) { jit_emit8(0x48); jit_emit8(0x81); jit_emit8(0xEC); jit_emit32(imm32); }
 static void jit_add_rsp_imm32(UINT32 imm32) { jit_emit8(0x48); jit_emit8(0x81); jit_emit8(0xC4); jit_emit32(imm32); }
 
@@ -895,6 +905,60 @@ static UINT64 g_za_lambda_slot_free[ZA_MAX_LAMBDA_SLOTS];
 static UINT64 g_za_lambda_slot_free_count = 0;
 
 /**
+ * fn解決結果キャッシュ(documents/abi-redesign.md「fn解決結果のキャッシュ化」参照):
+ * za_compile_callの一般呼び出し(flet/labels以外、シンボル名によるグローバル関数
+ * 呼び出し)1箇所につき1枠を割り当て、初回実行時だけos_make_symbol+
+ * os_get_function_cellで解決したFunction Cellのアドレスを格納する
+ * (2回目以降の実行はこのスロットの値をそのまま再利用し、シンボル名からの
+ * 再解決を一切行わない)。
+ *
+ * 他の3プールと異なり、格納する値(Function Cellのアドレス)はos_imm_slot_alloc
+ * (runtime.c、os_set_function参照)でImmobilized Spaceに確保された非移動領域を
+ * 指すため、GCによる再配置を追跡する必要がなく、os_gc_register_rootは呼ばない。
+ * 関数再定義(defunの再実行)時もos_set_functionは既存セルのアドレスを維持した
+ * まま中身だけを書き換えるため、一度キャッシュしたアドレスは再定義後も有効
+ * (呼び出しのたびにセルの中身自体は毎回デリファレンスする既存コードにより、
+ * 再定義後の新しい関数が正しく呼ばれる)。
+ * スロットの初期値は生の0(未キャッシュを表すセンチネル)。nilは
+ * g_nil_cellのアドレス|TAG_CONSという非ゼロの実行時値(runtime.cのos_bootstrap
+ * 参照)であり、これをセンチネルにすると生成コード側の「非ゼロならキャッシュ済み」
+ * 判定が常に真になってしまうため使えない(0はos_get_function_cellの正常な戻り値
+ * であるTAG_RAW_POINTER付きアドレスとは値域が重ならないため安全に判別できる)。
+ */
+#define ZA_MAX_FN_CELL_CACHE_SLOTS 2048
+static lisp_val_t g_za_fn_cell_cache_slots[ZA_MAX_FN_CELL_CACHE_SLOTS];
+static UINT64 g_za_fn_cell_cache_slot_count = 0;
+static UINT64 g_za_fn_cell_cache_slot_free[ZA_MAX_FN_CELL_CACHE_SLOTS];
+static UINT64 g_za_fn_cell_cache_slot_free_count = 0;
+
+/** g_za_fn_cell_cache_slotsプールから1枠確保し、未キャッシュ状態(nil)で初期化する。
+ * za_alloc_quote_slotと同型だが、GC追跡(os_gc_register_root)は行わない(コメント
+ * 参照、Immobilized Spaceのため不要)。
+ * @return 確保できれば1(out_slot_idxに書く)、プール枯渇なら0
+ */
+static int za_alloc_fn_cell_cache_slot(UINT64 *out_slot_idx) {
+    UINT64 slot_idx;
+    if (g_za_fn_cell_cache_slot_free_count > 0) {
+        slot_idx = g_za_fn_cell_cache_slot_free[--g_za_fn_cell_cache_slot_free_count];
+    } else if (g_za_fn_cell_cache_slot_count < ZA_MAX_FN_CELL_CACHE_SLOTS) {
+        slot_idx = g_za_fn_cell_cache_slot_count++;
+    } else {
+        return 0;
+    }
+    // 重要: 未キャッシュを表すセンチネルは生の0でなければならない。nilは
+    // g_nil_cellのアドレス|TAG_CONSという非ゼロの実行時値(runtime.cのos_bootstrap
+    // 参照)であり、これをセンチネルにすると生成コード側のTEST+JNE(「非ゼロなら
+    // キャッシュ済み」)が常に真になってしまい、一度も実際の解決が起きないまま
+    // nilをFunction Cellアドレスとして誤用する(このバグを実際に踏んで全JIT関数が
+    // 沈黙してNILを返す事態を引き起こした、調査の経緯はdocuments/abi-redesign.md
+    // 参照)。
+    g_za_fn_cell_cache_slots[slot_idx] = (lisp_val_t)0;
+    za_track_literal_slot_alloc(&g_za_fn_cell_cache_slots[slot_idx]);
+    *out_slot_idx = slot_idx;
+    return 1;
+}
+
+/**
  * addrがg_za_quote_slots/g_za_number_slots/g_za_lambda_slotsのいずれかのプールの
  * 1エントリを指している前提で、そのプールを判別し(ポインタの範囲比較)、
  * os_gc_unregister_rootでGC rootから外してから、そのプールのフリーリストへ
@@ -919,6 +983,14 @@ static void za_free_literal_slot(lisp_val_t *addr) {
     if (addr >= g_za_lambda_slots && addr < g_za_lambda_slots + ZA_MAX_LAMBDA_SLOTS) {
         UINT64 idx = (UINT64)(addr - g_za_lambda_slots);
         g_za_lambda_slot_free[g_za_lambda_slot_free_count++] = idx;
+        return;
+    }
+    if (addr >= g_za_fn_cell_cache_slots && addr < g_za_fn_cell_cache_slots + ZA_MAX_FN_CELL_CACHE_SLOTS) {
+        // os_gc_unregister_root(上でこの関数冒頭に呼び済み)は、このプールの
+        // アドレスに対しては元々登録していないため何もしない(該当なしとして
+        // 静かに無視される、os_gc_unregister_root参照)。
+        UINT64 idx = (UINT64)(addr - g_za_fn_cell_cache_slots);
+        g_za_fn_cell_cache_slot_free[g_za_fn_cell_cache_slot_free_count++] = idx;
         return;
     }
 }
@@ -3011,6 +3083,55 @@ static void za_emit_call_build_acc_and_unlink(UINT64 call_depth, UINT64 argc) {
 }
 
 /**
+ * fn解決結果キャッシュ(documents/abi-redesign.md参照): za_compile_callの一般呼び出し
+ * (flet/labels以外、シンボル名によるグローバル関数呼び出し)のfn解決部分を、
+ * za_compile_call自身のスタックフレームを肥大化させないよう別関数として切り出した
+ * もの。このコンパイルサイト専用のスロットに、初回実行時だけos_make_symbol+
+ * os_get_function_cellで解決したFunction Cellのアドレスを格納し、2回目以降は
+ * スロットの値をそのまま再利用する(シンボル名からの再解決を省略)。プール枯渇時
+ * (za_alloc_fn_cell_cache_slot失敗)は、このcall1箇所のみキャッシュを諦めて
+ * 従来通り毎回解決する(コンパイル自体は失敗させない)。
+ * 呼び出し前提: ZA_OFF_ENV_VALが評価済みで読み出し可能なこと。結果はraxに残す
+ * (呼び出し元がza_store_slot(RAX, ZA_OFF_FN_VAL)する)。
+ */
+static void za_emit_fn_resolve_cached(lisp_val_t fn_sym) {
+    UINT64 fn_cache_slot_idx;
+    if (za_alloc_fn_cell_cache_slot(&fn_cache_slot_idx)) {
+        lisp_val_t *fn_cache_slot_addr = &g_za_fn_cell_cache_slots[fn_cache_slot_idx];
+        jit_movabs_reg(ZA_REG_R14, (UINT64)(void *)fn_cache_slot_addr);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R14, 0);
+        jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RAX);
+        jit_test_reg_reg(ZA_REG_R10, ZA_REG_R10);
+        UINT64 fn_cache_have_patch = jit_emit_jne_rel32_placeholder();
+
+        UINT64 name_off = za_emit_symbol_name(fn_sym);
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
+        jit_call_r11();
+        jit_mov_mem_disp8_from_reg(ZA_REG_R14, 0, ZA_REG_RAX);
+
+        jit_patch_rel32(fn_cache_have_patch);
+    } else {
+        UINT64 name_off = za_emit_symbol_name(fn_sym);
+        jit_movabs_self_ref(ZA_REG_RCX, name_off);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
+        jit_call_r11();
+    }
+}
+
+/**
  * 一般呼び出し「(fn_sym arg arg...)」をコンパイルする(呼び出しごとに以下の順で
  * 機械語を出力する)。
  *   1. 呼び出し前のgc_rootsをCALL_SAVED_HEADスロット(自分のcall_depth用)へ保存する。
@@ -3136,16 +3257,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
         jit_call_r11();
     } else {
-        UINT64 name_off = za_emit_symbol_name(fn_sym);
-        jit_movabs_self_ref(ZA_REG_RCX, name_off);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
-        jit_call_r11();
-        jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
-
-        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R13);
-        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
-        jit_call_r11();
+        za_emit_fn_resolve_cached(fn_sym);
     }
     za_store_slot(ZA_REG_RAX, ZA_OFF_FN_VAL);
     za_emit_gc_link_slot(ZA_OFF_FN_VAL, ZA_OFF_FN_NODE);

@@ -715,3 +715,37 @@
 (assert-equal 7 (isiki-za-test-inline-sub -3 -10))                          ;; 負数→fallback
 (assert-equal -8 (isiki-za-test-inline-sub -3 5))                           ;; 負数→fallback
 (close (open-output-file "/9p/tmp/ckpt-32-inline-arith.txt"))
+
+;; fn解決結果キャッシュ化(documents/abi-redesign.md参照): za_compile_callの一般
+;; 呼び出しについて、初回だけos_make_symbol+os_get_function_cellで解決した
+;; Function Cellのアドレスをコンパイルサイトごとにキャッシュし、2回目以降は
+;; 再解決を省略する最適化の正当性を検証する。
+
+;; 1. 関数再定義への安全性(最重要): Function Cell自身のアドレスは再定義後も
+;; 不変(os_set_functionが中身だけを書き換える、runtime.c参照)であり、呼び出しの
+;; たびにセルの中身自体は毎回デリファレンスするため、キャッシュ後に関数を
+;; 再定義しても新しい定義が正しく呼ばれることを確認する(REPL上でコードを
+;; 汚しながら試行錯誤する開発体験の根幹に関わる)。
+(defun isiki-za-test-redef-target () 1)
+(defun isiki-za-test-redef-caller () (isiki-za-test-redef-target))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-redef-caller)))
+(assert-equal 1 (isiki-za-test-redef-caller)) ;; 初回、解決してキャッシュ
+(assert-equal 1 (isiki-za-test-redef-caller)) ;; 2回目、キャッシュを使用
+(defun isiki-za-test-redef-target () 2)       ;; 再定義(Cellのアドレスは不変)
+(assert-equal 2 (isiki-za-test-redef-caller)) ;; キャッシュ済みCell経由でも新定義が呼ばれる
+(assert-equal 2 (isiki-za-test-redef-caller))
+
+;; 2. GC整合性: キャッシュしたFunction Cellアドレス(Immobilized Space上の固定
+;; アドレス)が、GCが複数回発火する状況でも正しく機能し続けることを確認する
+;; (bignum確保で毎回GCを誘発する条件、za-gc-test-step等と同じ手法)。
+(defun isiki-za-test-fncache-callee (x) (+ x 1))
+(defun isiki-za-test-fncache-gc-stress (n acc)
+  (if (= n 0)
+      acc
+      (isiki-za-test-fncache-gc-stress (- n 1) (isiki-za-test-fncache-callee acc))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-fncache-gc-stress)))
+(defglobal fncache-gc-stress-n 2000)
+(defglobal fncache-gc-stress-start 1152921504606846976) ;; 2^60、bignum
+(assert-equal (+ fncache-gc-stress-start fncache-gc-stress-n)
+              (isiki-za-test-fncache-gc-stress fncache-gc-stress-n fncache-gc-stress-start))
+(close (open-output-file "/9p/tmp/ckpt-33-fn-resolve-cache.txt"))
