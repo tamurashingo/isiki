@@ -228,6 +228,22 @@ static lisp_val_t g_symbol_table[MAX_SYMBOLS];
 /** g_symbol_tableに登録済みのsymbol数 */
 static int g_symbol_count = 0;
 
+/**
+ * os_make_symbolの名前引き(interning)をO(1)平均にするための、大文字小文字を
+ * 無視した名前→g_symbol_table添字のオープンアドレッシング・ハッシュ表。
+ * 空きスロットは-1。[ABI刷新] AOT生成コード(defmethodのクロージャ捕捉・
+ * quoteシンボルリテラル・tagbody/goのタグ比較等)がホットループの毎反復で
+ * os_make_symbolを呼ぶ設計(documents/abi-redesign.md 2026-09-10調査参照)のため、
+ * 旧来の線形走査(g_symbol_count個を毎回舐める)がFAT16/FAT32読み込み等の
+ * 実測ボトルネックだった。サイズはMAX_SYMBOLSの2倍の2べきにして負荷率を
+ * 0.5以下に保つ(衝突チェインが伸びてO(n)へ劣化するのを防ぐ)。
+ * g_symbol_table同様、値は「添字」であってポインタではないため、コピーGCで
+ * symbolの実体が移動してもこの表自体は書き換え不要(gc_copy_valueは
+ * g_symbol_table[i]を所定のiのまま上書きするだけ)。実体の関数(symbol_hash_lookup/
+ * symbol_hash_insert)はstrncmpignorecase定義の後に置く(前方参照を避けるため)。
+ */
+#define SYMBOL_HASH_SIZE 16384
+static INT32 g_symbol_hash[SYMBOL_HASH_SIZE];
 
 /** From空間(現在割り当てに使っている側)の先頭アドレス */
 static UINT8 *g_from_start;
@@ -305,6 +321,67 @@ static int strncmpignorecase(const char *s1, const char *s2, UINT64 size) {
 }
 
 /**
+ * 大文字小文字を無視したFNV-1aハッシュ。nameは常にNUL終端のCの文字列
+ * (os_make_symbolの引数と同じ契約)。
+ * @param name ハッシュ対象の文字列
+ * @return SYMBOL_HASH_SIZE未満のハッシュ値(添字として直接使える)
+ */
+static UINT32 symbol_name_hash(const char *name) {
+    UINT32 h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; p++) {
+        unsigned char c = (*p > 0x60 && *p < 0x7b) ? (unsigned char)(*p - 0x20) : *p;
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h & (SYMBOL_HASH_SIZE - 1);
+}
+
+/**
+ * g_symbol_hash中からnameと一致するinterned symbolのg_symbol_table添字を探す
+ * (線形探査、削除操作の無いテーブルなので空きスロット(-1)に当たった時点で
+ * 「未登録」と確定できる)。
+ * @param name 探すsymbol名
+ * @return 見つかった場合はg_symbol_tableの添字、無ければ-1
+ */
+static int symbol_hash_lookup(const char *name) {
+    UINT32 h = symbol_name_hash(name);
+    for (UINT32 i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        UINT32 slot = (h + i) & (SYMBOL_HASH_SIZE - 1);
+        INT32 idx = g_symbol_hash[slot];
+        if (idx < 0) {
+            return -1;
+        }
+        lisp_val_t sym = g_symbol_table[idx];
+        lisp_addr_t sym_addr = sym & ~TAG_MASK;
+        lisp_val_t str_obj = ((lisp_val_t *)sym_addr)[0];
+        lisp_addr_t str_addr = str_obj & ~TAG_MASK;
+        UINT64 len = ((UINT64 *)str_addr)[0];
+        const char *sym_name = (const char *)(str_addr + 8);
+        if (strncmpignorecase(sym_name, name, len) == 0 && name[len] == '\0') {
+            return (int)idx;
+        }
+    }
+    return -1;
+}
+
+/**
+ * g_symbol_table[idx](名前nameのsymbol)をg_symbol_hashへ登録する。
+ * os_make_symbolが新規symbolをg_symbol_tableへ追加した直後に呼ぶ。
+ */
+static void symbol_hash_insert(int idx, const char *name) {
+    UINT32 h = symbol_name_hash(name);
+    for (UINT32 i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        UINT32 slot = (h + i) & (SYMBOL_HASH_SIZE - 1);
+        if (g_symbol_hash[slot] < 0) {
+            g_symbol_hash[slot] = (INT32)idx;
+            return;
+        }
+    }
+    // SYMBOL_HASH_SIZE(MAX_SYMBOLSの2倍)回探査しても空きが無い場合は理論上
+    // 起こらない(MAX_SYMBOLS到達時点でos_make_symbol側が別途枯渇停止するため)
+}
+
+/**
  * sをコピーしてstringオブジェクトを作る。uppercase_flagが立っていれば小文字を大文字化する。
  * @param s 文字列(NUL終端)
  * @param uppercase_flag 非0なら小文字を大文字化する(symbol名の正規化用)
@@ -341,6 +418,16 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     g_to_start   = g_from_end;
     g_to_end     = (UINT8 *)(heap_base + heap_size);
     g_to_ptr     = g_to_start;
+
+    // g_symbol_hash(静的配列)はCのゼロ初期化任せだと全スロットが0=「添字0が
+    // 占有中」という誤った状態になってしまう(空きスロットの番兵は-1)。
+    // os_heap_initは起動時/各テストのヒープ再確保のたび必ず1回呼ばれるので、
+    // ここで確実に初期化しておけばos_bootstrap内の最初のos_make_symbol呼び出し
+    // (NIL以外で最初に来るのはos_make_environment経由の"GLOBAL-ENV")より前に
+    // 必ず-1埋め済みになる
+    for (int i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        g_symbol_hash[i] = -1;
+    }
 }
 
 double os_heap_used_ratio(void) {
@@ -1473,19 +1560,14 @@ lisp_val_t os_make_symbol(const char *name) {
         return nil;
     }
 
-    for (int i = 0; i < g_symbol_count; i++) {
-        lisp_val_t sym = g_symbol_table[i];
-        lisp_addr_t sym_addr = sym & ~TAG_MASK;
-   
-        lisp_val_t str_obj = ((lisp_val_t *)sym_addr)[0];
-        lisp_addr_t str_addr = str_obj & ~TAG_MASK;
-        UINT64 len = ((UINT64 *)str_addr)[0];
-        const char *sym_name = (const char *)(str_addr + 8);
-
-        if (strncmpignorecase(sym_name, name, len) == 0 && name[len] == '\0') {
-            return sym;
-        }
-   }
+    // [ABI刷新] 以前はg_symbol_count個を毎回舐める線形走査だったが、AOT生成
+    // コードがホットループの毎反復でos_make_symbolを呼ぶ設計(documents/
+    // abi-redesign.md参照)のため実測上の支配的ボトルネックだった。
+    // symbol_hash_lookupはオープンアドレッシングのハッシュ表で同じ結果をO(1)平均で返す
+    int found = symbol_hash_lookup(name);
+    if (found >= 0) {
+        return g_symbol_table[found];
+    }
 
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
     GC_PROTECT(name_str);
@@ -1506,7 +1588,9 @@ lisp_val_t os_make_symbol(const char *name) {
         for (;;) {
         }
     }
+    int new_idx = g_symbol_count;
     g_symbol_table[g_symbol_count++] = tagged;
+    symbol_hash_insert(new_idx, name);
 
     return tagged;
 }
@@ -1567,6 +1651,13 @@ int os_symbol_table_count(void) {
  */
 void os_reset_runtime_state_for_test(void) {
     g_symbol_count = 0;
+    // g_symbol_hashは「添字」を保持するだけなので、g_symbol_table自体をクリアする
+    // 必要は無いが、g_symbol_countを0へ戻すのに合わせてハッシュ表も空にしないと
+    // 前のテストで登録した(既に破棄されたヒープ上の)symbolの添字が残ってしまい、
+    // 新しいヒープでの再internがstaleな添字をそのまま返してしまう
+    for (int i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        g_symbol_hash[i] = -1;
+    }
     global_environment = nil;
     g_dynamic_bindings = nil;
     g_gc_extra_root_count = 0;
