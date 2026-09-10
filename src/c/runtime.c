@@ -2964,13 +2964,26 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
 
 /**
  * primitive_addを2引数固定で呼ぶためのラッパー。JITコンパイルされたコードから
- * 呼ばれることを想定し、引数aとbは呼び出し直後にGC_PROTECTしてからconsリストへ
- * 組み立てるため、この呼び出し中にGCが走ってもa/bが失われることはない。
+ * 呼ばれることを想定する。
+ * ABI検証で判明した問題への対処: 以前はconsリストへ組み立てて汎用のprimitive_add
+ * へ丸ごと委譲するだけの実装だったため、呼び出しサイト側のconsリスト構築は
+ * 無くなっても呼び出し先(このラッパー自身)が同じconsを構築し続けており、
+ * 正味のヒープ確保削減になっていなかった。両方が非負FIXNUMで和がオーバーフロー
+ * しない(=primitive_add本体のfast-path条件と同じ)場合はconsを一切構築せず
+ * 直接計算する高速pathを追加し、それ以外(負数・float・bignum昇格が絡む稀な
+ * ケース)のみ従来通りconsリストを組み立てて委譲する。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_addと同じ規則で計算した合計値
  */
 lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
+    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
+        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
+        UINT64 sum = os_fixnum_magnitude(a) + os_fixnum_magnitude(b);
+        if (sum <= FIXNUM_MAGNITUDE_MASK) {
+            return os_make_fixnum(sum);
+        }
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -2978,13 +2991,23 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
 }
 
 /**
- * primitive_subtractを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_subtractを2引数固定で呼ぶためのラッパー。primitive_add2と同じ
+ * 理由で高速pathを追加した。両方が非負FIXNUMでb<=a(=結果が非負、
+ * primitive_subtract本体のfast-path条件と同じ)の場合はconsを一切構築せず
+ * 直接計算し、それ以外は従来通りconsリストを組み立てて委譲する。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_subtractと同じ規則で計算したa-b
  */
 lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
+    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
+        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
+        UINT64 mag_a = os_fixnum_magnitude(a);
+        UINT64 mag_b = os_fixnum_magnitude(b);
+        if (mag_b <= mag_a) {
+            return os_make_fixnum(mag_a - mag_b);
+        }
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -3322,16 +3345,17 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
 
 /**
  * primitive_less_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * 呼ばれる想定。number_compareが元々2値を直接取り内部でconsを一切構築しない
+ * ため、primitive_add2等と異なりconsチェーンを経由せず直接呼べる(ABI検証で
+ * primitive_add2等がconsを構築したまま汎用n項版へ委譲するだけで正味の
+ * cons削減になっていなかったことが判明し、比較演算子は直接number_compareへ
+ * 委譲する形に改めた)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a<bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_less_than(args, global_environment);
+    return number_compare(a, b) < 0 ? g_sym_t : nil;
 }
 
 /**
@@ -3351,17 +3375,14 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * primitive_greater_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_greater_thanを2引数固定で呼ぶためのラッパー。primitive_less_than2と
+ * 同じ理由でnumber_compareへ直接委譲する(consを一切構築しない)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a>bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_greater_than(args, global_environment);
+    return number_compare(a, b) > 0 ? g_sym_t : nil;
 }
 
 /**
@@ -3381,17 +3402,14 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * primitive_num_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_num_equalを2引数固定で呼ぶためのラッパー。primitive_less_than2と
+ * 同じ理由でnumber_compareへ直接委譲する(consを一切構築しない)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_num_equal(args, global_environment);
+    return number_compare(a, b) == 0 ? g_sym_t : nil;
 }
 
 /**
@@ -3429,17 +3447,14 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * primitive_greater_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_greater_equalを2引数固定で呼ぶためのラッパー。primitive_less_than2と
+ * 同じ理由でnumber_compareへ直接委譲する(consを一切構築しない)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a>=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_greater_equal(args, global_environment);
+    return number_compare(a, b) >= 0 ? g_sym_t : nil;
 }
 
 /**
