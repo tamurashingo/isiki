@@ -1149,11 +1149,36 @@
     (format nil "({ lisp_val_t ~A = ~A; GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (os_set_dynamic(~A, ~A), ~A); })"
             temp (transpile-expr (third expr) scope) temp temp temp name-c temp name-c)))
 
+(defparameter *enclosing-tagbodies* nil
+  "現在transpile中のC関数内で、直接Cのgotoでジャンプできるtagbodyのタグ→
+   Cラベル名のalist(内側のtagbodyのタグほど前に来る=assocが自然に最も近い
+   tagbodyを優先する、CLの字句的スコープと同じ結果になる)。transpile-tagbody
+   が自分のタグをpushしながら本体をtranspileし、emit-function-body(新しいC
+   関数=defun/lambdaの境界)とtranspile-unwind-protect(protected-form/
+   cleanup-formsの実行を飛び越えてはいけない境界)がnilへ再束縛することで、
+   Cのgotoが届かない/届いてはいけない場合には自動的にこのリストが空になり、
+   transpile-goが安全に(従来の)シグナル方式へフォールバックする")
+
 (defun transpile-go (expr)
-  "(go tag)。tagは未評価のシンボルリテラル(quoteと同様)。eval_go(eval.c)と
-   同じくMAGIC_GO_EXITのシグナル値を作って返すだけで、実際のジャンプは
-   このシグナルを受け取ったtagbody側(transpile-tagbody)が行う"
-  (format nil "os_make_instance(MAGIC_GO_EXIT, ~A, nil, nil)" (transpile-quoted (second expr))))
+  "(go tag)。tagは未評価のシンボルリテラル(quoteと同様)。
+   [ABI刷新] AOT改善A: tagが*enclosing-tagbodies*(直接Cのgotoで届く範囲=
+   同一C関数内かつunwind-protectのprotected-form/cleanup-formsを跨がない)
+   に見つかれば、シグナル値の構築(os_make_instance+os_make_symbol、
+   ホットループの毎反復で線形/ハッシュ探索を伴う)を一切せず直接C の
+   gotoへコンパイルする(while/dotimes/for等、tagbodyの外へエスケープ
+   しない大多数のケースがこれに当たる)。届かない場合(lambdaへエスケープした
+   クロージャからの参照等、documents/abi-redesign.md 2026-09-10調査の
+   「cross function boundary」参照)は、eval_go(eval.c)と同じくMAGIC_GO_EXIT
+   のシグナル値を作って返すだけの従来方式のまま(実際のジャンプはこの
+   シグナルを受け取ったtagbody側=transpile-tagbodyの%%tagbody-dispatch-chain
+   が行う)。goto先はCの文であってCの式ではないため、GNU文式({ goto L; nil; })
+   で包んで式コンテキストへ埋め込む(gotoの後のnilは実際には評価されない
+   到達不能コード=goto自体が既に制御を移すため)"
+  (let* ((tag (second expr))
+         (direct (assoc tag *enclosing-tagbodies*)))
+    (if direct
+        (format nil "({ goto ~A; nil; })" (cdr direct))
+        (format nil "os_make_instance(MAGIC_GO_EXIT, ~A, nil, nil)" (transpile-quoted tag)))))
 
 (defparameter *block-temp-counter* 0)
 
@@ -1230,7 +1255,17 @@
          (tags (remove-if-not #'tagbody-tag-p body))
          (suffix (incf *tagbody-temp-counter*))
          (result-temp (format nil "__tagbody_result_~A" suffix))
-         (end-label (format nil "__tagbody_end_~A" suffix)))
+         (end-label (format nil "__tagbody_end_~A" suffix))
+         ;; [ABI刷新] AOT改善A: このtagbody自身のタグをCラベルへ対応付け、
+         ;; 内側の(=より新しくpushされた)ものがassocで先に見つかるよう手前へ
+         ;; 追加する。これにより同名タグを持つネストしたtagbody(例: whileの
+         ;; ネスト)でもCLの字句的スコープ通り最も内側のtagbodyが優先される。
+         ;; body(=以下でtranspile-goに到達する再帰)のtranspile中だけ有効な
+         ;; 動的束縛にすることで、emit-function-body/transpile-unwind-protectが
+         ;; nilへ再束縛した外側では自動的に見えなくなる
+         (*enclosing-tagbodies*
+           (append (mapcar (lambda (tag) (cons tag (%%tagbody-c-label tag suffix))) tags)
+                   *enclosing-tagbodies*)))
     (format nil "({ lisp_val_t ~A = nil; ~{~A~}~A: ~A; })"
             result-temp
             (mapcar (lambda (elem)
@@ -1250,14 +1285,22 @@
    変数へ保存する。cleanup-formはtranspile-progn-formsで評価するが、その戻り値は
    捨てる——cleanup-form自身が新たな非局所脱出を起こした場合もその脱出は無視して
    protected-formの結果を優先する、eval_unwind_protectに明記された既知の簡略化と
-   同じ。式全体の値としては常にprotected-formの結果(GC_PROTECTしたtemp)を返す"
+   同じ。式全体の値としては常にprotected-formの結果(GC_PROTECTしたtemp)を返す。
+   [ABI刷新] AOT改善A: protected-form/cleanup-formsの中から外側のtagbodyのタグへ
+   goする場合、Cのgotoで直接ジャンプしてしまうとcleanup-formsの実行(またはまだ
+   実行していないcleanup-forms自体)を飛び越えてしまい、unwind-protectの契約
+   (保護対象の脱出経路に関わらずcleanup-formsを必ず実行する)を破る。そのため
+   *enclosing-tagbodies*をnilへ再束縛してから両方をtranspileし、この境界を
+   跨ぐgoは必ず(従来通り)シグナル方式にフォールバックさせる(protected-form/
+   cleanup-forms自身の中で完結するtagbody/goはこの再束縛の影響を受けず、
+   通常通り直接gotoが使われる)"
   (destructuring-bind (uwp-kw protected-form &rest cleanup-forms) expr
     (declare (ignore uwp-kw))
-    (let ((temp (format nil "__unwind_protect_val_~A" (incf *unwind-protect-temp-counter*))))
+    (let* ((temp (format nil "__unwind_protect_val_~A" (incf *unwind-protect-temp-counter*)))
+           (protected-c (let ((*enclosing-tagbodies* nil)) (transpile-expr protected-form scope)))
+           (cleanup-c (let ((*enclosing-tagbodies* nil)) (transpile-progn-forms cleanup-forms scope))))
       (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); (void)(~A); ~A; })"
-              temp (transpile-expr protected-form scope) temp
-              (transpile-progn-forms cleanup-forms scope)
-              temp))))
+              temp protected-c temp cleanup-c temp))))
 
 (defparameter *catch-temp-counter* 0)
 
@@ -1445,8 +1488,16 @@
    ABI継続、transpile-tail-call-fixed-args-guarded参照)により、他の(同一
    ファイル内で前方参照になる、またはファイルを跨ぐ)関数の末尾呼び出しからも
    fixed_fnとして直接参照されるようになったため、__step自身と同じ理由で
-   staticにできない(transpile-prototypeが両ファイルへ共通で前方宣言を出力する)"
-  (let ((tail-stmt (transpile-tail-stmt body-form scope)))
+   staticにできない(transpile-prototypeが両ファイルへ共通で前方宣言を出力する)。
+   [ABI刷新] AOT改善A: ここが常に新しいC関数(__step)の先頭であり、Cのgotoは
+   他の関数のラベルへは届かない。そのため*enclosing-tagbodies*をnilへ再束縛
+   してからbody-formをtranspileし、この関数の外(呼び出し元がlambdaなら
+   捕捉元のtagbody等)のタグへのgoが誤って直接gotoにコンパイルされないように
+   する(このケースは実際にはdefun/lambda境界を跨ぐ通常のLispコードでは
+   起こらないはずだが、万一書かれた場合も安全に従来のシグナル方式へ
+   フォールバックさせるための防御)"
+  (let* ((*enclosing-tagbodies* nil)
+         (tail-stmt (transpile-tail-stmt body-form scope)))
     (with-output-to-string (out)
       (format out "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
       (when (null params)
