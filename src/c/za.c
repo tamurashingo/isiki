@@ -89,13 +89,33 @@ enum {
     ZA_REG_R12 = 12, ZA_REG_R13 = 13, ZA_REG_R14 = 14, ZA_REG_R15 = 15
 };
 
-/** mov dst, src (64bitレジスタ間、"mov r/m64, r64"opcode0x89でエンコード) */
-static void jit_mov_reg_reg(UINT8 dst, UINT8 src) {
+/** "op r/m64, r64"系(mov/or/add/sub/cmp/test等、opcodeのみ異なりModRM/REXの
+ * エンコードは共通)の共有ヘルパー。ModRM.reg=src、ModRM.rm=dst(2オペランド命令の
+ * 標準的な並び)。 */
+static void jit_emit_reg_reg_op(UINT8 opcode, UINT8 dst, UINT8 src) {
     UINT8 rex = (UINT8)(0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1));
     jit_emit8(rex);
-    jit_emit8(0x89);
+    jit_emit8(opcode);
     jit_emit8((UINT8)(0xC0 | ((src & 7) << 3) | (dst & 7)));
 }
+
+/** mov dst, src (64bitレジスタ間、"mov r/m64, r64"opcode0x89でエンコード) */
+static void jit_mov_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x89, dst, src); }
+
+/** or dst, src ("or r/m64, r64"opcode0x09) */
+static void jit_or_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x09, dst, src); }
+
+/** add dst, src ("add r/m64, r64"opcode0x01) */
+static void jit_add_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x01, dst, src); }
+
+/** sub dst, src ("sub r/m64, r64"opcode0x29) */
+static void jit_sub_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x29, dst, src); }
+
+/** cmp dst, src (dst-srcのフラグのみ、"cmp r/m64, r64"opcode0x39) */
+static void jit_cmp_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x39, dst, src); }
+
+/** test dst, src (dst&srcのフラグのみ、"test r/m64, r64"opcode0x85) */
+static void jit_test_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x85, dst, src); }
 
 /** movabs reg, imm64 (任意レジスタ版。既存のjit_movabs_rax/r11の一般化) */
 static void jit_movabs_reg(UINT8 reg, UINT64 imm) {
@@ -262,6 +282,24 @@ static UINT64 jit_emit_jmp_rel32_placeholder(void) {
 static UINT64 jit_emit_jne_rel32_placeholder(void) {
     jit_emit8(0x0F);
     jit_emit8(0x85);
+    UINT64 offset = g_jit_used;
+    jit_emit32(0);
+    return offset;
+}
+
+/** js rel32(サインフラグ=1)のプレースホルダ。jit_emit_je_rel32_placeholderと同様 */
+static UINT64 jit_emit_js_rel32_placeholder(void) {
+    jit_emit8(0x0F);
+    jit_emit8(0x88);
+    UINT64 offset = g_jit_used;
+    jit_emit32(0);
+    return offset;
+}
+
+/** jb rel32(符号無し比較でdst<src、CF=1)のプレースホルダ。同上 */
+static UINT64 jit_emit_jb_rel32_placeholder(void) {
+    jit_emit8(0x0F);
+    jit_emit8(0x82);
     UINT64 offset = g_jit_used;
     jit_emit32(0);
     return offset;
@@ -1867,6 +1905,70 @@ static int za_compile_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
  * @return 対応できれば1、できなければ0(この場合何バイト書き込んだかは呼び出し元が
  * ロールバックするので気にしなくてよい)
  */
+
+/**
+ * JIT算術インライン展開(Phase2、documents/abi-redesign.md参照): rcx=a, rdx=bとして
+ * wrapper_fn(a, b)相当を計算しraxへ結果を残す。wrapper_fnが`primitive_add2`/
+ * `primitive_subtract2`の場合、それぞれのC実装が持つfixnum高速path(共に非負fixnum
+ * かつ結果が60bitに収まる)と完全に同一の条件・結果になるインラインアセンブリを
+ * 生成し、条件を満たす限りwrapper_fnへの間接callを一切発行しない。条件を満たさない
+ * 場合(型不一致・負数・オーバーフロー)、またはそれ以外のwrapper_fn(primitive_
+ * multiply2等、オーバーフロー判定に除算を要し単純なインライン化が困難なもの)は、
+ * 従来通りwrapper_fnへの間接callにフォールバックする。
+ *
+ * rcx/rdxの値は、フォールバック時にそのままwrapper_fn(a=rcx, b=rdx)の引数として
+ * 使う必要があるため、インライン試行部分は破壊せずr10を計算用スコッチとして使う
+ * (add/subの結果をr10で計算してからraxへ移す。rcx/rdx自体は最後まで不変)。
+ */
+static void za_emit_arith_call_or_inline(void *wrapper_fn) {
+    if (wrapper_fn != (void *)primitive_add2 && wrapper_fn != (void *)primitive_subtract2) {
+        jit_movabs_r11((UINT64)wrapper_fn);
+        jit_call_r11();
+        return;
+    }
+
+    // 両方非負fixnum(タグ3bit=000かつ符号bit63=0)かどうかを、a|bへ
+    // (TAG_MASK|FIXNUM_SIGN_BIT)を掛けた結果が0かどうかで一括判定する
+    // (いずれかがこの条件を満たさなければ対応するビットが立つ)。
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
+    jit_or_reg_reg(ZA_REG_R10, ZA_REG_RDX);
+    jit_movabs_reg(ZA_REG_R9, TAG_MASK | FIXNUM_SIGN_BIT);
+    jit_test_reg_reg(ZA_REG_R10, ZA_REG_R9);
+    UINT64 fallback_patches[2];
+    UINT64 fallback_count = 0;
+    fallback_patches[fallback_count++] = jit_emit_jne_rel32_placeholder();
+
+    if (wrapper_fn == (void *)primitive_add2) {
+        // 生のタグ付き値同士をそのまま加算するだけでよい(下位3bitは両方0のまま、
+        // マグニチュード和が60bitを超えるとbit63(符号bit)が1になるので、
+        // それをオーバーフロー検出に使う。primitive_add2の
+        // `sum <= FIXNUM_MAGNITUDE_MASK`判定と数学的に同値)。
+        jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
+        jit_add_reg_reg(ZA_REG_R10, ZA_REG_RDX);
+        fallback_patches[fallback_count++] = jit_emit_js_rel32_placeholder();
+    } else {
+        // primitive_subtract2の`mag_b <= mag_a`判定(=結果が非負)を、生のタグ付き
+        // 値同士の符号無し比較(タグ・符号bitが両方0なので大小関係が保たれる)で
+        // 直接判定する。満たせばそのままsubで正しいタグ付き結果が得られる。
+        jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
+        fallback_patches[fallback_count++] = jit_emit_jb_rel32_placeholder();
+        jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
+        jit_sub_reg_reg(ZA_REG_R10, ZA_REG_RDX);
+    }
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R10);
+    UINT64 fast_done_patch = jit_emit_jmp_rel32_placeholder();
+
+    // フォールバック: rcx=a, rdx=bは上記のいずれの分岐でも変更していないため、
+    // 従来通りwrapper_fn(a, b)をそのまま間接callできる。
+    UINT64 slow_offset = g_jit_used;
+    for (UINT64 k = 0; k < fallback_count; k++) {
+        jit_patch_rel32_target(fallback_patches[k], slow_offset);
+    }
+    jit_movabs_r11((UINT64)wrapper_fn);
+    jit_call_r11();
+
+    jit_patch_rel32(fast_done_patch);
+}
 static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
@@ -1928,8 +2030,7 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         ct_patches[ct_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
         jit_mov_rdx_rax();
         za_load_slot(ZA_REG_RCX, val_off);
-        jit_movabs_r11((UINT64)wrapper_fn);
-        jit_call_r11();
+        za_emit_arith_call_or_inline(wrapper_fn);
         if (i != count - 1) {
             za_store_slot(ZA_REG_RAX, val_off);
         }

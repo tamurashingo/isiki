@@ -690,3 +690,28 @@
 (assert-equal za-gc-test-sub-expected
               (isiki-za-test-bignum-sub-loop za-gc-test-sub-start za-gc-test-step za-gc-test-n))
 (close (open-output-file "/9p/tmp/ckpt-31-gc-protect-skip.txt"))
+
+;; Phase2(算術インライン展開)の境界条件検証: 両方非負fixnumかつ結果がオーバー
+;; フローしない場合のインライン高速path(wrapper_fn呼び出しを一切伴わない)と、
+;; それ以外(オーバーフロー・負数)のfallback(従来通りwrapper_fn呼び出し)の両方で、
+;; 修正前と完全に同じ計算結果になることを確認する。
+(defglobal fixnum-max 1152921504606846975) ;; 2^60-1
+
+(defun isiki-za-test-inline-add (a b) (+ a b))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-inline-add)))
+(assert-equal 8 (isiki-za-test-inline-add 3 5))                             ;; 高速path
+(assert-equal fixnum-max (isiki-za-test-inline-add fixnum-max 0))           ;; 高速path、境界値ちょうど
+(assert-equal t (fixnump (isiki-za-test-inline-add fixnum-max 0)))
+(assert-equal 1152921504606846976 (isiki-za-test-inline-add fixnum-max 1)) ;; オーバーフロー→fallback、bignum昇格
+(assert-equal t (bignump (isiki-za-test-inline-add fixnum-max 1)))
+(assert-equal -2 (isiki-za-test-inline-add -5 3))                           ;; 負数→fallback
+(assert-equal -2 (isiki-za-test-inline-add 3 -5))                           ;; 負数→fallback
+
+(defun isiki-za-test-inline-sub (a b) (- a b))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-inline-sub)))
+(assert-equal 7 (isiki-za-test-inline-sub 10 3))                            ;; 高速path
+(assert-equal 0 (isiki-za-test-inline-sub fixnum-max fixnum-max))           ;; 高速path、境界(等しい)
+(assert-equal -7 (isiki-za-test-inline-sub 3 10))                           ;; mag_b>mag_a→fallback
+(assert-equal 7 (isiki-za-test-inline-sub -3 -10))                          ;; 負数→fallback
+(assert-equal -8 (isiki-za-test-inline-sub -3 5))                           ;; 負数→fallback
+(close (open-output-file "/9p/tmp/ckpt-32-inline-arith.txt"))
