@@ -951,7 +951,8 @@ static int za_alloc_fn_cell_cache_slot(UINT64 *out_slot_idx) {
     // キャッシュ済み」)が常に真になってしまい、一度も実際の解決が起きないまま
     // nilをFunction Cellアドレスとして誤用する(このバグを実際に踏んで全JIT関数が
     // 沈黙してNILを返す事態を引き起こした、調査の経緯はdocuments/abi-redesign.md
-    // 参照)。
+    // 参照)。0が安全な番兵として使える一般的な条件(TAG_RAW_POINTERタグ付き値は
+    // 下位3bitが常に非ゼロ)はdocuments/pitfalls.md「原則1」参照。
     g_za_fn_cell_cache_slots[slot_idx] = (lisp_val_t)0;
     za_track_literal_slot_alloc(&g_za_fn_cell_cache_slots[slot_idx]);
     *out_slot_idx = slot_idx;
