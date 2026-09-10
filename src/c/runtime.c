@@ -1595,6 +1595,48 @@ lisp_val_t os_make_symbol(const char *name) {
     return tagged;
 }
 
+/**
+ * [ABI刷新] AOT改善B: os_make_symbolの呼び出し箇所専用キャッシュ版。詳細は
+ * runtime.hのdocコメント参照。*cache_idxはg_symbol_table上の添字(未解決は-1、
+ * "NIL"センチネルは-2)を呼び出し元の(通常はstatic局所変数の)ストレージへ
+ * 書き戻す。2回目以降はg_symbol_table[idx]を返すだけでハッシュ計算・文字列
+ * 比較を一切行わない。添字はGCで symbol実体が移動しても不変(g_symbol_table
+ * 自体が毎GCで所定の添字のままgc_copy_valueされる)ため、追加のGCルート登録は
+ * 不要。
+ * @param cache_idx 呼び出し元が保持するキャッシュ状態(呼び出しごとに書き換わる)
+ * @param name symbol名
+ * @return タグ付けされたSYMBOL(os_make_symbolと同じ結果)
+ */
+lisp_val_t os_make_symbol_cached(int *cache_idx, const char *name) {
+    if (*cache_idx >= 0) {
+        return g_symbol_table[*cache_idx];
+    }
+    if (*cache_idx == -2) {
+        // 過去にこの呼び出し箇所がNIL(g_symbol_tableに登録されない特殊
+        // センチネル)を返したと判明済み。transpile-quotedはnilを事前に
+        // Cリテラル"nil"へ静的解決するためこの経路には通常来ないが、他の
+        // 呼び出し元のための安全策として残す。
+        return nil;
+    }
+
+    int found = symbol_hash_lookup(name);
+    lisp_val_t sym;
+    if (found >= 0) {
+        sym = g_symbol_table[found];
+    } else {
+        // 未intern(または"NIL"センチネル)。os_make_symbol自体が両方を
+        // 正しく処理する(新規intern、またはnilを返す)
+        sym = os_make_symbol(name);
+        if (sym != nil) {
+            // 直前のos_make_symbolが新規internしたばかりなので必ず見つかる
+            found = symbol_hash_lookup(name);
+        }
+    }
+
+    *cache_idx = (sym == nil) ? -2 : found;
+    return sym;
+}
+
 
 /**
  * name(大文字化される)の新しいsymbolを、名前の重複チェックもg_symbol_tableへの

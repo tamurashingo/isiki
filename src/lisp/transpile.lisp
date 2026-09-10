@@ -1110,17 +1110,28 @@
 
 (defun transpile-quoted (val)
   "(quote val)のval側。fixnum/string/nil/tはtranspile-exprと同じ扱いで、
-   それ以外のシンボルはos_make_symbolで名前から解決する。consは要素ごとに
+   それ以外のシンボルはos_make_symbol_cachedで名前から解決する。consは要素ごとに
    再帰的にtranspile-quotedしたものをos_make_consで組み立てる(caseのkeylist
    '(1 2 3)等、リテラルなリストのquote対応。transpile-cons-chainと同じ
    「引数を評価してから呼び出す」C評価順のため、途中でGCが起きても未保護の
-   中間値が上位32bit破壊等に晒される窓は無い)"
+   中間値が上位32bit破壊等に晒される窓は無い)。
+   [ABI刷新] AOT改善B: シンボル解決はos_make_symbolを直接呼ぶ代わりに、この
+   呼び出し箇所専用のC static局所変数(GNU文式`({ static int idx = -1; ...; })`
+   で包む)にg_symbol_table上の添字をキャッシュするos_make_symbol_cachedを使う。
+   2回目以降の実行はハッシュ計算・文字列比較を一切行わずg_symbol_table[idx]を
+   返すだけになる(quoteシンボルリテラルはslot-value/dynamic/tagbodyのタグ名
+   比較等でも使われ、B'適用後もwhile/dotimesの各反復で複数回実行される
+   ホットパスだったため、documents/abi-redesign.md 2026-09-10調査参照)。
+   staticローカル変数はCの言語仕様上ブロックスコープごとに独立した実体を持つ
+   ため、transpile-quotedの呼び出し箇所ごとに(このtranspile-quoted関数自身が
+   何度呼ばれても、生成されるC上の字句的ブロックはその都度別物なので)
+   衝突なく機能する——一意なカウンタ付き変数名を振る必要が無い"
   (cond
     ((symbolp val)
      (cond
        ((null val) "nil")
        ((eq val t) "g_sym_t")
-       (t (format nil "os_make_symbol(~A)"
+       (t (format nil "({ static int __quote_sym_idx = -1; os_make_symbol_cached(&__quote_sym_idx, ~A); })"
                   (c-string-literal (if (keywordp val)
                                          (concatenate 'string ":" (symbol-name val))
                                          (symbol-name val)))))))
@@ -1403,8 +1414,13 @@
    symbol-name-stringという名前のシンボルで検索し、Cローカル変数c-varへ束縛
    するC文を作る。この変数がboxか値コピーかは、捕捉元の外側スコープでの
    boxed-pがそのまま伝播する(呼び出し元のtranspile-lambda参照)ため、ここでは
-   os_get_variableが返した値をそのままc-varへ入れるだけでよい"
-  (format nil "lisp_val_t ~A = os_get_variable(os_make_symbol(~A), env); GC_PROTECT(~A);"
+   os_get_variableが返した値をそのままc-varへ入れるだけでよい。
+   [ABI刷新] AOT改善B: このstep関数は捕捉した各クロージャの呼び出しのたび
+   (defmethodの本体はM10のクロージャリフティング経由でコンパイルされるため、
+   メソッド呼び出しのたびにこれが実行される)に毎回実行されるホットパスの
+   ため、transpile-quotedと同じos_make_symbol_cached+static局所変数の
+   キャッシュ化を適用する"
+  (format nil "lisp_val_t ~A = os_get_variable(({ static int __capture_sym_idx = -1; os_make_symbol_cached(&__capture_sym_idx, ~A); }), env); GC_PROTECT(~A);"
           c-var (c-string-literal symbol-name-string) c-var))
 
 (defun param-scope-and-preamble (params body)
@@ -1546,11 +1562,16 @@
    os_env_add_binding_pairで(sym . 値)ペアとして連結する。boxそのものを共有
    することで、複数のクロージャが同じboxを捕捉した場合に一方の書き換えが
    他方からも見える(za.cの拡張4と同じ設計)。シンボル/consの確保がGCを
-   誘発しても既存のOUTER-SCOPEの変数は呼び出し元でGC_PROTECT済みなので安全"
+   誘発しても既存のOUTER-SCOPEの変数は呼び出し元でGC_PROTECT済みなので安全。
+   [ABI刷新] AOT改善B: このクロージャ生成式はループ内で毎回新規クロージャを
+   作る箇所(defmethodのメソッド呼び出しのたび等)で繰り返し実行されるため、
+   環境名/各自由変数名のシンボル解決をos_make_symbol_cached+static局所変数の
+   キャッシュ化に置き換える(transpile-quoted/emit-capture-fetch-stmtと同じ
+   パターン)"
   (if (null free-vars)
       (format nil "os_make_lifted_closure((lisp_addr_t)(void *)~A, global_environment)" c-name)
       (let ((env-temp (format nil "__closure_env_~A" (incf *closure-temp-counter*))))
-        (format nil "({ lisp_val_t ~A = os_make_environment(os_make_symbol(~A), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
+        (format nil "({ lisp_val_t ~A = os_make_environment(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
                 env-temp
                 (c-string-literal c-name)
                 env-temp
@@ -1558,7 +1579,7 @@
                           (let* ((sym-temp (format nil "__closure_sym_~A" (incf *closure-temp-counter*)))
                                  (pair-temp (format nil "__closure_pair_~A" (incf *closure-temp-counter*)))
                                  (outer-c-name (car (cdr (assoc v outer-scope)))))
-                            (format nil "lisp_val_t ~A = os_make_symbol(~A); GC_PROTECT(~A); lisp_val_t ~A = os_make_cons(~A, ~A); GC_PROTECT(~A); os_env_add_binding_pair(~A, ~A); "
+                            (format nil "lisp_val_t ~A = ({ static int __closure_free_sym_idx = -1; os_make_symbol_cached(&__closure_free_sym_idx, ~A); }); GC_PROTECT(~A); lisp_val_t ~A = os_make_cons(~A, ~A); GC_PROTECT(~A); os_env_add_binding_pair(~A, ~A); "
                                     sym-temp (c-string-literal (symbol-name v)) sym-temp
                                     pair-temp sym-temp outer-c-name
                                     pair-temp

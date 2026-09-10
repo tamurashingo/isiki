@@ -426,6 +426,25 @@ lisp_val_t os_make_cons(const lisp_val_t car, const lisp_val_t cdr);
 lisp_val_t os_make_symbol(const char *name);
 
 /**
+ * [ABI刷新] AOT改善B: os_make_symbolの呼び出し元が、同一呼び出し箇所(コール
+ * サイト)専用のキャッシュスロットを持てる版。*cache_idxは呼び出し元(通常は
+ * その箇所だけのC static局所変数)が保持する、g_symbol_table上の添字キャッシュ
+ * (未解決なら-1、名前が"NIL"でg_symbol_tableに登録されない特殊センチネルの
+ * 場合は-2)。2回目以降の呼び出しはg_symbol_table[idx]を直接返すだけで、
+ * ハッシュ計算・文字列比較を一切行わない。g_symbol_tableは毎GCで通常通り
+ * 更新される(gc_copy_valueで所定の添字のまま上書き)ため、このキャッシュ自体は
+ * 「添字」を保持するだけで追加のGCルート登録は不要(symbol_hash_lookup/
+ * symbol_hash_insertと同じ理由)。transpile.lispのtranspile-quoted(AOT生成
+ * コードのquoteシンボルリテラル)が呼び出し箇所ごとに
+ * `({ static int idx = -1; os_make_symbol_cached(&idx, "NAME"); })`という
+ * 形で使う想定。
+ * @param cache_idx 呼び出し元が保持するキャッシュ状態(呼び出しごとに書き換わる)
+ * @param name symbol名
+ * @return タグ付けされたSYMBOL(os_make_symbolと同じ結果)
+ */
+lisp_val_t os_make_symbol_cached(int *cache_idx, const char *name);
+
+/**
  * name(大文字化される)の新しいsymbolを、名前の重複チェックもg_symbol_tableへの
  * 登録もせずに作る(gensym用)。word1に非nilのgensymフラグが立つ。
  * @param name symbol名
