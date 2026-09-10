@@ -660,3 +660,33 @@
   (assert-equal 1 (car c))
   (assert-equal 9 (cdr c)))
 (close (open-output-file "/9p/tmp/ckpt-30-set-car-cdr.txt"))
+
+;; GC保護コスト削減(za_operand_is_safe_leafによる、za_compile_fold/za_compile_binaryの
+;; アキュムレータlink/unlink省略最適化)の正当性検証。「後続オペランドが単純なparam/
+;; local参照(leaf)ならGCルート保護を省略してよい」という判断が、実際にwrapper_fn
+;; (primitive_add2/primitive_subtract2)がbignum昇格でヒープ確保しGCが複数回発火する
+;; 状況でも正しい結果を返すことを確認する。stepを最初からbignum範囲の値にすることで、
+;; 毎イテレーションで新規bignum確保(=GC発火機会)を強制する。期待値はmultiply(全く
+;; 別のwrapper_fn/コード経路)で計算し、加算/減算ループの結果と独立にクロスチェックする。
+(defglobal za-gc-test-step 1152921504606846976) ;; 2^60、bignum
+(defun isiki-za-test-bignum-add-loop (acc step n)
+  (if (= n 0)
+      acc
+      (isiki-za-test-bignum-add-loop (+ acc step) step (- n 1))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bignum-add-loop)))
+
+(defglobal za-gc-test-n 3000)
+(defglobal za-gc-test-expected (* za-gc-test-n za-gc-test-step))
+(assert-equal za-gc-test-expected
+              (isiki-za-test-bignum-add-loop 0 za-gc-test-step za-gc-test-n))
+
+(defun isiki-za-test-bignum-sub-loop (acc step n)
+  (if (= n 0)
+      acc
+      (isiki-za-test-bignum-sub-loop (- acc step) step (- n 1))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bignum-sub-loop)))
+(defglobal za-gc-test-sub-start (* za-gc-test-expected 2))
+(defglobal za-gc-test-sub-expected (- za-gc-test-sub-start za-gc-test-expected))
+(assert-equal za-gc-test-sub-expected
+              (isiki-za-test-bignum-sub-loop za-gc-test-sub-start za-gc-test-step za-gc-test-n))
+(close (open-output-file "/9p/tmp/ckpt-31-gc-protect-skip.txt"))

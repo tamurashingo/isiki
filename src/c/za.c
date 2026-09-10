@@ -1788,6 +1788,43 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
                              UINT64 arith_depth);
 
 /**
+ * JIT GC保護コスト削減(Phase1、documents/jit.md参照)向け: 「このオペランドの評価が
+ * 絶対にGCを誘発しうる呼び出しを一切含まない」ことを、za_classify_operandを実際に
+ * 呼ばずに(副作用、特にis_literal==7の新規リテラルスロット登録を二重に踏まないため)
+ * 判定する。za_emit_operandの各分岐を確認した結果、以下の3パターンだけがCALL命令を
+ * 一切発行しない(movabs/レジスタ・スタックのMOVのみ):
+ *   - is_literal==1相当(TAG_FIXNUM/TAG_CHARの裸リテラル): jit_movabs_raxのみ
+ *   - is_literal==4相当(let-IIFEでbox化されていないローカル変数): za_load_slotのみ
+ *   - is_literal==0かつg_za_use_param_slots(ABI-M5のパラメータスロット方式が有効な
+ *     関数での固定引数params参照): za_load_slotのみ
+ * それ以外(&rest/box化ローカル/quoteリテラル/裸のT/グローバル変数/(function sym)等)
+ * は、cc_car/cc_cdr(非allocatingだが判定の単純さを優先し保守的に除外)や
+ * os_make_symbol/os_get_variable等への実CALLを伴うため、ここでは「安全なleafでは
+ * ない」として扱う(=最適化を見送るだけで、常に既存の保護付きパスにフォールバック
+ * する安全側の判定)。
+ * za_compile_fold/za_compile_binaryが、後続オペランド評価中にGCが起きないと確認
+ * できた場合にアキュムレータのGCルートlink/unlinkを省略するための判定にのみ使う。
+ */
+static int za_operand_is_safe_leaf(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                    const za_local_scope_t *locals) {
+    if ((form & TAG_MASK) == TAG_FIXNUM || (form & TAG_MASK) == TAG_CHAR) {
+        return 1;
+    }
+    if ((form & TAG_MASK) == TAG_SYMBOL) {
+        UINT32 local_off;
+        za_var_kind_t local_kind;
+        if (za_local_lookup(locals, form, &local_off, &local_kind)) {
+            return local_kind != ZA_VAR_BOXED;
+        }
+        UINT64 idx;
+        if (za_param_index(params, form, fixed_count, &idx)) {
+            return g_za_use_param_slots ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
+/**
  * オペランド1個を評価してraxへ値を残す共通ヘルパー(拡張16)。まずza_classify_operand/
  * za_emit_operandの高速パス(fixnumリテラル・params/local参照等、CALL/GC無し)を試し、
  * leafに分類できない場合のみza_compile_expr(is_tail=0)へ再帰する。これにより
@@ -1852,6 +1889,21 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         return 0;
     }
 
+    // JIT GC保護コスト削減(Phase1): 2個目以降の全オペランドがza_operand_is_safe_leaf
+    // (呼び出しを一切伴わない、GCを誘発しようがない評価)なら、アキュムレータの
+    // GCルートlink/unlinkを丸ごと省略する。wrapper_fn(primitive_add2等)自身が
+    // 自分の引数をGC_PROTECTしてから確保する実装になっているため(runtime.c参照)、
+    // za.c側の外部保護は「後続オペランド評価中の生存」を守るためだけに存在する。
+    // 後続オペランドの評価が一切の呼び出しを含まなければ、その区間でGCが起きようが
+    // ないため外部保護は不要になる。
+    int skip_protect = 1;
+    for (UINT64 i = 1; i < count; i++) {
+        if (!za_operand_is_safe_leaf(operand_forms[i], params, fixed_count, locals)) {
+            skip_protect = 0;
+            break;
+        }
+    }
+
     if (!za_compile_operand(operand_forms[0], params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth,
                              tb_ctx, call_depth, arith_depth)) {
         return 0;
@@ -1862,7 +1914,9 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     UINT64 val_off = za_arith_val_off(arith_depth);
     UINT64 node_off = za_arith_node_off(arith_depth);
     za_store_slot(ZA_REG_RAX, val_off);
-    za_emit_gc_link_slot(val_off, node_off);
+    if (!skip_protect) {
+        za_emit_gc_link_slot(val_off, node_off);
+    }
 
     UINT64 ct_patches[ZA_MAX_OPERANDS];
     UINT64 ct_patch_count = 0;
@@ -1880,6 +1934,19 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
             za_store_slot(ZA_REG_RAX, val_off);
         }
     }
+
+    if (skip_protect) {
+        // 何もlinkしていないためunlink/cleanupは不要。ct_patch群(skip_protect時の
+        // オペランドはza_operand_is_safe_leaf判定により呼び出しを含まないため、
+        // 制御転送は理論上起こり得ないが、安全のためct_patch0と同じ最終合流点へ
+        // 向けておく)もここへ合流させる。raxには最終結果がそのまま残っている。
+        jit_patch_rel32(ct_patch0);
+        for (UINT64 i = 0; i < ct_patch_count; i++) {
+            jit_patch_rel32(ct_patches[i]);
+        }
+        return 1;
+    }
+
     // raxに最終結果が残った状態でunlinkを呼ぶ(za_gc_unlink_node自体もCALL経由で
     // volatileレジスタを破壊するため)ので、いったん非volatileなr13へ退避する。
     jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
@@ -1991,6 +2058,11 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     }
     lisp_val_t op1_form = cc_car(rest2);
 
+    // JIT GC保護コスト削減(Phase1): za_compile_foldと同じ理由・同じ判定基準
+    // (za_operand_is_safe_leaf参照)で、op1がGCを誘発しうる呼び出しを一切含まない
+    // ことが分かればop0用のGCルートlink/unlinkを丸ごと省略する。
+    int skip_protect = za_operand_is_safe_leaf(op1_form, params, fixed_count, locals);
+
     if (!za_compile_operand(op0_form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                              call_depth, arith_depth)) {
         return 0;
@@ -2001,7 +2073,9 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     UINT64 val_off = za_arith_val_off(arith_depth);
     UINT64 node_off = za_arith_node_off(arith_depth);
     za_store_slot(ZA_REG_RAX, val_off);
-    za_emit_gc_link_slot(val_off, node_off);
+    if (!skip_protect) {
+        za_emit_gc_link_slot(val_off, node_off);
+    }
 
     if (!za_compile_operand(op1_form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                              call_depth, arith_depth + 1)) {
@@ -2013,6 +2087,16 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     za_load_slot(ZA_REG_RCX, val_off);
     jit_movabs_r11((UINT64)wrapper_fn);
     jit_call_r11();
+
+    if (skip_protect) {
+        // 何もlinkしていないためunlink/cleanupは不要。ct_patch1(op1はleafなので
+        // 理論上制御転送は起こり得ないが、安全のためct_patch0と同じ最終合流点へ
+        // 向けておく)もここへ合流させる。raxには結果がそのまま残っている。
+        jit_patch_rel32(ct_patch0);
+        jit_patch_rel32(ct_patch1);
+        return 1;
+    }
+
     // raxに結果が残った状態でunlinkを呼ぶ(za_gc_unlink_node自体もCALL経由で
     // volatileレジスタを破壊するため)ので、いったん非volatileなr13へ退避する。
     jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
