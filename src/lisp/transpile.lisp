@@ -726,26 +726,60 @@
       (cons (list (car (car bindings)) (car (cdr (car bindings))))
             (%%for-let-bindings (cdr bindings)))))
 
-(defun %%for-setqs (bindings list-expr)
+(defun %%for-temp-names (bindings n)
+  "並列更新用の一時変数名(%FOR-TMP-1, %FOR-TMP-2, ...)をbindingsの個数だけ作る"
   (if (null bindings)
       nil
-      (cons `(setq ,(car (car bindings)) (car ,list-expr))
-            (%%for-setqs (cdr bindings) `(cdr ,list-expr)))))
+      (cons (intern (format nil "%FOR-TMP-~A" n))
+            (%%for-temp-names (cdr bindings) (+ n 1)))))
+
+(defun %%for-temp-let-bindings (temps)
+  (if (null temps) nil (cons (list (car temps) nil) (%%for-temp-let-bindings (cdr temps)))))
+
+(defun %%for-step-setqs (bindings temps)
+  "全step式を一時変数へ評価する。束縛変数はまだ書き換えない(並列束縛の意味論)"
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car temps) ,(%%for-next (car bindings)))
+            (%%for-step-setqs (cdr bindings) (cdr temps)))))
+
+(defun %%for-commit-setqs (bindings temps)
+  "全step式の評価が終わってから、一時変数の値を各束縛変数へ書き戻す"
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car (car bindings)) ,(car temps))
+            (%%for-commit-setqs (cdr bindings) (cdr temps)))))
 
 (defun expand-for (form)
+  "ISLispのfor。ループ構造自体はwhileと同じくtagbody/goへ直接展開する。
+   [性能測定] 旧実装は並列束縛の意味論を満たすため、ループ本体の中で毎反復
+   (let ((%for-next-values (list step1 step2 ...))) (setq v1 (car ...)) ...)
+   を評価していた。この展開形は1反復ごとに (1)step値のconsリスト構築
+   (2)letによるクロージャ生成+consリスト構築+primitive_funcall経由の
+   動的ディスパッチ (3)変数N個に対するO(N^2)のcar/cdr連鎖、を発生させており、
+   構文別ベンチマークでforがlet単体の2.3倍・素のCの1711倍という最悪値を
+   示す原因になっていた(documents/performance-measurement.md参照)。
+   一時変数をループの外側のletで一度だけ束縛し、ループ本体では素のsetqだけを
+   使う形へ変更する。全step式を一時変数へ評価しきってから各束縛変数へ書き戻す
+   ため、並列束縛の意味論は保たれる((for ((a 0 b) (b 1 (+ a b)))...)のように
+   互いの旧値を参照するstepでも正しい)。
+   ide.lispが記録していた『forマクロはGCが特定のタイミングで走ると以後
+   永久に結果が壊れる』既知のバグも、その原因とされていた『ループ本体に毎回
+   新規生成されるlet』自体が無くなる"
   (destructuring-bind (for-kw bindings test-and-result &rest body) form
     (declare (ignore for-kw))
-    `(let ,(%%for-let-bindings bindings)
-       (block nil
-         (tagbody
-          %for-loop
-          (if ,(car test-and-result)
-              (return-from nil (progn ,@(cdr test-and-result)))
-              (progn
-                ,@body
-                (let ((%for-next-values (list ,@(%%for-nexts bindings))))
-                  ,@(%%for-setqs bindings '%for-next-values))
-                (go %for-loop))))))))
+    (let ((temps (%%for-temp-names bindings 1)))
+      `(let ,(append (%%for-let-bindings bindings) (%%for-temp-let-bindings temps))
+         (block nil
+           (tagbody
+            %for-loop
+            (if ,(car test-and-result)
+                (return-from nil (progn ,@(cdr test-and-result)))
+                (progn
+                  ,@body
+                  ,@(%%for-step-setqs bindings temps)
+                  ,@(%%for-commit-setqs bindings temps)
+                  (go %for-loop)))))))))
 
 (defun expand-while (form)
   (destructuring-bind (while-kw test &rest body) form

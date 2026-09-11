@@ -759,6 +759,11 @@ test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
 test-qemu-imm-leak:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_imm_leak.lisp
 
+# [性能測定] forマクロの展開形変更(ループ本体のlet廃止)の意味論回帰テスト。
+# 並列束縛・step省略・入れ子・GC併走を確認する
+test-qemu-for-expansion:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_expansion.lisp
+
 # 構文別ベンチマークのC版/AOT版が同じ計算をしていることの確認(比に意味を
 # 持たせる前提条件)。計測と違い数秒で終わるため単独で実行できる
 test-qemu-bench-construct-check:
