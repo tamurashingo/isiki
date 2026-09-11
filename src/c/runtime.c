@@ -5294,6 +5294,18 @@ lisp_val_t os_make_vector_from_list(lisp_val_t list) {
     return vec;
 }
 
+lisp_val_t os_make_vector_raw(UINT64 count, lisp_val_t **out_data) {
+    // os_make_vector_from_list/primitive_create_vectorと同じ理由(コメント参照)で、
+    // まずword1=0のプレースホルダでVECTORをラップしGC_PROTECTしてから本体ブロックを
+    // 確保する
+    lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
+    GC_PROTECT(vec);
+    lisp_addr_t addr = alloc_vector_block(1, &count);
+    ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
+    *out_data = (lisp_val_t *)(addr + 16);
+    return vec;
+}
+
 /**
  * 組み込み関数VECTOR。評価済みの引数列をそのまま要素とするrank1のgeneral-vectorを返す。
  * @param args 評価済みの引数リスト(すべて要素として使う)

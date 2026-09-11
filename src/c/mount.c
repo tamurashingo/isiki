@@ -7,6 +7,7 @@
 #include "process.h"
 #include "eval.h"
 #include "lisp.h"
+#include "block_device.h"
 
 /** ホスト9P経由のファイルアクセスの組み込みマウントパス。*mounts*に登録が無くても
     常にこのプレフィックスを解決できる(9Pドライバでアクセスするファイルは
@@ -312,4 +313,307 @@ int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *rel
     }
     *out_len = (UINT32)os_fixnum_magnitude(result);
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// [性能測定] READ-FILE-INTO-VECTOR-NATIVE(documents/performance-measurement.md
+// 「read-file-into-vector-native」参照)
+//
+// read-file-into-vector(file-cmd.lisp)は、内部でopen-input-stream(FATパスなら
+// os_mount_fat_read_file経由でファイル全体を一括でCバッファへ読み込み済み)の後、
+// read-byte/set-eltを1byteずつ呼ぶAOTのwhileループでLisp vectorへ詰め直す。この
+// 「詰め直し」1回ごとに、呼び出し規約・GC_PROTECT・primitive_*ディスパッチの
+// オーバーヘッドが乗る。さらにos_mount_fat_read_file自体も、内部で呼ぶAOT
+// fat16-read-file(fat16.lisp、%fat16-read-lba-list)がクラスタ→セクタの
+// バイト列をelt/set-eltで1byteずつコピーしており、同種のオーバーヘッドが
+// もう一段ある。
+//
+// この「Lisp呼び出し規約を完全に経由しない場合の理論的な下限(フロア)」を
+// 計測するため、fat16.lispのBPBパース・ディレクトリエントリ走査・クラスタ
+// チェイン追跡・セクタ読み込みのロジックを、Lisp呼び出し規約を一切経由しない
+// 素のC関数として再実装する。IDEへのセクタ読み込みはblock_device_t::
+// read_sectorsを直接呼び(1クラスタ分をまとめて1回のPIO転送にできる、
+// read-sectorのLisp版が1セクタずつしか読めないのと異なる点)、読み込んだ
+// バイト列は最終的なLisp vectorのデータ部へ直接os_make_fixnum(単なる左シフト、
+// ヒープ確保を伴わない)で書き込む。
+//
+// スコープ: このベンチマーク用途に限定し、対象はFAT16のみ・ルート直下の
+// ファイル(サブディレクトリ非対応)のみとする(実際の計測対象である
+// tmp/perf_read_fat16.imgのREAD100K.BIN等がすべてルート直下にあるため)。
+// 正規のfat16-read-file/read-file-into-vectorはサブディレクトリ・FAT32にも
+// 対応済みであり、本関数はそれらを置き換えるものではなく、命令数計測実験
+// 専用の別実装として追加する。
+
+typedef struct {
+    UINT16 bytes_per_sector;
+    UINT8 sectors_per_cluster;
+    UINT16 reserved_sectors;
+    UINT8 num_fats;
+    UINT16 root_entry_count;
+    UINT16 sectors_per_fat;
+} fat16n_bpb_t;
+
+/** FAT16の1クラスタの最大サイズ(仕様上の上限、32KB)。これを超える構成は非対応としnilを返す */
+#define FAT16N_MAX_CLUSTER_BYTES 32768
+
+static UINT16 fat16n_u16(const UINT8 *b, UINT32 off) {
+    return (UINT16)(b[off] | (b[off + 1] << 8));
+}
+
+static UINT32 fat16n_u32(const UINT8 *b, UINT32 off) {
+    return (UINT32)(fat16n_u16(b, off) | ((UINT32)fat16n_u16(b, off + 2) << 16));
+}
+
+/**
+ * deviceハンドル(%DEVICE-HANDLEの戻り値、生のblock_device_t*、またはIDE
+ * パーティションハンドル(:ide-partition base-handle base-lba)のconsリスト)を
+ * block_device_t*と、その上でのLBAに足すべきオフセットへ分解する
+ * (read-sector/ide.lispの%ide-partition-handle-p相当)。
+ */
+static int fat16n_resolve_device(lisp_val_t handle, block_device_t **out_dev, UINT32 *out_base_lba) {
+    if ((handle & TAG_MASK) == TAG_CONS) {
+        lisp_val_t head = cc_car(handle);
+        if (head != os_make_symbol(":IDE-PARTITION")) {
+            return 0;
+        }
+        lisp_val_t rest = cc_cdr(handle);
+        lisp_val_t base_handle = cc_car(rest);
+        lisp_val_t base_lba_val = cc_car(cc_cdr(rest));
+        if ((base_handle & TAG_MASK) != TAG_RAW_POINTER) {
+            return 0;
+        }
+        *out_dev = (block_device_t *)(lisp_addr_t)(base_handle & ~TAG_MASK);
+        *out_base_lba = (UINT32)os_fixnum_magnitude(base_lba_val);
+        return 1;
+    }
+    if ((handle & TAG_MASK) != TAG_RAW_POINTER) {
+        return 0;
+    }
+    *out_dev = (block_device_t *)(lisp_addr_t)(handle & ~TAG_MASK);
+    *out_base_lba = 0;
+    return 1;
+}
+
+static int fat16n_read_sectors(block_device_t *dev, UINT32 base_lba, UINT32 lba, UINT16 count, UINT8 *buf) {
+    char err_msg[128];
+    err_msg[0] = '\0';
+    return dev->read_sectors(dev, base_lba + lba, count, buf, err_msg, sizeof(err_msg));
+}
+
+static int fat16n_read_bpb(block_device_t *dev, UINT32 base_lba, fat16n_bpb_t *out_bpb) {
+    UINT8 sector[512];
+    if (!fat16n_read_sectors(dev, base_lba, 0, 1, sector)) {
+        return 0;
+    }
+    // total-sectors自体はクラスタ位置計算に不要なため読み取らない
+    out_bpb->bytes_per_sector = fat16n_u16(sector, 11);
+    out_bpb->sectors_per_cluster = sector[13];
+    out_bpb->reserved_sectors = fat16n_u16(sector, 14);
+    out_bpb->num_fats = sector[16];
+    out_bpb->root_entry_count = fat16n_u16(sector, 17);
+    out_bpb->sectors_per_fat = fat16n_u16(sector, 22);
+    if (out_bpb->bytes_per_sector != 512) {
+        // 本関数の固定512byteスタックバッファ前提が崩れるため非対応
+        return 0;
+    }
+    return 1;
+}
+
+static UINT32 fat16n_root_dir_lba(const fat16n_bpb_t *bpb) {
+    return bpb->reserved_sectors + (UINT32)bpb->num_fats * bpb->sectors_per_fat;
+}
+
+static UINT32 fat16n_root_dir_sector_count(const fat16n_bpb_t *bpb) {
+    return ((UINT32)bpb->root_entry_count * 32) / bpb->bytes_per_sector;
+}
+
+static UINT32 fat16n_data_start_lba(const fat16n_bpb_t *bpb) {
+    return fat16n_root_dir_lba(bpb) + fat16n_root_dir_sector_count(bpb);
+}
+
+static UINT32 fat16n_cluster_to_lba(const fat16n_bpb_t *bpb, UINT32 cluster_no) {
+    return fat16n_data_start_lba(bpb) + (cluster_no - 2) * bpb->sectors_per_cluster;
+}
+
+/** cluster-noに対応するFATエントリ(16bit)を返す。読み込み失敗時は0xFFFF(終端扱い) */
+static UINT16 fat16n_fat_entry(block_device_t *dev, UINT32 base_lba, const fat16n_bpb_t *bpb, UINT32 cluster_no) {
+    UINT32 byte_offset = cluster_no * 2;
+    UINT32 sector_offset = byte_offset / bpb->bytes_per_sector;
+    UINT32 offset_in_sector = byte_offset % bpb->bytes_per_sector;
+    UINT8 sector[512];
+    if (!fat16n_read_sectors(dev, base_lba, bpb->reserved_sectors + sector_offset, 1, sector)) {
+        return 0xFFFF;
+    }
+    return fat16n_u16(sector, offset_in_sector);
+}
+
+/**
+ * ルートディレクトリを先頭から走査し、8.3名(拡張子ドット込み、大文字)が
+ * nameと一致するエントリのstart-cluster/sizeを取り出す。見つからなければ0を返す。
+ * name中に'/'が含まれる(サブディレクトリを含むパス)場合は非対応として0を返す。
+ */
+static int fat16n_find_root_entry(block_device_t *dev, UINT32 base_lba, const fat16n_bpb_t *bpb,
+                                   const char *name, UINT32 *out_start_cluster, UINT32 *out_size) {
+    UINT32 root_lba = fat16n_root_dir_lba(bpb);
+    UINT32 root_sectors = fat16n_root_dir_sector_count(bpb);
+    char entry_name[13];
+
+    for (UINT32 s = 0; s < root_sectors; s++) {
+        UINT8 sector[512];
+        if (!fat16n_read_sectors(dev, base_lba, root_lba + s, 1, sector)) {
+            return 0;
+        }
+        for (UINT32 off = 0; off < 512; off += 32) {
+            UINT8 first = sector[off];
+            if (first == 0x00) {
+                return 0; // ルートディレクトリ終端
+            }
+            if (first == 0xE5) {
+                continue; // 削除済みエントリ
+            }
+            // 8.3名を"NAME.EXT"(拡張子が空ならNAMEのみ)へrtrim+結合する
+            UINT32 p = 0;
+            UINT32 name_end = 8;
+            while (name_end > 0 && sector[off + name_end - 1] == ' ') name_end--;
+            for (UINT32 i = 0; i < name_end; i++) entry_name[p++] = (char)sector[off + i];
+            UINT32 ext_end = 3;
+            while (ext_end > 0 && sector[off + 8 + ext_end - 1] == ' ') ext_end--;
+            if (ext_end > 0) {
+                entry_name[p++] = '.';
+                for (UINT32 i = 0; i < ext_end; i++) entry_name[p++] = (char)sector[off + 8 + i];
+            }
+            entry_name[p] = '\0';
+
+            // name(呼び出し元が渡す相対パス、大文字の8.3名)とentry_nameの完全一致を
+            // 判定する(%fat16-find-dir-entryのstring=と同じ、大文字小文字は
+            // 変換しない厳密比較)
+            int matches = 1;
+            UINT32 j = 0;
+            for (; entry_name[j] != '\0' && name[j] != '\0'; j++) {
+                if (entry_name[j] != name[j]) {
+                    matches = 0;
+                    break;
+                }
+            }
+            if (matches && (entry_name[j] != '\0' || name[j] != '\0')) {
+                matches = 0;
+            }
+            if (matches) {
+                *out_start_cluster = fat16n_u16(sector, off + 26);
+                *out_size = fat16n_u32(sector, off + 28);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/**
+ * (read-file-into-vector-native path) : read-file-into-vectorと同じ契約
+ * (成功時general-vector、マウント解決失敗/非対応時nil)だが、Lisp呼び出し
+ * 規約を一切経由しない素のC実装で読み込む(上のコメント参照)。FAT16の
+ * ルート直下のファイルのみ対応。
+ */
+lisp_val_t cc_read_file_into_vector_native(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    char path[STREAM_PATH_MAX];
+    os_string_to_cstr(cc_car(args), path, sizeof(path));
+
+    char relative[STREAM_PATH_MAX];
+    lisp_val_t device_sym;
+    mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device_sym);
+    if (kind != MOUNT_KIND_FAT16) {
+        return nil;
+    }
+    // ルート直下限定(サブディレクトリパス"/DIR/FILE.TXT"は非対応)
+    if (relative[0] != '/') {
+        return nil;
+    }
+    for (UINT32 i = 1; relative[i] != '\0'; i++) {
+        if (relative[i] == '/') {
+            return nil;
+        }
+    }
+
+    GC_PROTECT(device_sym);
+    lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
+    if (handle_fn == nil) {
+        return nil;
+    }
+    GC_PROTECT(handle_fn);
+    lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device_sym, nil), global_environment);
+    // [性能測定] handle自体はGCに再配置されうるが、ここから先(fat16n_*)は
+    // 生のblock_device_t*しか使わない(handleを再度参照しない)ため、
+    // これ以降GC_PROTECTは不要
+    block_device_t *dev;
+    UINT32 base_lba;
+    if (!fat16n_resolve_device(handle, &dev, &base_lba)) {
+        return nil;
+    }
+
+    fat16n_bpb_t bpb;
+    if (!fat16n_read_bpb(dev, base_lba, &bpb)) {
+        return nil;
+    }
+
+    UINT32 start_cluster, size;
+    if (!fat16n_find_root_entry(dev, base_lba, &bpb, relative + 1, &start_cluster, &size)) {
+        return nil;
+    }
+    if (size == 0) {
+        // read-file-into-vector(file-cmd.lisp)はos_mount_fat_read_file経由で
+        // 0byteファイルをnilとして扱う(fat16-read-fileの既知の制約、
+        // 「ファイル無し」と区別できない)。比較対象と挙動を一致させるため
+        // ここでも同じ契約(0byteファイルはnil)に合わせる
+        return nil;
+    }
+
+    lisp_val_t *data;
+    lisp_val_t vec = os_make_vector_raw(size, &data);
+    // [性能測定] os_make_vector_raw確保後はvecがGCルートから到達可能な正規の
+    // VECTORなので、以降の(FATエントリ読み込み等の)処理でGCが発火しても
+    // vec/dataの安全性に問題は無い(VECTORの内部ブロックはgc_relocateが
+    // 正しく再配置する、既存のVECTOR実装と同じ)
+    GC_PROTECT(vec);
+
+    UINT32 cluster_bytes = (UINT32)bpb.sectors_per_cluster * bpb.bytes_per_sector;
+    if (cluster_bytes == 0 || cluster_bytes > FAT16N_MAX_CLUSTER_BYTES) {
+        return nil;
+    }
+    UINT8 cluster_buf[FAT16N_MAX_CLUSTER_BYTES];
+
+    UINT32 cluster = start_cluster;
+    UINT32 written = 0;
+    UINT32 safety_limit = (size + cluster_bytes - 1) / cluster_bytes + 2; // 想定クラスタ数+安全マージン
+    for (UINT32 iter = 0; iter < safety_limit && written < size; iter++) {
+        if (!fat16n_read_sectors(dev, base_lba, fat16n_cluster_to_lba(&bpb, cluster),
+                                  bpb.sectors_per_cluster, cluster_buf)) {
+            return nil;
+        }
+        UINT32 chunk = cluster_bytes;
+        if (written + chunk > size) {
+            chunk = size - written;
+        }
+        for (UINT32 i = 0; i < chunk; i++) {
+            data[written + i] = os_make_fixnum(cluster_buf[i]);
+        }
+        written += chunk;
+        if (written >= size) {
+            break;
+        }
+        UINT16 next = fat16n_fat_entry(dev, base_lba, &bpb, cluster);
+        if (next >= 0xFFF8) {
+            return nil; // チェインがsizeに満たないまま終端(破損)
+        }
+        cluster = next;
+    }
+    if (written < size) {
+        return nil;
+    }
+    return vec;
+}
+
+void os_register_mount_native_subprimitives(void) {
+    os_set_function(os_make_symbol("READ-FILE-INTO-VECTOR-NATIVE"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_read_file_into_vector_native), global_environment);
 }

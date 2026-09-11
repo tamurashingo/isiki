@@ -1681,6 +1681,19 @@ lisp_val_t os_make_vector_from_list(lisp_val_t list);
 lisp_val_t *os_vector_header(lisp_val_t vec);
 
 /**
+ * [性能測定] documents/performance-measurement.md「read-file-into-vector-native」
+ * 参照。rank1・長さcountのgeneral-vectorを1回だけ確保し、要素は初期化せず
+ * データ部先頭へのポインタを*out_dataへ返す。呼び出し元はこのポインタへ
+ * 直接os_make_fixnum済みの値を書き込む(GC_PROTECT・primitive_set_elt経由の
+ * 1要素ずつの呼び出し規約を経由しないバルク書き込み用)。countが0の場合も
+ * 有効な(長さ0の)VECTORを返す。
+ * @param count 要素数
+ * @param out_data データ部先頭へのポインタの格納先(count==0でも書き込む)
+ * @return 確保したVECTOR
+ */
+lisp_val_t os_make_vector_raw(UINT64 count, lisp_val_t **out_data);
+
+/**
  * 組み込み関数VECTOR。評価済みの引数列をそのまま要素とするrank1のgeneral-vectorを返す。
  * @param args 評価済みの引数リスト(すべて要素として使う)
  * @param env 呼び出し時の環境(未使用)

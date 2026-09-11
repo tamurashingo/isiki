@@ -606,6 +606,15 @@ test-qemu-all:
 test-qemu-stress:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m2_za_stress.lisp
 
+# [性能測定] documents/performance-measurement.md「read-file-into-vector-native」
+# 参照。READ-FILE-INTO-VECTOR-NATIVE(mount.c、命令数計測実験専用のFAT16
+# ルート直下限定・素のC実装)がread-file-into-vectorと完全に同じ結果を返す
+# ことを、0byte・クラスタサイズ未満・ちょうど1クラスタ・複数クラスタに
+# またがるサイズの各パターンで確認する。test-qemu-allには含めない(実験専用
+# プリミティブの検証であり、CIで恒常的に検証すべき正式APIではないため)
+test-qemu-read-file-native:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_read_file_native.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+
 # [ファイルI/O]#52(M9): カーネル自身のブートバイナリ(約1.76MB)の読み込み(#41)と
 # 65536byte超の書き込み(#39)を実データ規模で検証する。test-qemu-stressと同じ理由
 # (KVM無しのQEMU/TCGでは1MB超のファイルI/Oが現実的な時間で終わらない)でローカル

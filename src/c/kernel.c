@@ -16,6 +16,7 @@
 #include "clock.h"
 #include "stream.h"
 #include "za.h"
+#include "mount.h"
 
 // src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
 // gitignore対象のビルド成果物)で定義される。init.lispから移動したmember/assoc等を
@@ -102,6 +103,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_bootstrap();
     os_register_subprimitives();
     os_register_ide_subprimitives();
+    os_register_mount_native_subprimitives();
     os_register_load();
     os_register_eval_primitives();
     os_register_streams();
