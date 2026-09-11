@@ -105,6 +105,45 @@
           (setq i (+ i 1))))
       acc)))
 
+;;; --- 6c. 束縛数10のlet*(第1部: 傾きの線形性確認用) ---
+(defun %%bench-aot-let10 (n)
+  (let ((acc 0) (i 0))
+    (progn
+      (while (< i n)
+        (progn
+          (setq acc (+ acc (let* ((a i) (b (+ a 1)) (c (+ b 1)) (d (+ c 1)) (e (+ d 1))
+                                  (f (+ e 1)) (g (+ f 1)) (h (+ g 1)) (j (+ h 1)) (k (+ j 1)))
+                             k)))
+          (setq i (+ i 1))))
+      acc)))
+
+;;; --- 6d. 束縛数5だがinitが全て定数(第1部: init評価分の分離用) ---
+;; initが全て即値リテラル。即値はGC_PROTECTもcontrol transferチェックも省略
+;; されるため、これが「束縛そのもの」の純コストになる。bodyは最後の束縛だけを
+;; 参照する(全変数を参照すると内側lambdaに捕捉されフォールバック経路になる)
+(defun %%bench-aot-let5const (n)
+  (let ((acc 0) (i 0))
+    (progn
+      (while (< i n)
+        (progn
+          (setq acc (+ acc (let* ((a 1) (b 2) (c 3) (d 4) (e 5))
+                             e)))
+          (setq i (+ i 1))))
+      acc)))
+
+;;; --- 6e. 束縛数5のlet(並列束縛、第1部: let*との傾き比較 + GC_PROTECT分の分離用) ---
+;; initは非box化ローカル参照なのでGC_PROTECTは発行されるがcontrol transfer
+;; チェックは省略される。let5constとの差がGC_PROTECT1回分のコストになる
+(defun %%bench-aot-let5par (n)
+  (let ((acc 0) (i 0))
+    (progn
+      (while (< i n)
+        (progn
+          (setq acc (+ acc (let ((a i) (b i) (c i) (d i) (e i))
+                             e)))
+          (setq i (+ i 1))))
+      acc)))
+
 ;;; --- 7. cons/リスト操作(長さ1000のリストを構築して走査、N/1000回) ---
 (defun %%bench-aot-cons (n)
   (let ((reps (div n 1000)) (r 0) (total 0))
