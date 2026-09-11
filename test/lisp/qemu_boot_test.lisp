@@ -21,6 +21,7 @@
 (load "test/lisp/environment_literal_slots_test.lisp")
 (load "test/lisp/environment_utilities_test.lisp")
 (load "test/lisp/room_test.lisp")
+(load "test/lisp/aot_leaf_gc_test.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

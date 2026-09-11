@@ -1643,6 +1643,43 @@
 
 (defparameter *call-temp-counter* 0)
 
+(defun aot-form-is-leaf (form scope)
+  "[ABI刷新] AOT改善(GC_PROTECT削減、za.cのPhase1=za_operand_is_safe_leafと
+   同じ基準をtranspile.lisp側に移植したもの、documents/performance-
+   measurement.md 2026-09-11「read-file-into-vectorのAOT呼び出し規約
+   オーバーヘッド」節参照)。FORMの評価結果が、GC_PROTECT(GCルートへの
+   一時登録)もos_is_control_transfer(非局所脱出シグナル判定)も一切不要な
+   「leaf」かどうかを、FORMを実際にtranspile-exprへ通さずに静的に判定する。
+   leafと判定できるのは以下の2ケースのみ(za_operand_is_safe_leafのコメントと
+   同じ判断基準):
+   - fixnum/文字リテラル: os_make_fixnum/os_make_charが生成するのは即値
+     (TAG_FIXNUM/TAG_CHAR、ヒープ非経由)であり、GCによる再配置の対象に
+     ならない。呼び出しを一切含まないため非局所脱出シグナルにもなりえない。
+   - 非box化ローカル変数(scope中でboxed-pがnil)への参照: 束縛時に
+     emit-param-binding-stmt等が一度だけGC_PROTECTしたCローカル変数を
+     単に読むだけであり、その保護(GC_PROTECTマクロのcleanup属性は
+     束縛を含むCブロックのスコープを抜ける時にのみ発火する)は束縛を含む
+     関数の実行が終わるまで有効なままなので、読み出しのたびの再保護は
+     不要。またLisp側の代入(setq)は非局所脱出シグナルを弾いてから
+     でなければ実際の代入を行わない生成コードになっているため、
+     正しく評価が完了したローカル変数がシグナル値そのものを保持する
+     ことはない。
+   上記以外(box化ローカル・グローバル変数・quoteシンボル・文字列
+   リテラル・裸のT・関数呼び出し・複合式全般)は、ヒープ確保やGCを
+   誘発しうる呼び出しを含む可能性があるため安全側でleafとしない
+   (最適化を見送るだけで、常に既存の保護付きパスへフォールバックする)。
+   NILは呼び出し元(transpile-exprの他の分岐)で既にCリテラル\"nil\"へ
+   静的解決されこの関数へは到達しないが、念のためleaf扱いにしておく"
+  (cond
+    ((integerp form) t)
+    ((characterp form) t)
+    ((null form) t)
+    ((eq form t) nil)
+    ((symbolp form)
+     (let ((binding (cdr (assoc form scope))))
+       (and binding (not (cdr binding)))))
+    (t nil)))
+
 (defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr)
   "ALL-TEMPSを1つずつGC-safeに評価し、いずれかが非局所脱出シグナル
    (os_is_control_transfer)であれば残りの引数評価とFINAL-C-EXPR(呼び出し本体)を
@@ -1651,13 +1688,22 @@
    関数呼び出しの引数評価にも適用する(funcall経由でreturn-from/throwする
    エスケープするクロージャの結果が、letの脱糖((lambda (result) body) init)の
    ように別の呼び出しの引数として渡された場合、この規則が無いと非局所脱出
-   シグナルが素通しされずただの値として本体に渡ってしまう不具合があった)"
+   シグナルが素通しされずただの値として本体に渡ってしまう不具合があった)。
+   [ABI刷新] AOT改善: aot-form-is-leaf参照。引数の(未評価の)元のLisp式が
+   leafと判定できる場合は、GC_PROTECT・os_is_control_transferチェックの
+   両方を省略する(za.cのza_emit_operandが同じ条件でこれらを一切発行しない
+   ことを確認済み、documents/performance-measurement.md参照)"
   (if (null remaining-temps)
       (funcall final-c-expr all-temps)
-      (let ((temp (car remaining-temps)))
-        (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
-                temp (transpile-expr (car remaining-args) scope) temp temp temp
-                (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope final-c-expr)))))
+      (let ((temp (car remaining-temps))
+            (arg-form (car remaining-args)))
+        (if (aot-form-is-leaf arg-form scope)
+            (format nil "({ lisp_val_t ~A = (~A); ~A; })"
+                    temp (transpile-expr arg-form scope)
+                    (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope final-c-expr))
+            (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                    temp (transpile-expr arg-form scope) temp temp temp
+                    (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope final-c-expr))))))
 
 (defun transpile-call (expr scope)
   "(name arg*)。nameはdefunされた関数名またはプリミティブのホワイトリストに

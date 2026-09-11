@@ -359,6 +359,29 @@ init.lispは巨大なので、M8で対応範囲を「まず`and`/`or`が通る�
   全体の目的そのものであるため、単なる機能追加ではなく既存の脆弱な仕組みへの
   依存を減らせているかを明示的に測定する。
 
+## 生成コードの最適化状況(`documents/jit.md`のJIT側と対になる節)
+
+このドキュメントの表(M0〜M13)は、実際の進捗が`feature/file-io`ブランチ系の
+別ナンバリング(M14以降、`documents/abi-redesign.md`参照)で大きく先行して
+おり、機能カバレッジの観点では既にstaleである。一方、`za.c`(JIT)と
+`transpile.lisp`(AOT)がそれぞれ生成するコードの**性能最適化**の観点では、
+どちらがどの最適化を持つかを対応付けておく価値があるため、ここに記録する
+(詳しい計測・実装経緯は`documents/performance-measurement.md`参照)。
+
+| 最適化 | JIT(`za.c`) | AOT(`transpile.lisp`) |
+|---|---|---|
+| 非アロケーション演算のGC保護(GC_PROTECT/link-unlink)省略(leaf判定) | 適用済み(`za_operand_is_safe_leaf`、Phase1) | 適用済み(`aot-form-is-leaf`、2026-09-11) |
+| fixnum算術(`+`/`-`)のインライン化 | 適用済み(Phase2、インラインアセンブリ) | **未適用**(常に`primitive_add2`等の関数呼び出し) |
+| 関数呼び出し先のFunction Cell解決キャッシュ | 適用済み(呼び出しサイトごとのキャッシュスロット) | 適用済み(ABI-M6/M8の固定引数直接呼び出し、consリスト構築自体を回避) |
+| `os_is_control_transfer`チェックの省略 | leafオペランドでは元々発行しない(`za_emit_operand`) | leaf判定される引数のみ省略済み。関数呼び出し結果への一般的な省略は未着手(呼び出しグラフの到達可能性解析が必要、リスク高) |
+
+AOT側の「fixnum算術のインライン化」は未着手のまま残っている。`read-file-
+into-vector`のGC_PROTECT削減(-43.6%命令数)は`primitive_add2`/
+`primitive_less_than2`等の関数呼び出し自体のコストには手を付けていない
+ため、これをJIT Phase2と同種のインライン化(Cレベルなのでインライン
+アセンブリではなく`static inline`関数化等になる)で削減する余地が
+さらに残っている可能性が高い(未計測、フォローアップ候補)。
+
 ## 未解決の論点
 
 1. ~~M5のホストSBCLへの`load`+`macroexpand`方式が本当に成立するか~~

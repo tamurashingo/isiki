@@ -323,11 +323,145 @@ process_index]`、配列添字アクセス)だが、`GC_PROTECT`マクロが1回
 AOTトランスパイラ(`transpile.lisp`)側にも適用することを、新しい
 マイルストンとして提案する(本書の範囲外、別途指示書で計画する)。
 
+## AOT側GC_PROTECT削減(leaf判定)の実装と効果(2026-09-11)
+
+前節の判定に基づき、za.cのPhase1(`za_operand_is_safe_leaf`)と同じ基準を
+`transpile.lisp`に移植した。
+
+### 実装
+
+`transpile-call-args-guarded`(関数/プリミティブ呼び出しの各引数を1つずつ
+評価する箇所、AOT生成コードの`GC_PROTECT`発行源の大半を占める)に、新設の
+`aot-form-is-leaf`判定を組み込んだ。leafと判定される(=`GC_PROTECT`も
+`os_is_control_transfer`チェックも省略できる)のは以下の2ケースのみ
+(za.cの`za_operand_is_safe_leaf`と同一基準):
+
+- fixnum/文字リテラル(`os_make_fixnum`/`os_make_char`が返すのは即値で
+  ヒープ非経由、GCの再配置対象にならない)。
+- 非box化ローカル変数への参照(束縛時に一度だけ`GC_PROTECT`された
+  Cローカル変数を読むだけで、その保護は束縛を含む関数の実行が終わるまで
+  有効なまま。Lisp側の`setq`は非局所脱出シグナルを弾いてからでなければ
+  実際の代入を行わない生成コードのため、正しく評価が完了したローカル
+  変数がシグナル値そのものを保持することはない)。
+
+`za_emit_operand`(JIT側)がこれら2ケースで`CALL`命令を一切発行しない
+(movabs/レジスタロードのみ)ことを確認済みであり、AOT側でも同じ条件で
+`os_is_control_transfer`チェックまで安全に省略できると判断した(box化
+ローカル・グローバル変数・quoteシンボル・文字列リテラル・裸のT・関数
+呼び出し等は、za.c同様に安全側でleafとしない)。
+
+### 効果測定
+
+`read-file-into-vector`の内側ループ(`__lisp_lambda_417__step`、1byteの
+処理につき`(< i len)`→`(read-byte stream)`→`(set-elt byte vec i)`→
+`(setq i (+ i 1))`)の反復あたり`GC_PROTECT`呼び出しが**8回→1回**へ
+削減された(`(read-byte stream)`の戻り値のみ、後続の`set-elt`に渡すまで
+保護が必要なため残る)。
+
+| 計測 | 修正前 | 修正後 | 変化 |
+|---|---|---|---|
+| 1MB読み込みの命令数(TCGプラグイン) | 約2,562,646,170 | 1,444,529,546 | **-43.6%** |
+| 1MB読み込みの壁時計時間(tickカウンタ) | 31.28秒 | 14.40秒 | **-54.0%(2.17倍)** |
+
+壁時計時間の改善率が命令数の改善率を上回っているのは、削減された命令の
+多くが(`get_current_process`呼び出し等の)実関数呼び出し(CALL/RET)
+であり、TCGでの1命令あたりのディスパッチコストが均一ではない
+(関数呼び出し境界はより重い)ためと見られる。
+
+ネイティブ`make test`(8135件)・QEMU`make test-qemu`(1614→1620件、
+新設のGC整合性回帰テスト6件を含む)とも全てパスすることを確認済み。
+
+### GC整合性回帰テスト
+
+`test/lisp/aot_leaf_gc_test.lisp`(`qemu_boot_test.lisp`経由で標準テスト
+スイートに常設)を追加した。`write-vector-to-file`/`read-file-into-vector`
+(本改善の対象そのもの)で300KBのデータを往復させ、その前後で意図的に
+大量のゴミ`vector`を確保してGCを複数回誘発し、内容(`equal`での完全一致)
+が破損しないことを確認する。leaf判定は式の**静的な構文形**(fixnum/文字
+リテラルか、既存のscope alistでboxed-pがnilと分かるローカル変数参照か)
+だけに基づき実行時の値には一切依存しないため、za.cのfixnum溢れ時
+フォールバックのような「実行時に型で分岐する」境界ケースは存在しない
+(該当しない場合は常に安全側の保護付きパスにフォールバックする)。
+
+## `os_is_control_transfer`削減の調査(実装は見送り、2026-09-11)
+
+`is_control_transfer`の実装(`eval.c`)を確認した:
+
+```c
+static int is_control_transfer(lisp_val_t v) {
+    if ((v & TAG_MASK) != TAG_INSTANCE) {
+        return 0;
+    }
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[0] == MAGIC_BLOCK_EXIT || obj[0] == MAGIC_CATCH_EXIT || obj[0] == MAGIC_GO_EXIT;
+}
+```
+
+チェック自体は極めて軽い(非TAG_INSTANCE値なら1回のタグ比較のみで即座に
+falseを返し、メモリ参照すら発生しない)。にもかかわらず全体の27.3%を
+占めていた理由は、GC_PROTECTと同様に**呼び出し回数そのものの多さ**と、
+`os_is_control_transfer`が`eval.c`(別コンパイル単位)で定義された非
+`inline`関数であるため、`lisp_compiled.c`側の呼び出し元へインライン
+展開されず毎回実際のCALL/RETが発生していることにある。
+
+**上記のGC_PROTECT削減により、leaf判定される引数についてはこのチェック
+自体も既に併せて省略済み**である(残るのは、関数呼び出しの戻り値等
+「呼び出しを含む式」の結果に対するチェックのみ)。
+
+### 条件システムとの関係
+
+`isiki-os`の条件システム(`error`/`cerror`/`with-handler`、
+`src/lisp/init.lisp`/`init_aot.lisp`)は、`*handlers*`という動的変数
+スタックをたどってハンドラを直接`funcall`する設計であり、
+`block`/`catch`/`tagbody`の非局所脱出シグナル機構(`is_control_transfer`
+が検知する対象)とは**完全に別系統**である。したがって条件システムの
+挙動を壊す心配なく、`is_control_transfer`削減は`return-from`/`throw`/`go`
+の到達可能性だけを考えればよい。
+
+### 削減が難しい理由
+
+leaf判定(GC_PROTECT削減)は「この式の評価自体がヒープ確保も呼び出しも
+一切含まない」という、**式そのものの構文形だけ**から静的に判定できた。
+一方`os_is_control_transfer`を安全に省略するには、「この式(典型的には
+関数呼び出し)の評価結果が、`return-from`/`throw`/`go`による非局所脱出
+シグナルには絶対になりえない」ことを示す必要があり、これは式単体の
+構文形ではなく、**呼び出し先の関数の中身(さらにその中身が呼ぶ関数…)**
+まで辿らないと判定できない(=関数単位ではなく呼び出しグラフ全体の
+到達可能性解析が必要)。本セッション前半で`go`の直接goto化のために
+`*enclosing-tagbodies*`を導入したが、あれは「字句的に閉じた同一C関数内」
+という局所的な情報だけで済む特殊ケースであり、一般の関数呼び出しの
+戻り値には適用できない。
+
+### 判定: 実装は見送り、低リスクな代替案のみ記録
+
+`return-from`/`throw`/`go`の到達可能性解析は、GC_PROTECT削減より
+はるかに大きく・リスクの高い実装になる(呼び出しグラフ全体を辿る
+必要があり、相互再帰・前方参照・動的なfuncall経由の呼び出し等を
+どう扱うかという設計判断が新たに必要になる)ため、本マイルストンの
+スコープには含めない。
+
+代わりに、意味論を一切変えない、機械的で低リスクな代替案を記録して
+おく: `os_is_control_transfer`(および内部の`is_control_transfer`)を
+共有ヘッダで`static inline`として定義し直せば、コンパイラが
+`lisp_compiled.c`の各呼び出し箇所へインライン展開できるようになり、
+チェックの論理自体は変えずにCALL/RETのオーバーヘッドだけを除去できる
+可能性がある。ただし実際の効果はコンパイラの最適化判断(`-O1`ビルド、
+巨大な`lisp_compiled.c`1ファイルでのインライン化の可否)に依存するため
+未検証であり、着手する場合は本書の手法1(TCGプラグイン)で効果を
+確認すること。
+
 ## 今後のフォローアップ
 
 - ~~IDE読み込みの`ide.c`単独 vs それ以外の大枠切り分け~~ → 完了
   (「IDE読み込みの命令数内訳」節、`ide.c`は全体の0.368%のみ、FAT層+
   Lispランタイム側が99.632%)。
+- ~~read-file-into-vectorのAOT呼び出し規約オーバーヘッド(GC_PROTECT)の
+  削減~~ → 完了(「AOT側GC_PROTECT削減」節、命令数-43.6%・壁時計時間
+  -54.0%)。
+- ~~os_is_control_transferの削減可否調査~~ → 完了、実装は見送り
+  (「os_is_control_transfer削減の調査」節、削減には呼び出しグラフ全体の
+  到達可能性解析が必要でリスクが高い。`static inline`化という低リスクな
+  代替案のみ記録)。
 - ~~FAT層側(read-into!)のILOSディスパッチが支配的かどうかの切り分け~~
   → 完了(「FAT層側(read-into!)の命令数内訳」節、ディスパッチ自体は
   全体の0.0004%と無視できる規模。真因は`read-file-into-vector`のAOT
