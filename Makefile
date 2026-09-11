@@ -5,6 +5,14 @@ PWD = $(shell pwd)
 # `make test-qemu OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd` のように上書きする
 OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
 
+# 命令数ベースの性能計測(documents/performance-measurement.md参照)で使う
+# TCGプラグインのビルドに必要な、ホストにインストール済みのqemu-system-x86_64
+# バージョン(`qemu-system-x86_64 --version`で確認)。プラグインABI
+# (QEMU_PLUGIN_VERSION)はヘッダのバージョンとホストのQEMU本体バージョンが
+# 一致している必要があるため、`.envrc`等で実際のホスト側バージョンに
+# 合わせて上書きすること
+QEMU_VERSION_FOR_PLUGIN ?= 10.2.1
+
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
 # トランスパイラ(transpileターゲット)の生成物。git管理対象外で、これらの
@@ -612,6 +620,12 @@ test-qemu-perf:
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)
+# QEMU起動コマンドへ追加で渡す任意のフラグ。test-qemu-instcount/
+# test-qemu-icountが命令数計測プラグイン・-icountを差し込むのに使う
+# (documents/performance-measurement.md参照)。通常のtest-qemu-milestone
+# 単体実行では空のままで既存の振る舞いを変えない
+QEMU_EXTRA_FLAGS ?=
+
 test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
@@ -625,8 +639,45 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		$(QEMU_EXTRA_FLAGS) \
 		-no-reboot
 	rm -f .qemu-test-trigger
 	test -f test-results.txt
 	cat test-results.txt
 	grep -q " 0 failed" test-results.txt
+
+# 命令数ベースの性能計測基盤(documents/performance-measurement.md参照)。
+# ゲストが実際に実行した命令数を、ホストの実行速度・スケジューリング
+# ノイズと無関係にカウントするTCGプラグイン(tools/plugins/
+# isiki_instcount.c)。プラグイン本体はisiki-builderコンテナ内で
+# (QEMU_VERSION_FOR_PLUGINに対応する)qemu-plugin.hを取得してビルドする
+# (ソースからの再ビルドを前提とし、.soはgit管理対象外)。stderrへ
+# `[isiki_instcount] total_insns=<N>` の形式で報告する。
+INSTCOUNT_PLUGIN = tools/plugins/isiki_instcount.so
+
+$(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
+	docker run --rm --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder -c '\
+		set -e; \
+		apt-get update -qq; \
+		apt-get install -y -qq libglib2.0-dev pkg-config curl >/dev/null; \
+		mkdir -p tools/plugins/build; \
+		curl -sL https://raw.githubusercontent.com/qemu/qemu/v$(QEMU_VERSION_FOR_PLUGIN)/include/qemu/qemu-plugin.h -o tools/plugins/build/qemu-plugin.h; \
+		gcc -shared -fPIC -Wall -Wextra -O2 -Itools/plugins/build $$(pkg-config --cflags glib-2.0) -o $(INSTCOUNT_PLUGIN) tools/plugins/isiki_instcount.c $$(pkg-config --libs glib-2.0)'
+
+# 使い方: make test-qemu-instcount MILESTONE=test/lisp/qemu_boot_xxx.lisp
+# [QEMU_DISK_IMG=...]。既存のtest-qemu-milestoneと同じ引数を受け付ける
+test-qemu-instcount: $(INSTCOUNT_PLUGIN)
+	$(MAKE) test-qemu-milestone QEMU_EXTRA_FLAGS="-plugin file=$(INSTCOUNT_PLUGIN)"
+
+# 決定論的実行モード(-icount)での計測(documents/performance-measurement.md
+# 参照)。1命令ごとに仮想時間を進めるため、ホストの実行速度と無関係に常に
+# 同じ結果が再現される。ただしI/Oが絡む大きなワークロード(IDE PIO読み込み等)
+# は実時間で非常に遅くなる(実測: 通常運転なら数秒で終わるN=1,000,000の
+# JITループが3分強かかった)ため、小規模な決定論的A/B比較に用途を限定する
+# こと。マルチスレッドTCGと非互換なのでaccelも合わせて上書きする
+ICOUNT_SHIFT ?= 7
+
+# 使い方: make test-qemu-icount MILESTONE=test/lisp/qemu_boot_xxx.lisp
+# [QEMU_DISK_IMG=...] [ICOUNT_SHIFT=N]
+test-qemu-icount:
+	$(MAKE) test-qemu-milestone QEMU_EXTRA_FLAGS="-accel tcg,thread=single -icount shift=$(ICOUNT_SHIFT)"
