@@ -4209,6 +4209,7 @@ static lisp_val_t za_rewrite_binding_list(lisp_val_t bindings, lisp_val_t env, c
  * fallbackする。
  */
 static lisp_val_t za_rewrite_body_list(lisp_val_t forms, lisp_val_t env, const za_fn_scope_t *scope, int *ok) {
+    GC_DEBUG_CLASSIFY(env); /* [GCデバッグ] stale仮説の直接確認(入口でenvの所属空間を数える) */
     if (forms == nil) {
         return nil;
     }
@@ -4241,6 +4242,7 @@ static lisp_val_t za_rewrite_body_list(lisp_val_t forms, lisp_val_t env, const z
  * 同じscope(=呼び出し元、まだ入れ子自身の新しい束縛は含まない)を保って再帰する。
  */
 static lisp_val_t za_rewrite_binding_list(lisp_val_t bindings, lisp_val_t env, const za_fn_scope_t *scope, int *ok) {
+    GC_DEBUG_CLASSIFY(env); /* [GCデバッグ] stale仮説の直接確認(入口でenvの所属空間を数える) */
     if (bindings == nil) {
         return nil;
     }
@@ -4304,6 +4306,7 @@ static lisp_val_t za_rewrite_binding_list(lisp_val_t bindings, lisp_val_t env, c
  * @return 書き換え後のフォーム(新しいcons構造、コンパイル時アロケーション)
  */
 static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_fn_scope_t *scope, int *ok) {
+    GC_DEBUG_CLASSIFY(env); /* [GCデバッグ] stale仮説の直接確認(入口でenvの所属空間を数える) */
     form = za_macroexpand(form, env);
     // nilはTAG_CONS(g_nil_cellへの自己参照)なので次のTAG_CONSチェックだけでは
     // 素通りしてしまい、cc_car(nil)=nilをheadとして扱った結果、一般呼び出し分岐

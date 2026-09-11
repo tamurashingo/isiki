@@ -804,8 +804,12 @@ int os_gc_debug_is_stale(lisp_addr_t addr);
 void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site);
 #define GC_DEBUG_ASSERT_LIVE(obj, where) \
     os_gc_debug_assert_live((obj), (where), __builtin_return_address(0))
+/** 値がどの空間に属するかを分類して計数する(stale仮説の直接確認用) */
+void os_gc_debug_classify(lisp_val_t v);
+#define GC_DEBUG_CLASSIFY(v) os_gc_debug_classify(v)
 #else
 #define GC_DEBUG_ASSERT_LIVE(obj, where) ((void)0)
+#define GC_DEBUG_CLASSIFY(v) ((void)0)
 #endif
 
 /**

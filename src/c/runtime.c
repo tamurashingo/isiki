@@ -421,6 +421,35 @@ void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site) {
     }
 }
 
+/* [GCデバッグ] stale仮説の直接確認。値がFrom空間(=生きている側)か
+   To空間(=旧From空間、stale)かその他(Immobilized/静的)かを入口で分類して数える。
+   検査点の列挙(cc_car等)では捉えられない経路のために、対象関数の入口へ直接置く */
+static UINT64 g_gc_cls_live = 0;   /* From空間 = 正常 */
+static UINT64 g_gc_cls_stale = 0;  /* To空間 = staleを指している */
+static UINT64 g_gc_cls_other = 0;  /* どちらでもない(Immobilized/静的) */
+
+void os_gc_debug_classify(lisp_val_t v) {
+    lisp_addr_t addr = (lisp_addr_t)(v & ~TAG_MASK);
+    if (addr == 0) { return; }
+    if (addr >= (lisp_addr_t)g_from_start && addr < (lisp_addr_t)g_from_end) {
+        g_gc_cls_live++;
+    } else if (addr >= (lisp_addr_t)g_to_start && addr < (lisp_addr_t)g_to_end) {
+        g_gc_cls_stale++;
+    } else {
+        g_gc_cls_other++;
+    }
+}
+
+lisp_val_t cc_diag_gc_cls(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 which = os_fixnum_magnitude(cc_car(args));
+    if (which == 0) { return os_make_fixnum(g_gc_cls_live); }
+    if (which == 1) { return os_make_fixnum(g_gc_cls_stale); }
+    if (which == 2) { return os_make_fixnum(g_gc_cls_other); }
+    g_gc_cls_live = 0; g_gc_cls_stale = 0; g_gc_cls_other = 0;
+    return nil;
+}
+
 lisp_val_t cc_diag_gc_stale_sites(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum(g_gc_debug_site_count);
@@ -1557,6 +1586,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_sites), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_site_addr), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-CLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_cls), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-STALE-RESET"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_reset), global_environment);
 
         #endif
