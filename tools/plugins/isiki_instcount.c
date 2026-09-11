@@ -17,6 +17,18 @@
  *   (JIT生成コードはヒープ上の動的アドレスのため、AOT/Cで静的アドレスが
  *   既知な関数区間の切り分けに主に有効)。
  *
+ * 【重要】start/endに渡す実行時アドレスは、ビルド成果物(BOOTX64.EFI)の
+ * シンボルテーブルが示すファイル上の相対仮想アドレス(RVA)そのままでは
+ * 使えない。UEFIローダが実際にイメージをロードする実行時ベースアドレスは
+ * 起動のたびに変わりうるだけでなく、**アタッチするディスクイメージの構成
+ * (サイズ・パーティション形式の違い)によっても変わる**ことを実測で確認済み
+ * (documents/performance-measurement.md「IDE読み込みの命令数内訳」節参照)。
+ * 同一のディスク構成であれば起動ごとの再現性はある(2回検証済み)ため、
+ * 計測対象と全く同じQEMUコマンドライン(同じディスクイメージ)で、まず
+ * 実行時アドレスを取得してから(例: src/c/ide_subprimitive.cの
+ * cc_diag_ide_read_sectors_addrのような診断用組み込み関数でos_ide_
+ * read_sectors等の実行時ポインタ値を取得)、start/endを計算すること。
+ *
  * 終了時(qemu_plugin_register_atexit_cb)にstderrへ
  *   [isiki_instcount] total_insns=<N> range_insns=<M>
  * の形式で出力する。
