@@ -450,6 +450,63 @@ leaf判定(GC_PROTECT削減)は「この式の評価自体がヒープ確保も�
 未検証であり、着手する場合は本書の手法1(TCGプラグイン)で効果を
 確認すること。
 
+## AOT側fixnum算術インライン化(Phase 2相当)の投資対効果見積もり(2026-09-11)
+
+GC_PROTECT削減後の残り約14.4億命令のうち、`primitive_add2`/
+`primitive_less_than2`(呼び出し先の中身も含む)がどれだけを占めるかを、
+実測プロファイラ(`profile=1`)のtop40出力をシンボルへ対応付けて計測した。
+前回・前々回の教訓通り、アドレス範囲は静的に予想せず、計測対象と同一
+ディスク構成で`%%DIAG-IDE-READ-SECTORS-ADDR`により実測した
+(`0xd00d000`)。
+
+| 区分 | 命令数(top40内) | 残り14.4億に占める割合 |
+|---|---|---|
+| `primitive_add2` | 121,852,560 | 8.44% |
+| `primitive_less_than2` | 15,156,140 | 1.05% |
+| **合計** | **137,008,700** | **9.48%** |
+
+参考(同じtop40内での他の主要項目との比較):
+
+| 区分 | 割合 |
+|---|---|
+| `get_current_process`(GC_PROTECT、削減後も残る1回分) | 11.05% |
+| `is_control_transfer`+`os_is_control_transfer`(合算) | 13.46% |
+| `primitive_set_elt_impl`(書き込みの実処理そのもの) | 7.54% |
+| `number_compare`(`primitive_less_than2`が委譲する先、下記参照) | 7.2%(上表には含めず) |
+
+### 判定: 「中間的な結果」、ただし実装コストに大きな非対称性がある
+
+9.48%は判定基準の「10〜15%以上(着手)」と「5%未満(見送り)」の中間に
+位置する。着手可否を左右する重要な非対称性として、`primitive_add2`と
+`primitive_less_than2`とで実装のしやすさが大きく異なることが判明した:
+
+- **`primitive_add2`**: 既に非負fixnum同士の高速パス(オーバーフロー
+  チェック込み)を持つ小さな自己完結関数(`runtime.c`)。`za.c`のように
+  生の機械語を生成する必要は無く、**この関数を`static inline`として
+  共有ヘッダへ移し、コンパイラに`lisp_compiled.c`側の呼び出し箇所へ
+  インライン展開させるだけ**で、CALL/RETのオーバーヘッドをほぼ排除
+  できる可能性が高い(低リスク・低実装コスト)。
+- **`primitive_less_than2`**: `return number_compare(a, b) < 0 ? ... : ...;`
+  という薄いラッパーで、実処理は`number_compare`(bignum/float等を含む
+  汎用の多相比較、大きめの関数)に委譲している。`primitive_less_than2`
+  自体を`static inline`化しても、`number_compare`への呼び出し自体は
+  残る(`number_compare`は大きく`-O1`でのインライン化候補になりにくい)
+  ため、`primitive_add2`ほどの効果は見込めない。fixnum同士の比較専用の
+  高速パスを`primitive_less_than2`自身に追加する(`number_compare`への
+  委譲を、非fixnum時のみのフォールバックにする)実装が必要で、
+  `primitive_add2`より実装コストが高い。
+
+### 次のアクション(本書のスコープ外、別途指示書で計画)
+
+`za.c`のPhase2(生の機械語を手書き生成)をそのままAOTへ移植するのではなく、
+**まず`primitive_add2`(および同様の自己完結な高速パスを持つ2引数
+プリミティブ)を`static inline`化する、より小さく低リスクな一手から
+着手する**ことを推奨する。これは前節で記録した`os_is_control_transfer`の
+`static inline`化案と同じ手法(意味論を変えずコンパイラのインライン化に
+委ねる)であり、まとめて1つのマイルストンとして計画できる可能性がある。
+`primitive_less_than2`/`number_compare`側のfixnum高速パス追加は、効果が
+不確実なため、`primitive_add2`側の実測結果を見てから改めて判断する。
+
 ## 今後のフォローアップ
 
 - ~~IDE読み込みの`ide.c`単独 vs それ以外の大枠切り分け~~ → 完了
