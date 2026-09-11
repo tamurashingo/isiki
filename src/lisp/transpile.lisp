@@ -537,6 +537,10 @@
     (< 2 . "primitive_less_than2")
     (> 2 . "primitive_greater_than2")
     (>= 2 . "primitive_greater_equal2")
+    ;; [ABI刷新] 2026-09-11: primitive_add2_inline(runtime.h、static inline
+    ;; +always_inline)を試したが、-O1ビルドでの実測で逆に命令数・壁時計時間
+    ;; とも悪化することを確認したため元に戻した(documents/performance-
+    ;; measurement.md「AOT側primitive_add2のstatic inline化」節参照)。
     (+ 2 . "primitive_add2")
     (- 2 . "primitive_subtract2")
     (set-car 2 . "primitive_set_car2")

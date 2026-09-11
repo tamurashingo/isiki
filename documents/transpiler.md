@@ -371,16 +371,21 @@ init.lispは巨大なので、M8で対応範囲を「まず`and`/`or`が通る�
 | 最適化 | JIT(`za.c`) | AOT(`transpile.lisp`) |
 |---|---|---|
 | 非アロケーション演算のGC保護(GC_PROTECT/link-unlink)省略(leaf判定) | 適用済み(`za_operand_is_safe_leaf`、Phase1) | 適用済み(`aot-form-is-leaf`、2026-09-11) |
-| fixnum算術(`+`/`-`)のインライン化 | 適用済み(Phase2、インラインアセンブリ) | **未適用**(常に`primitive_add2`等の関数呼び出し) |
+| fixnum算術(`+`/`-`)のインライン化 | 適用済み(Phase2、インラインアセンブリ) | **試みたがrevert**(`primitive_add2`の`static inline`化、`-O1`で命令数+4.7%・壁時計時間約2倍の悪化を実測、常に`primitive_add2`等の関数呼び出しのまま) |
 | 関数呼び出し先のFunction Cell解決キャッシュ | 適用済み(呼び出しサイトごとのキャッシュスロット) | 適用済み(ABI-M6/M8の固定引数直接呼び出し、consリスト構築自体を回避) |
 | `os_is_control_transfer`チェックの省略 | leafオペランドでは元々発行しない(`za_emit_operand`) | leaf判定される引数のみ省略済み。関数呼び出し結果への一般的な省略は未着手(呼び出しグラフの到達可能性解析が必要、リスク高) |
 
-AOT側の「fixnum算術のインライン化」は未着手のまま残っている。`read-file-
-into-vector`のGC_PROTECT削減(-43.6%命令数)は`primitive_add2`/
-`primitive_less_than2`等の関数呼び出し自体のコストには手を付けていない
-ため、これをJIT Phase2と同種のインライン化(Cレベルなのでインライン
-アセンブリではなく`static inline`関数化等になる)で削減する余地が
-さらに残っている可能性が高い(未計測、フォローアップ候補)。
+AOT側の「fixnum算術のインライン化」は、JIT Phase2と同種のアプローチ
+(`primitive_add2`を`static inline`化しコンパイラのインライン化に委ねる)
+を実装・実測したところ、`-O1`ビルドではコンパイラが実際にインライン
+展開したにもかかわらず命令数・壁時計時間とも悪化することが判明し、
+revertした(`documents/performance-measurement.md`「AOT側primitive_add2の
+static inline化」節参照)。JIT(za.cのPhase2)が生の機械語を直接手書きする
+ことで確実に効果を出せるのに対し、AOTのC言語レベルでの「インライン化」は
+Cコンパイラの最適化パイプライン全体に委ねることになり、確実な改善を
+保証しない、という根本的な違いが実測で明らかになった。再検討する場合は
+`-O2`ビルドでの再実測、またはコンパイラの判断を経由しないコード生成
+レベルでのインライン化(za.cと同じ確実性が必要)のいずれかが前提となる。
 
 ## 未解決の論点
 
