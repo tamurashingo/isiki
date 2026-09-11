@@ -801,8 +801,9 @@ void os_panic(const char *msg);
 /** 旧From空間(stale領域)を指すアドレスかどうか */
 int os_gc_debug_is_stale(lisp_addr_t addr);
 /** staleなオブジェクトのデリファレンスを検出したら診断付きで停止する */
-void os_gc_debug_assert_live(lisp_val_t obj, const char *where);
-#define GC_DEBUG_ASSERT_LIVE(obj, where) os_gc_debug_assert_live((obj), (where))
+void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site);
+#define GC_DEBUG_ASSERT_LIVE(obj, where) \
+    os_gc_debug_assert_live((obj), (where), __builtin_return_address(0))
 #else
 #define GC_DEBUG_ASSERT_LIVE(obj, where) ((void)0)
 #endif

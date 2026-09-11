@@ -371,6 +371,12 @@ void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
 /** [GCデバッグ] staleなデリファレンスを検出した回数 */
 static UINT64 g_gc_debug_stale_hits = 0;
 
+/** [GCデバッグ] GC実行中フラグ。GC自身がコピー先(To空間)のオブジェクトを
+    cc_car/cc_cdrで走査するため、その参照までstaleと誤判定してしまう。
+    対照実験(za.cを通らないワークロード+強制GC)で2,044件の誤検出として
+    現れたことで判明した */
+static int g_gc_debug_in_gc = 0;
+
 lisp_val_t cc_diag_gc_stale_hits(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum(g_gc_debug_stale_hits);
@@ -380,18 +386,65 @@ int os_gc_debug_is_stale(lisp_addr_t addr) {
     return addr >= (lisp_addr_t)g_to_start && addr < (lisp_addr_t)g_to_end;
 }
 
-void os_gc_debug_assert_live(lisp_val_t obj, const char *where) {
+/** [GCデバッグ] 検出した発生箇所(呼び出し元の戻りアドレス)ごとの回数。
+    2,035という数字が「箇所」ではなく「回数」である可能性が高いため、
+    dedupeして実際のバグ箇所数を出すために使う(同じ未保護変数が再帰の各段で
+    読まれれば1つのバグが深さぶんの検出を生む) */
+#define GC_DEBUG_MAX_SITES 64
+static void *g_gc_debug_sites[GC_DEBUG_MAX_SITES];
+static UINT64 g_gc_debug_site_hits[GC_DEBUG_MAX_SITES];
+static UINT32 g_gc_debug_site_count = 0;
+
+void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site) {
     (void)where;
     lisp_addr_t addr = (lisp_addr_t)(obj & ~TAG_MASK);
     if (addr == 0) {
         return;
     }
-    // [GCデバッグ] panicではなく**計数**する。ブート中だけでも多数踏むことが
-    // 実測で分かっており、最初の1件で止めると全体像が掴めないため。
-    // 「保護漏れがどこにどれだけあるか」を調べる調査用の網として使う
-    if (os_gc_debug_is_stale(addr)) {
-        g_gc_debug_stale_hits++;
+    if (g_gc_debug_in_gc) {
+        return; /* GC自身の走査は対象外 */
     }
+    if (!os_gc_debug_is_stale(addr)) {
+        return;
+    }
+    g_gc_debug_stale_hits++;
+    for (UINT32 i = 0; i < g_gc_debug_site_count; i++) {
+        if (g_gc_debug_sites[i] == site) {
+            g_gc_debug_site_hits[i]++;
+            return;
+        }
+    }
+    if (g_gc_debug_site_count < GC_DEBUG_MAX_SITES) {
+        g_gc_debug_sites[g_gc_debug_site_count] = site;
+        g_gc_debug_site_hits[g_gc_debug_site_count] = 1;
+        g_gc_debug_site_count++;
+    }
+}
+
+lisp_val_t cc_diag_gc_stale_sites(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_debug_site_count);
+}
+
+lisp_val_t cc_diag_gc_stale_site_addr(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_debug_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum((UINT64)(lisp_addr_t)g_gc_debug_sites[i]);
+}
+
+lisp_val_t cc_diag_gc_stale_site_hits(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_debug_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum(g_gc_debug_site_hits[i]);
+}
+
+lisp_val_t cc_diag_gc_stale_reset(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    g_gc_debug_stale_hits = 0;
+    g_gc_debug_site_count = 0;
+    return nil;
 }
 #endif
 
@@ -1212,6 +1265,9 @@ static void gc_fixup_environment_cells(lisp_val_t env) {
  * 生存オブジェクトをTo空間へコピーし、完了後にFrom/To空間を入れ替える。
  */
 void os_gc_collect(void) {
+#ifdef ISIKIOS_GC_DEBUG
+    g_gc_debug_in_gc = 1;
+#endif
 #ifdef ISIKIOS_GC_PAINT
     // [GCデバッグ] 入れ替え後に塗り潰す範囲(旧From空間の使用済み末尾)を控える
     UINT8 *gc_debug_old_used_end = g_from_ptr;
@@ -1316,6 +1372,10 @@ void os_gc_collect(void) {
     g_to_start = new_to_start;
     g_to_end = new_to_end;
     g_to_ptr = g_to_start;
+
+#ifdef ISIKIOS_GC_DEBUG
+    g_gc_debug_in_gc = 0;
+#endif
 
 #ifdef ISIKIOS_GC_PAINT
     // [GCデバッグ] 入れ替え後のTo空間(=旧From空間)がstale領域そのものなので、
@@ -1494,6 +1554,10 @@ void os_bootstrap() {
 
         os_set_function(os_make_symbol("%%DIAG-GC-STRESS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stress), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-STALE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_sites), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_site_addr), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-RESET"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_reset), global_environment);
 
         #endif
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
@@ -1565,6 +1629,7 @@ void os_bootstrap() {
  * @return 見つかった値。未定義の場合はnil
  */
 lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env) {
+    GC_DEBUG_ASSERT_LIVE(env, "os_get_variable");
     lisp_val_t current_env = env;
 
     /*
