@@ -334,14 +334,21 @@ lisp_val_t cc_stream_ready_p(lisp_val_t args, lisp_val_t env) {
     return g_sym_t;
 }
 
-lisp_val_t cc_read_byte(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    os_stream_t *raw = stream_raw(cc_car(args));
+/** cc_read_byteの固定引数版(read-file-into-vector等のバイト単位ループが
+ * 1byteごとにconsリストを構築するコストを避けるため、consチェーンを経由せず
+ * 直接呼べるようにする)。意味論はcc_read_byteと完全に同じ。 */
+lisp_val_t cc_read_byte1(lisp_val_t stream) {
+    os_stream_t *raw = stream_raw(stream);
     char ch;
     if (!os_stream_read_char(raw, &ch)) {
         return nil;
     }
     return os_make_fixnum((UINT64)(UINT8)ch);
+}
+
+lisp_val_t cc_read_byte(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return cc_read_byte1(cc_car(args));
 }
 
 lisp_val_t cc_write_byte(lisp_val_t args, lisp_val_t env) {

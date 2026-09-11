@@ -128,7 +128,10 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
     lisp_addr_t addr = fn & ~TAG_MASK;
     UINT64 *obj = (UINT64 *)addr;
     if (obj[0] == MAGIC_FUNCTION_NATIVE) {
-        lisp_val_t (*fnptr)(lisp_val_t, lisp_val_t) = (lisp_val_t (*)(lisp_val_t, lisp_val_t))obj[1];
+        // ABI-M4: word1はza_fn_meta_tへの生ポインタ。meta->cons_entryが従来通りの
+        // consリストABI fn(evaluated_args, env)の実体を指す(fixed_entryはABI-M5まで未使用)。
+        za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+        lisp_val_t (*fnptr)(lisp_val_t, lisp_val_t) = (lisp_val_t (*)(lisp_val_t, lisp_val_t))meta->cons_entry;
         // word2がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)の場合、
         // word3(定義時に捕捉した自由変数を保持する環境)をenv引数として渡す。
         // 呼び出し元のenvではなく、リフトされた関数本体が自由変数を解決できる

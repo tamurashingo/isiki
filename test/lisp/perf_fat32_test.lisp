@@ -1,6 +1,12 @@
 ;; test/lisp/perf_fat32_test.lisp
 ;;
 ;; [ファイルI/O]#52(M9): perf_fat16_test.lispのFAT32版(コメントはそちら参照)。
+;;
+;; [ABI刷新] 2026-09-10改訂: perf_fat16_test.lispと同じ理由で、テストデータを
+;; 9P経由のホストファイル読み込みから、JITコンパイルされるwhileループでの
+;; その場生成(%%perf-make-fill-vector)へ変更した。9Pはベアメタル実機では
+;; 使われない暫定的な経路であり、このテストが計測すべきはFAT32自体の読み書き
+;; 性能のみ。
 
 (defglobal *perf-test-device* (%device-handle 'blk0))
 (mount "/mnt" 'blk0 ':fat32)
@@ -25,13 +31,34 @@
 (assert-equal 90 (elt perf-bigwrite-after 0))
 (assert-equal 90 (elt perf-bigwrite-after (- perf-bigwrite-len 1)))
 
-;;; --- #41: カーネル自身のブートバイナリ(約1.76MB)の読み込み性能 ---
-(defglobal perf-kernel-bytes (read-file-into-vector "/9p/esp_dir/EFI/BOOT/BOOTX64.EFI"))
-(assert-equal t (if perf-kernel-bytes t nil))
-(defglobal perf-kernel-len (length perf-kernel-bytes))
+;;; --- #41: 大きなファイル(旧カーネルバイナリ相当、約2MB)の読み込み性能 ---
+;; (%%perf-make-fill-vector n) : perf_fat16_test.lispと同じ(コメントはそちら参照。
+;; modを避けたincrement-and-wrap方式)
+(defun %%perf-make-fill-vector (n)
+  (let ((v (create-vector n 0)) (i 0) (b 0))
+    (while (< i n)
+      (progn
+        (set-elt b v i)
+        (setq b (if (>= b 255) 0 (+ b 1)))
+        (setq i (+ i 1))))
+    v))
+
+(defglobal perf-kernel-len 2000000)
 (assert-equal t (> perf-kernel-len 1000000))
 
+(defglobal perf-fill-t0 (get-internal-real-time))
+(defglobal perf-kernel-bytes (%%perf-make-fill-vector perf-kernel-len))
+(defglobal perf-fill-t1 (get-internal-real-time))
+(assert-equal t (%%za-compiled-p (function %%perf-make-fill-vector)))
+(assert-equal perf-kernel-len (length perf-kernel-bytes))
+(format *isiki-test-stream* "[参考] テストデータ~A byteの生成(JIT、FAT32とは無関係)に約~A秒かかった~%"
+        perf-kernel-len (/ (- perf-fill-t1 perf-fill-t0) (internal-time-units-per-second)))
+
+(defglobal perf-write-t0 (get-internal-real-time))
 (assert-equal t (if (fat32-create-file *perf-test-device* "/KERNEL.BIN" perf-kernel-bytes) t nil))
+(defglobal perf-write-t1 (get-internal-real-time))
+(format *isiki-test-stream* "[参考] fat32-create-fileでの~A byte一括書き込みに約~A秒かかった~%"
+        perf-kernel-len (/ (- perf-write-t1 perf-write-t0) (internal-time-units-per-second)))
 
 (defglobal perf-read-t0 (get-internal-real-time))
 (defglobal perf-kernel-readback (read-file-into-vector "/mnt/KERNEL.BIN"))
@@ -44,7 +71,7 @@
   (/ (- perf-read-t1 perf-read-t0) (internal-time-units-per-second)))
 (format *isiki-test-stream* "#41: KERNEL.BIN(~A byte)の読み込みに約~A秒かかった~%"
         perf-kernel-len perf-read-seconds)
-;; 閾値の根拠はperf_fat16_test.lisp参照。FAT16実測(約2.0MBで約1063秒)に
-;; M8で確認済みのFAT16/FAT32比(1.2MBで約14分/約25分、約1.79倍)を掛けた
-;; 見込み値(約1900秒)へ安全マージンを載せ、3000秒とする。
-(assert-equal t (< perf-read-seconds 3000))
+;; [ABI刷新] 2026-09-10改訂: perf_fat16_test.lispと同じ理由で閾値を更新。
+;; 旧閾値(FAT16実測1063秒にFAT16/FAT32比1.79倍を掛けた3000秒)は
+;; B'/A/B適用後の実測には大幅に保守的すぎるため縮小する。
+(assert-equal t (< perf-read-seconds 500))

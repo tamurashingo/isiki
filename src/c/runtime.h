@@ -193,6 +193,14 @@ lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数%%GC-COLLECT-COUNT。os_gc_collect_count(累積GC発火回数)をfixnumで返す。
+ * ABI-M0: JIT実行下でのcons-list経由呼び出しのヒープ確保圧を計測するベンチマーク
+ * (test/lisp/abi_bench.lisp)が、ホットループの前後でこの値と%%HEAP-USED-BYTESの
+ * 差分を取るために使う。
+ */
+lisp_val_t primitive_gc_collect_count(lisp_val_t args, lisp_val_t env);
+
+/**
  * boot直後からLisp起動(os_heap_init)までの間だけ使えるbumpアロケータを、
  * base〜base+sizeの範囲で初期化する。os_heap_initより前に呼ぶこと。
  * @param base アロケータが使える領域の先頭アドレス
@@ -416,6 +424,25 @@ lisp_val_t os_make_cons(const lisp_val_t car, const lisp_val_t cdr);
  * @return タグ付けされたSYMBOL
  */
 lisp_val_t os_make_symbol(const char *name);
+
+/**
+ * [ABI刷新] AOT改善B: os_make_symbolの呼び出し元が、同一呼び出し箇所(コール
+ * サイト)専用のキャッシュスロットを持てる版。*cache_idxは呼び出し元(通常は
+ * その箇所だけのC static局所変数)が保持する、g_symbol_table上の添字キャッシュ
+ * (未解決なら-1、名前が"NIL"でg_symbol_tableに登録されない特殊センチネルの
+ * 場合は-2)。2回目以降の呼び出しはg_symbol_table[idx]を直接返すだけで、
+ * ハッシュ計算・文字列比較を一切行わない。g_symbol_tableは毎GCで通常通り
+ * 更新される(gc_copy_valueで所定の添字のまま上書き)ため、このキャッシュ自体は
+ * 「添字」を保持するだけで追加のGCルート登録は不要(symbol_hash_lookup/
+ * symbol_hash_insertと同じ理由)。transpile.lispのtranspile-quoted(AOT生成
+ * コードのquoteシンボルリテラル)が呼び出し箇所ごとに
+ * `({ static int idx = -1; os_make_symbol_cached(&idx, "NAME"); })`という
+ * 形で使う想定。
+ * @param cache_idx 呼び出し元が保持するキャッシュ状態(呼び出しごとに書き換わる)
+ * @param name symbol名
+ * @return タグ付けされたSYMBOL(os_make_symbolと同じ結果)
+ */
+lisp_val_t os_make_symbol_cached(int *cache_idx, const char *name);
 
 /**
  * name(大文字化される)の新しいsymbolを、名前の重複チェックもg_symbol_tableへの
@@ -676,6 +703,31 @@ void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr)
 void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp_val_t *slot_addr));
 
 /**
+ * ABI-M4: MAGIC_FUNCTION_NATIVEのword1が指すメタデータ(dual-entry設計の土台)。
+ * Immobilized Space上に確保する生データ構造体で、フィールドはいずれもコード
+ * 領域を指す不変の生関数ポインタ(またはABI-M5用の未使用値0)のため、GCの
+ * スキャン対象にはならない(gc_scan_instanceがword1を素通しするのは従来通り、
+ * 「指す先の構造体の中身」もGC非対象という点が変わらない)。cons_entryを
+ * 先頭(offset 0)固定にしているのは、za.c(za_ensure_trampoline)が手書きの
+ * 機械語からシンボルオフセット無しで直接dereferenceできるようにするため。
+ * fixed_entry/arityは本マイルストンでは常に0(=未対応)で、ABI-M5で実際に
+ * 使われるようになるまで振る舞いに影響しない。
+ */
+typedef struct {
+    UINT64 cons_entry;  /* offset 0: 従来のconsリストABI fn(evaluated_args, env) */
+    UINT64 fixed_entry; /* offset 8: ABI-M5で使う固定引数エントリ(現状は常に0) */
+    UINT64 arity;       /* offset 16: ABI-M5で使う固定arity(現状は常に0) */
+} za_fn_meta_t;
+
+/**
+ * cons_entryを設定したza_fn_meta_tをImmobilized Spaceに確保する
+ * (fixed_entry/arityは0で初期化、ABI-M5まで未使用)。
+ * @param cons_entry 従来のconsリストABI(fn(evaluated_args, env))の関数ポインタ
+ * @return 確保したza_fn_meta_tへの生ポインタ(GC非対象の固定アドレス)
+ */
+za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry);
+
+/**
  * fnptrをネイティブ(C)関数として呼び出すTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すC関数のアドレス
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)
@@ -688,6 +740,21 @@ lisp_val_t os_make_native_function(lisp_addr_t fnptr);
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
 lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
+
+/**
+ * os_make_jit_functionのdual-entry版(ABI-M5)。cons_entry(従来のconsリストABI
+ * fn(evaluated_args, env))に加え、fixed_entry(固定引数レジスタ渡し
+ * fn(env, arg0, ...)、za.cのza_try_compile_defunがパラメータスロット方式
+ * (fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS、&restなし、lambda/flet/labelsを
+ * 含まない関数のみ)で生成)とそのarityをza_fn_meta_tへ設定する。za_compile_call
+ * が実引数個数とarityが一致する静的呼び出しに対し、consリストを経由せず
+ * fixed_entryをレジスタ渡しで直接callできるようにする。
+ * @param cons_entry 従来のconsリストABIのJITコンパイル済みアドレス
+ * @param fixed_entry 固定引数レジスタ渡しのJITコンパイル済みアドレス
+ * @param arity fixed_entryが受け取る固定引数の個数
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_entry, UINT64 arity);
 
 /**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
@@ -1008,6 +1075,13 @@ lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_numberpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return 数値ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_numberp1(lisp_val_t val);
+
+/**
  * 組み込み関数FIXNUMP。第一引数がFIXNUMかどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
@@ -1016,12 +1090,26 @@ lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_fixnumpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return FIXNUMならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_fixnump1(lisp_val_t val);
+
+/**
  * 組み込み関数BIGNUMP。第一引数が60bitを超える整数(bignum、MAGIC_BIGNUMのINSTANCE)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return bignumならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_bignumpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return bignumならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_bignump1(lisp_val_t val);
 
 /**
  * doubleの値をMAGIC_FLOATのINSTANCEとしてヒープに確保する。word1にdoubleの
@@ -1054,6 +1142,13 @@ double bignum_to_double(lisp_val_t val);
  * @return floatならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_floatpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_floatp1(lisp_val_t val);
 
 /**
  * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
@@ -1165,6 +1260,13 @@ lisp_val_t primitive_parse_number(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_symbolpの非allocatingな核ロジック(za向け)。nilもsymbolとして扱う。
+ * @param val 判定対象
+ * @return symbolならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_symbolp1(lisp_val_t val);
+
+/**
  * 組み込み関数CONSP。第一引数がconsかどうかを判定する。
  * nilは内部表現上TAG_CONSだが、ISLisp上はconsではないため val == nil は偽と判定する。
  * @param args 評価済みの引数リスト
@@ -1172,6 +1274,14 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env);
  * @return consならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_conspの非allocatingな核ロジック(za向け)。nilはISLisp上consではないため
+ * val == nilは偽と判定する。
+ * @param val 判定対象
+ * @return consならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_consp1(lisp_val_t val);
 
 /**
  * primitive_conspの論理否定にあたる非allocatingな核ロジック(za向け)。nilはconsでは
@@ -1220,12 +1330,26 @@ lisp_val_t primitive_equal(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_listpの非allocatingな核ロジック(za向け)。nilはlist(空リスト)として扱う。
+ * @param val 判定対象
+ * @return listならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_listp1(lisp_val_t val);
+
+/**
  * 組み込み関数CHARACTERP。第一引数がcharacterかどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return characterならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_characterp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_characterpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return characterならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_characterp1(lisp_val_t val);
 
 /**
  * 組み込み関数CHAR=。argsがすべて同じ文字かどうかを判定する。
@@ -1286,6 +1410,13 @@ lisp_val_t primitive_char_greater_equal(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_stringpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return stringならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_stringp1(lisp_val_t val);
+
+/**
  * 組み込み関数FUNCTIONP。第一引数が関数(MAGIC_FUNCTION_NATIVEまたはMAGIC_FUNCTION_INTERPRETED)
  * かどうかを判定する。MAGIC_MACROは関数ではないため偽と判定する。
  * @param args 評価済みの引数リスト
@@ -1293,6 +1424,13 @@ lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env);
  * @return 関数ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_functionpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return 関数ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_functionp1(lisp_val_t val);
 
 /**
  * 組み込み関数%%ZA-COMPILED-P。第一引数がza.cによって機械語へJITコンパイルされた関数
@@ -1427,6 +1565,13 @@ lisp_val_t primitive_general_vector_p(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_streamp(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_streampの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return streamならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_streamp1(lisp_val_t val);
+
+/**
  * 組み込み関数SYMBOL-NAME。第一引数のsymbolの名前をSTRINGとして返す。
  * @param args 評価済みの引数リスト(第一引数はSYMBOL)
  * @param env 呼び出し時の環境(未使用)
@@ -1485,12 +1630,30 @@ lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_set_car(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_set_carを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param target 破壊的に書き換えるCONS
+ * @param val 書き込む値
+ * @return 書き込んだ値(val)
+ */
+lisp_val_t primitive_set_car2(lisp_val_t target, lisp_val_t val);
+
+/**
  * 組み込み関数SET-CDR。第一引数のconsのcdrを第二引数で破壊的に書き換える。
  * @param args 評価済みの引数リスト(第一引数はCONS)
  * @param env 呼び出し時の環境(未使用)
  * @return 書き込んだ値(第二引数)
  */
 lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_set_cdrを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param target 破壊的に書き換えるCONS
+ * @param val 書き込む値
+ * @return 書き込んだ値(val)
+ */
+lisp_val_t primitive_set_cdr2(lisp_val_t target, lisp_val_t val);
 
 /**
  * 組み込み関数SET-AREF。第一引数の配列の、続く添字が指す要素を最後の引数で破壊的に書き換える。
@@ -1648,6 +1811,16 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_eltの固定引数版(ABI検証: read-file-into-vector等のバイト単位ループが
+ * 1要素ごとにconsリストを構築するコストを避けるため、consチェーンを経由せず
+ * 直接呼べるようにする)。意味論はprimitive_eltと完全に同じ。
+ * @param seq LIST/STRING/VECTOR
+ * @param idx FIXNUM(0起算の添字)
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_elt2(lisp_val_t seq, lisp_val_t idx);
+
+/**
  * 組み込み関数SET-ELT。第二引数のシーケンス(LIST/STRING/VECTOR)の第三引数(0起算)
  * 番目の要素を第一引数で破壊的に書き換える。仕様上「新しい値が最初」という引数順
  * である点に注意(SET-AREF/SET-CAR/SET-CDRとは逆順)。
@@ -1657,6 +1830,16 @@ lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env);
  * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
  */
 lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_set_eltの固定引数版(primitive_elt2と同じ理由)。意味論は
+ * primitive_set_eltと完全に同じ。
+ * @param obj 新しい値
+ * @param seq LIST/STRING/VECTOR
+ * @param idx FIXNUM(0起算の添字)
+ * @return 書き込んだ値(obj)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx);
 
 /**
  * 組み込み関数SUBSEQ。第一引数のシーケンス(LIST/STRING/VECTOR)の[z1, z2)の

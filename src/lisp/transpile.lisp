@@ -84,6 +84,12 @@
    全defunを読み終えた時点で束縛し、transpile-callが呼び出し先を解決する際に
    参照する(自己/相互再帰が定義順に関係なく解決できるようにするため)")
 
+(defparameter *known-function-arities* nil
+  "ABI-M6: *known-function-names*と対になる(name . fixed-arity)のalist。
+   &restパラメータを持たないdefunのみ、その固定パラメータ数をfixed-arityとして
+   持つ(&restを持つ、または未知の関数はassocがnilを返す)。mainが
+   *known-function-names*と同時に束縛する。known-function-fixed-arity参照")
+
 (defparameter *primitive-c-names*
   ;; 自己再帰の停止条件(カウントダウン等)を書くために最低限必要な算術/比較
   ;; プリミティブと、M10で導入するfuncall(lambdaが生成するクロージャ値を
@@ -510,6 +516,73 @@
     ((member name *known-function-names*) (lisp-name-to-c-name name))
     ((assoc name *primitive-c-names*) (cdr (assoc name *primitive-c-names*)))
     (t (error "transpile-call: 未対応の呼び出し先です: ~S" name))))
+
+(defparameter *primitive-fixed-arity-c-names*
+  ;; ABI-M3: *primitive-c-names*に載っているn項/可変長版の呼び出し先のうち、
+  ;; ABI-M1/M2(documents/abi-redesign.md)でza.c向けにruntime.h/runtime.cへ
+  ;; 追加した固定引数版(_1/_2サフィックス、またはcar/cdr/consのように
+  ;; cc_car/cc_cdr/os_make_consを直接使えるもの)へ、実引数の個数がちょうど
+  ;; 一致する呼び出しに限って直接callできるようにする対応表。(name arity . c-name)
+  ;; の形。個数が一致しない呼び出し(例: (+ a b c)というn項和や単項の(- x))は
+  ;; ここに載らず*primitive-c-names*側のn項版へ従来通りフォールバックする
+  ;; (transpile-call参照)。固定引数版はいずれも「argsをconsリストとして
+  ;; 受け取らない」ため、呼び出し側もconsリスト構築(transpile-cons-chain)を
+  ;; 経由しない
+  '((car 1 . "cc_car")
+    (cdr 1 . "cc_cdr")
+    (cons 2 . "os_make_cons")
+    (eq 2 . "primitive_eq2")
+    (null 1 . "primitive_null1")
+    (= 2 . "primitive_num_equal2")
+    (< 2 . "primitive_less_than2")
+    (> 2 . "primitive_greater_than2")
+    (>= 2 . "primitive_greater_equal2")
+    (+ 2 . "primitive_add2")
+    (- 2 . "primitive_subtract2")
+    (set-car 2 . "primitive_set_car2")
+    (set-cdr 2 . "primitive_set_cdr2")
+    (numberp 1 . "primitive_numberp1")
+    (fixnump 1 . "primitive_fixnump1")
+    (bignump 1 . "primitive_bignump1")
+    (floatp 1 . "primitive_floatp1")
+    (symbolp 1 . "primitive_symbolp1")
+    (consp 1 . "primitive_consp1")
+    (characterp 1 . "primitive_characterp1")
+    (stringp 1 . "primitive_stringp1")
+    (functionp 1 . "primitive_functionp1")
+    (streamp 1 . "primitive_streamp1")
+    ;; read-file-into-vector(file-cmd.lisp)のような1byteずつread-byte/set-eltを
+    ;; 呼ぶホットループが、バイトごとにconsセルを構築するコストを避けるために追加
+    ;; (性能調査で判明。ABI-M1/M2で車輪の横展開をした際にはvector/streamの
+    ;; プリミティブまでは対象にしていなかった)。
+    (elt 2 . "primitive_elt2")
+    (set-elt 3 . "primitive_set_elt3")
+    (read-byte 1 . "cc_read_byte1")))
+
+(defun primitive-fixed-arity-c-name (name argc)
+  "NAMEが*primitive-fixed-arity-c-names*に載っており、かつ実引数個数ARGCが
+   その固定arityと一致する場合、対応するC関数名を返す。一致しなければnil
+   (transpile-callがconsチェーン経由の従来呼び出しへフォールバックする合図)"
+  (let ((entry (assoc name *primitive-fixed-arity-c-names*)))
+    (if (and entry (= (cadr entry) argc))
+        (cddr entry)
+        nil)))
+
+(defun known-function-fixed-arity (name)
+  "ABI-M6: NAMEが*known-function-names*内で&restパラメータを持たないdefunの
+   場合そのパラメータ数、&restを持つ場合・未知の場合・パラメータ0個の場合は
+   nilを返す(0個は元々consチェーンを構築しない0引数呼び出しに対し新たな
+   エントリを増やす利点が無いため対象外とする)。transpile-call/
+   transpile-prototype/transpile-defunがname__fixedエントリの有無を判定する
+   のに使う。*known-function-arities*はmainが束縛する"
+  (let ((arity (cdr (assoc name *known-function-arities*))))
+    (and arity (> arity 0) arity)))
+
+(defun fixed-entry-param-c-names (arity)
+  "ARITY個の`lisp_val_t`引数名(__arg0, __arg1, ...)のリストを返す。
+   name__fixedのCシグネチャ生成(transpile-prototype/emit-function-body)と
+   呼び出し側(transpile-call)のいずれからも参照する共通の命名規則"
+  (loop for i from 0 below arity collect (format nil "__arg~D" i)))
 
 
 ;;; let/let*: init.lispのdefmacro let/let*(%let-vars/%let-inits)と同じ展開規則。
@@ -1037,17 +1110,28 @@
 
 (defun transpile-quoted (val)
   "(quote val)のval側。fixnum/string/nil/tはtranspile-exprと同じ扱いで、
-   それ以外のシンボルはos_make_symbolで名前から解決する。consは要素ごとに
+   それ以外のシンボルはos_make_symbol_cachedで名前から解決する。consは要素ごとに
    再帰的にtranspile-quotedしたものをos_make_consで組み立てる(caseのkeylist
    '(1 2 3)等、リテラルなリストのquote対応。transpile-cons-chainと同じ
    「引数を評価してから呼び出す」C評価順のため、途中でGCが起きても未保護の
-   中間値が上位32bit破壊等に晒される窓は無い)"
+   中間値が上位32bit破壊等に晒される窓は無い)。
+   [ABI刷新] AOT改善B: シンボル解決はos_make_symbolを直接呼ぶ代わりに、この
+   呼び出し箇所専用のC static局所変数(GNU文式`({ static int idx = -1; ...; })`
+   で包む)にg_symbol_table上の添字をキャッシュするos_make_symbol_cachedを使う。
+   2回目以降の実行はハッシュ計算・文字列比較を一切行わずg_symbol_table[idx]を
+   返すだけになる(quoteシンボルリテラルはslot-value/dynamic/tagbodyのタグ名
+   比較等でも使われ、B'適用後もwhile/dotimesの各反復で複数回実行される
+   ホットパスだったため、documents/abi-redesign.md 2026-09-10調査参照)。
+   staticローカル変数はCの言語仕様上ブロックスコープごとに独立した実体を持つ
+   ため、transpile-quotedの呼び出し箇所ごとに(このtranspile-quoted関数自身が
+   何度呼ばれても、生成されるC上の字句的ブロックはその都度別物なので)
+   衝突なく機能する——一意なカウンタ付き変数名を振る必要が無い"
   (cond
     ((symbolp val)
      (cond
        ((null val) "nil")
        ((eq val t) "g_sym_t")
-       (t (format nil "os_make_symbol(~A)"
+       (t (format nil "({ static int __quote_sym_idx = -1; os_make_symbol_cached(&__quote_sym_idx, ~A); })"
                   (c-string-literal (if (keywordp val)
                                          (concatenate 'string ":" (symbol-name val))
                                          (symbol-name val)))))))
@@ -1076,11 +1160,36 @@
     (format nil "({ lisp_val_t ~A = ~A; GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (os_set_dynamic(~A, ~A), ~A); })"
             temp (transpile-expr (third expr) scope) temp temp temp name-c temp name-c)))
 
+(defparameter *enclosing-tagbodies* nil
+  "現在transpile中のC関数内で、直接Cのgotoでジャンプできるtagbodyのタグ→
+   Cラベル名のalist(内側のtagbodyのタグほど前に来る=assocが自然に最も近い
+   tagbodyを優先する、CLの字句的スコープと同じ結果になる)。transpile-tagbody
+   が自分のタグをpushしながら本体をtranspileし、emit-function-body(新しいC
+   関数=defun/lambdaの境界)とtranspile-unwind-protect(protected-form/
+   cleanup-formsの実行を飛び越えてはいけない境界)がnilへ再束縛することで、
+   Cのgotoが届かない/届いてはいけない場合には自動的にこのリストが空になり、
+   transpile-goが安全に(従来の)シグナル方式へフォールバックする")
+
 (defun transpile-go (expr)
-  "(go tag)。tagは未評価のシンボルリテラル(quoteと同様)。eval_go(eval.c)と
-   同じくMAGIC_GO_EXITのシグナル値を作って返すだけで、実際のジャンプは
-   このシグナルを受け取ったtagbody側(transpile-tagbody)が行う"
-  (format nil "os_make_instance(MAGIC_GO_EXIT, ~A, nil, nil)" (transpile-quoted (second expr))))
+  "(go tag)。tagは未評価のシンボルリテラル(quoteと同様)。
+   [ABI刷新] AOT改善A: tagが*enclosing-tagbodies*(直接Cのgotoで届く範囲=
+   同一C関数内かつunwind-protectのprotected-form/cleanup-formsを跨がない)
+   に見つかれば、シグナル値の構築(os_make_instance+os_make_symbol、
+   ホットループの毎反復で線形/ハッシュ探索を伴う)を一切せず直接C の
+   gotoへコンパイルする(while/dotimes/for等、tagbodyの外へエスケープ
+   しない大多数のケースがこれに当たる)。届かない場合(lambdaへエスケープした
+   クロージャからの参照等、documents/abi-redesign.md 2026-09-10調査の
+   「cross function boundary」参照)は、eval_go(eval.c)と同じくMAGIC_GO_EXIT
+   のシグナル値を作って返すだけの従来方式のまま(実際のジャンプはこの
+   シグナルを受け取ったtagbody側=transpile-tagbodyの%%tagbody-dispatch-chain
+   が行う)。goto先はCの文であってCの式ではないため、GNU文式({ goto L; nil; })
+   で包んで式コンテキストへ埋め込む(gotoの後のnilは実際には評価されない
+   到達不能コード=goto自体が既に制御を移すため)"
+  (let* ((tag (second expr))
+         (direct (assoc tag *enclosing-tagbodies*)))
+    (if direct
+        (format nil "({ goto ~A; nil; })" (cdr direct))
+        (format nil "os_make_instance(MAGIC_GO_EXIT, ~A, nil, nil)" (transpile-quoted tag)))))
 
 (defparameter *block-temp-counter* 0)
 
@@ -1157,7 +1266,17 @@
          (tags (remove-if-not #'tagbody-tag-p body))
          (suffix (incf *tagbody-temp-counter*))
          (result-temp (format nil "__tagbody_result_~A" suffix))
-         (end-label (format nil "__tagbody_end_~A" suffix)))
+         (end-label (format nil "__tagbody_end_~A" suffix))
+         ;; [ABI刷新] AOT改善A: このtagbody自身のタグをCラベルへ対応付け、
+         ;; 内側の(=より新しくpushされた)ものがassocで先に見つかるよう手前へ
+         ;; 追加する。これにより同名タグを持つネストしたtagbody(例: whileの
+         ;; ネスト)でもCLの字句的スコープ通り最も内側のtagbodyが優先される。
+         ;; body(=以下でtranspile-goに到達する再帰)のtranspile中だけ有効な
+         ;; 動的束縛にすることで、emit-function-body/transpile-unwind-protectが
+         ;; nilへ再束縛した外側では自動的に見えなくなる
+         (*enclosing-tagbodies*
+           (append (mapcar (lambda (tag) (cons tag (%%tagbody-c-label tag suffix))) tags)
+                   *enclosing-tagbodies*)))
     (format nil "({ lisp_val_t ~A = nil; ~{~A~}~A: ~A; })"
             result-temp
             (mapcar (lambda (elem)
@@ -1177,14 +1296,22 @@
    変数へ保存する。cleanup-formはtranspile-progn-formsで評価するが、その戻り値は
    捨てる——cleanup-form自身が新たな非局所脱出を起こした場合もその脱出は無視して
    protected-formの結果を優先する、eval_unwind_protectに明記された既知の簡略化と
-   同じ。式全体の値としては常にprotected-formの結果(GC_PROTECTしたtemp)を返す"
+   同じ。式全体の値としては常にprotected-formの結果(GC_PROTECTしたtemp)を返す。
+   [ABI刷新] AOT改善A: protected-form/cleanup-formsの中から外側のtagbodyのタグへ
+   goする場合、Cのgotoで直接ジャンプしてしまうとcleanup-formsの実行(またはまだ
+   実行していないcleanup-forms自体)を飛び越えてしまい、unwind-protectの契約
+   (保護対象の脱出経路に関わらずcleanup-formsを必ず実行する)を破る。そのため
+   *enclosing-tagbodies*をnilへ再束縛してから両方をtranspileし、この境界を
+   跨ぐgoは必ず(従来通り)シグナル方式にフォールバックさせる(protected-form/
+   cleanup-forms自身の中で完結するtagbody/goはこの再束縛の影響を受けず、
+   通常通り直接gotoが使われる)"
   (destructuring-bind (uwp-kw protected-form &rest cleanup-forms) expr
     (declare (ignore uwp-kw))
-    (let ((temp (format nil "__unwind_protect_val_~A" (incf *unwind-protect-temp-counter*))))
+    (let* ((temp (format nil "__unwind_protect_val_~A" (incf *unwind-protect-temp-counter*)))
+           (protected-c (let ((*enclosing-tagbodies* nil)) (transpile-expr protected-form scope)))
+           (cleanup-c (let ((*enclosing-tagbodies* nil)) (transpile-progn-forms cleanup-forms scope))))
       (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); (void)(~A); ~A; })"
-              temp (transpile-expr protected-form scope) temp
-              (transpile-progn-forms cleanup-forms scope)
-              temp))))
+              temp protected-c temp cleanup-c temp))))
 
 (defparameter *catch-temp-counter* 0)
 
@@ -1287,8 +1414,13 @@
    symbol-name-stringという名前のシンボルで検索し、Cローカル変数c-varへ束縛
    するC文を作る。この変数がboxか値コピーかは、捕捉元の外側スコープでの
    boxed-pがそのまま伝播する(呼び出し元のtranspile-lambda参照)ため、ここでは
-   os_get_variableが返した値をそのままc-varへ入れるだけでよい"
-  (format nil "lisp_val_t ~A = os_get_variable(os_make_symbol(~A), env); GC_PROTECT(~A);"
+   os_get_variableが返した値をそのままc-varへ入れるだけでよい。
+   [ABI刷新] AOT改善B: このstep関数は捕捉した各クロージャの呼び出しのたび
+   (defmethodの本体はM10のクロージャリフティング経由でコンパイルされるため、
+   メソッド呼び出しのたびにこれが実行される)に毎回実行されるホットパスの
+   ため、transpile-quotedと同じos_make_symbol_cached+static局所変数の
+   キャッシュ化を適用する"
+  (format nil "lisp_val_t ~A = os_get_variable(({ static int __capture_sym_idx = -1; os_make_symbol_cached(&__capture_sym_idx, ~A); }), env); GC_PROTECT(~A);"
           c-var (c-string-literal symbol-name-string) c-var))
 
 (defun param-scope-and-preamble (params body)
@@ -1312,14 +1444,76 @@
         (when rest-param
           (list (emit-rest-param-binding-stmt (param-symbol-to-c-name rest-param) (and (member rest-param boxed) t)))))))))
 
-(defun emit-function-body (c-name params preamble-stmts body-form scope)
+(defun emit-direct-preamble-stmts (params scope arg-c-names)
+  "ABI-M6: PARAMS(&restを持たない固定パラメータのみ。呼び出し元がarityの
+   一致で保証する)を、ARG-C-NAMES(name__fixedが直接受け取るCパラメータ名)から
+   束縛するC文のリストを作る。emit-param-binding-stmt(evaluated_argsをcc_car/
+   cc_cdrで剥がす版)に対応する直接束縛版で、box化するかどうか(boxed-p)は
+   呼び出し規約に依存しないためparam-scope-and-preambleが返したSCOPEをそのまま
+   再利用する"
+  (mapcar (lambda (p arg-c-name)
+            (let* ((entry (cdr (assoc p scope)))
+                   (c-var (car entry))
+                   (boxed-p (cdr entry)))
+              (if boxed-p
+                  (format nil "lisp_val_t ~A = os_make_cons(nil, ~A); GC_PROTECT(~A);" c-var arg-c-name c-var)
+                  (format nil "lisp_val_t ~A = ~A; GC_PROTECT(~A);" c-var arg-c-name c-var))))
+          params arg-c-names))
+
+(defun emit-trampoline-drive-loop (var-name env-c-name)
+  "tco_result_tを繰り返しトランポリンし切って最終値をVAR-NAMEに残すCの文列を作る
+   (defun/lambdaの公開ラッパー(name(evaluated_args,env))、ABI-M6のname__fixed
+   公開ラッパーのいずれも、この同じ文列を共有する)。
+   ABI-M8: is_tail_call==2(固定引数ABI継続、transpile-tail-call-fixed-args-guarded
+   参照)の場合は、fixed_fn(void*、実際の呼び出し先ごとに引数個数が異なる
+   name__step_fixedへの生ポインタ)をfixed_argc(0〜3)に応じた関数ポインタ型へ
+   キャストしてenv+arg0..2で直接call(consリストを一切構築しない)。
+   is_tail_call==1(従来のconsリストABI継続)の場合は従来通りfn(args, env)を呼ぶ"
+  (with-output-to-string (out)
+    (format out "    while (~A.is_tail_call) {~%" var-name)
+    (format out "        if (~A.is_tail_call == 2) {~%" var-name)
+    (format out "            switch (~A.fixed_argc) {~%" var-name)
+    (format out "            case 0: ~A = ((tco_result_t (*)(lisp_val_t))~A.fixed_fn)(~A); break;~%"
+            var-name var-name env-c-name)
+    (format out "            case 1: ~A = ((tco_result_t (*)(lisp_val_t, lisp_val_t))~A.fixed_fn)(~A, ~A.arg0); break;~%"
+            var-name var-name env-c-name var-name)
+    (format out "            case 2: ~A = ((tco_result_t (*)(lisp_val_t, lisp_val_t, lisp_val_t))~A.fixed_fn)(~A, ~A.arg0, ~A.arg1); break;~%"
+            var-name var-name env-c-name var-name var-name)
+    (format out "            default: ~A = ((tco_result_t (*)(lisp_val_t, lisp_val_t, lisp_val_t, lisp_val_t))~A.fixed_fn)(~A, ~A.arg0, ~A.arg1, ~A.arg2); break;~%"
+            var-name var-name env-c-name var-name var-name var-name)
+    (format out "            }~%")
+    (format out "        } else {~%")
+    (format out "            ~A = ~A.fn(~A.args, ~A);~%" var-name var-name var-name env-c-name)
+    (format out "        }~%")
+    (format out "    }~%")))
+
+(defun emit-function-body (c-name params preamble-stmts body-form scope &optional fixed-arity)
   "defun/lambdaのどちらにも共通のstep関数+公開ラッパーのC関数定義を組み立てる。
    PARAMSはevaluated_argsを消費するパラメータの並び(空ならevaluated_args自体が
    未使用になるため(void)キャストで警告を抑止する)、PREAMBLE-STMTSはstep関数の
    先頭で実行するC文(パラメータ束縛+lambdaの場合は自由変数の捕捉環境からの
    読み出し)、BODY-FORMは末尾位置として処理する本体式、SCOPEはPREAMBLE-STMTSが
-   束縛した全変数(パラメータ+自由変数)を含むalist"
-  (let ((tail-stmt (transpile-tail-stmt body-form scope)))
+   束縛した全変数(パラメータ+自由変数)を含むalist。
+   ABI-M6: FIXED-ARITYが非nil(&restを持たないdefunのみ、transpile-defun参照。
+   lambdaは常にnilのまま渡さない)の場合、consリストABI(__step/公開ラッパー)に
+   加えて固定引数レジスタ渡し版(__step_fixed/__fixed)も出力する。za.cの
+   ABI-M5(パラメータスロット方式)と同じ「エントリの前段(パラメータ束縛)だけを
+   複製し、tail-stmt(本体)のテキスト自体は1度生成したものを両エントリで
+   共有する」設計。__step_fixedは当初「このファイル内のname__fixedからしか
+   呼ばれない」という想定でstaticにしていたが、ABI-M8(tco_result_tの固定引数
+   ABI継続、transpile-tail-call-fixed-args-guarded参照)により、他の(同一
+   ファイル内で前方参照になる、またはファイルを跨ぐ)関数の末尾呼び出しからも
+   fixed_fnとして直接参照されるようになったため、__step自身と同じ理由で
+   staticにできない(transpile-prototypeが両ファイルへ共通で前方宣言を出力する)。
+   [ABI刷新] AOT改善A: ここが常に新しいC関数(__step)の先頭であり、Cのgotoは
+   他の関数のラベルへは届かない。そのため*enclosing-tagbodies*をnilへ再束縛
+   してからbody-formをtranspileし、この関数の外(呼び出し元がlambdaなら
+   捕捉元のtagbody等)のタグへのgoが誤って直接gotoにコンパイルされないように
+   する(このケースは実際にはdefun/lambda境界を跨ぐ通常のLispコードでは
+   起こらないはずだが、万一書かれた場合も安全に従来のシグナル方式へ
+   フォールバックさせるための防御)"
+  (let* ((*enclosing-tagbodies* nil)
+         (tail-stmt (transpile-tail-stmt body-form scope)))
     (with-output-to-string (out)
       (format out "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
       (when (null params)
@@ -1331,11 +1525,24 @@
       (format out "}~%~%")
       (format out "lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env) {~%" c-name)
       (format out "    tco_result_t __r = ~A__step(evaluated_args, env);~%" c-name)
-      (format out "    while (__r.is_tail_call) {~%")
-      (format out "        __r = __r.fn(__r.args, env);~%")
-      (format out "    }~%")
+      (format out "~A" (emit-trampoline-drive-loop "__r" "env"))
       (format out "    return __r.value;~%")
-      (format out "}~%"))))
+      (format out "}~%")
+      (when fixed-arity
+        (let* ((arg-c-names (fixed-entry-param-c-names fixed-arity))
+               (direct-preamble (emit-direct-preamble-stmts params scope arg-c-names)))
+          (format out "~%tco_result_t ~A__step_fixed(lisp_val_t env~{, lisp_val_t ~A~}) {~%"
+                  c-name arg-c-names)
+          (dolist (stmt direct-preamble)
+            (format out "    ~A~%" stmt))
+          (format out "    (void)env;~%")
+          (format out "    ~A~%" tail-stmt)
+          (format out "}~%~%")
+          (format out "lisp_val_t ~A__fixed(lisp_val_t env~{, lisp_val_t ~A~}) {~%" c-name arg-c-names)
+          (format out "    tco_result_t __r = ~A__step_fixed(env~{, ~A~});~%" c-name arg-c-names)
+          (format out "~A" (emit-trampoline-drive-loop "__r" "env"))
+          (format out "    return __r.value;~%")
+          (format out "}~%"))))))
 
 (defun emit-closure-creation (c-name free-vars outer-scope)
   "リフトしたlambda本体(c-name)を、自由変数だけを含む最小限の捕捉環境と共に
@@ -1355,11 +1562,16 @@
    os_env_add_binding_pairで(sym . 値)ペアとして連結する。boxそのものを共有
    することで、複数のクロージャが同じboxを捕捉した場合に一方の書き換えが
    他方からも見える(za.cの拡張4と同じ設計)。シンボル/consの確保がGCを
-   誘発しても既存のOUTER-SCOPEの変数は呼び出し元でGC_PROTECT済みなので安全"
+   誘発しても既存のOUTER-SCOPEの変数は呼び出し元でGC_PROTECT済みなので安全。
+   [ABI刷新] AOT改善B: このクロージャ生成式はループ内で毎回新規クロージャを
+   作る箇所(defmethodのメソッド呼び出しのたび等)で繰り返し実行されるため、
+   環境名/各自由変数名のシンボル解決をos_make_symbol_cached+static局所変数の
+   キャッシュ化に置き換える(transpile-quoted/emit-capture-fetch-stmtと同じ
+   パターン)"
   (if (null free-vars)
       (format nil "os_make_lifted_closure((lisp_addr_t)(void *)~A, global_environment)" c-name)
       (let ((env-temp (format nil "__closure_env_~A" (incf *closure-temp-counter*))))
-        (format nil "({ lisp_val_t ~A = os_make_environment(os_make_symbol(~A), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
+        (format nil "({ lisp_val_t ~A = os_make_environment(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
                 env-temp
                 (c-string-literal c-name)
                 env-temp
@@ -1367,7 +1579,7 @@
                           (let* ((sym-temp (format nil "__closure_sym_~A" (incf *closure-temp-counter*)))
                                  (pair-temp (format nil "__closure_pair_~A" (incf *closure-temp-counter*)))
                                  (outer-c-name (car (cdr (assoc v outer-scope)))))
-                            (format nil "lisp_val_t ~A = os_make_symbol(~A); GC_PROTECT(~A); lisp_val_t ~A = os_make_cons(~A, ~A); GC_PROTECT(~A); os_env_add_binding_pair(~A, ~A); "
+                            (format nil "lisp_val_t ~A = ({ static int __closure_free_sym_idx = -1; os_make_symbol_cached(&__closure_free_sym_idx, ~A); }); GC_PROTECT(~A); lisp_val_t ~A = os_make_cons(~A, ~A); GC_PROTECT(~A); os_env_add_binding_pair(~A, ~A); "
                                     sym-temp (c-string-literal (symbol-name v)) sym-temp
                                     pair-temp sym-temp outer-c-name
                                     pair-temp
@@ -1424,6 +1636,11 @@
       "nil"
       (format nil "os_make_cons(~A, ~A)" (car temps) (transpile-cons-chain (cdr temps)))))
 
+(defun transpile-c-arg-list (temps)
+  "Cの一時変数名のリストをカンマ区切りの引数並びへ整形する(ABI-M3の固定引数
+   直接呼び出し用。transpile-cons-chainと異なりconsチェーンを組み立てない)"
+  (format nil "~{~A~^, ~}" temps))
+
 (defparameter *call-temp-counter* 0)
 
 (defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr)
@@ -1450,24 +1667,78 @@
    指したままにならないようにするため)。引数が無い場合は一時変数もconsチェーンも
    不要なため、直接nilを渡す単純な呼び出し式にする。M12 Phase 9(#27):
    transpile-call-args-guarded参照、いずれかの引数が非局所脱出シグナルなら
-   呼び出し自体を行わずそのシグナルを伝播させる"
+   呼び出し自体を行わずそのシグナルを伝播させる。
+   ABI-M3: nameの実引数個数が*primitive-fixed-arity-c-names*の固定arityと
+   一致する場合は、consチェーン構築(transpile-cons-chain)を経由せず、
+   GC_PROTECT済みの引数一時変数をそのままカンマ区切りで固定引数版のC関数へ
+   渡す(primitive-fixed-arity-c-name参照)。ただしcall-target-c-nameと同じ
+   優先順位(*known-function-names*、つまりこのファイル内でユーザーが同名の
+   defunで再定義した場合はそちらを優先する)を保つため、nameが
+   *known-function-names*に載っている場合はこの高速パスを使わない。
+   ABI-M6: nameが*known-function-names*に載っており(defunされた関数)、かつ
+   その関数が&restを持たず実引数個数argcとちょうどarityが一致する場合、
+   name__fixed(env, arg0, ...)を直接callする(consチェーン構築を経由しない)。
+   za.cのABI-M5(JIT側)と異なり、AOTの既知関数呼び出しはFunction Cell経由の
+   間接呼び出しではなく元々リンク時に確定するC関数名の直接呼び出しのため
+   (call-target-c-name参照)、実行時のarity/redefinition判定は不要でコンパイル
+   時にこの高速パスを選べる。いずれの高速パスにも一致しなければ従来通り
+   call-target-c-nameが解決するconsチェーン渡しのn項/可変長版へフォールバック
+   する"
   (let* ((name (car expr))
          (args (cdr expr))
-         (c-name (call-target-c-name name)))
-    (if (null args)
-        (format nil "~A(nil, env)" c-name)
-        (let ((temps (mapcar (lambda (arg)
-                                (declare (ignore arg))
-                                (format nil "__call_arg_~A" (incf *call-temp-counter*)))
-                              args)))
-          (transpile-call-args-guarded temps temps args scope
-            (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps))))))))
+         (argc (length args))
+         (known-p (member name *known-function-names*))
+         (known-arity (and known-p (known-function-fixed-arity name)))
+         (fixed-c-name (if known-p
+                            nil
+                            (primitive-fixed-arity-c-name name argc))))
+    (cond
+      ((and known-arity (= known-arity argc))
+       (let ((temps (mapcar (lambda (arg)
+                               (declare (ignore arg))
+                               (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                             args)))
+         (transpile-call-args-guarded temps temps args scope
+           (lambda (all-temps)
+             (format nil "~A__fixed(env, ~A)" (lisp-name-to-c-name name) (transpile-c-arg-list all-temps))))))
+      (fixed-c-name
+       (let ((temps (mapcar (lambda (arg)
+                               (declare (ignore arg))
+                               (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                             args)))
+         (transpile-call-args-guarded temps temps args scope
+           (lambda (all-temps) (format nil "~A(~A)" fixed-c-name (transpile-c-arg-list all-temps))))))
+      (t
+       (let ((c-name (call-target-c-name name)))
+         (if (null args)
+             (format nil "~A(nil, env)" c-name)
+             (let ((temps (mapcar (lambda (arg)
+                                     (declare (ignore arg))
+                                     (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                                   args)))
+               (transpile-call-args-guarded temps temps args scope
+                 (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps)))))))))))
 
 (defun tail-return-final (c-expr)
   "末尾位置で、既に確定したC式c-exprの値をそのままtco_result_tとしてreturnする
    Cの文を作る(トランポリンを継続させず、この時点で呼び出し元のwhileループを
    終了させる)"
   (format nil "return (tco_result_t){.is_tail_call = 0, .value = (~A)};" c-expr))
+
+(defparameter *tco-max-fixed-argc* 3
+  "ABI-M8: tco_result_tの固定引数ABI継続(fixed_fn/fixed_argc/arg0..2)が
+   保持できる引数個数の上限。za.cのABI-M5/M7のZA_MAX_FIXED_ENTRY_PARAMSと
+   同じ値に揃えた(tco_result_tは全呼び出し先で共有する固定サイズのCの構造体
+   のため、フィールド数の上限をどこかで決める必要があり、za.c側との対応関係を
+   分かりやすくする目的でこの値を選んだ。AOTの非末尾呼び出し(ABI-M6の__fixed)
+   自体には technicalなレジスタ制約は無いが、末尾呼び出しのトランポリン継続は
+   1つの共有構造体を経由するためこの上限が必要になる)")
+
+(defun tco-fixed-arg-inits (temps)
+  "TEMPSの各要素を、tco_result_tの.arg0/.arg1/.arg2フィールド初期化子の
+   カンマ区切り文字列にする(transpile-tail-call-fixed-args-guarded参照)"
+  (format nil "~{~A~^, ~}"
+          (loop for i from 0 for temp in temps collect (format nil ".arg~D = ~A" i temp))))
 
 (defun transpile-tail-call (expr scope)
   "末尾位置の(name arg*)で、nameが*known-function-names*に含まれる(=この
@@ -1477,17 +1748,45 @@
    returnして消えるため、何段トランポリンが続いてもCスタックは伸びない。
    M12 Phase 9(#27): transpile-call-args-guardedと同じ短絡規則で、いずれかの
    引数が非局所脱出シグナルならトランポリン継続を組み立てず、そのシグナルを
-   確定値としてreturnする"
+   確定値としてreturnする。
+   ABI-M8: nameが&restを持たない既知関数で、実引数個数がそのarityとちょうど
+   一致し、かつ*tco-max-fixed-argc*以下の場合、consチェーン構築を経由せず
+   tco_result_tの固定引数ABI継続(fixed_fn=name__step_fixed、arg0..2に評価済みの
+   引数)を詰めてreturnする(emit-trampoline-drive-loop参照)。ABI-M6の非末尾
+   呼び出しと異なり実行時判定は不要(理由はABI-M6/M7の設計判断と同じ:
+   AOTの既知関数呼び出しはリンク時確定の直接呼び出しであり、za.cのような
+   Function Cell経由の間接呼び出しではないため)"
   (let* ((name (car expr))
          (args (cdr expr))
-         (c-name (lisp-name-to-c-name name)))
-    (if (null args)
-        (format nil "return (tco_result_t){.is_tail_call = 1, .fn = ~A__step, .args = nil};" c-name)
-        (let ((temps (mapcar (lambda (arg)
-                                (declare (ignore arg))
-                                (format nil "__call_arg_~A" (incf *call-temp-counter*)))
-                              args)))
-          (transpile-tail-call-args-guarded temps temps args scope c-name)))))
+         (argc (length args))
+         (c-name (lisp-name-to-c-name name))
+         (fixed-arity (known-function-fixed-arity name)))
+    (cond
+      ((and fixed-arity (= fixed-arity argc) (<= argc *tco-max-fixed-argc*))
+       (let ((temps (mapcar (lambda (arg)
+                               (declare (ignore arg))
+                               (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                             args)))
+         (transpile-tail-call-fixed-args-guarded temps temps args scope c-name)))
+      ((null args)
+       (format nil "return (tco_result_t){.is_tail_call = 1, .fn = ~A__step, .args = nil};" c-name))
+      (t
+       (let ((temps (mapcar (lambda (arg)
+                               (declare (ignore arg))
+                               (format nil "__call_arg_~A" (incf *call-temp-counter*)))
+                             args)))
+         (transpile-tail-call-args-guarded temps temps args scope c-name))))))
+
+(defun transpile-tail-call-fixed-args-guarded (all-temps remaining-temps remaining-args scope c-name)
+  "transpile-tail-call-args-guardedのABI-M8版。consチェーンを組み立てず、
+   評価済みの引数一時変数をtco_result_tの.arg0/.arg1/.arg2へ直接詰める"
+  (if (null remaining-temps)
+      (format nil "return (tco_result_t){.is_tail_call = 2, .fixed_fn = (void *)~A__step_fixed, .fixed_argc = ~D, ~A};"
+              c-name (length all-temps) (tco-fixed-arg-inits all-temps))
+      (let ((temp (car remaining-temps)))
+        (format nil "{ lisp_val_t ~A = (~A); GC_PROTECT(~A); if (os_is_control_transfer(~A)) { return (tco_result_t){.is_tail_call = 0, .value = (~A)}; } else { ~A } }"
+                temp (transpile-expr (car remaining-args) scope) temp temp temp
+                (transpile-tail-call-fixed-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope c-name)))))
 
 (defun transpile-tail-call-args-guarded (all-temps remaining-temps remaining-args scope c-name)
   "transpile-call-args-guardedの末尾呼び出し版。式ではなく完結したC文を返す
@@ -1583,10 +1882,21 @@
    跨いで関数ポインタを取る必要があるため、__step版もstaticにはしない(以前は
    ファイル内実装詳細としてstaticにしていたが、ファイル分割に伴い外部リンケージが
    必須になった)。全既知関数の前方宣言を両ファイルへ共通で出力する(自分の
-   ファイルで定義されない関数は本体無しの宣言のみになるが、Cとして正しい)"
-  (let ((c-name (lisp-name-to-c-name (second form))))
-    (format nil "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);"
-            c-name c-name)))
+   ファイルで定義されない関数は本体無しの宣言のみになるが、Cとして正しい)。
+   ABI-M6: known-function-fixed-arityが非nilを返す(&restを持たない)関数のみ、
+   name__fixedの前方宣言も追加する。ABI-M8: __step_fixedもname__fixedと同じく
+   ファイルを跨いで(またはファイル内で前方参照として)tco_result_tの
+   fixed_fnから直接参照されるようになったため、__stepと同様前方宣言する
+   (emit-function-body参照)"
+  (let* ((name (second form))
+         (c-name (lisp-name-to-c-name name))
+         (arity (known-function-fixed-arity name)))
+    (format nil "tco_result_t ~A__step(lisp_val_t evaluated_args, lisp_val_t env);~%lisp_val_t ~A(lisp_val_t evaluated_args, lisp_val_t env);~%~A"
+            c-name c-name
+            (if arity
+                (format nil "tco_result_t ~A__step_fixed(lisp_val_t env~{, lisp_val_t ~A~});~%lisp_val_t ~A__fixed(lisp_val_t env~{, lisp_val_t ~A~});~%"
+                        c-name (fixed-entry-param-c-names arity) c-name (fixed-entry-param-c-names arity))
+                ""))))
 
 
 (defun transpile-defun (form)
@@ -1617,9 +1927,12 @@
       (error "transpile-defun: bodyは単一式のみ対応です: ~S" name))
     (let* ((c-name (lisp-name-to-c-name name))
            (*lifted-lambda-decls* nil)
-           (expanded-body (macroexpand-all (first body))))
+           (expanded-body (macroexpand-all (first body)))
+           ;; ABI-M6: &restを持たない(=paramsがそのまま固定パラメータ列と一致する)
+           ;; 場合のみ非nil。known-function-fixed-arity参照
+           (fixed-arity (known-function-fixed-arity name)))
       (multiple-value-bind (scope preamble) (param-scope-and-preamble params expanded-body)
-        (let ((fn-text (emit-function-body c-name params preamble expanded-body scope)))
+        (let ((fn-text (emit-function-body c-name params preamble expanded-body scope fixed-arity)))
           (format nil "~{~A~%~}~A" (reverse *lifted-lambda-decls*) fn-text))))))
 
 (defun read-all-forms (path)
@@ -1688,13 +2001,21 @@
     ;; 同じ理由でide_subprimitive.hも必要
     (format out "#include \"runtime.h\"~%#include \"lisp.h\"~%#include \"eval.h\"~%#include \"stream_lisp.h\"~%#include \"format.h\"~%#include \"subprimitive.h\"~%#include \"ide_subprimitive.h\"~%~%")
     ;; 末尾呼び出しのトランポリン継続を表す型。is_tail_call=0ならvalueが確定値、
-    ;; 1ならfn/argsが「次にこのstep関数をこの引数で呼ぶ」ことを表す(実際の呼び出し
-    ;; は各defunの公開ラッパーのwhileループが行う。ファイル先頭のコメント参照)。
+    ;; 1ならfn/argsが「次にこのstep関数をこの引数(consリスト)で呼ぶ」ことを表す
+    ;; (実際の呼び出しは各defunの公開ラッパーのwhileループが行う。ファイル先頭の
+    ;; コメント参照)。
+    ;; ABI-M8: is_tail_call=2はfixed_fn/fixed_argc/arg0..2が「次にこのstep_fixed
+    ;; 関数を(env, arg0, ...)で直接呼ぶ(consリストを構築しない)」ことを表す。
+    ;; fixed_fnは実際の呼び出し先ごとに引数個数が異なる(name__step_fixedの
+    ;; シグネチャはfixed_argc個)ため、汎用のvoid*として持ち、呼び出し側
+    ;; (emit-trampoline-drive-loop)がfixed_argcに応じたステップ関数ポインタ型へ
+    ;; キャストしてから呼ぶ。fixed_argcは3(ABI-M5/M7のZA_MAX_FIXED_ENTRY_PARAMSと
+    ;; 揃えた上限、known-function-fixed-arity/transpile-tail-callが保証)まで。
     ;; M15: 2ファイルそれぞれが独立してこの型定義を持つ(Cにtypeのリンケージは
     ;; 無く、同じレイアウトの型を各翻訳単位が個別に定義するだけなので問題ない)
     (format out "typedef struct tco_result tco_result_t;~%")
     (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
-    (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%};~%~%")
+    (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%    void *fixed_fn;~%    UINT64 fixed_argc;~%    lisp_val_t arg0;~%    lisp_val_t arg1;~%    lisp_val_t arg2;~%};~%~%")
     (dolist (p prototypes)
       (format out "~A~%" p))
     (format out "~%")
@@ -1719,6 +2040,15 @@
          (main-defuns (append aot-defuns utility-defuns fs-defuns))
          (all-defuns (append fixture-defuns main-defuns))
          (*known-function-names* (mapcar #'second all-defuns))
+         ;; ABI-M6: known-function-fixed-arity(transpile-call/transpile-prototype/
+         ;; transpile-defunが参照)が使う、名前->固定パラメータ数の対応表。
+         ;; &restを持つ関数はnilのまま(assocに現れず、known-function-fixed-arityが
+         ;; nilを返す)にする
+         (*known-function-arities*
+           (mapcar (lambda (form)
+                     (multiple-value-bind (fixed-params rest-param) (split-rest-param (third form))
+                       (cons (second form) (if rest-param nil (length fixed-params)))))
+                   all-defuns))
          ;; フィクスチャ側からAOT関数を(直接/末尾)呼び出すケースがあるため、
          ;; 前方宣言だけは両ファイルへ全既知関数分を共通で出力する(定義が無い
          ;; 側ではただのextern宣言になるだけで、Cとして問題ない)

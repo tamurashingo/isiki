@@ -562,3 +562,190 @@
 ;; sum_{i=0}^{4} (i+2) = (0+1+2+3+4) + 2*5 = 10+10 = 20
 (assert-equal 20 (isiki-za-test-sum-box-counters (isiki-za-test-box-counter-chain 5)))
 (close (open-output-file "/9p/tmp/ckpt-24-box-counter-final.txt"))
+
+;; ABI-M1: NOT/CONSP/LISTPをza_compile_unary経由の固定引数直接呼び出しへ追加。
+;; (not x) : nullと実体を共用するprimitive_null1を直接呼ぶ(runtime.c os_bootstrap参照)
+(defun isiki-za-test-not (x) (not x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-not)))
+(assert-equal t (isiki-za-test-not nil))
+(assert-equal nil (isiki-za-test-not 1))
+(assert-equal nil (isiki-za-test-not (cons 1 2)))
+;; NOTはインタプリタ側でも(za未対応のフォールバック経路でも)使える正式な組み込み関数
+(assert-equal t (not nil))
+(assert-equal nil (not 1))
+(close (open-output-file "/9p/tmp/ckpt-25-not.txt"))
+
+;; (consp x) : nilを除くconsのみt
+(defun isiki-za-test-consp (x) (consp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-consp)))
+(assert-equal t (isiki-za-test-consp (cons 1 2)))
+(assert-equal nil (isiki-za-test-consp nil))
+(assert-equal nil (isiki-za-test-consp 1))
+(close (open-output-file "/9p/tmp/ckpt-26-consp.txt"))
+
+;; (listp x) : nil(空リスト)またはconsならt
+(defun isiki-za-test-listp (x) (listp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-listp)))
+(assert-equal t (isiki-za-test-listp (cons 1 2)))
+(assert-equal t (isiki-za-test-listp nil))
+(assert-equal nil (isiki-za-test-listp 1))
+(close (open-output-file "/9p/tmp/ckpt-27-listp.txt"))
+
+;; ABI-M2: 未対応プリミティブへの固定引数ラッパー拡充(車輪の横展開)。
+;; いずれも1引数の型述語がza_compile_unary経由の固定引数直接呼び出しへ乗る。
+
+(defun isiki-za-test-numberp (x) (numberp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-numberp)))
+(assert-equal t (isiki-za-test-numberp 1))
+(assert-equal t (isiki-za-test-numberp 1152921504606846976)) ;; 2^60、bignum
+(assert-equal t (isiki-za-test-numberp 3.14))
+(assert-equal nil (isiki-za-test-numberp 'foo))
+
+(defun isiki-za-test-fixnump (x) (fixnump x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-fixnump)))
+(assert-equal t (isiki-za-test-fixnump 1))
+(assert-equal nil (isiki-za-test-fixnump 1152921504606846976))
+(assert-equal nil (isiki-za-test-fixnump 3.14))
+
+(defun isiki-za-test-bignump (x) (bignump x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bignump)))
+(assert-equal t (isiki-za-test-bignump 1152921504606846976))
+(assert-equal nil (isiki-za-test-bignump 1))
+
+(defun isiki-za-test-floatp (x) (floatp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-floatp)))
+(assert-equal t (isiki-za-test-floatp 3.14))
+(assert-equal nil (isiki-za-test-floatp 1))
+(close (open-output-file "/9p/tmp/ckpt-28-numeric-predicates.txt"))
+
+(defun isiki-za-test-symbolp (x) (symbolp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-symbolp)))
+(assert-equal t (isiki-za-test-symbolp 'foo))
+(assert-equal t (isiki-za-test-symbolp nil))
+(assert-equal nil (isiki-za-test-symbolp 1))
+
+(defun isiki-za-test-stringp (x) (stringp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-stringp)))
+(assert-equal t (isiki-za-test-stringp "abc"))
+(assert-equal nil (isiki-za-test-stringp 1))
+
+(defun isiki-za-test-functionp (x) (functionp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-functionp)))
+(assert-equal t (isiki-za-test-functionp (function isiki-za-test-symbolp)))
+(assert-equal nil (isiki-za-test-functionp 1))
+
+(defun isiki-za-test-characterp (x) (characterp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-characterp)))
+(assert-equal t (isiki-za-test-characterp #\A))
+(assert-equal nil (isiki-za-test-characterp 1))
+
+(defun isiki-za-test-streamp (x) (streamp x))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-streamp)))
+(assert-equal t (isiki-za-test-streamp (create-string-output-stream)))
+(assert-equal nil (isiki-za-test-streamp 1))
+(close (open-output-file "/9p/tmp/ckpt-29-type-predicates.txt"))
+
+;; (set-car x v)/(set-cdr x v) : 破壊的更新(非allocating、2引数固定)
+(defun isiki-za-test-set-car (c v) (set-car c v))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-set-car)))
+(let ((c (cons 1 2)))
+  (assert-equal 9 (isiki-za-test-set-car c 9))
+  (assert-equal 9 (car c))
+  (assert-equal 2 (cdr c)))
+
+(defun isiki-za-test-set-cdr (c v) (set-cdr c v))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-set-cdr)))
+(let ((c (cons 1 2)))
+  (assert-equal 9 (isiki-za-test-set-cdr c 9))
+  (assert-equal 1 (car c))
+  (assert-equal 9 (cdr c)))
+(close (open-output-file "/9p/tmp/ckpt-30-set-car-cdr.txt"))
+
+;; GC保護コスト削減(za_operand_is_safe_leafによる、za_compile_fold/za_compile_binaryの
+;; アキュムレータlink/unlink省略最適化)の正当性検証。「後続オペランドが単純なparam/
+;; local参照(leaf)ならGCルート保護を省略してよい」という判断が、実際にwrapper_fn
+;; (primitive_add2/primitive_subtract2)がbignum昇格でヒープ確保しGCが複数回発火する
+;; 状況でも正しい結果を返すことを確認する。stepを最初からbignum範囲の値にすることで、
+;; 毎イテレーションで新規bignum確保(=GC発火機会)を強制する。期待値はmultiply(全く
+;; 別のwrapper_fn/コード経路)で計算し、加算/減算ループの結果と独立にクロスチェックする。
+(defglobal za-gc-test-step 1152921504606846976) ;; 2^60、bignum
+(defun isiki-za-test-bignum-add-loop (acc step n)
+  (if (= n 0)
+      acc
+      (isiki-za-test-bignum-add-loop (+ acc step) step (- n 1))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bignum-add-loop)))
+
+(defglobal za-gc-test-n 3000)
+(defglobal za-gc-test-expected (* za-gc-test-n za-gc-test-step))
+(assert-equal za-gc-test-expected
+              (isiki-za-test-bignum-add-loop 0 za-gc-test-step za-gc-test-n))
+
+(defun isiki-za-test-bignum-sub-loop (acc step n)
+  (if (= n 0)
+      acc
+      (isiki-za-test-bignum-sub-loop (- acc step) step (- n 1))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-bignum-sub-loop)))
+(defglobal za-gc-test-sub-start (* za-gc-test-expected 2))
+(defglobal za-gc-test-sub-expected (- za-gc-test-sub-start za-gc-test-expected))
+(assert-equal za-gc-test-sub-expected
+              (isiki-za-test-bignum-sub-loop za-gc-test-sub-start za-gc-test-step za-gc-test-n))
+(close (open-output-file "/9p/tmp/ckpt-31-gc-protect-skip.txt"))
+
+;; Phase2(算術インライン展開)の境界条件検証: 両方非負fixnumかつ結果がオーバー
+;; フローしない場合のインライン高速path(wrapper_fn呼び出しを一切伴わない)と、
+;; それ以外(オーバーフロー・負数)のfallback(従来通りwrapper_fn呼び出し)の両方で、
+;; 修正前と完全に同じ計算結果になることを確認する。
+(defglobal fixnum-max 1152921504606846975) ;; 2^60-1
+
+(defun isiki-za-test-inline-add (a b) (+ a b))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-inline-add)))
+(assert-equal 8 (isiki-za-test-inline-add 3 5))                             ;; 高速path
+(assert-equal fixnum-max (isiki-za-test-inline-add fixnum-max 0))           ;; 高速path、境界値ちょうど
+(assert-equal t (fixnump (isiki-za-test-inline-add fixnum-max 0)))
+(assert-equal 1152921504606846976 (isiki-za-test-inline-add fixnum-max 1)) ;; オーバーフロー→fallback、bignum昇格
+(assert-equal t (bignump (isiki-za-test-inline-add fixnum-max 1)))
+(assert-equal -2 (isiki-za-test-inline-add -5 3))                           ;; 負数→fallback
+(assert-equal -2 (isiki-za-test-inline-add 3 -5))                           ;; 負数→fallback
+
+(defun isiki-za-test-inline-sub (a b) (- a b))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-inline-sub)))
+(assert-equal 7 (isiki-za-test-inline-sub 10 3))                            ;; 高速path
+(assert-equal 0 (isiki-za-test-inline-sub fixnum-max fixnum-max))           ;; 高速path、境界(等しい)
+(assert-equal -7 (isiki-za-test-inline-sub 3 10))                           ;; mag_b>mag_a→fallback
+(assert-equal 7 (isiki-za-test-inline-sub -3 -10))                          ;; 負数→fallback
+(assert-equal -8 (isiki-za-test-inline-sub -3 5))                           ;; 負数→fallback
+(close (open-output-file "/9p/tmp/ckpt-32-inline-arith.txt"))
+
+;; fn解決結果キャッシュ化(documents/abi-redesign.md参照): za_compile_callの一般
+;; 呼び出しについて、初回だけos_make_symbol+os_get_function_cellで解決した
+;; Function Cellのアドレスをコンパイルサイトごとにキャッシュし、2回目以降は
+;; 再解決を省略する最適化の正当性を検証する。
+
+;; 1. 関数再定義への安全性(最重要): Function Cell自身のアドレスは再定義後も
+;; 不変(os_set_functionが中身だけを書き換える、runtime.c参照)であり、呼び出しの
+;; たびにセルの中身自体は毎回デリファレンスするため、キャッシュ後に関数を
+;; 再定義しても新しい定義が正しく呼ばれることを確認する(REPL上でコードを
+;; 汚しながら試行錯誤する開発体験の根幹に関わる)。
+(defun isiki-za-test-redef-target () 1)
+(defun isiki-za-test-redef-caller () (isiki-za-test-redef-target))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-redef-caller)))
+(assert-equal 1 (isiki-za-test-redef-caller)) ;; 初回、解決してキャッシュ
+(assert-equal 1 (isiki-za-test-redef-caller)) ;; 2回目、キャッシュを使用
+(defun isiki-za-test-redef-target () 2)       ;; 再定義(Cellのアドレスは不変)
+(assert-equal 2 (isiki-za-test-redef-caller)) ;; キャッシュ済みCell経由でも新定義が呼ばれる
+(assert-equal 2 (isiki-za-test-redef-caller))
+
+;; 2. GC整合性: キャッシュしたFunction Cellアドレス(Immobilized Space上の固定
+;; アドレス)が、GCが複数回発火する状況でも正しく機能し続けることを確認する
+;; (bignum確保で毎回GCを誘発する条件、za-gc-test-step等と同じ手法)。
+(defun isiki-za-test-fncache-callee (x) (+ x 1))
+(defun isiki-za-test-fncache-gc-stress (n acc)
+  (if (= n 0)
+      acc
+      (isiki-za-test-fncache-gc-stress (- n 1) (isiki-za-test-fncache-callee acc))))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-fncache-gc-stress)))
+(defglobal fncache-gc-stress-n 2000)
+(defglobal fncache-gc-stress-start 1152921504606846976) ;; 2^60、bignum
+(assert-equal (+ fncache-gc-stress-start fncache-gc-stress-n)
+              (isiki-za-test-fncache-gc-stress fncache-gc-stress-n fncache-gc-stress-start))
+(close (open-output-file "/9p/tmp/ckpt-33-fn-resolve-cache.txt"))

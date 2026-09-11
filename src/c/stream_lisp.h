@@ -182,6 +182,8 @@ lisp_val_t cc_stream_ready_p(lisp_val_t args, lisp_val_t env);
  * @return 読み込んだバイト値(FIXNUM)。EOF・エラー・close後はnil
  */
 lisp_val_t cc_read_byte(lisp_val_t args, lisp_val_t env);
+/** cc_read_byteの固定引数版(ABI検証: read-file-into-vector等参照)。 */
+lisp_val_t cc_read_byte1(lisp_val_t stream);
 
 /**
  * 組み込み関数WRITE-BYTE。第一引数のバイト値(FIXNUM)を第二引数のstreamへ書き込む

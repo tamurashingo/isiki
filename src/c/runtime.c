@@ -72,7 +72,9 @@
  *  [ inst-addr(61bit) ................................ ][1 0 1]
  *    instanceへのアドレス
  *    - word0: このinstanceの種別を表わすMAGIC NUMBER
- *    - word1: MAGIC_FUNCTION_NATIVEの場合: cの関数のアドレス
+ *    - word1: MAGIC_FUNCTION_NATIVEの場合: za_fn_meta_t(ABI-M4、Immobilized Space上)
+ *             への生ポインタ。meta->cons_entryが従来通りのconsリストABI
+ *             fn(evaluated_args, env)の実体を指す(meta自体もGCのスキャン対象外)
  *             MAGIC_FUNCTION_INTERPRETEDの場合: 仮引数リスト(未評価のシンボルリスト)
  *    - word2: MAGIC_FUNCTION_NATIVEの場合: fixnum 1(za.cがコンパイルした関数)、
  *             fixnum 2(トランスパイラがリフトしたlambdaのクロージャ)、
@@ -226,6 +228,22 @@ static lisp_val_t g_symbol_table[MAX_SYMBOLS];
 /** g_symbol_tableに登録済みのsymbol数 */
 static int g_symbol_count = 0;
 
+/**
+ * os_make_symbolの名前引き(interning)をO(1)平均にするための、大文字小文字を
+ * 無視した名前→g_symbol_table添字のオープンアドレッシング・ハッシュ表。
+ * 空きスロットは-1。[ABI刷新] AOT生成コード(defmethodのクロージャ捕捉・
+ * quoteシンボルリテラル・tagbody/goのタグ比較等)がホットループの毎反復で
+ * os_make_symbolを呼ぶ設計(documents/abi-redesign.md 2026-09-10調査参照)のため、
+ * 旧来の線形走査(g_symbol_count個を毎回舐める)がFAT16/FAT32読み込み等の
+ * 実測ボトルネックだった。サイズはMAX_SYMBOLSの2倍の2べきにして負荷率を
+ * 0.5以下に保つ(衝突チェインが伸びてO(n)へ劣化するのを防ぐ)。
+ * g_symbol_table同様、値は「添字」であってポインタではないため、コピーGCで
+ * symbolの実体が移動してもこの表自体は書き換え不要(gc_copy_valueは
+ * g_symbol_table[i]を所定のiのまま上書きするだけ)。実体の関数(symbol_hash_lookup/
+ * symbol_hash_insert)はstrncmpignorecase定義の後に置く(前方参照を避けるため)。
+ */
+#define SYMBOL_HASH_SIZE 16384
+static INT32 g_symbol_hash[SYMBOL_HASH_SIZE];
 
 /** From空間(現在割り当てに使っている側)の先頭アドレス */
 static UINT8 *g_from_start;
@@ -303,6 +321,67 @@ static int strncmpignorecase(const char *s1, const char *s2, UINT64 size) {
 }
 
 /**
+ * 大文字小文字を無視したFNV-1aハッシュ。nameは常にNUL終端のCの文字列
+ * (os_make_symbolの引数と同じ契約)。
+ * @param name ハッシュ対象の文字列
+ * @return SYMBOL_HASH_SIZE未満のハッシュ値(添字として直接使える)
+ */
+static UINT32 symbol_name_hash(const char *name) {
+    UINT32 h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; p++) {
+        unsigned char c = (*p > 0x60 && *p < 0x7b) ? (unsigned char)(*p - 0x20) : *p;
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h & (SYMBOL_HASH_SIZE - 1);
+}
+
+/**
+ * g_symbol_hash中からnameと一致するinterned symbolのg_symbol_table添字を探す
+ * (線形探査、削除操作の無いテーブルなので空きスロット(-1)に当たった時点で
+ * 「未登録」と確定できる)。
+ * @param name 探すsymbol名
+ * @return 見つかった場合はg_symbol_tableの添字、無ければ-1
+ */
+static int symbol_hash_lookup(const char *name) {
+    UINT32 h = symbol_name_hash(name);
+    for (UINT32 i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        UINT32 slot = (h + i) & (SYMBOL_HASH_SIZE - 1);
+        INT32 idx = g_symbol_hash[slot];
+        if (idx < 0) {
+            return -1;
+        }
+        lisp_val_t sym = g_symbol_table[idx];
+        lisp_addr_t sym_addr = sym & ~TAG_MASK;
+        lisp_val_t str_obj = ((lisp_val_t *)sym_addr)[0];
+        lisp_addr_t str_addr = str_obj & ~TAG_MASK;
+        UINT64 len = ((UINT64 *)str_addr)[0];
+        const char *sym_name = (const char *)(str_addr + 8);
+        if (strncmpignorecase(sym_name, name, len) == 0 && name[len] == '\0') {
+            return (int)idx;
+        }
+    }
+    return -1;
+}
+
+/**
+ * g_symbol_table[idx](名前nameのsymbol)をg_symbol_hashへ登録する。
+ * os_make_symbolが新規symbolをg_symbol_tableへ追加した直後に呼ぶ。
+ */
+static void symbol_hash_insert(int idx, const char *name) {
+    UINT32 h = symbol_name_hash(name);
+    for (UINT32 i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        UINT32 slot = (h + i) & (SYMBOL_HASH_SIZE - 1);
+        if (g_symbol_hash[slot] < 0) {
+            g_symbol_hash[slot] = (INT32)idx;
+            return;
+        }
+    }
+    // SYMBOL_HASH_SIZE(MAX_SYMBOLSの2倍)回探査しても空きが無い場合は理論上
+    // 起こらない(MAX_SYMBOLS到達時点でos_make_symbol側が別途枯渇停止するため)
+}
+
+/**
  * sをコピーしてstringオブジェクトを作る。uppercase_flagが立っていれば小文字を大文字化する。
  * @param s 文字列(NUL終端)
  * @param uppercase_flag 非0なら小文字を大文字化する(symbol名の正規化用)
@@ -339,6 +418,16 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     g_to_start   = g_from_end;
     g_to_end     = (UINT8 *)(heap_base + heap_size);
     g_to_ptr     = g_to_start;
+
+    // g_symbol_hash(静的配列)はCのゼロ初期化任せだと全スロットが0=「添字0が
+    // 占有中」という誤った状態になってしまう(空きスロットの番兵は-1)。
+    // os_heap_initは起動時/各テストのヒープ再確保のたび必ず1回呼ばれるので、
+    // ここで確実に初期化しておけばos_bootstrap内の最初のos_make_symbol呼び出し
+    // (NIL以外で最初に来るのはos_make_environment経由の"GLOBAL-ENV")より前に
+    // 必ず-1埋め済みになる
+    for (int i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        g_symbol_hash[i] = -1;
+    }
 }
 
 double os_heap_used_ratio(void) {
@@ -380,6 +469,18 @@ static UINT64 g_gc_collect_count = 0;
 
 UINT64 os_gc_collect_count(void) {
     return g_gc_collect_count;
+}
+
+/**
+ * 組み込み関数%%GC-COLLECT-COUNT。os_gc_collect_countをfixnumで返す。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 累積GC発火回数のfixnum
+ */
+lisp_val_t primitive_gc_collect_count(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(os_gc_collect_count());
 }
 
 /* ============================== Boot Allocator ==============================
@@ -544,6 +645,18 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
  * バンプカーソル。全environment共通の1本のみ持つ(現状はどのenvironmentが所有する
  * ページかを区別しない、Phase3でenvironmentごとの所有ページリストに置き換える予定) */
 static imm_slot_cursor_t g_function_cell_cursor = {0, 0};
+
+/** ABI-M4: za_fn_meta_t(os_fn_meta_alloc参照)の確保に使うバンプカーソル。
+ * Function Cellと同様、個別解放はせずOS生存期間中保持される前提 */
+static imm_slot_cursor_t g_fn_meta_cursor = {0, 0};
+
+za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
+    za_fn_meta_t *meta = (za_fn_meta_t *)os_imm_slot_alloc(&g_fn_meta_cursor, sizeof(za_fn_meta_t));
+    meta->cons_entry = cons_entry;
+    meta->fixed_entry = 0;
+    meta->arity = 0;
+    return meta;
+}
 
 /* ============================== GC (Cheney方式コピーGC) ============================== */
 
@@ -785,7 +898,9 @@ static void gc_scan_instance(UINT64 *words) {
 
     switch (magic) {
         case MAGIC_FUNCTION_NATIVE:
-            // word1はCコード領域への生の関数ポインタ(Lispヒープ外)。素通し
+            // word1はza_fn_meta_t(ABI-M4、Immobilized Space上)への生ポインタ
+            // (Lispヒープ外)。素通し(meta自体もGCが移動しない固定領域にあり、
+            // 中身の関数ポインタもコード領域を指す不変アドレスのためトレース不要)
             // word2がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)の場合のみ、
             // word3にGC管理下の捕捉環境を持つのでトレースする。それ以外(fixnum 1/NIL)は
             // word3を使わずNIL固定なので何もしなくてよい
@@ -1196,6 +1311,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%EVAL-IN-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_eval_in_environment), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
+        os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
@@ -1444,19 +1560,14 @@ lisp_val_t os_make_symbol(const char *name) {
         return nil;
     }
 
-    for (int i = 0; i < g_symbol_count; i++) {
-        lisp_val_t sym = g_symbol_table[i];
-        lisp_addr_t sym_addr = sym & ~TAG_MASK;
-   
-        lisp_val_t str_obj = ((lisp_val_t *)sym_addr)[0];
-        lisp_addr_t str_addr = str_obj & ~TAG_MASK;
-        UINT64 len = ((UINT64 *)str_addr)[0];
-        const char *sym_name = (const char *)(str_addr + 8);
-
-        if (strncmpignorecase(sym_name, name, len) == 0 && name[len] == '\0') {
-            return sym;
-        }
-   }
+    // [ABI刷新] 以前はg_symbol_count個を毎回舐める線形走査だったが、AOT生成
+    // コードがホットループの毎反復でos_make_symbolを呼ぶ設計(documents/
+    // abi-redesign.md参照)のため実測上の支配的ボトルネックだった。
+    // symbol_hash_lookupはオープンアドレッシングのハッシュ表で同じ結果をO(1)平均で返す
+    int found = symbol_hash_lookup(name);
+    if (found >= 0) {
+        return g_symbol_table[found];
+    }
 
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
     GC_PROTECT(name_str);
@@ -1477,9 +1588,53 @@ lisp_val_t os_make_symbol(const char *name) {
         for (;;) {
         }
     }
+    int new_idx = g_symbol_count;
     g_symbol_table[g_symbol_count++] = tagged;
+    symbol_hash_insert(new_idx, name);
 
     return tagged;
+}
+
+/**
+ * [ABI刷新] AOT改善B: os_make_symbolの呼び出し箇所専用キャッシュ版。詳細は
+ * runtime.hのdocコメント参照。*cache_idxはg_symbol_table上の添字(未解決は-1、
+ * "NIL"センチネルは-2)を呼び出し元の(通常はstatic局所変数の)ストレージへ
+ * 書き戻す。2回目以降はg_symbol_table[idx]を返すだけでハッシュ計算・文字列
+ * 比較を一切行わない。添字はGCで symbol実体が移動しても不変(g_symbol_table
+ * 自体が毎GCで所定の添字のままgc_copy_valueされる)ため、追加のGCルート登録は
+ * 不要。
+ * @param cache_idx 呼び出し元が保持するキャッシュ状態(呼び出しごとに書き換わる)
+ * @param name symbol名
+ * @return タグ付けされたSYMBOL(os_make_symbolと同じ結果)
+ */
+lisp_val_t os_make_symbol_cached(int *cache_idx, const char *name) {
+    if (*cache_idx >= 0) {
+        return g_symbol_table[*cache_idx];
+    }
+    if (*cache_idx == -2) {
+        // 過去にこの呼び出し箇所がNIL(g_symbol_tableに登録されない特殊
+        // センチネル)を返したと判明済み。transpile-quotedはnilを事前に
+        // Cリテラル"nil"へ静的解決するためこの経路には通常来ないが、他の
+        // 呼び出し元のための安全策として残す。
+        return nil;
+    }
+
+    int found = symbol_hash_lookup(name);
+    lisp_val_t sym;
+    if (found >= 0) {
+        sym = g_symbol_table[found];
+    } else {
+        // 未intern(または"NIL"センチネル)。os_make_symbol自体が両方を
+        // 正しく処理する(新規intern、またはnilを返す)
+        sym = os_make_symbol(name);
+        if (sym != nil) {
+            // 直前のos_make_symbolが新規internしたばかりなので必ず見つかる
+            found = symbol_hash_lookup(name);
+        }
+    }
+
+    *cache_idx = (sym == nil) ? -2 : found;
+    return sym;
 }
 
 
@@ -1538,6 +1693,13 @@ int os_symbol_table_count(void) {
  */
 void os_reset_runtime_state_for_test(void) {
     g_symbol_count = 0;
+    // g_symbol_hashは「添字」を保持するだけなので、g_symbol_table自体をクリアする
+    // 必要は無いが、g_symbol_countを0へ戻すのに合わせてハッシュ表も空にしないと
+    // 前のテストで登録した(既に破棄されたヒープ上の)symbolの添字が残ってしまい、
+    // 新しいヒープでの再internがstaleな添字をそのまま返してしまう
+    for (int i = 0; i < SYMBOL_HASH_SIZE; i++) {
+        g_symbol_hash[i] = -1;
+    }
     global_environment = nil;
     g_dynamic_bindings = nil;
     g_gc_extra_root_count = 0;
@@ -1545,6 +1707,8 @@ void os_reset_runtime_state_for_test(void) {
     g_imm_free_list = 0;
     g_function_cell_cursor.page = 0;
     g_function_cell_cursor.offset = 0;
+    g_fn_meta_cursor.page = 0;
+    g_fn_meta_cursor.offset = 0;
 }
 
 
@@ -1610,7 +1774,10 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
     lisp_addr_t addr;
     switch (magic) {
         case MAGIC_FUNCTION_NATIVE: {
-            // word1は生の関数ポインタ、word2はfixnum。どちらもタグ無しの生データ。
+            // word1はza_fn_meta_t(ABI-M4、Immobilized Space上)への生ポインタ、
+            // word2はfixnum。どちらもタグ無しの生データ(呼び出し元のos_make_native_function
+            // 等が既にos_fn_meta_allocでmetaを確保済みであり、ここでは受け取った
+            // 生ポインタをそのままword1へ書き込むだけでよい)。
             // word3はword2がfixnum(2)(リフトされたクロージャ)の場合のみ捕捉環境
             // (タグ付き)を持つ
             if (w2 == os_make_fixnum(2)) {
@@ -1854,7 +2021,8 @@ lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val) {
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=NIL、組み込みprimitive扱い)
  */
 lisp_val_t os_make_native_function(UINT64 fnptr) {
-    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, nil, nil);
+    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, nil, nil);
 }
 
 /**
@@ -1865,7 +2033,23 @@ lisp_val_t os_make_native_function(UINT64 fnptr) {
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
 lisp_val_t os_make_jit_function(UINT64 fnptr) {
-    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(1), nil);
+    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), nil);
+}
+
+/**
+ * os_make_jit_functionのdual-entry版(ABI-M5)。meta->fixed_entry/arityを設定する
+ * 点のみがos_make_jit_functionと異なる。
+ * @param cons_entry 従来のconsリストABIのJITコンパイル済みアドレス
+ * @param fixed_entry 固定引数レジスタ渡しのJITコンパイル済みアドレス
+ * @param arity fixed_entryが受け取る固定引数の個数
+ * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
+ */
+lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT64 arity) {
+    za_fn_meta_t *meta = os_fn_meta_alloc(cons_entry);
+    meta->fixed_entry = fixed_entry;
+    meta->arity = arity;
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), nil);
 }
 
 /**
@@ -1877,7 +2061,8 @@ lisp_val_t os_make_jit_function(UINT64 fnptr) {
  */
 lisp_val_t os_make_lifted_closure(UINT64 fnptr, lisp_val_t captured_env) {
     GC_PROTECT(captured_env);
-    return os_make_instance(MAGIC_FUNCTION_NATIVE, fnptr, os_make_fixnum(2), captured_env);
+    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(2), captured_env);
 }
 
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
@@ -2912,13 +3097,26 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
 
 /**
  * primitive_addを2引数固定で呼ぶためのラッパー。JITコンパイルされたコードから
- * 呼ばれることを想定し、引数aとbは呼び出し直後にGC_PROTECTしてからconsリストへ
- * 組み立てるため、この呼び出し中にGCが走ってもa/bが失われることはない。
+ * 呼ばれることを想定する。
+ * ABI検証で判明した問題への対処: 以前はconsリストへ組み立てて汎用のprimitive_add
+ * へ丸ごと委譲するだけの実装だったため、呼び出しサイト側のconsリスト構築は
+ * 無くなっても呼び出し先(このラッパー自身)が同じconsを構築し続けており、
+ * 正味のヒープ確保削減になっていなかった。両方が非負FIXNUMで和がオーバーフロー
+ * しない(=primitive_add本体のfast-path条件と同じ)場合はconsを一切構築せず
+ * 直接計算する高速pathを追加し、それ以外(負数・float・bignum昇格が絡む稀な
+ * ケース)のみ従来通りconsリストを組み立てて委譲する。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_addと同じ規則で計算した合計値
  */
 lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
+    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
+        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
+        UINT64 sum = os_fixnum_magnitude(a) + os_fixnum_magnitude(b);
+        if (sum <= FIXNUM_MAGNITUDE_MASK) {
+            return os_make_fixnum(sum);
+        }
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -2926,13 +3124,23 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
 }
 
 /**
- * primitive_subtractを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_subtractを2引数固定で呼ぶためのラッパー。primitive_add2と同じ
+ * 理由で高速pathを追加した。両方が非負FIXNUMでb<=a(=結果が非負、
+ * primitive_subtract本体のfast-path条件と同じ)の場合はconsを一切構築せず
+ * 直接計算し、それ以外は従来通りconsリストを組み立てて委譲する。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_subtractと同じ規則で計算したa-b
  */
 lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
+    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
+        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
+        UINT64 mag_a = os_fixnum_magnitude(a);
+        UINT64 mag_b = os_fixnum_magnitude(b);
+        if (mag_b <= mag_a) {
+            return os_make_fixnum(mag_a - mag_b);
+        }
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -3168,6 +3376,14 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
  * @return primitive_multiplyと同じ規則で計算したa*b
  */
 lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
+    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
+        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
+        UINT64 mag_a = os_fixnum_magnitude(a);
+        UINT64 mag_b = os_fixnum_magnitude(b);
+        if (mag_a == 0 || mag_b <= FIXNUM_MAGNITUDE_MASK / mag_a) {
+            return os_make_fixnum(mag_a * mag_b);
+        }
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -3270,16 +3486,17 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
 
 /**
  * primitive_less_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * 呼ばれる想定。number_compareが元々2値を直接取り内部でconsを一切構築しない
+ * ため、primitive_add2等と異なりconsチェーンを経由せず直接呼べる(ABI検証で
+ * primitive_add2等がconsを構築したまま汎用n項版へ委譲するだけで正味の
+ * cons削減になっていなかったことが判明し、比較演算子は直接number_compareへ
+ * 委譲する形に改めた)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a<bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_less_than(args, global_environment);
+    return number_compare(a, b) < 0 ? g_sym_t : nil;
 }
 
 /**
@@ -3299,17 +3516,14 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * primitive_greater_thanを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_greater_thanを2引数固定で呼ぶためのラッパー。primitive_less_than2と
+ * 同じ理由でnumber_compareへ直接委譲する(consを一切構築しない)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a>bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_greater_than(args, global_environment);
+    return number_compare(a, b) > 0 ? g_sym_t : nil;
 }
 
 /**
@@ -3329,17 +3543,14 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * primitive_num_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_num_equalを2引数固定で呼ぶためのラッパー。primitive_less_than2と
+ * 同じ理由でnumber_compareへ直接委譲する(consを一切構築しない)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_num_equal(args, global_environment);
+    return number_compare(a, b) == 0 ? g_sym_t : nil;
 }
 
 /**
@@ -3377,17 +3588,14 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * primitive_greater_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
- * 呼ばれる想定。primitive_add2と同様、aとbは呼び出し直後にGC_PROTECTする。
+ * primitive_greater_equalを2引数固定で呼ぶためのラッパー。primitive_less_than2と
+ * 同じ理由でnumber_compareへ直接委譲する(consを一切構築しない)。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return a>=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_greater_equal(args, global_environment);
+    return number_compare(a, b) >= 0 ? g_sym_t : nil;
 }
 
 /**
@@ -3414,10 +3622,7 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
  * @return a<=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
-    GC_PROTECT(a);
-    GC_PROTECT(b);
-    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
-    return primitive_less_equal(args, global_environment);
+    return number_compare(a, b) <= 0 ? g_sym_t : nil;
 }
 
 /**
@@ -4051,7 +4256,15 @@ lisp_val_t primitive_parse_number(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_numberp1(cc_car(args));
+}
+
+/**
+ * primitive_numberpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return 数値ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_numberp1(lisp_val_t val) {
     if ((val & TAG_MASK) == TAG_FIXNUM) {
         return g_sym_t;
     }
@@ -4072,7 +4285,15 @@ lisp_val_t primitive_numberp(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_fixnump1(cc_car(args));
+}
+
+/**
+ * primitive_fixnumpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return FIXNUMならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_fixnump1(lisp_val_t val) {
     return (val & TAG_MASK) == TAG_FIXNUM ? g_sym_t : nil;
 }
 
@@ -4084,7 +4305,15 @@ lisp_val_t primitive_fixnump(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_bignump1(cc_car(args));
+}
+
+/**
+ * primitive_bignumpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return bignumならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_bignump1(lisp_val_t val) {
     if ((val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_BIGNUM) {
         return g_sym_t;
     }
@@ -4099,7 +4328,16 @@ lisp_val_t primitive_bignump(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    return is_float(cc_car(args)) ? g_sym_t : nil;
+    return primitive_floatp1(cc_car(args));
+}
+
+/**
+ * primitive_floatpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_floatp1(lisp_val_t val) {
+    return is_float(val) ? g_sym_t : nil;
 }
 
 /**
@@ -4130,7 +4368,15 @@ lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_symbolp1(cc_car(args));
+}
+
+/**
+ * primitive_symbolpの非allocatingな核ロジック(za向け)。nilもsymbolとして扱う。
+ * @param val 判定対象
+ * @return symbolならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_symbolp1(lisp_val_t val) {
     if (val == nil) {
         return g_sym_t;
     }
@@ -4146,7 +4392,16 @@ lisp_val_t primitive_symbolp(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_consp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_consp1(cc_car(args));
+}
+
+/**
+ * primitive_conspの非allocatingな核ロジック(za向け)。nilはISLisp上consではないため
+ * val == nilは偽と判定する。
+ * @param val 判定対象
+ * @return consならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_consp1(lisp_val_t val) {
     if (val == nil) {
         return nil;
     }
@@ -4316,7 +4571,15 @@ lisp_val_t primitive_equal(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_listp1(cc_car(args));
+}
+
+/**
+ * primitive_listpの非allocatingな核ロジック(za向け)。nilはlist(空リスト)として扱う。
+ * @param val 判定対象
+ * @return listならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_listp1(lisp_val_t val) {
     if (val == nil) {
         return g_sym_t;
     }
@@ -4331,7 +4594,15 @@ lisp_val_t primitive_listp(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_characterp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_characterp1(cc_car(args));
+}
+
+/**
+ * primitive_characterpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return characterならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_characterp1(lisp_val_t val) {
     return (val & TAG_MASK) == TAG_CHAR ? g_sym_t : nil;
 }
 
@@ -4669,7 +4940,15 @@ lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_stringp1(cc_car(args));
+}
+
+/**
+ * primitive_stringpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return stringならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_stringp1(lisp_val_t val) {
     return (val & TAG_MASK) == TAG_STRING ? g_sym_t : nil;
 }
 
@@ -4682,7 +4961,15 @@ lisp_val_t primitive_stringp(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_functionp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_functionp1(cc_car(args));
+}
+
+/**
+ * primitive_functionpの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return 関数ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_functionp1(lisp_val_t val) {
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
     }
@@ -4855,7 +5142,15 @@ lisp_val_t primitive_general_vector_p(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_streamp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t val = cc_car(args);
+    return primitive_streamp1(cc_car(args));
+}
+
+/**
+ * primitive_streampの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return streamならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_streamp1(lisp_val_t val) {
     if ((val & TAG_MASK) != TAG_INSTANCE) {
         return nil;
     }
@@ -5166,6 +5461,17 @@ lisp_val_t primitive_set_car(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t target = cc_car(args);
     lisp_val_t val = cc_car(cc_cdr(args));
+    return primitive_set_car2(target, val);
+}
+
+/**
+ * primitive_set_carを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param target 破壊的に書き換えるCONS
+ * @param val 書き込む値
+ * @return 書き込んだ値(val)
+ */
+lisp_val_t primitive_set_car2(lisp_val_t target, lisp_val_t val) {
     cc_set_car(target, val);
     return val;
 }
@@ -5180,6 +5486,17 @@ lisp_val_t primitive_set_cdr(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t target = cc_car(args);
     lisp_val_t val = cc_car(cc_cdr(args));
+    return primitive_set_cdr2(target, val);
+}
+
+/**
+ * primitive_set_cdrを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。
+ * @param target 破壊的に書き換えるCONS
+ * @param val 書き込む値
+ * @return 書き込んだ値(val)
+ */
+lisp_val_t primitive_set_cdr2(lisp_val_t target, lisp_val_t val) {
     cc_set_cdr(target, val);
     return val;
 }
@@ -5304,18 +5621,15 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数ELT。第一引数のシーケンス(LIST/STRING/VECTOR)の第二引数(0起算)
- * 番目の要素を返す。VECTORの場合は次元に関わらずdata部を1次元配列とみなす
- * (LENGTHと同じ簡略化方針)。
- * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二引数はFIXNUM)
- * @param env 呼び出し時の環境(未使用)
+ * 組み込み関数ELTの共有実装。seq(LIST/STRING/VECTOR)のidx(0起算)番目の要素を
+ * 返す。VECTORの場合は次元に関わらずdata部を1次元配列とみなす(LENGTHと同じ
+ * 簡略化方針)。primitive_elt(consリスト版)/primitive_elt2(固定引数版)の
+ * どちらからも呼ばれる。
+ * @param seq LIST/STRING/VECTOR
+ * @param idx 0起算の添字(タグを外した生の値)
  * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
  */
-lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    lisp_val_t seq = cc_car(args);
-    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
-
+static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
         case TAG_CONS: {
             lisp_val_t cur = seq;
@@ -5358,20 +5672,33 @@ lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数SET-ELT。第二引数のシーケンス(LIST/STRING/VECTOR)の第三引数(0起算)
- * 番目の要素を第一引数で破壊的に書き換える。仕様上set-eltは「新しい値が最初」
- * という引数順である点に注意(SET-AREF/SET-CAR/SET-CDRとは逆順)。
- * @param args 評価済みの引数リスト(第一引数は新しい値、第二引数はLIST/STRING/VECTOR、
- *             第三引数はFIXNUM)
+ * 組み込み関数ELT本体(評価済みの引数リストからseq/idxを取り出しprimitive_elt_impl
+ * へ委譲する)。
+ * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二引数はFIXNUM)
  * @param env 呼び出し時の環境(未使用)
- * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
  */
-lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
+lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t obj = cc_car(args);
-    lisp_val_t seq = cc_car(cc_cdr(args));
-    UINT64 idx = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+    lisp_val_t seq = cc_car(args);
+    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
+    return primitive_elt_impl(seq, idx);
+}
 
+lisp_val_t primitive_elt2(lisp_val_t seq, lisp_val_t idx) {
+    return primitive_elt_impl(seq, idx >> 3);
+}
+
+/**
+ * 組み込み関数SET-ELTの共有実装。seq(LIST/STRING/VECTOR)のidx(0起算)番目の
+ * 要素をobjで破壊的に書き換える。primitive_set_elt(consリスト版)/
+ * primitive_set_elt3(固定引数版)のどちらからも呼ばれる。
+ * @param obj 新しい値
+ * @param seq LIST/STRING/VECTOR
+ * @param idx 0起算の添字(タグを外した生の値)
+ * @return 書き込んだ値(obj)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
         case TAG_CONS: {
             lisp_val_t cur = seq;
@@ -5414,6 +5741,26 @@ lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
         default:
             return g_sym_eval_error;
     }
+}
+
+/**
+ * 組み込み関数SET-ELT本体(評価済みの引数リストからobj/seq/idxを取り出し
+ * primitive_set_elt_implへ委譲する)。
+ * @param args 評価済みの引数リスト(第一引数は新しい値、第二引数はLIST/STRING/VECTOR、
+ *             第三引数はFIXNUM)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 書き込んだ値(第一引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ */
+lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t obj = cc_car(args);
+    lisp_val_t seq = cc_car(cc_cdr(args));
+    UINT64 idx = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+    return primitive_set_elt_impl(obj, seq, idx);
+}
+
+lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx) {
+    return primitive_set_elt_impl(obj, seq, idx >> 3);
 }
 
 /**
