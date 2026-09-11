@@ -787,6 +787,14 @@ UINT64 os_imm_space_used_bytes(void);
 void os_panic(const char *msg);
 
 /**
+ * スタック溢れを診断情報付きで報告して停止する([性能測定] Phase5 第0部)。
+ * @param rsp 検出時のスタックポインタ
+ * @param stack_low スタック下端アドレス
+ * @param stack_used 消費バイト数
+ */
+void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used);
+
+/**
  * os_panicが停止前に呼ぶフックを登録する。
  * @param hook 停止処理(QEMUテスト時の電源断等)
  */

@@ -58,6 +58,20 @@ void initialize_processes(frame_buffer *buffers);
    だけなのでヘッダのstatic inlineへ移し、呼び出しを消す。za.cのJITランタイム
    ヘルパー(za_gc_*)も同じ関数を呼ぶため、そちらにも効く。
    アドレスを取っている箇所は無いことを確認済み */
+/**
+ * 現在のプロセスのスタックが溢れていないかを検査する([性能測定] Phase5 第0部)。
+ * カナリアの破壊と、rspがスタック範囲(下端からSTACK_GUARD_MARGINの余裕を含む)を
+ * 外れていないかの両方を見る。タイマ割り込みから呼ぶ想定で、通常パスには乗らない。
+ * @param rsp 検査する(割り込み時の)スタックポインタ
+ * @param out_low スタック下端アドレスの格納先
+ * @param out_used 消費バイト数の格納先
+ * @return 正常なら1、溢れていれば0
+ */
+int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used);
+
+/** プロセス1つあたりのスタックサイズ(panicの診断表示用) */
+#define STACK_SIZE_FOR_PANIC (256 * 1024)
+
 extern process_t g_processes[PROCESS_COUNT];
 extern UINT32 g_current_process_index;
 

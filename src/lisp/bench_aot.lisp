@@ -195,3 +195,11 @@
           (setq acc (%%bench-aot-callee acc))
           (setq i (+ i 1))))
       acc)))
+
+;;; --- [性能測定] Phase5 第0部: スタックガードの動作確認用(深度1000で溢れる) ---
+;; AOTの非末尾再帰は1レベルあたり約330byte消費するため、深度1000で約330KBとなり
+;; 256KBのスタックを溢れさせる。ガードが無ければゲストが無反応のまま停止する
+(defun %%bench-aot-deep-recursion (n)
+  (if (= n 0)
+      0
+      (+ n (%%bench-aot-deep-recursion (- n 1)))))

@@ -318,6 +318,20 @@ static void panic_write_uint(frame_buffer *fb, UINT64 v) {
 /* Immobilized Spaceの各定義より後ろで定義する(前方宣言のみここに置く) */
 static void panic_write_imm_breakdown(frame_buffer *fb);
 
+void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
+    frame_buffer *fb = get_active_frame_buffer();
+    fb->write_string(fb, "PANIC: stack overflow\n  rsp=");
+    panic_write_uint(fb, rsp);
+    fb->write_string(fb, " stack_low=");
+    panic_write_uint(fb, stack_low);
+    fb->write_string(fb, "\n  used=");
+    panic_write_uint(fb, stack_used);
+    fb->write_string(fb, " byte (stack size=");
+    panic_write_uint(fb, (UINT64)STACK_SIZE_FOR_PANIC);
+    fb->write_string(fb, ")\n");
+    os_panic("stack overflow (see above)");
+}
+
 void os_panic(const char *msg) {
     frame_buffer *fb = get_active_frame_buffer();
     fb->write_string(fb, "PANIC: ");

@@ -29,6 +29,57 @@ UINT32 g_current_process_index = 0;
 /** @brief プロセスごとの専用実行スタック。GCが関知しないOS層の生メモリなので静的配列で確保する */
 static UINT8 g_stacks[PROCESS_COUNT][STACK_SIZE] __attribute__((aligned(16)));
 
+/* [性能測定] Phase5 第0部: スタックガード。
+   スタックにはガードページが無く、溢れてもページフォルトにならない。検出が無いと
+   ゲストは無反応のまま停止し、外からは「極端に遅い処理」と区別できない
+   (documents/pitfalls.md 原則5)。ページング機構をこの段階で触るのは影響範囲が
+   大きいため、(1)各スタックの最下端へカナリアを置き (2)タイマ割り込みで
+   rspの範囲とカナリアの両方を検査する、という方式にする。通常パスのコストは
+   ゼロで、検査はスケジューラの切り替え時にのみ走る。
+   ただし検出粒度はタイマ周期(約10ms)であり、深い再帰は10ms未満で256KBを
+   消費しうる。その場合でも「溢れた後の次のtickで診断付きpanicに到達する」ため、
+   無言の停止よりは大幅に切り分けやすくなる(完全な即時検出にはガードページか
+   関数プロローグでの検査が要るが、後者はPhase4で削った呼び出しコストを
+   再び載せることになる) */
+#define STACK_CANARY 0x5441434B47554152ULL /* "STACKGUAR" 相当のマジック */
+/** カナリアの直上に置く安全マージン。rspがここより下に来た時点で溢れたと判定する */
+#define STACK_GUARD_MARGIN 4096
+
+static void stack_canary_init(UINT32 proc_index) {
+    *(UINT64 *)g_stacks[proc_index] = STACK_CANARY;
+}
+
+int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used) {
+    // まず全プロセスのカナリアを見る。溢れたスタックのrspはg_stacksの範囲外へ
+    // 出てしまい下のループでは捕まらないため、破壊の痕跡はこちらで検出する
+    // (PROCESS_COUNTは数個なのでtickごとに全部見ても無視できるコスト)
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        if (*(UINT64 *)g_stacks[i] != STACK_CANARY) {
+            *out_low = (UINT64)g_stacks[i];
+            *out_used = STACK_SIZE;
+            return 0;
+        }
+    }
+    // rspが属するスタックを特定し、下端のマージンに食い込んでいないかを見る。
+    // 実行中のプロセスはスケジューラが*CURRENT-PROCESS*で管理しており
+    // g_current_process_index(表示フォーカス用)とは別物なので、indexではなく
+    // rspがどの範囲に入るかで判定する
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        UINT64 low = (UINT64)g_stacks[i];
+        UINT64 high = low + STACK_SIZE;
+        if (rsp >= low && rsp <= high) {
+            *out_low = low;
+            *out_used = high - rsp;
+            return rsp >= low + STACK_GUARD_MARGIN;
+        }
+    }
+    // どのプロセススタックにも属さない。起動直後の初回tickはkernelのidleループの
+    // スタック上で走るため、ここへ来るのは正常
+    *out_low = 0;
+    *out_used = 0;
+    return 1;
+}
+
 /**
  * @brief PCB(word2)に保存されているsaved_rspを読み出す
  * @param pcb os_make_instance(MAGIC_PROCESS, ...)で作られたPCB
@@ -77,6 +128,7 @@ void SYSV_ABI process_trampoline_c(UINT64 proc_index) {
  * @return 構築したPCB
  */
 static lisp_val_t spawn(UINT32 proc_index) {
+    stack_canary_init(proc_index);
     UINT64 stack_top = (UINT64)(g_stacks[proc_index] + STACK_SIZE);
     // iretq後のRSPがmod 16 == 8となるよう調整(SysV ABIの関数入口の想定に揃える)
     if ((stack_top & 0xFULL) != 8) {

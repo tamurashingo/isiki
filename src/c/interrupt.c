@@ -432,6 +432,14 @@ UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     outb(0x20, 0x20); // EOI を先に返す
     g_tick_counter++;
 
+    // [性能測定] Phase5 第0部: スタックガード。通常パスには乗らない位置で、
+    // 割り込み時のrspとカナリアからスタック溢れを検出する(process.c参照)
+    UINT64 stack_low = 0;
+    UINT64 stack_used = 0;
+    if (!os_process_stack_check(current_rsp, &stack_low, &stack_used)) {
+        os_panic_stack_overflow(current_rsp, stack_low, stack_used);
+    }
+
     lisp_val_t current_cell = os_get_variable(g_sym_current_process, global_environment);
     lisp_val_t next_cell;
     if (current_cell == nil) {
