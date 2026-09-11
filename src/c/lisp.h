@@ -12,17 +12,13 @@
  * @param obj cons cell
  * @return car の値
  */
-/* [性能測定] Phase5 第2部: cc_car/cc_cdr(生成コード中2,784箇所)のinline化は
-   **見送る**。static inline化・実体を1つだけ残すinline化のいずれでも、JITが
-   labels本体内にletを持つ関数をコンパイルしなくなる回帰が出る
-   (test/lisp/za_test_ext17.lispの11番目、%%za-compiled-pがnil)。
-   %%DIAG-ZA-BAIL-LINEで追跡したところ、断念箇所はza_rewrite_body_listの
-   「formsがTAG_CONSでない」判定であり、コンパイル時に組み直している
-   bodyリストが壊れていることを示す。同関数はos_make_cons(first, rest)を
-   呼ぶがrestを保護しておらず(firstは保護済み)、documents/pitfalls.md原則4と
-   同じクラスの漏れに見える。ただしGC_PROTECT(rest)を足すと別の形で壊れる
-   (EVAL-ERROR)ため、za.cのコンパイル時アロケーション経路全体の監査が要る。
-   その調査を経るまでinline化は行わない */
+/* [性能測定] Phase5: cc_car/cc_cdr(生成コード中2,784箇所)のinline化は引き続き
+   見送る。za_rewrite_*系のenv未保護(本コミットで修正)は真の潜在バグだったが、
+   それを直してもinline化すると別の箇所(za_compile_body_forms経由、za.c:4703で
+   伝播)で断念しEVAL-ERRORになる。同型の保護漏れがza.cのコンパイル時経路に
+   まだ残っていることを示す。%%DIAG-ZA-BAIL-LINEは失敗を表すreturn 0だけを
+   捉えており、正常終了と区別できないreturn nilの経路は追えないため、
+   za.cのコンパイル時アロケーション経路全体の監査が必要 */
 lisp_val_t cc_car(lisp_val_t obj);
 lisp_val_t cc_cdr(lisp_val_t obj);
 

@@ -4216,6 +4216,11 @@ static lisp_val_t za_rewrite_body_list(lisp_val_t forms, lisp_val_t env, const z
         *ok = 0; ZA_BAIL_LINE();
         return nil;
     }
+    // [性能測定] Phase5: envは確保を伴う再帰呼び出し(za_rewrite_*/os_make_cons)を
+    // 跨いで生存するlisp_val_tのCローカルだが保護されていなかった。環境オブジェクトは
+    // GCで移動するため、この間にGCが走るとenvはstaleなアドレスを指したままになる
+    // (documents/pitfalls.md 原則4と同じクラス)。
+    GC_PROTECT(env);
     GC_PROTECT(forms);
     lisp_val_t first = za_rewrite_fn_refs(cc_car(forms), env, scope, ok);
     if (!*ok) {
@@ -4243,6 +4248,11 @@ static lisp_val_t za_rewrite_binding_list(lisp_val_t bindings, lisp_val_t env, c
         *ok = 0; ZA_BAIL_LINE();
         return nil;
     }
+    // [性能測定] Phase5: envは確保を伴う再帰呼び出し(za_rewrite_*/os_make_cons)を
+    // 跨いで生存するlisp_val_tのCローカルだが保護されていなかった。環境オブジェクトは
+    // GCで移動するため、この間にGCが走るとenvはstaleなアドレスを指したままになる
+    // (documents/pitfalls.md 原則4と同じクラス)。
+    GC_PROTECT(env);
     GC_PROTECT(bindings);
     lisp_val_t binding = cc_car(bindings);
     if ((binding & TAG_MASK) != TAG_CONS) {
@@ -4315,6 +4325,11 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
         return form;
     }
 
+    // [性能測定] Phase5: envは確保を伴う再帰呼び出し(za_rewrite_*/os_make_cons)を
+    // 跨いで生存するlisp_val_tのCローカルだが保護されていなかった。環境オブジェクトは
+    // GCで移動するため、この間にGCが走るとenvはstaleなアドレスを指したままになる
+    // (documents/pitfalls.md 原則4と同じクラス)。
+    GC_PROTECT(env);
     GC_PROTECT(form);
     lisp_val_t rest = cc_cdr(form);
 
