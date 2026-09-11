@@ -1039,15 +1039,95 @@
      (transpile-call expr scope))
     ((and (consp expr) (consp (car expr)) (eq (car (car expr)) 'lambda) (= (length (car expr)) 3))
      ;; let/let*の展開((lambda (vars) body) inits)のような、演算子位置に直接
-     ;; lambda式が来る即時呼び出し形式。funcallプリミティブ(primitive_funcall、
-     ;; fnを第一引数、残りを実引数として受け取りapply_functionへ渡す)への
-     ;; 呼び出しへ書き換えることで、既存のtranspile-call/transpile-lambdaを
-     ;; そのまま再利用できる
-     (transpile-call (cons 'funcall expr) scope))
+     ;; lambda式が来る即時呼び出し形式。
+     ;; [性能測定] Phase2: 束縛変数がネストしたlambdaに捕捉されない場合は、
+     ;; クロージャ生成(os_make_lifted_closure)・引数リスト構築(os_make_cons)・
+     ;; primitive_funcallの動的ディスパッチのいずれも経由せず、Cのブロックへ
+     ;; 直接インライン展開する。実測でletのコストの91%がこの「1束縛あたりの
+     ;; オーバーヘッド」だった(documents/performance-measurement.md参照)。
+     ;; 捕捉がある場合は従来通りfuncallプリミティブへの呼び出しへ書き換え、
+     ;; 既存のtranspile-call/transpile-lambdaをそのまま使う
+     (if (immediate-lambda-inlinable-p (second (car expr)) (third (car expr)) (cdr expr))
+         (transpile-inline-immediate-lambda (car expr) (cdr expr) scope)
+         (transpile-call (cons 'funcall expr) scope)))
     ((symbolp expr)
      (error "transpile-expr: 未束縛の変数参照です: ~S" expr))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
 
+
+(defparameter *inline-let-counter* 0
+  "[性能測定] Phase2: インライン展開した即時lambda呼び出しの束縛変数へ付ける
+   一意なCローカル変数名のカウンタ(入れ子のlet/let*で名前が衝突しないようにする)")
+
+(defparameter *inline-fallback-log* nil
+  "[性能測定] Phase2: インライン展開を見送った箇所と理由の記録。
+   『ベンチマークのletが実はフォールバックしていた』という取り違えを防ぐため、
+   mainの最後に集計を標準エラーへ出す")
+
+(defun immediate-lambda-inlinable-p (params body args)
+  "((lambda (params) body) args) をクロージャ生成を経由せずCブロックへ
+   インライン展開してよいかを判定する。判定に迷うものは必ずフォールバック側
+   (nil)へ倒す。インライン化し損ねた場合の損失は命令数だけだが、捕捉の
+   見落としはGCタイミング依存の破壊になるため。
+   捕捉の判定にはcaptured-params(transpile-lambdaのラムダリフティング判定と
+   同一のもの)をそのまま使う。独立した解析器を新たに書くと既存判定との
+   食い違いが将来のバグ源になるため、必ずこれを再利用すること"
+  (multiple-value-bind (fixed-params rest-param) (split-rest-param params)
+    (cond
+      ;; &restつきは固定引数への1対1束縛にならない
+      (rest-param (push (list :rest params) *inline-fallback-log*) nil)
+      ((not (every #'symbolp params)) (push (list :non-symbol-param params) *inline-fallback-log*) nil)
+      ((not (= (length fixed-params) (length args)))
+       (push (list :arity params) *inline-fallback-log*) nil)
+      ;; 束縛変数がネストしたlambdaに捕捉される場合、その変数はCローカルに
+      ;; 置けない(クロージャの寿命がCスタックフレームより長くなりdanglingする)
+      ((captured-params body fixed-params)
+       (push (list :captured (captured-params body fixed-params)) *inline-fallback-log*) nil)
+      (t t))))
+
+(defun transpile-inline-binds (params temps inits body outer-scope inner-scope)
+  "インライン展開した束縛を1つずつGC-safeに評価し、最後にBODYを展開する。
+   transpile-call-args-guardedと同じ短絡規則(いずれかのinit評価が非局所脱出
+   シグナルなら、残りのinit評価とbodyを一切実行せずそのシグナルを返す)に従う。
+   GC_PROTECTの省略条件がtranspile-call-args-guardedより厳しい点に注意:
+   関数呼び出しの引数は評価後すぐ呼び出しに消費されるためleafなら保護を
+   省けるが、letの束縛変数はbodyの実行中ずっと生き、body内でsetqされて
+   ヒープ上の値を持ちうる。そのためleafであっても、その変数がbody内で
+   setqされる場合は保護を省略しない(省略するとGC後にstaleなポインタが残る)"
+  (if (null params)
+      (transpile-expr body inner-scope)
+      (let* ((param (car params))
+             (temp (car temps))
+             (init (car inits))
+             (rest-c (transpile-inline-binds (cdr params) (cdr temps) (cdr inits) body
+                                             outer-scope inner-scope)))
+        ;; initはOUTER-SCOPEで展開する。これが並列束縛の意味論そのもので、
+        ;; INNER-SCOPEで展開すると (let ((a 1)) (let ((a 2) (b a)) b)) のbのinit aが
+        ;; 同じletのa(=2)を見てしまい逐次束縛になる(実測で検出済み)
+        (if (and (aot-form-is-leaf init outer-scope)
+                 (not (member param (setq-targets body nil))))
+            (format nil "({ lisp_val_t ~A = (~A); ~A; })"
+                    temp (transpile-expr init outer-scope) rest-c)
+            (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                    temp (transpile-expr init outer-scope) temp temp temp rest-c)))))
+
+(defun transpile-inline-immediate-lambda (lambda-form args scope)
+  "((lambda (params) body) args) をCのブロック(GCC statement expression)へ
+   インライン展開する。os_make_lifted_closure・引数リストのos_make_cons・
+   primitive_funcallのいずれも発生させない。
+   並列束縛の意味論は自然に満たされる: 各initは外側のSCOPEで展開され、
+   束縛変数には新しい一意のC名を割り当てるため、(let ((a 1)) (let ((a 2) (b a)) b))
+   のbのinit aは外側のaへ解決される。let*は入れ子のlambdaへ展開済みなので、
+   各段が個別にこの経路を通ることで逐次束縛になる"
+  (destructuring-bind (lambda-kw params body) lambda-form
+    (declare (ignore lambda-kw))
+    (let* ((temps (mapcar (lambda (p)
+                            (declare (ignore p))
+                            (format nil "__inl_~A" (incf *inline-let-counter*)))
+                          params))
+           (inner-scope (append (mapcar (lambda (p temp) (cons p (cons temp nil))) params temps)
+                                scope)))
+      (transpile-inline-binds params temps args body scope inner-scope))))
 
 (defparameter *ct-temp-counter* 0
   "M14基盤D: block/return-from/tagbody/go導入に伴い、testの結果や中間式の値を
@@ -2170,4 +2250,12 @@
     ;; M15: フィクスチャは登録(emit-aot-registration)もtoplevel-runnerも不要
     ;; (テスト専用でglobal_environmentへは登録しない、transpile_fixture.lisp
     ;; 自体もdefun以外のトップレベルフォームを持たない)
-    (emit-c-file *fixture-output-c-path* all-prototypes fixture-bodies "")))
+    (emit-c-file *fixture-output-c-path* all-prototypes fixture-bodies "")
+    ;; [性能測定] Phase2: インライン展開を見送った箇所の集計を出す。
+    ;; 「ベンチマークのletが実はフォールバックしていた」という取り違えを防ぐため
+    (let ((counts nil))
+      (dolist (entry *inline-fallback-log*)
+        (let ((hit (assoc (first entry) counts)))
+          (if hit (incf (cdr hit)) (push (cons (first entry) 1) counts))))
+      (format *error-output* "~&[transpile] 即時lambdaのインライン展開: 見送り ~A件~@[ ~S~]~%"
+              (length *inline-fallback-log*) counts))))

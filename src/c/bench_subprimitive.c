@@ -1,6 +1,7 @@
 #include "bench_subprimitive.h"
 #include "runtime.h"
 #include "lisp.h"
+#include "eval.h"
 
 // [性能測定] 構文別ベンチマークスイートのC側参照実装(bench_subprimitive.h参照)。
 //
@@ -198,6 +199,32 @@ static UINT64 bench_funcall(UINT64 n) {
     return acc;
 }
 
+/* [性能測定] 診断専用(Phase2の2-0-1): インライン展開で消せる3つの操作
+   (1)os_make_lifted_closure_with_meta によるクロージャ生成
+   (2)引数リストのos_make_cons
+   (3)primitive_funcall の動的ディスパッチ
+   だけをN回繰り返し、その合計コストを測る。letのAOT生成コードが1束縛あたり
+   この3つを行うため、「インライン展開が最大でいくつ削減できるか」の下限が分かる
+   (AOT側は各式をGC_PROTECT/os_is_control_transferで包むぶん更に重いので下限)。 */
+static lisp_val_t bench_closure_body(lisp_val_t evaluated_args, lisp_val_t env) {
+    (void)env;
+    return cc_car(evaluated_args);
+}
+
+static UINT64 bench_closure_call(UINT64 n) {
+    static za_fn_meta_t meta;
+    UINT64 acc = 0;
+    for (UINT64 i = 0; i < n; i++) {
+        lisp_val_t fn = os_make_lifted_closure_with_meta(
+            &meta, (lisp_addr_t)(void *)bench_closure_body, global_environment);
+        GC_PROTECT(fn);
+        lisp_val_t args = os_make_cons(fn, os_make_cons(os_make_fixnum(i), nil));
+        lisp_val_t r = primitive_funcall(args, global_environment);
+        acc = acc + os_fixnum_magnitude(r);
+    }
+    return acc;
+}
+
 /* [性能測定] 診断専用: Immobilized Spaceを意図的に消費し、枯渇時にOSが永久停止
    せずos_panicへ到達することを確認するためのもの。専用カーソルから確保するため、
    os_imm_space_used_bytesはこのカーソルの現在ページの未使用末尾分だけ過大に
@@ -235,6 +262,7 @@ BENCH_DEFINE_PRIMITIVE(cc_bench_c_cons, bench_cons)
 BENCH_DEFINE_PRIMITIVE(cc_bench_c_for, bench_for)
 BENCH_DEFINE_PRIMITIVE(cc_bench_c_vector, bench_vector)
 BENCH_DEFINE_PRIMITIVE(cc_bench_c_funcall, bench_funcall)
+BENCH_DEFINE_PRIMITIVE(cc_diag_closure_call, bench_closure_call)
 
 void os_register_bench_subprimitives(void) {
     os_set_function(os_make_symbol("%%BENCH-C-LOOP"),
@@ -255,6 +283,8 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_for), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-VECTOR"),
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_vector), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-CLOSURE-CALL"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_closure_call), global_environment);
     os_set_function(os_make_symbol("%%DIAG-IMM-BURN"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_imm_burn), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-FUNCALL"),

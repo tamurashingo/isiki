@@ -90,6 +90,21 @@
           (setq i (+ i 1))))
       acc)))
 
+;;; --- 6b. ローカル変数束縛(let*で1変数) ---
+;; [性能測定] Phase2の2-0-1: %%bench-aot-letと同じ計算(acc += i+4)を、
+;; 内側のlet*の束縛数だけ1個に変えたもの。5束縛版との差を4で割ると、
+;; AOTの実コード上での「1束縛あたりのコスト」(インライン展開で消せる分)が
+;; 分離できる。
+(defun %%bench-aot-let1 (n)
+  (let ((acc 0) (i 0))
+    (progn
+      (while (< i n)
+        (progn
+          (setq acc (+ acc (let* ((a (+ i 4)))
+                             a)))
+          (setq i (+ i 1))))
+      acc)))
+
 ;;; --- 7. cons/リスト操作(長さ1000のリストを構築して走査、N/1000回) ---
 (defun %%bench-aot-cons (n)
   (let ((reps (div n 1000)) (r 0) (total 0))
