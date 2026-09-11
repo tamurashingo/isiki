@@ -863,3 +863,34 @@
         (funcall (lambda (y) (cons captured y)) 0)
         (%%transpile-fixture-gc-churn n)
         (+ (car inlined) (car captured))))))
+
+;; [性能測定] Phase3 第0部: leaf判定でGC_PROTECTが省略される形の健全性確認。
+;; initは非box化ローカル(パラメータ)参照なのでleafと判定され保護が省略される。
+;; bodyでGCを誘発したあとに束縛変数を読む。省略された保護が不健全なら、
+;; GCで移動した先へ追随できずstaleなポインタを読む
+(defun %%transpile-fixture-let-leaf-gc (pair n)
+  (let ((x pair))
+    (progn
+      (%%transpile-fixture-gc-churn n)
+      (car x))))
+
+;; 同じ問題の関数引数版(Phase2以前からある経路)。第1引数pairはleafとして
+;; 保護を省略され、第2引数の評価でGCが走る
+(defun %%transpile-fixture-arg-leaf-gc (pair n)
+  (cons pair (%%transpile-fixture-gc-churn n)))
+
+;; [性能測定] Phase3 第0部: 直接呼び出し(引数consリストを組まない形)で
+;; GC_PROTECTを省略する経路の健全性確認。第1引数pairはヒープ値を持つ
+;; 非box化ローカル参照で保護が省略されるが、第2引数も割り付けを伴わない
+;; 読み出しなので使うまでGCは起こりえない。呼び出し先(os_make_cons)の
+;; 内部で割り付けが起きても、その時点で両引数は既に読み出し済み
+(defun %%transpile-fixture-direct-call-noprotect (pair other)
+  (car (cons pair other)))
+
+;; 同じ形で、呼び出し先が割り付けを何度も行う場合
+(defun %%transpile-fixture-direct-call-alloc-loop (pair n)
+  (let ((i 0) (last nil))
+    (progn
+      (while (< i n)
+        (progn (setq last (cons pair i)) (setq i (+ i 1))))
+      (car (car last)))))

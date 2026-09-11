@@ -145,6 +145,10 @@ extern lisp_val_t lisp_ll_transpile_fixture_let_deep(lisp_val_t args, lisp_val_t
 extern lisp_val_t lisp_ll_transpile_fixture_let_capture_escape(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_let_capture_setq(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_let_gc_mixed(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_leaf_gc(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_arg_leaf_gc(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_direct_call_noprotect(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_direct_call_alloc_loop(lisp_val_t args, lisp_val_t env);
 
 extern lisp_val_t lisp_ll_transpile_fixture_answer(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_string(lisp_val_t args, lisp_val_t env);
@@ -1450,6 +1454,43 @@ void test_transpile_fixture_let_inline(void) {
     lisp_val_t gc_args = os_make_cons(os_make_fixnum(200000), nil);
     assert(lisp_ll_transpile_fixture_let_gc_mixed(gc_args, env) == os_make_fixnum(42),
            "let: インライン化letとフォールバックletの混在でGCを跨いでも値が保たれる(11+31)");
+
+    /* [Phase3 第0部] leaf判定でGC_PROTECTを省略した束縛変数が、body内のGCに
+       追随できるか。initは非box化ローカル参照(leaf)でヒープ値を保持している */
+    lisp_val_t pair = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair);
+    lisp_val_t leaf_args = os_make_cons(pair, os_make_cons(os_make_fixnum(200000), nil));
+    GC_PROTECT(leaf_args);
+    assert(lisp_ll_transpile_fixture_let_leaf_gc(leaf_args, env) == os_make_fixnum(77),
+           "let: leaf判定で保護を省略した束縛変数がbody内のGCに追随する");
+
+    lisp_val_t pair2 = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair2);
+    lisp_val_t leaf_args2 = os_make_cons(pair2, os_make_cons(os_make_fixnum(200000), nil));
+    GC_PROTECT(leaf_args2);
+    lisp_val_t arg_result = lisp_ll_transpile_fixture_arg_leaf_gc(leaf_args2, env);
+    GC_PROTECT(arg_result);
+    assert(cc_car(cc_car(arg_result)) == os_make_fixnum(77),
+           "関数引数: leaf判定で保護を省略した引数が、後続引数の評価で起きたGCに追随する");
+
+    /* [Phase3 第0部] 直接呼び出し(引数consリストを組まない形)でGC_PROTECTを
+       省略する経路。使うまでGCが起こりえないことが省略の根拠なので、
+       呼び出し先の内部で割り付けが起きても壊れないことを確認する */
+    lisp_val_t pair3 = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair3);
+    lisp_val_t d_args = os_make_cons(pair3, os_make_cons(os_make_fixnum(5), nil));
+    GC_PROTECT(d_args);
+    lisp_val_t d_res = lisp_ll_transpile_fixture_direct_call_noprotect(d_args, env);
+    GC_PROTECT(d_res);
+    assert(cc_car(d_res) == os_make_fixnum(77),
+           "直接呼び出し: 保護を省略した引数が呼び出し先の割り付けを跨いでも正しい");
+
+    lisp_val_t pair4 = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair4);
+    lisp_val_t d_args2 = os_make_cons(pair4, os_make_cons(os_make_fixnum(200000), nil));
+    GC_PROTECT(d_args2);
+    assert(lisp_ll_transpile_fixture_direct_call_alloc_loop(d_args2, env) == os_make_fixnum(77),
+           "直接呼び出し: 20万回の割り付けでGCを何度も跨いでも引数が正しい");
 }
 
 int main(void) {

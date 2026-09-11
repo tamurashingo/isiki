@@ -20,26 +20,15 @@ N_C="${BENCH_N_C:-10000000}"
 N_AOT="${BENCH_N_AOT:-1000000}"
 CASES="${BENCH_CASES:-loop arith tailrec nontailrec branch let cons for vector funcall}"
 
-# カテゴリごとのN(AOT版)の上書き。構文によって1反復あたりのコストが3桁近く違うため、
-# 全カテゴリを同じNで測ると重いものが現実的な時間で終わらない(実測: letをN=1,000,000で
-# 測ったところ、他カテゴリが1起動2分程度なのに対し33分経っても完走しなかった)。
-# 原因は、letが1回評価されるごとにos_make_lifted_closureがza_fn_meta_tを
-# Immobilized Space(GC非対象・解放されないバンプ確保)へリークさせること
-# (documents/performance-measurement.md「letのImmobilized Spaceリーク」節)。
-# 1単位あたりへ正規化してから比を出すので、Nが違っても比較は成立する。
-#
-# さらに重要な制約: letとforは1反復ごとにImmobilized Space(4MB固定、GC非対象)を
-# 消費し、使い切るとos_imm_page_allocがOSを無限ループで停止させる。実測で
-# letは160 byte/反復・forは28.7 byte/反復を消費するため、空き約3.89MBに対し
-# letは約24,300反復・forは約135,000反復でハングする。そのためNはこの上限より
-# 十分小さい値に抑える必要がある(この制約自体が本ベンチマークの最大の発見)。
+# [性能測定] Phase1以前は、letとforが1反復ごとにImmobilized Space(4MB固定・
+# GC非対象)を消費し使い切るとOSが停止したため、これらのカテゴリだけNを
+# 10,000〜100,000に抑えていた。Phase1(za_fn_meta_tのfnptr単位一意化)で
+# 実行回数比例の消費が0になったため、この回避策は不要になった。
+# むしろ小さいNはboot時のゆらぎ(実測で約3,700万命令)に信号が埋もれ、
+# 測定値が信用できなくなる(letをN=10,000で測っていた間、同一実装で
+# 643と531という17%も違う値が出ていた)。全カテゴリで同じNを使う。
 aot_n_for() {
-    case "$1" in
-        let)  echo 10000 ;;
-        for)  echo 50000 ;;
-        cons) echo 100000 ;;
-        *)    echo "$N_AOT" ;;
-    esac
+    echo "$N_AOT"
 }
 MILESTONE="tmp/bench_construct_milestone.lisp"
 RESULT_TSV="tmp/bench_construct_results.tsv"

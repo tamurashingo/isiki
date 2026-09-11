@@ -1104,12 +1104,18 @@
         ;; initはOUTER-SCOPEで展開する。これが並列束縛の意味論そのもので、
         ;; INNER-SCOPEで展開すると (let ((a 1)) (let ((a 2) (b a)) b)) のbのinit aが
         ;; 同じletのa(=2)を見てしまい逐次束縛になる(実測で検出済み)
-        (if (and (aot-form-is-leaf init outer-scope)
-                 (not (member param (setq-targets body nil))))
-            (format nil "({ lisp_val_t ~A = (~A); ~A; })"
-                    temp (transpile-expr init outer-scope) rest-c)
-            (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
-                    temp (transpile-expr init outer-scope) temp temp temp rest-c)))))
+        (let ((init-c (transpile-expr init outer-scope))
+              (setq-p (and (member param (setq-targets body nil)) t)))
+          (cond
+            ;; 即値で、かつbody内でsetqされない(=ヒープ値を持ちえない)場合のみ
+            ;; GC_PROTECTを省略できる
+            ((and (aot-form-is-immediate init) (not setq-p))
+             (format nil "({ lisp_val_t ~A = (~A); ~A; })" temp init-c rest-c))
+            ((aot-form-is-signal-free init outer-scope)
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); ~A; })" temp init-c temp rest-c))
+            (t
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                     temp init-c temp temp temp rest-c)))))))
 
 (defun transpile-inline-immediate-lambda (lambda-form args scope)
   "((lambda (params) body) args) をCのブロック(GCC statement expression)へ
@@ -1778,44 +1784,37 @@
 
 (defparameter *call-temp-counter* 0)
 
-(defun aot-form-is-leaf (form scope)
-  "[ABI刷新] AOT改善(GC_PROTECT削減、za.cのPhase1=za_operand_is_safe_leafと
-   同じ基準をtranspile.lisp側に移植したもの、documents/performance-
-   measurement.md 2026-09-11「read-file-into-vectorのAOT呼び出し規約
-   オーバーヘッド」節参照)。FORMの評価結果が、GC_PROTECT(GCルートへの
-   一時登録)もos_is_control_transfer(非局所脱出シグナル判定)も一切不要な
-   「leaf」かどうかを、FORMを実際にtranspile-exprへ通さずに静的に判定する。
-   leafと判定できるのは以下の2ケースのみ(za_operand_is_safe_leafのコメントと
-   同じ判断基準):
-   - fixnum/文字リテラル: os_make_fixnum/os_make_charが生成するのは即値
-     (TAG_FIXNUM/TAG_CHAR、ヒープ非経由)であり、GCによる再配置の対象に
-     ならない。呼び出しを一切含まないため非局所脱出シグナルにもなりえない。
-   - 非box化ローカル変数(scope中でboxed-pがnil)への参照: 束縛時に
-     emit-param-binding-stmt等が一度だけGC_PROTECTしたCローカル変数を
-     単に読むだけであり、その保護(GC_PROTECTマクロのcleanup属性は
-     束縛を含むCブロックのスコープを抜ける時にのみ発火する)は束縛を含む
-     関数の実行が終わるまで有効なままなので、読み出しのたびの再保護は
-     不要。またLisp側の代入(setq)は非局所脱出シグナルを弾いてから
-     でなければ実際の代入を行わない生成コードになっているため、
-     正しく評価が完了したローカル変数がシグナル値そのものを保持する
-     ことはない。
-   上記以外(box化ローカル・グローバル変数・quoteシンボル・文字列
-   リテラル・裸のT・関数呼び出し・複合式全般)は、ヒープ確保やGCを
-   誘発しうる呼び出しを含む可能性があるため安全側でleafとしない
-   (最適化を見送るだけで、常に既存の保護付きパスへフォールバックする)。
-   NILは呼び出し元(transpile-exprの他の分岐)で既にCリテラル\"nil\"へ
-   静的解決されこの関数へは到達しないが、念のためleaf扱いにしておく"
-  (cond
-    ((integerp form) t)
-    ((characterp form) t)
-    ((null form) t)
-    ((eq form t) nil)
-    ((symbolp form)
-     (let ((binding (cdr (assoc form scope))))
-       (and binding (not (cdr binding)))))
-    (t nil)))
+(defun aot-form-is-immediate (form)
+  "FORMの評価結果が必ず即値(fixnum/文字リテラル/nil)かどうか。即値は
+   TAG_FIXNUM/TAG_CHAR等のヒープ非経由の値でGCの再配置対象にならず、
+   呼び出しを一切含まないため非局所脱出シグナルにもなりえない。
+   したがってGC_PROTECTもos_is_control_transferも共に省略できる"
+  (or (integerp form) (characterp form) (null form)))
 
-(defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr)
+(defun aot-form-is-signal-free (form scope)
+  "FORMの評価結果が非局所脱出シグナルになりえないかどうか
+   (os_is_control_transferチェックのみを省略してよいか)。即値に加えて、
+   非box化ローカル変数への参照を含む。Lisp側の代入(setq)は非局所脱出
+   シグナルを弾いてからでなければ実際の代入を行う生成コードにならないため、
+   正しく評価が完了したローカル変数がシグナル値そのものを保持することはない。
+
+   [性能測定] Phase3 第0部: **GC_PROTECTの省略はこの条件では行えない。**
+   以前は『束縛時に一度GC_PROTECTしたCローカル変数を読むだけだから再保護は
+   不要』としてGC_PROTECTも省略していたが、これは誤りだった。保護されている
+   のは元のCローカル変数であって、その値を写した一時変数(__call_arg_N /
+   __inl_N)は別のCローカルであり、GCはこちらを更新しない。ローカル変数は
+   ヒープ値(cons/vector/string等)を保持しうるため、写した後にGCが走ると
+   一時変数はstaleなアドレスを指したままになる。
+   実際に (let ((x pair)) (progn <GC誘発> (car x))) と
+   (cons pair <GC誘発>) の両方で値が壊れることをネイティブテストで再現した
+   (test/c/lisp_compiled_test.c)。そのためGC_PROTECTの省略は
+   aot-form-is-immediate(即値であることが確実な場合)に限る"
+  (or (aot-form-is-immediate form)
+      (and (symbolp form)
+           (not (eq form t))
+           (let ((binding (cdr (assoc form scope))))
+             (and binding (not (cdr binding)))))))
+(defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr direct-call-p)
   "ALL-TEMPSを1つずつGC-safeに評価し、いずれかが非局所脱出シグナル
    (os_is_control_transfer)であれば残りの引数評価とFINAL-C-EXPR(呼び出し本体)を
    一切実行せずそのシグナル自身を式全体の値として返す。M14基盤D:
@@ -1824,21 +1823,48 @@
    エスケープするクロージャの結果が、letの脱糖((lambda (result) body) init)の
    ように別の呼び出しの引数として渡された場合、この規則が無いと非局所脱出
    シグナルが素通しされずただの値として本体に渡ってしまう不具合があった)。
-   [ABI刷新] AOT改善: aot-form-is-leaf参照。引数の(未評価の)元のLisp式が
-   leafと判定できる場合は、GC_PROTECT・os_is_control_transferチェックの
-   両方を省略する(za.cのza_emit_operandが同じ条件でこれらを一切発行しない
-   ことを確認済み、documents/performance-measurement.md参照)"
+   [ABI刷新] AOT改善 / [性能測定] Phase3 第0部で是正:
+   aot-form-is-immediate / aot-form-is-signal-free 参照。引数の(未評価の)
+   元のLisp式が即値(fixnum/文字リテラル/nil)ならGC_PROTECT・
+   os_is_control_transferの両方を省略し、非box化ローカル変数への参照なら
+   os_is_control_transferのみを省略する。ローカル変数参照でGC_PROTECTまで
+   省略していた以前の実装は、一時変数(__call_arg_N)へ写した値をGCが更新
+   しないためstaleなアドレスを残す不具合があり、ネイティブテストで再現して
+   是正した(documents/performance-measurement.md参照)"
   (if (null remaining-temps)
       (funcall final-c-expr all-temps)
       (let ((temp (car remaining-temps))
             (arg-form (car remaining-args)))
-        (if (aot-form-is-leaf arg-form scope)
-            (format nil "({ lisp_val_t ~A = (~A); ~A; })"
-                    temp (transpile-expr arg-form scope)
-                    (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope final-c-expr))
-            (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
-                    temp (transpile-expr arg-form scope) temp temp temp
-                    (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope final-c-expr))))))
+        (let* ((rest-c (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args)
+                                                    scope final-c-expr direct-call-p))
+               (arg-c (transpile-expr arg-form scope))
+               ;; [性能測定] Phase3 第0部: この一時変数を代入してから実際に使うまでの
+               ;; 間にGCが起こりえないなら、ヒープ値を保持していてもstaleにならないので
+               ;; GC_PROTECTを省略できる。その条件は
+               ;;   - 呼び出し自体が引数consリストを組まない直接呼び出しであること
+               ;;     (name__fixed / primitive_add2形式。consリストを組む経路は
+               ;;      os_make_consが割り付けを行うためGCが起こりうる)
+               ;;   - 自分を含む以降の全引数が割り付けを伴わない評価であること
+               ;;     (即値または非box化ローカル変数の読み出しのみ)
+               ;; 呼び出し先の内部で割り付けが起きても、その時点で一時変数は既に
+               ;; 引数として読み出され済みで以後参照されないため問題にならない
+               (no-gc-until-use-p
+                 (and direct-call-p
+                      (every (lambda (a) (aot-form-is-signal-free a scope)) remaining-args))))
+          (cond
+            ;; 即値: GCの再配置対象でもシグナルでもないので常に両方省略できる
+            ((aot-form-is-immediate arg-form)
+             (format nil "({ lisp_val_t ~A = (~A); ~A; })" temp arg-c rest-c))
+            ;; 使うまでGCが起こりえないなら、非box化ローカル参照でも両方省略できる
+            ((and no-gc-until-use-p (aot-form-is-signal-free arg-form scope))
+             (format nil "({ lisp_val_t ~A = (~A); ~A; })" temp arg-c rest-c))
+            ;; 非box化ローカル参照: シグナルにはなりえないのでチェックは省くが、
+            ;; ヒープ値を保持しうるためGC_PROTECTは省略できない(上記参照)
+            ((aot-form-is-signal-free arg-form scope)
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); ~A; })" temp arg-c temp rest-c))
+            (t
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                     temp arg-c temp temp temp rest-c)))))))
 
 (defun transpile-call (expr scope)
   "(name arg*)。nameはdefunされた関数名またはプリミティブのホワイトリストに
@@ -1881,14 +1907,16 @@
                              args)))
          (transpile-call-args-guarded temps temps args scope
            (lambda (all-temps)
-             (format nil "~A__fixed(env, ~A)" (lisp-name-to-c-name name) (transpile-c-arg-list all-temps))))))
+             (format nil "~A__fixed(env, ~A)" (lisp-name-to-c-name name) (transpile-c-arg-list all-temps)))
+           t)))
       (fixed-c-name
        (let ((temps (mapcar (lambda (arg)
                                (declare (ignore arg))
                                (format nil "__call_arg_~A" (incf *call-temp-counter*)))
                              args)))
          (transpile-call-args-guarded temps temps args scope
-           (lambda (all-temps) (format nil "~A(~A)" fixed-c-name (transpile-c-arg-list all-temps))))))
+           (lambda (all-temps) (format nil "~A(~A)" fixed-c-name (transpile-c-arg-list all-temps)))
+           t)))
       (t
        (let ((c-name (call-target-c-name name)))
          (if (null args)
@@ -1898,7 +1926,8 @@
                                      (format nil "__call_arg_~A" (incf *call-temp-counter*)))
                                    args)))
                (transpile-call-args-guarded temps temps args scope
-                 (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps)))))))))))
+                 (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps)))
+                 nil))))))))
 
 (defun tail-return-final (c-expr)
   "末尾位置で、既に確定したC式c-exprの値をそのままtco_result_tとしてreturnする
