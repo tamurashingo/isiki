@@ -213,27 +213,145 @@ FAT層側が支配的であればそちらを優先する」という当初の�
   FAT層の関数(`%fat16-read-lba-list`/`fat16-fat-entry`等)の寄与も
   同じ手法でさらに分離することを検討する。
 
+## FAT層側(read-into!)の命令数内訳: ILOS総称関数ディスパッチの精査(2026-09-11)
+
+前節の切り分けで「FAT層+Lispランタイム」が全体の99.632%を占めることが
+判明したため、次に**ILOS総称関数(`read-into!`)のディスパッチ処理**が
+支配的かどうかを検証した。結論から言うと**ディスパッチは無視できるほど
+軽微であり、真因は別の場所(`read-file-into-vector`のAOT生成コード自体の
+呼び出し規約オーバーヘッド)にあった**。
+
+### 1. ディスパッチ機構の実装確認(コードレビュー)
+
+`src/lisp/init.lisp`/`src/lisp/init_aot.lisp`を確認したところ、`defgeneric`は
+`(defun name (&rest args) (%generic-call 'name args))`という`&rest`関数に
+展開され、`%generic-call`は毎回:
+
+```lisp
+(defun %generic-call (name args)
+  (%invoke-method-chain (%order-methods (%applicable-methods name args)) args))
+```
+
+を実行する。`%applicable-methods`は`*generic-methods*`をname(gf名)で`assoc`
+線形走査し、見つかった全メソッドに対し`subclassp`判定を行い、
+`%order-methods`は挿入ソート(毎回)、`%invoke-method-chain`は
+`unwind-protect`+動的変数の退避/復元を伴う。**メソッド解決結果のキャッシュは
+一切無い**——コードだけを見れば、以前の`os_make_symbol`線形走査と同種の
+ホットスポットに見えた。
+
+### 2. 実測: ディスパッチは全体の0.0004%に過ぎない
+
+`subclassp`/`class-of`/`%find-generic-methods`/`%method-applicable-p`/
+`%specializers-applicable-p`/`%filter-applicable-methods`/
+`%applicable-methods`/`%order-methods`/`%invoke-method-chain`/
+`%generic-call`等、ディスパッチ機構一式がリンク後のバイナリで連続領域
+(ファイルRVA `0x52600`〜`0x631cb`)を構成していることを確認し、TCGプラグインの
+アドレス範囲指定でこの区間だけの命令数を計測したところ:
+
+| 計測 | 命令数 |
+|---|---|
+| 起動+mountのみ | 20,271 |
+| 起動+mount+1MB読み込み | 30,427 |
+| **ディスパッチ機構自体の差分** | **10,156(全体の0.0004%)** |
+
+`*generic-methods*`に登録される総称関数・メソッドの実数が(システム全体で
+`initialize-object`/`report-condition`/`read-into!`/`write-from!`等)数個〜
+十数個程度にとどまるため、「線形走査」自体はO(1000)級の`os_make_symbol`とは
+規模が全く異なり、実害が無いレベルだった。**コードの見た目上の懸念(未
+キャッシュの線形探索)が、実際のボトルネックとは限らない**という、本調査
+全体を通じて繰り返し現れているパターンがここでも再現した。
+
+### 3. 落とし穴: __step(consリストABI)ではなく__step_fixed(固定引数ABI)を測るべきだった
+
+「メソッド本体(クラスタチェイン走査)」の候補として`%fat16-read-into-impl`
+(`lisp_ll_fat16_read_into_impl__step`)のアドレス範囲を計測したところ
+`range_insns=0`という結果になった。TBダンプで直接確認したところ、実行時に
+このアドレス範囲へは一切到達していなかった。原因は、ABI-M6(AOT-to-AOT
+静的呼び出しの固定引数ABI化)により、`defmethod`本体のクロージャから
+`%fat16-read-into-impl`への呼び出しが実際には**consリストABI版
+(`__step`)ではなく固定引数ABI版(`__step_fixed`)**を使っていたため。
+`__step_fixed`(ファイルRVA `0xdbd83`)を測り直しても、やはり
+`range_insns=0`だった。
+
+### 4. 方針転換: アドレス範囲の事前予想をやめ、プラグインに実測プロファイラ機能を追加
+
+2回連続で「予想したアドレス範囲に実行が無い」という結果になったため、
+`tools/plugins/isiki_instcount.c`に`profile=1`オプションを追加した。TB単位で
+(開始アドレス, 命令数, 実行回数)を記録し、終了時に「命令数×実行回数」
+降順でtop 40件を出力する機能で、アドレス範囲を静的に予想する代わりに
+**実際にホットな箇所を直接発見する**アプローチに切り替えた。
+
+### 5. 実測結果: 真因は`read-file-into-vector`のAOT呼び出し規約オーバーヘッド
+
+1MB読み込みベンチマークをプロファイルし、top 40のホットTBをシンボルに
+対応付けたところ(top 40だけで全体2,566,285,269命令のうち
+1,777,902,294命令≒69.3%を説明):
+
+| シンボル | 命令数(top40内) | 割合 |
+|---|---|---|
+| `get_current_process` | 526,208,500 | 29.6% |
+| `is_control_transfer`/`os_is_control_transfer`(合算) | 484,457,888 | 27.3% |
+| `primitive_add2` | 121,852,560 | 6.9% |
+| `primitive_set_elt_impl` | 108,880,356 | 6.1% |
+| `number_compare` | 81,950,954 | 4.6% |
+| `is_vector`/`is_float`(合算) | 70,680,930 | 4.0% |
+| `strncmpignorecase` | 16,215,168 | 0.9% |
+| `primitive_less_than2` | 15,156,140 | 0.9% |
+| `primitive_create_vector` | 15,112,240 | 0.9% |
+| `os_stream_read_char` | 13,719,810 | 0.8% |
+
+`get_current_process`は1MB(1,000,000byte)に対し**105,241,700回**呼ばれて
+いた(1byteあたり約105回)。実装自体はO(1)(`&g_processes[g_current_
+process_index]`、配列添字アクセス)だが、`GC_PROTECT`マクロが1回につき
+`get_current_process()`を2回呼ぶ(初期化子と代入)ため、**呼び出し回数の
+絶対数**がボトルネックになっている。`is_control_transfer`/
+`os_is_control_transfer`も同様に、`transpile-call-args-guarded`が生成する
+「引数を1つ評価するたびにGC_PROTECTし、非局所脱出シグナルでないか
+チェックする」というAOTの安全側ガード付き呼び出しパターインが、1byteの
+読み込み・書き込みという極めて軽い操作に対しても律儀に発行され続けて
+いることを示している。
+
+### 判定
+
+「ディスパッチ処理が支配的」でも「メソッド本体(クラスタチェイン走査)が
+支配的」でもなく、**`read-file-into-vector`のAOT生成コード自体(1byte
+ずつの`read-byte`/`set-elt`呼び出しループ)が、za.cのJITには既に適用済み
+(Phase1/Phase2、documents/abi-redesign.md参照)のような「非アロケーション
+演算のGC_PROTECT省略」「fixnum算術のインライン化」を一切受けていない**
+ことが真因と判明した。次のアクションとして、za.cのPhase1/Phase2と同種の
+最適化(leaf判定によるGC_PROTECT省略、`+`/`<`等の単純演算のインライン化)を
+AOTトランスパイラ(`transpile.lisp`)側にも適用することを、新しい
+マイルストンとして提案する(本書の範囲外、別途指示書で計画する)。
+
 ## 今後のフォローアップ
 
+- ~~IDE読み込みの`ide.c`単独 vs それ以外の大枠切り分け~~ → 完了
+  (「IDE読み込みの命令数内訳」節、`ide.c`は全体の0.368%のみ、FAT層+
+  Lispランタイム側が99.632%)。
+- ~~FAT層側(read-into!)のILOSディスパッチが支配的かどうかの切り分け~~
+  → 完了(「FAT層側(read-into!)の命令数内訳」節、ディスパッチ自体は
+  全体の0.0004%と無視できる規模。真因は`read-file-into-vector`のAOT
+  呼び出し規約オーバーヘッド(`GC_PROTECT`/`is_control_transfer`)と判明)。
+- **【最有力の次の一手】** AOTトランスパイラ(`transpile.lisp`)に、
+  za.cのPhase1(非アロケーション演算のGC_PROTECT省略、leaf判定ベース)・
+  Phase2(`+`/`-`等の単純演算のインライン化)と同種の最適化を適用する。
+  1byteの読み書きという最小単位の操作に対してすら`GC_PROTECT`
+  (`get_current_process`2回)+`is_control_transfer`チェックを律儀に
+  発行し続けている現状が、`read-file-into-vector`の命令数の過半を
+  占めている(「FAT層側(read-into!)の命令数内訳」節参照)。新しい
+  マイルストンとして別途指示書で計画する。
+- `insw`一括転送化・`READ MULTIPLE`対応は保留のまま(`ide.c`自体は全体の
+  0.368%しか占めないため、上記AOT側の最適化より優先度は低い)。
 - `-d in_asm,out_asm`の出力を`objdump`等で読める形に変換するパイプライン
   の整備。
-- JIT生成コードの実行時アドレスを`-dfilter`へ渡す仕組みの整備
-  (`za_compile_call`が生成した関数の先頭アドレスをLisp側から取得する方法の
-  確立)。
-- ~~IDE読み込みの`ide.c`単独 vs それ以外の大枠切り分け~~ →
-  完了(下記「IDE読み込みの命令数内訳」節参照、`ide.c`は全体の0.368%
-  のみ、FAT層+Lispランタイム側が99.632%を占めることが判明)。
-- FAT層(`read-into!`/`fat16-fat-entry`等)側の、より細かい命令数内訳の
-  分離。前節の判定に基づき、`insw`一括転送化・`READ MULTIPLE`対応より
-  こちらを優先する。
-- `-d in_asm,out_asm`の出力を`objdump`等で読める形に変換するパイプライン
-  の整備。
-- JIT生成コードの実行時アドレスを`-dfilter`/TCGプラグインのアドレス
-  範囲指定へ渡す仕組みの整備(`za_compile_call`が生成した関数の先頭
-  アドレスをLisp側から取得する方法の確立)。
-- 今後アドレス範囲指定を使う際は、必ず計測対象と全く同じディスク構成で
-  実行時アドレスを実測すること(前節の「重要な落とし穴」参照、ディスク
-  構成によってUEFIのイメージロードアドレスが変わりうる)。
-- `insw`一括転送化・`READ MULTIPLE`対応(保留中、FAT層側の調査結果次第で
-  再検討)を実装する際は、本書の手法1(TCGプラグインの`total_insns`)を
+- 今後アドレス範囲指定(`-dfilter`/TCGプラグインの`start=`/`end=`)を
+  使う際は、必ず計測対象と全く同じディスク構成で実行時アドレスを実測
+  すること(「重要な落とし穴」節参照、ディスク構成によってUEFIの
+  イメージロードアドレスが変わりうる)。また、ABI-M6/M8のAOT-to-AOT
+  固定引数ABI化により、AOT関数の実際の呼び出しが`__step`(consリスト
+  ABI)ではなく`__step_fixed`(固定引数ABI)を使っている場合があるため、
+  アドレス範囲を静的に予想する前に、まず`profile=1`オプション
+  (`tools/plugins/isiki_instcount.c`)で実際にホットな箇所を確認する
+  ことを推奨する。
+- 次の最適化を実装する際は、本書の手法1(TCGプラグインの`total_insns`)を
   主指標とし、壁時計時間は最終確認としてのみ用いる。
