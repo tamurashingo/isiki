@@ -617,6 +617,72 @@ test-qemu-perf:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 
+# [性能測定] test-qemu-perfは#39(書き込み)と#41(読み込み)を同居させており、
+# documents/performance-measurement.mdの調査(残り約14.4億命令のホットスポット
+# 再探索)で「書き込み側には未解明の遅さ・再現する劣化がある」ことが判明した
+# ため、読み込み単体の計測にはこのノイズを排除する必要がある。そのため、
+# ゲスト内での書き込み・テストデータ生成を一切行わず、ホスト側で事前に
+# mkfs.vfat+mount+cpして焼き込んだファイル(100KB/1MB/2MB、i mod 256の
+# 決定論的パターン)をread-file-into-vectorで読むだけの専用ディスクイメージ・
+# マイルストーンを用意する(documents/performance-measurement.mdで確立した
+# 「ホスト側事前書き込み」手法の恒久化)。サイズはFAT16_DISK_IMG/FAT32_DISK_IMGと
+# 同じ理由(FAT32はmkfs.vfat -F 32のクラスタ数警告を避けるための実測済み安全
+# マージン)でFAT16=16MB/FAT32=40MBとする。
+PERF_READ_SIZE_100K = 100000
+PERF_READ_SIZE_1M = 1000000
+PERF_READ_SIZE_2M = 2000000
+PERF_READ_DATA_100K = $(BUILD_TMPDIR)/perf_read_100k.bin
+PERF_READ_DATA_1M = $(BUILD_TMPDIR)/perf_read_1m.bin
+PERF_READ_DATA_2M = $(BUILD_TMPDIR)/perf_read_2m.bin
+
+# ホスト側でi mod 256を反復する決定論的パターンのバイナリを生成する
+# (docker/gcc本体には依存しないため、isiki-builderコンテナ外・ホストの
+# python3で直接生成する)。ゲスト側(perf_read_fat16_test.lisp/
+# perf_read_fat32_test.lisp)は同じi mod 256パターンで期待値を再計算して照合する
+$(PERF_READ_DATA_100K): | $(BUILD_TMPDIR)
+	python3 -c "open('$@', 'wb').write(bytes([i % 256 for i in range($(PERF_READ_SIZE_100K))]))"
+
+$(PERF_READ_DATA_1M): | $(BUILD_TMPDIR)
+	python3 -c "open('$@', 'wb').write(bytes([i % 256 for i in range($(PERF_READ_SIZE_1M))]))"
+
+$(PERF_READ_DATA_2M): | $(BUILD_TMPDIR)
+	python3 -c "open('$@', 'wb').write(bytes([i % 256 for i in range($(PERF_READ_SIZE_2M))]))"
+
+PERF_READ_FAT16_IMG = $(BUILD_TMPDIR)/perf_read_fat16.img
+
+$(PERF_READ_FAT16_IMG): $(PERF_READ_DATA_100K) $(PERF_READ_DATA_1M) $(PERF_READ_DATA_2M) | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			mkfs.vfat -F 16 $@; \
+			mkdir -p /mnt/perf_read_fat16; \
+			mount -o loop $@ /mnt/perf_read_fat16; \
+			cp $(PERF_READ_DATA_100K) /mnt/perf_read_fat16/READ100K.BIN; \
+			cp $(PERF_READ_DATA_1M) /mnt/perf_read_fat16/READ1M.BIN; \
+			cp $(PERF_READ_DATA_2M) /mnt/perf_read_fat16/READ2M.BIN; \
+			umount /mnt/perf_read_fat16'
+
+PERF_READ_FAT32_IMG = $(BUILD_TMPDIR)/perf_read_fat32.img
+
+$(PERF_READ_FAT32_IMG): $(PERF_READ_DATA_100K) $(PERF_READ_DATA_1M) $(PERF_READ_DATA_2M) | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=40 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			mkfs.vfat -F 32 $@; \
+			mkdir -p /mnt/perf_read_fat32; \
+			mount -o loop $@ /mnt/perf_read_fat32; \
+			cp $(PERF_READ_DATA_100K) /mnt/perf_read_fat32/READ100K.BIN; \
+			cp $(PERF_READ_DATA_1M) /mnt/perf_read_fat32/READ1M.BIN; \
+			cp $(PERF_READ_DATA_2M) /mnt/perf_read_fat32/READ2M.BIN; \
+			umount /mnt/perf_read_fat32'
+
+# 使い方: make test-qemu-perf-read。test-qemu-perfと同じくローカル専用
+# (KVM無しのQEMU/TCGでは1MB超のファイルI/Oが現実的な時間で終わらないため)
+# だが、書き込みを一切含まないため、test-qemu-perfよりも明確に短時間で完走する
+test-qemu-perf-read: $(PERF_READ_FAT16_IMG) $(PERF_READ_FAT32_IMG)
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_read_fat16.lisp QEMU_DISK_IMG=$(PERF_READ_FAT16_IMG)
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_read_fat32.lisp QEMU_DISK_IMG=$(PERF_READ_FAT32_IMG)
+
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)
