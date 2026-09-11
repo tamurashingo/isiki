@@ -30,6 +30,13 @@ HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+# [GCデバッグ] documents/pitfalls.md 原則4/原則6。GC_DEBUG=1でstale領域の
+# staleポインタのデリファレンス検査を有効にする(%%DIAG-GC-STRESSで実行時に
+# 強制GCの間隔も設定できる)。GC_PAINT=1を併用すると旧From空間をトラップパターンで
+# 塗り潰すが、GC非管理の生データ(os_stream_t等)を壊すため既定では無効。
+# 通常ビルドでは空なので影響しない
+GC_DEBUG_FLAGS = $(if $(GC_DEBUG),-DISIKIOS_GC_DEBUG,)$(if $(GC_PAINT), -DISIKIOS_GC_PAINT,)
+
 BUILD_TMPDIR = tmp
 OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
 
@@ -148,6 +155,7 @@ $(TARGET): $(SRC) $(HDR)
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
+		$(GC_DEBUG_FLAGS) \
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)

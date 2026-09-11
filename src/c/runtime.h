@@ -786,6 +786,27 @@ UINT64 os_imm_space_used_bytes(void);
  */
 void os_panic(const char *msg);
 
+/* [性能測定] GCデバッグ機構(documents/pitfalls.md 原則4/原則6)。
+   ISIKIOS_GC_DEBUGを定義してビルドすると、コピーGC完了後に旧From空間
+   (=stale領域)をトラップパターンで塗り潰し、そこを指すポインタの
+   デリファレンスを検出できるようにする。
+
+   コピーGCでは、塗り潰さない限り旧コピーは上書きされるまで「正しく見える値」の
+   ままである。staleポインタを読んでも移動前の内容がそのまま読めてしまい、
+   多くの場合クラッシュしない。強制GCを毎回走らせても黙って成功し続けるため、
+   塗り潰しが無いと保護漏れは検出できない(原則6そのものの形)。
+
+   通常ビルドではこれらは何も行わない(マクロが空になる)ため性能に影響しない。 */
+#ifdef ISIKIOS_GC_DEBUG
+/** 旧From空間(stale領域)を指すアドレスかどうか */
+int os_gc_debug_is_stale(lisp_addr_t addr);
+/** staleなオブジェクトのデリファレンスを検出したら診断付きで停止する */
+void os_gc_debug_assert_live(lisp_val_t obj, const char *where);
+#define GC_DEBUG_ASSERT_LIVE(obj, where) os_gc_debug_assert_live((obj), (where))
+#else
+#define GC_DEBUG_ASSERT_LIVE(obj, where) ((void)0)
+#endif
+
 /**
  * スタック溢れを診断情報付きで報告して停止する([性能測定] Phase5 第0部)。
  * @param rsp 検出時のスタックポインタ

@@ -269,10 +269,35 @@ static UINT8 g_nil_cell[16] __attribute__((aligned(8)));
  * @param n 割り当てるバイト数
  * @return 割り当てたメモリの先頭アドレス
  */
+#ifdef ISIKIOS_GC_DEBUG
+/** [GCデバッグ] 強制GCの間隔(確保N回ごとに1回、0で無効)。実行時に
+    %%DIAG-GC-STRESSで設定する。ブート自体は膨大な確保を行うため、
+    コンパイル時に固定すると起動が終わらない。テスト直前に有効化する運用にする */
+static UINT64 g_gc_stress_interval = 0;
+
+lisp_val_t cc_diag_gc_stress(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_gc_stress_interval = os_fixnum_magnitude(cc_car(args));
+    return cc_car(args);
+}
+#endif
+
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
     UINT64 aligned = (n + 7) & ~7ULL;
 #ifndef ISIKIOS_UNIT_TEST
     __asm__ __volatile__ ("cli");
+#endif
+#ifdef ISIKIOS_GC_DEBUG
+    // [GCデバッグ] 強制GCモード。ISIKIOS_GC_STRESS回の確保ごとにGCを走らせ、
+    // 保護漏れが踏まれる確率を上げる。1にすると毎回GCが走り非常に遅くなるため、
+    // まず大きい値で全体を流し、当たりがついた経路で1にするという段階的な使い方をする
+    if (g_gc_stress_interval != 0) {
+        static UINT64 stress_counter = 0;
+        if (++stress_counter >= g_gc_stress_interval) {
+            stress_counter = 0;
+            os_gc_collect();
+        }
+    }
 #endif
     UINT8 *p = g_from_ptr;
     if (p + aligned > g_from_end) {
@@ -331,6 +356,44 @@ void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
     fb->write_string(fb, ")\n");
     os_panic("stack overflow (see above)");
 }
+
+#ifdef ISIKIOS_GC_DEBUG
+/* [GCデバッグ] **塗り潰し(ISIKIOS_GC_PAINT)は既定で無効にしてある。**
+   このコードベースはos_alloc_rawで確保したGC非管理の生データ(os_stream_t、
+   ファイル読み込みバッファ等)をGCヒープ内に置いており、GCはこれらをコピーしない。
+   つまり旧From空間に残ったまま「上書きされるまで生き延びる」ことに依存している。
+   塗り潰すとこれらが即座に破壊され、ブート中(init.lispのload)で停止する。
+   staleポインタの検出はISIKIOS_GC_DEBUGの範囲検査だけでも行えるため、
+   通常はそちらを使う。塗り潰しを使うには先に生データのGCヒープ外への移設が要る。 */
+/** [GCデバッグ] stale領域を塗るトラップパターン(タグ=TAG_FORWARD、本来観測されない値) */
+#define GC_DEBUG_TRAP_PATTERN 0xDEADDEADDEADDEA6ULL
+
+/** [GCデバッグ] staleなデリファレンスを検出した回数 */
+static UINT64 g_gc_debug_stale_hits = 0;
+
+lisp_val_t cc_diag_gc_stale_hits(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_debug_stale_hits);
+}
+
+int os_gc_debug_is_stale(lisp_addr_t addr) {
+    return addr >= (lisp_addr_t)g_to_start && addr < (lisp_addr_t)g_to_end;
+}
+
+void os_gc_debug_assert_live(lisp_val_t obj, const char *where) {
+    (void)where;
+    lisp_addr_t addr = (lisp_addr_t)(obj & ~TAG_MASK);
+    if (addr == 0) {
+        return;
+    }
+    // [GCデバッグ] panicではなく**計数**する。ブート中だけでも多数踏むことが
+    // 実測で分かっており、最初の1件で止めると全体像が掴めないため。
+    // 「保護漏れがどこにどれだけあるか」を調べる調査用の網として使う
+    if (os_gc_debug_is_stale(addr)) {
+        g_gc_debug_stale_hits++;
+    }
+}
+#endif
 
 void os_panic(const char *msg) {
     frame_buffer *fb = get_active_frame_buffer();
@@ -1149,6 +1212,10 @@ static void gc_fixup_environment_cells(lisp_val_t env) {
  * 生存オブジェクトをTo空間へコピーし、完了後にFrom/To空間を入れ替える。
  */
 void os_gc_collect(void) {
+#ifdef ISIKIOS_GC_PAINT
+    // [GCデバッグ] 入れ替え後に塗り潰す範囲(旧From空間の使用済み末尾)を控える
+    UINT8 *gc_debug_old_used_end = g_from_ptr;
+#endif
     g_gc_collect_count++;
     g_to_ptr = g_to_start;
     g_gc_queue_head = 0;
@@ -1249,6 +1316,26 @@ void os_gc_collect(void) {
     g_to_start = new_to_start;
     g_to_end = new_to_end;
     g_to_ptr = g_to_start;
+
+#ifdef ISIKIOS_GC_PAINT
+    // [GCデバッグ] 入れ替え後のTo空間(=旧From空間)がstale領域そのものなので、
+    // ここをトラップパターンで塗り潰す。**全コピーとfixupが終わった後**でなければ
+    // ならない(forwarding pointerを旧From空間へ書く実装なので、GC自身がまだ
+    // 旧From空間を読んでいる間に塗るとGCが壊れる)。
+    // 塗る値のタグはTAG_FORWARD(0x6)にする。forwarding pointerはGCの内部でしか
+    // 現れないはずの値なので、これを観測したコードは必ずバグである。タグ0〜7は
+    // すべて有効値として使われており「タグとして不正な値」は作れないため、
+    // 「本来ありえないタグ」を選ぶのが最も検出しやすい
+    {
+        // 旧From空間のうち実際に使われていた範囲だけを塗る。半ヒープ全体を毎GC
+        // 塗るのは高コストで、未使用部分にはstaleなオブジェクトが存在しない
+        UINT64 *p = (UINT64 *)g_to_start;
+        UINT64 *end = (UINT64 *)gc_debug_old_used_end;
+        while (p < end) {
+            *p++ = GC_DEBUG_TRAP_PATTERN;
+        }
+    }
+#endif
 }
 
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
@@ -1403,6 +1490,12 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%GLOBAL-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_global_environment), global_environment);
         os_set_function(os_make_symbol("%%SET-CURRENT-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_set_current_environment), global_environment);
         os_set_function(os_make_symbol("%%EVAL-IN-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_eval_in_environment), global_environment);
+        #ifdef ISIKIOS_GC_DEBUG
+
+        os_set_function(os_make_symbol("%%DIAG-GC-STRESS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stress), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_hits), global_environment);
+
+        #endif
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);

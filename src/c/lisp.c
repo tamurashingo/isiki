@@ -12,11 +12,13 @@
  */
 lisp_val_t cc_car(lisp_val_t obj) {
     // TODO: TAG_CONS であることのチェックを入れる
+    GC_DEBUG_ASSERT_LIVE(obj, "cc_car");
     return ((lisp_val_t *)(obj & ~TAG_MASK))[0];
 }
 
 lisp_val_t cc_cdr(lisp_val_t obj) {
     // TODO: TAG_CONS であることのチェックを入れる
+    GC_DEBUG_ASSERT_LIVE(obj, "cc_cdr");
     return ((lisp_val_t *)(obj & ~TAG_MASK))[1];
 }
 
