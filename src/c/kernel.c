@@ -8,6 +8,7 @@
 #include "repl.h"
 #include "subprimitive.h"
 #include "ide_subprimitive.h"
+#include "bench_subprimitive.h"
 #include "virtio9p.h"
 #include "load.h"
 #include "eval.h"
@@ -104,6 +105,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_subprimitives();
     os_register_ide_subprimitives();
     os_register_mount_native_subprimitives();
+    os_register_bench_subprimitives();
     os_register_load();
     os_register_eval_primitives();
     os_register_streams();
@@ -151,6 +153,12 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
         qemu_test_mode = 1;
         g_qemu_test_power_off = power_off;
         os_set_qemu_test_mode(run_qemu_boot_test);
+        // ヒープ/Immobilized Spaceの枯渇等でos_panicへ落ちた場合、テスト実行中は
+        // 電源断して「テスト失敗」として終わらせる。旧実装は空のfor(;;)で永久に
+        // 停止し、-display noneでは診断メッセージも見えないため、外からは
+        // 「極端に遅い処理」と区別がつかなかった(letのImmobilized Spaceリークの
+        // 調査で33分間ハングに気づけなかった実例がある)
+        os_set_panic_hook(power_off);
     }
 
     if (!qemu_test_mode) {

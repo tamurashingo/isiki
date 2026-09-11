@@ -597,8 +597,11 @@ void test_lifted_closure_uses_captured_env_not_caller_env() {
     // apply_functionが実際にword3(捕捉環境)をfnptrへ渡していることを検証する
     lisp_val_t captured_env = os_make_environment(os_make_symbol("CAPTURED-ENV"), nil);
     os_set_variable(os_make_symbol("N"), os_make_fixnum(10), captured_env);
-    lisp_val_t closure = os_make_lifted_closure(
-        (lisp_addr_t)(void *)lifted_closure_body_add_captured_n, captured_env);
+    // Phase1: metaは呼び出し元が持つC静的変数(トランスパイラの生成コードと同じ形)。
+    // クロージャ生成のたびにImmobilized Spaceを消費しないための変更
+    static za_fn_meta_t closure_meta;
+    lisp_val_t closure = os_make_lifted_closure_with_meta(
+        &closure_meta, (lisp_addr_t)(void *)lifted_closure_body_add_captured_n, captured_env);
 
     lisp_val_t caller_env = os_make_environment(os_make_symbol("CALLER-ENV"), nil);
     lisp_val_t args = os_make_cons(closure, os_make_cons(os_make_fixnum(5), nil));

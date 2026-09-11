@@ -766,7 +766,26 @@ lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_e
  * @param captured_env 定義時に捕捉した自由変数を保持する環境
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 2、word3=captured_env)
  */
-lisp_val_t os_make_lifted_closure(lisp_addr_t fnptr, lisp_val_t captured_env);
+lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnptr, lisp_val_t captured_env);
+
+/**
+ * Immobilized Spaceの実消費バイト数をバイト粒度で返す(%%IMM-SPACE-USED-BYTESの実体)。
+ * @return 切り出し済みのバイト数
+ */
+UINT64 os_imm_space_used_bytes(void);
+
+/**
+ * 診断メッセージを表示して停止する。フックが登録されていればそれを呼ぶ
+ * (QEMUテスト実行時は電源断させ、ハングではなくテスト失敗として終わらせる)。
+ * @param msg 表示する診断メッセージ
+ */
+void os_panic(const char *msg);
+
+/**
+ * os_panicが停止前に呼ぶフックを登録する。
+ * @param hook 停止処理(QEMUテスト時の電源断等)
+ */
+void os_set_panic_hook(void (*hook)(void));
 
 /**
  * init.lisp の (make-instance class-sym . initargs) と (signal-condition condition nil) を

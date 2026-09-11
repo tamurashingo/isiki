@@ -21,11 +21,11 @@ SRCDIR = src/c
 # (テスト専用、global_environmentへは登録されない)で、本番のカーネルバイナリには
 # 含めず$(LISP_COMPILED_FIXTURE)という別ファイルへコンパイルする(transpile.lispの
 # main参照)
-TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/file-node.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp
+TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/file-node.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp src/lisp/bench_aot.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
-HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
+HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/bench_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -738,6 +738,31 @@ $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 		mkdir -p tools/plugins/build; \
 		curl -sL https://raw.githubusercontent.com/qemu/qemu/v$(QEMU_VERSION_FOR_PLUGIN)/include/qemu/qemu-plugin.h -o tools/plugins/build/qemu-plugin.h; \
 		gcc -shared -fPIC -Wall -Wextra -O2 -Itools/plugins/build $$(pkg-config --cflags glib-2.0) -o $(INSTCOUNT_PLUGIN) tools/plugins/isiki_instcount.c $$(pkg-config --libs glib-2.0)'
+
+# [性能測定] 構文別ベンチマークスイート(documents/performance-measurement.md
+# 「構文別ベンチマークスイート」節)。src/c/bench_subprimitive.cの素のC実装と
+# src/lisp/bench_aot.lispの同等Lispコード(AOTトランスパイル済み)を、構文
+# カテゴリごとに1対1で命令数比較する。ケースごとに別々のQEMU起動が必要
+# (total_insnsはブート全体の合計しか得られないため)なので21回起動し、
+# 10〜20分程度かかる。test-qemu-perf等と同じくローカル専用でCIには含めない。
+# transpile.lisp/生成コードを変更した後に再実行して、構文単位の改善/退行を追う
+BENCH_N_C ?= 10000000
+BENCH_N_AOT ?= 1000000
+
+test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
+	BENCH_N_C=$(BENCH_N_C) BENCH_N_AOT=$(BENCH_N_AOT) tools/bench/run_construct_bench.sh
+
+# [性能測定] Phase1の受け入れ条件(documents/performance-measurement.md
+# 「letのImmobilized Spaceリーク」節)。クロージャ生成が実行回数に比例して
+# Immobilized Space(4MB固定・GC非対象)を消費しないことを回帰として確認する。
+# 修正前はループ内の5変数let*が約24,300反復でOSを永久停止させていた
+test-qemu-imm-leak:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_imm_leak.lisp
+
+# 構文別ベンチマークのC版/AOT版が同じ計算をしていることの確認(比に意味を
+# 持たせる前提条件)。計測と違い数秒で終わるため単独で実行できる
+test-qemu-bench-construct-check:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_construct.lisp
 
 # 使い方: make test-qemu-instcount MILESTONE=test/lisp/qemu_boot_xxx.lisp
 # [QEMU_DISK_IMG=...]。既存のtest-qemu-milestoneと同じ引数を受け付ける

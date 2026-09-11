@@ -73,6 +73,14 @@
    *fs-lisp-paths*内での並び順=実際の登録順を守らないと未登録エラーになる)。
    このリストの並び順とMakefileのTRANSPILE_LISP_SRCの並び順は同期を保つ共通の
    ソースが無いため、どちらかにファイルを追加する際は両方を手動で更新すること")
+(defparameter *bench-lisp-path* "src/lisp/bench_aot.lisp"
+  "[性能測定] 構文別ベンチマークスイート(documents/performance-measurement.md)の
+   Lisp側実装。src/c/bench_subprimitive.cの%%BENCH-C-*と1対1で対応する
+   %%bench-aot-*を置く。init_aot.lisp/utility.lispと同じ制約・同じ
+   os_register_aot_init_functions経由の登録で、AOTトランスパイラが生成する
+   コードの構文単位のコストを継続的に再計測できるようにするためのもの
+   (本体機能ではないが、最適化作業のたびに再計測する標準ベンチマークとして
+   カーネルへ常駐させる)")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
 (defparameter *fixture-output-c-path* "test/c/lisp_compiled_fixture.c"
   "*runtime-lisp-path*(テスト専用フィクスチャ)のコンパイル結果の出力先。
@@ -1571,11 +1579,20 @@
    作る箇所(defmethodのメソッド呼び出しのたび等)で繰り返し実行されるため、
    環境名/各自由変数名のシンボル解決をos_make_symbol_cached+static局所変数の
    キャッシュ化に置き換える(transpile-quoted/emit-capture-fetch-stmtと同じ
-   パターン)"
+   パターン)。
+   [性能測定] Phase1: os_make_lifted_closureはクロージャ生成のたびに
+   za_fn_meta_tをImmobilized Space(4MB固定・GC非対象・解放手段なし)から
+   確保しており、ループ内のletが約24,300反復でOSを停止させていた
+   (documents/performance-measurement.md「letのImmobilized Spaceリーク」節)。
+   metaの内容はリフト先のC関数アドレスだけで決まるため、呼び出し箇所ごとに
+   C静的変数として1個だけ持たせ(静的記憶域はアドレスが不変で、GCにも
+   Immobilized Spaceにも依存しない)、そのポインタを
+   os_make_lifted_closure_with_metaへ渡す形に変更した。これにより
+   Immobilized Spaceの消費は実行回数比例からゼロになる"
   (if (null free-vars)
-      (format nil "os_make_lifted_closure((lisp_addr_t)(void *)~A, global_environment)" c-name)
+      (format nil "os_make_lifted_closure_with_meta(({ static za_fn_meta_t __closure_meta; &__closure_meta; }), (lisp_addr_t)(void *)~A, global_environment)" c-name)
       (let ((env-temp (format nil "__closure_env_~A" (incf *closure-temp-counter*))))
-        (format nil "({ lisp_val_t ~A = os_make_environment(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
+        (format nil "({ lisp_val_t ~A = os_make_environment(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure_with_meta(({ static za_fn_meta_t __closure_meta; &__closure_meta; }), (lisp_addr_t)(void *)~A, ~A); })"
                 env-temp
                 (c-string-literal c-name)
                 env-temp
@@ -2085,9 +2102,12 @@
          (fs-all-forms (%%expand-defgenerics-in-forms (mapcan #'read-all-forms *fs-lisp-paths*)))
          (fs-defuns (remove-if-not #'toplevel-defun-p fs-all-forms))
          (fs-toplevel-forms (remove-if #'toplevel-defun-p fs-all-forms))
+         (bench-all-forms (%%expand-defgenerics-in-forms (read-all-forms *bench-lisp-path*)))
+         (bench-defuns (remove-if-not #'toplevel-defun-p bench-all-forms))
+         (bench-toplevel-forms (remove-if #'toplevel-defun-p bench-all-forms))
          ;; M15: main-defunsが本番のカーネルバイナリ(*output-c-path*)へ実際に
          ;; 定義を出力する関数群。fixture-defuns(テスト専用)はここに含めない
-         (main-defuns (append aot-defuns utility-defuns fs-defuns))
+         (main-defuns (append aot-defuns utility-defuns fs-defuns bench-defuns))
          (all-defuns (append fixture-defuns main-defuns))
          (*known-function-names* (mapcar #'second all-defuns))
          ;; ABI-M6: known-function-fixed-arity(transpile-call/transpile-prototype/
@@ -2110,7 +2130,7 @@
          ;; -> utility.lisp -> fs-lisp-paths(依存関係の順)の順序で実行する必要がある
          ;; (fat16.lisp/fat32.lispのdefclassが<standard-object>等の組み込みクラスに
          ;; 依存するため)。この3ファイル群の読み込み順がそのまま実行順になる
-         (toplevel-runner (emit-toplevel-forms-runner (append aot-toplevel-forms utility-toplevel-forms fs-toplevel-forms))))
+         (toplevel-runner (emit-toplevel-forms-runner (append aot-toplevel-forms utility-toplevel-forms fs-toplevel-forms bench-toplevel-forms))))
     (emit-c-file *output-c-path* all-prototypes main-bodies
                  (format nil "~A~%~A" registration toplevel-runner))
     ;; M15: フィクスチャは登録(emit-aot-registration)もtoplevel-runnerも不要

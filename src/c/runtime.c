@@ -281,10 +281,7 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
         p = g_from_ptr;
         if (p + aligned > g_from_end) {
             // GC後もなお不足している場合は本当の枯渇として停止する
-            frame_buffer *fb = get_active_frame_buffer();
-            fb->write_string(fb, "out of memory...");
-            for (;;) {
-            }
+            os_panic("out of memory (lisp heap exhausted)");
         }
     }
     g_from_ptr = p + aligned;
@@ -292,6 +289,33 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     __asm__ __volatile__ ("sti");
 #endif
     return (UINT64)p;
+}
+
+/** os_panicがフック済みなら呼ぶ、環境依存の停止処理(QEMUテスト時の電源断等) */
+static void (*g_panic_hook)(void) = 0;
+
+void os_set_panic_hook(void (*hook)(void)) {
+    g_panic_hook = hook;
+}
+
+void os_panic(const char *msg) {
+    frame_buffer *fb = get_active_frame_buffer();
+    fb->write_string(fb, "PANIC: ");
+    fb->write_string(fb, msg);
+    fb->write_char(fb, '\n');
+    // フックが登録されていれば(QEMUテスト実行時は電源断)そちらへ委ねる。
+    // 登録が無ければhltで止まる: 旧実装の空のfor(;;)はCPUを全力で回し続けるため
+    // 「異常停止」と「極端に遅い処理」を外から区別できなかった(letの
+    // Immobilized Spaceリークの調査で33分間ハングに気づけなかった実例がある)。
+    // hltなら停止中のCPU使用率がほぼ0になり、外から明確に判別できる
+    if (g_panic_hook) {
+        g_panic_hook();
+    }
+    for (;;) {
+#ifndef ISIKIOS_UNIT_TEST
+        __asm__ __volatile__ ("hlt");
+#endif
+    }
 }
 
 lisp_addr_t os_alloc_raw(UINT64 n) {
@@ -585,9 +609,10 @@ lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数%%IMM-SPACE-USED-BYTES。Immobilized Spaceのうちg_imm_bumpが
- * これまでに切り出した使用バイト数を返す(フリーリストに返却済みのページも
- * 「切り出し済み」として使用量に含まれる、os_imm_pages_used_for_testと同じ数え方)。
+ * 組み込み関数%%IMM-SPACE-USED-BYTES。Immobilized Spaceの実消費バイト数を
+ * バイト粒度で返す(os_imm_space_used_bytes参照)。以前はページ粒度
+ * (g_imm_bump - g_imm_space)を返していたため、4096byte未満の消費が「0 byte」に
+ * 見え、実行回数に比例するリークを回帰テストで検出できなかった。
  * @param args 評価済みの引数リスト(未使用)
  * @param env 呼び出し時の環境(未使用)
  * @return Immobilized Spaceの使用バイト数のfixnum
@@ -595,8 +620,12 @@ lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env) {
     (void)args;
     (void)env;
-    return os_make_fixnum((UINT64)(g_imm_bump - g_imm_space));
+    return os_make_fixnum(os_imm_space_used_bytes());
 }
+
+/* os_imm_space_used_bytesが参照する2本のスロットカーソル(実体は下方で定義) */
+static imm_slot_cursor_t g_function_cell_cursor;
+static imm_slot_cursor_t g_fn_meta_cursor;
 
 void *os_imm_page_alloc(void) {
     if (g_imm_free_list) {
@@ -605,14 +634,26 @@ void *os_imm_page_alloc(void) {
         return page;
     }
     if (g_imm_bump + IMM_PAGE_SIZE > g_imm_space + IMM_SPACE_SIZE) {
-        frame_buffer *fb = get_active_frame_buffer();
-        fb->write_string(fb, "imm: space exhausted...");
-        for (;;) {
-        }
+        os_panic("immobilized space exhausted");
     }
     void *page = g_imm_bump;
     g_imm_bump += IMM_PAGE_SIZE;
     return page;
+}
+
+UINT64 os_imm_space_used_bytes(void) {
+    // g_imm_bumpはページ単位でしか進まないため、そのままでは4096byte未満の
+    // 消費が見えない。各スロットカーソルが現在のページに残している未使用の
+    // 末尾分を差し引くことで、実際に切り出したバイト数を返す。
+    // (os_imm_pages_alloc_contiguousで取るJITコード用ページは全体が使用中)
+    UINT64 used = (UINT64)(g_imm_bump - g_imm_space);
+    if (g_fn_meta_cursor.page != 0) {
+        used -= (UINT64)(IMM_PAGE_SIZE - g_fn_meta_cursor.offset);
+    }
+    if (g_function_cell_cursor.page != 0) {
+        used -= (UINT64)(IMM_PAGE_SIZE - g_function_cell_cursor.offset);
+    }
+    return used;
 }
 
 void os_imm_page_free(void *page) {
@@ -644,11 +685,11 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
 /** Function Cell(os_get_function_cell/os_set_function参照)の確保に使う
  * バンプカーソル。全environment共通の1本のみ持つ(現状はどのenvironmentが所有する
  * ページかを区別しない、Phase3でenvironmentごとの所有ページリストに置き換える予定) */
-static imm_slot_cursor_t g_function_cell_cursor = {0, 0};
+/* 実体は上方の前方宣言(ゼロ初期化) */
 
 /** ABI-M4: za_fn_meta_t(os_fn_meta_alloc参照)の確保に使うバンプカーソル。
  * Function Cellと同様、個別解放はせずOS生存期間中保持される前提 */
-static imm_slot_cursor_t g_fn_meta_cursor = {0, 0};
+/* 実体は上方の前方宣言(ゼロ初期化) */
 
 za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
     za_fn_meta_t *meta = (za_fn_meta_t *)os_imm_slot_alloc(&g_fn_meta_cursor, sizeof(za_fn_meta_t));
@@ -2059,9 +2100,23 @@ lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT
  * @param captured_env 定義時に捕捉した自由変数を保持する環境
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 2、word3=captured_env)
  */
-lisp_val_t os_make_lifted_closure(UINT64 fnptr, lisp_val_t captured_env) {
+lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnptr, lisp_val_t captured_env) {
     GC_PROTECT(captured_env);
-    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    // metaは呼び出し元(トランスパイラの生成コード)が持つC静的変数への
+    // ポインタ。静的記憶域はアドレスが不変でGCにもImmobilized Spaceにも
+    // 依存しないため、クロージャを作るたびに確保する必要が無い。
+    //
+    // 旧実装はここでos_fn_meta_allocを呼んでおり、letを1回評価するごとに
+    // Immobilized Space(4MB固定・GC非対象・解放手段なし)を32byteずつ消費して
+    // いた。ループ内のletは約24,300反復でこれを使い切り、os_imm_page_allocが
+    // OSを停止させる(documents/performance-measurement.md「letのImmobilized
+    // Spaceリーク」節)。
+    //
+    // metaの内容はfnptrだけで決まり(captured_envはmetaではなくインスタンスの
+    // word3に入る)、lifted closureではfixed_entry/arityは常に0のままなので、
+    // 同じlambdaから作られる全クロージャが1つのmetaを共有してよい。毎回同じ値を
+    // 書き込むだけなので初回判定の分岐すら不要
+    meta->cons_entry = fnptr;
     return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(2), captured_env);
 }
 
