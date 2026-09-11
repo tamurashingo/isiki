@@ -4182,6 +4182,19 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     return 1;
 }
 
+/* [性能測定] Phase5 第2部 2-3: JITがコンパイルを断念した位置を観測可能にする。
+   断念は*ok=0を書くだけで黙って進むため、外からは「なぜJIT化されなかったか」が
+   一切分からず切り分けに時間がかかっていた(cc_car/cc_cdrのinline化回帰の調査で
+   実際に問題になった)。直近の断念箇所の行番号を記録し、%%DIAG-ZA-BAIL-LINEで読む */
+static int g_za_bail_line = 0;
+
+#define ZA_BAIL_LINE() do { if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } } while (0)
+
+lisp_val_t cc_diag_za_bail_line(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum((UINT64)g_za_bail_line);
+}
+
 /** za_rewrite_fn_refsの前方宣言(body-list版と相互再帰する)。 */
 static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_fn_scope_t *scope, int *ok);
 /** za_rewrite_binding_list(入れ子flet/labelsのbindings書き換え)の前方宣言。 */
@@ -4200,7 +4213,7 @@ static lisp_val_t za_rewrite_body_list(lisp_val_t forms, lisp_val_t env, const z
         return nil;
     }
     if ((forms & TAG_MASK) != TAG_CONS) {
-        *ok = 0;
+        *ok = 0; ZA_BAIL_LINE();
         return nil;
     }
     GC_PROTECT(forms);
@@ -4227,19 +4240,19 @@ static lisp_val_t za_rewrite_binding_list(lisp_val_t bindings, lisp_val_t env, c
         return nil;
     }
     if ((bindings & TAG_MASK) != TAG_CONS) {
-        *ok = 0;
+        *ok = 0; ZA_BAIL_LINE();
         return nil;
     }
     GC_PROTECT(bindings);
     lisp_val_t binding = cc_car(bindings);
     if ((binding & TAG_MASK) != TAG_CONS) {
-        *ok = 0;
+        *ok = 0; ZA_BAIL_LINE();
         return nil;
     }
     lisp_val_t name = cc_car(binding);
     lisp_val_t brest = cc_cdr(binding);
     if ((brest & TAG_MASK) != TAG_CONS) {
-        *ok = 0;
+        *ok = 0; ZA_BAIL_LINE();
         return nil;
     }
     lisp_val_t binding_params = cc_car(brest);
@@ -4310,13 +4323,13 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
         // 複数pair非対応、za_compile_setqのコメント参照)。varは別namespaceなので
         // 書き換えず、value-formのみ再帰する。
         if ((rest & TAG_MASK) != TAG_CONS) {
-            *ok = 0;
+            *ok = 0; ZA_BAIL_LINE();
             return form;
         }
         lisp_val_t var = cc_car(rest);
         lisp_val_t rest2 = cc_cdr(rest);
         if ((rest2 & TAG_MASK) != TAG_CONS || cc_cdr(rest2) != nil) {
-            *ok = 0;
+            *ok = 0; ZA_BAIL_LINE();
             return form;
         }
         lisp_val_t val_form = cc_car(rest2);
@@ -4349,7 +4362,7 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
             // outer/ancestorスコープの実際に解決済みの束縛のみを対象とする)。
             if (za_fn_scope_lookup(scope, target, &binding) && binding->gensym_slot_addr != 0) {
                 g_za_saw_flet_labels_escape = 1;
-                *ok = 0;
+                *ok = 0; ZA_BAIL_LINE();
                 return form;
             }
         }
@@ -4370,7 +4383,7 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
         // 誤って書き換えられることを防げる。内外で名前が重複しない場合は従来通り
         // (センチネルがlookupで見つからず素通りするだけなので)動作は変わらない。
         if ((rest & TAG_MASK) != TAG_CONS) {
-            *ok = 0;
+            *ok = 0; ZA_BAIL_LINE();
             return form;
         }
         lisp_val_t bindings = cc_car(rest);
@@ -4381,17 +4394,17 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
         inner_scope.parent = scope;
         for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
             if ((b & TAG_MASK) != TAG_CONS) {
-                *ok = 0;
+                *ok = 0; ZA_BAIL_LINE();
                 return form;
             }
             lisp_val_t binding = cc_car(b);
             if ((binding & TAG_MASK) != TAG_CONS) {
-                *ok = 0;
+                *ok = 0; ZA_BAIL_LINE();
                 return form;
             }
             lisp_val_t name = cc_car(binding);
             if (inner_scope.count >= ZA_MAX_FLET_BINDINGS) {
-                *ok = 0;
+                *ok = 0; ZA_BAIL_LINE();
                 return form;
             }
             inner_scope.bindings[inner_scope.count].orig_name = name;
@@ -4500,13 +4513,13 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
 
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
     lisp_val_t bindings = cc_car(rest);
     lisp_val_t body = cc_cdr(rest);
 
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
 
     // bindings検証: 「(name params . body)」の形を持つ、重複を許す平坦なリスト
@@ -4518,22 +4531,22 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
     UINT64 binding_count = 0;
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
         if ((b & TAG_MASK) != TAG_CONS) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         lisp_val_t binding = cc_car(b);
         if ((binding & TAG_MASK) != TAG_CONS) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         lisp_val_t name = cc_car(binding);
         if ((name & TAG_MASK) != TAG_SYMBOL) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         lisp_val_t brest = cc_cdr(binding);
         if (brest == nil || (brest & TAG_MASK) != TAG_CONS) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         if (binding_count >= ZA_MAX_FLET_BINDINGS) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         name_syms[binding_count] = name;
         binding_params[binding_count] = cc_car(brest);
@@ -4565,7 +4578,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
         lisp_val_t gensym = os_make_uninterned_symbol("FLET-FN");
         UINT64 slot_idx;
         if (!za_alloc_quote_slot(gensym, &slot_idx)) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         new_scope.bindings[i].orig_name = name_syms[i];
         new_scope.bindings[i].gensym_slot_addr = &g_za_quote_slots[slot_idx];
@@ -4581,7 +4594,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
         for (UINT64 i = 0; i < binding_count; i++) {
             binding_bodies[i] = za_rewrite_body_list(binding_bodies[i], env, &new_scope, &rewrite_ok);
             if (!rewrite_ok) {
-                return 0;
+                { ZA_BAIL_LINE(); return 0; }
             }
         }
     }
@@ -4605,7 +4618,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
         } else if (g_za_lambda_slot_count < ZA_MAX_LAMBDA_SLOTS) {
             lambda_slot_idx = g_za_lambda_slot_count++;
         } else {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         g_za_lambda_slots[lambda_slot_idx] = os_make_cons(binding_params[i], binding_bodies[i]);
         os_gc_register_root(&g_za_lambda_slots[lambda_slot_idx]);
@@ -4672,7 +4685,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
                                          call_depth, trampoline_offset, arith_depth);
     g_za_fn_scope = saved_fn_scope;
     if (!body_ok) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
 
     UINT64 nlx_val_off = za_nlx_val_off(nlx_depth);
@@ -4714,12 +4727,12 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
                                       UINT64 arith_depth) {
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
     lisp_val_t protected_form = cc_car(rest);
     lisp_val_t cleanup_forms = cc_cdr(rest);
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
 
     // protected-formの評価結果は制御転送かどうかに関わらずcleanupへ進む
@@ -4729,7 +4742,7 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
     // 確実に拒否させるため(cleanup-formsと同じ深さで評価する)。
     if (!za_compile_expr(protected_form, params, fixed_count, locals, syms, env, 0, trampoline_offset, nlx_depth + 1,
                           tb_ctx, call_depth, arith_depth)) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
 
     UINT64 val_off = za_nlx_val_off(nlx_depth);
@@ -4741,7 +4754,7 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
     // eval_unwind_protectの既知の簡略化に合わせる)。
     if (!za_compile_body_forms(cleanup_forms, params, fixed_count, locals, syms, env, nlx_depth + 1, tb_ctx,
                                 call_depth, trampoline_offset, arith_depth)) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
 
     za_load_slot(ZA_REG_RAX, val_off);
@@ -4773,7 +4786,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
 
     for (lisp_val_t rest = body; rest != nil; rest = cc_cdr(rest)) {
         if ((rest & TAG_MASK) != TAG_CONS) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         lisp_val_t elem = cc_car(rest);
         if (elem != nil && (elem & TAG_MASK) == TAG_SYMBOL) {
@@ -4786,7 +4799,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
             }
             if (idx < 0) {
                 if (new_ctx.tag_count >= ZA_MAX_TAGBODY_TAGS) {
-                    return 0;
+                    { ZA_BAIL_LINE(); return 0; }
                 }
                 idx = new_ctx.tag_count++;
                 new_ctx.tags[idx].tag = elem;
@@ -4803,11 +4816,11 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
         }
 
         if (end_patch_count >= ZA_MAX_TAGBODY_FORMS) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         if (!za_compile_expr(elem, params, fixed_count, locals, syms, env, 0, trampoline_offset, nlx_depth, &new_ctx,
                               call_depth, arith_depth)) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         end_patches[end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
     }
@@ -4815,7 +4828,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
     // 未解決の前方参照が残っていたら(=body中に無いタグへのgo)コンパイル断念。
     for (int i = 0; i < new_ctx.tag_count; i++) {
         if (new_ctx.tags[i].pending_count > 0) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
     }
 
@@ -4830,15 +4843,15 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
 
 static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
     if (tb_ctx == 0 || nlx_depth != tb_ctx->base_nlx_depth) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
     lisp_val_t tag = cc_car(rest);
     if ((tag & TAG_MASK) != TAG_SYMBOL) {
-        return 0;
+        { ZA_BAIL_LINE(); return 0; }
     }
 
     int idx = -1;
@@ -4850,7 +4863,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
     }
     if (idx < 0) {
         if (tb_ctx->tag_count >= ZA_MAX_TAGBODY_TAGS) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         idx = tb_ctx->tag_count++;
         tb_ctx->tags[idx].tag = tag;
@@ -4862,7 +4875,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
         jit_emit_jmp_to(tb_ctx->tags[idx].offset);
     } else {
         if (tb_ctx->tags[idx].pending_count >= ZA_MAX_TAGBODY_GOTOS_PER_TAG) {
-            return 0;
+            { ZA_BAIL_LINE(); return 0; }
         }
         tb_ctx->tags[idx].pending[tb_ctx->tags[idx].pending_count++] = jit_emit_jmp_rel32_placeholder();
     }
@@ -4870,6 +4883,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+    g_za_bail_line = 0; /* [性能測定] Phase5 2-3: このコンパイル試行の断念記録をリセット */
 #ifdef ISIKIOS_UNIT_TEST
     // za.cが出力する機械語は実機ビルド(mingw-gcc, MS x64 ABI, 実行可能メモリ)を前提と
     // しており、ネイティブgccでビルドするユニットテストではABI/メモリ保護が異なるため
@@ -5148,6 +5162,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
  * 自体には登録しない)。 */
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
 }
 
 #else /* !defined(__x86_64__) */
@@ -5165,6 +5180,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {

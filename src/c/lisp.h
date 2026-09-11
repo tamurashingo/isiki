@@ -12,20 +12,25 @@
  * @param obj cons cell
  * @return car の値
  */
-/* [性能測定] Phase4: os_make_fixnum/os_is_control_transferと同様にstatic inline化を
-   試みたが、za.cのJITがiz17-labels-with-let(labels本体内でletマクロを使う関数)を
-   コンパイルしなくなる回帰が出たため据え置く(%%za-compiled-pがnilを返す)。
-   za.cはcc_car/cc_cdrのアドレスをJITコードへ埋め込むが、同一性比較には使って
-   おらず、機構は未解明のまま。再挑戦する場合はまずこの回帰の原因を特定すること
-   (test/lisp/za_test_ext17.lispの11番目のケースで再現する) */
+/* [性能測定] Phase5 第2部: cc_car/cc_cdr(生成コード中2,784箇所)のinline化は
+   **見送る**。static inline化・実体を1つだけ残すinline化のいずれでも、JITが
+   labels本体内にletを持つ関数をコンパイルしなくなる回帰が出る
+   (test/lisp/za_test_ext17.lispの11番目、%%za-compiled-pがnil)。
+   %%DIAG-ZA-BAIL-LINEで追跡したところ、断念箇所はza_rewrite_body_listの
+   「formsがTAG_CONSでない」判定であり、コンパイル時に組み直している
+   bodyリストが壊れていることを示す。同関数はos_make_cons(first, rest)を
+   呼ぶがrestを保護しておらず(firstは保護済み)、documents/pitfalls.md原則4と
+   同じクラスの漏れに見える。ただしGC_PROTECT(rest)を足すと別の形で壊れる
+   (EVAL-ERROR)ため、za.cのコンパイル時アロケーション経路全体の監査が要る。
+   その調査を経るまでinline化は行わない */
 lisp_val_t cc_car(lisp_val_t obj);
+lisp_val_t cc_cdr(lisp_val_t obj);
 
 /**
  * cons cell の cdr を返す。
  * @param obj cons cell
  * @return cdr の値
  */
-lisp_val_t cc_cdr(lisp_val_t obj);
 
 /**
  * cons cell の car を破壊的に書き換える。

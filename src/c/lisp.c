@@ -15,15 +15,17 @@ lisp_val_t cc_car(lisp_val_t obj) {
     return ((lisp_val_t *)(obj & ~TAG_MASK))[0];
 }
 
+lisp_val_t cc_cdr(lisp_val_t obj) {
+    // TODO: TAG_CONS であることのチェックを入れる
+    return ((lisp_val_t *)(obj & ~TAG_MASK))[1];
+}
+
 /**
  * cons cell の cdr を返す。
  * @param obj cons cell
  * @return cdr の値
  */
-lisp_val_t cc_cdr(lisp_val_t obj) {
-    // TODO: TAG_CONS であることのチェックを入れる
-    return ((lisp_val_t *)(obj & ~TAG_MASK))[1];
-}
+
 
 /**
  * cons cell の car を破壊的に書き換える。

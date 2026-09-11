@@ -1478,6 +1478,62 @@ Phase 4で`%%bench-aot-nontailrec`(深度1000×1000回)がハングした件を�
 前提は保たれる)。再挑戦する際は`%%bench-aot-deep-recursion`(深度を直接指定できる
 診断用関数)と`BENCH_REC_DEPTH`を使って切り分けられる。
 
+## Phase 5 第1部/第2部: 単価の確定と、cc_car回帰の原因(2026-09-11)
+
+### os_is_control_transferの単価は19.5ではなく約9.08だった
+
+Phase 3で測った19.5命令/回は、**Phase 4で`os_is_control_transfer`自身を
+`static inline`化する前**の値だった(`%%DIAG-CT-CHECK`を追加したのは
+`get_current_process`のインライン化と同時で、`os_is_control_transfer`自体の
+インライン化はその後)。現HEADで傾き法により測り直すと**9.08命令/回**である
+(この値には診断ループ自身のオーバーヘッド4〜5命令が含まれるため、チェック本体は
+数命令)。
+
+したがって`branch`(463.86)のうち17回のチェックが占めるのは約85命令(18%)であり、
+「71%を占めるので構造的再帰への拡張が最優先に戻る」というシナリオには該当しない。
+`os_is_control_transfer`の**発行箇所削減**の優先度は下がったままでよい。
+
+### cc_car/cc_cdrのinline化は見送る
+
+`static inline`(TUごとに実体が増える)と、C99の`inline`+1TUでの`extern`宣言
+(実体を1つだけ残す)の両方を試したが、**どちらでも同じ回帰が出た**。シンボルが
+一意であることをobjdumpで確認した上で回帰したので、「アドレスの多重化」という
+仮説は**外れ**である。
+
+引き金を1回の起動で絞り込んだ結果、**`labels`の本体内に`let`がある場合だけ**
+JIT化されなくなることが分かった(`labels`単独・`let`単独・`let`+自己再帰はいずれも
+正常)。
+
+JITのコンパイル断念は`*ok = 0`や`return 0`を書くだけで黙って進むため、
+指示書2-3に従って断念箇所の行番号を記録する仕組み(`%%DIAG-ZA-BAIL-LINE`)を
+入れた。これにより断念箇所が`za_rewrite_body_list`の
+「`forms`が`TAG_CONS`でない」判定であることが特定できた。**コンパイル時に
+組み直しているbodyリストが壊れている**ことを示す。
+
+同関数は次の形をしている。
+
+```c
+GC_PROTECT(forms);
+lisp_val_t first = za_rewrite_fn_refs(cc_car(forms), env, scope, ok);
+GC_PROTECT(first);
+lisp_val_t rest = za_rewrite_body_list(cc_cdr(forms), env, scope, ok);
+return os_make_cons(first, rest);   /* restは未保護 */
+```
+
+`first`は保護されているが**`rest`は未保護**であり、直後の`os_make_cons`は確保を
+行うためGCが走りうる。原則4(保護されているのはその変数であって、そこから写した値
+ではない)と同じクラスの漏れに見える。
+
+ただし`GC_PROTECT(rest)`を足すと別の形で壊れる(`EVAL-ERROR`になり、それまで
+JIT化できていた`let`+自己再帰まで落ちる)。za.cのコンパイル時アロケーション経路
+全体の監査が必要であり、**その調査を経るまでinline化は行わない**。cc_car/cc_cdrは
+非インラインのまま据え置いた。
+
+### 得られたもの
+
+- `%%DIAG-ZA-BAIL-LINE`: JITが断念した行番号を読める。今回の切り分けに直接効いた。
+- `za_rewrite_body_list`の`rest`未保護という**具体的な調査対象**。
+
 ## 今後のフォローアップ
 
 - ~~IDE読み込みの`ide.c`単独 vs それ以外の大枠切り分け~~ → 完了
@@ -1566,8 +1622,10 @@ Phase 4で`%%bench-aot-nontailrec`(深度1000×1000回)がハングした件を�
 - **【未解決】`%%bench-aot-nontailrec`深度1000×1000回のハング。** 単発の深度1000は
   完走し、深度100×10000回も完走し、スタックガードも発動しない。Phase 4の
   インライン化前は完走していた。
-- **【次の一手】`cc_car`/`cc_cdr`のインライン化を阻んでいるJIT回帰の原因特定。**
-  2,784箇所あり、他と同じ幅が期待できる。`za_test_ext17.lisp`の11番目で再現する。
+- ~~`cc_car`/`cc_cdr`のインライン化を阻んでいるJIT回帰の原因特定~~ → 断念箇所まで
+  特定(「Phase 5 第1部/第2部」節)。`za_rewrite_body_list`の`rest`未保護が疑わしいが、
+  素朴に`GC_PROTECT`を足すと別の形で壊れるため、**za.cのコンパイル時アロケーション
+  経路全体の監査**が次の課題。それまでinline化は見送る。
 - `os_is_control_transfer`の発行箇所削減(Phase 3第2部)は、単価が19.5命令と
   実測できた一方、17件中16件が構文自体に対するチェックであるため
   `aot-form-is-signal-free`の構造的再帰への拡張が必要。インライン化で単価が
