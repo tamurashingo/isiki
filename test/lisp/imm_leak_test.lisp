@@ -43,6 +43,13 @@
           (setq i (+ i 1))))
       acc)))
 
+
+;; この2関数はトップレベルdefunなのでza.cにJITコンパイルされる。AOT経路
+;; (bench_aot.lisp由来の%%bench-aot-let)だけでなくJIT経路も確認するため、
+;; 実際にJIT済みであることを明示的に確認してから計測する
+(assert-equal t (%%za-compiled-p (function %%imm-leak-make-closure)))
+(assert-equal t (%%za-compiled-p (function %%imm-leak-closure-loop)))
+
 (defglobal imm-before-closure (%%imm-space-used-bytes))
 (defglobal imm-closure-result (%%imm-leak-closure-loop 20000))
 (defglobal imm-after-closure (%%imm-space-used-bytes))

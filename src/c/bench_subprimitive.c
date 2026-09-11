@@ -198,6 +198,22 @@ static UINT64 bench_funcall(UINT64 n) {
     return acc;
 }
 
+/* [性能測定] 診断専用: Immobilized Spaceを意図的に消費し、枯渇時にOSが永久停止
+   せずos_panicへ到達することを確認するためのもの。専用カーソルから確保するため、
+   os_imm_space_used_bytesはこのカーソルの現在ページの未使用末尾分だけ過大に
+   報告する(診断用途では問題にならない)。%%DIAG-IDE-READ-SECTORS-ADDRと同様、
+   恒久的な公開APIとしての安定性は保証しない */
+static imm_slot_cursor_t g_bench_imm_burn_cursor = {0, 0};
+
+static lisp_val_t cc_diag_imm_burn(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 n = os_fixnum_magnitude(cc_car(args));
+    for (UINT64 i = 0; i < n; i++) {
+        (void)os_imm_slot_alloc(&g_bench_imm_burn_cursor, sizeof(za_fn_meta_t));
+    }
+    return os_make_fixnum(os_imm_space_used_bytes());
+}
+
 /** 第一引数のFIXNUMをUINT64として取り出す(全ベンチマーク共通の引数取り出し) */
 static UINT64 bench_arg_n(lisp_val_t args) {
     return os_fixnum_magnitude(cc_car(args));
@@ -239,6 +255,8 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_for), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-VECTOR"),
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_vector), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-IMM-BURN"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_imm_burn), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-FUNCALL"),
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_funcall), global_environment);
 }

@@ -298,11 +298,32 @@ void os_set_panic_hook(void (*hook)(void)) {
     g_panic_hook = hook;
 }
 
+/** 符号なし整数を10進文字列へ変換する(freestandingのためsnprintfは使えない) */
+static void panic_write_uint(frame_buffer *fb, UINT64 v) {
+    char buf[24];
+    int i = 0;
+    if (v == 0) {
+        fb->write_char(fb, '0');
+        return;
+    }
+    while (v > 0 && i < (int)sizeof(buf)) {
+        buf[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (i > 0) {
+        fb->write_char(fb, buf[--i]);
+    }
+}
+
+/* Immobilized Spaceの各定義より後ろで定義する(前方宣言のみここに置く) */
+static void panic_write_imm_breakdown(frame_buffer *fb);
+
 void os_panic(const char *msg) {
     frame_buffer *fb = get_active_frame_buffer();
     fb->write_string(fb, "PANIC: ");
     fb->write_string(fb, msg);
     fb->write_char(fb, '\n');
+    panic_write_imm_breakdown(fb);
     // フックが登録されていれば(QEMUテスト実行時は電源断)そちらへ委ねる。
     // 登録が無ければhltで止まる: 旧実装の空のfor(;;)はCPUを全力で回し続けるため
     // 「異常停止」と「極端に遅い処理」を外から区別できなかった(letの
@@ -626,6 +647,8 @@ lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env) {
 /* os_imm_space_used_bytesが参照する2本のスロットカーソル(実体は下方で定義) */
 static imm_slot_cursor_t g_function_cell_cursor;
 static imm_slot_cursor_t g_fn_meta_cursor;
+/** 直近にImmobilized Spaceへ要求された確保サイズ(枯渇時の診断表示用) */
+static UINT64 g_imm_last_request_bytes = 0;
 
 void *os_imm_page_alloc(void) {
     if (g_imm_free_list) {
@@ -671,8 +694,24 @@ void *os_imm_pages_alloc_contiguous(UINT64 count) {
     return pages;
 }
 
+/** os_panicが表示するImmobilized Spaceの内訳(枯渇時の診断用) */
+static void panic_write_imm_breakdown(frame_buffer *fb) {
+    fb->write_string(fb, "  immobilized space: used=");
+    panic_write_uint(fb, os_imm_space_used_bytes());
+    fb->write_string(fb, " / total=");
+    panic_write_uint(fb, (UINT64)IMM_SPACE_SIZE);
+    fb->write_string(fb, " byte\n  cursor fn_meta: offset=");
+    panic_write_uint(fb, g_fn_meta_cursor.page ? g_fn_meta_cursor.offset : 0);
+    fb->write_string(fb, ", function_cell: offset=");
+    panic_write_uint(fb, g_function_cell_cursor.page ? g_function_cell_cursor.offset : 0);
+    fb->write_string(fb, "\n  last request=");
+    panic_write_uint(fb, g_imm_last_request_bytes);
+    fb->write_string(fb, " byte\n");
+}
+
 void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
     UINT64 aligned = (size + 15) & ~15ULL;
+    g_imm_last_request_bytes = aligned;
     if (cursor->page == 0 || cursor->offset + aligned > IMM_PAGE_SIZE) {
         cursor->page = (UINT8 *)os_imm_page_alloc();
         cursor->offset = 0;
