@@ -10,8 +10,9 @@
 ;;;;     避ける(「典型的なLispコードを書いたら何が起きるか」を測るのが目的)。
 ;;;;   - init_aot.lisp/utility.lispと同じAOTの制約(defunのパラメータはシンボル
 ;;;;     のみ、bodyは単一式のみ)に従う。
-;;;;   - 再帰系はC側と同様、深さ1000で区切って外側のwhileで繰り返す(仕事の
-;;;;     単位数は常にN個になる)。
+;;;;   - 再帰系はC側と同様、深さ100で区切って外側のwhileで繰り返す(仕事の
+;;;;     単位数は常にN個になる)。深さ1000だとAOTの非末尾再帰が256KBのスタックを
+;;;;     溢れさせる(bench_subprimitive.cのBENCH_REC_DEPTHのコメント参照)。
 ;;;;
 ;;;; 注意: dotimes/dolistはISLispには存在せず(CommonLisp由来)、トランスパイラも
 ;;;; 未対応のため、higher-levelなイテレーション構文としてはISLisp標準のforを測る。
@@ -41,11 +42,11 @@
       (%%bench-aot-tailrec-step (- n 1) (+ acc n))))
 
 (defun %%bench-aot-tailrec (n)
-  (let ((reps (div n 1000)) (r 0) (total 0))
+  (let ((reps (div n 100)) (r 0) (total 0))
     (progn
       (while (< r reps)
         (progn
-          (setq total (+ total (%%bench-aot-tailrec-step 1000 0)))
+          (setq total (+ total (%%bench-aot-tailrec-step 100 0)))
           (setq r (+ r 1))))
       total)))
 
@@ -56,11 +57,11 @@
       (+ n (%%bench-aot-nontailrec-step (- n 1)))))
 
 (defun %%bench-aot-nontailrec (n)
-  (let ((reps (div n 1000)) (r 0) (total 0))
+  (let ((reps (div n 100)) (r 0) (total 0))
     (progn
       (while (< r reps)
         (progn
-          (setq total (+ total (%%bench-aot-nontailrec-step 1000)))
+          (setq total (+ total (%%bench-aot-nontailrec-step 100)))
           (setq r (+ r 1))))
       total)))
 
@@ -145,6 +146,8 @@
       acc)))
 
 ;;; --- 7. cons/リスト操作(長さ1000のリストを構築して走査、N/1000回) ---
+;; ここの1000は再帰の深さ(BENCH_REC_DEPTH)ではなくリスト長なので、
+;; 仕事の単位数をNに保つため除数は1000のままにする
 (defun %%bench-aot-cons (n)
   (let ((reps (div n 1000)) (r 0) (total 0))
     (progn

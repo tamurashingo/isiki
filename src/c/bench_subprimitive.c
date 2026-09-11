@@ -20,8 +20,16 @@
 // 最適化を「利用する」ための細工ではなく、計測対象が消えるのを防ぐためのもの。
 #define BENCH_KEEP(x) __asm__ __volatile__("" : "+r"(x))
 
-/** 再帰ベンチマーク1回あたりの再帰の深さ(CのスタックもAOTのスタックも無限ではない) */
-#define BENCH_REC_DEPTH 1000
+/** 再帰ベンチマーク1回あたりの再帰の深さ。
+    [性能測定] Phase4: 当初1000にしていたが、AOTの非末尾再帰は1レベルあたり
+    __fixed(136byte)と__step_fixed(112byte)の2フレームを積み、保存レジスタと
+    戻りアドレスを含めて約330byte消費する。プロセスのスタックは256KB
+    (process.cのSTACK_SIZE)しかないため深度1000では約330KBとなり溢れる。
+    スタックガードが無いためオーバーフローは検出されず、ゲストが無反応の
+    まま停止する(CPU使用率が1%未満になるだけで、外からは極端に遅い処理と
+    区別しにくい)。AOT側で十分な余裕を持つ100にする。C側と同じ値を使うことで
+    比較の前提は保たれる(仕事の単位数は常にN個で変わらない) */
+#define BENCH_REC_DEPTH 100
 /** cons/vectorベンチマークが使うリスト長・ベクタ長 */
 #define BENCH_LIST_LEN 1000
 #define BENCH_VEC_LEN 1000
@@ -225,6 +233,21 @@ static UINT64 bench_closure_call(UINT64 n) {
     return acc;
 }
 
+/* [性能測定] 診断専用(Phase4 第0部 2-3): os_is_control_transferの単価を実測する。
+   GC_PROTECTの34.9命令が実測値なのに対し、こちらは見積もりのままだったため、
+   同じ土俵(傾き法)で比較できるようにする。戻り値を積算して最適化で消えるのを防ぐ */
+static UINT64 bench_ct_check(UINT64 n) {
+    UINT64 hits = 0;
+    lisp_val_t v = os_make_fixnum(1);
+    for (UINT64 i = 0; i < n; i++) {
+        BENCH_KEEP(v);
+        if (os_is_control_transfer(v)) {
+            hits = hits + 1;
+        }
+    }
+    return hits + n;
+}
+
 /* [性能測定] 診断専用: Immobilized Spaceを意図的に消費し、枯渇時にOSが永久停止
    せずos_panicへ到達することを確認するためのもの。専用カーソルから確保するため、
    os_imm_space_used_bytesはこのカーソルの現在ページの未使用末尾分だけ過大に
@@ -263,6 +286,7 @@ BENCH_DEFINE_PRIMITIVE(cc_bench_c_for, bench_for)
 BENCH_DEFINE_PRIMITIVE(cc_bench_c_vector, bench_vector)
 BENCH_DEFINE_PRIMITIVE(cc_bench_c_funcall, bench_funcall)
 BENCH_DEFINE_PRIMITIVE(cc_diag_closure_call, bench_closure_call)
+BENCH_DEFINE_PRIMITIVE(cc_diag_ct_check, bench_ct_check)
 
 void os_register_bench_subprimitives(void) {
     os_set_function(os_make_symbol("%%BENCH-C-LOOP"),
@@ -283,6 +307,8 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_for), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-VECTOR"),
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_vector), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-CT-CHECK"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_ct_check), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CLOSURE-CALL"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_closure_call), global_environment);
     os_set_function(os_make_symbol("%%DIAG-IMM-BURN"),

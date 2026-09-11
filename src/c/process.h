@@ -51,7 +51,19 @@ void initialize_processes(frame_buffer *buffers);
 /**
  * 現在アクティブなプロセスを返す
  */
-process_t* get_current_process(void);
+/* [性能測定] Phase4 第1部: GC_PROTECTはこの関数を1箇所につき3回呼ぶ
+   (マクロ本体で2回、スコープ脱出時のgc_unprotect_nodeで1回)。process.cに
+   実体を置いたままだと-O1・LTO無しでは3回とも本物のクロスTU呼び出しになり、
+   実測でGC_PROTECT 1箇所あたり34.9命令のうち大半を占めていた。中身は配列参照
+   だけなのでヘッダのstatic inlineへ移し、呼び出しを消す。za.cのJITランタイム
+   ヘルパー(za_gc_*)も同じ関数を呼ぶため、そちらにも効く。
+   アドレスを取っている箇所は無いことを確認済み */
+extern process_t g_processes[PROCESS_COUNT];
+extern UINT32 g_current_process_index;
+
+static inline process_t* get_current_process(void) {
+    return &g_processes[g_current_process_index];
+}
 
 /**
  * 表示フォーカスとは無関係に、固定indexでプロセスを返す(スケジューラが全プロセスを巡回するために使う)

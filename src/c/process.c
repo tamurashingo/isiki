@@ -5,10 +5,10 @@
 #include "repl.h"
 
 /** @brief PROCESS_COUNT個のprocess_t本体(F1〜F4)。indexで直接アクセスされる */
-static process_t g_processes[PROCESS_COUNT];
+process_t g_processes[PROCESS_COUNT];
 
 /** @brief 現在アクティブ(表示フォーカスがある)プロセスのindex。switch_active_processが更新する */
-static UINT32 g_current_process_index = 0;
+UINT32 g_current_process_index = 0;
 
 /**
  * @brief プロセスごとの専用実行スタックのサイズ(バイト)
@@ -178,9 +178,9 @@ void initialize_processes(frame_buffer *buffers) {
  * @brief 現在アクティブなプロセスを返す
  * @return 現在アクティブなプロセス
  */
-process_t* get_current_process(void) {
-    return &g_processes[g_current_process_index];
-}
+/* [性能測定] Phase4 第1部: process.hのstatic inlineへ移した
+   (GC_PROTECT 1箇所につきこの関数が3回呼ばれており、クロスTU呼び出しのままだと
+   その3回分がGC_PROTECTのコストの大半を占めていた) */
 
 /**
  * @brief 表示フォーカスとは無関係に、固定indexでプロセスを返す(スケジューラが全プロセスを巡回するために使う)

@@ -1571,9 +1571,7 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env) {
  * @param fixnum 表現する値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum(const UINT64 fixnum) {
-    return (lisp_val_t)(fixnum << 3);
-}
+/* [性能測定] Phase4: runtime.hのstatic inlineへ移した */
 
 /**
  * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。

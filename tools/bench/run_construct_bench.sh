@@ -8,11 +8,16 @@
 # 命令数」を求めて比(AOT版 ÷ C版)を出す。
 #
 # 1回のQEMU起動で得られるのはtotal_insns(ブート全体の合計)だけなので、
-# ケースごとに起動を分け、必ずboot-onlyとの差分を取る(本書で確立した標準手順)。
-# C版はAOT版より桁違いに軽く、差分がboot時のゆらぎ(±100万命令程度)に
-# 埋もれるため、C版だけNを10倍にして計測し、最後に1単位あたりへ正規化する。
+# ケースごとに起動を分ける。
 #
-# 使い方: make test-qemu-construct-bench [BENCH_N_C=...] [BENCH_N_AOT=...]
+# [性能測定] Phase4 第0部: boot-onlyとの差分ではなく**傾き法**を使う。
+# 同じベンチマークをNと3Nの2点で測り、差を2Nで割って1単位あたりの命令数を得る。
+# bootのコストは両方に等しく含まれるので引き算で完全に相殺され、boot時のゆらぎ
+# (実測で±数百万命令)が結果に混入しない。単一Nとboot-onlyの差分で測っていた
+# 間は、Nが小さいカテゴリで信号がゆらぎに埋もれ、同一実装で17%違う値が出たり
+# 「consが半減した」という誤った結論を出したりしていた。
+# この方法なら「適正Nをカテゴリごとに決める」問題自体が消える(固定コストは
+# 切片に入り傾きには乗らない)。
 
 set -eu
 
@@ -61,34 +66,32 @@ run_case() {
     echo "$insns"
 }
 
-echo "=== 構文別ベンチマーク: N(C版)=$N_C N(AOT版)=$N_AOT ==="
-echo "--- boot-only ベースラインを計測中 ---"
-BOOT=$(run_case "")
-echo "boot-only total_insns=$BOOT"
+echo "=== 構文別ベンチマーク(傾き法): N(C版)=$N_C/${N_C}x3  N(AOT版)=$N_AOT/${N_AOT}x3 ==="
 
 : > "$RESULT_TSV"
 for c in $CASES; do
     n_aot_c=$(aot_n_for "$c")
-    echo "--- $c (C版, N=$N_C) ---"
-    raw_c=$(run_case "(%%bench-c-$c $N_C)")
-    echo "--- $c (AOT版, N=$n_aot_c) ---"
-    raw_aot=$(run_case "(%%bench-aot-$c $n_aot_c)")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$raw_c" "$raw_aot" "$BOOT" "$N_C" "$n_aot_c" >> "$RESULT_TSV"
-    echo "$c: C raw=$raw_c AOT raw=$raw_aot"
+    echo "--- $c ---"
+    c_lo=$(run_case "(%%bench-c-$c $N_C)")
+    c_hi=$(run_case "(%%bench-c-$c $((N_C * 3)))")
+    a_lo=$(run_case "(%%bench-aot-$c $n_aot_c)")
+    a_hi=$(run_case "(%%bench-aot-$c $((n_aot_c * 3)))")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$c_lo" "$c_hi" "$a_lo" "$a_hi" "$N_C" "$n_aot_c" >> "$RESULT_TSV"
+    echo "$c: C $c_lo -> $c_hi / AOT $a_lo -> $a_hi"
 done
 
-python3 - "$RESULT_TSV" << 'PYEOF'
+python3 - "$RESULT_TSV" << 'PYEOF2'
 import sys
 rows = []
 for line in open(sys.argv[1]):
-    name, raw_c, raw_aot, boot, n_c, n_aot = line.split()
-    per_c = (int(raw_c) - int(boot)) / int(n_c)
-    per_aot = (int(raw_aot) - int(boot)) / int(n_aot)
+    name, c_lo, c_hi, a_lo, a_hi, n_c, n_aot = line.split()
+    per_c = (int(c_hi) - int(c_lo)) / (2 * int(n_c))
+    per_aot = (int(a_hi) - int(a_lo)) / (2 * int(n_aot))
     rows.append((name, per_c, per_aot, per_aot / per_c if per_c > 0 else float('inf')))
-rows.sort(key=lambda r: -r[3])
+rows.sort(key=lambda r: -r[2])
 print()
 print("| カテゴリ | C版(命令/単位) | AOT版(命令/単位) | 比(AOT/C) |")
 print("|---|---|---|---|")
 for name, pc, pa, ratio in rows:
     print(f"| {name} | {pc:.2f} | {pa:.2f} | {ratio:.1f}x |")
-PYEOF
+PYEOF2

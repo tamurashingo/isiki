@@ -981,9 +981,7 @@ lisp_val_t os_apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_
  * @param v 判定対象の値
  * @return 非局所脱出シグナルならnon-zero
  */
-int os_is_control_transfer(lisp_val_t v) {
-    return is_control_transfer(v);
-}
+/* [性能測定] Phase4: eval.hのstatic inlineへ移した(判定内容はis_control_transferと同一) */
 
 /**
  * 非局所脱出シグナル(TAG_INSTANCE、word1=magic)のmagic(MAGIC_BLOCK_EXIT等)を

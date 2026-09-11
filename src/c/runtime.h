@@ -358,7 +358,12 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
  * @param fixnum 表現する値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum(const UINT64 fixnum);
+/* [性能測定] Phase4: 生成コード中に1,513箇所ある。中身はシフト1回だけなので、
+   process.cのget_current_processと同様クロスTU呼び出しのままだと呼び出し
+   オーバーヘッドが本体を上回る。ヘッダのstatic inlineへ移す */
+static inline lisp_val_t os_make_fixnum(const UINT64 fixnum) {
+    return (lisp_val_t)(fixnum << 3);
+}
 
 /**
  * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。

@@ -8,7 +8,7 @@
 ;; 両実装を実行し、互いに一致すること・期待値と一致することを確認する。
 ;; 再帰系は深さ1000で区切るため、Nは1000の倍数にする必要がある。
 
-;; Nは1000の倍数(再帰系がN/1000回の繰り返しになるため)
+;; Nは1000の倍数(cons系がN/1000回、再帰系がN/100回の繰り返しになるため)
 (defglobal bench-n 2000)
 
 ;;; --- 1. 単純ループ: nから0までデクリメントするので結果は常に0 ---
@@ -19,13 +19,13 @@
 (assert-equal 1999000 (%%bench-c-arith bench-n))
 (assert-equal 1999000 (%%bench-aot-arith bench-n))
 
-;;; --- 3. 末尾再帰: (1+...+1000)を(n/1000)回 = 500500*2 ---
-(assert-equal 1001000 (%%bench-c-tailrec bench-n))
-(assert-equal 1001000 (%%bench-aot-tailrec bench-n))
+;;; --- 3. 末尾再帰: (1+...+100)を(n/100)回 = 5050*20 ---
+(assert-equal 101000 (%%bench-c-tailrec bench-n))
+(assert-equal 101000 (%%bench-aot-tailrec bench-n))
 
 ;;; --- 4. 非末尾再帰: 末尾再帰と同じ計算結果になる ---
-(assert-equal 1001000 (%%bench-c-nontailrec bench-n))
-(assert-equal 1001000 (%%bench-aot-nontailrec bench-n))
+(assert-equal 101000 (%%bench-c-nontailrec bench-n))
+(assert-equal 101000 (%%bench-aot-nontailrec bench-n))
 
 ;;; --- 5. 条件分岐: 5分岐を巡回し1+2+3+4+5=15を(n/5)回 = 6000 ---
 (assert-equal 6000 (%%bench-c-branch bench-n))
