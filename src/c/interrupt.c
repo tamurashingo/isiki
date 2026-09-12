@@ -12,7 +12,34 @@
 
 
 /** GDT本体(null/コード/データの3エントリ) */
-static struct gdt_entry g_gdt[3];
+/* [原則6] スタック溢れを**報告可能にする**ためのTSS + IST。
+   従来はタイマー割り込みでのカナリア/rsp検査だけだったが、100Hzのサンプリングでは
+   1フレーム160byteで降りていくCスタックに追いつけない。実測では深度4000で
+   GP例外 → (ハンドラ自身が枯渇スタックへpushできず)ダブルフォルト → トリプル
+   フォルトとなり、QEMUがリセットして終わっていた(`-d int`で確認)。
+   外からは「電源が落ちた」としか見えず、原則6が指す無言の失敗そのものだった。
+
+   IST1に専用スタックを割り当て、GP(13)・PF(14)・ダブルフォルト(8)をそこで
+   受けるようにする。枯渇したスタックの上で動かないので、診断を出し切れる。 */
+#define IST_STACK_SIZE 16384
+static UINT8 g_ist_stack[IST_STACK_SIZE] __attribute__((aligned(16)));
+
+/** x86-64のTSS(長モードではタスク切り替えには使わず、RSP0とISTの置き場として使う) */
+struct tss64 {
+    uint32_t reserved0;
+    uint64_t rsp0, rsp1, rsp2;
+    uint64_t reserved1;
+    uint64_t ist[7];
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
+} __attribute__((packed));
+
+static struct tss64 g_tss;
+
+/* GDTはTSSディスクリプタ(長モードでは16byte = エントリ2つ分)のぶん広げる。
+   0:null 1:code 2:data 3-4:TSS */
+static struct gdt_entry g_gdt[5];
 /** lgdt命令に渡すGDTポインタ */
 static struct gdt_ptr g_gdt_ptr;
 
@@ -151,7 +178,29 @@ static void serial_write_string(const char *s) {
     }
 }
 
+/* [原則6] panicの診断をフレームバッファだけに出すと、-display noneでは誰も読めない。
+   スタックガードは正しく発動していたのに、外からは「電源が落ちた」としか見えず、
+   深度4000で溢れていることに気づけなかった。runtime.cのpanic経路から呼べるよう
+   serialへの出力を公開する(診断専用。通常の実行経路では使わない) */
+void os_diag_serial_write(const char *s) {
+    serial_write_string(s);
+}
+
+/** 64bit値を"0x"付き16桁でserialへ出す(フレームバッファを経由しない) */
+static void serial_write_hex64(uint64_t v) {
+    static const char hex_digits[] = "0123456789ABCDEF";
+    char buf[19];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        buf[2 + i] = hex_digits[(v >> ((15 - i) * 4)) & 0xF];
+    }
+    buf[18] = '\0';
+    serial_write_string(buf);
+}
+
 /** GP例外(vector 13)のエントリポイント。エラーコードとvectorを積んでcpu_exception_commonへ入る */
+/** ダブルフォルト(vector 8)のエントリポイント。IST1の専用スタックで動く */
+void asm_df_handler(void);
 void asm_gpf_handler(void);
 /** ページフォルト(vector 14)のエントリポイント。エラーコードとvectorを積んでcpu_exception_commonへ入る */
 void asm_pf_handler(void);
@@ -166,6 +215,12 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
 // asm_gpf_handler/asm_pf_handlerの共通後続処理。15汎用レジスタとexceptionのコンテキストを
 // ExceptionContextとしてスタックに積み、c_cpu_exception_handlerを呼ぶ(戻ってこない)
 asm(
+    ".global asm_df_handler\n"
+    "asm_df_handler:\n"
+    /* ダブルフォルトはCPUがエラーコード(常に0)を積むので、vectorだけ足せば
+       GP/PFと同じExceptionContextの形になる */
+    "    push $8\n"
+    "    jmp cpu_exception_common\n"
     ".global asm_gpf_handler\n"
     "asm_gpf_handler:\n"
     "    push $13\n"
@@ -509,6 +564,30 @@ static void diag_write_string(frame_buffer *fb, const char *s) {
  */
 void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr) {
     (void)fault_addr;
+    /* [原則6] **まずシリアルへ最小限を出し切る。** この後のフレームバッファ描画も
+       スタックdumpも、状況によってはハンドラ自身をフォルトさせる。実測では
+       スタック溢れのとき、下のdumpがrsp(範囲外)を読んでダブルフォルト→
+       トリプルフォルトになり、外からは「電源が落ちた」としか見えなかった */
+    os_diag_serial_write("\n!! CPU EXCEPTION vector=");
+    serial_write_hex64(ctx->vector);
+    os_diag_serial_write(" rip=");
+    serial_write_hex64(ctx->rip);
+    os_diag_serial_write(" rsp=");
+    serial_write_hex64(ctx->rsp);
+    /* ハンドラ自身がどのスタックで動いているか。IST1が効いていればg_ist_stackの
+       範囲(専用スタック)になる。効いていなければ溢れたスタックの続きで、
+       そもそも報告できない */
+    os_diag_serial_write(" handler_sp=");
+    serial_write_hex64((uint64_t)(void *)&ctx);
+    os_diag_serial_write(" ist=");
+    serial_write_hex64((uint64_t)(void *)g_ist_stack);
+    if (ctx->vector == 8) {
+        os_diag_serial_write("\n   (double fault: Cスタックの溢れが最有力)");
+    } else if (!os_process_stack_contains(ctx->rsp)) {
+        os_diag_serial_write("\n   (rspがどのプロセススタックの範囲にもない = スタック溢れ)");
+    }
+    os_diag_serial_write("\n");
+
     frame_buffer *fb = get_active_frame_buffer();
 
     diag_write_string(fb, "\n!! CPU EXCEPTION !!\nvector=");
@@ -570,6 +649,11 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
     // ホスト側(tools/bench/locate_rip.sh)がイメージ範囲に入る値だけを拾って
     // 関数名へ逆引きする。スタックは上位アドレス方向へ読むので、この深さで
     // 範囲外へ出ることはない
+    /* rspが範囲外のときは読まない(読むとハンドラ自身がフォルトする) */
+    if (!os_process_stack_contains(ctx->rsp)) {
+        diag_write_string(fb, "\nstack: rspが範囲外のためdumpしない\n");
+        return;
+    }
     diag_write_string(fb, "\nstack(rsp..):");
     {
         const uint64_t *sp = (const uint64_t *)ctx->rsp;
@@ -602,15 +686,22 @@ static void set_gdt_entry(int idx, uint8_t access, uint8_t granularity) {
  * @param vec 設定先の割り込み番号
  * @param handler ハンドラのエントリポイント
  */
-static void set_idt_entry(int vec, void *handler) {
+/* istが非0なら、そのIST番号の専用スタックへ切り替えてからハンドラへ入る。
+   スタック溢れで落ちる例外(GP/PF/ダブルフォルト)は、枯渇したスタックの上では
+   報告すらできないので必ずISTを使う(原則6) */
+static void set_idt_entry_ist(int vec, void *handler, uint8_t ist) {
     uint64_t addr = (uint64_t)handler;
     g_idt[vec].offset_low = addr & 0xFFFF;
     g_idt[vec].selector = 0x08;
-    g_idt[vec].ist = 0;
+    g_idt[vec].ist = ist;
     g_idt[vec].type_attr = 0x8E;
     g_idt[vec].offset_mid = (addr >> 16) & 0xFFFF;
     g_idt[vec].offset_high = (addr >> 32) & 0xFFFFFFFF;
     g_idt[vec].zero = 0;
+}
+
+static void set_idt_entry(int vec, void *handler) {
+    set_idt_entry_ist(vec, handler, 0);
 }
 
 /** GDTを構築し、lgdt/lretqでコード・データセグメントを切り替える */
@@ -618,6 +709,30 @@ void init_gdt(void) {
     set_gdt_entry(0, 0x00, 0x00);
     set_gdt_entry(1, 0x9A, 0x20); // コード: access 0x9A, granularity 0x20(64bitフラグ)
     set_gdt_entry(2, 0x92, 0x00); // データ: access 0x92
+
+    /* TSSディスクリプタ(インデックス3。長モードでは16byteなので4も占有する)。
+       ISTの置き場として使うだけで、タスク切り替えには使わない */
+    {
+        uint64_t base = (uint64_t)&g_tss;
+        uint32_t limit = (uint32_t)(sizeof(g_tss) - 1);
+        uint8_t *d = (uint8_t *)&g_gdt[3];
+        for (int i = 0; i < 16; i++) { d[i] = 0; }
+        d[0] = (uint8_t)(limit & 0xFF);
+        d[1] = (uint8_t)((limit >> 8) & 0xFF);
+        d[2] = (uint8_t)(base & 0xFF);
+        d[3] = (uint8_t)((base >> 8) & 0xFF);
+        d[4] = (uint8_t)((base >> 16) & 0xFF);
+        d[5] = 0x89; /* present, type=9 (available 64-bit TSS) */
+        d[6] = (uint8_t)((limit >> 16) & 0x0F);
+        d[7] = (uint8_t)((base >> 24) & 0xFF);
+        d[8] = (uint8_t)((base >> 32) & 0xFF);
+        d[9] = (uint8_t)((base >> 40) & 0xFF);
+        d[10] = (uint8_t)((base >> 48) & 0xFF);
+        d[11] = (uint8_t)((base >> 56) & 0xFF);
+    }
+    /* IST1 = 専用スタックの**上端**(スタックは下方向に伸びる) */
+    g_tss.ist[0] = (uint64_t)(g_ist_stack + IST_STACK_SIZE);
+    g_tss.iomap_base = (uint16_t)sizeof(g_tss);
 
     g_gdt_ptr.limit = sizeof(g_gdt) - 1;
     g_gdt_ptr.base = (uint64_t)&g_gdt;
@@ -635,6 +750,8 @@ void init_gdt(void) {
         "1:\n"
         : : "m"(g_gdt_ptr) : "rax"
     );
+    /* TSSセレクタ(GDTインデックス3 = オフセット0x18)をロードする */
+    asm volatile("mov $0x18, %%ax\n ltr %%ax\n" : : : "ax");
 }
 
 /** PICを初期化し、IRQ1(キーボード)のみを許可した状態にする(IRQ0は未許可のまま) */
@@ -681,8 +798,11 @@ void init_fpu(void) {
 /** IDTを構築し、GPF/PF/タイマー/キーボードの各ハンドラを登録してlidt/stiする */
 void init_idt(void) {
     serial_init();
-    set_idt_entry(13, (void *)asm_gpf_handler);
-    set_idt_entry(14, (void *)asm_pf_handler);
+    /* スタック溢れはGP/PFとして現れ、ハンドラ自身がpushできずダブルフォルトへ
+       進む。IST1(専用スタック)で受けることで診断を出せるようにする */
+    set_idt_entry_ist(8, (void *)asm_df_handler, 1);
+    set_idt_entry_ist(13, (void *)asm_gpf_handler, 1);
+    set_idt_entry_ist(14, (void *)asm_pf_handler, 1);
     set_idt_entry(32, (void *)asm_timer_handler);
     set_idt_entry(33, (void *)asm_keyboard_handler);
 

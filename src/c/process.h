@@ -67,6 +67,11 @@ void initialize_processes(frame_buffer *buffers);
  * @param out_used 消費バイト数の格納先
  * @return 正常なら1、溢れていれば0
  */
+/** rspがいずれかのプロセススタックの範囲内かどうか。例外ハンドラがスタックを
+    dumpしてよいかの判定に使う(スタック溢れではrspが範囲外を指しており、
+    そのまま読むとハンドラ自身がフォルトしてダブルフォルトになる) */
+int os_process_stack_contains(UINT64 rsp);
+
 int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used);
 
 /** プロセス1つあたりのスタックサイズ(panicの診断表示用) */

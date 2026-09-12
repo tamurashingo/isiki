@@ -323,12 +323,25 @@ void os_set_panic_hook(void (*hook)(void)) {
     g_panic_hook = hook;
 }
 
+/* [原則6] panicの診断はフレームバッファとシリアルの両方へ出す。fbだけだと
+   -display noneでは誰も読めず、外からは「電源が落ちた」としか見えない。
+   実際、スタックガードは深度4000で正しく発動していたのに、診断が読めないために
+   「無反応で止まった」と区別がつかなかった。 */
+static void panic_write_string(frame_buffer *fb, const char *s) {
+    fb->write_string(fb, s);
+#ifndef ISIKIOS_UNIT_TEST
+    os_diag_serial_write(s);
+#endif
+}
+
 /** 符号なし整数を10進文字列へ変換する(freestandingのためsnprintfは使えない) */
 static void panic_write_uint(frame_buffer *fb, UINT64 v) {
     char buf[24];
+    char out[25];
     int i = 0;
+    int o = 0;
     if (v == 0) {
-        fb->write_char(fb, '0');
+        panic_write_string(fb, "0");
         return;
     }
     while (v > 0 && i < (int)sizeof(buf)) {
@@ -336,24 +349,57 @@ static void panic_write_uint(frame_buffer *fb, UINT64 v) {
         v /= 10;
     }
     while (i > 0) {
-        fb->write_char(fb, buf[--i]);
+        out[o++] = buf[--i];
     }
+    out[o] = '\0';
+    panic_write_string(fb, out);
 }
 
 /* Immobilized Spaceの各定義より後ろで定義する(前方宣言のみここに置く) */
 static void panic_write_imm_breakdown(frame_buffer *fb);
 
+/* [原則6] 数値をシリアルへ直接出す(スタックをほとんど使わない)。
+   スタック溢れの報告はフレームバッファより先にこちらで出す必要がある — 下記参照 */
+static void serial_write_uint(UINT64 v) {
+    char out[24];
+    int o = 0;
+    if (v == 0) { os_diag_serial_write("0"); return; }
+    while (v > 0 && o < 23) { out[o++] = (char)('0' + (v % 10)); v /= 10; }
+    char rev[25];
+    int r = 0;
+    while (o > 0) { rev[r++] = out[--o]; }
+    rev[r] = '\0';
+    os_diag_serial_write(rev);
+}
+
 void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
+    /* [原則6] **フレームバッファより先にシリアルへ出す。**
+       このハンドラはタイマー割り込みから、溢れているスタックの上で動く。
+       get_active_frame_buffer以降の描画経路はさらにスタックを使うため、
+       そこへ入る前に落ちると外からは「電源が落ちた」としか見えない。
+       実際、深度4000で溢れているのにシリアルには何も出ていなかった。
+       シリアル出力はローカルが数十byteで済むので、まずこちらを出し切る。 */
+#ifndef ISIKIOS_UNIT_TEST
+    os_diag_serial_write("\nPANIC: stack overflow\n  rsp=");
+    serial_write_uint(rsp);
+    os_diag_serial_write(" stack_low=");
+    serial_write_uint(stack_low);
+    os_diag_serial_write("\n  used=");
+    serial_write_uint(stack_used);
+    os_diag_serial_write(" byte (stack size=");
+    serial_write_uint((UINT64)STACK_SIZE_FOR_PANIC);
+    os_diag_serial_write(")\n");
+#endif
     frame_buffer *fb = get_active_frame_buffer();
-    fb->write_string(fb, "PANIC: stack overflow\n  rsp=");
+    panic_write_string(fb, "PANIC: stack overflow\n  rsp=");
     panic_write_uint(fb, rsp);
-    fb->write_string(fb, " stack_low=");
+    panic_write_string(fb, " stack_low=");
     panic_write_uint(fb, stack_low);
-    fb->write_string(fb, "\n  used=");
+    panic_write_string(fb, "\n  used=");
     panic_write_uint(fb, stack_used);
-    fb->write_string(fb, " byte (stack size=");
+    panic_write_string(fb, " byte (stack size=");
     panic_write_uint(fb, (UINT64)STACK_SIZE_FOR_PANIC);
-    fb->write_string(fb, ")\n");
+    panic_write_string(fb, ")\n");
     os_panic("stack overflow (see above)");
 }
 
@@ -689,9 +735,9 @@ lisp_val_t cc_diag_gc_stale_reset(lisp_val_t args, lisp_val_t env) {
 
 void os_panic(const char *msg) {
     frame_buffer *fb = get_active_frame_buffer();
-    fb->write_string(fb, "PANIC: ");
-    fb->write_string(fb, msg);
-    fb->write_char(fb, '\n');
+    panic_write_string(fb, "PANIC: ");
+    panic_write_string(fb, msg);
+    panic_write_string(fb, "\n");
     panic_write_imm_breakdown(fb);
     // フックが登録されていれば(QEMUテスト実行時は電源断)そちらへ委ねる。
     // 登録が無ければhltで止まる: 旧実装の空のfor(;;)はCPUを全力で回し続けるため
@@ -1078,17 +1124,17 @@ void *os_imm_pages_alloc_contiguous(UINT64 count) {
 
 /** os_panicが表示するImmobilized Spaceの内訳(枯渇時の診断用) */
 static void panic_write_imm_breakdown(frame_buffer *fb) {
-    fb->write_string(fb, "  immobilized space: used=");
+    panic_write_string(fb, "  immobilized space: used=");
     panic_write_uint(fb, os_imm_space_used_bytes());
-    fb->write_string(fb, " / total=");
+    panic_write_string(fb, " / total=");
     panic_write_uint(fb, (UINT64)IMM_SPACE_SIZE);
-    fb->write_string(fb, " byte\n  cursor fn_meta: offset=");
+    panic_write_string(fb, " byte\n  cursor fn_meta: offset=");
     panic_write_uint(fb, g_fn_meta_cursor.page ? g_fn_meta_cursor.offset : 0);
-    fb->write_string(fb, ", function_cell: offset=");
+    panic_write_string(fb, ", function_cell: offset=");
     panic_write_uint(fb, g_function_cell_cursor.page ? g_function_cell_cursor.offset : 0);
-    fb->write_string(fb, "\n  last request=");
+    panic_write_string(fb, "\n  last request=");
     panic_write_uint(fb, g_imm_last_request_bytes);
-    fb->write_string(fb, " byte\n");
+    panic_write_string(fb, " byte\n");
 }
 
 void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {

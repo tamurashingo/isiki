@@ -49,6 +49,16 @@ static void stack_canary_init(UINT32 proc_index) {
     *(UINT64 *)g_stacks[proc_index] = STACK_CANARY;
 }
 
+int os_process_stack_contains(UINT64 rsp) {
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        UINT64 low = (UINT64)g_stacks[i];
+        if (rsp >= low && rsp <= low + STACK_SIZE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used) {
     // まず全プロセスのカナリアを見る。溢れたスタックのrspはg_stacksの範囲外へ
     // 出てしまい下のループでは捕まらないため、破壊の痕跡はこちらで検出する
