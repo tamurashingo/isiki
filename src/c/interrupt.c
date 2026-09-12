@@ -592,8 +592,13 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
         os_diag_serial_write(" cr2=");
         serial_write_hex64(cr2v);
         if (os_process_in_stack_guard(cr2v)) {
-            /* [原則6] ガードページを踏んだ = スタック溢れ。通常の#PFと区別して出す */
-            os_diag_serial_write("\n   ** STACK OVERFLOW: ガードページを踏んだ **\n   stack=");
+            /* [原則6] ガードページを踏んだ。**どちら側かで原因が違う**ので区別する */
+            if (os_process_guard_is_upper(cr2v, ctx->rsp)) {
+                os_diag_serial_write("\n   ** GUARD HIT (上端側): スタック溢れではない。"
+                                     "基底/上限の破壊かバッファオーバーラン **\n   stack=");
+            } else {
+                os_diag_serial_write("\n   ** STACK OVERFLOW (下端側): 再帰が深すぎる **\n   stack=");
+            }
             serial_write_hex64(os_process_stack_base(0));
             os_diag_serial_write(" guard=");
             serial_write_hex64(os_process_guard_base(0));

@@ -76,6 +76,8 @@ void os_process_install_stack_guards(void);
 UINT64 os_process_guard_base(UINT32 i);
 UINT64 os_process_guard_size(void);
 int os_process_in_stack_guard(UINT64 va);
+/** ガードのどちら側かを区別する。上端側は「溢れ」ではなく基底/上限の破壊である */
+int os_process_guard_is_upper(UINT64 va, UINT64 rsp);
 UINT64 os_process_stack_base(UINT32 i);
 int os_process_stack_contains(UINT64 rsp);
 

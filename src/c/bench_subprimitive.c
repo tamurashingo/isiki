@@ -357,9 +357,23 @@ static lisp_val_t cc_diag_gdt_addr(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(os_diag_gdt_addr());
 }
 
+static lisp_val_t cc_diag_guard_base(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_process_guard_base((UINT32)os_fixnum_magnitude(cc_car(args))));
+}
+
 static lisp_val_t cc_diag_stack_base(lisp_val_t args, lisp_val_t env) {
     (void)env;
     return os_make_fixnum(os_process_stack_base((UINT32)os_fixnum_magnitude(cc_car(args))));
+}
+
+/* [第0部] 上端側ガードの動作確認。プロセス0のスタック上端の8byte上を読む。
+   これは「溢れ」ではないので、診断が上端側と表示されることを確かめるためのもの */
+static lisp_val_t cc_diag_force_overrun(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    volatile UINT64 *above = (volatile UINT64 *)(lisp_addr_t)
+        (os_process_stack_base(0) + 256 * 1024 + 8);
+    return os_make_fixnum(*above);
 }
 
 static lisp_val_t cc_diag_force_gp(lisp_val_t args, lisp_val_t env) {
@@ -435,6 +449,8 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_ct_check), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CLOSURE-CALL"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_closure_call), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-FORCE-OVERRUN"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_force_overrun), global_environment);
     os_set_function(os_make_symbol("%%DIAG-PAGE-LEVEL"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_page_level), global_environment);
     os_set_function(os_make_symbol("%%DIAG-IDT-ADDR"),
@@ -443,6 +459,8 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_gdt_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CODE-ANCHOR"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_code_anchor), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-GUARD-BASE"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_guard_base), global_environment);
     os_set_function(os_make_symbol("%%DIAG-STACK-BASE"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_stack_base), global_environment);
     os_set_function(os_make_symbol("%%DIAG-FORCE-GP"),

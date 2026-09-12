@@ -34,16 +34,32 @@ UINT32 g_current_process_index = 0;
    SPを一気に下げてガードを**跨いで着地**しうるためである。踏まれなければ
    フォルトは出ず、「IDTを壊してから死ぬ」に戻る。
 
-   レイアウト: g_stacks[i] = [ガード64KB][実スタック256KB]
-   実際に使うのは上側のSTACK_SIZEだけで、下側は常に未マップにする。
+   レイアウト: slot[i] = [ガード64KB][実スタック256KB] を連続で並べ、**末尾にもガードを1つ足す**。
+   こうするとプロセスiの上端は必ずプロセスi+1のガード(未マップ)になり、
+   最後のプロセスの上端も末尾ガードで守られる。上下両側が塞がる。
+
+     [G0][stack0][G1][stack1][G2][stack2][G3][stack3][Gtop]
+
+   末尾ガードが要るのは、以前プロセス0の**上端**を越える読み出し(usagesの
+   ループ上限が壊れた件)を実際に踏んでいるためである。あのときは隣が
+   プロセス1のガードだったので捕まったが、最後のプロセスには隣が無かった。
+
+   配列を2次元ではなく平坦にするのは、末尾ガードとの連続性を宣言順に依存せず
+   保証するため(BSSの配置順は保証されない)。
    4KB境界に揃えるのは、ページテーブルの粒度で未マップにするため。 */
 #define STACK_GUARD_SIZE (64 * 1024)
 #define STACK_SLOT_SIZE  (STACK_GUARD_SIZE + STACK_SIZE)
-static UINT8 g_stacks[PROCESS_COUNT][STACK_SLOT_SIZE] __attribute__((aligned(4096)));
+#define STACK_AREA_SIZE  (PROCESS_COUNT * STACK_SLOT_SIZE + STACK_GUARD_SIZE)
+static UINT8 g_stack_area[STACK_AREA_SIZE] __attribute__((aligned(4096)));
 
-/** i番目のプロセスが実際に使うスタックの下端(ガードの直上) */
+/** i番目のスロット先頭(=そのプロセスの下側ガードの先頭) */
+static UINT8 *stack_slot(UINT32 i) {
+    return g_stack_area + (UINT64)i * STACK_SLOT_SIZE;
+}
+
+/** i番目のプロセスが実際に使うスタックの下端(下側ガードの直上) */
 static UINT8 *stack_usable_base(UINT32 i) {
-    return g_stacks[i] + STACK_GUARD_SIZE;
+    return stack_slot(i) + STACK_GUARD_SIZE;
 }
 
 /* ---- ガードページの設営 ----------------------------------------------------
@@ -121,25 +137,56 @@ void os_process_install_stack_guards(void) {
     __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
     __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0 & ~(1ULL << 16)));
 
-    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
-        unmap_range((UINT64)g_stacks[i], STACK_GUARD_SIZE);
+    /* 各スロット先頭のガード + 末尾ガード(最後のプロセスの上端側) */
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        unmap_range((UINT64)stack_slot(i), STACK_GUARD_SIZE);
     }
 
     __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0));
 }
 
 UINT64 os_process_guard_base(UINT32 i) {
-    if (i >= PROCESS_COUNT) { return 0; }
-    return (UINT64)g_stacks[i];
+    if (i > PROCESS_COUNT) { return 0; }
+    return (UINT64)stack_slot(i);
 }
 
 UINT64 os_process_guard_size(void) { return STACK_GUARD_SIZE; }
 
 /** vaがいずれかのガード領域の中か。例外ハンドラが「ガードページを踏んだ」と
     明示するために使う */
+/* [原則6] ガードのどちら側かで**原因が違う**ので区別する。
+   下端側 = スタック溢れ(再帰が深すぎる)。
+   上端側 = 溢れではなく、基底や上限の破壊・バッファオーバーラン。
+   実際に`usages`のループ上限が壊れて上端を越えた事例がある。
+   0=ガードでない 1=どれかのスタックの下端側 2=どれかのスタックの上端側 */
+int os_process_guard_side(UINT64 va) {
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        UINT64 lo = (UINT64)stack_slot(i);
+        if (va < lo || va >= lo + STACK_GUARD_SIZE) { continue; }
+        /* スロットiのガードは「プロセスiの下端側」であり、同時に
+           「プロセスi-1の上端側」でもある。rspがどちらのスタックに居るかで決める */
+        return 1;
+    }
+    return 0;
+}
+
+/** vaがガードのとき、rspから見て上端側の踏み越しかどうか。
+    rspがスロットi-1のスタック内にあり、vaがスロットiのガードなら上端側 */
+int os_process_guard_is_upper(UINT64 va, UINT64 rsp) {
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        UINT64 lo = (UINT64)stack_slot(i);
+        if (va < lo || va >= lo + STACK_GUARD_SIZE) { continue; }
+        if (i == 0) { return 0; }  /* 先頭スロットの下は誰の上端でもない */
+        UINT64 prev_lo = (UINT64)stack_usable_base(i - 1);
+        if (rsp >= prev_lo && rsp <= prev_lo + STACK_SIZE) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
 int os_process_in_stack_guard(UINT64 va) {
-    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
-        UINT64 lo = (UINT64)g_stacks[i];
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        UINT64 lo = (UINT64)stack_slot(i);
         if (va >= lo && va < lo + STACK_GUARD_SIZE) { return 1; }
     }
     return 0;
