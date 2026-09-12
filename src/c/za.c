@@ -1711,15 +1711,18 @@ static void za_analyze_var_usage(lisp_val_t form, lisp_val_t env, za_var_usage_t
     }
 
     lisp_val_t head = cc_car(form);
+    GC_PROTECT(head);
     if (head == g_sym_quote) {
         return;
     }
     if (head == g_sym_setq) {
         lisp_val_t rest = cc_cdr(form);
+        GC_PROTECT(rest);
         if (rest == nil || (rest & TAG_MASK) != TAG_CONS) {
             return;
         }
         lisp_val_t sym = cc_car(rest);
+        GC_PROTECT(sym);
         if ((sym & TAG_MASK) == TAG_SYMBOL) {
             for (UINT64 i = 0; i < n; i++) {
                 if (usages[i].sym == sym) {
@@ -1728,6 +1731,7 @@ static void za_analyze_var_usage(lisp_val_t form, lisp_val_t env, za_var_usage_t
             }
         }
         lisp_val_t rest2 = cc_cdr(rest);
+        GC_PROTECT(rest2);
         if (rest2 != nil && (rest2 & TAG_MASK) == TAG_CONS) {
             za_analyze_var_usage(cc_car(rest2), env, usages, n, in_escaping_lambda);
         }
@@ -1735,8 +1739,11 @@ static void za_analyze_var_usage(lisp_val_t form, lisp_val_t env, za_var_usage_t
     }
     if (za_is_iife_call(form)) {
         lisp_val_t lrest = cc_cdr(head);
+        GC_PROTECT(lrest);
         lisp_val_t lambda_vars = ((lrest & TAG_MASK) == TAG_CONS) ? cc_car(lrest) : nil;
+        GC_PROTECT(lambda_vars);
         lisp_val_t lambda_body = ((lrest & TAG_MASK) == TAG_CONS) ? cc_cdr(lrest) : nil;
+        GC_PROTECT(lambda_body);
         // 実引数(呼び出しの引数位置)は現在のスコープで評価されるため、シャドウなし・
         // in_escaping_lambdaそのままで解析する。
         for (lisp_val_t a = cc_cdr(form); (a & TAG_MASK) == TAG_CONS && a != nil; a = cc_cdr(a)) {
@@ -1751,8 +1758,11 @@ static void za_analyze_var_usage(lisp_val_t form, lisp_val_t env, za_var_usage_t
     }
     if (za_is_raw_lambda(form)) {
         lisp_val_t lrest = cc_cdr(form);
+        GC_PROTECT(lrest);
         lisp_val_t lambda_vars = ((lrest & TAG_MASK) == TAG_CONS) ? cc_car(lrest) : nil;
+        GC_PROTECT(lambda_vars);
         lisp_val_t lambda_body = ((lrest & TAG_MASK) == TAG_CONS) ? cc_cdr(lrest) : nil;
+        GC_PROTECT(lambda_body);
         za_analyze_body_with_shadow(lambda_vars, lambda_body, env, usages, n, 1);
         return;
     }
@@ -2142,6 +2152,16 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     // za.c側の外部保護は「後続オペランド評価中の生存」を守るためだけに存在する。
     // 後続オペランドの評価が一切の呼び出しを含まなければ、その区間でGCが起きようが
     // ないため外部保護は不要になる。
+    /* [GC安全性] operand_forms[]はC配列のlisp_val_tで、以降のコンパイル
+       (1要素ずつza_compile_*へ渡す。各回が確保を伴う)を跨いで残りの要素が
+       生存する。GC_PROTECTは配列要素に届かないので既存ヘルパーで繋ぐ
+       (documents/pitfalls.md 原則8) */
+    gc_rootnode operand_form_nodes[ZA_MAX_OPERANDS];
+    za_gc_protect_batch_t operand_form_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    operand_form_batch.saved_head = get_current_process()->gc_roots;
+    for (UINT64 gi = 0; gi < count; gi++) {
+        za_gc_protect_batch_push(&operand_form_nodes[gi], &operand_forms[gi]);
+    }
     int skip_protect = 1;
     for (UINT64 i = 1; i < count; i++) {
         if (!za_operand_is_safe_leaf(operand_forms[i], params, fixed_count, locals)) {
@@ -2698,6 +2718,16 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     // 対応するローカルスロットへ格納・linkする。いずれかが制御転送を返した場合は
     // 残りのinit評価・body実行をすべて中止し、abort_cleanupへ直接jmpする
     // (za_compile_callの引数評価ループと同一パターン)。
+    /* [GC安全性] init_forms[]はC配列のlisp_val_tで、以降のコンパイル
+       (1要素ずつza_compile_*へ渡す。各回が確保を伴う)を跨いで残りの要素が
+       生存する。GC_PROTECTは配列要素に届かないので既存ヘルパーで繋ぐ
+       (documents/pitfalls.md 原則8) */
+    gc_rootnode init_form_nodes[ZA_MAX_LOCALS_PER_LET];
+    za_gc_protect_batch_t init_form_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    init_form_batch.saved_head = get_current_process()->gc_roots;
+    for (UINT64 gi = 0; gi < var_count; gi++) {
+        za_gc_protect_batch_push(&init_form_nodes[gi], &init_forms[gi]);
+    }
     UINT64 ct_patches[ZA_MAX_LOCALS_PER_LET];
     UINT64 ct_patch_count = 0;
     for (UINT64 i = 0; i < var_count; i++) {
@@ -3339,6 +3369,16 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
     // CALL_SAVED_HEADでまとめてunlinkしてから、関数末尾の共通着地点へ合流する)。
     // 引数の評価自体はcall_depth+1で再帰する(拡張15、関数doc comment参照)ため、
     // 引数がさらに一般呼び出しであってもこのループが使うスロットとは衝突しない。
+    /* [GC安全性] arg_forms[]はC配列のlisp_val_tで、以降のコンパイル
+       (1要素ずつza_compile_*へ渡す。各回が確保を伴う)を跨いで残りの要素が
+       生存する。GC_PROTECTは配列要素に届かないので既存ヘルパーで繋ぐ
+       (documents/pitfalls.md 原則8) */
+    gc_rootnode arg_form_nodes[ZA_MAX_OPERANDS];
+    za_gc_protect_batch_t arg_form_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    arg_form_batch.saved_head = get_current_process()->gc_roots;
+    for (UINT64 gi = 0; gi < argc; gi++) {
+        za_gc_protect_batch_push(&arg_form_nodes[gi], &arg_forms[gi]);
+    }
     UINT64 ct_patches[ZA_MAX_OPERANDS];
     UINT64 ct_patch_count = 0;
     for (UINT64 i = 0; i < argc; i++) {
