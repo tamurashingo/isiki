@@ -586,6 +586,21 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
     serial_write_hex64((uint64_t)(void *)&ctx);
     os_diag_serial_write(" ist=");
     serial_write_hex64((uint64_t)(void *)g_ist_stack);
+    if (ctx->vector == 14) {
+        uint64_t cr2v = 0;
+        __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2v));
+        os_diag_serial_write(" cr2=");
+        serial_write_hex64(cr2v);
+        if (os_process_in_stack_guard(cr2v)) {
+            /* [原則6] ガードページを踏んだ = スタック溢れ。通常の#PFと区別して出す */
+            os_diag_serial_write("\n   ** STACK OVERFLOW: ガードページを踏んだ **\n   stack=");
+            serial_write_hex64(os_process_stack_base(0));
+            os_diag_serial_write(" guard=");
+            serial_write_hex64(os_process_guard_base(0));
+            os_diag_serial_write(" guard_size=");
+            serial_write_hex64(os_process_guard_size());
+        }
+    }
     if (ctx->vector == 8) {
         os_diag_serial_write("\n   (double fault: Cスタックの溢れが最有力)");
     } else if (!os_process_stack_contains(ctx->rsp)) {

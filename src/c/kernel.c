@@ -165,6 +165,11 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
         kernel_show_information(fb);
     }
 
+    // [原則6] 各プロセススタックの直下を未マップにする。溢れた瞬間に#PFが出て、
+    // IDT/GDT(BSS上、スタックの下側にある)へ到達する前に止まる。
+    // プロセスを起動する前に済ませる必要がある
+    os_process_install_stack_guards();
+
     process_scheduler_start();
 }
 

@@ -70,6 +70,12 @@ void initialize_processes(frame_buffer *buffers);
 /** rspがいずれかのプロセススタックの範囲内かどうか。例外ハンドラがスタックを
     dumpしてよいかの判定に使う(スタック溢れではrspが範囲外を指しており、
     そのまま読むとハンドラ自身がフォルトしてダブルフォルトになる) */
+/** 全プロセスのスタック直下のガード領域を未マップにする(ブート時に1回) */
+void os_process_install_stack_guards(void);
+/** i番目のガード領域の先頭とサイズ、およびvaがガード内かの判定 */
+UINT64 os_process_guard_base(UINT32 i);
+UINT64 os_process_guard_size(void);
+int os_process_in_stack_guard(UINT64 va);
 UINT64 os_process_stack_base(UINT32 i);
 int os_process_stack_contains(UINT64 rsp);
 

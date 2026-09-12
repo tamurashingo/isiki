@@ -321,6 +321,32 @@ static lisp_val_t cc_diag_code_anchor(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum((UINT64)(lisp_addr_t)(void *)cc_diag_force_gp);
 }
 
+/* [第0部] ガードページを置けるかの下調べ。UEFIが張った恒等マップを、
+   指定アドレスについてPML4→PDPT→PD→PTと辿り、どの段で終端しているか
+   (2MBページなのか4KBページなのか)を返す。
+   0=未マップ 1=1GBページ 2=2MBページ 3=4KBページ */
+static lisp_val_t cc_diag_page_level(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 va = os_fixnum_magnitude(cc_car(args));
+    UINT64 cr3;
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+    UINT64 *pml4 = (UINT64 *)(cr3 & ~0xFFFULL);
+    UINT64 e4 = pml4[(va >> 39) & 0x1FF];
+    if (!(e4 & 1)) { return os_make_fixnum(0); }
+    UINT64 *pdpt = (UINT64 *)(e4 & 0x000FFFFFFFFFF000ULL);
+    UINT64 e3 = pdpt[(va >> 30) & 0x1FF];
+    if (!(e3 & 1)) { return os_make_fixnum(0); }
+    if (e3 & 0x80) { return os_make_fixnum(1); }
+    UINT64 *pd = (UINT64 *)(e3 & 0x000FFFFFFFFFF000ULL);
+    UINT64 e2 = pd[(va >> 21) & 0x1FF];
+    if (!(e2 & 1)) { return os_make_fixnum(0); }
+    if (e2 & 0x80) { return os_make_fixnum(2); }
+    UINT64 *pt = (UINT64 *)(e2 & 0x000FFFFFFFFFF000ULL);
+    UINT64 e1 = pt[(va >> 12) & 0x1FF];
+    if (!(e1 & 1)) { return os_make_fixnum(0); }
+    return os_make_fixnum(3);
+}
+
 static lisp_val_t cc_diag_idt_addr(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum(os_diag_idt_addr());
@@ -409,6 +435,8 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_ct_check), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CLOSURE-CALL"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_closure_call), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-PAGE-LEVEL"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_page_level), global_environment);
     os_set_function(os_make_symbol("%%DIAG-IDT-ADDR"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_idt_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-GDT-ADDR"),
