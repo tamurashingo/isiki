@@ -1033,6 +1033,19 @@ void *os_imm_page_alloc(void) {
     return page;
 }
 
+int os_addr_region(lisp_addr_t addr) {
+    UINT8 *p = (UINT8 *)addr;
+    if (p >= g_from_start && p < g_from_end) { return 0; }
+    if (p >= g_to_start && p < g_to_end) { return 1; }
+    if (p >= g_imm_space && p < g_imm_space + IMM_SPACE_SIZE) { return 2; }
+    return 4;
+}
+
+lisp_val_t cc_diag_addr_region(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum((UINT64)os_addr_region((lisp_addr_t)os_fixnum_magnitude(cc_car(args))));
+}
+
 UINT64 os_imm_space_used_bytes(void) {
     // g_imm_bumpはページ単位でしか進まないため、そのままでは4096byte未満の
     // 消費が見えない。各スロットカーソルが現在のページに残している未使用の
@@ -1106,6 +1119,12 @@ za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
     meta->arity = 0;
     return meta;
 }
+
+/* [GC監査] アドレスがどの領域に属するかを返す。生成コードに焼き込まれた即値が
+   「GCで動く領域」を指していないかを、機械語のレベルで判定するために使う。
+   0=From空間(生きている側) 1=To空間(GCのコピー先) 2=Immobilized Space
+   3=JITステージングバッファ 4=それ以外(静的/スタック/未使用) */
+int os_addr_region(lisp_addr_t addr);
 
 /* ============================== GC (Cheney方式コピーGC) ============================== */
 
@@ -1828,6 +1847,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_sites), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_addr), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-ADDR-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_addr_region), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-PAINTED-FIELDS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_painted_fields), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-RESET"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_reset), global_environment);

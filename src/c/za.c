@@ -707,6 +707,27 @@ static int za_validate_params(lisp_val_t params, UINT64 *out_fixed_count) {
     return 1;
 }
 
+/** GC_PROTECTは1個の名前付きローカル変数専用(トークン連結で内部変数名を作るため
+ * 配列添字`arr[i]`のような式を渡せない)。za_compile_flet_labelsのname_syms/
+ * binding_params/binding_bodies配列は、束縛数(binding_count、実行時に決まる)分の
+ * 要素をgensym確保・za_rewrite_fn_refs呼び出し(いずれもos_make_cons等の実アロケーション
+ * を伴う)の間、生存させ続ける必要があるため、この汎用ヘルパーで1要素ずつ手動で
+ * shadow stackへlinkする(GC_PROTECTの内部実装と同じ「node->var_ptr、現在のgc_rootsを
+ * nextに繋いで先頭を差し替える」手順を、配列分だけ繰り返すだけ)。 */
+typedef struct {
+    gc_rootnode *saved_head;
+} za_gc_protect_batch_t;
+
+static inline void za_gc_protect_batch_cleanup(za_gc_protect_batch_t *batch) {
+    get_current_process()->gc_roots = batch->saved_head;
+}
+
+static inline void za_gc_protect_batch_push(gc_rootnode *node, lisp_val_t *var_ptr) {
+    node->var_ptr = var_ptr;
+    node->next = get_current_process()->gc_roots;
+    get_current_process()->gc_roots = node;
+}
+
 /** let-IIFEインライン化(拡張B)のローカル変数を、内側スコープから外側へ向かって
  * 探索する。最初に見つかった(=最も内側の)一致を返すことで、シャドーイング
  * (letローカルが外側paramや外側letと同名)が自然に正しく解決される。out_kindには
@@ -2695,12 +2716,18 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     // letが末尾位置にある場合のtail-call性を保つ専用ループを使う(最後のフォームのみ
     // 呼び出し元のis_tailを継承)。
     za_local_scope_t new_scope;
+    /* [GC安全性] varsのsymもCスタック上の構造体フィールドなのでGC_PROTECTでは
+       守れない。fletのname_syms等と同じヘルパーで1要素ずつ繋ぐ(原則8) */
+    za_gc_protect_batch_t local_scope_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    local_scope_batch.saved_head = get_current_process()->gc_roots;
+    gc_rootnode local_scope_nodes[ZA_MAX_LOCALS_PER_LET];
     new_scope.count = var_count;
     new_scope.parent = locals;
     for (UINT64 i = 0; i < var_count; i++) {
         new_scope.vars[i].sym = var_syms[i];
         new_scope.vars[i].val_off = za_local_val_off(depth, i);
         new_scope.vars[i].kind = var_kind[i];
+        za_gc_protect_batch_push(&local_scope_nodes[i], &new_scope.vars[i].sym);
     }
 
     UINT64 body_end_patches[ZA_MAX_OPERANDS];
@@ -4319,6 +4346,90 @@ lisp_val_t cc_diag_za_bail_line(lisp_val_t args, lisp_val_t env) {
 }
 
 /** 記録された断念行の件数(先頭ほど内側 = 起点に近い) */
+/* [GC監査] 第0部: 直近に生成したコードの位置と長さ、およびそこへ焼き込まれた
+   movabs即値の一覧。jit_movabs_regは REX.W(0x48|0x49) + (0xB8+reg) + imm64 を
+   発行するので、その並びを走査すれば「生成コードが焼き込んだ64bit値」を全部拾える。
+
+   このバグクラス(生成コードに焼き込まれたアドレス)を守る機構は存在しない。
+   GC_PROTECTはlisp_val_tのCローカルを守るもので、機械語の中の即値には届かない。 */
+static UINT8 *g_za_last_code = 0;
+static UINT64 g_za_last_code_len = 0;
+#define ZA_MAX_SCAN_IMM 256
+static UINT64 g_za_scan_off[ZA_MAX_SCAN_IMM];
+static UINT64 g_za_scan_val[ZA_MAX_SCAN_IMM];
+static UINT32 g_za_scan_count = 0;
+
+lisp_val_t cc_diag_za_code_addr(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum((UINT64)(lisp_addr_t)g_za_last_code);
+}
+
+lisp_val_t cc_diag_za_code_len(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_za_last_code_len);
+}
+
+/** 直近の生成コードを走査し直し、見つかったmovabs即値の個数を返す。
+    GCの前後で2回呼べば「バッファの中身が変わったか」も「即値の指す先が
+    動いたか」も分かる */
+lisp_val_t cc_diag_za_scan(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    g_za_scan_count = 0;
+    if (g_za_last_code == 0 || g_za_last_code_len < 10) {
+        return os_make_fixnum(0);
+    }
+    for (UINT64 i = 0; i + 10 <= g_za_last_code_len; i++) {
+        UINT8 rex = g_za_last_code[i];
+        UINT8 op = g_za_last_code[i + 1];
+        if ((rex != 0x48 && rex != 0x49) || (op & 0xF8) != 0xB8) {
+            continue;
+        }
+        UINT64 imm = 0;
+        for (UINT64 b = 0; b < 8; b++) {
+            imm |= ((UINT64)g_za_last_code[i + 2 + b]) << (b * 8);
+        }
+        if (g_za_scan_count < ZA_MAX_SCAN_IMM) {
+            g_za_scan_off[g_za_scan_count] = i;
+            g_za_scan_val[g_za_scan_count] = imm;
+            g_za_scan_count++;
+        }
+        i += 9; /* この命令の残りは読み飛ばす */
+    }
+    return os_make_fixnum(g_za_scan_count);
+}
+
+/** 直近の生成コードのiバイト目。ホスト側で逆アセンブルするための生dump用 */
+lisp_val_t cc_diag_za_code_byte(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (g_za_last_code == 0 || i >= g_za_last_code_len) { return os_make_fixnum(0); }
+    return os_make_fixnum((UINT64)g_za_last_code[i]);
+}
+
+lisp_val_t cc_diag_za_imm_off(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_za_scan_count) { return os_make_fixnum(0); }
+    return os_make_fixnum(g_za_scan_off[i]);
+}
+
+/* 即値の下位60bitを返す(fixnumの表現範囲。ここで扱うアドレスは32bit程度なので
+   欠落しない。塗り潰しのトラップのような上位ビットのある値は領域4として出る) */
+lisp_val_t cc_diag_za_imm_val(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_za_scan_count) { return os_make_fixnum(0); }
+    return os_make_fixnum(g_za_scan_val[i] & 0x0FFFFFFFFFFFFFFFULL);
+}
+
+/** 即値が指す先の領域。0=From(GCで動く) 1=To 2=Immobilized 4=その他 */
+lisp_val_t cc_diag_za_imm_region(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_za_scan_count) { return os_make_fixnum(9); }
+    return os_make_fixnum((UINT64)os_addr_region((lisp_addr_t)(g_za_scan_val[i] & ~(UINT64)TAG_MASK)));
+}
+
 lisp_val_t cc_diag_za_bail_count(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum((UINT64)g_za_bail_count);
@@ -4620,26 +4731,6 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
     return os_make_cons(new_head, new_rest);
 }
 
-/** GC_PROTECTは1個の名前付きローカル変数専用(トークン連結で内部変数名を作るため
- * 配列添字`arr[i]`のような式を渡せない)。za_compile_flet_labelsのname_syms/
- * binding_params/binding_bodies配列は、束縛数(binding_count、実行時に決まる)分の
- * 要素をgensym確保・za_rewrite_fn_refs呼び出し(いずれもos_make_cons等の実アロケーション
- * を伴う)の間、生存させ続ける必要があるため、この汎用ヘルパーで1要素ずつ手動で
- * shadow stackへlinkする(GC_PROTECTの内部実装と同じ「node->var_ptr、現在のgc_rootsを
- * nextに繋いで先頭を差し替える」手順を、配列分だけ繰り返すだけ)。 */
-typedef struct {
-    gc_rootnode *saved_head;
-} za_gc_protect_batch_t;
-
-static inline void za_gc_protect_batch_cleanup(za_gc_protect_batch_t *batch) {
-    get_current_process()->gc_roots = batch->saved_head;
-}
-
-static inline void za_gc_protect_batch_push(gc_rootnode *node, lisp_val_t *var_ptr) {
-    node->var_ptr = var_ptr;
-    node->next = get_current_process()->gc_roots;
-    get_current_process()->gc_roots = node;
-}
 
 /**
  * `(flet bindings . body)`/`(labels bindings . body)`。各bindingは`(name params . body)`。
@@ -4735,7 +4826,10 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
     // shadow stackへlinkして保護する(za_gc_protect_batch_tのコメント参照)。
     za_gc_protect_batch_t flet_gc_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
     flet_gc_batch.saved_head = get_current_process()->gc_roots;
-    gc_rootnode flet_gc_nodes[ZA_MAX_FLET_BINDINGS * 3];
+    /* [GC安全性] +1はnew_scope.bindings[i].orig_name用(下で押す)。
+       Cスタック上の構造体フィールドはGC_PROTECTでは守れないため、同じ要領で
+       1要素ずつshadow stackへ繋ぐ(documents/pitfalls.md 原則8) */
+    gc_rootnode flet_gc_nodes[ZA_MAX_FLET_BINDINGS * 4];
     for (UINT64 i = 0; i < binding_count; i++) {
         za_gc_protect_batch_push(&flet_gc_nodes[i * 3 + 0], &name_syms[i]);
         za_gc_protect_batch_push(&flet_gc_nodes[i * 3 + 1], &binding_params[i]);
@@ -4747,6 +4841,11 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
     za_fn_scope_t new_scope;
     new_scope.count = binding_count;
     new_scope.parent = g_za_fn_scope;
+    /* [GC安全性] orig_nameはCスタック上の構造体に置くシンボルで、GC_PROTECTでは
+       守れない。この後のコンパイルはGCを誘発しうるため、GCが動かしたらポインタ
+       等価の名前解決が黙って失敗し、labelsの内側関数がグローバル名解決のコードに
+       化ける(実測で生成コードの差分として確認、呼ぶとEVAL-ERROR)。
+       フィールドを個別にGCルートへ繋ぐ */
     for (UINT64 i = 0; i < binding_count; i++) {
         lisp_val_t gensym = os_make_uninterned_symbol("FLET-FN");
         GC_PROTECT(gensym);
@@ -4756,6 +4855,10 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
         }
         new_scope.bindings[i].orig_name = name_syms[i];
         new_scope.bindings[i].gensym_slot_addr = &g_za_quote_slots[slot_idx];
+    }
+    for (UINT64 i = 0; i < binding_count; i++) {
+        za_gc_protect_batch_push(&flet_gc_nodes[ZA_MAX_FLET_BINDINGS * 3 + i],
+                                 &new_scope.bindings[i].orig_name);
     }
 
     // labelsの場合のみ、各bindingのbodyをnew_scope(自分自身・兄弟bindingを含む)で
@@ -5311,6 +5414,13 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
 
     jit_serialize_icache();
 
+    /* [GC監査] 第0部: 生成コードに焼き込まれた即値を後から読めるようにする。
+       これまで観測してきたのはすべてC側の状態(GC_PROTECTに渡した値、cc_carが
+       読んだ値、範囲検査)で、**コードバッファに書き出された即値そのものを
+       読んだことは一度もなかった**。 */
+    g_za_last_code = dest_bytes;
+    g_za_last_code_len = code_len;
+
     os_environment_register_pages(env, dest, page_count);
 
     // Phase3.6: このコンパイル試行で確保したリテラルスロットをenvの所有物として登録する
@@ -5360,6 +5470,13 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-CODE-BYTE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_byte), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-SCAN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_scan), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-IMM-OFF"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_off), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-IMM-VAL"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_val), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-IMM-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_region), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
 }
@@ -5380,6 +5497,13 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-CODE-BYTE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_byte), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-SCAN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_scan), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-IMM-OFF"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_off), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-IMM-VAL"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_val), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-IMM-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_region), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
 }

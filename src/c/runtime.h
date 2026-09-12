@@ -335,6 +335,11 @@ void os_gc_unregister_root(lisp_val_t *root_ptr);
     スコープ脱出に現れる。ここに**関数呼び出しを置くと**インライン展開が効かなくなり、
     za.cのJITコンパイルが数分かかるようになった(実測)。カウンタ変数を直接
     インクリメントするだけにして、ハンドラを自明なままに保つこと */
+/** [GC監査] アドレスがどの領域に属するかを返す。生成コードに焼き込まれた即値が
+    「GCで動く領域」を指していないかを機械語のレベルで判定するために使う。
+    0=From空間(生きている側) 1=To空間(GCのコピー先) 2=Immobilized Space 4=その他 */
+int os_addr_region(lisp_addr_t addr);
+
 extern UINT64 g_gc_lifo_violations;
 
 /** [GC監査] GC_PROTECTしようとした値が**すでにstale**なら記録する。
@@ -396,6 +401,12 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
         { (lisp_val_t *)&(var), get_current_process()->gc_roots }; \
     get_current_process()->gc_roots = &_gcnode_##var
 #endif
+
+/* [GC安全性] **C構造体の中のlisp_val_tフィールドを守る機構は無い**
+   (documents/pitfalls.md 原則8)。GC_PROTECTは「変数」を守る機構でトークン連結により
+   内部ノード名を作るため、`arr[i].field`のような式は渡せない。構造体フィールドや
+   配列要素を守るには、za.cのza_gc_protect_batch_push/za_gc_protect_batch_cleanupの
+   ように、1要素ずつ手動でshadow stackへ繋ぐこと。 */
 
 /**
  * 非負のfixnumオブジェクトを作る(即値、ヒープ確保なし、符号は常に0)。
