@@ -70,6 +70,7 @@ void initialize_processes(frame_buffer *buffers);
 /** rspがいずれかのプロセススタックの範囲内かどうか。例外ハンドラがスタックを
     dumpしてよいかの判定に使う(スタック溢れではrspが範囲外を指しており、
     そのまま読むとハンドラ自身がフォルトしてダブルフォルトになる) */
+UINT64 os_process_stack_base(UINT32 i);
 int os_process_stack_contains(UINT64 rsp);
 
 int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used);

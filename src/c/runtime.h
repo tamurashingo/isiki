@@ -899,6 +899,8 @@ void os_gc_debug_trap_result_hit(const char *where, void *site);
 /** [原則6] 診断文字列をCOM1シリアルへ出す。panicの内容を-display noneでも読めるようにする
     (実装はinterrupt.c。フレームバッファだけに出すと外からは電源断としか見えない) */
 void os_diag_serial_write(const char *s);
+UINT64 os_diag_idt_addr(void);
+UINT64 os_diag_gdt_addr(void);
 
 void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used);
 

@@ -49,6 +49,13 @@ static void stack_canary_init(UINT32 proc_index) {
     *(UINT64 *)g_stacks[proc_index] = STACK_CANARY;
 }
 
+/** [第0部] 診断用: i番目のプロセススタックの下端アドレス。フォルト時のrspが
+    どのスタックのどこにあったかを、外から突き合わせるために公開する */
+UINT64 os_process_stack_base(UINT32 i) {
+    if (i >= PROCESS_COUNT) { return 0; }
+    return (UINT64)g_stacks[i];
+}
+
 int os_process_stack_contains(UINT64 rsp) {
     for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
         UINT64 low = (UINT64)g_stacks[i];

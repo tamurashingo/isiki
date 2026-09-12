@@ -182,6 +182,11 @@ static void serial_write_string(const char *s) {
    スタックガードは正しく発動していたのに、外からは「電源が落ちた」としか見えず、
    深度4000で溢れていることに気づけなかった。runtime.cのpanic経路から呼べるよう
    serialへの出力を公開する(診断専用。通常の実行経路では使わない) */
+/** [第0部] 診断: IDT/GDT/TSSの置き場。暴走したスタックがこれらを踏んでいないかを
+    外から突き合わせるために公開する(スタックの下に何があるかはBSSの配置次第) */
+UINT64 os_diag_idt_addr(void) { return (UINT64)(void *)&g_idt[0]; }
+UINT64 os_diag_gdt_addr(void) { return (UINT64)(void *)&g_gdt[0]; }
+
 void os_diag_serial_write(const char *s) {
     serial_write_string(s);
 }

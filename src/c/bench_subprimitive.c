@@ -1,5 +1,6 @@
 #include "bench_subprimitive.h"
 #include "runtime.h"
+#include "process.h"
 #include "lisp.h"
 #include "eval.h"
 
@@ -309,6 +310,32 @@ static lisp_val_t cc_diag_stale_negative(lisp_val_t args, lisp_val_t env) {
    上位16bitが0xBADCなのでcanonicalでなく、必ずGP例外(vector=13)になる。
    例外ハンドラのダンプに「GC PAINT TRAP」が**出ない**ことまで見ること
    — トラップ判定が本物の例外を握り潰していないことの確認である */
+/* [第0部] 診断: i番目のプロセススタックの下端。フォルト時のrspと突き合わせて
+   「本当にスタックを踏み外したのか」を判定するために使う */
+static lisp_val_t cc_diag_force_gp(lisp_val_t args, lisp_val_t env);
+
+/* [第0部] 診断: 既知の関数のアドレス。実行時ripをPEファイル上の位置へ逆引きする
+   ための基準(GC_DEBUGビルドでなくても使えるようにここへ置く) */
+static lisp_val_t cc_diag_code_anchor(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum((UINT64)(lisp_addr_t)(void *)cc_diag_force_gp);
+}
+
+static lisp_val_t cc_diag_idt_addr(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(os_diag_idt_addr());
+}
+
+static lisp_val_t cc_diag_gdt_addr(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(os_diag_gdt_addr());
+}
+
+static lisp_val_t cc_diag_stack_base(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_process_stack_base((UINT32)os_fixnum_magnitude(cc_car(args))));
+}
+
 static lisp_val_t cc_diag_force_gp(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     volatile UINT64 *bad = (volatile UINT64 *)(lisp_addr_t)0xBADC0FFEE0DDF00DULL;
@@ -382,6 +409,14 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_ct_check), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CLOSURE-CALL"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_closure_call), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-IDT-ADDR"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_idt_addr), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-GDT-ADDR"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_gdt_addr), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-CODE-ANCHOR"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_code_anchor), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-STACK-BASE"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_stack_base), global_environment);
     os_set_function(os_make_symbol("%%DIAG-FORCE-GP"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_force_gp), global_environment);
     os_set_function(os_make_symbol("%%DIAG-IMM-BURN"),
