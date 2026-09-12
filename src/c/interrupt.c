@@ -551,6 +551,14 @@ UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
         serial_write_hex64((UINT64)current_cell);
         os_diag_serial_write(" gc_count=");
         serial_write_hex64(os_gc_collect_count());
+        os_diag_serial_write("\n  in_gc=");
+        serial_write_hex64((UINT64)g_gc_debug_in_gc);
+        os_diag_serial_write(" tick_during_gc=");
+        serial_write_hex64(g_gc_tick_during_gc);
+        os_diag_serial_write(" current_process_sym_val=");
+        serial_write_hex64((UINT64)os_get_variable(g_sym_current_process, global_environment));
+        os_diag_serial_write(" run_queue=");
+        serial_write_hex64((UINT64)os_get_variable(g_sym_run_queue, global_environment));
         os_diag_serial_write("\n");
         os_panic("c_timer_switch: saved_rsp corrupted (see serial)");
     }

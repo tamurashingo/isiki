@@ -1609,7 +1609,43 @@ static void gc_fixup_environment_cells(lisp_val_t env) {
  * 全プロセスのshadow stack(GC_PROTECTされたCローカル変数)をルートとして
  * 生存オブジェクトをTo空間へコピーし、完了後にFrom/To空間を入れ替える。
  */
+static void os_gc_collect_body(void);
+
+/**
+ * GCの実行中はタイマー割り込みを止める。
+ *
+ * [原則9] **GCはスケジューラに割り込まれてはならない。**
+ * c_timer_switchは *current-process* / *RUN-QUEUE* / PCB という
+ * **GC管理データ**を読み書きする。コピーの途中で入ると、まだ更新されていない
+ * 参照や半分だけ書かれたオブジェクトを読むことになる。
+ *
+ * 実測(監査ビルド、塗り潰し監査の22試験): 9試験が
+ * 「c_timer_switchの復元先rspがどのプロセススタックにも無い」で落ち、
+ * 採取できた3件はいずれも in_gc=1 / tick_during_gc=1 で、
+ * os_get_variable(*current-process*) も *RUN-QUEUE* も同じゴミ値
+ * (0x0DB91DC9、ヒープ外)を返していた。読み出したsaved_rspは
+ * ヒープ末尾0x0BB6C000で、asm_timer_handlerがそれをrspに入れて
+ * iretqした先で #GP になる。
+ *
+ * os_alloc_bytes側は以前からcli/stiで囲ってあり、repl.cのセーフポイントGC
+ * (os_heap_used_ratio超過時)だけが素通しだった。呼び出し側ではなくGC本体を
+ * 囲うことで、将来増える呼び出し口も自動的に安全側になる。
+ *
+ * cli/stiではなくRFLAGSの退避・復帰にしてあるのは、os_alloc_bytes経由の
+ * 呼び出し(既に割り込み禁止中)で早すぎるstiをしないため。
+ */
 void os_gc_collect(void) {
+#ifndef ISIKIOS_UNIT_TEST
+    UINT64 saved_flags;
+    __asm__ __volatile__ ("pushfq\n\tpop %0\n\tcli" : "=r"(saved_flags) :: "memory");
+#endif
+    os_gc_collect_body();
+#ifndef ISIKIOS_UNIT_TEST
+    __asm__ __volatile__ ("push %0\n\tpopfq" :: "r"(saved_flags) : "memory", "cc");
+#endif
+}
+
+static void os_gc_collect_body(void) {
 #ifdef ISIKIOS_GC_DEBUG
     g_gc_debug_in_gc = 1;
 #endif
