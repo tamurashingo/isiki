@@ -248,6 +248,41 @@ static UINT64 bench_ct_check(UINT64 n) {
     return hits + n;
 }
 
+/* [性能測定] GC検出器の陽性対照/陰性対照(診断専用)。
+   env revertは陽性対照ではないことが判明したため(envは一度もstale領域を
+   指さない)、必ずstaleになる合成バグをここに用意する。
+   陽性: lisp_val_tのローカルを保護せずに確保を跨がせ、staleになった後に読む。
+   陰性: 同じ構造でGC_PROTECTを正しく行う。
+   片方で検出され、もう片方で検出されないことまで確認して初めて感度と言える。
+   強制GC(%%DIAG-GC-STRESS)を有効にしてから呼ぶこと。 */
+static UINT64 bench_stale_churn(UINT64 n) {
+    UINT64 acc = 0;
+    for (UINT64 i = 0; i < n; i++) {
+        lisp_val_t junk = os_make_cons(os_make_fixnum(i), nil);
+        acc = acc + (UINT64)(junk & 1);
+    }
+    return acc;
+}
+
+/** 陽性対照: unprotectedは保護されないまま確保を跨ぎ、その後読まれる */
+static lisp_val_t cc_diag_stale_positive(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 n = os_fixnum_magnitude(cc_car(args));
+    lisp_val_t unprotected = os_make_cons(os_make_fixnum(11), os_make_fixnum(22));
+    (void)bench_stale_churn(n);
+    return cc_car(unprotected);
+}
+
+/** 陰性対照: 同じ構造だが正しく保護する */
+static lisp_val_t cc_diag_stale_negative(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 n = os_fixnum_magnitude(cc_car(args));
+    lisp_val_t protected_val = os_make_cons(os_make_fixnum(11), os_make_fixnum(22));
+    GC_PROTECT(protected_val);
+    (void)bench_stale_churn(n);
+    return cc_car(protected_val);
+}
+
 /* [性能測定] 診断専用: Immobilized Spaceを意図的に消費し、枯渇時にOSが永久停止
    せずos_panicへ到達することを確認するためのもの。専用カーソルから確保するため、
    os_imm_space_used_bytesはこのカーソルの現在ページの未使用末尾分だけ過大に
@@ -307,6 +342,10 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_for), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-VECTOR"),
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_vector), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-STALE-POSITIVE"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_stale_positive), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-STALE-NEGATIVE"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_stale_negative), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CT-CHECK"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_ct_check), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CLOSURE-CALL"),
