@@ -2908,5 +2908,31 @@ process 1のガード領域である。rspは上端から7.4KB下で、スタッ
   スタック上端を越える読み出しが起き、ガードページに捕まる。原因は別途追う。
 
 「遅いから入れない」ではなく「別のバグを踏むから入れない」に変わった。
-場所も1箇所(スタック上端の8byte上を読む)まで絞れている。
+
+#### フォルト箇所の特定
+
+`tools/bench/locate_rip.sh --serial` で `rip` を逆引きすると
+`za_compile_expr+0x7ab`(`za_compile_let`がインライン展開されたもの)。
+逆アセンブルすると:
+
+```
++0x79a   add    $0x10,%rdx        ; rdxは16byte刻み
++0x79e   add    $0x4,%rax         ; raxは4byte刻み
++0x7a2   cmp    %rax,%r8          ; 上限と比較
++0x7ab   mov    0x8(%rdx),%ecx    ; ← フォルト。[rdx+8]
++0x7b2   cmpl   $0x0,0xc(%rdx)    ;   [rdx+12]
+```
+
+16byte刻みでオフセット+8と+12を読むのは `za_var_usage_t { lisp_val_t sym;
+int assigned; int captured; }` であり、`za_compile_let` の
+
+```c
+for (i < var_count) var_kind[i] = (usages[i].assigned && usages[i].captured) ? ... ;
+```
+
+である。**`usages` の基底ポインタがスタック上端の外を指している。**
+`var_count`は4以下に検証済みなので、添字の暴走ではなく基底が壊れている。
+
+ここまでで場所は確定したが、**なぜ基底が壊れるのかは未解明**である。
+`za_analyze_var_usage`の保護を入れたときだけ、かつ通常ビルドでだけ起きる。
 
