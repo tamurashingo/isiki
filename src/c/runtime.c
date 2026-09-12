@@ -3303,6 +3303,14 @@ static void decompose(lisp_val_t v, signed_mag_t *out) {
  * 正規化後マグニチュードが60bit以内に収まる場合はFIXNUM(即値)に降格し、
  * それ以外はlimb配列をコピーしてヒープに確保しMAGIC_BIGNUMのINSTANCEを返す。
  */
+/* [原則7] os_make_integerがlimbsを確保より前に写し取るための、GC非管理の作業領域。
+   32bit limbで16384個 = 524288bit(約157800桁)まで賄える。これを超える場合だけは
+   従来どおり確保後に読むが、その大きさの整数は現実には現れない。
+   os_make_integerは再入しない(間に走るのはos_alloc_bytesとGCだけで、
+   どちらもos_make_integerを呼ばない)ため、単一バッファで足りる。 */
+#define LIMB_STAGE_LIMBS 16384
+static UINT64 g_limb_stage[LIMB_STAGE_LIMBS];
+
 lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
     count = mag_len(limbs, count);
     if (count == 1 && limbs[0] == 0) {
@@ -3319,16 +3327,30 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
         }
     }
 
-    // limbsは呼び出し元が管理する生バッファで、GCのルートとして追跡されない。
-    // この後アロケーションを2回以上挟むとGCがfrom/to空間を2回フリップし得て、
-    // 2回目のフリップで元のfrom空間(=limbsの実体があった領域)が新たなto空間として
-    // 再利用され、まだ読んでいないlimbsの内容が上書きされる危険がある。そのため、
-    // limbsを読む最後の操作(このコピー)を、limbs確保後最初のアロケーション
-    // (limb配列自体の確保)の直後、他のアロケーションを一切挟まずに完了させる
+    // [原則7] limbsは呼び出し元が管理する生バッファで、GCのルートとして追跡されない。
+    // 呼び出し元(primitive_add等)はこれをos_alloc_bytesでGCヒープに取っているため、
+    // この直後のos_alloc_bytesでGCが1回でも走ると、フリップ直後の塗り潰しで
+    // limbsは読む前に壊れる。
+    //
+    // 以前は「フリップ1回なら旧From空間の中身は残る」という前提でコピー順だけを
+    // 工夫していたが、それはGC実装の内部事情に依存した暗黙の前提であり、
+    // 塗り潰し(ISIKIOS_GC_PAINT)を入れると即座に破れる。実測で、
+    // (isiki-za-test-bignum-add-loop ...) の結果が 0xDEADDEA7 の並びになった。
+    //
+    // そこで、確保より**前に**GC非管理の静的作業領域へ写し切る。
+    // os_make_integerに至るlimb作業バッファは23箇所あるが、いずれも最終段は
+    // ここなので、この一箇所でクラス全体が閉じる。
+    UINT64 *src = limbs;
+    if (count <= LIMB_STAGE_LIMBS) {
+        for (UINT64 i = 0; i < count; i++) {
+            g_limb_stage[i] = limbs[i];
+        }
+        src = g_limb_stage;
+    }
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
-        dst[i] = limbs[i];
+        dst[i] = src[i];
     }
 
     // ここから先はlimbsを二度と読まないため、以降で何回アロケーションが発生しても安全。

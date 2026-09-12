@@ -656,3 +656,97 @@ staleを読んでいたのはJITが生成した機械語で、計器化された
 - [ ] 生データをGCヒープへ置く場合、次のアロケーションまでに消費し切る設計に
       なっているか。`cc_open_input_stream`が`os_mount_fat_read_file`の戻り値を
       すぐストリームへ組み込んでいるのはこの理由による。
+
+## 原則9: GCの実行中にスケジューラを走らせてはならない(2026-09-12)
+
+`c_timer_switch`(`src/c/interrupt.c`)は `*current-process*` / `*RUN-QUEUE*` /
+PCB という**GC管理データ**を読み書きする。したがってGCのコピー中に
+タイマー割り込みが入ると、まだ更新されていない参照や半分だけ書かれた
+オブジェクトを読むことになる。
+
+`os_alloc_bytes` は以前から `cli`/`sti` で囲ってあったので、
+「確保に伴うGC」は守られていた。守られていなかったのは
+**`repl.c` のセーフポイントGC**である。`os_repl_step` は
+`os_heap_used_ratio()` が閾値を超えたときに `os_gc_collect()` を直接呼ぶが、
+ここは割り込み許可のままだった。
+
+### 症状が発生源から遠い
+
+観測できたのは次の例外だけだった。
+
+```
+!! CPU EXCEPTION vector=0x0D rip=0x0D25FA1D rsp=0x0BB6C078
+→ asm_timer_handler+0x67
+```
+
+`asm_timer_handler+0x67` は最後の `pop %rax` の次、つまり `iretq` である。
+このハンドラは `c_timer_switch` の戻り値を `rsp` に入れてから15レジスタを
+popするので、**`rsp` から 0x78 を引いた値が `c_timer_switch` の戻り値そのもの**に
+なる。0x0BB6C078 - 0x78 = 0x0BB6C000 はヒープ末尾ちょうどで、全GPRが0なのは
+その先の未マップ領域をpopしたためだった。
+
+つまりこの例外ダンプは「1tick遅れの現場」でしかなく、
+「スタック溢れ」でも「rspが壊れた」でもない。**PCBから読んだ`saved_rsp`が
+不正だった**、という一点に絞れる。
+
+### 発生源で捕まえる
+
+`c_timer_switch` が戻す直前に `os_process_stack_contains` で検証し、
+外れていたら `next_cell` / PCB / 各語 / それぞれの所属領域 / `in_gc` を
+出して止める計器を入れた(`ISIKIOS_GC_DEBUG` 限定)。結果:
+
+- 塗り潰し監査22試験のうち **9試験** がこの検出で落ちた(それまでは無症状)
+- 採取した3件はいずれも `in_gc=1` `tick_during_gc=1`
+- `os_get_variable(*current-process*)` も `*RUN-QUEUE*` も
+  同一のゴミ値(ヒープ外)を返していた
+
+修正は呼び出し側ではなく `os_gc_collect` 本体を囲う形にした。
+将来増える呼び出し口も自動的に安全側になる。`cli`/`sti` ではなく
+RFLAGSの退避・復帰にしてあるのは、`os_alloc_bytes` 経由(既に割り込み禁止中)で
+早すぎる `sti` をしないためである。
+
+### 教訓
+
+- **割り込みハンドラがGC管理データを触るなら、GCは不可分でなければならない。**
+  「確保のときだけ止める」では足りない。GCを呼びうる経路すべてではなく、
+  GC本体を囲うこと。
+- 例外ダンプの `rip` が割り込みハンドラの中にあるときは、**そのハンドラの
+  逆アセンブルを読んで、`rsp` から発生源の値を逆算する**。
+  ダンプの `rsp` をそのまま「壊れたrsp」と読むと発生源に辿り着けない。
+
+## 原則7の追補: `os_alloc_raw` だけを見ても足りない(2026-09-12)
+
+原則7のチェックリストは `os_alloc_raw` を対象にしていたが、
+**bignum演算は `os_alloc_bytes` を直接呼んでlimb作業バッファを取っている**ため、
+当時の洗い出しから漏れていた。塗り潰し監査(`AUDIT_STRESS=10000`)で
+`za_test` が落ちて判明した。
+
+```
+[NG] (ISIKI-ZA-TEST-BIGNUM-ADD-LOOP 0 ZA-GC-TEST-STEP ZA-GC-TEST-N)
+     => 5460077584634632450518118065064752558900321225311123267239
+     (expected 3458764513820540928000)
+```
+
+壊れた値を16進で見ると `deaddeaebd5bbd55...deaddea7` で、
+**塗り潰しパターン `0xDEADDEADDEADDEA7` そのもの**が limb として読まれている。
+
+該当箇所の形はどこも同じである(`primitive_add` の例)。
+
+```c
+UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);   // GCが知らない生バッファ
+...
+mag_add(acc.limbs, acc.count, operand.limbs, operand.count, result);
+acc_val = os_make_integer(result_sign, result, result_len);  // ← 中で確保する
+```
+
+`os_make_integer` は limb 配列を確保してから `result` を読む。その確保でGCが
+走ると、フリップ直後に旧From空間が塗り潰され、`result` は読む前に壊れる。
+
+通常ビルドで動いているのは「To空間の中身が消されない」という
+**文書化されていない前提**に依存しているだけで、原則7がまさに禁じている形である。
+`os_alloc_bytes(8 * ...)` は現在23箇所あり、単発ではなく一つのクラスをなす。
+
+### チェックリスト(追加)
+
+- [ ] `os_alloc_raw` だけでなく **`os_alloc_bytes` の直接呼び出し**も
+      同じ観点で洗うこと。生バッファかどうかは呼び出す関数名では決まらない。
