@@ -13,12 +13,18 @@
 lisp_val_t cc_car(lisp_val_t obj) {
     // TODO: TAG_CONS であることのチェックを入れる
     GC_DEBUG_ASSERT_LIVE(obj, "cc_car");
+    // [GC監査] 塗り潰し有効時、objがトラップパターンなら**デリファレンスしない**。
+    // トラップパターンは上位16bitが0xDEADでcanonicalでないため、そのまま読むと
+    // GP例外でOSが止まり、その1件で以後の監査が全部隠れてしまう。記録して
+    // nilを返し、続行させる(指示書 第0部2「検出しても中断しない」)
+    if (GC_DEBUG_TRAP_READ(obj, "cc_car")) { return nil; }
     return ((lisp_val_t *)(obj & ~TAG_MASK))[0];
 }
 
 lisp_val_t cc_cdr(lisp_val_t obj) {
     // TODO: TAG_CONS であることのチェックを入れる
     GC_DEBUG_ASSERT_LIVE(obj, "cc_cdr");
+    if (GC_DEBUG_TRAP_READ(obj, "cc_cdr")) { return nil; }
     return ((lisp_val_t *)(obj & ~TAG_MASK))[1];
 }
 

@@ -530,6 +530,54 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
         diag_write_string(fb, "\ncr2(fault addr)=");
         fb_write_hex64(fb, cr2);
     }
+
+    // [GC監査] ripだけでは発生地点がソースのどこか分からない。UEFIがイメージを
+    // 読み込むアドレスは実行ごとに変わりうるので、既知のシンボル(このハンドラ
+    // 自身)のアドレスを併記して、rip - handler の差からPE内のオフセットを
+    // 逆算できるようにする(objdump -d でその差を持つ命令を探す)
+    diag_write_string(fb, "\nhandler=");
+    fb_write_hex64(fb, (uint64_t)(void *)&c_cpu_exception_handler);
+
+    // [GC監査] 汎用レジスタ一式。塗り潰し(ISIKIOS_GC_PAINT)のトラップパターン
+    // 0xDEADDEADDEADDEA6 は上位16bitが0xDEADでcanonicalでないため、これを
+    // デリファレンスするとページフォルトではなく**GP例外(vector=13,
+    // error_code=0)**になる。つまりGPの瞬間のレジスタにトラップパターンが
+    // 載っていれば、その例外はstaleポインタの参照そのものである
+    {
+        static const char *const names[15] = {
+            "r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8",
+            "rsi", "rdi", "rbp", "rdx", "rcx", "rbx", "rax"
+        };
+        const uint64_t *regs = &ctx->r15;
+        int trap_seen = 0;
+        for (int i = 0; i < 15; i++) {
+            diag_write_string(fb, (i % 4 == 0) ? "\n" : " ");
+            diag_write_string(fb, names[i]);
+            diag_write_string(fb, "=");
+            fb_write_hex64(fb, regs[i]);
+            if ((regs[i] & ~(uint64_t)0x7) == (0xDEADDEADDEADDEA6ULL & ~(uint64_t)0x7)) {
+                trap_seen = 1;
+            }
+        }
+        if (trap_seen) {
+            diag_write_string(fb, "\n** GC PAINT TRAP in register: stale pointer dereference **");
+        }
+    }
+
+    // [GC監査] ripだけでは「staleを読んだ関数」(cc_car/cc_cdr等)しか分からず、
+    // **保護を怠った呼び出し元**が分からない。呼び出し元は戻りアドレスとして
+    // スタックに載っているので、フォルト時点のrspから一定語数を生のまま出す。
+    // ホスト側(tools/bench/locate_rip.sh)がイメージ範囲に入る値だけを拾って
+    // 関数名へ逆引きする。スタックは上位アドレス方向へ読むので、この深さで
+    // 範囲外へ出ることはない
+    diag_write_string(fb, "\nstack(rsp..):");
+    {
+        const uint64_t *sp = (const uint64_t *)ctx->rsp;
+        for (int i = 0; i < 32; i++) {
+            diag_write_string(fb, (i % 4 == 0) ? "\n  " : " ");
+            fb_write_hex64(fb, sp[i]);
+        }
+    }
     diag_write_string(fb, "\n");
 }
 

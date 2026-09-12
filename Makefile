@@ -709,6 +709,36 @@ test-qemu-perf-read: $(PERF_READ_FAT16_IMG) $(PERF_READ_FAT32_IMG)
 # 単体実行では空のままで既存の振る舞いを変えない
 QEMU_EXTRA_FLAGS ?=
 
+# [GC監査] 塗り潰し(GC_PAINT=1)下で試験を流すための実行ターゲット。
+# test-qemu-milestoneとの違いは3点だけで、いずれも監査に必須のもの:
+#   1. AUDIT_TIMEOUT秒でQEMU自体をtimeoutで打ち切る(makeを殺すとQEMUが孤児に
+#      なるため、timeoutはQEMUに直接かける)。打ち切りは終了コード124で分かる。
+#   2. " 0 failed" の検証をしない。監査では失敗も結果であり、ホスト側の
+#      ドライバ(tools/bench/run_paint_audit.sh)が分類する。
+#   3. QEMUの終了コードを$(BUILD_TMPDIR)/qemu-exit.txtへ残す。タイムアウトと
+#      試験失敗を区別するのに使う(混同すると実在しないバグを追うことになる)。
+# test-results.txtは9p越しにホストのファイルへ直接書かれるため、ゲストが
+# ハングしてもそこまでの逐次出力は残る
+AUDIT_TIMEOUT ?= 1800
+
+test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
+	mkdir -p $(BUILD_TMPDIR)
+	test -n "$(MILESTONE)"
+	rm -f .qemu-test-trigger test-results.txt $(BUILD_TMPDIR)/qemu-exit.txt
+	echo "$(MILESTONE)" > .qemu-test-trigger
+	ec=0; timeout -k 10 $(AUDIT_TIMEOUT) qemu-system-x86_64 \
+		-m 256M \
+		-display none \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
+		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		$(QEMU_EXTRA_FLAGS) \
+		-no-reboot || ec=$$?; \
+		echo $$ec > $(BUILD_TMPDIR)/qemu-exit.txt
+	rm -f .qemu-test-trigger
+
 test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"

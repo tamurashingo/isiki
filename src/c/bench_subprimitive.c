@@ -256,6 +256,16 @@ static UINT64 bench_ct_check(UINT64 n) {
    片方で検出され、もう片方で検出されないことまで確認して初めて感度と言える。
    強制GC(%%DIAG-GC-STRESS)を有効にしてから呼ぶこと。 */
 static UINT64 bench_stale_churn(UINT64 n) {
+    // [GC監査] n=0は「確保でGCを誘発する」のではなく**GCをちょうど1回**走らせる。
+    // 塗り潰しは旧From空間を塗るが、その領域は次のGCのコピー先になるため、
+    // GCを2回以上跨いだstaleアドレスは塗り潰しではなく新しい生きたオブジェクトを
+    // 指してしまい、トラップとしては観測されない(強制GC間隔100で陽性対照が
+    // 999ではなく190を返したのがこれ)。対照を毎回確実に検出させるには、
+    // 書き込みと読み出しの間のGCを1回に固定する必要がある
+    if (n == 0) {
+        os_gc_collect();
+        return 0;
+    }
     UINT64 acc = 0;
     for (UINT64 i = 0; i < n; i++) {
         lisp_val_t junk = os_make_cons(os_make_fixnum(i), nil);

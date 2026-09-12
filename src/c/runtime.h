@@ -809,9 +809,19 @@ void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site);
 /** 値がどの空間に属するかを分類して計数する(stale仮説の直接確認用) */
 void os_gc_debug_classify(lisp_val_t v);
 #define GC_DEBUG_CLASSIFY(v) os_gc_debug_classify(v)
+/** [GC監査] 読もうとした値が塗り潰しのトラップパターンなら、発生箇所ごとに
+    記録して1を返す。呼び出し側はデリファレンスを避けてnilを返すこと。
+    トラップパターンはcanonicalでないアドレスなので、読めばGP例外でOSが止まる。
+    監査ではそこで止めず、1回の実行で全体像を取りたい(指示書 第0部2) */
+int os_gc_debug_trap_read(lisp_val_t v, const char *where, void *site);
+/** [GC監査] GCが「生きた構造の中の塗り潰し済み領域へのポインタ」を見つけたときに数える */
+void os_gc_debug_note_painted_field(void);
+#define GC_DEBUG_TRAP_READ(v, where) \
+    os_gc_debug_trap_read((v), (where), __builtin_return_address(0))
 #else
 #define GC_DEBUG_ASSERT_LIVE(obj, where) ((void)0)
 #define GC_DEBUG_CLASSIFY(v) ((void)0)
+#define GC_DEBUG_TRAP_READ(v, where) (0)
 #endif
 
 /**
