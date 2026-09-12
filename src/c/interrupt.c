@@ -511,7 +511,51 @@ UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     }
     os_set_variable(g_sym_current_process, next_cell, global_environment);
 
-    return os_process_get_saved_rsp(cc_car(next_cell));
+    UINT64 next_rsp = os_process_get_saved_rsp(cc_car(next_cell));
+#ifdef ISIKIOS_GC_DEBUG
+    /* [GC監査] GCの実行中に入ったtickを数える。上の*current-process* / run-queue/PCBの
+       読み書きは、その瞬間には半端な状態を触っている可能性がある */
+    if (g_gc_debug_in_gc) { g_gc_tick_during_gc++; }
+#endif
+#ifdef ISIKIOS_GC_DEBUG
+    /* [GC監査] 復元しようとしているrspがどのプロセススタックにも属さないなら、
+       ここが破壊の**発生源**である。asm_timer_handlerはこの値をrspに入れて
+       15回popしてからiretqするので、実際に落ちるのはiretqの位置になり、
+       例外ダンプだけを見ると「rspが壊れている」としか分からない
+       (実測: rip=asm_timer_handler+0x67, rsp=ヒープ末尾+0x78 = 本値+0x78)。
+       戻す前に捕まえて、PCBとrun-queueの中身をそのまま出す。 */
+    if (!os_process_stack_contains(next_rsp)) {
+        lisp_val_t pcb = cc_car(next_cell);
+        UINT64 *w = (UINT64 *)(pcb & ~TAG_MASK);
+        os_diag_serial_write("\nPANIC: c_timer_switch: 復元先rspがどのプロセススタックにも無い\n  next_rsp=");
+        serial_write_hex64(next_rsp);
+        os_diag_serial_write(" region=");
+        serial_write_hex64((UINT64)os_addr_region((lisp_addr_t)next_rsp));
+        os_diag_serial_write("\n  current_rsp=");
+        serial_write_hex64(current_rsp);
+        os_diag_serial_write("\n  next_cell=");
+        serial_write_hex64((UINT64)next_cell);
+        os_diag_serial_write(" tag=");
+        serial_write_hex64((UINT64)(next_cell & TAG_MASK));
+        os_diag_serial_write(" region=");
+        serial_write_hex64((UINT64)os_addr_region((lisp_addr_t)(next_cell & ~TAG_MASK)));
+        os_diag_serial_write("\n  pcb=");
+        serial_write_hex64((UINT64)pcb);
+        os_diag_serial_write(" tag=");
+        serial_write_hex64((UINT64)(pcb & TAG_MASK));
+        os_diag_serial_write(" region=");
+        serial_write_hex64((UINT64)os_addr_region((lisp_addr_t)(pcb & ~TAG_MASK)));
+        os_diag_serial_write("\n  pcb[0..3]=");
+        for (int i = 0; i < 4; i++) { serial_write_hex64(w[i]); os_diag_serial_write(" "); }
+        os_diag_serial_write("\n  current_cell=");
+        serial_write_hex64((UINT64)current_cell);
+        os_diag_serial_write(" gc_count=");
+        serial_write_hex64(os_gc_collect_count());
+        os_diag_serial_write("\n");
+        os_panic("c_timer_switch: saved_rsp corrupted (see serial)");
+    }
+#endif
+    return next_rsp;
 }
 
 /**
@@ -609,7 +653,13 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
     if (ctx->vector == 8) {
         os_diag_serial_write("\n   (double fault: Cスタックの溢れが最有力)");
     } else if (!os_process_stack_contains(ctx->rsp)) {
-        os_diag_serial_write("\n   (rspがどのプロセススタックの範囲にもない = スタック溢れ)");
+        /* [原則6] rspがスタック範囲外なのは**溢れとは限らない**。
+           ガードページ導入後は溢れなら境界で#PFになるので、ここへ来るのは
+           むしろ「rspそのものが壊れている」場合である(実測で、監査ビルドの
+           za_testがrsp=ヒープ末尾+0x78でasm_timer_handler内フォルトを起こした)。
+           断定せず、事実だけを出す。 */
+        os_diag_serial_write("\n   (rspがどのプロセススタックの範囲にもない: "
+                             "溢れではなくrspの破壊の可能性。ガード側の表示も確認すること)");
     }
     os_diag_serial_write("\n");
 

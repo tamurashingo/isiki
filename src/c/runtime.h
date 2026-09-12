@@ -360,6 +360,13 @@ int os_addr_region(lisp_addr_t addr);
 
 extern UINT64 g_gc_lifo_violations;
 
+#ifdef ISIKIOS_GC_DEBUG
+/** [GC監査] os_gc_collectの実行中なら1。割り込みハンドラから見るために公開している */
+extern int g_gc_debug_in_gc;
+/** [GC監査] GC実行中に入ったタイマー割り込みの回数 */
+extern UINT64 g_gc_tick_during_gc;
+#endif
+
 /** [GC監査] GC_PROTECTしようとした値が**すでにstale**なら記録する。
     保護は「その変数」を追跡するだけで、入ってきた時点で古い値なら直せない。
     ここで捕まえた関数の**呼び出し元**が、確保を跨いで保護せずに持っていた張本人である。

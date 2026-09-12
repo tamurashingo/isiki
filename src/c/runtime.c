@@ -438,7 +438,11 @@ void os_gc_debug_note_painted_field(void) {
     複数のプロセスのノードが1本のリストへ混ざる */
 UINT64 g_gc_lifo_violations = 0;
 
-static int g_gc_debug_in_gc = 0;
+int g_gc_debug_in_gc = 0;
+/* [GC監査] GCの実行中にタイマー割り込みが入った回数。c_timer_switchが数える。
+   タイマーハンドラは*current-process* / run-queue/PCBというGC管理データを読むので、
+   ここが0でないならGC途中の半端な状態を読む窓が実在することになる */
+UINT64 g_gc_tick_during_gc = 0;
 
 /* [GC監査] 保護しようとした時点で既にstaleだった回数と、その箇所。
    GC_PROTECTは「その変数」を追跡するだけなので、入ってきた値が既に古ければ
@@ -1086,6 +1090,16 @@ int os_addr_region(lisp_addr_t addr) {
     if (p >= g_imm_space && p < g_imm_space + IMM_SPACE_SIZE) { return 2; }
     return 4;
 }
+
+/** [GC監査] GC実行中に入ったタイマー割り込みの回数を返す。
+    0でなければ、タイマーハンドラが*current-process* / run-queue/PCBを
+    GC途中の半端な状態で読む窓が実在する */
+#ifdef ISIKIOS_GC_DEBUG
+lisp_val_t cc_diag_gc_tick_during_gc(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_tick_during_gc);
+}
+#endif
 
 lisp_val_t cc_diag_addr_region(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -1895,6 +1909,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_sites), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_addr), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TICK-DURING-GC"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_tick_during_gc), global_environment);
         os_set_function(os_make_symbol("%%DIAG-ADDR-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_addr_region), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-PAINTED-FIELDS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_painted_fields), global_environment);
