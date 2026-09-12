@@ -358,15 +358,21 @@ void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
 }
 
 #ifdef ISIKIOS_GC_DEBUG
-/* [GCデバッグ] **塗り潰し(ISIKIOS_GC_PAINT)は既定で無効にしてある。**
-   このコードベースはos_alloc_rawで確保したGC非管理の生データ(os_stream_t、
-   ファイル読み込みバッファ等)をGCヒープ内に置いており、GCはこれらをコピーしない。
-   つまり旧From空間に残ったまま「上書きされるまで生き延びる」ことに依存している。
-   塗り潰すとこれらが即座に破壊され、ブート中(init.lispのload)で停止する。
-   staleポインタの検出はISIKIOS_GC_DEBUGの範囲検査だけでも行えるため、
-   通常はそちらを使う。塗り潰しを使うには先に生データのGCヒープ外への移設が要る。 */
-/** [GCデバッグ] stale領域を塗るトラップパターン(タグ=TAG_FORWARD、本来観測されない値) */
-#define GC_DEBUG_TRAP_PATTERN 0xDEADDEADDEADDEA6ULL
+/* [GCデバッグ] 塗り潰し(ISIKIOS_GC_PAINT)はGC_PAINT=1で有効になる。
+   かつては「os_alloc_rawの生データがGCヒープに置かれているので塗ると壊れる」と
+   していたが、これは誤りだった。os_stream_tとそのバッファはgc_relocate_streamが
+   コピーしており、実際に未管理だったのはprint.cのbignum印字用作業バッファ2箇所
+   だけである(fe97f45で解消)。 */
+/** [GCデバッグ] stale領域を塗るトラップパターン。
+   タグはTAG_RAW_POINTER(0x7)にする。**「タグとして不正な値」は作れない**
+   — 0x0〜0x7の8値はすべて使用中である(FIXNUM/CONS/SYMBOL/CHAR/STRING/
+   INSTANCE/FORWARD/RAW_POINTER)。そこで「GCが決して追いかけないタグ」を選ぶ。
+   gc_copy_valueはFIXNUM/CHAR/RAW_POINTERをその場で返すので、トラップを
+   デリファレンスしない。
+   当初はTAG_FORWARD(0x6)にしていたが、これはGCが転送ポインタとみなして
+   追いかけるタグであり、生きた構造の中にトラップが入るとGC自身が
+   canonicalでないアドレスを読んでGP例外で止まっていた(gc_copy_value+0x33)。 */
+#define GC_DEBUG_TRAP_PATTERN GC_DEBUG_TRAP_PATTERN_VALUE
 
 /** [GCデバッグ] staleなデリファレンスを検出した回数 */
 static UINT64 g_gc_debug_stale_hits = 0;
@@ -379,6 +385,96 @@ void os_gc_debug_note_painted_field(void) {
     g_gc_painted_field_hits++;
 }
 
+/** [GC監査] shadow stackのLIFO規律が破れた回数。GC_PROTECTは
+    get_current_process()->gc_rootsへ繋ぐが、get_current_processが返すのは
+    g_current_process_index(=表示フォーカス)であって、スケジューラが実際に
+    走らせているプロセスではない。プリエンプティブな切り替えが起きると、
+    複数のプロセスのノードが1本のリストへ混ざる */
+static UINT64 g_gc_lifo_violations = 0;
+
+static int g_gc_debug_in_gc = 0;
+
+void os_gc_debug_note_lifo_violation(void) {
+    g_gc_lifo_violations++;
+}
+
+/* [GC監査] 保護しようとした時点で既にstaleだった回数と、その箇所。
+   GC_PROTECTは「その変数」を追跡するだけなので、入ってきた値が既に古ければ
+   保護しても直らない。ここで記録された関数そのものではなく、**その呼び出し元**が
+   確保を跨いで保護せずに値を持っていた張本人である */
+static UINT64 g_gc_protect_stale_hits = 0;
+#define GC_PROTECT_STALE_MAX_SITES 64
+static void *g_gc_protect_stale_sites[GC_PROTECT_STALE_MAX_SITES];
+static UINT64 g_gc_protect_stale_site_hits[GC_PROTECT_STALE_MAX_SITES];
+static UINT32 g_gc_protect_stale_site_count = 0;
+
+int g_gc_protect_check_enabled = 0;
+
+/* [GC監査] 保護時の検査を実行時に切り替える。既定は無効。
+   常時有効だとGC_PROTECTが最も多く通る場所なので、za.cのlabels+letの
+   JITコンパイルが現実的な時間で終わらなくなる(実測で10分以上進まなかった) */
+lisp_val_t cc_diag_gc_protect_check(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_gc_protect_check_enabled = (cc_car(args) != nil) ? 1 : 0;
+    return nil;
+}
+
+void os_gc_debug_check_protect_slow(lisp_val_t *var, void *site) {
+    if (g_gc_debug_in_gc) {
+        return;
+    }
+    lisp_val_t v = *var;
+    UINT64 tag = v & TAG_MASK;
+    if (tag == TAG_FIXNUM || tag == TAG_CHAR || tag == TAG_RAW_POINTER) {
+        return;
+    }
+    UINT8 *addr = (UINT8 *)(lisp_addr_t)(v & ~TAG_MASK);
+    if (addr == 0) {
+        return;
+    }
+    // 旧From空間(=いまのTo空間)を指しているか。範囲検査は偶奇の影響を受けるが、
+    // 塗り潰し有効ならその中身がトラップパターンであることで確定できる
+    if (!(addr >= g_to_start && addr < g_to_end)) {
+        return;
+    }
+#ifdef ISIKIOS_GC_PAINT
+    if (*(lisp_val_t *)addr != (lisp_val_t)GC_DEBUG_TRAP_PATTERN) {
+        return; /* 塗り潰し済みでないなら、まだ上書きされていないだけの可能性がある */
+    }
+#endif
+    g_gc_protect_stale_hits++;
+    for (UINT32 i = 0; i < g_gc_protect_stale_site_count; i++) {
+        if (g_gc_protect_stale_sites[i] == site) {
+            g_gc_protect_stale_site_hits[i]++;
+            return;
+        }
+    }
+    if (g_gc_protect_stale_site_count < GC_PROTECT_STALE_MAX_SITES) {
+        g_gc_protect_stale_sites[g_gc_protect_stale_site_count] = site;
+        g_gc_protect_stale_site_hits[g_gc_protect_stale_site_count] = 1;
+        g_gc_protect_stale_site_count++;
+    }
+}
+
+lisp_val_t cc_diag_gc_protect_stale(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 which = os_fixnum_magnitude(cc_car(args));
+    if (which == 0) { return os_make_fixnum(g_gc_protect_stale_hits); }
+    return os_make_fixnum(g_gc_protect_stale_site_count);
+}
+
+lisp_val_t cc_diag_gc_protect_stale_site(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_protect_stale_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum((UINT64)(lisp_addr_t)g_gc_protect_stale_sites[i]);
+}
+
+lisp_val_t cc_diag_gc_lifo_violations(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_lifo_violations);
+}
+
 lisp_val_t cc_diag_gc_painted_fields(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum(g_gc_painted_field_hits);
@@ -388,7 +484,6 @@ lisp_val_t cc_diag_gc_painted_fields(lisp_val_t args, lisp_val_t env) {
     cc_car/cc_cdrで走査するため、その参照までstaleと誤判定してしまう。
     対照実験(za.cを通らないワークロード+強制GC)で2,044件の誤検出として
     現れたことで判明した */
-static int g_gc_debug_in_gc = 0;
 
 lisp_val_t cc_diag_gc_stale_hits(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
@@ -448,25 +543,31 @@ void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site) {
    指してしまい、トラップとしては観測されない(陽性対照をinterval=100で流すと
    999ではなく190のような別の値が返るのはこれである)。
    したがって「トラップ0件」もまた保護漏れが無いことの証明にはならない。 */
-static UINT64 g_gc_trap_read_hits = 0;
 #define GC_TRAP_MAX_SITES 64
 static void *g_gc_trap_sites[GC_TRAP_MAX_SITES];
 static UINT64 g_gc_trap_site_hits[GC_TRAP_MAX_SITES];
 static UINT32 g_gc_trap_site_count = 0;
 
-int os_gc_debug_trap_read(lisp_val_t v, const char *where, void *site) {
+
+/* [GC監査] 読み出した結果がトラップだった箇所。**最初にstaleを読んだ場所**を
+   直接押さえられるのはこちらである。読み出し元のポインタ自体は塗り潰し済み領域を
+   指す「ふつうのアドレス」に見えるため、ポインタ側の判定では素通りしてしまい、
+   トラップは1段あとの読み出しで初めて現れる(実測でeval_argsが最初の検出箇所に
+   見えていたのはこのため) */
+static UINT64 g_gc_trap_result_hits = 0;
+
+/* 比較はGC_DEBUG_TRAP_RESULTマクロ側でインラインに行う。ここへ来るのは
+   実際にトラップを読んだときだけなので、呼び出しコストは問題にならない */
+void os_gc_debug_trap_result_hit(const char *where, void *site) {
     (void)where;
-    if ((v & ~(lisp_val_t)TAG_MASK) != (GC_DEBUG_TRAP_PATTERN & ~(lisp_val_t)TAG_MASK)) {
-        return 0;
-    }
     if (g_gc_debug_in_gc) {
-        return 1; /* GC自身の走査は記録しない(読まないことだけ伝える) */
+        return;
     }
-    g_gc_trap_read_hits++;
+    g_gc_trap_result_hits++;
     for (UINT32 i = 0; i < g_gc_trap_site_count; i++) {
         if (g_gc_trap_sites[i] == site) {
             g_gc_trap_site_hits[i]++;
-            return 1;
+            return;
         }
     }
     if (g_gc_trap_site_count < GC_TRAP_MAX_SITES) {
@@ -474,12 +575,11 @@ int os_gc_debug_trap_read(lisp_val_t v, const char *where, void *site) {
         g_gc_trap_site_hits[g_gc_trap_site_count] = 1;
         g_gc_trap_site_count++;
     }
-    return 1;
 }
 
-lisp_val_t cc_diag_gc_trap_hits(lisp_val_t args, lisp_val_t env) {
+lisp_val_t cc_diag_gc_trap_result_hits(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
-    return os_make_fixnum(g_gc_trap_read_hits);
+    return os_make_fixnum(g_gc_trap_result_hits);
 }
 
 lisp_val_t cc_diag_gc_trap_sites(lisp_val_t args, lisp_val_t env) {
@@ -501,7 +601,7 @@ lisp_val_t cc_diag_gc_trap_site_addr(lisp_val_t args, lisp_val_t env) {
    対照は意図的にstaleを作るので、監査本体の計数に混ぜてはならない */
 lisp_val_t cc_diag_gc_trap_reset(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
-    g_gc_trap_read_hits = 0;
+    g_gc_trap_result_hits = 0;
     g_gc_trap_site_count = 0;
     g_gc_painted_field_hits = 0;
     return nil;
@@ -519,7 +619,7 @@ lisp_val_t cc_diag_gc_trap_site_hits(lisp_val_t args, lisp_val_t env) {
    (tools/bench/locate_rip.sh の handler= と同じ役割) */
 lisp_val_t cc_diag_image_anchor(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
-    return os_make_fixnum((UINT64)(lisp_addr_t)(void *)os_gc_debug_trap_read);
+    return os_make_fixnum((UINT64)(lisp_addr_t)(void *)os_gc_debug_check_protect_slow);
 }
 
 /* [GCデバッグ] stale仮説の直接確認。値がFrom空間(=生きている側)か
@@ -1105,7 +1205,15 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
     // この経路で捕まるのは「保護漏れでstaleになった値が、その後**生きた構造へ
     // 書き込まれた**」ケースである。読み出し側(cc_car/cc_cdr)の検出より後になるが、
     // 読まずに保存しただけの漏れはこちらでしか捕まらない
-    if ((obj & ~(lisp_val_t)TAG_MASK) == (GC_DEBUG_TRAP_PATTERN & ~(lisp_val_t)TAG_MASK)) {
+    // タグがTAG_RAW_POINTERなのでこの下のswitchは追いかけない(GCが転送ポインタと
+    // 誤認して落ちることはもう無い)。ここを残しているのは2つの理由による:
+    //   1. 計数。生きた構造のフィールドが塗り潰し済み領域を指していた、という形の
+    //      漏れはこれでしか数えられない。
+    //   2. 伝播を止める。そのまま残すと、後でその値をcarやcdrとして辿った側が
+    //      canonicalでないアドレスを読んでGP例外で停止し、監査がそこで終わる。
+    //      nilへ潰せば「そのフィールドは壊れていた」という記録を残したまま走り切れる
+    //      (指示書 第0部2「検出しても中断しない」)
+    if (obj == (lisp_val_t)GC_DEBUG_TRAP_PATTERN) {
         os_gc_debug_note_painted_field();
         return nil;
     }
@@ -1707,13 +1815,18 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-CLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_cls), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-STALE-RESET"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_reset), global_environment);
         /* [GC監査] 塗り潰しのトラップを読んだ箇所。偶奇に依存しない検出 */
-        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_result_hits), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_sites), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_addr), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_hits), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-PAINTED-FIELDS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_painted_fields), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-RESET"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_reset), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-RESULT-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_result_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-CHECK"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_check), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE-SITE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale_site), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-LIFO-VIOLATIONS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_lifo_violations), global_environment);
 
         #endif
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);

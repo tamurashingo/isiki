@@ -40,7 +40,7 @@ def main():
     syms = load_symbols(dis_path)
 
     # 基準シンボル。例外ダンプは c_cpu_exception_handler を、ゲスト内の
-    # %%DIAG-IMAGE-ANCHOR は os_gc_debug_trap_read をアンカーとして報告する
+    # %%DIAG-IMAGE-ANCHOR は os_gc_debug_check_protect_slow をアンカーとして報告する
     anchor_name = 'c_cpu_exception_handler'
     if '--anchor-symbol' in sys.argv:
         i = sys.argv.index('--anchor-symbol')

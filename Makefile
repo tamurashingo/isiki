@@ -38,6 +38,18 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 GC_DEBUG_FLAGS = $(if $(GC_DEBUG),-DISIKIOS_GC_DEBUG,)$(if $(GC_PAINT), -DISIKIOS_GC_PAINT,)
 
 BUILD_TMPDIR = tmp
+
+# [GCデバッグ] $(TARGET)はSRC/HDRのファイル依存で追跡するため、**フラグだけ変えても
+# 再ビルドされない**。以前はrm -f $(TARGET)を手で打つ運用にしていたが、忘れると
+# 「塗り潰し有効のつもりで無効のバイナリを測る」ことになり、しかも無言で成立する
+# (documents/pitfalls.md 原則6)。使用したフラグをスタンプに残し、変わったときだけ
+# スタンプを更新して$(TARGET)の再ビルドを促す
+GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
+.PHONY: FORCE
+FORCE:
+$(GC_DEBUG_STAMP): FORCE
+	@mkdir -p $(BUILD_TMPDIR)
+	@echo '$(GC_DEBUG_FLAGS)' | cmp -s - $@ 2>/dev/null || echo '$(GC_DEBUG_FLAGS)' > $@
 OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
 
 # fat16_test.img/fat32_test.imgのような固定テストフィクスチャはtmp/に置くが、
@@ -148,7 +160,7 @@ transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 # 「実際にソース/ヘッダが変更された時だけ」再生成されるようにする土台になる
 # (buildをphonyのままにしていると、buildを経由するあらゆる後続ターゲットが
 # 常に再実行されてしまう)。
-$(TARGET): $(SRC) $(HDR)
+$(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
 	mkdir -p esp_dir/EFI/BOOT
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
 		-nostdlib -mno-red-zone -O1 -shared \

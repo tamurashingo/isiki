@@ -330,12 +330,40 @@ void os_gc_register_root(lisp_val_t *root_ptr);
  */
 void os_gc_unregister_root(lisp_val_t *root_ptr);
 
+/** [GC監査] shadow stackのLIFO規律が破れた回数を数える */
+void os_gc_debug_note_lifo_violation(void);
+
+/** [GC監査] GC_PROTECTしようとした値が**すでにstale**なら記録する。
+    保護は「その変数」を追跡するだけで、入ってきた時点で古い値なら直せない。
+    ここで捕まえた関数の**呼び出し元**が、確保を跨いで保護せずに持っていた張本人である。
+
+    GC_PROTECTはインタプリタで最も多く通る場所なので、**既定では無効**にしてある
+    (`%%DIAG-GC-PROTECT-CHECK`で有効化する)。常時有効にすると、za.cの
+    labels+letのJITコンパイルが現実的な時間で終わらなくなる(実測で10分以上)。
+    フラグの読み出し1回ぶんのコストだけは残るが、それは無視できる */
+extern int g_gc_protect_check_enabled;
+void os_gc_debug_check_protect_slow(lisp_val_t *var, void *site);
+static inline void os_gc_debug_check_protect(lisp_val_t *var, void *site) {
+    if (g_gc_protect_check_enabled) {
+        os_gc_debug_check_protect_slow(var, site);
+    }
+}
+
 /**
  * GC_PROTECTされたローカル変数のcleanup(スコープ脱出時)ハンドラ。
  * 現在のプロセスのshadow stack先頭を、このノードのnextに巻き戻す。
  * GC_PROTECTマクロ内でのみ使う。
  */
 static inline void gc_unprotect_node(gc_rootnode *node) {
+#ifdef ISIKIOS_GC_DEBUG
+    // [GC監査] shadow stackはLIFOでなければならない。外そうとしているノードが
+    // 先頭でないなら、間に別の誰かがpushしたまま抜けていない = 規律が破れている。
+    // プリエンプティブな切り替えでプロセスを跨いで同じリストを使っていると、
+    // ここが必ず破れる(一方のスコープ脱出が他方のノードをリストから落とす)
+    if (get_current_process()->gc_roots != node) {
+        os_gc_debug_note_lifo_violation();
+    }
+#endif
     get_current_process()->gc_roots = node->next;
 }
 
@@ -346,10 +374,18 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
  * 対応するGC_UNPROTECTの呼び出しは不要。varは登録前に有効なlisp_val_t(nil等)で
  * 初期化しておくこと。
  */
+#ifdef ISIKIOS_GC_DEBUG
+#define GC_PROTECT(var) \
+    gc_rootnode _gcnode_##var __attribute__((cleanup(gc_unprotect_node))) = \
+        { (lisp_val_t *)&(var), get_current_process()->gc_roots }; \
+    get_current_process()->gc_roots = &_gcnode_##var; \
+    os_gc_debug_check_protect((lisp_val_t *)&(var), __builtin_return_address(0))
+#else
 #define GC_PROTECT(var) \
     gc_rootnode _gcnode_##var __attribute__((cleanup(gc_unprotect_node))) = \
         { (lisp_val_t *)&(var), get_current_process()->gc_roots }; \
     get_current_process()->gc_roots = &_gcnode_##var
+#endif
 
 /**
  * 非負のfixnumオブジェクトを作る(即値、ヒープ確保なし、符号は常に0)。
@@ -809,19 +845,28 @@ void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site);
 /** 値がどの空間に属するかを分類して計数する(stale仮説の直接確認用) */
 void os_gc_debug_classify(lisp_val_t v);
 #define GC_DEBUG_CLASSIFY(v) os_gc_debug_classify(v)
-/** [GC監査] 読もうとした値が塗り潰しのトラップパターンなら、発生箇所ごとに
-    記録して1を返す。呼び出し側はデリファレンスを避けてnilを返すこと。
-    トラップパターンはcanonicalでないアドレスなので、読めばGP例外でOSが止まる。
-    監査ではそこで止めず、1回の実行で全体像を取りたい(指示書 第0部2) */
-int os_gc_debug_trap_read(lisp_val_t v, const char *where, void *site);
 /** [GC監査] GCが「生きた構造の中の塗り潰し済み領域へのポインタ」を見つけたときに数える */
 void os_gc_debug_note_painted_field(void);
-#define GC_DEBUG_TRAP_READ(v, where) \
-    os_gc_debug_trap_read((v), (where), __builtin_return_address(0))
+/** [GC監査] 読み出した**結果**がトラップだった場合の記録。読み出し元のポインタが
+    塗り潰し済み領域を指していたことを意味する。ポインタ側の判定では捕まらない
+    (staleポインタ自体は「ふつうのアドレス」に見えるため)。
+
+    cc_car/cc_cdrは最も多く通る関数なので、**比較だけをインラインで行い**、
+    一致したときだけ関数呼び出しに落とす。ここを無条件の関数呼び出しにしたところ、
+    za.cのlabels+letのJITコンパイルが数分たっても終わらなくなった
+    (documents/pitfalls.md 原則6「計器が対象の実行時間を変えていないか」) */
+#define GC_DEBUG_TRAP_PATTERN_VALUE 0xDEADDEADDEADDEA7ULL
+void os_gc_debug_trap_result_hit(const char *where, void *site);
+#define GC_DEBUG_TRAP_RESULT(v, where) \
+    do { \
+        if ((v) == (lisp_val_t)GC_DEBUG_TRAP_PATTERN_VALUE) { \
+            os_gc_debug_trap_result_hit((where), __builtin_return_address(0)); \
+        } \
+    } while (0)
 #else
 #define GC_DEBUG_ASSERT_LIVE(obj, where) ((void)0)
 #define GC_DEBUG_CLASSIFY(v) ((void)0)
-#define GC_DEBUG_TRAP_READ(v, where) (0)
+#define GC_DEBUG_TRAP_RESULT(v, where) ((void)0)
 #endif
 
 /**

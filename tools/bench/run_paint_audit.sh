@@ -15,13 +15,12 @@
 #   5. 再開・分割: グループ単位で1回ずつQEMUを起動し、完了済みグループは飛ばす。
 #
 # 使い方:
-#   # 塗り潰し有効ビルドで監査
-#   rm -f esp_dir/EFI/BOOT/BOOTX64.EFI    # フラグ変更では再ビルドされないため必須
-#   GC_DEBUG=1 GC_PAINT=1 make build
+#   # 塗り潰し有効ビルドで監査(フラグはスタンプで追跡するのでrmは要らない)
+#   export GC_DEBUG=1 GC_PAINT=1
 #   tools/bench/run_paint_audit.sh
 #
 #   # 基準時間(通常ビルド)の取得。対照は使えないのでAUDIT_CONTROL=0
-#   rm -f esp_dir/EFI/BOOT/BOOTX64.EFI && make build
+#   unset GC_DEBUG GC_PAINT
 #   AUDIT_CONTROL=0 AUDIT_OUTDIR=tmp/paint_audit_base tools/bench/run_paint_audit.sh
 #
 # 環境変数:
@@ -34,6 +33,10 @@
 #                  GC 0回の試験が多かった場合に、集計を見てから使う
 #   AUDIT_FILES    流す試験ファイル(空白区切り)。既定はqemu_boot_test.lispと同じ列
 #   AUDIT_DISK_IMG QEMUのhd0に与えるイメージ(既定はMakefileのIDE_DISK_IMG)
+#   GC_DEBUG / GC_PAINT  ビルドフラグ。**必ず環境から引き継ぐこと。**
+#                  各グループはmake経由で走るので、ここで渡さないと途中で
+#                  ソースが更新された瞬間にフラグ無しで再ビルドされ、
+#                  「塗り潰し有効のつもりで無効のバイナリを測る」ことになる
 
 set -eu
 
@@ -92,6 +95,11 @@ gen_boot() {
 }
 
 echo "=== 塗り潰し監査: outdir=$OUTDIR timeout=${TIMEOUT_SEC}s control=$USE_CONTROL stress=$STRESS ==="
+echo "    ビルドフラグ: GC_DEBUG=${GC_DEBUG:-(なし)} GC_PAINT=${GC_PAINT:-(なし)}"
+if [ "$USE_CONTROL" = "1" ] && [ -z "${GC_DEBUG:-}" ]; then
+    echo "ERROR: 対照を使うにはGC_DEBUG=1が要る(%%DIAG-*がそのビルドにしかない)" >&2
+    exit 1
+fi
 
 for name in $FILES; do
     if [ -f "$OUTDIR/$name.status" ]; then
@@ -106,6 +114,7 @@ for name in $FILES; do
     start=$(date +%s)
     set +e
     make test-qemu-audit-run \
+        GC_DEBUG="${GC_DEBUG:-}" GC_PAINT="${GC_PAINT:-}" \
         MILESTONE="$boot" \
         AUDIT_TIMEOUT="$TIMEOUT_SEC" \
         QEMU_EXTRA_FLAGS="-serial file:$PWD/$serial" \

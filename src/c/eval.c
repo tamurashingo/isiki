@@ -960,6 +960,13 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
  * @return formの評価結果。abortされた場合はabortに渡されたcondition
  */
 lisp_val_t os_eval_top_level(lisp_val_t form, lisp_val_t env) {
+    // envはos_make_consの引数ではないため、os_make_consの内部保護の対象外である。
+    // wrappedを組み立てる3回の確保はいずれもGCを誘発しうるので、envはここで
+    // 自分で保護しなければならない。保護していないと、GCを跨いだ時点でenvが
+    // 旧From空間を指したままos_evalへ渡り、os_eval側のGC_PROTECT(env)は
+    // 「すでに古い値」を追跡するだけになって救えない
+    // (documents/pitfalls.md 原則4。formは各os_make_consの引数なので内部保護される)
+    GC_PROTECT(env);
     lisp_val_t wrapped = os_make_cons(g_sym_block,
         os_make_cons(g_sym_top_level_block, os_make_cons(form, nil)));
     return os_eval(wrapped, env);

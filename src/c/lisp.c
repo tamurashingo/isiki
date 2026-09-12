@@ -13,19 +13,24 @@
 lisp_val_t cc_car(lisp_val_t obj) {
     // TODO: TAG_CONS であることのチェックを入れる
     GC_DEBUG_ASSERT_LIVE(obj, "cc_car");
-    // [GC監査] 塗り潰し有効時、objがトラップパターンなら**デリファレンスしない**。
-    // トラップパターンは上位16bitが0xDEADでcanonicalでないため、そのまま読むと
-    // GP例外でOSが止まり、その1件で以後の監査が全部隠れてしまう。記録して
-    // nilを返し、続行させる(指示書 第0部2「検出しても中断しない」)
-    if (GC_DEBUG_TRAP_READ(obj, "cc_car")) { return nil; }
-    return ((lisp_val_t *)(obj & ~TAG_MASK))[0];
+    // [GC監査] **読んだ結果**がトラップなら、objは塗り潰し済み領域のcons cellを
+    // 指していた。最初にstaleを読んだ場所を押さえられるのはこの形だけである。
+    // ポインタ側を判定しても、staleポインタ自体は「ふつうのアドレス」に見えるので
+    // 素通りし、トラップは1段あとの読み出しで初めて現れる(実測でeval_argsが
+    // 最初の検出箇所に見えていたのはこのため。真の起点はos_eval_top_levelだった)。
+    // **例外ハンドラでは代替できない。** 塗り潰した領域は読んでもフォルトせず、
+    // ただトラップの値が返るだけだからである(アンマップ方式にすれば不要になる)
+    lisp_val_t v = ((lisp_val_t *)(obj & ~TAG_MASK))[0];
+    GC_DEBUG_TRAP_RESULT(v, "cc_car");
+    return v;
 }
 
 lisp_val_t cc_cdr(lisp_val_t obj) {
     // TODO: TAG_CONS であることのチェックを入れる
     GC_DEBUG_ASSERT_LIVE(obj, "cc_cdr");
-    if (GC_DEBUG_TRAP_READ(obj, "cc_cdr")) { return nil; }
-    return ((lisp_val_t *)(obj & ~TAG_MASK))[1];
+    lisp_val_t v = ((lisp_val_t *)(obj & ~TAG_MASK))[1];
+    GC_DEBUG_TRAP_RESULT(v, "cc_cdr");
+    return v;
 }
 
 /**

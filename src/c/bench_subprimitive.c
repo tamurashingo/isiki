@@ -304,6 +304,17 @@ static lisp_val_t cc_diag_stale_negative(lisp_val_t args, lisp_val_t env) {
     return got;
 }
 
+/* [GC監査] 本物のGP例外で従来どおり停止することの確認用(診断専用)。
+   塗り潰しのトラップパターンではないnon-canonicalアドレスをデリファレンスする。
+   上位16bitが0xBADCなのでcanonicalでなく、必ずGP例外(vector=13)になる。
+   例外ハンドラのダンプに「GC PAINT TRAP」が**出ない**ことまで見ること
+   — トラップ判定が本物の例外を握り潰していないことの確認である */
+static lisp_val_t cc_diag_force_gp(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    volatile UINT64 *bad = (volatile UINT64 *)(lisp_addr_t)0xBADC0FFEE0DDF00DULL;
+    return os_make_fixnum(*bad);
+}
+
 /* [性能測定] 診断専用: Immobilized Spaceを意図的に消費し、枯渇時にOSが永久停止
    せずos_panicへ到達することを確認するためのもの。専用カーソルから確保するため、
    os_imm_space_used_bytesはこのカーソルの現在ページの未使用末尾分だけ過大に
@@ -371,6 +382,8 @@ void os_register_bench_subprimitives(void) {
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_ct_check), global_environment);
     os_set_function(os_make_symbol("%%DIAG-CLOSURE-CALL"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_closure_call), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-FORCE-GP"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_diag_force_gp), global_environment);
     os_set_function(os_make_symbol("%%DIAG-IMM-BURN"),
                      os_make_native_function((lisp_addr_t)(void *)cc_diag_imm_burn), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-FUNCALL"),

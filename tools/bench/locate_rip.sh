@@ -13,7 +13,7 @@
 #
 # --trap は、ゲスト内の %%DIAG-GC-TRAP-SITE-ADDR が報告した検出箇所を引くための
 # 形。基準シンボルが例外ダンプ(c_cpu_exception_handler)ではなく
-# %%DIAG-IMAGE-ANCHOR(os_gc_debug_trap_read)になる
+# %%DIAG-IMAGE-ANCHOR(os_gc_debug_check_protect_slow)になる
 #
 # --serial を使うと、例外ダンプのrip・汎用レジスタ・stack(rsp..)の全語を読み、
 # イメージ範囲に入るものだけを関数名へ逆引きして並べる(= 簡易バックトレース)。
@@ -37,7 +37,7 @@ if [ "${1:-}" = "--serial" ]; then
 elif [ "${1:-}" = "--trap" ]; then
     shift
     anchor="$1"; shift
-    python3 tools/bench/locate_rip.py "$dis" --anchor-symbol os_gc_debug_trap_read \
+    python3 tools/bench/locate_rip.py "$dis" --anchor-symbol os_gc_debug_check_protect_slow \
         --handler "$anchor" "$@"
 else
     handler="$1"; shift

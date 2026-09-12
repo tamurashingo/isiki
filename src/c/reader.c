@@ -264,6 +264,11 @@ static lisp_val_t read_list_rest(reader_source_t *src) {
     if (elem == g_sym_read_error) {
         return g_sym_read_error;
     }
+    // elemはこの下のread_list_rest(残り全体を読んでconsで組み立てる)を跨いで
+    // 生存する。os_make_cons(elem, rest)の内部保護は「os_make_consを呼んだ時点の
+    // 値」しか守らないので、それより前の確保でstaleになったelemは救えない
+    // (documents/pitfalls.md 原則4)
+    GC_PROTECT(elem);
 
     if (elem == g_sym_dot) {
         skip_whitespace(src);
@@ -311,6 +316,10 @@ static lisp_val_t read_list(reader_source_t *src) {
     if (car == g_sym_dot) {
         return g_sym_read_error; // リスト先頭の単独'.'は構文エラー
     }
+    // carはread_list_rest(リストの残り全体を読む)を跨いで生存する。read_list_restは
+    // 要素ごとにconsを確保するためGCを誘発しうる。read_list_restのelemと同じ理由で、
+    // ここで自分で保護しなければos_make_consの内部保護では間に合わない
+    GC_PROTECT(car);
     lisp_val_t cdr = read_list_rest(src);
     if (cdr == g_sym_read_error) {
         return g_sym_read_error;
@@ -831,6 +840,12 @@ static int is_number_result(lisp_val_t val) {
 }
 
 lisp_val_t os_parse_number(lisp_val_t str, lisp_val_t env) {
+    // strとenvはこの下のread_expr(数値リテラルの確保を伴う)とos_resolve_class、
+    // さらにinitargsを組む4回のos_make_consを跨いで生存する。os_make_consの
+    // 内部保護は「呼んだ時点の値」しか守らないので、それより前の確保で古くなった
+    // strは救えない(documents/pitfalls.md 原則4)
+    GC_PROTECT(str);
+    GC_PROTECT(env);
     char buf[READER_TOKEN_MAX];
     os_string_to_cstr(str, buf, sizeof(buf));
     UINT64 len = 0;
