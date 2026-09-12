@@ -1634,6 +1634,22 @@ static void za_analyze_body_with_shadow(lisp_val_t lambda_vars, lisp_val_t lambd
     for (UINT64 i = 0; i < n; i++) {
         saved_syms[i] = usages[i].sym;
     }
+    /* [GC安全性] usages[].symもsaved_syms[]もC配列のlisp_val_tで、下の
+       za_analyze_var_usage再帰(za_macroexpandがos_make_consする)を跨いで生存する。
+       GC_PROTECTは変数しか守れないので、既存のバッチヘルパーで1要素ずつ繋ぐ
+       (documents/pitfalls.md 原則8)。
+
+       保護しないと、GCがシンボルを動かした時点で下の `usages[i].sym == vsym` が
+       **一致しなくなる**。エラーにはならず「この変数はシャドウされていない」という
+       もっともらしい結果になり、さらに最後の復元ループがstaleな値を書き戻すため、
+       以後のコンパイル全体が誤った使用状況で進む。 */
+    gc_rootnode shadow_nodes[ZA_MAX_LOCALS_PER_LET * 2];
+    za_gc_protect_batch_t shadow_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    shadow_batch.saved_head = get_current_process()->gc_roots;
+    for (UINT64 i = 0; i < n; i++) {
+        za_gc_protect_batch_push(&shadow_nodes[i * 2 + 0], &usages[i].sym);
+        za_gc_protect_batch_push(&shadow_nodes[i * 2 + 1], &saved_syms[i]);
+    }
     for (lisp_val_t v = lambda_vars; (v & TAG_MASK) == TAG_CONS && v != nil; v = cc_cdr(v)) {
         lisp_val_t vsym = cc_car(v);
         for (UINT64 i = 0; i < n; i++) {
@@ -2624,8 +2640,16 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     // lambdaに捕捉される変数だけをZA_VAR_BOXEDにする。bodyをコンパイルする前に
     // 静的解析しておく必要がある(box化するかどうかで初期値のstore方法自体が変わる)。
     za_var_usage_t usages[ZA_MAX_LOCALS_PER_LET];
+    /* [GC安全性] var_syms[]/usages[].symはC配列のlisp_val_tで、この先のinit式・body
+       のコンパイル(確保を伴う)を跨いで生存し、しかもポインタ等価で引かれる。
+       za_analyze_body_with_shadowと同じ理由で1要素ずつGCルートへ繋ぐ(原則8) */
+    gc_rootnode let_sym_nodes[ZA_MAX_LOCALS_PER_LET * 2];
+    za_gc_protect_batch_t let_sym_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    let_sym_batch.saved_head = get_current_process()->gc_roots;
     for (UINT64 i = 0; i < var_count; i++) {
         usages[i].sym = var_syms[i];
+        za_gc_protect_batch_push(&let_sym_nodes[i * 2 + 0], &var_syms[i]);
+        za_gc_protect_batch_push(&let_sym_nodes[i * 2 + 1], &usages[i].sym);
         usages[i].assigned = 0;
         usages[i].captured = 0;
     }
