@@ -330,22 +330,32 @@ void os_gc_register_root(lisp_val_t *root_ptr);
  */
 void os_gc_unregister_root(lisp_val_t *root_ptr);
 
-/** [GC監査] shadow stackのLIFO規律が破れた回数を数える */
-void os_gc_debug_note_lifo_violation(void);
+/** [GC監査] shadow stackのLIFO規律が破れた回数。
+    gc_unprotect_nodeは`cleanup`属性のハンドラで、GC_PROTECTを使うすべての関数の
+    スコープ脱出に現れる。ここに**関数呼び出しを置くと**インライン展開が効かなくなり、
+    za.cのJITコンパイルが数分かかるようになった(実測)。カウンタ変数を直接
+    インクリメントするだけにして、ハンドラを自明なままに保つこと */
+extern UINT64 g_gc_lifo_violations;
 
 /** [GC監査] GC_PROTECTしようとした値が**すでにstale**なら記録する。
     保護は「その変数」を追跡するだけで、入ってきた時点で古い値なら直せない。
     ここで捕まえた関数の**呼び出し元**が、確保を跨いで保護せずに持っていた張本人である。
+
+    発生箇所は`__builtin_return_address(0)`ではなく`__FILE__`/`__LINE__`で取る。
+    戻りアドレスを使うと、GC_PROTECTを含む**すべての関数**がフレームポインタを
+    保持させられて最適化が阻害され、za.cのJITコンパイルが桁違いに遅くなった
+    (実行時スイッチで無効にしても、builtin自体は展開されるので効かない)。
+    ソース位置のほうが逆引き不要で読みやすくもある。
 
     GC_PROTECTはインタプリタで最も多く通る場所なので、**既定では無効**にしてある
     (`%%DIAG-GC-PROTECT-CHECK`で有効化する)。常時有効にすると、za.cの
     labels+letのJITコンパイルが現実的な時間で終わらなくなる(実測で10分以上)。
     フラグの読み出し1回ぶんのコストだけは残るが、それは無視できる */
 extern int g_gc_protect_check_enabled;
-void os_gc_debug_check_protect_slow(lisp_val_t *var, void *site);
-static inline void os_gc_debug_check_protect(lisp_val_t *var, void *site) {
+void os_gc_debug_check_protect_slow(lisp_val_t *var, const char *file, int line);
+static inline void os_gc_debug_check_protect(lisp_val_t *var, const char *file, int line) {
     if (g_gc_protect_check_enabled) {
-        os_gc_debug_check_protect_slow(var, site);
+        os_gc_debug_check_protect_slow(var, file, line);
     }
 }
 
@@ -361,7 +371,7 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
     // プリエンプティブな切り替えでプロセスを跨いで同じリストを使っていると、
     // ここが必ず破れる(一方のスコープ脱出が他方のノードをリストから落とす)
     if (get_current_process()->gc_roots != node) {
-        os_gc_debug_note_lifo_violation();
+        g_gc_lifo_violations++;
     }
 #endif
     get_current_process()->gc_roots = node->next;
@@ -379,7 +389,7 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
     gc_rootnode _gcnode_##var __attribute__((cleanup(gc_unprotect_node))) = \
         { (lisp_val_t *)&(var), get_current_process()->gc_roots }; \
     get_current_process()->gc_roots = &_gcnode_##var; \
-    os_gc_debug_check_protect((lisp_val_t *)&(var), __builtin_return_address(0))
+    os_gc_debug_check_protect((lisp_val_t *)&(var), __FILE__, __LINE__)
 #else
 #define GC_PROTECT(var) \
     gc_rootnode _gcnode_##var __attribute__((cleanup(gc_unprotect_node))) = \

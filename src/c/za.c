@@ -4188,7 +4188,21 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
    実際に問題になった)。直近の断念箇所の行番号を記録し、%%DIAG-ZA-BAIL-LINEで読む */
 static int g_za_bail_line = 0;
 
-#define ZA_BAIL_LINE() do { if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } } while (0)
+/* [GC監査] 断念行を1つしか持たないと、記録されるのは**伝播点**であって起点ではない。
+   実測でza.c:4711(za_compile_body_formsが0を返したときの伝播)しか出なかった。
+   最初のN件を順に残せば、先頭が最も内側 = 起点に近いものになる。
+   なお、計器の追加先は慎重に選ぶこと。za_compile_fold/binary/unaryの`return 0;`は
+   「この特化経路は当てはまらない」という**正常な否定**であって断念ではない。
+   ここへ一括で計器を入れると正常経路を断念として拾う(documents/pitfalls.md 原則6の
+   実例そのもの)。現状の44箇所は失敗パスであることを確認済みのものだけである。 */
+#define ZA_BAIL_MAX 24
+static int g_za_bail_lines[ZA_BAIL_MAX];
+static int g_za_bail_count = 0;
+
+#define ZA_BAIL_LINE() do { \
+        if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } \
+        if (g_za_bail_count < ZA_BAIL_MAX) { g_za_bail_lines[g_za_bail_count++] = __LINE__; } \
+    } while (0)
 /* [性能測定] 計器を入れる対象は「失敗を表す返却」だけにすること。以前
    `return nil;`へ一括で入れたところ、za_rewrite_body_listのリスト終端(正常終了)
    まで拾って誤った箇所を指した。逆にreturn 0だけに絞ると、za_try_compile_defunが
@@ -4198,6 +4212,20 @@ static int g_za_bail_line = 0;
 lisp_val_t cc_diag_za_bail_line(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum((UINT64)g_za_bail_line);
+}
+
+/** 記録された断念行の件数(先頭ほど内側 = 起点に近い) */
+lisp_val_t cc_diag_za_bail_count(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum((UINT64)g_za_bail_count);
+}
+
+/** i番目の断念行 */
+lisp_val_t cc_diag_za_bail_at(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if ((int)i >= g_za_bail_count) { return os_make_fixnum(0); }
+    return os_make_fixnum((UINT64)g_za_bail_lines[i]);
 }
 
 /** za_rewrite_fn_refsの前方宣言(body-list版と相互再帰する)。 */
@@ -4907,6 +4935,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
     g_za_bail_line = 0; /* [性能測定] Phase5 2-3: このコンパイル試行の断念記録をリセット */
+    g_za_bail_count = 0;
 #ifdef ISIKIOS_UNIT_TEST
     // za.cが出力する機械語は実機ビルド(mingw-gcc, MS x64 ABI, 実行可能メモリ)を前提と
     // しており、ネイティブgccでビルドするユニットテストではABI/メモリ保護が異なるため
@@ -5186,6 +5215,8 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
 }
 
 #else /* !defined(__x86_64__) */
@@ -5204,6 +5235,8 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {

@@ -390,13 +390,9 @@ void os_gc_debug_note_painted_field(void) {
     g_current_process_index(=表示フォーカス)であって、スケジューラが実際に
     走らせているプロセスではない。プリエンプティブな切り替えが起きると、
     複数のプロセスのノードが1本のリストへ混ざる */
-static UINT64 g_gc_lifo_violations = 0;
+UINT64 g_gc_lifo_violations = 0;
 
 static int g_gc_debug_in_gc = 0;
-
-void os_gc_debug_note_lifo_violation(void) {
-    g_gc_lifo_violations++;
-}
 
 /* [GC監査] 保護しようとした時点で既にstaleだった回数と、その箇所。
    GC_PROTECTは「その変数」を追跡するだけなので、入ってきた値が既に古ければ
@@ -404,7 +400,8 @@ void os_gc_debug_note_lifo_violation(void) {
    確保を跨いで保護せずに値を持っていた張本人である */
 static UINT64 g_gc_protect_stale_hits = 0;
 #define GC_PROTECT_STALE_MAX_SITES 64
-static void *g_gc_protect_stale_sites[GC_PROTECT_STALE_MAX_SITES];
+static const char *g_gc_protect_stale_files[GC_PROTECT_STALE_MAX_SITES];
+static int g_gc_protect_stale_lines[GC_PROTECT_STALE_MAX_SITES];
 static UINT64 g_gc_protect_stale_site_hits[GC_PROTECT_STALE_MAX_SITES];
 static UINT32 g_gc_protect_stale_site_count = 0;
 
@@ -419,7 +416,7 @@ lisp_val_t cc_diag_gc_protect_check(lisp_val_t args, lisp_val_t env) {
     return nil;
 }
 
-void os_gc_debug_check_protect_slow(lisp_val_t *var, void *site) {
+void os_gc_debug_check_protect_slow(lisp_val_t *var, const char *file, int line) {
     if (g_gc_debug_in_gc) {
         return;
     }
@@ -444,13 +441,14 @@ void os_gc_debug_check_protect_slow(lisp_val_t *var, void *site) {
 #endif
     g_gc_protect_stale_hits++;
     for (UINT32 i = 0; i < g_gc_protect_stale_site_count; i++) {
-        if (g_gc_protect_stale_sites[i] == site) {
+        if (g_gc_protect_stale_files[i] == file && g_gc_protect_stale_lines[i] == line) {
             g_gc_protect_stale_site_hits[i]++;
             return;
         }
     }
     if (g_gc_protect_stale_site_count < GC_PROTECT_STALE_MAX_SITES) {
-        g_gc_protect_stale_sites[g_gc_protect_stale_site_count] = site;
+        g_gc_protect_stale_files[g_gc_protect_stale_site_count] = file;
+        g_gc_protect_stale_lines[g_gc_protect_stale_site_count] = line;
         g_gc_protect_stale_site_hits[g_gc_protect_stale_site_count] = 1;
         g_gc_protect_stale_site_count++;
     }
@@ -463,11 +461,22 @@ lisp_val_t cc_diag_gc_protect_stale(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(g_gc_protect_stale_site_count);
 }
 
+/* 発生箇所はソースの行番号で返す(戻りアドレスと違い逆引きが要らない)。
+   どのファイルかはcc_diag_gc_protect_stale_fileで別に取る */
 lisp_val_t cc_diag_gc_protect_stale_site(lisp_val_t args, lisp_val_t env) {
     (void)env;
     UINT64 i = os_fixnum_magnitude(cc_car(args));
     if (i >= g_gc_protect_stale_site_count) { return os_make_fixnum(0); }
-    return os_make_fixnum((UINT64)(lisp_addr_t)g_gc_protect_stale_sites[i]);
+    return os_make_fixnum((UINT64)g_gc_protect_stale_lines[i]);
+}
+
+lisp_val_t cc_diag_gc_protect_stale_file(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_protect_stale_site_count || g_gc_protect_stale_files[i] == 0) {
+        return os_make_string("");
+    }
+    return os_make_string(g_gc_protect_stale_files[i]);
 }
 
 lisp_val_t cc_diag_gc_lifo_violations(lisp_val_t args, lisp_val_t env) {
@@ -1825,6 +1834,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-RESULT-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_result_hits), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-CHECK"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_check), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE-FILE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale_file), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE-SITE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale_site), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-LIFO-VIOLATIONS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_lifo_violations), global_environment);
 
