@@ -94,6 +94,18 @@ gen_boot() {
     echo "$boot"
 }
 
+# [測定] **最初の1回はイメージ再生成などを踏んで所要時間が膨らむ。**
+# 実測で、監査ビルドのroom_test(最も軽い試験)が初回8秒・2回目以降4秒だった。
+# 捨てないと最初に流す試験だけ所要時間が系統的に長く出て、タイムアウト分類の
+# 基準が狂う。ベンチマークドライバと同じ理由(tools/bench/run_construct_bench.sh)。
+warmup_boot="tmp/audit_warmup.lisp"
+{ echo '(load "src/lisp/init.lisp")'
+  echo '(load "test/lisp/test_framework.lisp")'
+  echo '(isiki-test-report)'
+  echo '(close *isiki-test-stream*)'; } > "$warmup_boot"
+echo "--- ウォームアップ(捨てる) ---"
+make test-qemu-audit-run MILESTONE="$warmup_boot" AUDIT_TIMEOUT="$TIMEOUT_SEC"     GC_DEBUG="${GC_DEBUG:-}" GC_PAINT="${GC_PAINT:-}" >/dev/null 2>&1 || true
+
 echo "=== 塗り潰し監査: outdir=$OUTDIR timeout=${TIMEOUT_SEC}s control=$USE_CONTROL stress=$STRESS ==="
 echo "    ビルドフラグ: GC_DEBUG=${GC_DEBUG:-(なし)} GC_PAINT=${GC_PAINT:-(なし)}"
 if [ "$USE_CONTROL" = "1" ] && [ -z "${GC_DEBUG:-}" ]; then
