@@ -4189,6 +4189,11 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
 static int g_za_bail_line = 0;
 
 #define ZA_BAIL_LINE() do { if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } } while (0)
+/* [性能測定] 計器を入れる対象は「失敗を表す返却」だけにすること。以前
+   `return nil;`へ一括で入れたところ、za_rewrite_body_listのリスト終端(正常終了)
+   まで拾って誤った箇所を指した。逆にreturn 0だけに絞ると、za_try_compile_defunが
+   nilで失敗を返す経路(コンパイル断念の大半)を取りこぼす。そこで
+   za_try_compile_defun内のnil返却(全て失敗パス)だけを個別に計器化している。 */
 
 lisp_val_t cc_diag_za_bail_line(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
@@ -4907,16 +4912,16 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     // しており、ネイティブgccでビルドするユニットテストではABI/メモリ保護が異なるため
     // 常にインタプリタへフォールバックする。コンパイル結果の検証はtest/lisp/za_test.lisp
     // (make test-qemu)で実機上で行う。
-    return nil;
+    { ZA_BAIL_LINE(); return nil; }
 #endif
 
     UINT64 fixed_count;
     if (!za_validate_params(params, &fixed_count)) {
-        return nil;
+        { ZA_BAIL_LINE(); return nil; }
     }
 
     if (body == nil || (body & TAG_MASK) != TAG_CONS || cc_cdr(body) != nil) {
-        return nil;
+        { ZA_BAIL_LINE(); return nil; }
     }
     lisp_val_t form = cc_car(body);
     za_syms_t syms;
@@ -4970,7 +4975,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     UINT64 trampoline_offset = za_ensure_trampoline();
     if (g_jit_overflow) {
         za_release_literal_slot_allocs();
-        return nil;
+        { ZA_BAIL_LINE(); return nil; }
     }
 
     // ABI-M5: use_param_slotsの場合、entryはこのコンパイル試行が出力する全機械語
@@ -5048,7 +5053,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         g_za_use_param_slots = 0;
         za_release_literal_slot_allocs();
         g_jit_used = entry;
-        return nil;
+        { ZA_BAIL_LINE(); return nil; }
     }
     // body本体のコード生成(za_emit_operand)はここまでで完了しているため、以降は
     // このコンパイル試行専用のフラグをリセットしてよい。
@@ -5075,7 +5080,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     if (g_jit_overflow || g_za_saw_flet_labels_escape) {
         za_release_literal_slot_allocs();
         g_jit_used = entry;
-        return nil;
+        { ZA_BAIL_LINE(); return nil; }
     }
 
     // ここまでコンパイル成功。g_jit_code[entry..g_jit_used)をImmobilized Spaceの
@@ -5090,7 +5095,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     if (dest == 0) {
         za_release_literal_slot_allocs();
         g_jit_used = entry;
-        return nil;
+        { ZA_BAIL_LINE(); return nil; }
     }
 
     UINT8 *dest_bytes = (UINT8 *)dest;
