@@ -4,6 +4,17 @@
 #include "eval.h"
 #include "za.h"
 
+/* [GC安全性] 生成コードへ「GCで動く領域を指す即値」を焼き込んだ回数(累計)。
+   0以外なら原則8のバグクラスが再発している。test/lisp/za_code_imm_test.lispが
+   通常ビルドで0であることを常時確認する */
+UINT64 g_za_heap_imm_count = 0;
+UINT64 g_za_heap_imm_first_off = 0;
+
+lisp_val_t primitive_za_heap_imm_count(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_za_heap_imm_count);
+}
+
 #if defined(__x86_64__)
 
 /* let-IIFEインライン化(拡張B)およびprogn対応により、以前はインタプリタへfallback
@@ -5421,6 +5432,38 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     g_za_last_code = dest_bytes;
     g_za_last_code_len = code_len;
 
+    /* [GC安全性] 第2部 2-3: 生成コードに「GCで動く領域を指す即値」が焼き込まれて
+       いないことを、コンパイルのたびに確認する。このバグクラス(原則8)には守る
+       機構が無いため、**検出を常時回せる形にしておかないと omission list になる**。
+       za.cはリテラルを静的スロット経由で参照する設計なので、ここは常に0のはずである。
+
+       fixnum即値がたまたまヒープ範囲に落ちる誤検出を避けるため、タグが
+       ヒープオブジェクトを表すもの(CONS/SYMBOL/STRING/INSTANCE)に限って判定する。
+       FIXNUM(0)・CHAR(3)・RAW_POINTER(7)の即値は対象外。 */
+    for (UINT64 i = 0; i + 10 <= code_len; i++) {
+        UINT8 rex = dest_bytes[i];
+        UINT8 opc = dest_bytes[i + 1];
+        if ((rex != 0x48 && rex != 0x49) || (opc & 0xF8) != 0xB8) {
+            continue;
+        }
+        UINT64 imm = 0;
+        for (UINT64 b = 0; b < 8; b++) {
+            imm |= ((UINT64)dest_bytes[i + 2 + b]) << (b * 8);
+        }
+        i += 9;
+        UINT64 tag = imm & TAG_MASK;
+        if (tag != TAG_CONS && tag != TAG_SYMBOL && tag != TAG_STRING && tag != TAG_INSTANCE) {
+            continue;
+        }
+        int region = os_addr_region((lisp_addr_t)(imm & ~(UINT64)TAG_MASK));
+        if (region == 0 || region == 1) {
+            g_za_heap_imm_count++;
+            if (g_za_heap_imm_first_off == 0) {
+                g_za_heap_imm_first_off = i - 9;
+            }
+        }
+    }
+
     os_environment_register_pages(env, dest, page_count);
 
     // Phase3.6: このコンパイル試行で確保したリテラルスロットをenvの所有物として登録する
@@ -5470,6 +5513,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%ZA-HEAP-IMM-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_za_heap_imm_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-BYTE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_byte), global_environment);
@@ -5497,6 +5541,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%ZA-HEAP-IMM-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_za_heap_imm_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-BYTE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_byte), global_environment);

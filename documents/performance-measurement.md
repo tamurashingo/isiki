@@ -2632,3 +2632,27 @@ shadow stackへ繋ぐヘルパー)があり、`za_compile_flet_labels`の`name_s
 「計器がCコードにしか入っていない」ことのほうが効いていた。
 
 生成物を扱うコードを疑うときは、**生成物そのものを読む**必要がある。
+
+## 検出機構を常時回す形にした(指示書 第2部 2-3)
+
+原則8のバグクラス(生成コードに焼き込まれたアドレス)には守る機構が無い。
+**検出を常時回す形にしておかないと omission list になる。**
+
+`za_try_compile_defun` がコンパイルのたびに生成コードを走査し、
+「GCで動く領域(From/To空間)を指す即値」を数えるようにした
+(`%%ZA-HEAP-IMM-COUNT`、累計)。`test/lisp/za_code_imm_test.lisp` を
+`make test-qemu` の試験列へ加え、ブート後およびlabels+let・quote付き関数を
+新たにコンパイルした後も0であることを確認する(**1626件**に増えた)。
+
+誤検出を避けるため、タグがヒープオブジェクトを表すもの(CONS/SYMBOL/STRING/INSTANCE)
+に限って判定する。fixnum即値がたまたまヒープ範囲に落ちるのを拾わないためである。
+
+### インライン展開の発火確認も常時テストにした
+
+AOTの`let`インライナは`expand-let`の出力形にパターンマッチしている。マクロ側の
+出力が変わるとインライナが**黙って発火しなくなり**、`let`が355から2,945へ戻る。
+エラーにならずテストも通る(原則6の形)。
+
+`make test-inline-expansion`(`tools/bench/check_inline_expansion.sh`)を追加し、
+生成コードに`__inl_`が現れ、フォールバック経路の`os_make_lifted_closure`/
+`primitive_funcall`が現れないことを確認する。現状は`__inl_=34`・他0で発火している。

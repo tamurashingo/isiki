@@ -733,6 +733,12 @@ QEMU_EXTRA_FLAGS ?=
 # ハングしてもそこまでの逐次出力は残る
 AUDIT_TIMEOUT ?= 1800
 
+# [性能測定] AOTのletインライナが発火していることを生成コードで確認する。
+# 発火しなくなってもエラーにならずテストも通り、命令数だけが戻る(原則6の形)ため、
+# 生成コードを直接見るテストとして常時回す
+test-inline-expansion: $(LISP_COMPILED)
+	tools/bench/check_inline_expansion.sh
+
 test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
