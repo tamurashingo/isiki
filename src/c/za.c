@@ -3717,7 +3717,15 @@ static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fix
     // 戻る。要素数はZA_MAX_OPERANDSと同じ規模の上限で十分(既存の他構文と同じ考え方)。
     UINT64 end_patches[ZA_MAX_OPERANDS];
     UINT64 end_patch_count = 0;
-    for (lisp_val_t rest = forms; rest != nil; rest = cc_cdr(rest)) {
+    // rest/params/envはza_compile_expr(部分式のコンパイル本体。大量に確保する)を
+    // 跨いで生存する。for文の初期化子では保護できないのでwhileへ展開する。
+    // 保護しないと、コンパイル中にGCが1回走った時点でASTの走査位置が古いままになり、
+    // 次のcc_cdr(rest)が旧From空間を読む(実測でこの2箇所が検出された)
+    lisp_val_t rest = forms;
+    GC_PROTECT(rest);
+    GC_PROTECT(params);
+    GC_PROTECT(env);
+    while (rest != nil) {
         if ((rest & TAG_MASK) != TAG_CONS) {
             return 0;
         }
@@ -3733,6 +3741,7 @@ static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fix
             }
             end_patches[end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
         }
+        rest = cc_cdr(rest);
     }
     for (UINT64 i = 0; i < end_patch_count; i++) {
         jit_patch_rel32(end_patches[i]);
@@ -4944,6 +4953,16 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     { ZA_BAIL_LINE(); return nil; }
 #endif
 
+    // params/env/formはこの関数の最後まで生存し、その間にos_make_symbolを25回以上、
+    // さらにコード生成全体で大量の確保を行う。保護していないと、コンパイル中にGCが
+    // **1回でも**走った時点でstaleになり、以後のza_compile_exprが古いASTを読む。
+    // これが「GC圧力を上げるとJITコンパイルが失敗する」の実体である
+    // (documents/pitfalls.md 原則4。呼び出し元eval_defunの保護は向こうのローカルを
+    // 守るだけで、値渡しで入ってきたこちらのコピーには及ばない)。
+    // bodyはformを取り出すまでしか使わないので、ここでは保護しない
+    GC_PROTECT(params);
+    GC_PROTECT(env);
+
     UINT64 fixed_count;
     if (!za_validate_params(params, &fixed_count)) {
         { ZA_BAIL_LINE(); return nil; }
@@ -4953,6 +4972,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         { ZA_BAIL_LINE(); return nil; }
     }
     lisp_val_t form = cc_car(body);
+    GC_PROTECT(form);
     za_syms_t syms;
     syms.plus = os_make_symbol("+");
     syms.minus = os_make_symbol("-");

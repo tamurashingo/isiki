@@ -358,6 +358,13 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     lisp_val_t body = cc_cdr(cc_cdr(args));
     GC_PROTECT(name);
     GC_PROTECT(env);
+    // params/bodyはza_try_compile_defun(JITコンパイラ本体。大量に確保する)を跨いで
+    // 生存し、失敗時はその後のmake_interpreted_functionへ渡される。保護していないと、
+    // コンパイル中にGCが1回でも走った時点で両方staleになる。
+    // za_try_compile_defun側の保護は「向こうのコピー」を守るだけで、こちらの
+    // ローカルには及ばない(documents/pitfalls.md 原則4)
+    GC_PROTECT(params);
+    GC_PROTECT(body);
 
     lisp_val_t fn = za_try_compile_defun(params, body, env);
     if (fn == nil) {
