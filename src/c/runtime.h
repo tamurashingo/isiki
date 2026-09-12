@@ -800,6 +800,8 @@ void os_panic(const char *msg);
 #ifdef ISIKIOS_GC_DEBUG
 /** 旧From空間(stale領域)を指すアドレスかどうか */
 int os_gc_debug_is_stale(lisp_addr_t addr);
+/** 値が塗り潰しのトラップパターンそのものか(陽性対照が読んだ値の判定用) */
+int os_gc_debug_is_trap(lisp_val_t v);
 /** staleなオブジェクトのデリファレンスを検出したら診断付きで停止する */
 void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site);
 #define GC_DEBUG_ASSERT_LIVE(obj, where) \

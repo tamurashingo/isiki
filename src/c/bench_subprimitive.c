@@ -270,7 +270,14 @@ static lisp_val_t cc_diag_stale_positive(lisp_val_t args, lisp_val_t env) {
     UINT64 n = os_fixnum_magnitude(cc_car(args));
     lisp_val_t unprotected = os_make_cons(os_make_fixnum(11), os_make_fixnum(22));
     (void)bench_stale_churn(n);
-    return cc_car(unprotected);
+    lisp_val_t got = cc_car(unprotected);
+    // 塗り潰しが有効なら、staleを読んだ時点でトラップパターンが返る。そのまま
+    // Lisp値として返すとタグがTAG_FORWARDのため印字側で暴走するので、ここで
+    // 判定して固定値999(=検出)へ置き換える
+#ifdef ISIKIOS_GC_DEBUG
+    if (os_gc_debug_is_trap(got)) { return os_make_fixnum(999); }
+#endif
+    return got;
 }
 
 /** 陰性対照: 同じ構造だが正しく保護する */
@@ -280,7 +287,11 @@ static lisp_val_t cc_diag_stale_negative(lisp_val_t args, lisp_val_t env) {
     lisp_val_t protected_val = os_make_cons(os_make_fixnum(11), os_make_fixnum(22));
     GC_PROTECT(protected_val);
     (void)bench_stale_churn(n);
-    return cc_car(protected_val);
+    lisp_val_t got = cc_car(protected_val);
+#ifdef ISIKIOS_GC_DEBUG
+    if (os_gc_debug_is_trap(got)) { return os_make_fixnum(999); }
+#endif
+    return got;
 }
 
 /* [性能測定] 診断専用: Immobilized Spaceを意図的に消費し、枯渇時にOSが永久停止

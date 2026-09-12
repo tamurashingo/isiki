@@ -382,6 +382,10 @@ lisp_val_t cc_diag_gc_stale_hits(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(g_gc_debug_stale_hits);
 }
 
+int os_gc_debug_is_trap(lisp_val_t v) {
+    return v == (lisp_val_t)GC_DEBUG_TRAP_PATTERN;
+}
+
 int os_gc_debug_is_stale(lisp_addr_t addr) {
     return addr >= (lisp_addr_t)g_to_start && addr < (lisp_addr_t)g_to_end;
 }
