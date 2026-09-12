@@ -1294,7 +1294,9 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
 #endif
 
     UINT64 tag = obj & TAG_MASK;
-    if (tag == TAG_FIXNUM || tag == TAG_CHAR || tag == TAG_RAW_POINTER) {
+    /* [単一の真実源] 追いかけるかどうかの判断はos_tag_is_heap_refに集約している
+       (生成コードの焼き込み検出器と同じ集合を使うため。runtime.h参照) */
+    if (!os_tag_is_heap_ref(tag)) {
         return obj;
     }
 

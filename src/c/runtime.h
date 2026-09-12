@@ -23,6 +23,24 @@
 /** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等)。fixnum/charと同様の即値として扱い、GCは素通しする(111) */
 #define TAG_RAW_POINTER 0x7ULL
 
+/**
+ * [単一の真実源] このタグの値はヒープオブジェクトへの参照か(=GCが追いかけるか)。
+ *
+ * gc_copy_valueが「その場で返す」タグと、生成コードの焼き込み検出器
+ * (%%ZA-HEAP-IMM-COUNT)が「GCで動く値」とみなすタグは、**同じ集合でなければ
+ * ならない**。別々に列挙するとomission listになり、片方に足したタグが
+ * もう片方から黙って漏れる(実際にTAG_FORWARDが検出器から漏れていた)。
+ *
+ * ここを唯一の判断元にして、両者から参照する。新しいタグを足したときは
+ * この関数だけを直せばよい。
+ */
+static inline int os_tag_is_heap_ref(UINT64 tag) {
+    /* FIXNUM/CHARは即値、RAW_POINTERはGC管理外の生ポインタ。それ以外は
+       ヒープ上のオブジェクトを指す(FORWARDはGC内部の転送ポインタだが、
+       これが外に現れたらそれ自体がバグなので検出対象に含める) */
+    return tag != TAG_FIXNUM && tag != TAG_CHAR && tag != TAG_RAW_POINTER;
+}
+
 /** TAG_FIXNUMの値フィールド最上位bit(bit63)。1なら負数を表す(0は常に非負に正規化) */
 #define FIXNUM_SIGN_BIT       0x8000000000000000ULL
 /** TAG_FIXNUMの値フィールドのうちマグニチュードに使う60bit(bit3〜62)分のマスク */

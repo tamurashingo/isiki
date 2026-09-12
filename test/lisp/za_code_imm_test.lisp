@@ -29,3 +29,27 @@
 (defun zci-quoted (x) (progn x (quote (a b c))))
 (assert-equal '(a b c) (zci-quoted 1))
 (assert-equal 0 (%%za-heap-imm-count))
+
+;;; --- 陽性確認: 検出器が実際に発火すること ---
+;;
+;; 「0件だった」を根拠にする前に、発火することを確認する。
+;; %%ZA-SCAN-SYNTH は、指定タグを持つヒープ参照を焼き込んだ合成movabsを作り、
+;; za_try_compile_defunと同じ判定経路(os_tag_is_heap_ref + os_addr_region)へ通す。
+;;
+;; タグごとに確認する。1つ通ったから全部通るとは限らない
+;; (かつてCONS/SYMBOL/STRING/INSTANCEだけを列挙しており、TAG_FORWARDが漏れていた)。
+
+;; GCが追いかけるタグ = 検出されなければならない
+(assert-equal 1 (%%za-scan-synth 1))   ; TAG_CONS
+(assert-equal 1 (%%za-scan-synth 2))   ; TAG_SYMBOL
+(assert-equal 1 (%%za-scan-synth 4))   ; TAG_STRING
+(assert-equal 1 (%%za-scan-synth 5))   ; TAG_INSTANCE(VECTOR/BIGNUM/FLOATもこれ)
+(assert-equal 1 (%%za-scan-synth 6))   ; TAG_FORWARD(以前は漏れていた)
+
+;; GCが追いかけないタグ = 検出されてはならない(fixnum即値の誤検出を防ぐ性質)
+(assert-equal 0 (%%za-scan-synth 0))   ; TAG_FIXNUM
+(assert-equal 0 (%%za-scan-synth 3))   ; TAG_CHAR
+(assert-equal 0 (%%za-scan-synth 7))   ; TAG_RAW_POINTER
+
+;; 陽性対照を流した後も、本物の焼き込みは0のままであること
+(assert-equal 0 (%%za-heap-imm-count))

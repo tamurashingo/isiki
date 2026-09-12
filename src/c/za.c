@@ -10,6 +10,42 @@
 UINT64 g_za_heap_imm_count = 0;
 UINT64 g_za_heap_imm_first_off = 0;
 
+/* [陽性対照] 検出器が実際に発火することを、**同じ判定経路**で確かめる。
+   検出器が0を返すことを根拠にする前に、発火することを確認する
+   (envのrevertが陽性対照になっていなかった前例がある)。
+
+   引数のタグを持つ「ヒープを指す即値」を含む合成movabsを作り、
+   za_try_compile_defunと同じ判定(os_tag_is_heap_ref + os_addr_region)にかける。
+   ヒープ参照タグなら1、そうでなければ0を返さなければならない。 */
+lisp_val_t primitive_za_scan_synth(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 tag = os_fixnum_magnitude(cc_car(args)) & TAG_MASK;
+    /* 実際にヒープ上にあるアドレスを用意し、指定タグを付け直す */
+    lisp_val_t probe = os_make_cons(nil, nil);
+    UINT64 imm = ((UINT64)probe & ~(UINT64)TAG_MASK) | tag;
+
+    UINT8 code[10];
+    code[0] = 0x48;             /* REX.W */
+    code[1] = 0xB8;             /* movabs rax, imm64 */
+    for (UINT64 b = 0; b < 8; b++) {
+        code[2 + b] = (UINT8)(imm >> (b * 8));
+    }
+
+    UINT64 hits = 0;
+    for (UINT64 i = 0; i + 10 <= sizeof(code); i++) {
+        UINT8 rex = code[i];
+        UINT8 opc = code[i + 1];
+        if ((rex != 0x48 && rex != 0x49) || (opc & 0xF8) != 0xB8) { continue; }
+        UINT64 v = 0;
+        for (UINT64 b = 0; b < 8; b++) { v |= ((UINT64)code[i + 2 + b]) << (b * 8); }
+        i += 9;
+        if (!os_tag_is_heap_ref(v & TAG_MASK)) { continue; }
+        int region = os_addr_region((lisp_addr_t)(v & ~(UINT64)TAG_MASK));
+        if (region == 0 || region == 1) { hits++; }
+    }
+    return os_make_fixnum(hits);
+}
+
 lisp_val_t primitive_za_heap_imm_count(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum(g_za_heap_imm_count);
@@ -5515,8 +5551,12 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
             imm |= ((UINT64)dest_bytes[i + 2 + b]) << (b * 8);
         }
         i += 9;
-        UINT64 tag = imm & TAG_MASK;
-        if (tag != TAG_CONS && tag != TAG_SYMBOL && tag != TAG_STRING && tag != TAG_INSTANCE) {
+        /* [単一の真実源] 「GCで動く値か」はos_tag_is_heap_refに集約している。
+           かつてはCONS/SYMBOL/STRING/INSTANCEを直接列挙しており、
+           TAG_FORWARDが黙って漏れていた(runtime.h参照)。
+           fixnum即値がたまたまヒープ範囲に落ちるのを拾わない性質は保たれる
+           (FIXNUM/CHAR/RAW_POINTERはos_tag_is_heap_refが0を返す) */
+        if (!os_tag_is_heap_ref(imm & TAG_MASK)) {
             continue;
         }
         int region = os_addr_region((lisp_addr_t)(imm & ~(UINT64)TAG_MASK));
@@ -5577,6 +5617,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%ZA-SCAN-SYNTH"), os_make_native_function((lisp_addr_t)(void *)primitive_za_scan_synth), global_environment);
     os_set_function(os_make_symbol("%%ZA-HEAP-IMM-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_za_heap_imm_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
@@ -5605,6 +5646,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
+    os_set_function(os_make_symbol("%%ZA-SCAN-SYNTH"), os_make_native_function((lisp_addr_t)(void *)primitive_za_scan_synth), global_environment);
     os_set_function(os_make_symbol("%%ZA-HEAP-IMM-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_za_heap_imm_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
