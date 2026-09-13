@@ -948,6 +948,9 @@ lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env) {
 
 /** os_gc_collectが呼ばれた延べ回数。テストが「計算中に実際にGCが発火したか」を確認するために使う */
 static UINT64 g_gc_collect_count = 0;
+/** [GC監査] gc_copy_valueがコピー不能なタグ(TAG_FORWARD等)を渡された回数。
+    0でなければ、生きたフィールドが転送ポインタを保持している = どこかの保護漏れ */
+UINT64 g_gc_uncopyable_tag_hits = 0;
 
 UINT64 os_gc_collect_count(void) {
     return g_gc_collect_count;
@@ -1113,6 +1116,14 @@ int os_addr_region(lisp_addr_t addr) {
     0でなければ、タイマーハンドラが*current-process* / run-queue/PCBを
     GC途中の半端な状態で読む窓が実在する */
 #ifdef ISIKIOS_GC_DEBUG
+extern UINT64 g_tick_sample_interval;
+/** [GC監査] %%DIAG-TICK-SAMPLE。引数tick数ごとに割り込み時ripをシリアルへ出す(0で停止) */
+lisp_val_t cc_diag_tick_sample(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_tick_sample_interval = os_fixnum_magnitude(cc_car(args));
+    return cc_car(args);
+}
+
 lisp_val_t cc_diag_gc_tick_during_gc(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum(g_gc_tick_during_gc);
@@ -1280,10 +1291,40 @@ static UINT8 *gc_to_alloc(UINT64 size) {
     UINT64 aligned = (size + 7) & ~7ULL;
     UINT8 *dst = g_to_ptr;
     if (dst + aligned > g_to_end) {
+        /* [原則6] 以前はフレームバッファへ1行書いて for(;;) で止まっていた。
+           GCは割り込み禁止のまま走るので、外からは**完全な無音のハング**にしか
+           見えず、シリアルにも何も残らない。実測で、塗り潰し監査の
+           za_test_ext8 / ext12 / ext14 の「静かなハング」の正体がこれだった
+           (QEMUモニタでRIPを採って gc_to_alloc+0x43 の jmp 自己ループと判明)。
+           数字を添えてシリアルへ出し、os_panicで止める。 */
+#ifndef ISIKIOS_UNIT_TEST
+        os_diag_serial_write("\nPANIC: gc: to-space exhausted\n  要求=");
+        serial_write_uint(aligned);
+        os_diag_serial_write("\n  to  =");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_start);
+        os_diag_serial_write("..");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_end);
+        os_diag_serial_write(" ptr=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_ptr);
+        os_diag_serial_write("\n  from=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_from_start);
+        os_diag_serial_write("..");
+        serial_write_uint((UINT64)(lisp_addr_t)g_from_end);
+        os_diag_serial_write(" ptr=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_from_ptr);
+        os_diag_serial_write("\n  to容量=");
+        serial_write_uint((UINT64)(g_to_end - g_to_start));
+        os_diag_serial_write(" to使用=");
+        serial_write_uint((UINT64)(g_to_ptr - g_to_start));
+        os_diag_serial_write(" from使用=");
+        serial_write_uint((UINT64)(g_from_ptr - g_from_start));
+        os_diag_serial_write(" GC回数=");
+        serial_write_uint(os_gc_collect_count());
+        os_diag_serial_write("\n");
+#endif
         frame_buffer *fb = get_active_frame_buffer();
         fb->write_string(fb, "gc: to-space exhausted...");
-        for (;;) {
-        }
+        os_panic("gc: to-space exhausted (see serial)");
     }
     g_to_ptr = dst + aligned;
     return dst;
@@ -1352,9 +1393,67 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
         case TAG_SYMBOL:   size = 32; break;
         case TAG_STRING:   size = 8 + word0; break;
         case TAG_INSTANCE: size = 32; break;
-        default:           size = 0; break;
+        default:
+            /* [原則6] コピーできるのはこの4タグだけである。以前はここが size=0 で、
+               そのまま下へ落ちていた。gc_to_alloc(0) は g_to_ptr を返すが**進めない**ので、
+               直後の words[0] = dst|TAG_FORWARD が「まだ誰も使っていない到達先」を指す
+               転送ヘッダを、**objが指す無関係なオブジェクトのword0へ書き込む**。
+               これは静かなヒープ破壊で、症状は遠く離れた場所に出る。
+
+               実測(塗り潰し監査、za_test_ext8/ext12/ext14):
+                 obj=24676182 tag=6(TAG_FORWARD) 領域=To size=0
+               で壊されたTAG_STRINGを後から訪れたとき、転送済み判定
+               (fwd_addr < g_to_ptr)が fwd_addr == g_to_ptr で外れ、word0 を
+               生の長さとして誤読して size=110644414(約105MB)を要求し、
+               To空間枯渇 → 割り込み禁止のまま for(;;) という無音のハングになった。
+
+               ここへ来る値そのものが既におかしい(生きたフィールドが転送ポインタを
+               保持している = どこかの保護漏れ)。しかしGCが**追加で**壊してよい理由には
+               ならないので、objはそのまま返して伝播を止め、記録だけ残す。
+               返した値はフリップ後に塗り潰されるので、塗り潰し検出器が拾う。 */
+            g_gc_uncopyable_tag_hits++;
+#ifdef ISIKIOS_GC_DEBUG
+            if (g_gc_uncopyable_tag_hits == 1) {
+                os_diag_serial_write("\n[GC監査] gc_copy_value: コピー不能なタグ obj=");
+                serial_write_uint((UINT64)obj);
+                os_diag_serial_write(" tag=");
+                serial_write_uint(tag);
+                os_diag_serial_write(" 領域=");
+                serial_write_uint((UINT64)os_addr_region((lisp_addr_t)addr));
+                os_diag_serial_write("\n  (生きたフィールドが転送ポインタを保持している"
+                                     " = どこかのGC_PROTECT漏れ)\n");
+            }
+#endif
+            return obj;
     }
 
+#ifdef ISIKIOS_GC_DEBUG
+    /* [GC監査] sizeが半空間容量を超えるのは、word0を長さとして誤読したときだけ。
+       gc_to_allocのto-space枯渇として現れると発生源が分からないので、ここで出す。 */
+    if (size == 0 || size > (UINT64)(g_to_end - g_to_start)) {
+        os_diag_serial_write("\nPANIC: gc_copy_value: sizeが異常"
+                             "(size=0はコピー可能でないタグ、巨大はword0の誤読)\n  obj=");
+        serial_write_uint((UINT64)obj);
+        os_diag_serial_write(" tag=");
+        serial_write_uint(tag);
+        os_diag_serial_write(" addr領域=");
+        serial_write_uint((UINT64)os_addr_region((lisp_addr_t)addr));
+        os_diag_serial_write("\n  word0=");
+        serial_write_uint(word0);
+        os_diag_serial_write(" word1=");
+        serial_write_uint(words[1]);
+        os_diag_serial_write(" size=");
+        serial_write_uint(size);
+        os_diag_serial_write("\n  to=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_start);
+        os_diag_serial_write("..");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_end);
+        os_diag_serial_write(" ptr=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_ptr);
+        os_diag_serial_write("\n");
+        os_panic("gc_copy_value: bogus size (see serial)");
+    }
+#endif
     UINT8 *dst = gc_to_alloc(size);
     UINT8 *src = (UINT8 *)addr;
     for (UINT64 i = 0; i < size; i++) {
@@ -1963,6 +2062,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_sites), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_addr), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TICK-DURING-GC"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_tick_during_gc), global_environment);
         os_set_function(os_make_symbol("%%DIAG-ADDR-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_addr_region), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor), global_environment);

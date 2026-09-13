@@ -488,9 +488,27 @@ UINT64 get_tick_counter(void) {
     return g_tick_counter;
 }
 
+#ifdef ISIKIOS_GC_DEBUG
+/* [GC監査] 無音のハングを追うための簡易サンプラ。0でなければ、そのtick数ごとに
+   「割り込まれた命令のアドレス」をシリアルへ出す。例外もパニックも出ないまま
+   止まる場合、どこを回っているかはこれでしか分からない。
+   asm_timer_handlerは15レジスタをpushしてからcurrent_rspを渡すので、
+   IRETQフレーム(rip,cs,rflags,rsp,ss)はcurrent_rsp+15*8にある。 */
+UINT64 g_tick_sample_interval = 0;
+#endif
+
 UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     outb(0x20, 0x20); // EOI を先に返す
     g_tick_counter++;
+#ifdef ISIKIOS_GC_DEBUG
+    if (g_tick_sample_interval != 0 && (g_tick_counter % g_tick_sample_interval) == 0) {
+        os_diag_serial_write("[tick] rip=");
+        serial_write_hex64(((UINT64 *)current_rsp)[15]);
+        os_diag_serial_write(" gc=");
+        serial_write_hex64(os_gc_collect_count());
+        os_diag_serial_write("\n");
+    }
+#endif
 
     // [性能測定] Phase5 第0部: スタックガード。通常パスには乗らない位置で、
     // 割り込み時のrspとカナリアからスタック溢れを検出する(process.c参照)

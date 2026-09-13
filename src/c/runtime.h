@@ -360,6 +360,9 @@ int os_addr_region(lisp_addr_t addr);
 
 extern UINT64 g_gc_lifo_violations;
 
+/** [GC監査] gc_copy_valueがコピー不能なタグを渡された回数(0であるべき) */
+extern UINT64 g_gc_uncopyable_tag_hits;
+
 #ifdef ISIKIOS_GC_DEBUG
 /** [GC監査] os_gc_collectの実行中なら1。割り込みハンドラから見るために公開している */
 extern int g_gc_debug_in_gc;
