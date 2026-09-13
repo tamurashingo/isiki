@@ -4655,6 +4655,13 @@ lisp_val_t cc_diag_za_imm_region(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum((UINT64)os_addr_region((lisp_addr_t)(g_za_scan_val[i] & ~(UINT64)TAG_MASK)));
 }
 
+lisp_val_t cc_diag_za_mx_calls(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= 4) { return os_make_fixnum(0); }
+    return os_make_fixnum(g_za_mx_calls[i]);
+}
+
 lisp_val_t cc_diag_za_bail_count(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum((UINT64)g_za_bail_count);
@@ -5789,7 +5796,8 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DIAG-ZA-IMM-OFF"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_off), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-IMM-VAL"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_val), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-IMM-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_region), global_environment);
-    os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-MX-CALLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_mx_calls), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
 }
 

@@ -30,6 +30,11 @@ s=s.replace('#define ZA_MAX_BODY_FORMS_WALK 10000','#define ZA_MAX_BODY_FORMS_WA
 s=s.replace('#define ZA_MX(site, form, env) (g_za_mx_calls[site]++, za_macroexpand((form), (env)))',
             '#define ZA_MX(site, form, env) (za_macroexpand((form), (env)))')
 s=s.replace('if (g_za_analyze_steps++ >= ZA_MAX_ANALYZE_STEPS) {','if (0) {')
+# Floyd検出器も外す。**これを残すと再現しない**(検出器のコードが実行されるだけで
+# 症状が消える。摂動に敏感という性質そのもの)
+s=s.replace('if (body_walk > 0 && (body_walk & 1) == 0 && (tortoise & TAG_MASK) == TAG_CONS) {','if (0) {')
+s=s.replace('if (body_walk > 0 && rest == tortoise) {','if (0) {')
+s=s.replace('if (++body_walk > ZA_MAX_BODY_FORMS_WALK) {','if (0) {')
 open(p,'w').write(s)
 PY
 

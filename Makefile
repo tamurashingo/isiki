@@ -15,6 +15,13 @@ OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
 # os_heap_initのheap_base > MAGIC_MUST_BE_BELOW 検査も併せて効く。
 QEMU_MEM ?= 256M
 
+# [測定] カーネル本体へ渡す追加フラグ。未初期化スタック読み出しの追跡に使う:
+#   make build EXTRA_CFLAGS=-ftrivial-auto-var-init=pattern
+# スタックフレームをパターンで埋めるので、未初期化のまま読んだ値がそのパターンなら
+# その場で分かる。レイアウトが変わっても**ゴミはゴミのまま**読まれるので、
+# 「無関係な変更で症状が消える」形の問題が摂動で消えなくなる。
+EXTRA_CFLAGS ?=
+
 # 命令数ベースの性能計測(documents/performance-measurement.md参照)で使う
 # TCGプラグインのビルドに必要な、ホストにインストール済みのqemu-system-x86_64
 # バージョン(`qemu-system-x86_64 --version`で確認)。プラグインABI
@@ -177,7 +184,7 @@ $(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
-		$(GC_DEBUG_FLAGS) \
+		$(GC_DEBUG_FLAGS) $(EXTRA_CFLAGS) \
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
