@@ -5,7 +5,7 @@
 `cc_car`/`cc_cdr`(生成コード中2,784箇所)を `static inline` にすると、
 `init.lisp` の `(defun make-environment (name &rest parent-env) ...)` を
 JITコンパイルする途中で**無限ループに入る**。コードは1バイトも出ず、
-確保だけが続く。根本原因は2026-09-13時点で**未特定**。
+確保だけが続く。根本原因は**特定済み**(同日): JIT生成コードが callee-saved の r14 を復元していなかった。`documents/pitfalls.md` 原則11 参照。
 
 ## 再現手順
 
@@ -16,6 +16,9 @@ JITコンパイルする途中で**無限ループに入る**。コードは1バ
 1. `tools/repro/cc_car_inline.patch` を当てる(cc_car/cc_cdrをstatic inline化)
 2. **za.c の上限コード/カウンタ類を無効化する**(後述)
 3. `make test-qemu` を走らせる。ハングすれば再現
+
+**修正後(r14 の退避/復元を入れた HEAD)では「完走した(再現せず)」と出るのが正しい。**
+ハングしたら回帰である。
 
 ## 重要: 上限コードを外さないと再現しない
 

@@ -503,6 +503,15 @@ UINT64 g_tick_sample_interval = 0;
 UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     outb(0x20, 0x20); // EOI を先に返す
     g_tick_counter++;
+#ifdef ISIKIOS_TIMER_ONESHOT
+    /* [測定] 最初の1回(kernelのidleからプロセス0への切り替え)だけ通し、以後は
+       IRQ0をマスクして二度と入らないようにする。プロセス0の試験は同期的に走るので
+       完走できる(他プロセスはos_wait_for_more_inputでhltしたまま)。
+       これで完走すれば、症状はタイマー割り込みの経路に依存している */
+    if (g_tick_counter >= 2) {
+        outb(0x21, inb(0x21) | 0x01);
+    }
+#endif
     if (g_tick_sample_interval != 0 && (g_tick_counter % g_tick_sample_interval) == 0) {
         /* 逆引きの基準点。ロードアドレスは実行ごとに変わるので毎回添える */
         os_diag_serial_write("[tick] anchor=");
@@ -609,7 +618,14 @@ void enable_timer_irq(void) {
  */
 void init_pit(void) {
     outb(0x43, 0x36);
+    /* [測定] -DISIKIOS_PIT_DIVISOR=N で周期を振れる(既定11932≒100Hz、
+       65535≒18Hz、1000≒1193Hz)。割り込みの入口/出口がレジスタを壊している疑いを
+       「tickの頻度で症状が変わるか」で切り分けるため */
+#ifdef ISIKIOS_PIT_DIVISOR
+    uint16_t divisor = (uint16_t)(ISIKIOS_PIT_DIVISOR);
+#else
     uint16_t divisor = 11932;
+#endif
     outb(0x40, (uint8_t)(divisor & 0xFF));
     outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
 }

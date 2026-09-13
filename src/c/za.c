@@ -107,6 +107,10 @@ static void jit_push_rbx(void) { jit_emit8(0x53); }
 static void jit_pop_rbx(void) { jit_emit8(0x5B); }
 static void jit_push_r13(void) { jit_emit8(0x41); jit_emit8(0x55); }
 static void jit_pop_r13(void) { jit_emit8(0x41); jit_emit8(0x5D); }
+/* [ABI] r14はMS x64/SysVともcallee-savedである。生成コードが使うなら必ず退避・復元する
+   (退避先はフレーム内スロット ZA_OFF_SAVED_R14。経緯はその定義のコメント参照)。 */
+static void jit_push_r14(void) { jit_emit8(0x41); jit_emit8(0x56); }
+static void jit_pop_r14(void) { jit_emit8(0x41); jit_emit8(0x5E); }
 
 static void jit_sub_rsp_imm8(UINT8 imm8) { jit_emit8(0x48); jit_emit8(0x83); jit_emit8(0xEC); jit_emit8(imm8); }
 static void jit_add_rsp_imm8(UINT8 imm8) { jit_emit8(0x48); jit_emit8(0x83); jit_emit8(0xC4); jit_emit8(imm8); }
@@ -1259,8 +1263,17 @@ static void za_gc_unlink_node(gc_rootnode *node) {
 #define ZA_OFF_PARAM_BASE ZA_OFF_SETQ_TMP_END
 /* 3スロット*24byte(ZA_ARG_SLOT_SIZE)=72byteに8byte paddingを足し80byte(16の倍数)にする
  * ことで、ZA_FRAME_EXTRA全体の16バイト境界に対する既存の関係を変えない。 */
+/* [ABI] r14はMS x64/SysVともcallee-savedである。生成コード(za_emit_fn_resolve_cached)が
+ * r14を使うので、プロローグでここへ退避し、3つの出口(通常エピローグ・末尾呼び出し2箇所)
+ * すべてで復元する。以前は退避しておらず、呼び出し元(C)の r14 を壊していた。
+ * za_compile_exprのlet本体走査は &nil を r14 に保持しており、cc_car/cc_cdr を
+ * inline化するとその割り当てになって init.lisp の make-environment のコンパイル中に
+ * 無限ループした(gdb の watch $r14 で g_imm_space 内の movabs $slot,%r14 を捕捉、2026-09-13)。
+ * 生ポインタなのでGCルートには繋がない(スロットは明示的にlinkしない限り走査されない)。
+ * 8byteのスロットに8byteのpaddingを足して、ZA_FRAME_EXTRAの16byte境界の関係を保つ。 */
+#define ZA_OFF_SAVED_R14 (ZA_OFF_PARAM_BASE + 80)
 #define ZA_FRAME_EXTRA \
-    (ZA_OFF_PARAM_BASE + 80)
+    (ZA_OFF_PARAM_BASE + 96)
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
@@ -3764,7 +3777,8 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
                 za_load_slot(ZA_REG_R9, za_arg_val_off(call_depth, 2));
             }
             jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R13);
-            jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+            za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
+        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
             jit_pop_r13();
             jit_pop_rbx();
             jit_jmp_reg(ZA_REG_R11);
@@ -3787,6 +3801,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         za_load_slot(ZA_REG_RCX, ZA_OFF_ACC_VAL);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
         za_load_slot(ZA_REG_R8, ZA_OFF_FN_VAL);
+        za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
         jit_add_rsp_imm32(ZA_FRAME_TOTAL);
         jit_pop_r13();
         jit_pop_rbx();
@@ -5554,6 +5569,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         jit_push_rbx();
         jit_push_r13();
         jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+        za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
         za_store_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
         if (fixed_count >= 1) {
             za_store_slot(ZA_REG_RDX, za_param_val_off(0));
@@ -5581,6 +5597,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     jit_push_rbx();
     jit_push_r13();
     jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+        za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
     za_store_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
     za_store_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_current_head);
@@ -5625,7 +5642,8 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
     jit_call_r11();
     jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
-    jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+    za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
+        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
     jit_pop_r13();
     jit_pop_rbx();
     jit_ret();
