@@ -488,27 +488,35 @@ UINT64 get_tick_counter(void) {
     return g_tick_counter;
 }
 
-#ifdef ISIKIOS_GC_DEBUG
-/* [GC監査] 無音のハングを追うための簡易サンプラ。0でなければ、そのtick数ごとに
+/* [測定] 無音のハングを追うための簡易サンプラ。0でなければ、そのtick数ごとに
    「割り込まれた命令のアドレス」をシリアルへ出す。例外もパニックも出ないまま
    止まる場合、どこを回っているかはこれでしか分からない。
    asm_timer_handlerは15レジスタをpushしてからcurrent_rspを渡すので、
-   IRETQフレーム(rip,cs,rflags,rsp,ss)はcurrent_rsp+15*8にある。 */
+   IRETQフレーム(rip,cs,rflags,rsp,ss)はcurrent_rsp+15*8にある。
+
+   **GC_DEBUG限定にしない。** GC_DEBUGビルドはcc_car内に呼び出しを入れるため
+   インライン化の効果を打ち消してしまい、cc_car/cc_cdrのインライン化回帰は
+   検出器を有効にすると消える。通常ビルドで観測できる手段が要る。
+   コストはtickごとの剰余1回で、無効時(0)は比較1回だけである。 */
 UINT64 g_tick_sample_interval = 0;
-#endif
 
 UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     outb(0x20, 0x20); // EOI を先に返す
     g_tick_counter++;
-#ifdef ISIKIOS_GC_DEBUG
     if (g_tick_sample_interval != 0 && (g_tick_counter % g_tick_sample_interval) == 0) {
-        os_diag_serial_write("[tick] rip=");
+        /* 逆引きの基準点。ロードアドレスは実行ごとに変わるので毎回添える */
+        os_diag_serial_write("[tick] anchor=");
+        serial_write_hex64((UINT64)(lisp_addr_t)(void *)c_timer_switch);
+        os_diag_serial_write(" rip=");
         serial_write_hex64(((UINT64 *)current_rsp)[15]);
         os_diag_serial_write(" gc=");
         serial_write_hex64(os_gc_collect_count());
+        os_diag_serial_write(" zacalls=");
+        serial_write_hex64(g_za_compile_calls);
+        os_diag_serial_write(" jit=");
+        serial_write_hex64(g_jit_used_for_diag());
         os_diag_serial_write("\n");
     }
-#endif
 
     // [性能測定] Phase5 第0部: スタックガード。通常パスには乗らない位置で、
     // 割り込み時のrspとカナリアからスタック溢れを検出する(process.c参照)

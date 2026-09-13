@@ -334,6 +334,8 @@ void os_set_panic_hook(void (*hook)(void)) {
    テストが一度も走っていなかった)。呼び出し側を#ifdefで囲うと診断コードが
    読みにくくなるので、テスト時だけ何もしない実体を置く */
 void os_diag_serial_write(const char *s) { (void)s; }
+/* 同じ理由(実体はinterrupt.c)。タイマーサンプラの間隔もテストでは意味を持たない */
+UINT64 g_tick_sample_interval = 0;
 #endif
 
 static void panic_write_string(frame_buffer *fb, const char *s) {
@@ -1147,6 +1149,21 @@ int os_addr_region(lisp_addr_t addr) {
 /** [GC監査] GC実行中に入ったタイマー割り込みの回数を返す。
     0でなければ、タイマーハンドラが*current-process* / run-queue/PCBを
     GC途中の半端な状態で読む窓が実在する */
+extern UINT64 g_tick_sample_interval;
+/** [測定] %%DIAG-TICK-SAMPLE。引数tick数ごとに割り込み時ripをシリアルへ出す(0で停止)。
+    GC_DEBUG限定にしない理由はinterrupt.c側のコメント参照 */
+lisp_val_t cc_diag_tick_sample_pub(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_tick_sample_interval = os_fixnum_magnitude(cc_car(args));
+    return cc_car(args);
+}
+/** [測定] %%DIAG-IMAGE-ANCHOR。ripをファイル上のアドレスへ逆引きする基準点。
+    ロードアドレスは実行ごとに変わるので、既知シンボルの実行時アドレスが要る */
+lisp_val_t cc_diag_image_anchor_pub(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum((UINT64)(lisp_addr_t)(void *)os_heap_used_ratio);
+}
+
 #ifdef ISIKIOS_GC_DEBUG
 /** [GC監査] limb作業領域の最高水位(limb単位)を返す */
 lisp_val_t cc_diag_limb_peak(lisp_val_t args, lisp_val_t env) {
@@ -2209,6 +2226,8 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-LIFO-VIOLATIONS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_lifo_violations), global_environment);
 
         #endif
+        os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample_pub), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);

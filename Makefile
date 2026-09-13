@@ -172,6 +172,13 @@ $(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
 
+# [測定の落とし穴] `build`は以前 $(TARGET)(= esp_dir/.../BOOTX64.EFI)だけを作って
+# いた。QEMUが実際に起動するのは $(BOOT_FAT32_IMG) の中にコピーされたEFIなので、
+# `make build` の後に手でqemuを起動すると**古いカーネルを測ってしまう**。
+# しかもEFIとイメージのmtimeが同じ秒に収まると make は「最新」と判断して
+# 作り直さないため、`make images/boot_fat32.img` を明示しても取りこぼす。
+# 実測で、cc_carインライン化の可否を2回とも誤判定しかけた。
+# buildにイメージまで含めて、`make build`だけで起動可能な状態が揃うようにする。
 build: $(TARGET)
 
 # ファイル単体のコンパイルチェック用。リンクは行わず、生成した .o は tmp/ に捨てる
@@ -526,6 +533,19 @@ $(MBR_MULTI_DISK_IMG): | $(BUILD_TMPDIR)
 # 区別してimages/(IMAGES_DIR)に置く。loopマウント/losetupはCAP_SYS_ADMIN相当の
 # 権限を要するため、FAT16_DISK_IMG/FAT32_DISK_IMGと同様--privilegedでdocker runする。
 BOOT_FAT32_IMG = $(IMAGES_DIR)/boot_fat32.img
+
+# [測定の落とし穴] buildにブートイメージまで含める。
+# QEMUが実際に起動するのは $(BOOT_FAT32_IMG) の中にコピーされたEFIであって
+# $(TARGET) ではない。`make build` の後に手でqemuを起動すると**古いカーネルを
+# 測ってしまう**。しかもEFIとイメージのmtimeが同じ秒に収まるとmakeは「最新」と
+# 判断するので、`make images/boot_fat32.img` を明示しても取りこぼす。
+# 実測で、cc_carインライン化の可否を2回とも誤判定しかけた
+# (documents/performance-measurement.md「測定の落とし穴」参照)。
+#
+# この行は $(BOOT_FAT32_IMG) の定義より**後**に書く必要がある。
+# 前置き部の `build: $(TARGET)` に足すと、prerequisiteはルール読み込み時に
+# 展開されるため空になり、黙って効かない(実際に一度踏んだ)。
+build: $(BOOT_FAT32_IMG)
 BOOT_FAT32_IMG_SIZE_MB = 64
 BOOT_FAT32_PART_SIZE_MB = 60
 BOOT_FAT32_PART_START_BYTES = 1048576

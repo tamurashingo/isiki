@@ -400,6 +400,11 @@ extern UINT64 g_gc_fwd_beyond_ptr_hits;
     読むのが整合的だが、**これは推定であって実証ではない**。当時の発火回数を
     記録していない。再発したときに確定事実だと思って探すと遠回りになる。 */
 extern UINT64 g_gc_to_space_revisits;
+/** [測定] za_try_compile_defunの呼び出し回数(サンプラから読む) */
+extern UINT64 g_za_compile_calls;
+/** [測定] JITバッファの使用量(サンプラから読む) */
+UINT64 g_jit_used_for_diag(void);
+
 /** [GC監査] limb作業領域の最高水位(limb単位)。容量設計の妥当性を実測で言うため */
 extern UINT64 g_limb_arena_peak;
 

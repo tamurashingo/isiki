@@ -1555,10 +1555,41 @@ static UINT64 za_ensure_trampoline(void) {
  * @param env マクロ定義を解決する環境(defunの定義時環境)
  * @return マクロでなくなるまで展開した後のフォーム
  */
+/** マクロ展開の反復上限。実用上のマクロは数段で収束する。 */
+#define ZA_MAX_MACROEXPAND_ITER 1000
+/** [測定] 上限に達した回数(0であるべき) */
+UINT64 g_za_macroexpand_runaway = 0;
+
 static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
     GC_PROTECT(form);
     GC_PROTECT(env);
-    for (;;) {
+    /* [原則6] 展開の終了判定は expanded == form という**ポインタ等価**である。
+       収束しなければ確保しながら永久に回り、外からは完全な無音のハングになる。
+       実測(cc_car/cc_cdrのstatic inline化を入れたビルド):
+         init.lispの (defun make-environment (name &rest parent-env) ...) の
+         コンパイル中に停止し、タイマーサンプラのrip分布が
+           os_wait_for_more_input 50% / os_alloc_bytes 32% /
+           za_macroexpand・za_analyze_var_usage・os_make_cons が残り
+         で、GC回数が単調に増え続けていた(1 -> 43)。
+       上限を設けて、超えたら断念する(bail = 安全側。インタプリタへ落ちる)。 */
+    for (UINT64 iter = 0; ; iter++) {
+        if (iter >= ZA_MAX_MACROEXPAND_ITER) {
+#ifndef ISIKIOS_UNIT_TEST
+            os_diag_serial_write("\n[za] マクロ展開が収束しない: 回数=");
+            {
+                char buf[24]; int n = 0; UINT64 x = iter;
+                if (x == 0) { buf[n++] = '0'; }
+                while (x > 0) { buf[n++] = (char)('0' + x % 10); x /= 10; }
+                char rev[25]; int j = 0;
+                while (n > 0) { rev[j++] = buf[--n]; }
+                rev[j] = '\0';
+                os_diag_serial_write(rev);
+            }
+            os_diag_serial_write(" (コンパイルを断念してインタプリタへ落とす)\n");
+#endif
+            g_za_macroexpand_runaway++;
+            return form;
+        }
         lisp_val_t wrapped = os_make_cons(form, nil);
         lisp_val_t expanded = primitive_macroexpand_1(wrapped, env);
         if (expanded == form) {
@@ -5320,7 +5351,15 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
     return 1;
 }
 
+/** [測定] JITバッファの使用量を割り込みハンドラから読むための入口 */
+UINT64 g_jit_used_for_diag(void) { return g_jit_used; }
+
+/** [測定] za_try_compile_defunの呼び出し回数。ハングが「1回のコンパイルの中」か
+    「何度も呼ばれている」かを切り分けるため、タイマーサンプラから読む */
+UINT64 g_za_compile_calls = 0;
+
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+    g_za_compile_calls++;
     g_za_bail_line = 0; /* [性能測定] Phase5 2-3: このコンパイル試行の断念記録をリセット */
     g_za_bail_count = 0;
 #ifdef ISIKIOS_UNIT_TEST
