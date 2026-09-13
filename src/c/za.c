@@ -960,6 +960,18 @@ typedef struct {
     lisp_val_t setcdr;
 } za_syms_t;
 
+/* [原則8] za_syms_tは全フィールドがlisp_val_tの平坦な構造体である。
+   実体はza_try_compile_defunのCスタック上のローカルで、GC_PROTECTでは守れない。
+   コンパイル中のGCでシンボルが動くと `head == syms->plus` が静かに外れ、
+   算術の高速パスに入らなくなる(あるいはstale値が別のシンボルと一致すれば
+   誤ったパスに入る)。**塗り潰し監査では捕まらない**: 比較であってデリファレンス
+   ではないので、stale領域を読まないからである。
+   配列とみなして一括linkするため、平坦であることを機械的に保証しておく。 */
+#define ZA_SYMS_FIELD_COUNT (sizeof(za_syms_t) / sizeof(lisp_val_t))
+_Static_assert(sizeof(za_syms_t) == 25 * sizeof(lisp_val_t),
+               "za_syms_tはlisp_val_tだけの平坦な構造体でなければならない"
+               "(フィールドを増減したらこの数も更新すること)");
+
 /**
  * 拡張4(lambda): (lambda (params...) . body)のparams/bodyはコンパイル対象defunの
  * ソースAST(生conscell)の一部であり、コンパイル成功後のMAGIC_FUNCTION_NATIVEオブジェクト
@@ -5340,6 +5352,18 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     lisp_val_t form = cc_car(body);
     GC_PROTECT(form);
     za_syms_t syms;
+    /* [原則8] 埋める**前に**全フィールドをnilにしてshadow stackへ繋ぐ。
+       os_make_symbolは未internのシンボルに対しては確保するので、初期化の途中で
+       GCが走ると先に埋めた分がstaleになる。また、symsはこのあとコンパイル全体に
+       渡り歩き、約30箇所で `head == syms->xxx` と比較される。その間のGCでも
+       追随させる必要がある。 */
+    za_gc_protect_batch_t syms_gc_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    syms_gc_batch.saved_head = get_current_process()->gc_roots;
+    gc_rootnode syms_gc_nodes[ZA_SYMS_FIELD_COUNT];
+    for (UINT64 i = 0; i < ZA_SYMS_FIELD_COUNT; i++) {
+        ((lisp_val_t *)&syms)[i] = nil;
+        za_gc_protect_batch_push(&syms_gc_nodes[i], &((lisp_val_t *)&syms)[i]);
+    }
     syms.plus = os_make_symbol("+");
     syms.minus = os_make_symbol("-");
     syms.star = os_make_symbol("*");
