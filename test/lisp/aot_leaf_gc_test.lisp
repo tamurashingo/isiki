@@ -34,7 +34,13 @@
         (create-vector size 0)
         (setq i (+ i 1))))))
 
-(defglobal leaf-gc-stress-len 300000)
+;; 監査モード(*isiki-audit*)では規模を落とす。
+;; 通常の回帰では300000byteの往復でleaf判定のGC整合性を検証するが、塗り潰し監査は
+;; 「各アサーションがGCを1回以上跨いだか」を見る用途で、確保量そのものは目的ではない。
+;; AUDIT_STRESS=100 だとこの規模では約4万回のGCになり打ち切られてしまい、
+;; **かえって1件も監査できなくなる**。通す方が被覆は上がる。
+;; 経路(write-vector-to-file/read-file-into-vectorのAOTコード)は同じものを通る。
+(defglobal leaf-gc-stress-len (if *isiki-audit* 3000 300000))
 (defglobal leaf-gc-stress-path "/9p/tmp/aot-leaf-gc-stress.bin")
 (defglobal leaf-gc-stress-src (%%leaf-gc-stress-make-vector leaf-gc-stress-len))
 
@@ -46,7 +52,9 @@
 ;; 追加のゴミ確保でさらにGCを誘発してから読み戻す(書き込み直後のキャッシュ効果
 ;; だけに依存しないようにするため)。ヒープ総量(%%heap-total-bytes)の数倍に
 ;; 相当する量を確保し、ヒープサイズに関わらず確実に複数回のGCを誘発する
-(%%leaf-gc-stress-churn-garbage 4000 5000)
+(if *isiki-audit*
+    (%%leaf-gc-stress-churn-garbage 40 5000)
+    (%%leaf-gc-stress-churn-garbage 4000 5000))
 
 ;; read-file-into-vector(AOT、本改善のleaf判定の対象そのもの)で読み戻す
 (defglobal leaf-gc-stress-readback (read-file-into-vector leaf-gc-stress-path))

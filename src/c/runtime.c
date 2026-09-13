@@ -919,6 +919,19 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     for (int i = 0; i < SYMBOL_HASH_SIZE; i++) {
         g_symbol_hash[i] = -1;
     }
+
+    /* [転送済み判定の不変条件] gc_copy_valueは word0 の下位3bitが TAG_FORWARD かで
+       転送済みを疑い、指す先が半空間の範囲にあるかで確定させる。
+       MAGIC_STREAM(0x6)とMAGIC_BUILTIN_CLASS(0xE)は下位3bitが実際に衝突しているので、
+       これらを弾いているのは範囲検査の**下限**だけである。
+
+       runtime.hの_Static_assertが保証しているのは「MAGIC値がMAGIC_MUST_BE_BELOWより
+       小さい」というコンパイル時定数どうしの比較にすぎず、**ヒープがその定数より上に
+       置かれること**は保証していない。低位アドレスにヒープが置かれる構成に変われば、
+       静的アサートは通ったまま範囲検査だけが壊れる。実行時に1回だけ確かめる。 */
+    if (heap_base <= MAGIC_MUST_BE_BELOW) {
+        os_panic("heap base too low: MAGICが転送ポインタと誤認される");
+    }
 }
 
 double os_heap_used_ratio(void) {
@@ -1135,6 +1148,16 @@ int os_addr_region(lisp_addr_t addr) {
     0でなければ、タイマーハンドラが*current-process* / run-queue/PCBを
     GC途中の半端な状態で読む窓が実在する */
 #ifdef ISIKIOS_GC_DEBUG
+/** [GC監査] limb作業領域の最高水位(limb単位)を返す */
+lisp_val_t cc_diag_limb_peak(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_limb_arena_peak);
+}
+/** [GC監査] gc_copy_valueがTo空間の値で呼ばれた回数を返す(標準のCheneyなら0) */
+lisp_val_t cc_diag_gc_to_revisits(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_to_space_revisits);
+}
 extern UINT64 g_tick_sample_interval;
 /** [GC監査] %%DIAG-TICK-SAMPLE。引数tick数ごとに割り込み時ripをシリアルへ出す(0で停止) */
 lisp_val_t cc_diag_tick_sample(lisp_val_t args, lisp_val_t env) {
@@ -2170,6 +2193,8 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_sites), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_addr), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-LIMB-PEAK"), os_make_native_function((lisp_addr_t)(void *)cc_diag_limb_peak), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TO-REVISITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_to_revisits), global_environment);
         os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample), global_environment);
         os_set_function(os_make_symbol("%%DIAG-GC-TICK-DURING-GC"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_tick_during_gc), global_environment);
         os_set_function(os_make_symbol("%%DIAG-ADDR-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_addr_region), global_environment);
@@ -3548,12 +3573,33 @@ static void decompose(lisp_val_t v, signed_mag_t *out) {
 static UINT64 g_limb_arena[LIMB_ARENA_LIMBS];
 static UINT64 g_limb_arena_used = 0;
 
+/** [GC監査] limb作業領域の最高水位。容量設計が妥当かを実測で言えるようにする */
+UINT64 g_limb_arena_peak = 0;
+
 static UINT64 *limb_alloc(UINT64 count) {
     if (g_limb_arena_used + count > LIMB_ARENA_LIMBS) {
-        os_panic("limb scratch arena exhausted (bignumが大きすぎる)");
+        /* [原則6] 無言で溢れて隣を壊すと、これまで潰してきたのと同じ形が増える。
+           bignumの大きさは入力次第で上限が無いので「現実には起きない」では済まない。
+           数字を添えてシリアルへ出してから止める。 */
+#ifndef ISIKIOS_UNIT_TEST
+        os_diag_serial_write("\nPANIC: limb作業領域が枯渇\n  要求=");
+        serial_write_uint(count);
+        os_diag_serial_write(" limb 使用中=");
+        serial_write_uint(g_limb_arena_used);
+        os_diag_serial_write(" 容量=");
+        serial_write_uint((UINT64)LIMB_ARENA_LIMBS);
+        os_diag_serial_write(" 最高水位=");
+        serial_write_uint(g_limb_arena_peak);
+        os_diag_serial_write("\n  (bignumが大きすぎるか、LIMB_FRAME()の無い経路で"
+                             "確保が積み上がっている)\n");
+#endif
+        os_panic("limb scratch arena exhausted (see serial)");
     }
     UINT64 *p = g_limb_arena + g_limb_arena_used;
     g_limb_arena_used += count;
+    if (g_limb_arena_used > g_limb_arena_peak) {
+        g_limb_arena_peak = g_limb_arena_used;
+    }
     return p;
 }
 

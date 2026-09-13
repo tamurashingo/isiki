@@ -85,7 +85,10 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
    したがって「MAGIC値はヒープの先頭アドレスより遥かに小さい」ことが不変条件になる。
    これを破るMAGICを足すと、そのインスタンスが転送済みと誤認され、word0が
    転送ポインタとして解釈されてヒープが静かに壊れる。範囲検査を触った瞬間に効く罠でもある。
-   タグ側の衝突自体は防げないので、代わりに大きさの上限を機械的に保証する。 */
+   タグ側の衝突自体は防げないので、代わりに大きさの上限を機械的に保証する。
+
+   **これはコンパイル時定数どうしの比較にすぎない。** 「ヒープがこの定数より上に
+   置かれること」は保証できないので、そちらは os_heap_init で起動時に1回確認する。 */
 #define MAGIC_MUST_BE_BELOW 0x1000ULL
 _Static_assert(MAGIC_FUNCTION_NATIVE      < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
 _Static_assert(MAGIC_FUNCTION_INTERPRETED < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
@@ -392,6 +395,8 @@ extern UINT64 g_gc_uncopyable_tag_hits;
 extern UINT64 g_gc_fwd_beyond_ptr_hits;
 /** [GC監査] gc_copy_valueがTo空間を指す値で呼ばれた回数(標準のCheneyなら0) */
 extern UINT64 g_gc_to_space_revisits;
+/** [GC監査] limb作業領域の最高水位(limb単位)。容量設計の妥当性を実測で言うため */
+extern UINT64 g_limb_arena_peak;
 
 #ifdef ISIKIOS_GC_DEBUG
 /** [GC監査] os_gc_collectの実行中なら1。割り込みハンドラから見るために公開している */
