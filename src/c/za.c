@@ -1555,6 +1555,22 @@ static UINT64 za_ensure_trampoline(void) {
  * @param env マクロ定義を解決する環境(defunの定義時環境)
  * @return マクロでなくなるまで展開した後のフォーム
  */
+/** [検出] bodyの循環をFloyd法で検出した回数(0であるべき) */
+UINT64 g_za_body_cycle_hits = 0;
+/** letのbodyフォーム数の上限(走査が終わらない=循環リストの検出用)。 */
+#define ZA_MAX_BODY_FORMS_WALK 10000
+/** 1回のコンパイルで許す変数使用状況解析のステップ数。実用上のdefunは桁違いに小さい。 */
+#define ZA_MAX_ANALYZE_STEPS 200000
+/** [測定] 現在のコンパイルでの解析ステップ数(za_try_compile_defunでリセット) */
+static UINT64 g_za_analyze_steps = 0;
+/** 解析が予算を超えたか。超えたらそのコンパイルは断念する */
+static int g_za_analyze_over = 0;
+
+/** [測定] za_macroexpandの呼び出し回数を呼び出し元ごとに数える。
+    どの経路が回り続けているかを、サンプラのripだけに頼らず特定するため */
+UINT64 g_za_mx_calls[4] = {0, 0, 0, 0};
+#define ZA_MX(site, form, env) (g_za_mx_calls[site]++, za_macroexpand((form), (env)))
+
 /** マクロ展開の反復上限。実用上のマクロは数段で収束する。 */
 #define ZA_MAX_MACROEXPAND_ITER 1000
 /** [測定] 上限に達した回数(0であるべき) */
@@ -1771,9 +1787,31 @@ static void za_analyze_body_with_shadow(lisp_val_t lambda_vars, lisp_val_t lambd
  */
 static void za_analyze_var_usage(lisp_val_t form, lisp_val_t env, za_var_usage_t *usages, UINT64 n,
                                   int in_escaping_lambda) {
+    /* [原則6] この解析は各ノードでマクロ展開してからcar/cdrへ再帰する。展開が木を
+       増やし続けると走査が終わらず、**コードを1バイトも出さないまま確保だけを
+       続ける無音のハング**になる。上限のないループはここでも同じ結末を招く。
+
+       実測(cc_car/cc_cdrのstatic inline化を入れたビルド、init.lispの
+       (defun make-environment (name &rest parent-env) ...) のコンパイル中):
+         za_try_compile_defunの呼び出し回数 55のまま、JITバッファ使用量 233のまま、
+         GC回数は単調増加、za_macroexpandの呼び出しがこの一箇所だけで
+         132,028 -> 191,571,768 に膨張。
+       1回のコンパイル分の解析ステップに予算を設け、超えたら解析を打ち切って
+       コンパイル自体を断念する(bail = 安全側。インタプリタへ落ちる)。
+       途中で打ち切った使用状況は信用できないので、**解析結果を使わせない**ことが要る。 */
+    if (g_za_analyze_steps++ >= ZA_MAX_ANALYZE_STEPS) {
+        if (!g_za_analyze_over) {
+            g_za_analyze_over = 1;
+#ifndef ISIKIOS_UNIT_TEST
+            os_diag_serial_write("\n[za] 変数使用状況の解析が発散: コンパイルを断念する"
+                                 "(マクロ展開が木を増やし続けている可能性)\n");
+#endif
+        }
+        return;
+    }
     GC_PROTECT(form);
     GC_PROTECT(env);
-    form = za_macroexpand(form, env);
+    form = ZA_MX(0, form, env);
 
     if ((form & TAG_MASK) == TAG_SYMBOL) {
         if (in_escaping_lambda) {
@@ -2752,12 +2790,45 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         usages[i].assigned = 0;
         usages[i].captured = 0;
     }
+    UINT64 body_walk = 0;
+    lisp_val_t tortoise = lambda_body;
+    GC_PROTECT(tortoise);
     for (lisp_val_t rest = lambda_body; (rest & TAG_MASK) == TAG_CONS && rest != nil; rest = cc_cdr(rest)) {
         /* [GC安全性] restは本体内の確保を跨いで生存する。for文の初期化子は
            保護できないので本体先頭で保護する。stepのcc_cdr(rest)は確保を
            伴わないため、cleanupで外れてから次のpushまでの間は安全 */
         GC_PROTECT(rest);
+        /* [原則6] bodyが**循環リスト**だとこの走査は終わらない。確保も伴わないので
+           GC回数すら増えず、外からは完全な無音のスピンになる。実測(cc_car/cc_cdrの
+           static inline化を入れたビルド)で、ここが終わらないことを突き止めた。
+           上限を超えたらコンパイルを断念する(bail = 安全側)。 */
+        /* [検出] Floydの循環検出。上限は「長すぎる」としか言えないが、こちらは
+           **循環していると断定できる**。症状が出ていなくても仕込んでおけば、
+           再発時に即座に判別できる。2歩ごとに1歩進める亀を持つだけで済む。 */
+        if (body_walk > 0 && (body_walk & 1) == 0 && (tortoise & TAG_MASK) == TAG_CONS) {
+            tortoise = cc_cdr(tortoise);
+        }
+        if (body_walk > 0 && rest == tortoise) {
+#ifndef ISIKIOS_UNIT_TEST
+            os_diag_serial_write("\n[za] bodyが循環している(Floyd検出): "
+                                 "コンパイルを断念してインタプリタへ落とす\n");
+#endif
+            g_za_body_cycle_hits++;
+            return 0;
+        }
+        if (++body_walk > ZA_MAX_BODY_FORMS_WALK) {
+#ifndef ISIKIOS_UNIT_TEST
+            os_diag_serial_write("\n[za] bodyの走査が終わらない: 循環リストの疑い"
+                                 "(コンパイルを断念してインタプリタへ落とす)\n");
+#endif
+            return 0;
+        }
         za_analyze_var_usage(cc_car(rest), env, usages, var_count, 0);
+    }
+    if (g_za_analyze_over) {
+        /* 打ち切った解析結果はbox化の判断に使えない(box化漏れは誤った実行結果になる)。
+           ZA_BAIL_LINE()はこの位置より後で定義されるため使えない。診断はシリアルに出る */
+        return 0;
     }
     za_var_kind_t var_kind[ZA_MAX_LOCALS_PER_LET];
     for (UINT64 i = 0; i < var_count; i++) {
@@ -2994,7 +3065,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     GC_PROTECT(form);
     GC_PROTECT(params);
     GC_PROTECT(env);
-    form = za_macroexpand(form, env);
+    form = ZA_MX(1, form, env);
 
     za_operand_t leaf;
     if (za_classify_operand(form, params, fixed_count, locals, &leaf)) {
@@ -4718,7 +4789,7 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
        (documents/pitfalls.md 原則4)。保護は最初の確保点より前に置くこと */
     GC_PROTECT(form);
     GC_PROTECT(env);
-    form = za_macroexpand(form, env);
+    form = ZA_MX(2, form, env);
     // nilはTAG_CONS(g_nil_cellへの自己参照)なので次のTAG_CONSチェックだけでは
     // 素通りしてしまい、cc_car(nil)=nilをheadとして扱った結果、一般呼び出し分岐
     // (headがシンボルでない場合の再帰)がza_rewrite_fn_refs(nil)を無限に再帰呼び出し
@@ -5360,6 +5431,8 @@ UINT64 g_za_compile_calls = 0;
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
     g_za_compile_calls++;
+    g_za_analyze_steps = 0;
+    g_za_analyze_over = 0;
     g_za_bail_line = 0; /* [性能測定] Phase5 2-3: このコンパイル試行の断念記録をリセット */
     g_za_bail_count = 0;
 #ifdef ISIKIOS_UNIT_TEST

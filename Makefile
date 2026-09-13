@@ -5,6 +5,16 @@ PWD = $(shell pwd)
 # `make test-qemu OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd` のように上書きする
 OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
 
+# [測定] ゲストに与えるメモリ量。Lispヒープは起動時にUEFIの最大
+# EfiConventionalMemory領域から取るので、これを下げるとGC頻度が上がる。
+# **生成コードを一切変えずにGC圧を上げられる**のが要点で、
+# 「GC_DEBUGを有効にするとcc_carのインライン化が消えて観測できない」という
+# 壁を迂回できる(%%DIAG-GC-STRESSはGC_DEBUG専用)。
+#   make test-qemu QEMU_MEM=96M
+# 下げすぎるとinit.lispのload前に落ちる。ヒープ先頭アドレスも動くので、
+# os_heap_initのheap_base > MAGIC_MUST_BE_BELOW 検査も併せて効く。
+QEMU_MEM ?= 256M
+
 # 命令数ベースの性能計測(documents/performance-measurement.md参照)で使う
 # TCGプラグインのビルドに必要な、ホストにインストール済みのqemu-system-x86_64
 # バージョン(`qemu-system-x86_64 --version`で確認)。プラグインABI
@@ -585,7 +595,7 @@ RUN_DISK_IMG ?= $(FAT16_DISK_IMG)
 
 run: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 	qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
@@ -594,7 +604,7 @@ run: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 
 debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 	qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
@@ -611,7 +621,7 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	rm -f .qemu-test-trigger test-results.txt
 	touch .qemu-test-trigger
 	qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
@@ -765,7 +775,7 @@ test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	rm -f .qemu-test-trigger test-results.txt $(BUILD_TMPDIR)/qemu-exit.txt
 	echo "$(MILESTONE)" > .qemu-test-trigger
 	ec=0; timeout -k 10 $(AUDIT_TIMEOUT) qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
@@ -783,7 +793,7 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	rm -f .qemu-test-trigger test-results.txt
 	echo "$(MILESTONE)" > .qemu-test-trigger
 	qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \

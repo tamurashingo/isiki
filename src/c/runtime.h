@@ -404,6 +404,8 @@ extern UINT64 g_gc_to_space_revisits;
 extern UINT64 g_za_compile_calls;
 /** [測定] JITバッファの使用量(サンプラから読む) */
 UINT64 g_jit_used_for_diag(void);
+/** [測定] za_macroexpandの呼び出し回数(呼び出し元ごと。サンプラから読む) */
+extern UINT64 g_za_mx_calls[4];
 
 /** [GC監査] limb作業領域の最高水位(limb単位)。容量設計の妥当性を実測で言うため */
 extern UINT64 g_limb_arena_peak;

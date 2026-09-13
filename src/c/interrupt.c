@@ -515,6 +515,9 @@ UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
         serial_write_hex64(g_za_compile_calls);
         os_diag_serial_write(" jit=");
         serial_write_hex64(g_jit_used_for_diag());
+        os_diag_serial_write(" mx=");
+        for (int mi = 0; mi < 3; mi++) { serial_write_hex64(g_za_mx_calls[mi]); os_diag_serial_write("/"); }
+
         os_diag_serial_write("\n");
     }
 
