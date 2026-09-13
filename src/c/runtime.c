@@ -962,6 +962,9 @@ static UINT64 g_gc_collect_count = 0;
 UINT64 g_gc_uncopyable_tag_hits = 0;
 /** [GC監査] 転送先が未割り当て区間(>= g_to_ptr)を指していた回数。0であるべき */
 UINT64 g_gc_fwd_beyond_ptr_hits = 0;
+/** [GC監査] gc_copy_valueがTo空間を指す値で呼ばれた回数(=二度目の走査)。
+    標準のCheneyなら0。0でなければ走査が重複している */
+UINT64 g_gc_to_space_revisits = 0;
 /** [GC監査] gc_scan_queueが今走査しているオブジェクトと、そのフィールド番号。
     コピー不能なタグを見つけたときに「誰が持っていたか」を言うために使う。
     ルート走査中(shadow stack等)は0で、その場合は保持元不明として出す */
@@ -1408,6 +1411,9 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
        STRINGでこれが起きると word0(生の長さ)が壊れ、印字が
        ヒープのバイト列になる。 */
     if ((UINT8 *)addr >= g_to_start && (UINT8 *)addr < g_to_end) {
+        /* 標準のCheneyならここは0回のはずである。0でないなら同じ場所を二度
+           走査していて、正しさは保たれても走査コストが無駄になっている */
+        g_gc_to_space_revisits++;
         return obj;
     }
 
@@ -1564,6 +1570,11 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
 /** MAGIC_BIGNUM(word3=limb配列への生ポインタ、中身はLisp値を含まない生の32bit値の配列)を再配置する */
 static void gc_relocate_bignum(UINT64 *words) {
     UINT64 count = words[2];
+    /* count==0 は os_make_integer が limb配列を確保する前の構築中の状態
+       (MAGIC_VECTOR の word1==0 と同じ扱い)。再配置対象が無いので素通しする */
+    if (count == 0) {
+        return;
+    }
     UINT8 *dst = gc_to_alloc(8 * count);
     UINT8 *src = (UINT8 *)words[3];
     for (UINT64 i = 0; i < 8 * count; i++) {
@@ -3518,6 +3529,41 @@ static void decompose(lisp_val_t v, signed_mag_t *out) {
  * 正規化後マグニチュードが60bit以内に収まる場合はFIXNUM(即値)に降格し、
  * それ以外はlimb配列をコピーしてヒープに確保しMAGIC_BIGNUMのINSTANCEを返す。
  */
+/* [原則7] limb作業バッファはGCヒープに置かない。
+ *
+ * bignum演算はmag_add/mag_divmod等の作業領域を必要とする。これを
+ * os_alloc_bytesでGCヒープから取ると、GCが知らない生データをGCヒープに置くことに
+ * なり、確保を1回跨いだだけで(塗り潰しビルドでは即座に)読めなくなる。
+ *
+ * 実際に23箇所を洗った結果、最終段のos_make_integerだけを跨ぐものは
+ * ステージングで救えていたが、**別のバッファの確保を跨ぐもの**が6箇所残っていた。
+ * 例(mag_isqrt): quot_bufにmag_divmodで書いた後、sum_bufの確保を跨いでから読む。
+ * これが (ISQRT 1000000000000002000000000000000) が誤った値を返す原因だった。
+ *
+ * 個々の箇所を並べ替えて回避してもまた漏れるので、作業領域そのものを
+ * GCヒープの外へ出す。LIMB_FRAME()を置いたスコープを抜けると自動で巻き戻る
+ * (ループ本体に置けばイテレーションごとに解放される)。
+ */
+#define LIMB_ARENA_LIMBS 32768
+static UINT64 g_limb_arena[LIMB_ARENA_LIMBS];
+static UINT64 g_limb_arena_used = 0;
+
+static UINT64 *limb_alloc(UINT64 count) {
+    if (g_limb_arena_used + count > LIMB_ARENA_LIMBS) {
+        os_panic("limb scratch arena exhausted (bignumが大きすぎる)");
+    }
+    UINT64 *p = g_limb_arena + g_limb_arena_used;
+    g_limb_arena_used += count;
+    return p;
+}
+
+static void limb_frame_release(UINT64 *mark) { g_limb_arena_used = *mark; }
+
+/** limb作業領域のスコープ。抜けると確保分が巻き戻る */
+#define LIMB_FRAME() \
+    UINT64 __limb_mark __attribute__((cleanup(limb_frame_release))) = g_limb_arena_used; \
+    (void)__limb_mark
+
 /* [原則7] os_make_integerがlimbsを確保より前に写し取るための、GC非管理の作業領域。
    32bit limbで16384個 = 524288bit(約157800桁)まで賄える。これを超える場合だけは
    従来どおり確保後に読むが、その大きさの整数は現実には現れない。
@@ -3562,17 +3608,31 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
         }
         src = g_limb_stage;
     }
+    /* [原則7] 確保の順序を「入れ物が先、limb配列が後」にする。
+       以前は limb配列 -> os_make_instance の順で、**limb_addrという生ポインタが
+       os_make_instanceの確保を跨いでいた**。そこでGCが走ると limb_addr は旧From空間を
+       指したままになり、words[3] に死んだアドレスが入る。塗り潰しビルドでは
+       その先が 0xDEADDEADDEADDEA7 になる。
+       実測(mag_isqrtの反復トレース): GC直後の y の limb配列先頭がトラップパターン
+       そのものだった。これが (ISQRT ...) が誤った値を返す原因である。
+
+       入れ物を先に作ってGC_PROTECTしておけば、limb配列の確保でGCが走っても
+       bignum は追随する。srcはg_limb_stageかlimb arenaかCスタックで、
+       いずれもGC非管理なので確保を跨いでも動かない。
+       wordsは**確保のあとに**取り直すこと(bignum自身が動いているため)。
+
+       word3(limb配列アドセス) -> word2(count) の順に書くのは以前どおり。
+       「countだけ確定してaddrが未確定」という中間状態をGCに見せないため。
+       count=0 のプレースホルダ状態は gc_relocate_bignum が素通しする。 */
+    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
+    GC_PROTECT(bignum);
+
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
         dst[i] = src[i];
     }
 
-    // ここから先はlimbsを二度と読まないため、以降で何回アロケーションが発生しても安全。
-    // 書き込みはword3(limb配列アドレス)→word2(count)の順に行うことで、
-    // 「countだけ確定してaddrが未確定」という危険な中間状態を作らない
-    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
-    GC_PROTECT(bignum);
     UINT64 *words = (UINT64 *)(bignum & ~TAG_MASK);
     words[3] = (UINT64)limb_addr;
     words[2] = count;
@@ -3704,6 +3764,7 @@ static int number_compare(lisp_val_t a, lisp_val_t b) {
  * @param div_by_zero z2が0の場合に1を設定する(このときdiv_out/mod_outは未定義)
  */
 static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp_val_t *mod_out, int *div_by_zero) {
+    LIMB_FRAME();
     GC_PROTECT(z1);
     GC_PROTECT(z2);
     signed_mag_t m1, m2;
@@ -3716,8 +3777,8 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
     }
     *div_by_zero = 0;
 
-    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
-    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
+    UINT64 *quot_buf = limb_alloc(m1.count);
+    UINT64 *rem_buf = limb_alloc(m1.count);
     // os_alloc_bytesを2回挟んだのでm1/m2のlimbsを再取得してから使う
     decompose(z1, &m1);
     decompose(z2, &m2);
@@ -3755,14 +3816,14 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
     UINT64 one[1] = {1};
     signed_mag_t mq;
     decompose(quot_wrapped, &mq);
-    UINT64 *div_mag_buf = (UINT64 *)os_alloc_bytes(8 * (mq.count + 1));
+    UINT64 *div_mag_buf = limb_alloc(mq.count + 1);
     decompose(quot_wrapped, &mq);
     UINT64 div_mag_len = mag_add(mq.limbs, mq.count, one, 1, div_mag_buf);
     lisp_val_t div_result = os_make_integer(1, div_mag_buf, div_mag_len);
     GC_PROTECT(div_result);
 
     decompose(z2, &m2);
-    UINT64 *mod_mag_buf = (UINT64 *)os_alloc_bytes(8 * m2.count);
+    UINT64 *mod_mag_buf = limb_alloc(m2.count);
     decompose(z2, &m2);
     signed_mag_t mr;
     decompose(rem_wrapped, &mr);
@@ -3778,6 +3839,7 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
  * @param out_len 結果の実効長の格納先
  */
 static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
+    LIMB_FRAME();
     // cur_a/cur_bはイテレーションを跨いで生き続ける必要があるため、生バッファのまま
     // 保持せず、確保直後にMAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
     GC_PROTECT(a_val);
@@ -3786,7 +3848,7 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
     decompose(a_val, &ma);
     decompose(b_val, &mb);
 
-    UINT64 *cur_a_buf = (UINT64 *)os_alloc_bytes(8 * ma.count);
+    UINT64 *cur_a_buf = limb_alloc(ma.count);
     decompose(a_val, &ma);
     for (UINT64 i = 0; i < ma.count; i++) {
         cur_a_buf[i] = ma.limbs[i];
@@ -3795,7 +3857,7 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
     GC_PROTECT(cur_a);
 
     decompose(b_val, &mb);
-    UINT64 *cur_b_buf = (UINT64 *)os_alloc_bytes(8 * mb.count);
+    UINT64 *cur_b_buf = limb_alloc(mb.count);
     decompose(b_val, &mb);
     for (UINT64 i = 0; i < mb.count; i++) {
         cur_b_buf[i] = mb.limbs[i];
@@ -3806,11 +3868,12 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
     signed_mag_t mcb;
     decompose(cur_b, &mcb);
     while (!(mcb.count == 1 && mcb.limbs[0] == 0)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t mca;
         decompose(cur_a, &mca);
         decompose(cur_b, &mcb);
-        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * mca.count);
-        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * mca.count);
+        UINT64 *quot_buf = limb_alloc(mca.count);
+        UINT64 *rem_buf = limb_alloc(mca.count);
         decompose(cur_a, &mca);
         decompose(cur_b, &mcb);
         UINT64 quot_len, rem_len;
@@ -3832,6 +3895,7 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
  * @param out_len 結果の実効長の格納先
  */
 static lisp_val_t mag_isqrt(lisp_val_t n_val) {
+    LIMB_FRAME();
     // x/yはイテレーションを跨いで生き続ける必要があるため、生バッファのまま保持せず、
     // 確保直後にMAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
     GC_PROTECT(n_val);
@@ -3839,7 +3903,7 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
     decompose(n_val, &mn);
     UINT64 nlen = mn.count;
 
-    UINT64 *x_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+    UINT64 *x_buf = limb_alloc(nlen);
     decompose(n_val, &mn);
     for (UINT64 i = 0; i < nlen; i++) {
         x_buf[i] = mn.limbs[i];
@@ -3852,7 +3916,7 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
 
     signed_mag_t mx;
     decompose(x, &mx);
-    UINT64 *xp1_buf = (UINT64 *)os_alloc_bytes(8 * (mx.count + 1));
+    UINT64 *xp1_buf = limb_alloc(mx.count + 1);
     decompose(x, &mx);
     UINT64 xp1_len = mag_add(mx.limbs, mx.count, one, 1, xp1_buf);
     UINT64 ylen = mag_divmod_small(xp1_buf, xp1_len, 2, &dummy_rem);
@@ -3863,12 +3927,13 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
     decompose(y, &my_mag);
     decompose(x, &mx_mag);
     while (mag_compare(my_mag.limbs, my_mag.count, mx_mag.limbs, mx_mag.count) < 0) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         x = y;
 
         decompose(n_val, &mn);
         decompose(x, &mx_mag);
-        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
-        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+        UINT64 *quot_buf = limb_alloc(nlen);
+        UINT64 *rem_buf = limb_alloc(nlen);
         decompose(n_val, &mn);
         decompose(x, &mx_mag);
         UINT64 quot_len, rem_len;
@@ -3876,7 +3941,7 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
 
         decompose(x, &mx_mag);
         UINT64 cap = (mx_mag.count > quot_len ? mx_mag.count : quot_len) + 1;
-        UINT64 *sum_buf = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *sum_buf = limb_alloc(cap);
         decompose(x, &mx_mag);
         UINT64 sum_len = mag_add(mx_mag.limbs, mx_mag.count, quot_buf, quot_len, sum_buf);
 
@@ -3966,12 +4031,13 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; cur != nil; cur = cc_cdr(cur)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
 
         UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
-        UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *result = limb_alloc(cap);
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
         UINT64 result_len;
@@ -4113,12 +4179,13 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; rest != nil; rest = cc_cdr(rest)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(rest), &operand);
         decompose(acc_val, &acc);
 
         UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
-        UINT64 *result_buf = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *result_buf = limb_alloc(cap);
         decompose(cc_car(rest), &operand);
         decompose(acc_val, &acc);
         UINT64 result_len;
@@ -4250,12 +4317,13 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; cur != nil; cur = cc_cdr(cur)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
 
         UINT64 cap = acc.count + operand.count;
-        UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *result = limb_alloc(cap);
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
         UINT64 result_len = mag_mul(acc.limbs, acc.count, operand.limbs, operand.count, result);
@@ -4344,6 +4412,7 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; rest != nil; rest = cc_cdr(rest)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(rest), &operand);
 
@@ -4352,9 +4421,9 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
         }
 
         decompose(acc_val, &acc);
-        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        UINT64 *quot_buf = limb_alloc(acc.count);
         decompose(acc_val, &acc);
-        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        UINT64 *rem_buf = limb_alloc(acc.count);
         decompose(cc_car(rest), &operand);
         decompose(acc_val, &acc);
         UINT64 quot_len, rem_len;
@@ -4649,6 +4718,7 @@ lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
     (void)env;
+    LIMB_FRAME();
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
     GC_PROTECT(z1);
@@ -4666,7 +4736,7 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
     signed_mag_t m1, m2;
     decompose(z1, &m1);
     decompose(z2, &m2);
-    UINT64 *prod_buf = (UINT64 *)os_alloc_bytes(8 * (m1.count + m2.count));
+    UINT64 *prod_buf = limb_alloc(m1.count + m2.count);
     decompose(z1, &m1);
     decompose(z2, &m2);
     UINT64 prod_len = mag_mul(m1.limbs, m1.count, m2.limbs, m2.count, prod_buf);
@@ -4677,8 +4747,8 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
     signed_mag_t mp;
     decompose(prod_val, &mp);
     decompose(gcd_val, &mg);
-    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * mp.count);
-    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * mp.count);
+    UINT64 *quot_buf = limb_alloc(mp.count);
+    UINT64 *rem_buf = limb_alloc(mp.count);
     decompose(prod_val, &mp);
     decompose(gcd_val, &mg);
     UINT64 quot_len, rem_len;
@@ -4733,6 +4803,7 @@ static double sqrt_fpu(double d) {
  */
 lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
     (void)env;
+    LIMB_FRAME();
     lisp_val_t val = cc_car(args);
 
     if (is_float(val)) {
@@ -4755,7 +4826,7 @@ lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
 
     signed_mag_t mr;
     decompose(root, &mr);
-    UINT64 *sq_buf = (UINT64 *)os_alloc_bytes(8 * mr.count * 2);
+    UINT64 *sq_buf = limb_alloc(mr.count * 2);
     decompose(root, &mr);
     UINT64 sq_len = mag_mul(mr.limbs, mr.count, mr.limbs, mr.count, sq_buf);
 
@@ -4994,6 +5065,7 @@ lisp_val_t primitive_atan2(lisp_val_t args, lisp_val_t env) {
  * @return dと数値として等しいfixnum/bignum
  */
 static lisp_val_t double_to_integer(double d) {
+    LIMB_FRAME();
     if (d == 0.0) {
         return os_make_fixnum(0);
     }
@@ -5016,7 +5088,7 @@ static lisp_val_t double_to_integer(double d) {
     }
 
     UINT64 capacity = (UINT64)((64 + shift + 31) / 32) + 1;
-    UINT64 *limbs = (UINT64 *)os_alloc_bytes(8 * capacity);
+    UINT64 *limbs = limb_alloc(capacity);
     limbs[0] = significand & 0xFFFFFFFFULL;
     limbs[1] = significand >> 32;
     for (UINT64 i = 2; i < capacity; i++) {

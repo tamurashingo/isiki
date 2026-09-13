@@ -76,6 +76,32 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
 /** TAG_INSTANCEのword0に入る、ILOSの標準(standard)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<standard-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
 #define MAGIC_STANDARD_CLASS       0xFULL
 
+/* [転送済み判定の不変条件] gc_copy_valueは word0 の下位3bitが TAG_FORWARD(0x6)か
+   どうかで「転送済みかもしれない」と疑い、指す先がTo空間の範囲にあるかどうかで
+   確定させる。MAGIC_STREAM(0x6)とMAGIC_BUILTIN_CLASS(0xE)は下位3bitが
+   **実際に衝突している**ので、これらを弾いているのは範囲検査の下限だけである。
+   (STRINGのword0=生の長さも同じ理由で下限に守られている)
+
+   したがって「MAGIC値はヒープの先頭アドレスより遥かに小さい」ことが不変条件になる。
+   これを破るMAGICを足すと、そのインスタンスが転送済みと誤認され、word0が
+   転送ポインタとして解釈されてヒープが静かに壊れる。範囲検査を触った瞬間に効く罠でもある。
+   タグ側の衝突自体は防げないので、代わりに大きさの上限を機械的に保証する。 */
+#define MAGIC_MUST_BE_BELOW 0x1000ULL
+_Static_assert(MAGIC_FUNCTION_NATIVE      < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_FUNCTION_INTERPRETED < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_PROCESS              < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_MACRO                < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_BLOCK_EXIT           < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_STREAM               < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_CLASS_INSTANCE       < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_CATCH_EXIT           < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_GO_EXIT              < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_BIGNUM               < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_VECTOR               < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_FLOAT                < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_BUILTIN_CLASS        < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_STANDARD_CLASS       < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+
 /** NIL */
 extern lisp_val_t nil;
 /** T */
@@ -364,6 +390,8 @@ extern UINT64 g_gc_lifo_violations;
 extern UINT64 g_gc_uncopyable_tag_hits;
 /** [GC監査] 転送先が未割り当て区間を指していた回数(0であるべき) */
 extern UINT64 g_gc_fwd_beyond_ptr_hits;
+/** [GC監査] gc_copy_valueがTo空間を指す値で呼ばれた回数(標準のCheneyなら0) */
+extern UINT64 g_gc_to_space_revisits;
 
 #ifdef ISIKIOS_GC_DEBUG
 /** [GC監査] os_gc_collectの実行中なら1。割り込みハンドラから見るために公開している */
