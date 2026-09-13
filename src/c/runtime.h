@@ -362,6 +362,8 @@ extern UINT64 g_gc_lifo_violations;
 
 /** [GC監査] gc_copy_valueがコピー不能なタグを渡された回数(0であるべき) */
 extern UINT64 g_gc_uncopyable_tag_hits;
+/** [GC監査] 転送先が未割り当て区間を指していた回数(0であるべき) */
+extern UINT64 g_gc_fwd_beyond_ptr_hits;
 
 #ifdef ISIKIOS_GC_DEBUG
 /** [GC監査] os_gc_collectの実行中なら1。割り込みハンドラから見るために公開している */

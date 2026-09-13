@@ -327,6 +327,15 @@ void os_set_panic_hook(void (*hook)(void)) {
    -display noneでは誰も読めず、外からは「電源が落ちた」としか見えない。
    実際、スタックガードは深度4000で正しく発動していたのに、診断が読めないために
    「無反応で止まった」と区別がつかなかった。 */
+#ifdef ISIKIOS_UNIT_TEST
+/* os_diag_serial_writeの実体はinterrupt.cにあり、Cユニットテストのリンク対象では
+   ない。5a706ccでruntime.cのpanic経路がこれを参照するようになって以降、
+   `make test`がリンクエラーで通らなくなっていた(16コミットぶん、Cユニット
+   テストが一度も走っていなかった)。呼び出し側を#ifdefで囲うと診断コードが
+   読みにくくなるので、テスト時だけ何もしない実体を置く */
+void os_diag_serial_write(const char *s) { (void)s; }
+#endif
+
 static void panic_write_string(frame_buffer *fb, const char *s) {
     fb->write_string(fb, s);
 #ifndef ISIKIOS_UNIT_TEST
@@ -951,6 +960,13 @@ static UINT64 g_gc_collect_count = 0;
 /** [GC監査] gc_copy_valueがコピー不能なタグ(TAG_FORWARD等)を渡された回数。
     0でなければ、生きたフィールドが転送ポインタを保持している = どこかの保護漏れ */
 UINT64 g_gc_uncopyable_tag_hits = 0;
+/** [GC監査] 転送先が未割り当て区間(>= g_to_ptr)を指していた回数。0であるべき */
+UINT64 g_gc_fwd_beyond_ptr_hits = 0;
+/** [GC監査] gc_scan_queueが今走査しているオブジェクトと、そのフィールド番号。
+    コピー不能なタグを見つけたときに「誰が持っていたか」を言うために使う。
+    ルート走査中(shadow stack等)は0で、その場合は保持元不明として出す */
+static lisp_val_t g_gc_scan_holder = 0;
+static UINT64 g_gc_scan_field = 0;
 
 UINT64 os_gc_collect_count(void) {
     return g_gc_collect_count;
@@ -1374,15 +1390,56 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
     }
 
     lisp_addr_t addr = obj & ~TAG_MASK;
+
+    /* [転送済み判定の穴] すでにTo空間を指している値は、この回のGCで**もう転送済み**
+       である。Cheneyの転送済み判定はFrom側のword0に書いた転送ヘッダを見る仕組みなので、
+       To空間のオブジェクトには原理的に効かない。ここで止めないと、To空間のオブジェクトを
+       もう一度コピーし、**その word0 に転送ヘッダを焼き込む**。
+
+       焼き込まれたヘッダは次の世代で牙を剥く。世代NのToは世代N+1のFromなので、
+       そのオブジェクトは次の世代で生きたデータとしてコピーされ、
+       「SYMBOLのword0が転送ポインタを持っている」という状態になる。
+       実測(塗り潰し監査 isiki_test、AUDIT_STRESS=100):
+         保持元=24643394 tag=2(SYMBOL) 領域=To words=[110651760|6, nil, nil, nil]
+         to=24642240..110584160  from=110584160..196526080
+       word0が指す110651760は現Fromにある正常なシンボルで、これは前世代の
+       転送先アドレスそのものだった。
+
+       STRINGでこれが起きると word0(生の長さ)が壊れ、印字が
+       ヒープのバイト列になる。 */
+    if ((UINT8 *)addr >= g_to_start && (UINT8 *)addr < g_to_end) {
+        return obj;
+    }
+
     UINT64 *words = (UINT64 *)addr;
     UINT64 word0 = words[0];
 
     if ((word0 & TAG_MASK) == TAG_FORWARD) {
         UINT8 *fwd_addr = (UINT8 *)(lisp_addr_t)(word0 & ~TAG_MASK);
-        // Stringのword0は生の整数長であり、たまたま下位3bitが0x6(TAG_FORWARD)と一致した
-        // だけの誤検知の可能性がある。転送先は必ずTo空間内のアドレスになるはずなので、
-        // 範囲外なら転送済みではないとみなし、下のcopy_freshへ進む
-        if (fwd_addr >= g_to_start && fwd_addr < g_to_ptr) {
+        /* word0のタグだけでは転送済みか判別できない。曖昧になるのは3種類ある:
+             - STRING       word0は生の整数長。長さ6/14/22…が下位3bit=0x6になる
+             - MAGIC_STREAM        0x6 -> &7 == 6
+             - MAGIC_BUILTIN_CLASS 0xE -> &7 == 6
+           これらを転送済みと誤認しないための判別が下の範囲検査である。
+           効いているのは**下限**のほう。長さもMAGIC値も0x10未満で、To空間の
+           先頭アドレスより遥かに小さいので確実に弾ける。
+
+           上限は以前 g_to_ptr だった。これは**コピー中に動く値**で、
+           fwd_addr == g_to_ptr の境界で正当な転送を見落とす。実測で外れており、
+           そうなると同じオブジェクトを二度コピーし、二度目はFrom側のword0
+           (すでに転送ヘッダ)をデータとしてTo側へ写してしまう。結果、To空間の
+           SYMBOLのword0が転送ポインタを持つ、という状態が世代を跨いで残る
+           (世代NのToは世代N+1のFromなので、次の世代からはFromを指して見える)。
+           判別に必要なのは「To空間の中か」であって「割り当て済みか」ではないので、
+           動かない g_to_end を使う。 */
+        if (fwd_addr >= g_to_start && fwd_addr < g_to_end) {
+#ifdef ISIKIOS_GC_DEBUG
+            /* 正当な転送先は必ず割り当て済み区間にある。ここへ来るのは、
+               上の境界問題か、転送ヘッダの二重書き込みが起きている証拠 */
+            if (fwd_addr >= g_to_ptr) {
+                g_gc_fwd_beyond_ptr_hits++;
+            }
+#endif
             return (lisp_val_t)((lisp_addr_t)fwd_addr | tag);
         }
     }
@@ -1420,8 +1477,43 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
                 serial_write_uint(tag);
                 os_diag_serial_write(" 領域=");
                 serial_write_uint((UINT64)os_addr_region((lisp_addr_t)addr));
-                os_diag_serial_write("\n  (生きたフィールドが転送ポインタを保持している"
-                                     " = どこかのGC_PROTECT漏れ)\n");
+                os_diag_serial_write("\n  保持元=");
+                serial_write_uint((UINT64)g_gc_scan_holder);
+                os_diag_serial_write(" tag=");
+                serial_write_uint(g_gc_scan_holder & TAG_MASK);
+                os_diag_serial_write(" word[");
+                serial_write_uint(g_gc_scan_field);
+                os_diag_serial_write("] 領域=");
+                serial_write_uint((UINT64)os_addr_region((lisp_addr_t)(g_gc_scan_holder & ~TAG_MASK)));
+                if (g_gc_scan_holder != 0 && (g_gc_scan_holder & TAG_MASK) == TAG_INSTANCE) {
+                    os_diag_serial_write(" magic=");
+                    serial_write_uint(((UINT64 *)(g_gc_scan_holder & ~TAG_MASK))[0]);
+                }
+                os_diag_serial_write("\n  保持元words=");
+                if (g_gc_scan_holder != 0) {
+                    UINT64 *hw = (UINT64 *)(g_gc_scan_holder & ~TAG_MASK);
+                    for (int i = 0; i < 4; i++) { serial_write_uint(hw[i]); os_diag_serial_write(" "); }
+                }
+                os_diag_serial_write("\n  obj先words=");
+                {
+                    UINT64 *ow = (UINT64 *)(lisp_addr_t)(obj & ~TAG_MASK);
+                    for (int i = 0; i < 4; i++) { serial_write_uint(ow[i]); os_diag_serial_write(" "); }
+                }
+                os_diag_serial_write("\n  境界外転送=");
+                serial_write_uint(g_gc_fwd_beyond_ptr_hits);
+                os_diag_serial_write(" from=");
+                serial_write_uint((UINT64)(lisp_addr_t)g_from_start);
+                os_diag_serial_write("..");
+                serial_write_uint((UINT64)(lisp_addr_t)g_from_end);
+                os_diag_serial_write(" to=");
+                serial_write_uint((UINT64)(lisp_addr_t)g_to_start);
+                os_diag_serial_write("..");
+                serial_write_uint((UINT64)(lisp_addr_t)g_to_end);
+                os_diag_serial_write(" toptr=");
+                serial_write_uint((UINT64)(lisp_addr_t)g_to_ptr);
+                os_diag_serial_write(" GC回数=");
+                serial_write_uint(os_gc_collect_count());
+                os_diag_serial_write("\n");
             }
 #endif
             return obj;
@@ -1577,26 +1669,26 @@ static void gc_scan_instance(UINT64 *words) {
             // word3にGC管理下の捕捉環境を持つのでトレースする。それ以外(fixnum 1/NIL)は
             // word3を使わずNIL固定なので何もしなくてよい
             if (words[2] == os_make_fixnum(2)) {
-                words[3] = gc_copy_value(words[3]); // 捕捉環境
+                g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // 捕捉環境
             }
             break;
 
         case MAGIC_FUNCTION_INTERPRETED:
         case MAGIC_MACRO:
-            words[1] = gc_copy_value(words[1]); // params
-            words[2] = gc_copy_value(words[2]); // body
-            words[3] = gc_copy_value(words[3]); // closure env
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // params
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // body
+            g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // closure env
             break;
 
         case MAGIC_PROCESS:
-            words[1] = gc_copy_value(words[1]); // fixnum(process index)
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // fixnum(process index)
             // word2(saved_rsp)は生アドレス(process.cの静的スタック領域、Lispヒープ外)。素通し
-            words[3] = gc_copy_value(words[3]); // state symbol
+            g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // state symbol
             break;
 
         case MAGIC_BLOCK_EXIT:
-            words[1] = gc_copy_value(words[1]); // block名symbol
-            words[2] = gc_copy_value(words[2]); // 戻り値
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // block名symbol
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // 戻り値
             break;
 
         case MAGIC_STREAM:
@@ -1604,17 +1696,17 @@ static void gc_scan_instance(UINT64 *words) {
             break;
 
         case MAGIC_CLASS_INSTANCE:
-            words[1] = gc_copy_value(words[1]); // class
-            words[2] = gc_copy_value(words[2]); // slots-vector
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // class
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // slots-vector
             break;
 
         case MAGIC_CATCH_EXIT:
-            words[1] = gc_copy_value(words[1]); // tag
-            words[2] = gc_copy_value(words[2]); // throwされた値
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // tag
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // throwされた値
             break;
 
         case MAGIC_GO_EXIT:
-            words[1] = gc_copy_value(words[1]); // tag symbol
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // tag symbol
             break;
 
         case MAGIC_BIGNUM:
@@ -1637,9 +1729,9 @@ static void gc_scan_instance(UINT64 *words) {
 
         case MAGIC_BUILTIN_CLASS:
         case MAGIC_STANDARD_CLASS:
-            words[1] = gc_copy_value(words[1]); // name symbol
-            words[2] = gc_copy_value(words[2]); // superclasses list
-            words[3] = gc_copy_value(words[3]); // slots list
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // name symbol
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // superclasses list
+            g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // slots list
             break;
 
         default:
@@ -1657,20 +1749,25 @@ static void gc_scan_queue(void) {
     while (gc_queue_pop(&tagged)) {
         UINT64 tag = tagged & TAG_MASK;
         UINT64 *words = (UINT64 *)(tagged & ~TAG_MASK);
+        /* [GC監査] コピー不能なタグを見つけたとき、それを**保持していた側**を
+           言えるようにする。gc_copy_valueは値しか受け取らないので、
+           走査中のオブジェクトをここで控えておく */
+        g_gc_scan_holder = tagged;
+        g_gc_scan_field = 0;
 
         switch (tag) {
             case TAG_CONS:
-                words[0] = gc_copy_value(words[0]);
-                words[1] = gc_copy_value(words[1]);
+                g_gc_scan_field = 0; words[0] = gc_copy_value(words[0]);
+                g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]);
                 break;
 
             case TAG_SYMBOL:
                 // word0=name string。word1(gensymフラグ)/word2/word3(未使用)は常に
                 // nilまたはfixnumなのでgc_copy_valueに通しても素通しされるだけで安全
-                words[0] = gc_copy_value(words[0]);
-                words[1] = gc_copy_value(words[1]);
-                words[2] = gc_copy_value(words[2]);
-                words[3] = gc_copy_value(words[3]);
+                g_gc_scan_field = 0; words[0] = gc_copy_value(words[0]);
+                g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]);
+                g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]);
+                g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]);
                 break;
 
             case TAG_STRING:
