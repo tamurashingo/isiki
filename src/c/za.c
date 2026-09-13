@@ -5172,6 +5172,33 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
     new_ctx.tag_count = 0;
     new_ctx.base_nlx_depth = nlx_depth;
 
+    /* [原則8] new_ctx.tags[].tag は**Cスタック上の構造体配列の中のlisp_val_t**で、
+       GC_PROTECTでは守れない。goが前方参照として登録したタグシンボルは、その後の
+       コンパイル(gensym確保・consのリライト)でGCが走ると移動するが、ここは
+       更新されない。すると後で本体にラベルが現れたとき
+           new_ctx.tags[i].tag == elem
+       が「stale値 vs 更新後の値」の比較になって外れ、別エントリが作られる。
+       元のエントリはpending_countを抱えたまま残り、「未解決の前方参照」として
+       コンパイルを断念する。
+
+       forはtagbody/goへ展開され、goが**前方参照**を作る。だからGC圧下では
+       for系だけが落ちる。実測(AUDIT_STRESS=100):
+         %%DIAG-ZA-BAIL-AT 0 => 5230(= 未解決の前方参照の断念)
+         落ちるのは ISIKI-ZA-TEST-SETQ-FOR-LOOP / IZ14-NESTED-FOR /
+                    IZ14-TRIPLE-NESTED-FOR / IZ14-NESTED-TAGBODY-SHADOW の4件のみ
+
+       エントリはza_compile_go(より深いフレーム)からも追加されるので、その都度
+       pushするとshadow stackのLIFOが崩れる。上限が16と小さいので、全スロットを
+       nilで初期化して**先に**まとめてlinkしておく(za_gc_protect_batch_tの
+       コメント、documents/pitfalls.md 原則8を参照)。 */
+    za_gc_protect_batch_t tag_gc_batch __attribute__((cleanup(za_gc_protect_batch_cleanup)));
+    tag_gc_batch.saved_head = get_current_process()->gc_roots;
+    gc_rootnode tag_gc_nodes[ZA_MAX_TAGBODY_TAGS];
+    for (int i = 0; i < ZA_MAX_TAGBODY_TAGS; i++) {
+        new_ctx.tags[i].tag = nil;
+        za_gc_protect_batch_push(&tag_gc_nodes[i], &new_ctx.tags[i].tag);
+    }
+
     // 各form要素(タグを除く)の評価結果が制御転送なら(自分のタグへのgoはza_compile_go
     // が直接jmpで解決済みなので、ここに到達するのは他のcatch/block/goのみ)tagbody
     // 全体の結果としてそのまま伝播する(eval_tagbodyの「一致しなければ伝播」と同じ)。

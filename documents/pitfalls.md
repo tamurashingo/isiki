@@ -657,6 +657,52 @@ staleを読んでいたのはJITが生成した機械語で、計器化された
       なっているか。`cc_open_input_stream`が`os_mount_fat_read_file`の戻り値を
       すぐストリームへ組み込んでいるのはこの理由による。
 
+## 原則8の実例: tagbodyのタグ表(`for`の間欠バグの候補、2026-09-13)
+
+`za_tag_entry_t` は `lisp_val_t tag;` を持ち、`za_tagbody_ctx_t` は
+`za_compile_tagbody` の**Cスタック上のローカル**である。したがって
+`tags[].tag` は GC_PROTECT では守れない(原則8)。
+
+`go` が前方参照としてタグシンボルを登録したあと、コンパイルが続く間に
+gensym確保やconsのリライトでGCが走ると、そのシンボルは移動するのに
+`tags[].tag` は更新されない。後で本体にラベルが現れたとき
+
+```c
+if (new_ctx.tags[i].tag == elem)   // stale値 vs 更新後の値
+```
+
+が外れ、別エントリが作られる。元のエントリは `pending_count` を抱えたまま残り、
+「未解決の前方参照」としてコンパイルを断念する。
+
+### なぜ `for` だけなのか
+
+`for` は tagbody/go へ展開され、**`go` が前方参照を作る**。後方参照
+(ラベルが先に現れる)なら登録時点で `resolved` なので、この経路を通らない。
+塗り潰し監査(`AUDIT_STRESS=100`)で残った不合格4件は、
+`ISIKI-ZA-TEST-SETQ-FOR-LOOP` / `IZ14-NESTED-FOR` / `IZ14-TRIPLE-NESTED-FOR` /
+`IZ14-NESTED-TAGBODY-SHADOW` の**すべてが `for`/tagbody 系**だった。
+
+`%%DIAG-ZA-BAIL-AT 0` が `za.c:5230`(未解決の前方参照の断念)を名指ししたことで
+確定した。
+
+### 修正
+
+エントリは `za_compile_go`(より深いフレーム)からも追加されるため、その都度
+push すると shadow stack の LIFO が崩れる。上限が16と小さいので、全スロットを
+nil で初期化して**先に**まとめて link する。
+
+### `for` の間欠バグとの関係
+
+長く追ってきた「`for` が GC の特定のタイミング以後ずっと壊れる」間欠バグは
+真因未特定のままだが、**これは有力な候補である。**
+
+- 症状の出方が2通りありうる。タグ照合が外れれば bail(安全側)、
+  stale値がたまたま別のタグと一致すれば**誤ったjmp先を生成する**(誤答側)。
+- 「以後永久に壊れる」性質と合う。生成コードは一度焼き込まれたら再生成されない。
+
+ただし**誤答側を再現できたわけではない**。今回直したのは bail 側だけであり、
+間欠バグが解消したと言うにはまだ根拠が足りない。
+
 ## 原則9: GCの実行中にスケジューラを走らせてはならない(2026-09-12)
 
 `c_timer_switch`(`src/c/interrupt.c`)は `*current-process*` / `*RUN-QUEUE*` /

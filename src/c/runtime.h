@@ -393,7 +393,12 @@ extern UINT64 g_gc_lifo_violations;
 extern UINT64 g_gc_uncopyable_tag_hits;
 /** [GC監査] 転送先が未割り当て区間を指していた回数(0であるべき) */
 extern UINT64 g_gc_fwd_beyond_ptr_hits;
-/** [GC監査] gc_copy_valueがTo空間を指す値で呼ばれた回数(標準のCheneyなら0) */
+/** [GC監査] gc_copy_valueがTo空間を指す値で呼ばれた回数(標準のCheneyなら0)。
+    2026-09-13の全件監査(AUDIT_STRESS=100、22試験)では0だった。
+    ガード導入時(ebb985c)には効果が出ていたので当時は発火していたはずで、
+    「二度スキャンはbignum破壊(781cf2a)の結果で、それを直したら消えた」と
+    読むのが整合的だが、**これは推定であって実証ではない**。当時の発火回数を
+    記録していない。再発したときに確定事実だと思って探すと遠回りになる。 */
 extern UINT64 g_gc_to_space_revisits;
 /** [GC監査] limb作業領域の最高水位(limb単位)。容量設計の妥当性を実測で言うため */
 extern UINT64 g_limb_arena_peak;

@@ -371,6 +371,11 @@ static UINT32 fat16n_u32(const UINT8 *b, UINT32 off) {
  * (read-sector/ide.lispの%ide-partition-handle-p相当)。
  */
 static int fat16n_resolve_device(lisp_val_t handle, block_device_t **out_dev, UINT32 *out_base_lba) {
+    /* [原則4] os_make_symbolは未internのシンボルに対しては確保する。
+       ":IDE-PARTITION" は実際には他所で先にinternされているはずだが、それは
+       初期化順に依存した前提で、順序が変わった瞬間に破れる。踏み抜くと
+       直後の cc_cdr(handle) が旧From空間を読む。1行で閉じられるので閉じておく。 */
+    GC_PROTECT(handle);
     if ((handle & TAG_MASK) == TAG_CONS) {
         lisp_val_t head = cc_car(handle);
         if (head != os_make_symbol(":IDE-PARTITION")) {
