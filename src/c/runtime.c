@@ -490,6 +490,24 @@ void os_gc_debug_check_protect_slow(lisp_val_t *var, const char *file, int line)
     }
 #endif
     g_gc_protect_stale_hits++;
+    /* [GC監査] 最初の1件だけシリアルへ即出しする。検出のあとで落ちたり
+       ハングしたりすると %%DIAG-GC-PROTECT-STALE-FILE まで到達できず、
+       せっかく捕まえた発生箇所が読めない。 */
+    if (g_gc_protect_stale_hits == 1) {
+        os_diag_serial_write("\n[GC監査] GC_PROTECTに渡された時点で既にstale: ");
+        os_diag_serial_write(file);
+        os_diag_serial_write(":");
+        {
+            char buf[16]; int n = 0, x = line;
+            if (x == 0) { buf[n++] = '0'; }
+            while (x > 0) { buf[n++] = (char)('0' + x % 10); x /= 10; }
+            char rev[17]; int j = 0;
+            while (n > 0) { rev[j++] = buf[--n]; }
+            rev[j] = '\0';
+            os_diag_serial_write(rev);
+        }
+        os_diag_serial_write("\n  (この関数の**呼び出し元**が、確保を跨いで保護せずに持っていた)\n");
+    }
     for (UINT32 i = 0; i < g_gc_protect_stale_site_count; i++) {
         if (g_gc_protect_stale_files[i] == file && g_gc_protect_stale_lines[i] == line) {
             g_gc_protect_stale_site_hits[i]++;

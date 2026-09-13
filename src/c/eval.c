@@ -168,9 +168,20 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
  * @return 関数呼び出しの結果。opが未定義の場合はg_sym_eval_error
  */
 static lisp_val_t eval_form(lisp_val_t op, lisp_val_t args, lisp_val_t env) {
+    // [原則4の系] opの解決(os_get_functionの確保、opが(lambda ...)等ならos_evalの
+    // 任意深さの評価)はGCを誘発しうる。args/env/opの保護はそれより**前**でなければ
+    // ならない。あとからGC_PROTECTしても、入ってきた時点で古い値は直せない。
+    //
+    // 実測(塗り潰し監査、environment_pages_test): argsは一度も保護されておらず、
+    // envの保護もos_evalの後だったため、eval_argsに最初から塗り潰し済みの
+    // args/envが渡り、cc_car+0x1dで #GP になった(rcx=rbx=0xDEADDEADDEADDEA0)。
+    // eval_args側のGC_PROTECTは自分のフレームのスロットを守るだけで、
+    // 呼び出し元が古い値を渡してくる場合には効かない。
+    GC_PROTECT(op);
+    GC_PROTECT(args);
+    GC_PROTECT(env);
     lisp_val_t fn = ((op & TAG_MASK) == TAG_SYMBOL) ? os_get_function(op, env) : os_eval(op, env);
     GC_PROTECT(fn);
-    GC_PROTECT(env);
     if (fn == nil) {
         return g_sym_eval_error; // 未定義の関数
     }
@@ -413,6 +424,13 @@ static lisp_val_t eval_function(lisp_val_t args, lisp_val_t env) {
  * @return bodyの最後の評価結果
  */
 static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
+    // [原則4] envはos_make_symbol("FLET-ENV")の確保より**前**に保護すること。
+    // 引数の評価順は未規定なので、シンボル確保でGCが走った時点でenvが古いまま
+    // os_make_environmentへ渡りうる。
+    // 実測(塗り潰し監査、environment_literal_slots_test): ここが漏れていたため
+    // make_interpreted_function(eval.c:83)のGC_PROTECT(env)に既にstaleな値が入り、
+    // 最終的にos_get_function内のcc_cdrが塗り潰し済みポインタを参照して #GP になった。
+    GC_PROTECT(env);
     lisp_val_t bindings = cc_car(args);
     lisp_val_t body = cc_cdr(args);
     GC_PROTECT(bindings);
@@ -421,8 +439,13 @@ static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
+        // b/nameはmake_interpreted_functionとos_set_functionの確保を跨ぐ。
+        // 保護はループ**本体の中**で行う(forの初期化子から巻き上げるとスコープが
+        // 変わり、過去に別件で沈黙ハングを起こしている)
+        GC_PROTECT(b);
         lisp_val_t binding = cc_car(b);
         lisp_val_t name = cc_car(binding);
+        GC_PROTECT(name);
         lisp_val_t params = cc_car(cc_cdr(binding));
         lisp_val_t fn_body = cc_cdr(cc_cdr(binding));
         lisp_val_t fn = make_interpreted_function(params, fn_body, env);
@@ -440,6 +463,13 @@ static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
  * @return bodyの最後の評価結果
  */
 static lisp_val_t eval_labels(lisp_val_t args, lisp_val_t env) {
+    // [原則4] envはos_make_symbol("LABELS-ENV")の確保より**前**に保護すること。
+    // 引数の評価順は未規定なので、シンボル確保でGCが走った時点でenvが古いまま
+    // os_make_environmentへ渡りうる。
+    // 実測(塗り潰し監査、environment_literal_slots_test): ここが漏れていたため
+    // make_interpreted_function(eval.c:83)のGC_PROTECT(env)に既にstaleな値が入り、
+    // 最終的にos_get_function内のcc_cdrが塗り潰し済みポインタを参照して #GP になった。
+    GC_PROTECT(env);
     lisp_val_t bindings = cc_car(args);
     lisp_val_t body = cc_cdr(args);
     GC_PROTECT(bindings);
@@ -448,8 +478,13 @@ static lisp_val_t eval_labels(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
+        // b/nameはmake_interpreted_functionとos_set_functionの確保を跨ぐ。
+        // 保護はループ**本体の中**で行う(forの初期化子から巻き上げるとスコープが
+        // 変わり、過去に別件で沈黙ハングを起こしている)
+        GC_PROTECT(b);
         lisp_val_t binding = cc_car(b);
         lisp_val_t name = cc_car(binding);
+        GC_PROTECT(name);
         lisp_val_t params = cc_car(cc_cdr(binding));
         lisp_val_t fn_body = cc_cdr(cc_cdr(binding));
         lisp_val_t fn = make_interpreted_function(params, fn_body, new_env);
