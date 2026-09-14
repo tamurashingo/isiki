@@ -6139,11 +6139,19 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     // use_param_slotsでない場合はcons_entry_offset==entryなので、
     // dest_bytes+0==dest_bytesとなり従来と完全に同じアドレスになる。
     lisp_addr_t cons_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (cons_entry_offset - entry));
+    // disassembler(src/c/disasm.c)が後から機械語を読めるよう、エントリポイントとは別に
+    // ブロック全体の範囲[dest_bytes, dest_bytes+code_len)をza_fn_meta_tへ記録する。
+    // os_fn_set_code_rangeは生フィールドへの代入だけで確保しないため、fnを受け取ってから
+    // 呼ぶまでの間にGCは走らない
     if (use_param_slots) {
         lisp_addr_t fixed_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (fixed_entry_offset - entry));
-        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, env);
+        lisp_val_t fn = os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, env);
+        os_fn_set_code_range(fn, (UINT64)(lisp_addr_t)dest_bytes, code_len);
+        return fn;
     }
-    return os_make_jit_function(cons_entry_addr, env);
+    lisp_val_t fn = os_make_jit_function(cons_entry_addr, env);
+    os_fn_set_code_range(fn, (UINT64)(lisp_addr_t)dest_bytes, code_len);
+    return fn;
 }
 
 /**

@@ -854,6 +854,16 @@ typedef struct {
     UINT64 cons_entry;  /* offset 0: 従来のconsリストABI fn(evaluated_args, env) */
     UINT64 fixed_entry; /* offset 8: ABI-M5で使う固定引数エントリ(現状は常に0) */
     UINT64 arity;       /* offset 16: ABI-M5で使う固定arity(現状は常に0) */
+    /* offset 24/32: disassembler(src/c/disasm.c)用のコード範囲。
+       za_try_compile_defunが1回のコンパイルで出力した機械語ブロック全体
+       (固定引数エントリ+consリストエントリ+共有本体)の先頭と長さで、
+       cons_entry/fixed_entryはこの範囲の内側を指す。
+       生成コードはこの2つを読まないので、オフセットが後ろにずれても影響しない
+       (生成コードが直接dereferenceするのはoffset 0とoffset 16だけ)。
+       組み込みprimitiveとAOTのlifted closureでは0のままで、
+       「逆アセンブル対象の機械語を持たない」ことをcode_len==0で表す。 */
+    UINT64 code_base;
+    UINT64 code_len;
 } za_fn_meta_t;
 
 /**
@@ -892,6 +902,19 @@ lisp_val_t os_make_jit_function(lisp_addr_t fnptr, lisp_val_t def_env);
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
 lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_entry, UINT64 arity, lisp_val_t def_env);
+
+/**
+ * JITコンパイル済み関数のza_fn_meta_tへ、逆アセンブル用のコード範囲を記録する
+ * (src/c/disasm.c の %%DISASM-CODE-BASE / %%DISASM-CODE-LEN が読む)。
+ * cons_entry/fixed_entryは「エントリポイント」であって機械語ブロックの先頭とは
+ * 限らないため、ブロック全体の先頭と長さは別に持たせる必要がある
+ * (documents/jit-metadata-investigation.md)。生ポインタと長さだけを書き込む
+ * 非allocatingな操作で、GCとは無関係。
+ * @param fn os_make_jit_function(_dual)が返したMAGIC_FUNCTION_NATIVEの関数
+ * @param code_base 機械語ブロックの先頭アドレス(Immobilized Space上)
+ * @param code_len 同ブロックのバイト長
+ */
+void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len);
 
 /**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを

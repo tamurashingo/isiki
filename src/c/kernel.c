@@ -17,6 +17,7 @@
 #include "clock.h"
 #include "stream.h"
 #include "za.h"
+#include "disasm_lisp.h"
 #include "mount.h"
 
 // src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
@@ -112,6 +113,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_format();
     os_register_clock();
     os_register_za_primitives();
+    os_register_disasm();
     os_register_aot_init_functions();
     os_run_aot_toplevel_forms();
 

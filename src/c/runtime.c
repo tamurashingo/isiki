@@ -1267,6 +1267,10 @@ za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
     meta->cons_entry = cons_entry;
     meta->fixed_entry = 0;
     meta->arity = 0;
+    /* code_base/code_lenはza_try_compile_defunだけが後から埋める。0のままなら
+       「逆アセンブルできる機械語を持たない」(組み込みprimitive/AOT)を意味する */
+    meta->code_base = 0;
+    meta->code_len = 0;
     return meta;
 }
 
@@ -2997,6 +3001,28 @@ lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT
     meta->fixed_entry = fixed_entry;
     meta->arity = arity;
     return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), nil);
+}
+
+/**
+ * JITコンパイル済み関数のza_fn_meta_tへ、逆アセンブル用のコード範囲を記録する。
+ * @param fn os_make_jit_function(_dual)が返したMAGIC_FUNCTION_NATIVEの関数
+ * @param code_base 機械語ブロックの先頭アドレス(Immobilized Space上)
+ * @param code_len 同ブロックのバイト長
+ */
+void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE) {
+        return;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    if (meta == 0) {
+        return;
+    }
+    meta->code_base = code_base;
+    meta->code_len = code_len;
 }
 
 /**

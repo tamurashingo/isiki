@@ -14,6 +14,11 @@
   なる」という意味です。JIT化できたかどうかは`(print #'関数名)`等で表示される
   `#<FUNCTION-COMPILED ...>`(JIT成功)/`#<FUNCTION-INTERPRETED ...>`
   (フォールバック)の違いで確認できます。
+- JIT化できた場合、**生成された機械語そのもの**は`(disassemble '関数名)`で読めます
+  (`src/lisp/disassemble.lisp`、実体は`src/c/disasm.c`)。どの構文がどんなコードに
+  なるかを確認したいとき、また本ドキュメントの記述と実装がずれていないかを
+  確かめたいときはこれを使ってください。対応範囲は
+  `documents/disasm-backend-decision.md`にあります。
 
 ## コンパイルできるパターン
 
