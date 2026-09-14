@@ -691,7 +691,7 @@
     (cond ((symbolp place) `(setq ,place ,value))
           ((eq (car place) 'car) `(set-car ,(car (cdr place)) ,value))
           ((eq (car place) 'cdr) `(set-cdr ,(car (cdr place)) ,value))
-          ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))
+          ((eq (car place) 'aref) `(set-aref ,value ,@(cdr place)))
           ((eq (car place) 'elt) `(set-elt ,value ,@(cdr place)))
           ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
           ((eq (car place) 'property) `(set-property ,value ,@(cdr place))))))

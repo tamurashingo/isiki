@@ -1122,13 +1122,13 @@ void test_primitive_aref_reads_back_value() {
     lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
 
-    // 位置(1,2)は行優先オフセットで1*3+2=5番目
-    lisp_val_t set_args = os_make_cons(array,
+    // 位置(1,2)は行優先オフセットで1*3+2=5番目。引数順はISLisp仕様通り (set-aref obj array z*)
+    lisp_val_t set_args = os_make_cons(os_make_fixnum(99),
+        os_make_cons(array,
         os_make_cons(os_make_fixnum(1),
-        os_make_cons(os_make_fixnum(2),
-        os_make_cons(os_make_fixnum(99), nil))));
+        os_make_cons(os_make_fixnum(2), nil))));
     lisp_val_t set_result = primitive_set_aref(set_args, nil);
-    assert(set_result >> 3 == 99, "(set-aref a 1 2 99)は書き込んだ99を返す");
+    assert(set_result >> 3 == 99, "(set-aref 99 a 1 2)は書き込んだ99を返す");
 
     lisp_val_t aref_args = os_make_cons(array,
         os_make_cons(os_make_fixnum(1),
@@ -1179,8 +1179,8 @@ void test_primitive_create_vector() {
 
 void test_primitive_garef_set_garef() {
     lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
-    lisp_val_t set_args = os_make_cons(vec,
-        os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(42), nil)));
+    lisp_val_t set_args = os_make_cons(os_make_fixnum(42),
+        os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)));
     assert(primitive_set_aref(set_args, nil) >> 3 == 42, "set-garefはset-arefと同じ実体で書き込める");
 
     lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil));
@@ -1209,10 +1209,10 @@ void test_primitive_set_cdr() {
 
 void test_primitive_set_aref_out_of_bounds() {
     lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
-    lisp_val_t args = os_make_cons(array,
-        os_make_cons(os_make_fixnum(3),
-        os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_set_aref(args, nil) == g_sym_eval_error, "(set-aref a 3 1)は範囲外なのでg_sym_eval_error");
+    lisp_val_t args = os_make_cons(os_make_fixnum(1),
+        os_make_cons(array,
+        os_make_cons(os_make_fixnum(3), nil)));
+    assert(primitive_set_aref(args, nil) == g_sym_eval_error, "(set-aref 1 a 3)は範囲外なのでg_sym_eval_error");
 }
 
 void test_primitive_create_string_default_fill() {
@@ -1755,7 +1755,12 @@ void test_gc_reclaims_unreferenced_garbage() {
 // 計32byte)が恒久的にglobal_environmentから到達可能になった。os_bootstrapが
 // 登録するnative関数は100個超あり、合計で3KB超の恒久消費が増える。68KBのままだと
 // vector構築テスト(N=750)がGC後も確保不能になり停止するため、その分さらに広げる
-#define SMALL_HEAP_SIZE (76 * 1024)
+//
+// ISLisp仕様のCREATE-ARRAY(make-arrayと同じ実体)をos_bootstrapへ追加したことで、
+// native関数1つ分(function object + Function Cellのcons 2つ + 環境alistのcons)が
+// さらに恒久消費になり、76KBではgcd/isqrtテストがGC後も確保不能になって停止する
+// ようになったため、その分だけ広げる
+#define SMALL_HEAP_SIZE (77 * 1024)
 
 static void setup_small_heap(void) {
     void *heap = malloc(SMALL_HEAP_SIZE);

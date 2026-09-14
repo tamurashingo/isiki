@@ -612,8 +612,17 @@
 ;; list -> stringは仕様上エラーを発生させる変換(表の該当欄が"–")なので未対応
 (assert-equal nil (ignore-errors (convert (cons #\a (cons #\b nil)) <string>)))
 
-;; その他の未対応の組み合わせもerrorになる
-(assert-equal nil (ignore-errors (convert 5 <float>)))
+;; integer -> float は仕様の変換表で必須("X")の変換(hostのscript_testのassert-equalは
+;; eq比較なので、floatは値と型で確認する)
+(assert-equal t (= 5.0 (convert 5 <float>)))
+(assert-equal t (floatp (convert 5 <float>)))
+
+;; 変換表で"–"の組み合わせ(integer -> list)はdomain-errorになる
+(assert-equal nil (ignore-errors (convert 5 <list>)))
+(assert-equal t
+  (block b
+    (with-handler (lambda (c) (return-from b (typep c '<domain-error>)))
+      (convert 5 <list>))))
 
 ;;; --- symbol property list: property / set-property / remove-property ---
 
@@ -653,23 +662,32 @@
 
 ;;; --- with-standard-input / with-standard-output / with-error-output ---
 
-;; 束縛前はnil
-(assert-equal nil (standard-output))
+;; 束縛前の動的変数はnilだが、(standard-output)は既定のコンソール出力ストリームを返す
+;; (ISLisp仕様§26: 常にストリームを返す)
+(assert-equal nil (dynamic *standard-output*))
+(assert-equal t (output-stream-p (standard-output)))
 
 ;; with-standard-outputの間だけ束縛した値が見える
-(assert-equal t
-  (with-standard-output (open-output-stream) (if (standard-output) t nil)))
+(assert-equal 'bound
+  (let ((s (create-string-output-stream)))
+    (with-standard-output s (if (eq (standard-output) s) 'bound 'not-bound))))
 
 ;; 抜けたら元の値(nil)に戻る
-(assert-equal nil (standard-output))
+(assert-equal nil (dynamic *standard-output*))
 
-(assert-equal nil (standard-input))
-(assert-equal t (with-standard-input (open-output-stream) (if (standard-input) t nil)))
-(assert-equal nil (standard-input))
+(assert-equal nil (dynamic *standard-input*))
+(assert-equal t (input-stream-p (standard-input)))
+(assert-equal 'bound
+  (let ((s (create-string-input-stream "x")))
+    (with-standard-input s (if (eq (standard-input) s) 'bound 'not-bound))))
+(assert-equal nil (dynamic *standard-input*))
 
-(assert-equal nil (error-output))
-(assert-equal t (with-error-output (open-output-stream) (if (error-output) t nil)))
-(assert-equal nil (error-output))
+(assert-equal nil (dynamic *error-output*))
+(assert-equal t (output-stream-p (error-output)))
+(assert-equal 'bound
+  (let ((s (create-string-output-stream)))
+    (with-error-output s (if (eq (error-output) s) 'bound 'not-bound))))
+(assert-equal nil (dynamic *error-output*))
 
 ;;; --- with-open-input-file ---
 
@@ -1054,8 +1072,9 @@
 (assert-equal t (equal (create-vector 3 0) '#(0 0 0)))
 
 ;; garef/set-garefはaref/set-arefと同じ実体を共用する(既存のbasic-array*-p等と同様)
-(assert-equal 42 (let ((v (create-vector 3))) (set-garef v 1 42) (garef v 1)))
-(assert-equal 42 (let ((v (create-vector 3))) (set-garef v 1 42) (aref v 1)))
+;; 引数順はISLisp仕様通り (set-garef obj general-array z*)
+(assert-equal 42 (let ((v (create-vector 3))) (set-garef 42 v 1) (garef v 1)))
+(assert-equal 42 (let ((v (create-vector 3))) (set-garef 42 v 1) (aref v 1)))
 
 ;; #(...)リテラル
 (assert-equal 1 (aref #(1 2 3) 0))

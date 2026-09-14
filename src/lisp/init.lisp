@@ -259,10 +259,21 @@
   (cond ((symbolp place) `(setq ,place ,value))
         ((eq (car place) 'car) `(set-car ,(car (cdr place)) ,value))
         ((eq (car place) 'cdr) `(set-cdr ,(car (cdr place)) ,value))
-        ((eq (car place) 'aref) `(set-aref ,@(cdr place) ,value))
+        ((eq (car place) 'aref) `(set-aref ,value ,@(cdr place)))
+        ((eq (car place) 'garef) `(set-garef ,value ,@(cdr place)))
         ((eq (car place) 'elt) `(set-elt ,value ,@(cdr place)))
         ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
-        ((eq (car place) 'property) `(set-property ,value ,@(cdr place)))))
+        ((eq (car place) 'property) `(set-property ,value ,@(cdr place)))
+        ((eq (car place) 'dynamic) `(%%set-dynamic ',(car (cdr place)) ,value))
+        (t
+         ;; ISLisp仕様§10.2: placeがマクロ形式なら展開してからsetfを適用する
+         ;; ((defmacro first (spot) `(car ,spot)) の後の (setf (first x) 2) の例)。
+         ;; macroexpand-1はマクロでなければformをそのまま返すので、変化しなければ
+         ;; 未対応のplaceとしてエラーにする
+         (let ((expanded (macroexpand-1 place)))
+           (if (eq expanded place)
+               (error "setf: unsupported place ~S" place)
+               `(setf ,expanded ,value))))))
 
 ;;; --- apply (§9) ---
 ;;;
@@ -637,12 +648,91 @@
       seq
       (%sequence-to-list-from seq 0 (length seq))))
 
+(defun %convert-error (obj class-name)
+  (signal-condition
+    (make-instance '<domain-error> ':object obj ':expected-class (%find-class class-name))
+    nil))
+
+;; 文字列を数値に変換し、目的のクラス(<integer>/<float>)でなければdomain-error
+;; (仕様の変換表 X(2): parse-numberと同じ、ただし目的クラスの数でなければエラー)
+(defun %convert-string-to-number (obj class-name)
+  (let ((n (parse-number obj)))
+    (if (typep n class-name) n (%convert-error obj class-name))))
+
+(defun %number-to-string (obj)
+  (let ((s (create-string-output-stream)))
+    (format s "~A" obj)
+    (get-output-stream-string s)))
+
+;; ISLisp仕様§17 convertの変換表(tmp/islisp-spec.txt 3888-3895行)を実装する。
+;; 「=」(恒等)と「X」(必須)に加え、「I」(実装定義だが提供必須)は文字<->整数を
+;; 文字コードで、文字/シンボル<->文字列を名前文字列で対応させる。「–」はdomain-error
 (defun %convert (obj class-name)
   (case class-name
-    ((<string>) (if (symbolp obj) (symbol-name obj) (error "convert: unsupported conversion to <string>" obj)))
-    ((<symbol>) (string-to-symbol obj))
-    ((<list>) (%sequence-to-list obj))
-    (t (error "convert: unsupported target class" class-name))))
+    ((<character>)
+     (cond ((characterp obj) obj)
+           ((integerp obj) (code-char obj))
+           (t (%convert-error obj class-name))))
+    ((<integer>)
+     (cond ((integerp obj) obj)
+           ((characterp obj) (char-code obj))
+           ((stringp obj) (%convert-string-to-number obj class-name))
+           (t (%convert-error obj class-name))))
+    ((<float>)
+     (cond ((floatp obj) obj)
+           ((integerp obj) (float obj))
+           ((stringp obj) (%convert-string-to-number obj class-name))
+           (t (%convert-error obj class-name))))
+    ((<symbol>)
+     (cond ((symbolp obj) obj)
+           ((stringp obj) (string-to-symbol obj))
+           ((characterp obj) (string-to-symbol (create-string 1 obj)))
+           (t (%convert-error obj class-name))))
+    ((<string>)
+     (cond ((stringp obj) obj)
+           ((symbolp obj) (symbol-name obj))
+           ((characterp obj) (create-string 1 obj))
+           ((numberp obj) (%number-to-string obj))
+           (t (%convert-error obj class-name))))
+    ((<general-vector>)
+     (cond ((general-vector-p obj) obj)
+           ((stringp obj) (apply #'vector (%sequence-to-list obj)))
+           ((listp obj) (apply #'vector obj))
+           (t (%convert-error obj class-name))))
+    ((<list>)
+     (cond ((listp obj) obj)
+           ((stringp obj) (%sequence-to-list obj))
+           ((general-vector-p obj) (%sequence-to-list obj))
+           (t (%convert-error obj class-name))))
+    (t (%convert-error obj class-name))))
+
+;;; --- create (§15.3) ---
+;;;
+;;; (create class initarg*) はISLisp仕様のインスタンス生成関数(make-instanceは
+;;; このカーネル独自の名前で、クラス名/クラスオブジェクトのどちらも受け付ける)。
+;;; 仕様の例((create (class <simple-error>) 'format-string ...))のように
+;;; initargをキーワードでない通常のシンボルで指定した場合は、defclassの:initargで
+;;; 宣言した同名のキーワード(:format-string)へ読み替える
+
+(defun %create-initarg-key (key)
+  (if (and (symbolp key)
+           (not (null key))
+           (> (length (symbol-name key)) 0)
+           (not (char= (elt (symbol-name key) 0) #\:)))
+      (string-to-symbol (string-append ":" (symbol-name key)))
+      key))
+
+(defun %create-normalize-initargs (initargs)
+  (if (null initargs)
+      nil
+      (cons (%create-initarg-key (car initargs))
+            (if (null (cdr initargs))
+                nil
+                (cons (car (cdr initargs))
+                      (%create-normalize-initargs (cdr (cdr initargs))))))))
+
+(defun create (class &rest initargs)
+  (apply #'make-instance class (%create-normalize-initargs initargs)))
 
 ;; (convert obj class-name) : class-nameは評価しない
 (defmacro convert (obj class-name)
@@ -772,9 +862,19 @@
 (defdynamic *standard-output* nil)
 (defdynamic *error-output* nil)
 
-(defun standard-input () (dynamic *standard-input*))
-(defun standard-output () (dynamic *standard-output*))
-(defun error-output () (dynamic *error-output*))
+;; ISLisp仕様§26: (standard-input)/(standard-output)/(error-output)は常にストリームを返す。
+;; with-standard-input等で動的束縛されていればそれを、されていなければ既定の
+;; コンソール(キーボード入力/画面出力)ストリームを返す。READ等の入力関数は
+;; stream引数省略時にC側で*standard-input*を直接見る(stream_lisp.cのresolve_input_args)
+(defun standard-input ()
+  (let ((s (dynamic *standard-input*)))
+    (if s s (%%keyboard-input-stream))))
+(defun standard-output ()
+  (let ((s (dynamic *standard-output*)))
+    (if s s (open-output-stream))))
+(defun error-output ()
+  (let ((s (dynamic *error-output*)))
+    (if s s (open-output-stream))))
 
 ;; dynamic-letの単一変数版として展開するだけ
 (defmacro with-standard-input (stream-form &rest body)
@@ -805,11 +905,16 @@
 ;; float」という/とは異なる型変換規則を持つ。3引数以上は左から逐次適用する(divisorが
 ;; 複数ある場合の仕様の定義通り)。
 (defun %quotient2 (dividend divisor)
-  (if (and (or (fixnump dividend) (bignump dividend))
-           (or (fixnump divisor) (bignump divisor))
-           (= (mod dividend divisor) 0))
-      (div dividend divisor)
-      (/ (float dividend) (float divisor))))
+  (if (= divisor 0)
+      ;; ISLisp仕様§19.4: 除数が0(整数0でも0.0でも)なら<division-by-zero>
+      (signal-condition
+        (make-instance '<division-by-zero> ':operation 'quotient ':operands (list dividend divisor))
+        nil)
+      (if (and (or (fixnump dividend) (bignump dividend))
+               (or (fixnump divisor) (bignump divisor))
+               (= (mod dividend divisor) 0))
+          (div dividend divisor)
+          (/ (float dividend) (float divisor)))))
 
 (defun quotient (dividend &rest divisors)
   (if divisors

@@ -287,9 +287,9 @@ void test_os_print_vector_empty() {
 void test_os_print_vector_1d() {
     reset_capture();
     lisp_val_t array = primitive_make_array(os_make_cons(os_make_fixnum(3), nil), nil);
-    primitive_set_aref(make_val_list(3, array, os_make_fixnum(0), os_make_fixnum(10)), nil);
-    primitive_set_aref(make_val_list(3, array, os_make_fixnum(1), os_make_fixnum(20)), nil);
-    primitive_set_aref(make_val_list(3, array, os_make_fixnum(2), os_make_fixnum(30)), nil);
+    primitive_set_aref(make_val_list(3, os_make_fixnum(10), array, os_make_fixnum(0)), nil);
+    primitive_set_aref(make_val_list(3, os_make_fixnum(20), array, os_make_fixnum(1)), nil);
+    primitive_set_aref(make_val_list(3, os_make_fixnum(30), array, os_make_fixnum(2)), nil);
     os_print(array, &g_frame_buffer);
     assert(strcmp(captured(), "#(10 20 30)") == 0, "1次元配列は\"#(10 20 30)\"のように表示される");
 }
@@ -298,12 +298,12 @@ void test_os_print_vector_multi_dim() {
     reset_capture();
     lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(2), nil));
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
-    primitive_set_aref(make_val_list(4, array, os_make_fixnum(0), os_make_fixnum(0), os_make_fixnum(1)), nil);
-    primitive_set_aref(make_val_list(4, array, os_make_fixnum(0), os_make_fixnum(1), os_make_fixnum(2)), nil);
-    primitive_set_aref(make_val_list(4, array, os_make_fixnum(1), os_make_fixnum(0), os_make_fixnum(3)), nil);
-    primitive_set_aref(make_val_list(4, array, os_make_fixnum(1), os_make_fixnum(1), os_make_fixnum(4)), nil);
+    primitive_set_aref(make_val_list(4, os_make_fixnum(1), array, os_make_fixnum(0), os_make_fixnum(0)), nil);
+    primitive_set_aref(make_val_list(4, os_make_fixnum(2), array, os_make_fixnum(0), os_make_fixnum(1)), nil);
+    primitive_set_aref(make_val_list(4, os_make_fixnum(3), array, os_make_fixnum(1), os_make_fixnum(0)), nil);
+    primitive_set_aref(make_val_list(4, os_make_fixnum(4), array, os_make_fixnum(1), os_make_fixnum(1)), nil);
     os_print(array, &g_frame_buffer);
-    assert(strcmp(captured(), "#(1 2 3 4)") == 0, "多次元配列も次元の区切りなしにフラットに表示される");
+    assert(strcmp(captured(), "#2A((1 2) (3 4))") == 0, "多次元配列はISLisp仕様の#nA(...)表記でネストして表示される");
 }
 
 void test_os_print_native_function() {
@@ -315,7 +315,7 @@ void test_os_print_native_function() {
 
 void test_os_print_jit_function() {
     reset_capture();
-    lisp_val_t fn = os_make_jit_function((lisp_addr_t)(void *)primitive_car);
+    lisp_val_t fn = os_make_jit_function((lisp_addr_t)(void *)primitive_car, nil);
     os_print(fn, &g_frame_buffer);
     assert(strcmp(captured(), "#<FUNCTION-COMPILED>") == 0, "za.cがコンパイルしたnative関数は\"#<FUNCTION-COMPILED>\"と表示される");
 }

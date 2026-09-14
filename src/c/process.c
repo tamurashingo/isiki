@@ -400,6 +400,8 @@ void initialize_processes(frame_buffer *buffers) {
         proc->ready = 0;
         proc->env = 0;
         os_gc_register_root(&proc->env);
+        proc->live_blocks = 0;
+        os_gc_register_root(&proc->live_blocks);
         proc->gc_roots = 0;
     }
 

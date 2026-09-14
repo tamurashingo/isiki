@@ -289,8 +289,10 @@ void test_open_input_stream_read_char_reads_fake_data() {
     lisp_val_t c2 = cc_read_char(args, nil);
     assert(c2 == os_make_char('i'), "2文字目'i'が読める");
 
-    lisp_val_t c3 = cc_read_char(args, nil);
-    assert(c3 == nil, "EOFに達したらnilが返る");
+    // eos-error-p=nilを渡すとEOFでnil(既定のtはinit.lisp未ロードのユニットテストでは
+    // os_signal_conditionがg_sym_eval_errorを返す)
+    lisp_val_t c3 = cc_read_char(os_make_cons(stream, os_make_cons(nil, nil)), nil);
+    assert(c3 == nil, "EOFに達したらnilが返る(eos-error-p=nil)");
 
     cc_close(args, nil);
 }
@@ -313,8 +315,8 @@ void test_close_then_read_char_returns_nil() {
     lisp_val_t args = os_make_cons(stream, nil);
 
     cc_close(args, nil);
-    lisp_val_t r = cc_read_char(args, nil);
-    assert(r == nil, "close後のread-charはnilを返す");
+    lisp_val_t r = cc_read_char(os_make_cons(stream, os_make_cons(nil, nil)), nil);
+    assert(r == nil, "close後のread-charはnilを返す(eos-error-p=nil)");
 }
 
 void test_read_parses_sexpr_from_stream() {
@@ -395,7 +397,9 @@ void test_string_input_stream_reads_content() {
 
     assert(cc_read_char(args, nil) == os_make_char('a'), "string-input-streamの1文字目'a'が読める");
     assert(cc_read_char(args, nil) == os_make_char('b'), "string-input-streamの2文字目'b'が読める");
-    assert(cc_read_char(args, nil) == nil, "string-input-streamの末尾はEOFでnil");
+    assert(cc_read_char(os_make_cons(stream, os_make_cons(nil, nil)), nil) == nil, "string-input-streamの末尾はEOFでnil(eos-error-p=nil)");
+    assert(cc_read_char(os_make_cons(stream, os_make_cons(nil, os_make_cons(os_make_fixnum(7), nil))), nil) == os_make_fixnum(7),
+           "EOFでeos-error-p=nilならeos-valueを返す");
 }
 
 void test_string_output_stream_accumulates_and_resets() {
@@ -440,7 +444,7 @@ void test_read_line_reads_up_to_newline() {
     os_string_to_cstr(line2, buf2, sizeof(buf2));
     assert(strcmp(buf2, "bar") == 0, "read-lineは末尾改行の無い2行目'bar'も返す");
 
-    assert(cc_read_line(args, nil) == nil, "read-lineは即EOFでnilを返す");
+    assert(cc_read_line(os_make_cons(stream, os_make_cons(nil, nil)), nil) == nil, "read-lineは即EOFでnilを返す(eos-error-p=nil)");
 }
 
 void test_stream_ready_p_is_always_true() {
@@ -452,7 +456,7 @@ void test_read_byte_and_write_byte_wrap_char_ops() {
     lisp_val_t in_stream = cc_create_string_input_stream(os_make_cons(os_make_string("A"), nil), nil);
     lisp_val_t byte_val = cc_read_byte(os_make_cons(in_stream, nil), nil);
     assert(byte_val == os_make_fixnum(65), "read-byteは文字コードのFIXNUMを返す('A'=65)");
-    assert(cc_read_byte(os_make_cons(in_stream, nil), nil) == nil, "read-byteもEOFでnilを返す");
+    assert(cc_read_byte(os_make_cons(in_stream, os_make_cons(nil, nil)), nil) == nil, "read-byteもEOFでnilを返す(eos-error-p=nil)");
 
     lisp_val_t out_stream = cc_create_string_output_stream(nil, nil);
     lisp_val_t args = os_make_cons(os_make_fixnum(66), os_make_cons(out_stream, nil));

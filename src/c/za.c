@@ -1031,7 +1031,13 @@ _Static_assert(sizeof(za_syms_t) == 25 * sizeof(lisp_val_t),
  * 再取得する(スロットの値そのものではなくアドレスを埋め込むので安全)。
  * プロセス生涯で解放しない(JITコードバッファ自体も縮小しないのと同じ考え方)。
  */
-#define ZA_MAX_LAMBDA_SLOTS 40
+/* 2026-09-14: blockのNLX段消費を伴うZA_MAX_NLX_DEPTH 4→8の拡張で、深くネストした
+ * block/catch/unwind-protectを含む関数もJIT化されるようになり、lambda/flet/labelsを
+ * 持つ関数のJIT成功数が増えた分だけ恒久消費が増える。テスト一式(qemu_boot_test.lisp)
+ * の末尾でenvironment_literal_slots_test/za_code_imm_testの「新規flet/labelsがまだ
+ * JIT化できる」確認が40では枯渇して失敗するようになったため、64へ広げる
+ * (GC_MAX_EXTRA_ROOTSも同時に160→256へ) */
+#define ZA_MAX_LAMBDA_SLOTS 64
 static lisp_val_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS];
 static UINT64 g_za_lambda_slot_count = 0;
 /** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
@@ -1209,10 +1215,16 @@ static void za_gc_unlink_node(gc_rootnode *node) {
  * まま別の再帰的コンパイル呼び出し(GCを起こしうる)を挟んで保持するための
  * 深さ指定スロット配列。同時に生きているspanningスロットは常に1本のスタック
  * として積み重なるため、種類を問わず同じ配列を使い回す。 */
-#define ZA_MAX_NLX_DEPTH       4
+/* blockも(生きているblockリストの退避先として)1段消費するようになったため、
+ * 4から8へ拡張した。168 + 8*24 = 360 で、直後の未使用領域(272-655)に収まる
+ * (他オフセットは無変更)。 */
+#define ZA_MAX_NLX_DEPTH       8
 #define ZA_OFF_NLX_BASE        168
+/* コンパイル中の各nlx段が`block`(NLXスロットを使わず、live_blocksのpush/popだけを
+ * 行う段)かどうかのビットマスク(bit i = nlx_depth i)。za_compile_blockがbodyの
+ * コンパイル中だけ立て、za_compile_goがblockを飛び越えてよいかの判定に使う */
+static UINT64 g_za_block_level_mask = 0;
 #define ZA_NLX_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
-/* 168 + 4*24 = 264-271: 16バイト境界を保つためのpadding */
 /* 旧ZA_OFF_ARG_BASE(=272)〜656手前は拡張15でdepth化スロット(ZA_OFF_CALL_BASE配下)へ
  * 移動した。この272-655は未使用のまま残る(ZA_OFF_LOCAL_BASE=656より前の他オフセットは
  * 無変更)。ZA_ARG_SLOT_SIZEは新しいdepth化スロットのサイズ計算にも引き続き使う。 */
@@ -1563,16 +1575,16 @@ static UINT64 za_ensure_trampoline(void) {
     jit_cmp_rax_r11();
     UINT64 jne_patch = jit_emit_jne_rel32_placeholder();
 
-    // obj[2](word2)がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)なら、
-    // rdx(env)を呼び出し元のenvではなくobj[3](定義時に捕捉した自由変数を保持する環境)に
+    // obj[3](word3)がNILでなければ(トランスパイラがリフトしたlambdaのクロージャの捕捉環境、
+    // またはJITコンパイル済みdefunの定義時環境)、rdx(env)を呼び出し元のenvではなくobj[3]に
     // 差し替える。eval.cのapply_functionが行う分岐と同じ判断をここでも行う必要がある
     // (このtrampolineはapply_functionを経由しない直接jmpの高速pathだから)
-    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 16); // rax = obj[2] (word2)
-    jit_movabs_reg(ZA_REG_R11, os_make_fixnum(2));
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 24); // rax = obj[3] (word3)
+    jit_movabs_reg(ZA_REG_R11, nil);
     jit_cmp_rax_r11();
-    UINT64 jne_not_closure = jit_emit_jne_rel32_placeholder();
-    jit_mov_reg_from_mem_disp8(ZA_REG_RDX, ZA_REG_R10, 24); // rdx = obj[3] (captured env)
-    jit_patch_rel32(jne_not_closure);
+    UINT64 je_no_env = jit_emit_je_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RAX); // rdx = obj[3] (definition/captured env)
+    jit_patch_rel32(je_no_env);
 
     // native高速path: ABI-M4により、obj[1](word1)はza_fn_meta_tへの生ポインタに
     // なった(直接の関数アドレスではない)。r11 = obj[1](meta)、続けて
@@ -2076,6 +2088,9 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
                              const za_local_scope_t *locals, const za_syms_t *syms,
                              lisp_val_t env, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 trampoline_offset,
                              UINT64 arith_depth);
+
+/** ABI-M5高速pathの呼び出し先envをrcxへ載せる(定義はza_compile_unwind_protectの直前)。 */
+static void za_emit_load_callee_env_rcx(void);
 
 /** `(unwind-protect protected-form . cleanup-forms)`。 */
 static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
@@ -3707,8 +3722,8 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             za_load_slot(ZA_REG_RCX, za_call_saved_head_off(call_depth));
             jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
             jit_call_r11();
+            za_emit_load_callee_env_rcx();
             jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R13);
-            za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
             if (argc >= 1) {
                 za_load_slot(ZA_REG_RDX, za_arg_val_off(call_depth, 0));
             }
@@ -3811,7 +3826,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             // fixed_entryの呼び出し規約(rcx=env, rdx=arg0, r8=arg1, r9=arg2)に
             // 沿って、フレームを解体する前に値スロットからレジスタへ読み出して
             // おく(6a非末尾の直接call手順、既存のconsリスト版6bと同型)。
-            za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
+            za_emit_load_callee_env_rcx();
             if (argc >= 1) {
                 za_load_slot(ZA_REG_RDX, za_arg_val_off(call_depth, 0));
             }
@@ -4148,11 +4163,47 @@ static int za_compile_block(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     }
     lisp_val_t body = cc_cdr(rest);
     GC_PROTECT(body);
+    if (nlx_depth >= 64) {
+        return 0; // g_za_block_level_maskのビット数の上限
+    }
 
-    if (!za_compile_body_forms(body, params, fixed_count, locals, syms, env, nlx_depth, tb_ctx, call_depth,
-                                trampoline_offset, arith_depth)) {
+    // ISLisp仕様§14.7: eval.cのeval_blockと同じく、bodyの動的extentの間だけこのblockの
+    // 名前をプロセスの「生きているblock」リスト(process_t.live_blocks)へ積む
+    // (os_live_block_push)。JIT関数内で作られたクロージャ(インタプリタ実行)からの
+    // return-fromが、このblockを生きていると判定できるようにするため。
+    // 戻す側はGCスロットに保存値を持たず、body評価後にos_live_block_popで先頭を1つ
+    // 取り除く(push/popは常に対になる: bodyは非末尾でコンパイルされ、非局所脱出も
+    // 値として必ずこのblockのエピローグへ戻ってくる。唯一の例外であるgoによる
+    // 飛び越えは、za_compile_goが飛び越えるblockの数だけpopを発行してから jmp する)。
+    // そのためnlx_depthは1段消費するがNLXスロット自体は使わない。どの段がblockかは
+    // g_za_block_level_maskで記録し、za_compile_goが参照する
+    if (name == nil) {
+        jit_movabs_reg(ZA_REG_RCX, nil);
+    } else {
+        UINT64 push_name_off = za_emit_symbol_name(name);
+        jit_movabs_self_ref(ZA_REG_RCX, push_name_off);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
+        jit_call_r11();
+        jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    }
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_live_block_push);
+    jit_call_r11();
+
+    UINT64 level_bit = 1ULL << nlx_depth;
+    UINT64 saved_mask = g_za_block_level_mask;
+    g_za_block_level_mask |= level_bit;
+    int body_ok = za_compile_body_forms(body, params, fixed_count, locals, syms, env, nlx_depth + 1, tb_ctx,
+                                        call_depth, trampoline_offset, arith_depth);
+    g_za_block_level_mask = saved_mask;
+    if (!body_ok) {
         return 0;
     }
+
+    // rax=bodyの結果(通常値または脱出シグナル)。r13(callee-saved)へ退避してリストを戻す
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_live_block_pop);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
 
     // 結果が制御転送でなければ(通常経路)そのまま返す。制御転送ならobj[1]==nameを
     // チェックしてobj[2]を返す(eval_blockと同じ。obj[0]のmagicはチェックしない —
@@ -5290,6 +5341,29 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
     return 1;
 }
 
+/**
+ * ABI-M5の高速path(fixed_entryを直接call/jmp)で呼び出し先へ渡すenvをrcxへ載せる。
+ * ZA_OFF_FN_VALのcellが指すfn_objのword3(定義時環境。os_make_jit_function参照)が
+ * NILでなければそれを、NILなら自分のenv(ZA_OFF_ENV_VAL)を渡す。trampoline
+ * (za_ensure_trampoline)とeval.cのapply_functionが行う判断と同じ。
+ * rax/r10/r11/rcxを破壊する(r13は触らない)。
+ */
+static void za_emit_load_callee_env_rcx(void) {
+    za_load_slot(ZA_REG_R10, ZA_OFF_FN_VAL);                 // cell(タグ付き)
+    jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+    jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);   // fn_obj(タグ付き)
+    jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 24);  // rax = fn_obj word3
+    jit_movabs_reg(ZA_REG_R11, nil);
+    jit_cmp_rax_r11();
+    UINT64 je_nil = jit_emit_je_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
+    UINT64 jmp_done = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32(je_nil);
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
+    jit_patch_rel32(jmp_done);
+}
+
 static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                                       const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                                       UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 trampoline_offset,
@@ -5330,10 +5404,43 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
         { ZA_BAIL_LINE(); return 0; }
     }
 
+    // ISLisp仕様§14.7.2(eval.cのeval_unwind_protectと同じ規則):
+    //   cleanupが正常終了 → protected-formの結果(制御転送を含む)をそのまま返す
+    //   cleanupが非局所脱出 かつ protected-formは正常値 → cleanupの脱出を伝播する
+    //   cleanupが非局所脱出 かつ protected-formも脱出中   → <control-error>をsignalする
+    UINT64 cleanup_ct = za_emit_ct_check_and_jmp_if_transfer();  // rax=cleanupの値、脱出ならjmp
+
     za_load_slot(ZA_REG_RAX, val_off);
     jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
     za_emit_gc_unlink_slot(node_off);
     jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 done_normal = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(cleanup_ct);
+    // rax=cleanupの脱出シグナル。protected-formの結果と入れ替えてスロット(GCリンク済み)へ退避し、
+    // protected-formの結果が脱出かどうかを判定する
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RAX, val_off);
+    za_store_slot(ZA_REG_R13, val_off);
+    UINT64 both_ct = za_emit_ct_check_and_jmp_if_transfer();
+    // protected-formは正常値: cleanupの脱出を結果にする
+    za_load_slot(ZA_REG_RAX, val_off);
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_emit_gc_unlink_slot(node_off);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    UINT64 done_cleanup_exit = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(both_ct);
+    // 両方脱出: <control-error>
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_signal_control_error);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_emit_gc_unlink_slot(node_off);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+
+    jit_patch_rel32(done_normal);
+    jit_patch_rel32(done_cleanup_exit);
     return 1;
 }
 
@@ -5449,8 +5556,16 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
 }
 
 static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx) {
-    if (tb_ctx == 0 || nlx_depth != tb_ctx->base_nlx_depth) {
+    if (tb_ctx == 0 || nlx_depth < tb_ctx->base_nlx_depth) {
         { ZA_BAIL_LINE(); return 0; }
+    }
+    // tagbodyより深い段があってよいのは、それが全て`block`(GCスロットを持たない。
+    // za_compile_block参照)の場合だけ。catch/unwind-protect等のspanningスロットを
+    // 開いたまま jmp するとGCルートリンクが残留するので従来通り断念する
+    for (UINT64 d = tb_ctx->base_nlx_depth; d < nlx_depth; d++) {
+        if (d >= 64 || !(g_za_block_level_mask & (1ULL << d))) {
+            { ZA_BAIL_LINE(); return 0; }
+        }
     }
     lisp_val_t rest = cc_cdr(form);
     if (rest == nil || (rest & TAG_MASK) != TAG_CONS || cc_cdr(rest) != nil) {
@@ -5478,6 +5593,12 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
         tb_ctx->tags[idx].pending_count = 0;
     }
 
+    // 飛び越えるblock(tagbodyより深い段)の数だけlive_blocksをpopしてから jmp する
+    for (UINT64 d = tb_ctx->base_nlx_depth; d < nlx_depth; d++) {
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_live_block_pop);
+        jit_call_r11();
+    }
+
     if (tb_ctx->tags[idx].resolved) {
         jit_emit_jmp_to(tb_ctx->tags[idx].offset);
     } else {
@@ -5491,6 +5612,13 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
 
 /** [測定] JITバッファの使用量を割り込みハンドラから読むための入口 */
 UINT64 g_jit_used_for_diag(void) { return g_jit_used; }
+
+/** (%%diag-jit-used) → JITコード領域の使用バイト数(JIT_CODE_SIZEに対する消費量の診断用) */
+lisp_val_t cc_diag_jit_used(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(g_jit_used);
+}
 
 /** [測定] za_try_compile_defunの呼び出し回数。ハングが「1回のコンパイルの中」か
     「何度も呼ばれている」かを切り分けるため、タイマーサンプラから読む */
@@ -5821,9 +5949,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     lisp_addr_t cons_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (cons_entry_offset - entry));
     if (use_param_slots) {
         lisp_addr_t fixed_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (fixed_entry_offset - entry));
-        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count);
+        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, env);
     }
-    return os_make_jit_function(cons_entry_addr);
+    return os_make_jit_function(cons_entry_addr, env);
 }
 
 /**
@@ -5849,6 +5977,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
  * 自体には登録しない)。 */
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-JIT-USED"), os_make_native_function((lisp_addr_t)(void *)cc_diag_jit_used), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
     os_set_function(os_make_symbol("%%ZA-SCAN-SYNTH"), os_make_native_function((lisp_addr_t)(void *)primitive_za_scan_synth), global_environment);
     os_set_function(os_make_symbol("%%ZA-DIAG-CLOBBER-PROBE"), os_make_native_function((lisp_addr_t)(void *)primitive_za_diag_clobber_probe), global_environment);
@@ -5880,6 +6009,7 @@ static lisp_val_t primitive_destroy_environment_reclaim(lisp_val_t args, lisp_va
 
 void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-JIT-USED"), os_make_native_function((lisp_addr_t)(void *)cc_diag_jit_used), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
     os_set_function(os_make_symbol("%%ZA-SCAN-SYNTH"), os_make_native_function((lisp_addr_t)(void *)primitive_za_scan_synth), global_environment);
     os_set_function(os_make_symbol("%%ZA-DIAG-CLOBBER-PROBE"), os_make_native_function((lisp_addr_t)(void *)primitive_za_diag_clobber_probe), global_environment);

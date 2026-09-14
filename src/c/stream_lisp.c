@@ -15,7 +15,79 @@ static os_stream_t *stream_raw(lisp_val_t stream) {
 /** kindが入力可能(READ-CHAR等が使える)なストリーム種別かどうかを判定する */
 static int stream_kind_is_input(stream_kind_t kind) {
     return kind == STREAM_9P_FILE_READ || kind == STREAM_9P_FILE_IO || kind == STREAM_STRING_INPUT
-        || kind == STREAM_FAT_FILE_IO;
+        || kind == STREAM_FAT_FILE_IO || kind == STREAM_INPUT_KEYBOARD;
+}
+
+/** キーボード入力ストリーム(ISLisp仕様の既定の(standard-input))を新しく作る */
+static lisp_val_t make_keyboard_input_stream(void) {
+    os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
+    os_stream_open_keyboard_input(raw, os_process_stdin_read_char);
+    return os_make_stream(raw);
+}
+
+/** (%%keyboard-input-stream) → 新しいキーボード入力ストリーム。init.lispのstandard-inputが
+ * *standard-input*が束縛されていないときの既定値として使う */
+lisp_val_t cc_keyboard_input_stream(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return make_keyboard_input_stream();
+}
+
+/**
+ * ISLisp仕様§27.1の入力関数共通の引数 [input-stream [eos-error-p [eos-value]]] を解釈する。
+ * input-stream省略時は動的変数*standard-input*(with-standard-inputで束縛される)を使い、
+ * それも束縛されていなければキーボード入力ストリームを新しく作る。
+ * eos-error-pの既定はt(終端でエラー)、eos-valueの既定はnil。
+ * @param args 評価済み引数リスト
+ * @param out_stream 使う入力ストリーム(MAGIC_STREAM)の格納先
+ * @param out_eos_error_p 終端でconditionをsignalするかどうかの格納先
+ * @param out_eos_value 終端でsignalしない場合に返す値の格納先
+ */
+static void resolve_input_args(lisp_val_t args, lisp_val_t *out_stream, int *out_eos_error_p, lisp_val_t *out_eos_value) {
+    // os_make_symbol/make_keyboard_input_streamは割り当てを伴いGCを誘発しうるので、
+    // それを跨いで使うargs/streamは保護する
+    GC_PROTECT(args);
+    lisp_val_t stream = (args != nil) ? cc_car(args) : nil;
+    GC_PROTECT(stream);
+    if (stream == nil) {
+        stream = os_get_dynamic(os_make_symbol("*STANDARD-INPUT*"));
+    }
+    if (stream == nil) {
+        stream = make_keyboard_input_stream();
+    }
+    lisp_val_t rest = (args != nil) ? cc_cdr(args) : nil;
+    *out_eos_error_p = 1;
+    *out_eos_value = nil;
+    if (rest != nil) {
+        *out_eos_error_p = (cc_car(rest) != nil);
+        lisp_val_t rest2 = cc_cdr(rest);
+        if (rest2 != nil) {
+            *out_eos_value = cc_car(rest2);
+        }
+    }
+    *out_stream = stream;
+}
+
+/**
+ * 入力ストリームの終端に達した場合の共通処理(ISLisp仕様§27.1)。eos-error-pが真なら
+ * <end-of-stream>(:stream stream)をsignalし、偽ならeos-valueを返す。
+ */
+static lisp_val_t handle_end_of_stream(lisp_val_t stream, int eos_error_p, lisp_val_t eos_value, lisp_val_t env) {
+    if (!eos_error_p) {
+        return eos_value;
+    }
+    GC_PROTECT(stream);
+    GC_PROTECT(env);
+    // 割り当てを1つずつ行い、それぞれの結果を次の割り当てを跨いで保護する
+    // (C言語の引数評価順に依存したネストは避ける。documents/pitfalls.md 原則4)
+    lisp_val_t kw_stream = os_make_symbol(":STREAM");
+    GC_PROTECT(kw_stream);
+    lisp_val_t class_sym = os_make_symbol("<END-OF-STREAM>");
+    GC_PROTECT(class_sym);
+    lisp_val_t initargs = os_make_cons(stream, nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(kw_stream, initargs);
+    return os_signal_condition(class_sym, initargs, env);
 }
 
 /** kindが出力可能(WRITE-CHAR等が使える)なストリーム種別かどうかを判定する */
@@ -100,7 +172,13 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t cc_open_output_stream(lisp_val_t args, lisp_val_t env) {
-    (void)args;
+    // ISLisp仕様§27.2: (open-output-stream filename [element-class]) はファイルへの
+    // バイト出力ストリーム。ファイル名を渡された場合はopen-output-fileと同じ実装。
+    // 引数無しの(open-output-stream)はこのカーネル独自の拡張で、画面出力ストリームを返す
+    // ((standard-output)の既定値、device.lisp/ide.lisp/utility.lispが使う)
+    if (args != nil && (cc_car(args) & TAG_MASK) == TAG_STRING) {
+        return cc_open_output_file(args, env);
+    }
     (void)env;
     os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
     os_stream_open_screen_output(raw, get_current_process()->stdout_buffer);
@@ -114,11 +192,14 @@ lisp_val_t cc_close(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t cc_read_char(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    os_stream_t *raw = stream_raw(cc_car(args));
+    lisp_val_t stream;
+    int eos_error_p;
+    lisp_val_t eos_value;
+    resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    os_stream_t *raw = stream_raw(stream);
     char ch;
     if (!os_stream_read_char(raw, &ch)) {
-        return nil;
+        return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
     return os_make_char(ch);
 }
@@ -132,9 +213,32 @@ lisp_val_t cc_write_char(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t cc_read(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    os_stream_t *raw = stream_raw(cc_car(args));
-    return os_read_stream(raw);
+    lisp_val_t stream;
+    int eos_error_p;
+    lisp_val_t eos_value;
+    resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    GC_PROTECT(stream);
+    GC_PROTECT(eos_value);
+    os_stream_t *raw = stream_raw(stream);
+    int eof;
+    int has_pending;
+    char pending;
+    lisp_val_t result = os_read_stream_ex(raw, &eof, &has_pending, &pending);
+    GC_PROTECT(result);
+    if (eof) {
+        return handle_end_of_stream(stream, eos_error_p, eos_value, env);
+    }
+    // readerが先読みして未消費のまま残した1文字を、(読み取り中のGCで再配置されて
+    // いるかもしれないので)ハンドルから取り直したos_stream_tの先読みスロットへ戻し、
+    // 続くread-char等で失われないようにする
+    if (has_pending) {
+        raw = stream_raw(stream);
+        if (!raw->has_lookahead) {
+            raw->has_lookahead = 1;
+            raw->lookahead = pending;
+        }
+    }
+    return result;
 }
 
 lisp_val_t cc_open_stream_p(lisp_val_t args, lisp_val_t env) {
@@ -293,18 +397,24 @@ lisp_val_t cc_get_output_stream_string(lisp_val_t args, lisp_val_t env) {
 }
 
 lisp_val_t cc_preview_char(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    os_stream_t *raw = stream_raw(cc_car(args));
+    lisp_val_t stream;
+    int eos_error_p;
+    lisp_val_t eos_value;
+    resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    os_stream_t *raw = stream_raw(stream);
     char ch;
     if (!os_stream_preview_char(raw, &ch)) {
-        return nil;
+        return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
     return os_make_char(ch);
 }
 
 lisp_val_t cc_read_line(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    os_stream_t *raw = stream_raw(cc_car(args));
+    lisp_val_t stream;
+    int eos_error_p;
+    lisp_val_t eos_value;
+    resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    os_stream_t *raw = stream_raw(stream);
 
     #define READ_LINE_MAX 512
     char buf[READ_LINE_MAX];
@@ -321,7 +431,7 @@ lisp_val_t cc_read_line(lisp_val_t args, lisp_val_t env) {
         }
     }
     if (!got_any) {
-        return nil;
+        return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
     return make_string_from_bytes((const UINT8 *)buf, n);
     #undef READ_LINE_MAX
@@ -347,8 +457,15 @@ lisp_val_t cc_read_byte1(lisp_val_t stream) {
 }
 
 lisp_val_t cc_read_byte(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    return cc_read_byte1(cc_car(args));
+    lisp_val_t stream;
+    int eos_error_p;
+    lisp_val_t eos_value;
+    resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    lisp_val_t result = cc_read_byte1(stream);
+    if (result == nil) {
+        return handle_end_of_stream(stream, eos_error_p, eos_value, env);
+    }
+    return result;
 }
 
 lisp_val_t cc_write_byte(lisp_val_t args, lisp_val_t env) {
@@ -400,6 +517,18 @@ lisp_val_t cc_file_position(lisp_val_t args, lisp_val_t env) {
     }
     if (raw->kind == STREAM_STRING_OUTPUT) {
         return os_make_fixnum(raw->str_len);
+    }
+    if (raw->kind == STREAM_9P_FILE_READ || raw->kind == STREAM_9P_FILE_IO || raw->kind == STREAM_FAT_FILE_IO) {
+        // 読み込み側: next_offsetはチャンク単位で先読みした位置なので、バッファの未読み分と
+        // preview-char用の先読み1文字を差し引いた論理位置(次にread-byte/read-charが返す
+        // バイトの位置)を返す(ISLisp仕様§28の (read-byte) 後に (file-position) => 1 の例)
+        UINT64 unread = raw->buf_count - raw->buf_pos;
+        UINT64 pos = raw->next_offset - unread - (raw->has_lookahead ? 1 : 0);
+        return os_make_fixnum(pos);
+    }
+    if (raw->kind == STREAM_9P_FILE_WRITE || raw->kind == STREAM_FAT_FILE_WRITE) {
+        // 書き込み側: flush済みの位置に未flushのバッファ分を足した論理位置
+        return os_make_fixnum(raw->next_offset + raw->write_buf_len);
     }
     return os_make_fixnum(raw->next_offset);
 }
@@ -487,4 +616,5 @@ void os_register_streams(void) {
     os_set_function(os_make_symbol("FILE-POSITION"), os_make_native_function((lisp_addr_t)(void *)cc_file_position), global_environment);
     os_set_function(os_make_symbol("SET-FILE-POSITION"), os_make_native_function((lisp_addr_t)(void *)cc_set_file_position), global_environment);
     os_set_function(os_make_symbol("FILE-LENGTH"), os_make_native_function((lisp_addr_t)(void *)cc_file_length), global_environment);
+    os_set_function(os_make_symbol("%%KEYBOARD-INPUT-STREAM"), os_make_native_function((lisp_addr_t)(void *)cc_keyboard_input_stream), global_environment);
 }
