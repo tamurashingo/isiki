@@ -113,11 +113,13 @@ tools/repro/cc_car_hang.sh
    覆わないので棄却されていない。`za.c` の固定長配列
    (`usages[]`/`items[]`/`end_patches[]`/`init_forms[]` 等)の境界を
    検査するのが次の一手。
-2. **`za_compile_let` の `r8` と同根の可能性。** 2026-09-12 に
-   ループ上限 `r8 = 0x449AA7E0` がゴミになる件を追い、機序を特定できないまま
-   `init_forms`/`operand_forms`/`arg_forms` の保護追加で消えた。
-   **どちらも za.c のループまわりで、値がゴミになり、無関係な変更で消え、
-   機序が未特定。3件目が出たら3つ並べて見ること。**
+2. **`za_compile_let` の `r8`(→ 2026-09-14 に「r14 の二次症状」として確定)。**
+   2026-09-12 にループ上限 `r8 = 0x449AA7E0` がゴミになる件を追い、機序を特定
+   できないまま `init_forms`/`operand_forms`/`arg_forms` の保護追加で消えた。
+   `r8` は caller-saved なので r14 と同じ機序では壊れないが、2×2 の実験で
+   「配列保護なし + r14 修正なし」だけが let のコンパイルを壊し(Floyd 検出で断念)、
+   r14 修正だけで消えた。間接経路で確定。値そのものの出所は未特定。
+   performance-measurement.md「第1部: `za_compile_let` の `r8` の記録確定」。
 
 ### 方針(解決後)
 
