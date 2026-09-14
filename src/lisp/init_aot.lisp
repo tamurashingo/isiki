@@ -65,20 +65,27 @@
 
 ;; mapcarと同様だが、fnには要素そのものではなく後続のsublist(cdrで縮んでいく
 ;; リスト自身)を適用する。
-(defun maplist (fn list)
-  (if (null list)
+;; ISLisp仕様§21.4: maplist/maplはmapcarと同じく1つ以上のリストを受け取り、対応する
+;; sublist群をまとめてfnへ渡す。いずれかのリストが尽きた時点で終了する
+;; (%lists-cdr/%lists-some-nullはmapcarと共用)。
+(defun %maplist-lists (fn lists)
+  (if (or (null lists) (%lists-some-null lists))
       nil
-      (cons (funcall fn list) (maplist fn (cdr list)))))
+      (cons (%%apply fn lists)
+            (%maplist-lists fn (%lists-cdr lists)))))
 
-(defun %mapl-1 (fn list)
-  (if (null list)
+(defun maplist (fn &rest lists)
+  (%maplist-lists fn lists))
+
+(defun %mapl-lists (fn lists)
+  (if (or (null lists) (%lists-some-null lists))
       nil
-      (progn (funcall fn list) (%mapl-1 fn (cdr list)))))
+      (progn (%%apply fn lists) (%mapl-lists fn (%lists-cdr lists)))))
 
-;; maplistと同様にsublistへfnを副作用目的で適用し、list自身を返す(mapcの
+;; maplistと同様にsublistへfnを副作用目的で適用し、最初のlist自身を返す(mapcの
 ;; sublist版)。
-(defun mapl (fn list)
-  (progn (%mapl-1 fn list) list))
+(defun mapl (fn &rest lists)
+  (progn (%mapl-lists fn lists) (car lists)))
 
 ;;; --- list (M14) ---
 ;;;
@@ -160,7 +167,7 @@
   (let ((idx (%slot-index slot-name (%%class-slots (%%instance-class instance)) 0)))
     (if (null idx)
         'eval-error
-        (set-aref (%%instance-slots instance) idx value))))
+        (set-aref value (%%instance-slots instance) idx))))
 
 ;;; --- apply (M14) ---
 ;;;
@@ -216,20 +223,23 @@
 (defun mapcar (fn &rest lists)
   (%mapcar-lists fn lists))
 
-(defun %mapc-1 (fn list)
-  (if (null list)
+(defun %mapc-lists (fn lists)
+  (if (or (null lists) (%lists-some-null lists))
       nil
-      (progn (funcall fn (car list)) (%mapc-1 fn (cdr list)))))
+      (progn (%%apply fn (%lists-car lists)) (%mapc-lists fn (%lists-cdr lists)))))
 
-;; listの各要素にfnを副作用目的で適用し、list自身を返す。
-(defun mapc (fn list)
-  (progn (%mapc-1 fn list) list))
+;; 各listの対応する要素にfnを副作用目的で適用し、最初のlist自身を返す(ISLisp仕様§21.4: list+)。
+(defun mapc (fn &rest lists)
+  (progn (%mapc-lists fn lists) (car lists)))
 
-;; listの各要素にfnを適用した結果(リストであることを期待する)をappendで連結して返す。
-(defun mapcan (fn list)
-  (if (null list)
+(defun %mapcan-lists (fn lists)
+  (if (or (null lists) (%lists-some-null lists))
       nil
-      (append (funcall fn (car list)) (mapcan fn (cdr list)))))
+      (append (%%apply fn (%lists-car lists)) (%mapcan-lists fn (%lists-cdr lists)))))
+
+;; 各listの対応する要素にfnを適用した結果(リストであることを期待する)をappendで連結して返す。
+(defun mapcan (fn &rest lists)
+  (%mapcan-lists fn lists))
 
 ;;; --- mapcon (M14) ---
 ;;;
@@ -237,10 +247,14 @@
 ;;; 同様にsublistへfnを適用するが、結果はappendで連結する(mapcanのsublist版)。
 ;;; 仕様上はnconcによる破壊的な連結だが、既存のmapcanと同様にnconcが未実装の
 ;;; ためappendで代用する簡略化になっている。
-(defun mapcon (fn list)
-  (if (null list)
+(defun %mapcon-lists (fn lists)
+  (if (or (null lists) (%lists-some-null lists))
       nil
-      (append (funcall fn list) (mapcon fn (cdr list)))))
+      (append (%%apply fn lists) (%mapcon-lists fn (%lists-cdr lists)))))
+
+;; 対応するsublist群にfnを適用した結果(リスト)をappendで連結して返す(ISLisp仕様§21.4: list+)。
+(defun mapcon (fn &rest lists)
+  (%mapcon-lists fn lists))
 
 ;;; --- map-into (M14) ---
 ;;;
@@ -408,7 +422,7 @@
 (defun %fill-slots (vec values idx)
   (if (null values)
       vec
-      (progn (set-aref vec idx (car values))
+      (progn (set-aref (car values) vec idx)
              (%fill-slots vec (cdr values) (+ idx 1)))))
 
 ;; c1がc2自身、またはc2の(推移的な)サブクラスかどうか

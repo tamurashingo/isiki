@@ -89,7 +89,9 @@
 (defun isiki-za-test-rest-first (&rest args) (car args))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-rest-first)))
 (assert-equal 10 (isiki-za-test-rest-first 10 20))
-(assert-equal nil (isiki-za-test-rest-first))
+;; 引数無しではargs=nilで(car nil)になる。ISLisp仕様§21.2ではconsでない引数のcarは
+;; domain-errorなので(JITのcarもos_car_checkedでsignalする)、エラーになることを確認する
+(assert-error (isiki-za-test-rest-first))
 
 ;; defgenericが生成するdispatch関数`(defun name (&rest %generic-args) ...)`が
 ;; 今回の対応でJIT対象になることの確認(initialize-objectはinit.lispがdefgenericで

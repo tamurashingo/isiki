@@ -263,6 +263,11 @@ void os_stream_open_screen_output(os_stream_t *stream, frame_buffer *fb) {
     stream->out_fb = fb;
 }
 
+void os_stream_open_keyboard_input(os_stream_t *stream, int (*read_fn)(char *out_ch)) {
+    stream_init_common(stream, STREAM_INPUT_KEYBOARD);
+    stream->keyboard_read = read_fn;
+}
+
 void os_stream_open_string_input(os_stream_t *stream, UINT8 *buf, UINT32 len) {
     stream_init_common(stream, STREAM_STRING_INPUT);
     stream->str_buf = buf;
@@ -371,6 +376,14 @@ int os_stream_read_char(os_stream_t *stream, char *out_ch) {
         }
         *out_ch = (char)stream->str_buf[stream->str_pos];
         stream->str_pos++;
+        return 1;
+    }
+
+    if (stream->kind == STREAM_INPUT_KEYBOARD) {
+        /* 行入力待ちを含めてreader.c側の関数に委ねる。0はプロセスの入力終端 */
+        if (stream->keyboard_read == 0 || !stream->keyboard_read(out_ch)) {
+            return 0;
+        }
         return 1;
     }
 

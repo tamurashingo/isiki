@@ -92,8 +92,32 @@
     nil))
 ;; ---------------------------------------------------------------------------
 
+;; ---------------------------------------------------------------------------
+;; エラーで中断したアサーションの検出。
+;;
+;; assert-*の展開形の中でformの評価がエラー(handlerの無いsignal-conditionによる
+;; %abort-top-level、あるいはprimitiveのeval-error)で中断すると、そのトップレベル
+;; フォーム全体が捨てられ、passにもfailにも数えられずに「消える」。これでは
+;; 「0 failed」でも全件通ったとは言えないので、各assert-*はformを評価する**前**に
+;; *isiki-test-attempt*を進めておき、次のassert-*の入口(とisiki-test-report)で
+;; attempt > pass + fail なら直前のフォームが中断したと判定してfailに数える。
+;; 中断したフォームは*isiki-test-last-form*に残っているので[ABORT]として記録できる
+(defglobal *isiki-test-attempt* 0)
+(defglobal *isiki-test-last-form* nil)
+
+(defun isiki-test-begin (form)
+  (if (> *isiki-test-attempt* (+ *isiki-test-pass* *isiki-test-fail*))
+      (progn
+        (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+        (isiki-audit-record nil)
+        (format *isiki-test-stream* "[ABORT] ~S => aborted by error~%" *isiki-test-last-form*))
+    nil)
+  (setq *isiki-test-attempt* (+ *isiki-test-attempt* 1))
+  (setq *isiki-test-last-form* form))
+;; ---------------------------------------------------------------------------
+
 (defmacro assert-equal (expected form)
-  `(let ((%isiki-expected ,expected) (%isiki-actual ,form))
+  `(let ((%isiki-expected (progn (isiki-test-begin ',form) ,expected)) (%isiki-actual ,form))
      (if (equal %isiki-expected %isiki-actual)
          (progn
            (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
@@ -108,7 +132,7 @@
                    ',form %isiki-actual %isiki-expected)))))
 
 (defmacro assert-float-close (expected form)
-  `(let ((%isiki-expected ,expected) (%isiki-actual ,form))
+  `(let ((%isiki-expected (progn (isiki-test-begin ',form) ,expected)) (%isiki-actual ,form))
      (if (< (abs (- %isiki-expected %isiki-actual)) 1.0e-6)
          (progn
            (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
@@ -118,6 +142,26 @@
            (isiki-audit-record nil)
            (format *isiki-test-stream* "[NG] ~S => ~S (expected ~~ ~S)~%"
                    ',form %isiki-actual %isiki-expected)))))
+
+;; (assert-error form) : formの評価が何らかのconditionをsignalすること
+;; (仕様の "an error shall be signaled" の例)を検証する。handlerは
+;; return-fromで脱出するので、continuableかどうかにかかわらず捕捉した時点で
+;; passになる。formが正常に値を返した場合はfailとして、その値を記録する
+(defmacro assert-error (form)
+  `(let ((%isiki-actual
+          (block %isiki-assert-error
+            (isiki-test-begin ',form)
+            (with-handler (lambda (%isiki-c) (return-from %isiki-assert-error '%isiki-signaled))
+              (list '%isiki-no-error ,form)))))
+     (if (eq %isiki-actual '%isiki-signaled)
+         (progn
+           (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
+           (isiki-audit-record t))
+         (progn
+           (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+           (isiki-audit-record nil)
+           (format *isiki-test-stream* "[NG] ~S => ~S (expected an error to be signaled)~%"
+                   ',form (car (cdr %isiki-actual)))))))
 
 ;; (assert-output (result-var output-var) form body...) : formを
 ;; *standard-output*が文字列出力ストリーム(create-string-output-stream)に
@@ -136,6 +180,12 @@
            ,@body)))))
 
 (defun isiki-test-report ()
+  ;; 最後のassert-*が中断していた場合を拾う(isiki-test-beginと同じ判定)
+  (if (> *isiki-test-attempt* (+ *isiki-test-pass* *isiki-test-fail*))
+      (progn
+        (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+        (format *isiki-test-stream* "[ABORT] ~S => aborted by error~%" *isiki-test-last-form*))
+    nil)
   (if *isiki-audit*
       (format *isiki-test-stream* "#audit total=~D first-ng=~D~%"
               *isiki-audit-index* *isiki-audit-first-ng*)

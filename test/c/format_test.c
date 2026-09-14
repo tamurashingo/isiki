@@ -217,14 +217,13 @@ void test_format_aesthetic_and_sexpr_directives() {
     assert_stream_content(stream, "The result is meningitis and nothing else.",
         "~Aはprinc相当(ダブルクオート無し)でobjを出力する");
 
-    // 注: 既存のprint.c(TAG_CHAR)はescaped指定に関わらず文字をそのまま出力する実装のため、
-    // 仕様上のprin1表記("#\a")ではなく生の文字"a"が出力される(既存の簡略化、本タスクの対象外)
+    // ISLisp仕様§27.3の例: ~SはCHARをprin1表記(#\a)で出力する
     lisp_val_t s2 = make_out_stream();
     cc_format(os_make_cons(s2,
         os_make_cons(os_make_string("The results are ~S and ~S."),
             os_make_cons(os_make_fixnum(1), os_make_cons(os_make_char('a'), nil)))), nil);
-    assert_stream_content(s2, "The results are 1 and a.",
-        "~Sはprin1相当でobjを出力する(CHARのエスケープ表記は既存print.cの制約により非対応)");
+    assert_stream_content(s2, "The results are 1 and #\\a.",
+        "~Sはprin1相当でobjを出力する(CHARは#\\a表記)");
 }
 
 void test_format_numeric_directives() {

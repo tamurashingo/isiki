@@ -18,7 +18,10 @@ typedef enum {
     STREAM_STRING_INPUT,
     STREAM_STRING_OUTPUT,
     STREAM_FAT_FILE_WRITE,
-    STREAM_FAT_FILE_IO
+    STREAM_FAT_FILE_IO,
+    /** キーボード(現在のプロセスの標準入力バッファ)から1文字ずつ読む入力ストリーム。
+        ISLisp仕様の(standard-input)が返す既定の入力ストリーム */
+    STREAM_INPUT_KEYBOARD
 } stream_kind_t;
 
 /**
@@ -50,6 +53,11 @@ typedef struct {
 
     /** STREAM_OUTPUT_SCREENの書き込み先 */
     frame_buffer *out_fb;
+
+    /** STREAM_INPUT_KEYBOARDの読み取り関数。stream.cはreader.c(プロセスの入力バッファと
+        入力待ちの実装)に依存できない(stream_testはstream.c単体でリンクする)ため、
+        open時に呼び出し側が関数ポインタで渡す。1文字読めれば非0、入力終端なら0 */
+    int (*keyboard_read)(char *out_ch);
 
     /** STREAM_STRING_INPUT/OUTPUTのバッファ本体(os_alloc_rawで確保)。
         INPUTはstr_pos、OUTPUTはstr_lenがそれぞれ読み取り/書き込み済みの位置を表す */
@@ -135,6 +143,13 @@ int os_stream_open_9p_file_io(os_stream_t *stream, const char *path, int create_
  * @param fb 出力先のframe buffer
  */
 void os_stream_open_screen_output(os_stream_t *stream, frame_buffer *fb);
+
+/**
+ * キーボード入力ストリーム(STREAM_INPUT_KEYBOARD)として初期化する。
+ * @param stream 初期化先
+ * @param read_fn 1文字読む関数(reader.cのos_process_stdin_read_char)
+ */
+void os_stream_open_keyboard_input(os_stream_t *stream, int (*read_fn)(char *out_ch));
 
 /**
  * 文字列を読み込み専用ストリームとして初期化する。[ファイルI/O]#49で発覚したGC安全性

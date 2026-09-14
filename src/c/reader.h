@@ -44,4 +44,28 @@ lisp_val_t os_parse_number(lisp_val_t str, lisp_val_t env);
  */
 void os_wait_for_more_input(process_t *proc);
 
+/**
+ * 現在のプロセスの標準入力バッファから1文字読む(キーボード入力ストリーム
+ * STREAM_INPUT_KEYBOARD用)。バッファを使い切っていれば次の行の入力を待つ。
+ * @param out_ch 読んだ文字の格納先
+ * @return 読めれば1、入力終端(ユニットテスト等でos_wait_for_more_inputが供給しない場合)は0
+ */
+int os_process_stdin_read_char(char *out_ch);
+
+/**
+ * os_read_streamと同じだが、「S式が無いまま入力が終端した」ことをout_eofで区別できる。
+ * os_read_streamの戻り値nilは空リスト()を読んだ場合とも一致するため、ISLisp仕様のreadの
+ * eos-error-p/eos-value処理にはこちらを使う。
+ * readerが先読みして未消費のまま残した1文字は、stream自身には書き戻さない(読み取り中の
+ * 割り当てでGCが走るとos_stream_tは別アドレスへ再配置されているため)。代わりに
+ * out_has_pending/out_pendingで呼び出し側へ返すので、呼び出し側がMAGIC_STREAMハンドルから
+ * 取り直したos_stream_tのpreview-char用先読みスロット(has_lookahead/lookahead)へ戻すこと。
+ * @param stream 読み取り対象のストリーム
+ * @param out_eof 終端でS式を読めなかった場合に1、それ以外は0を書き込む
+ * @param out_has_pending 未消費の先読み文字があれば1、無ければ0を書き込む
+ * @param out_pending 未消費の先読み文字の格納先
+ * @return 読み取ったS式(終端時はnil)。構文エラーの場合はg_sym_read_error
+ */
+lisp_val_t os_read_stream_ex(os_stream_t *stream, int *out_eof, int *out_has_pending, char *out_pending);
+
 #endif /* _READER_H_ */

@@ -2,6 +2,12 @@
 (load "test/lisp/test_framework.lisp")
 (load "test/lisp/init_test.lisp")
 (load "test/lisp/isiki_test.lisp")
+;; リーダー構文依存の例(#nA 等)は別ファイル。load の戻り値(成功なら t)で構文エラーによる
+;; 中断を検出する(qemu_boot_test.lisp と同じ。assert-equal の中に load を直接書かない)
+(defglobal *isiki-test-syntax-load-result* (load "test/lisp/isiki_test_syntax.lisp"))
+(assert-equal t *isiki-test-syntax-load-result*)
+;; 同じ仕様例を defun の本体にして JIT コンパイラに通す版(tools/gen_isiki_test_jit.py で生成)
+(load "test/lisp/isiki_test_jit.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

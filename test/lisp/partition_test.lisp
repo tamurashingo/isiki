@@ -85,10 +85,10 @@
 
 (mount "/" 'blk0s1 ':fat32)
 
-;; streamからEOFまで1byteずつ読み、fixnumのリストにする(read-byteの戻り値は
-;; fixnumまたはEOFでnil)。
+;; streamからEOFまで1byteずつ読み、fixnumのリストにする(read-byteはISLisp仕様通り
+;; 既定ではEOFで<end-of-stream>をsignalするので、eos-error-p=nilでEOF時にnilを返させる)。
 (defun %partition-test-read-all-bytes (stream)
-  (let ((b (read-byte stream)))
+  (let ((b (read-byte stream nil)))
     (if (null b)
         nil
         (cons b (%partition-test-read-all-bytes stream)))))

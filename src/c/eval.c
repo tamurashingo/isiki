@@ -136,7 +136,9 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         // word3(定義時に捕捉した自由変数を保持する環境)をenv引数として渡す。
         // 呼び出し元のenvではなく、リフトされた関数本体が自由変数を解決できる
         // 環境を渡す必要があるため
-        lisp_val_t call_env = (obj[2] == os_make_fixnum(2)) ? obj[3] : env;
+        // word3(定義時環境/捕捉環境)がNILでなければそれを渡す(JITコンパイル済みdefunも
+        // os_make_jit_functionで定義時環境を持つ。レキシカルスコープのため)
+        lisp_val_t call_env = (obj[3] != nil) ? obj[3] : env;
         return fnptr(evaluated_args, call_env);
     }
     if (obj[0] == MAGIC_FUNCTION_INTERPRETED) {
@@ -563,7 +565,7 @@ static lisp_val_t apply_macro(lisp_val_t macro, lisp_val_t args) {
     return eval_progn(body, call_env);
 }
 
-static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env);
+static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env, UINT64 depth);
 
 /**
  * list(評価済み、unquote-splicingで得られたリスト)の要素をtailの手前に非破壊的に継ぎ足す。
@@ -583,14 +585,26 @@ lisp_val_t qq_append(lisp_val_t list, lisp_val_t tail) {
     return os_make_cons(cc_car(list), qq_append(cc_cdr(list), tail));
 }
 
+/** (sym x) の2要素リストを組み立てる(qq_expandがネストしたquasiquote/unquoteの
+ * 形を保ったまま内側だけ展開して再構成するために使う)。symはg_sym_*(GCルート)。 */
+static lisp_val_t qq_wrap(lisp_val_t sym, lisp_val_t inner) {
+    GC_PROTECT(inner);
+    lisp_val_t tail = os_make_cons(inner, nil);
+    GC_PROTECT(tail);
+    return os_make_cons(sym, tail);
+}
+
 /**
  * quasiquoteの本体(未評価のフォーム)を、unquote/unquote-splicingだけを評価しながら組み立てる。
- * nested quasiquote(入れ子のquasiquote)の深さは追跡しない簡易実装。
+ * ISLisp仕様§16.1: quasiquoteはネストでき、置換はネストレベルが同じunquoteだけに対して行う
+ * (内側のquasiquoteで+1、unquoteで-1)。depth>0のunquote/unquote-splicingは評価せず、
+ * その形のまま内側をdepth-1で展開して残す。
  * @param form 展開対象のフォーム(quasiquoteの直下、またはその再帰呼び出し)
  * @param env unquoteの評価に使う環境
+ * @param depth 現在のネストレベル(最外のquasiquote直下が0)
  * @return 組み立てた値
  */
-static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env) {
+static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env, UINT64 depth) {
     if (form == nil || (form & TAG_MASK) != TAG_CONS) {
         return form; // atom/nilは評価せずそのまま
     }
@@ -600,26 +614,41 @@ static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env) {
     lisp_val_t elem = cc_car(form);
     GC_PROTECT(elem);
 
-    if (elem == g_sym_unquote) {
-        // (unquote x): xを評価してその場に差し込む
-        return os_eval(cc_car(cc_cdr(form)), env);
+    if (elem == g_sym_quasiquote) {
+        // ネストしたquasiquote: 形を保ったまま内側をdepth+1で展開する
+        lisp_val_t inner = qq_expand(cc_car(cc_cdr(form)), env, depth + 1);
+        return qq_wrap(g_sym_quasiquote, inner);
     }
-    if (elem == g_sym_unquote_splicing) {
-        // リストの要素位置以外(先頭やドット対の末尾)でのunquote-splicingはunquoteと同様に扱う
-        return os_eval(cc_car(cc_cdr(form)), env);
+    if (elem == g_sym_unquote || elem == g_sym_unquote_splicing) {
+        // (unquote x): depth 0ならxを評価してその場に差し込む。リストの要素位置以外
+        // (先頭やドット対の末尾)でのunquote-splicingはunquoteと同様に扱う。
+        // depth>0なら形を保ち、内側をdepth-1で展開する
+        if (depth == 0) {
+            return os_eval(cc_car(cc_cdr(form)), env);
+        }
+        lisp_val_t inner = qq_expand(cc_car(cc_cdr(form)), env, depth - 1);
+        return qq_wrap(elem, inner);
     }
     if ((elem & TAG_MASK) == TAG_CONS && cc_car(elem) == g_sym_unquote_splicing) {
-        // リストの要素が(unquote-splicing x): xを評価し、その要素を残りに継ぎ足す
-        lisp_val_t spliced = os_eval(cc_car(cc_cdr(elem)), env);
-        GC_PROTECT(spliced);
-        lisp_val_t rest = qq_expand(cc_cdr(form), env);
-        GC_PROTECT(rest);
-        return qq_append(spliced, rest);
+        if (depth == 0) {
+            // リストの要素が(unquote-splicing x): xを評価し、その要素を残りに継ぎ足す
+            lisp_val_t spliced = os_eval(cc_car(cc_cdr(elem)), env);
+            GC_PROTECT(spliced);
+            lisp_val_t rest = qq_expand(cc_cdr(form), env, depth);
+            GC_PROTECT(rest);
+            return qq_append(spliced, rest);
+        }
+        lisp_val_t inner = qq_expand(cc_car(cc_cdr(elem)), env, depth - 1);
+        GC_PROTECT(inner);
+        lisp_val_t head = qq_wrap(g_sym_unquote_splicing, inner);
+        GC_PROTECT(head);
+        lisp_val_t tail = qq_expand(cc_cdr(form), env, depth);
+        return os_make_cons(head, tail);
     }
 
-    lisp_val_t head = qq_expand(elem, env);
+    lisp_val_t head = qq_expand(elem, env, depth);
     GC_PROTECT(head);
-    lisp_val_t tail = qq_expand(cc_cdr(form), env);
+    lisp_val_t tail = qq_expand(cc_cdr(form), env, depth);
     return os_make_cons(head, tail);
 }
 
@@ -630,7 +659,7 @@ static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env) {
  * @return 組み立てた値
  */
 static lisp_val_t eval_quasiquote(lisp_val_t args, lisp_val_t env) {
-    return qq_expand(cc_car(args), env);
+    return qq_expand(cc_car(args), env, 0);
 }
 
 /**
@@ -645,7 +674,15 @@ static lisp_val_t eval_block(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     GC_PROTECT(name);
     lisp_val_t body = cc_cdr(args);
+    GC_PROTECT(body);
+    GC_PROTECT(env);
+    // ISLisp仕様§14.7: blockの動的extent(bodyの評価中)だけ、このblockの名前を
+    // プロセスの「生きているblock」リストに積む。eval_return_fromが、既に抜けた
+    // blockへの脱出(クロージャ越しに後から呼ぶ等)を<control-error>にするために見る
+    lisp_val_t saved = os_live_block_push(name);
+    GC_PROTECT(saved);
     lisp_val_t result = eval_progn(body, env);
+    os_live_block_restore(saved);
     if (is_control_transfer(result)) {
         UINT64 *obj = (UINT64 *)(result & ~TAG_MASK);
         if (obj[1] == name) {
@@ -667,10 +704,18 @@ static lisp_val_t eval_return_from(lisp_val_t args, lisp_val_t env) {
     lisp_val_t name = cc_car(args);
     GC_PROTECT(name);
     lisp_val_t value_rest = cc_cdr(args);
+    GC_PROTECT(env);
     lisp_val_t val = (value_rest != nil) ? os_eval(cc_car(value_rest), env) : nil;
     GC_PROTECT(val);
     if (is_control_transfer(val)) {
         return val;
+    }
+    // 宛先のblockが動的に生きていなければ<control-error>(ISLisp仕様§14.7の
+    // (bar nil t)の例)。JITコンパイル済み関数内のblock(za_compile_block)も
+    // os_live_block_pushで同じリストに登録するので、JIT関数内で作られたクロージャ
+    // (インタプリタ実行)からのreturn-fromも正しく判定できる
+    if (!os_live_block_p(name)) {
+        return os_signal_control_error(env);
     }
     return os_make_instance(MAGIC_BLOCK_EXIT, name, val, nil);
 }
@@ -679,10 +724,12 @@ static lisp_val_t eval_return_from(lisp_val_t args, lisp_val_t env) {
  * unwind-protect特殊形式。(unwind-protect protected-form cleanup-form...)のprotected-formを評価し、
  * その結果(通常値・脱出シグナルのいずれでも)に関わらずcleanup-formを必ず評価してから、
  * protected-formの評価結果を返す。
- * 既知の簡略化: cleanup-form内で新たな脱出が起きた場合、その脱出は無視してprotected-formの結果を返す。
+ * ISLisp仕様§14.7.2: cleanup-form内で新たな非局所脱出が起きた場合、protected-formが
+ * 正常終了していればその脱出を伝播し、protected-form自身も脱出の途中(既に脱出先へ向かって
+ * いる)なら<control-error>をsignalする。
  * @param args (protected-form . cleanup-form-rest)
  * @param env 評価に使う環境
- * @return protected-formの評価結果(通常値または脱出シグナル)
+ * @return protected-formの評価結果(通常値または脱出シグナル)、またはcleanupの脱出シグナル
  */
 static lisp_val_t eval_unwind_protect(lisp_val_t args, lisp_val_t env) {
     lisp_val_t protected_form = cc_car(args);
@@ -691,7 +738,13 @@ static lisp_val_t eval_unwind_protect(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(env);
     lisp_val_t result = os_eval(protected_form, env);
     GC_PROTECT(result);
-    eval_progn(cleanup_forms, env);
+    lisp_val_t cleanup_result = eval_progn(cleanup_forms, env);
+    if (is_control_transfer(cleanup_result)) {
+        if (is_control_transfer(result)) {
+            return os_signal_control_error(env);
+        }
+        return cleanup_result;
+    }
     return result;
 }
 

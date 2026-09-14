@@ -124,12 +124,18 @@
 (assert-equal t (%%za-compiled-p (function iz18-nested-list)))
 (assert-equal '(a (b 9) d) (iz18-nested-list 9))
 
-;; ネストしたbacktickは特別扱いしない(qq_expandの素朴な意味論通り、内側の,cも
-;; 同じ1回の走査で評価される)。
+;; ネストしたbacktickはISLisp仕様§16.1のネストレベル規則に従う(eval.cのqq_expandと同じ):
+;; 内側の`で1段深くなった ,c は評価されず、(unquote c) の形のまま残る
+;; (2026-09-14: 以前は「内側の,cも同じ1回の走査で評価される」素朴な意味論だった)。
 (defun iz18-nested-backtick (c)
   `(a `(b ,c)))
 (assert-equal t (%%za-compiled-p (function iz18-nested-backtick)))
-(assert-equal '(a (quasiquote (b 9))) (iz18-nested-backtick 9))
+(assert-equal '(a (quasiquote (b (unquote c)))) (iz18-nested-backtick 9))
+;; ,,c のように2段のunquoteで外側レベルに達したものだけが評価される
+(defun iz18-nested-backtick-2 (c)
+  `(a `(b ,,c)))
+(assert-equal t (%%za-compiled-p (function iz18-nested-backtick-2)))
+(assert-equal '(a (quasiquote (b (unquote 9)))) (iz18-nested-backtick-2 9))
 
 ;;; --- 10. unquote内でreturn-from等の非局所脱出が起きた場合、quasiquote全体を
 ;;;         中断してその値がそのまま返る(NLX安全性、za_compile_callのabort_cleanup
@@ -166,11 +172,13 @@
 ;; (単に入れ子にするだけではfast-pathで畳み込まれてしまうため、各階層で必ず
 ;; 動的な内容を持たせる)。
 
-(defun iz18-too-deep (a b c d e)
-  `(l0 ,a (l1 ,b (l2 ,c (l3 ,d (l4 ,e))))))
+;; ZA_MAX_QQ_DEPTHは4→6に拡張した(2026-09-14、ネストしたquasiquoteの仕様例対応)ので、
+;; 7段で確認する
+(defun iz18-too-deep (a b c d e f g)
+  `(l0 ,a (l1 ,b (l2 ,c (l3 ,d (l4 ,e (l5 ,f (l6 ,g))))))))
 (assert-equal nil (%%za-compiled-p (function iz18-too-deep)))
-(assert-equal '(l0 1 (l1 2 (l2 3 (l3 4 (l4 5)))))
-              (iz18-too-deep 1 2 3 4 5))
+(assert-equal '(l0 1 (l1 2 (l2 3 (l3 4 (l4 5 (l5 6 (l6 7)))))))
+              (iz18-too-deep 1 2 3 4 5 6 7))
 
 ;;; --- 13. defunの外(トップレベル)のquasiquoteは元々インタプリタ経由であり、
 ;;;         今回の変更で壊れていないことの回帰確認 ---

@@ -793,8 +793,9 @@ static void test_transpile_fixture_slot_value_read(void) {
     lisp_val_t class = primitive_make_class_raw(
         os_make_cons(os_make_symbol("POINT"), os_make_cons(nil, os_make_cons(slots, nil))), nil);
     lisp_val_t slots_vector = primitive_make_array(os_make_cons(os_make_fixnum(1), nil), nil);
-    primitive_set_aref(os_make_cons(slots_vector,
-        os_make_cons(os_make_fixnum(0), os_make_cons(os_make_fixnum(42), nil))), nil);
+    // 引数順はISLisp仕様通り (set-aref obj array z*)
+    primitive_set_aref(os_make_cons(os_make_fixnum(42),
+        os_make_cons(slots_vector, os_make_cons(os_make_fixnum(0), nil))), nil);
     lisp_val_t instance = primitive_make_instance_raw(
         os_make_cons(class, os_make_cons(slots_vector, nil)), nil);
 

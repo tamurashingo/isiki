@@ -1076,7 +1076,9 @@ lisp_val_t primitive_boot_alloc_used_bytes(lisp_val_t args, lisp_val_t env) {
  * 既存のqemu_boot_test.lisp一式(init.lisp+全za_test*.lisp、トップレベルdefun約390個)を
  * 単一の生存し続けるREPL環境上で全て実行してもページ枯渇によるJITフォールバックが
  * 起きないよう、余裕を持って8倍(4MB)に拡張した。 */
-#define IMM_SPACE_SIZE (4 * 1024 * 1024)
+/* 2026-09-14: 4MB→16MB。ISLisp仕様例のJIT版(isiki_test_jit.lisp、約1200関数)を含む
+ * テスト一式を1ブートでJIT化すると4MBでは za_test_ext16 付近で枯渇(PANIC)する */
+#define IMM_SPACE_SIZE (16 * 1024 * 1024)
 
 static UINT8 g_imm_space[IMM_SPACE_SIZE] __attribute__((aligned(IMM_PAGE_SIZE)));
 /** 未使用領域のうち、まだページ切り出しに使っていない先頭アドレス */
@@ -1286,7 +1288,9 @@ int os_addr_region(lisp_addr_t addr);
  * だけで最大96、プロセス環境(PROCESS_COUNT)分を加えるとさらに増えるため、
  * 三者が同時に上限近くまで使われる状況を見込んで十分な余裕を持たせる。
  */
-#define GC_MAX_EXTRA_ROOTS 160
+/* za.cの各スロットプール(quote 1024 + number 512 + lambda 256)とプロセスごとの
+ * env/live_blocks(PROCESS_COUNT×2)を余裕を持って収める(2026-09-14: 160→2048) */
+#define GC_MAX_EXTRA_ROOTS 2048
 static lisp_val_t *g_gc_extra_roots[GC_MAX_EXTRA_ROOTS];
 static UINT64 g_gc_extra_root_count = 0;
 
@@ -1719,8 +1723,10 @@ static void gc_scan_instance(UINT64 *words) {
             // word2がfixnum 2(トランスパイラがリフトしたlambdaのクロージャ)の場合のみ、
             // word3にGC管理下の捕捉環境を持つのでトレースする。それ以外(fixnum 1/NIL)は
             // word3を使わずNIL固定なので何もしなくてよい
-            if (words[2] == os_make_fixnum(2)) {
-                g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // 捕捉環境
+            // word2がfixnum 1(JIT)の場合もword3に定義時の環境を持つ(os_make_jit_function参照)ので、
+            // word2の種別によらずword3がNILでなければトレースする
+            if (words[3] != nil) {
+                g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // 捕捉環境/定義時環境
             }
             break;
 
@@ -2246,6 +2252,8 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("STRING-TO-SYMBOL"), os_make_native_function((lisp_addr_t)(void *)primitive_string_to_symbol), global_environment);
         os_set_function(os_make_symbol("GENSYM"), os_make_native_function((lisp_addr_t)(void *)primitive_gensym), global_environment);
         os_set_function(os_make_symbol("MAKE-ARRAY"), os_make_native_function((lisp_addr_t)(void *)primitive_make_array), global_environment);
+        // ISLisp仕様§22の名前。(create-array dimensions [initial-element])はmake-arrayと同じ実装
+        os_set_function(os_make_symbol("CREATE-ARRAY"), os_make_native_function((lisp_addr_t)(void *)primitive_make_array), global_environment);
         os_set_function(os_make_symbol("AREF"), os_make_native_function((lisp_addr_t)(void *)primitive_aref), global_environment);
         os_set_function(os_make_symbol("ARRAY-DIMENSIONS"), os_make_native_function((lisp_addr_t)(void *)primitive_array_dimensions), global_environment);
         os_set_function(os_make_symbol("SET-CAR"), os_make_native_function((lisp_addr_t)(void *)primitive_set_car), global_environment);
@@ -2698,7 +2706,10 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
             // 生ポインタをそのままword1へ書き込むだけでよい)。
             // word3はword2がfixnum(2)(リフトされたクロージャ)の場合のみ捕捉環境
             // (タグ付き)を持つ
-            if (w2 == os_make_fixnum(2)) {
+            // word3はfixnum 2(リフトされたクロージャ)の捕捉環境、またはfixnum 1(JIT)の
+            // 定義時環境(タグ付き)。組み込みprimitive(os_bootstrap中に登録される。
+            // ユニットテストではプロセス初期化前でGC_PROTECTが使えない)ではNIL
+            if (w3 != nil) {
                 GC_PROTECT(w3);
                 addr = os_alloc_bytes(32);
             } else {
@@ -2950,9 +2961,20 @@ lisp_val_t os_make_native_function(UINT64 fnptr) {
  * @param fnptr 呼び出すJITコンパイル済み機械語のアドレス
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
-lisp_val_t os_make_jit_function(UINT64 fnptr) {
+lisp_val_t os_make_jit_function(UINT64 fnptr, lisp_val_t def_env) {
+    // os_fn_meta_allocはImmobilized Space上の確保でGCを起こさないが、念のためdef_envを
+    // 保護する。ユニットテスト(print_test等)はプロセス初期化前にNILを渡して呼ぶことが
+    // あり、その状態ではGC_PROTECT(get_current_process()を使う)が使えないのでNILは除外する
+    if (def_env != nil) {
+        GC_PROTECT(def_env);
+        za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+        return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), def_env);
+    }
     za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
-    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), nil);
+    // word3=定義時の環境。呼び出し側(eval.cのapply_function、za.cのtrampoline/高速path)は
+    // word3がNILでなければ呼び出し元のenvではなくこれをenvとして渡す(レキシカルスコープ:
+    // 関数本体の自由変数は定義時の環境で解決する。ISLisp仕様§10.1の(let ((today ...)) (what-is-today))の例)
+    return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), def_env);
 }
 
 /**
@@ -2963,7 +2985,14 @@ lisp_val_t os_make_jit_function(UINT64 fnptr) {
  * @param arity fixed_entryが受け取る固定引数の個数
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
-lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT64 arity) {
+lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT64 arity, lisp_val_t def_env) {
+    if (def_env != nil) {
+        GC_PROTECT(def_env);
+        za_fn_meta_t *meta = os_fn_meta_alloc(cons_entry);
+        meta->fixed_entry = fixed_entry;
+        meta->arity = arity;
+        return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), def_env);
+    }
     za_fn_meta_t *meta = os_fn_meta_alloc(cons_entry);
     meta->fixed_entry = fixed_entry;
     meta->arity = arity;
@@ -3032,6 +3061,71 @@ lisp_val_t os_resolve_class(lisp_val_t class_name_sym, lisp_val_t env) {
  * @return signal-conditionの戻り値(通常はハンドラ経由でトップレベルへabortするため到達しない)。
  *         init.lisp未ロードの場合はg_sym_eval_error
  */
+lisp_val_t os_live_block_push(lisp_val_t name) {
+    process_t *proc = get_current_process();
+    lisp_val_t saved = (proc->live_blocks == 0) ? nil : proc->live_blocks;
+    GC_PROTECT(saved);
+    GC_PROTECT(name);
+    lisp_val_t pushed = os_make_cons(name, saved);
+    // os_make_consでGCが走った後のprocess_tはアドレスが変わらないが、live_blocksは
+    // GCルート登録済み(process.c)なのでsavedとは独立に更新されている。ここで上書きする
+    get_current_process()->live_blocks = pushed;
+    return saved;
+}
+
+void os_live_block_restore(lisp_val_t saved) {
+    get_current_process()->live_blocks = saved;
+}
+
+void os_live_block_pop(void) {
+    process_t *proc = get_current_process();
+    if (proc->live_blocks != 0 && proc->live_blocks != nil) {
+        proc->live_blocks = cc_cdr(proc->live_blocks);
+    }
+}
+
+int os_live_block_p(lisp_val_t name) {
+    process_t *proc = get_current_process();
+    for (lisp_val_t cur = proc->live_blocks; cur != 0 && cur != nil; cur = cc_cdr(cur)) {
+        if (cc_car(cur) == name) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+lisp_val_t os_signal_control_error(lisp_val_t env) {
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol("<CONTROL-ERROR>");
+    return os_signal_condition(class_sym, nil, env);
+}
+
+/**
+ * offending_objectを<domain-error>(:object offending-object :expected-class (%find-class class-name))
+ * としてsignalする。signal_domain_errorの期待クラスを指定できる版(car/cdrの<cons>等)。
+ * @param offending_object domain-errorの原因になった値
+ * @param class_name 期待クラスの名前(例 "<CONS>")
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ */
+static lisp_val_t signal_domain_error_for_class(lisp_val_t offending_object, const char *class_name, lisp_val_t env) {
+    GC_PROTECT(offending_object);
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol(class_name);
+    GC_PROTECT(class_sym);
+    lisp_val_t expected_class = os_resolve_class(class_sym, env);
+    if (expected_class == g_sym_eval_error || os_is_control_transfer(expected_class)) {
+        return expected_class;
+    }
+    GC_PROTECT(expected_class);
+    lisp_val_t initargs = os_make_cons(expected_class, nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(g_sym_kw_expected_class, initargs);
+    initargs = os_make_cons(offending_object, initargs);
+    initargs = os_make_cons(g_sym_kw_object, initargs);
+    return os_signal_condition(g_sym_class_domain_error, initargs, env);
+}
+
 static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t env) {
     GC_PROTECT(offending_object);
     GC_PROTECT(env);
@@ -4029,8 +4123,12 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
  * @return 第一引数のcar
  */
 lisp_val_t primitive_car(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t target = cc_car(args); // 第一引数
+    // ISLisp仕様§21.1: consでなければ(nilを含む)domain-error。cc_car自体はカーネル内部の
+    // 利便のためnil許容のままにし、Lispから見える関数だけ仕様通りにする
+    if (target == nil || (target & TAG_MASK) != TAG_CONS) {
+        return signal_domain_error_for_class(target, "<CONS>", env);
+    }
     return cc_car(target);
 }
 
@@ -4040,9 +4138,25 @@ lisp_val_t primitive_car(lisp_val_t args, lisp_val_t env) {
  * @param env 呼び出し時の環境(未使用)
  * @return 第一引数のcdr
  */
+lisp_val_t os_car_checked(lisp_val_t x, lisp_val_t env) {
+    if (x == nil || (x & TAG_MASK) != TAG_CONS) {
+        return signal_domain_error_for_class(x, "<CONS>", env);
+    }
+    return cc_car(x);
+}
+
+lisp_val_t os_cdr_checked(lisp_val_t x, lisp_val_t env) {
+    if (x == nil || (x & TAG_MASK) != TAG_CONS) {
+        return signal_domain_error_for_class(x, "<CONS>", env);
+    }
+    return cc_cdr(x);
+}
+
 lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t target = cc_car(args); // 第一引数
+    if (target == nil || (target & TAG_MASK) != TAG_CONS) {
+        return signal_domain_error_for_class(target, "<CONS>", env);
+    }
     return cc_cdr(target);
 }
 
@@ -5552,6 +5666,11 @@ static int values_equal(lisp_val_t a, lisp_val_t b) {
             if (obj_a[0] == MAGIC_BIGNUM && obj_b[0] == MAGIC_BIGNUM) {
                 return bignum_equal(obj_a, obj_b);
             }
+            if (obj_a[0] == MAGIC_FLOAT && obj_b[0] == MAGIC_FLOAT) {
+                // 数値はeqlと同じ判定(ISLisp仕様§13 equal: 数値はeqlで比較)。
+                // floatは別々に確保されたインスタンスなので値で比較する
+                return os_float_value(a) == os_float_value(b);
+            }
             if (obj_a[0] == MAGIC_VECTOR && obj_b[0] == MAGIC_VECTOR) {
                 lisp_val_t *header_a = vector_header(a);
                 lisp_val_t *header_b = vector_header(b);
@@ -6385,9 +6504,64 @@ lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
  * @param env 呼び出し時の環境(未使用)
  * @return 確保したVECTOR
  */
+/** nestedをrank段のネストとして辿り、行優先でdataへ書き込む(os_make_array_from_nested_listの再帰本体)。
+ * 長さがdims[level]と食い違う段があれば0を返す */
+static int fill_array_from_nested(lisp_val_t nested, UINT64 rank, UINT64 level, const UINT64 *dims,
+                                  lisp_val_t *data, UINT64 *pos) {
+    if (level == rank) {
+        data[(*pos)++] = nested;
+        return 1;
+    }
+    UINT64 n = 0;
+    for (lisp_val_t cur = nested; cur != nil; cur = cc_cdr(cur)) {
+        if ((cur & TAG_MASK) != TAG_CONS) {
+            return 0;
+        }
+        if (!fill_array_from_nested(cc_car(cur), rank, level + 1, dims, data, pos)) {
+            return 0;
+        }
+        n++;
+    }
+    return n == dims[level];
+}
+
+lisp_val_t os_make_array_from_nested_list(UINT64 rank, lisp_val_t nested) {
+    if (rank > MAX_ARRAY_RANK) {
+        return g_sym_eval_error;
+    }
+    GC_PROTECT(nested);
+    UINT64 dims[MAX_ARRAY_RANK];
+    lisp_val_t probe = nested;
+    for (UINT64 i = 0; i < rank; i++) {
+        UINT64 n = 0;
+        for (lisp_val_t cur = probe; cur != nil; cur = cc_cdr(cur)) {
+            if ((cur & TAG_MASK) != TAG_CONS) {
+                return g_sym_eval_error;
+            }
+            n++;
+        }
+        dims[i] = n;
+        probe = (probe != nil) ? cc_car(probe) : nil;
+    }
+
+    lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
+    GC_PROTECT(vec);
+    lisp_addr_t addr = alloc_vector_block(rank, dims);
+    lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
+    UINT64 pos = 0;
+    if (!fill_array_from_nested(nested, rank, 0, dims, data, &pos)) {
+        return g_sym_eval_error;
+    }
+    ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
+    return vec;
+}
+
 lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t dims_arg = cc_car(args);
+    // 第二引数(任意)は全要素の初期値(ISLisp仕様のcreate-arrayのinitial-element)。省略時はnil
+    lisp_val_t initial = (cc_cdr(args) != nil) ? cc_car(cc_cdr(args)) : nil;
+    GC_PROTECT(initial);
 
     UINT64 dims[MAX_ARRAY_RANK];
     UINT64 rank = 0;
@@ -6410,7 +6584,7 @@ lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
     lisp_addr_t addr = alloc_vector_block(rank, dims);
     lisp_val_t *data = (lisp_val_t *)(addr + 8 * (1 + rank));
     for (UINT64 i = 0; i < total; i++) {
-        data[i] = nil;
+        data[i] = initial;
     }
 
     ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
@@ -6557,22 +6731,18 @@ lisp_val_t primitive_set_cdr2(lisp_val_t target, lisp_val_t val) {
  */
 lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_val_t array = cc_car(args);
+    // ISLisp仕様§22.2の引数順 (set-aref obj array z*): 第一引数が格納する値
+    lisp_val_t val = cc_car(args);
+    lisp_val_t array = cc_car(cc_cdr(args));
     lisp_val_t *header = vector_header(array);
     UINT64 rank = header[0];
 
     int out_of_bounds;
-    lisp_val_t idx_cur = cc_cdr(args);
+    lisp_val_t idx_cur = cc_cdr(cc_cdr(args));
     UINT64 offset = array_offset(header, rank, idx_cur, &out_of_bounds);
     if (out_of_bounds) {
         return g_sym_eval_error;
     }
-
-    lisp_val_t value_cur = idx_cur;
-    for (UINT64 i = 0; i < rank; i++) {
-        value_cur = cc_cdr(value_cur);
-    }
-    lisp_val_t val = cc_car(value_cur);
 
     lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
     data[offset] = val;

@@ -876,7 +876,7 @@ lisp_val_t os_make_native_function(lisp_addr_t fnptr);
  * @param fnptr 呼び出すJITコンパイル済み機械語のアドレス
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
-lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
+lisp_val_t os_make_jit_function(lisp_addr_t fnptr, lisp_val_t def_env);
 
 /**
  * os_make_jit_functionのdual-entry版(ABI-M5)。cons_entry(従来のconsリストABI
@@ -891,7 +891,7 @@ lisp_val_t os_make_jit_function(lisp_addr_t fnptr);
  * @param arity fixed_entryが受け取る固定引数の個数
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
-lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_entry, UINT64 arity);
+lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_entry, UINT64 arity, lisp_val_t def_env);
 
 /**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
@@ -997,6 +997,52 @@ void os_set_panic_hook(void (*hook)(void));
  *         init.lisp未ロードでmake-instance/signal-conditionが未定義の場合はg_sym_eval_error
  */
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env);
+
+/**
+ * <control-error>をsignalする(ISLisp仕様§14.7: 既に抜けたblockへのreturn-from、
+ * unwind-protectのcleanup中の別の非局所脱出など)。eval.cとza.c(JIT生成コード)の両方から呼ぶ。
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値(通常はトップレベルへのabort)
+ */
+lisp_val_t os_signal_control_error(lisp_val_t env);
+
+/**
+ * (car x)/(cdr x)のJIT生成コード用。xがconsでなければ(nilを含む)<domain-error>をsignalする
+ * (primitive_car/primitive_cdrと同じ規則、ISLisp仕様§21.2)。
+ * @param x 対象
+ * @param env 呼び出し時の環境(signal-conditionに使う)
+ */
+lisp_val_t os_car_checked(lisp_val_t x, lisp_val_t env);
+lisp_val_t os_cdr_checked(lisp_val_t x, lisp_val_t env);
+
+/**
+ * 現在のプロセスの「動的extentにあるblock」リスト(process_t.live_blocks)の先頭にnameを積む。
+ * eval.cのeval_blockとza.c(JIT生成コード)のblockが、bodyの評価の直前に呼ぶ。
+ * @param name blockの名前(symbolまたはnil)
+ * @return 積む前のリスト(bodyの評価後にos_live_block_restoreへ渡して元に戻す)
+ */
+lisp_val_t os_live_block_push(lisp_val_t name);
+
+/**
+ * os_live_block_pushの戻り値を渡して、現在のプロセスのlive_blocksを元に戻す。
+ * @param saved os_live_block_pushの戻り値
+ */
+void os_live_block_restore(lisp_val_t saved);
+
+/**
+ * 現在のプロセスのlive_blocksの先頭を1つ取り除く(os_live_block_pushと対)。za.c(JIT生成
+ * コード)のblockが、保存値をGCスロットに持たずに済むようbody評価後にこちらを呼ぶ。
+ * goでblockを飛び越える場合は、飛び越えるblockの数だけ呼んでから jmp する。
+ */
+void os_live_block_pop(void);
+
+/**
+ * nameという名前のblockが現在のプロセスの動的extentにある(まだ抜けていない)かどうか。
+ * eval.cのeval_return_fromが、既に抜けたblockへのreturn-fromを<control-error>にするために使う。
+ * @param name blockの名前
+ * @return 生きていれば非0
+ */
+int os_live_block_p(lisp_val_t name);
 
 /**
  * init.lisp の (%find-class class-name-sym) をosApplyFunction経由で呼び出し、クラスオブジェクトを
@@ -1887,6 +1933,16 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env);
  * @return 構築したVECTOR
  */
 lisp_val_t os_make_vector_from_list(lisp_val_t list);
+
+/**
+ * #nA(...)配列リテラル用。rank次元の配列を、rank段にネストしたリストnestedの内容で
+ * 行優先に初期化して作る。各次元の長さは各段の最初の要素の長さで決まり、揃っていない
+ * サブリストがあればg_sym_eval_errorを返す。rank==0のときはnestedそのものを唯一の要素とする。
+ * @param rank 次元数(MAX_ARRAY_RANK以下)
+ * @param nested rank段にネストした正規のリスト
+ * @return 作成した配列(TAG_INSTANCE+MAGIC_VECTOR)。不正な形ならg_sym_eval_error
+ */
+lisp_val_t os_make_array_from_nested_list(UINT64 rank, lisp_val_t nested);
 
 /**
  * VECTOR(TAG_INSTANCE+MAGIC_VECTOR)から、内部の可変長ブロック(rank+dims+data)の

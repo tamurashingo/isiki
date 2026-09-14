@@ -328,7 +328,8 @@ static lisp_val_t read_list(reader_source_t *src) {
 }
 
 /**
- * '"' は呼び出し元で消費済みの前提で、閉じクォートまでの文字列を読む。エスケープシーケンスは扱わない。
+ * '"' は呼び出し元で消費済みの前提で、閉じクォートまでの文字列を読む。ISLisp仕様§24の通り、
+ * バックスラッシュに続く1文字(\" と \\)はその文字自身として読む(それ以外の \x も x として読む)。
  * @param src 読み取り対象の文字ソース
  * @return 読み取ったSTRING。閉じクォートが無いまま入力が終端した場合はg_sym_read_error
  */
@@ -338,6 +339,12 @@ static lisp_val_t read_string(reader_source_t *src) {
 
     while (has_more(src) && peek(src) != '"') {
         char c = advance(src);
+        if (c == '\\') {
+            if (!has_more(src)) {
+                return g_sym_read_error; // バックスラッシュの直後で入力が終端した
+            }
+            c = advance(src);
+        }
         if (len < READER_TOKEN_MAX - 1) {
             token[len++] = c;
         }
@@ -763,6 +770,34 @@ static lisp_val_t read_expr(reader_source_t *src) {
             }
             return os_make_vector_from_list(list);
         }
+        if (is_digit(c2)) {
+            // #nA(...) / #na(...): n次元配列リテラル(ISLisp仕様§22)。nの後のA/aに続く
+            // ネストしたリストを行優先で配列に詰める。#0A obj は0次元配列
+            UINT64 rank = 0;
+            while (has_more(src) && is_digit(peek(src))) {
+                rank = rank * 10 + (UINT64)(advance(src) - '0');
+            }
+            if (!has_more(src)) {
+                return g_sym_read_error;
+            }
+            char c3 = advance(src);
+            if (c3 != 'a' && c3 != 'A') {
+                return g_sym_read_error;
+            }
+            skip_whitespace(src);
+            if (!has_more(src)) {
+                return g_sym_read_error;
+            }
+            lisp_val_t contents = read_expr(src);
+            if (contents == g_sym_read_error) {
+                return g_sym_read_error;
+            }
+            lisp_val_t array = os_make_array_from_nested_list(rank, contents);
+            if (array == g_sym_eval_error) {
+                return g_sym_read_error; // 各次元の長さが揃っていない等
+            }
+            return array;
+        }
         return g_sym_read_error;
     }
 
@@ -802,7 +837,7 @@ lisp_val_t os_read(process_t *proc) {
  * @param stream 読み取り対象のストリーム
  * @return 読み取ったS式。読めるものが無ければnil、構文エラーならg_sym_read_error
  */
-lisp_val_t os_read_stream(os_stream_t *stream) {
+lisp_val_t os_read_stream_ex(os_stream_t *stream, int *out_eof, int *out_has_pending, char *out_pending) {
     stream_source_ctx_t stream_ctx;
     stream_ctx.stream = stream;
     stream_ctx.has_lookahead = 0;
@@ -815,11 +850,36 @@ lisp_val_t os_read_stream(os_stream_t *stream) {
 
     skip_whitespace(&src);
 
+    *out_has_pending = 0;
     if (!has_more(&src)) {
+        *out_eof = 1;
         return nil;
     }
+    *out_eof = 0;
 
-    return read_expr(&src);
+    lisp_val_t result = read_expr(&src);
+    if (stream_ctx.has_lookahead) {
+        *out_has_pending = 1;
+        *out_pending = stream_ctx.lookahead;
+    }
+    return result;
+}
+
+lisp_val_t os_read_stream(os_stream_t *stream) {
+    int eof;
+    int has_pending;
+    char pending;
+    return os_read_stream_ex(stream, &eof, &has_pending, &pending);
+}
+
+int os_process_stdin_read_char(char *out_ch) {
+    process_t *proc = get_current_process();
+    ensure_data(proc);
+    if (proc->read_pos >= proc->stdin_len) {
+        return 0;
+    }
+    *out_ch = (char)proc->stdin_buf[proc->read_pos++];
+    return 1;
 }
 
 /**

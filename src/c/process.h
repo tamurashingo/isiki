@@ -38,6 +38,11 @@ typedef struct _process {
     /** このプロセスのLisp環境(global_environmentの子環境)。0は未初期化を表す */
     lisp_val_t env;
 
+    /** インタプリタが評価中の(動的extentにある)blockの名前のリスト(内側が先頭)。
+     * eval_block/eval_return_from(eval.c)が既に抜けたblockへのreturn-fromを
+     * <control-error>にするために使う。0は未初期化(空)を表す */
+    lisp_val_t live_blocks;
+
     /** このプロセスのshadow stackの先頭(GC_PROTECTで保護中のCローカル変数のリスト) */
     gc_rootnode *gc_roots;
 } process_t;

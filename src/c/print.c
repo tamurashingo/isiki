@@ -225,13 +225,22 @@ static void print_symbol(os_char_sink_t *sink, lisp_val_t val) {
  * @param escaped ダブルクオートで囲むかどうか
  */
 static void print_string(os_char_sink_t *sink, lisp_val_t val, int escaped) {
-    if (escaped) {
-        sink_write_char(sink, '"');
+    if (!escaped) {
+        print_bytes(sink, val & ~TAG_MASK);
+        return;
     }
-    print_bytes(sink, val & ~TAG_MASK);
-    if (escaped) {
-        sink_write_char(sink, '"');
+    // prin1相当: ISLisp仕様§24の通り、要素の " と \ はバックスラッシュでエスケープする
+    lisp_addr_t addr = val & ~TAG_MASK;
+    UINT64 len = ((UINT64 *)addr)[0];
+    const UINT8 *bytes = (const UINT8 *)(addr + 8);
+    sink_write_char(sink, '"');
+    for (UINT64 i = 0; i < len; i++) {
+        if (bytes[i] == '"' || bytes[i] == '\\') {
+            sink_write_char(sink, '\\');
+        }
+        sink_write_char(sink, bytes[i]);
     }
+    sink_write_char(sink, '"');
 }
 
 /**
@@ -267,24 +276,54 @@ static void print_list(os_char_sink_t *sink, lisp_val_t val, int escaped) {
  * @param val 出力するVECTOR
  * @param escaped 要素の出力にprin1/princどちらの規則を使うか
  */
-static void print_vector(os_char_sink_t *sink, lisp_val_t val, int escaped) {
-    lisp_val_t *header = os_vector_header(val);
-    UINT64 rank = header[0];
-    UINT64 total = 1;
-    for (UINT64 i = 0; i < rank; i++) {
-        total *= header[1 + i];
+/** rank次元配列のlevel次元目以降をネストした括弧で出力する(print_vectorの再帰本体)。
+ * dataは行優先の要素データ、*posは次に出力する要素の位置 */
+static void print_array_level(os_char_sink_t *sink, const lisp_val_t *header, UINT64 rank, UINT64 level,
+                              const lisp_val_t *data, UINT64 *pos, int escaped) {
+    if (level == rank) {
+        print_value(sink, data[(*pos)++], escaped);
+        return;
     }
-    lisp_val_t *data = header + 1 + rank;
-
-    sink_write_char(sink, '#');
+    UINT64 n = header[1 + level];
     sink_write_char(sink, '(');
-    for (UINT64 i = 0; i < total; i++) {
+    for (UINT64 i = 0; i < n; i++) {
         if (i != 0) {
             sink_write_char(sink, ' ');
         }
-        print_value(sink, data[i], escaped);
+        print_array_level(sink, header, rank, level + 1, data, pos, escaped);
     }
     sink_write_char(sink, ')');
+}
+
+static void print_vector(os_char_sink_t *sink, lisp_val_t val, int escaped) {
+    lisp_val_t *header = os_vector_header(val);
+    UINT64 rank = header[0];
+    lisp_val_t *data = header + 1 + rank;
+    UINT64 pos = 0;
+
+    if (rank == 1) {
+        // general-vectorはISLisp仕様§23の #(x1 x2 ...) 表記
+        sink_write_char(sink, '#');
+        print_array_level(sink, header, rank, 0, data, &pos, escaped);
+        return;
+    }
+    // それ以外はISLisp仕様§22の #nA(...) 表記(rank 0は #0A obj)
+    sink_write_char(sink, '#');
+    char digits[24];
+    int nd = 0;
+    UINT64 r = rank;
+    do {
+        digits[nd++] = (char)('0' + (r % 10));
+        r /= 10;
+    } while (r != 0);
+    while (nd > 0) {
+        sink_write_char(sink, (UINT8)digits[--nd]);
+    }
+    sink_write_char(sink, 'A');
+    if (rank == 0) {
+        sink_write_char(sink, ' ');
+    }
+    print_array_level(sink, header, rank, 0, data, &pos, escaped);
 }
 
 /**
@@ -314,9 +353,26 @@ static void print_value(os_char_sink_t *sink, lisp_val_t val, int escaped) {
         case TAG_STRING:
             print_string(sink, val, escaped);
             return;
-        case TAG_CHAR:
-            sink_write_char(sink, (UINT8)(val >> 3));
+        case TAG_CHAR: {
+            // prin1相当(escaped)ではISLisp仕様§20の文字リテラル表記 #\x で出力する。
+            // 名前を持つ文字(space/newline/tab)は名前で出す
+            UINT8 ch = (UINT8)(val >> 3);
+            if (!escaped) {
+                sink_write_char(sink, ch);
+                return;
+            }
+            sink_write_string(sink, "#\\");
+            if (ch == ' ') {
+                sink_write_string(sink, "space");
+            } else if (ch == '\n') {
+                sink_write_string(sink, "newline");
+            } else if (ch == '\t') {
+                sink_write_string(sink, "tab");
+            } else {
+                sink_write_char(sink, ch);
+            }
             return;
+        }
         case TAG_CONS:
             print_list(sink, val, escaped);
             return;
