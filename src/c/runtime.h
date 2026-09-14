@@ -267,6 +267,20 @@ void os_boot_alloc_init(UINT64 base, UINT64 size);
 void *os_boot_alloc(UINT64 size, UINT64 align);
 
 /**
+ * os_boot_allocの、枯渇時に停止しない版。領域が足りなければ0を返すだけで、
+ * bumpポインタも進めない。仮想バッファのcontentのように「取れなければ縮めて
+ * 続行する」余地がある確保に使う。
+ *
+ * os_boot_alloc自身は枯渇時にget_active_frame_buffer()へ書こうとするが、
+ * ブートのごく初期(仮想バッファの初期化より前)ではその関数ポインタがまだ
+ * 立っていないため、その時点の確保にはこちらを使うこと。
+ * @param size 確保するバイト数
+ * @param align アライメント(2のべき乗)
+ * @return 確保した領域の先頭アドレス。足りなければ0
+ */
+void *os_boot_alloc_try(UINT64 size, UINT64 align);
+
+/**
  * boot allocatorの使用を確定し、残りの領域をLispのGCヒープ(os_heap_init)へ
  * 渡せる形で返す。呼び出し後はos_boot_allocを呼ばないこと。
  * @param out_heap_base 残り領域の先頭アドレス(8byte境界)の書き込み先

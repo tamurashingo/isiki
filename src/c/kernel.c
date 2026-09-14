@@ -97,6 +97,33 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     g_boot_epoch_seconds = boot_epoch_seconds;
 
     os_boot_alloc_init(heap_base, heap_size);
+
+    // 仮想バッファのcontent(スクロールバックの履歴)をboot allocatorから取る。
+    // GOPの解像度はkernel_mainの引数として既に分かっているので、桁数はここで確定する
+    // (documents/console-scrollback.md)。
+    //
+    // os_boot_alloc_finalizeを呼ぶと残りがLispのGCヒープになってしまうため、
+    // 確保は必ずその**前**に行う。あわせてinitialize_virtual_buffersもここまで
+    // 繰り上げる。副作用として、これ以降のos_panic/boot_alloc枯渇の診断表示が
+    // 実際に画面へ出るようになる(従来はブート後半までフレームバッファの
+    // 関数ポインタが0のままだった)。
+    UINT32 vbuf_hist_rows = VBUF_DEFAULT_HIST_ROWS;
+    UINT8 *vbuf_content = (UINT8 *)os_boot_alloc_try(os_vbuf_content_bytes(fb_width, fb_height, vbuf_hist_rows), 8);
+    if (vbuf_content == 0) {
+        // 履歴ぶんが取れなければ画面1枚ぶんまで落として続行する。スクロールバックは
+        // 効かなくなるが、コンソールは従来どおり動く(起動しないよりよい)
+        vbuf_hist_rows = fb_height / VBUF_GLYPH_HEIGHT;
+        vbuf_content = (UINT8 *)os_boot_alloc(os_vbuf_content_bytes(fb_width, fb_height, vbuf_hist_rows), 8);
+    }
+    frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline,
+                                                  vbuf_content, vbuf_hist_rows);
+    // clear_screenは物理ピクセルだけを黒く塗り、contentには触れない。初期化直後
+    // (contentがまだ空の時点)で呼んでおかないと、これより前に出力があった場合に
+    // 「contentには残っているが画面には出ていない」食い違いが生まれ、
+    // バッファ切り替えやスクロールで唐突に現れることになる
+    fb->clear_screen(fb);
+    fb->draw_cursor(fb);
+
     os_block_device_probe_all();
     UINT64 lisp_heap_base, lisp_heap_size;
     os_boot_alloc_finalize(&lisp_heap_base, &lisp_heap_size);
@@ -117,11 +144,7 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_aot_init_functions();
     os_run_aot_toplevel_forms();
 
-    frame_buffer *fb = initialize_virtual_buffers(fb_base, fb_width, fb_height, fb_pixels_per_scanline);
     initialize_processes(fb);
-
-    fb->clear_screen(fb);
-    fb->draw_cursor(fb);
 
     init_fpu();
     init_gdt();

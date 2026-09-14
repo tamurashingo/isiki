@@ -136,6 +136,11 @@ TEST_BIN_LISP_COMPILED = $(BUILD_TMPDIR)/lisp_compiled_test
 TEST_SRC_IDE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(TESTDIR)/ide_test.c
 TEST_BIN_IDE = $(BUILD_TMPDIR)/ide_test
 
+# framebuffer.cもランタイムに依存しない(contentの確保は呼び出し側の責任)ので
+# 単体でリンクできる。履歴リングと表示窓の境界条件を検証する
+TEST_SRC_FRAMEBUFFER = $(SRCDIR)/framebuffer.c $(TESTDIR)/framebuffer_test.c
+TEST_BIN_FRAMEBUFFER = $(BUILD_TMPDIR)/framebuffer_test
+
 # disasm.cはランタイムに依存しない純粋なデコーダ(Lispからの入口はdisasm_lisp.c側)
 # なので、stream_testと同じく単体でリンクしてバイト列を直接食わせて検証できる
 TEST_SRC_DISASM = $(SRCDIR)/disasm.c $(TESTDIR)/disasm_test.c
@@ -220,7 +225,7 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-o $@ $<
 
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(HDR) | $(BUILD_TMPDIR)
+test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST \
@@ -321,6 +326,11 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_DISASM) $(TEST_SRC_DISASM)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_FRAMEBUFFER) $(TEST_SRC_FRAMEBUFFER)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_RUNTIME) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_PROCESS) -v "$(PWD)":/workspace isiki-builder
@@ -341,6 +351,7 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_IDE) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_MOUNT) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_DISASM) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_FRAMEBUFFER) -v "$(PWD)":/workspace isiki-builder
 
 clean:
 	rm -rf esp_dir $(BUILD_TMPDIR) $(IMAGES_DIR)
