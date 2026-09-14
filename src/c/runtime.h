@@ -387,6 +387,53 @@ void os_gc_unregister_root(lisp_val_t *root_ptr);
     0=From空間(生きている側) 1=To空間(GCのコピー先) 2=Immobilized Space 4=その他 */
 int os_addr_region(lisp_addr_t addr);
 
+/**
+ * アドレスの所属領域(disassemblerの注釈用)。
+ *
+ * 既存のos_addr_region(直上)とは目的が別なので分けてある。あちらはGC監査専用で、
+ * From空間とTo空間を**区別する**ことに意味がある(生成コードに焼き込まれた即値が
+ * 「GCで動く側」を指していないかの判定)。こちらは「そのアドレスが何であるか」を
+ * 人間に見せるためのもので、From/To の区別は意味を持たない。
+ * os_addr_regionの戻り値の意味はza_code_imm_test.lispが依存しているため変更しない。
+ */
+typedef enum {
+    /** どの領域にも属さない(境界が未確定の領域を含む) */
+    OS_ADDR_UNKNOWN = 0,
+    /** カーネルイメージの.textセクション。生Cで実装されたコード */
+    OS_ADDR_KERNEL_TEXT = 1,
+    /** Immobilized Space。JITが置いた機械語、Function Cell、リテラルスロット */
+    OS_ADDR_IMMOBILIZED = 2,
+    /** GCヒープ(From/To両方)。コードではなくGC対象オブジェクト */
+    OS_ADDR_GC_HEAP = 3
+} os_addr_region_t;
+
+/**
+ * addrがどの領域に属するかを返す。どの領域にも属さない場合はOS_ADDR_UNKNOWN。
+ * 境界が未確定の領域(ヒープ確保前、.text範囲が取得できないビルド)は判定対象から
+ * 外すため、やはりOS_ADDR_UNKNOWNになる。
+ * @param addr 判定するアドレス(タグは剥がしてから渡すこと)
+ * @return 所属領域
+ */
+os_addr_region_t os_classify_addr(lisp_addr_t addr);
+
+/**
+ * 表示用の短い名前("kernel"/"immobilized"/"gc-heap")。
+ * @param region os_classify_addrの戻り値
+ * @return 名前。OS_ADDR_UNKNOWNのときは0(NULL)
+ */
+const char *os_addr_region_name(os_addr_region_t region);
+
+/**
+ * 領域の実行時の境界を返す。境界が未確定(または未対応)の領域では*out_startと
+ * *out_endの両方に0を書き、0を返す。テストが「baseは範囲内、endは範囲外」の
+ * オフバイワンを確認するために必要なので、内部のstatic変数のままにはしない。
+ * @param region 対象の領域(OS_ADDR_UNKNOWNは常に0を返す)
+ * @param out_start 開始アドレス(範囲内)の書き込み先
+ * @param out_end 終了アドレス(**範囲外**、半開区間の上端)の書き込み先
+ * @return 境界が確定していれば1、していなければ0
+ */
+int os_addr_region_bounds(os_addr_region_t region, lisp_addr_t *out_start, lisp_addr_t *out_end);
+
 extern UINT64 g_gc_lifo_violations;
 
 /** [GC監査] gc_copy_valueがコピー不能なタグを渡された回数(0であるべき) */
@@ -854,6 +901,16 @@ typedef struct {
     UINT64 cons_entry;  /* offset 0: 従来のconsリストABI fn(evaluated_args, env) */
     UINT64 fixed_entry; /* offset 8: ABI-M5で使う固定引数エントリ(現状は常に0) */
     UINT64 arity;       /* offset 16: ABI-M5で使う固定arity(現状は常に0) */
+    /* offset 24/32: disassembler(src/c/disasm.c)用のコード範囲。
+       za_try_compile_defunが1回のコンパイルで出力した機械語ブロック全体
+       (固定引数エントリ+consリストエントリ+共有本体)の先頭と長さで、
+       cons_entry/fixed_entryはこの範囲の内側を指す。
+       生成コードはこの2つを読まないので、オフセットが後ろにずれても影響しない
+       (生成コードが直接dereferenceするのはoffset 0とoffset 16だけ)。
+       組み込みprimitiveとAOTのlifted closureでは0のままで、
+       「逆アセンブル対象の機械語を持たない」ことをcode_len==0で表す。 */
+    UINT64 code_base;
+    UINT64 code_len;
 } za_fn_meta_t;
 
 /**
@@ -892,6 +949,19 @@ lisp_val_t os_make_jit_function(lisp_addr_t fnptr, lisp_val_t def_env);
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
 lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_entry, UINT64 arity, lisp_val_t def_env);
+
+/**
+ * JITコンパイル済み関数のza_fn_meta_tへ、逆アセンブル用のコード範囲を記録する
+ * (src/c/disasm.c の %%DISASM-CODE-BASE / %%DISASM-CODE-LEN が読む)。
+ * cons_entry/fixed_entryは「エントリポイント」であって機械語ブロックの先頭とは
+ * 限らないため、ブロック全体の先頭と長さは別に持たせる必要がある
+ * (documents/jit-metadata-investigation.md)。生ポインタと長さだけを書き込む
+ * 非allocatingな操作で、GCとは無関係。
+ * @param fn os_make_jit_function(_dual)が返したMAGIC_FUNCTION_NATIVEの関数
+ * @param code_base 機械語ブロックの先頭アドレス(Immobilized Space上)
+ * @param code_len 同ブロックのバイト長
+ */
+void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len);
 
 /**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを

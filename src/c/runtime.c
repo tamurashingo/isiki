@@ -1148,6 +1148,147 @@ int os_addr_region(lisp_addr_t addr) {
     return 4;
 }
 
+/* ===================== disassembler用のアドレス分類 ===================== */
+
+/* カーネルイメージの.textセクションの実行時範囲。0,0なら未確定(=判定対象外)。
+   UEFIはイメージを起動ごとに違うアドレスへ再配置するため、ビルド時の値は使えない */
+static lisp_addr_t g_text_start = 0;
+static lisp_addr_t g_text_end = 0;
+static int g_addr_regions_ready = 0;
+
+#ifndef ISIKIOS_UNIT_TEST
+/* mingwのPEリンカが定義するイメージ先頭。ロード後の実アドレスを指す */
+extern char __ImageBase[];
+
+static UINT16 pe_rd16(const UINT8 *p) {
+    return (UINT16)((UINT16)p[0] | ((UINT16)p[1] << 8));
+}
+
+static UINT32 pe_rd32(const UINT8 *p) {
+    return (UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24);
+}
+
+/**
+ * __ImageBaseからPE/COFFヘッダを辿り、.textセクションの実行時範囲を求める。
+ *
+ * 「既知の関数のアドレス±16MB」で代用する手もあるが、この配置では.bssが.textの
+ * わずか2MB先から始まり、その.bssの中に16MBのg_imm_space(Immobilized Space)が
+ * ある。±16MBではImmobilized Spaceを丸ごとカーネルコードと誤判定してしまうため、
+ * セクション表から正確な範囲を取る。
+ *
+ * ヘッダが期待した形でなければ何もしない(g_text_start/endは0のままで、
+ * .textの判定だけが行われなくなる)。
+ */
+static void classify_init_text_range(void) {
+    const UINT8 *base = (const UINT8 *)(void *)__ImageBase;
+    if (base[0] != 'M' || base[1] != 'Z') {
+        return;
+    }
+    UINT32 pe_off = pe_rd32(base + 0x3C);
+    if (pe_off < 0x40 || pe_off > 0x1000) {
+        return;
+    }
+    const UINT8 *pe = base + pe_off;
+    if (pe[0] != 'P' || pe[1] != 'E' || pe[2] != 0 || pe[3] != 0) {
+        return;
+    }
+    /* COFFヘッダ(pe+4から20byte)のうち必要なのはセクション数と
+       オプショナルヘッダのサイズだけ。セクション表はその直後に並ぶ */
+    UINT16 section_count = pe_rd16(pe + 6);
+    UINT16 optional_header_size = pe_rd16(pe + 20);
+    if (section_count == 0 || section_count > 96) {
+        return;
+    }
+    const UINT8 *section = pe + 24 + optional_header_size;
+    for (UINT16 i = 0; i < section_count; i++, section += 40) {
+        /* セクション名は8byte固定長で、8文字ちょうどならNUL終端されない */
+        if (section[0] == '.' && section[1] == 't' && section[2] == 'e' &&
+            section[3] == 'x' && section[4] == 't' && section[5] == 0) {
+            UINT32 virtual_size = pe_rd32(section + 8);
+            UINT32 virtual_addr = pe_rd32(section + 12);
+            if (virtual_size == 0) {
+                return;
+            }
+            g_text_start = (lisp_addr_t)(void *)(base + virtual_addr);
+            g_text_end = g_text_start + virtual_size;
+            return;
+        }
+    }
+}
+#else
+/* ネイティブgccのユニットテストビルドはELFで__ImageBaseが無い。.textの範囲は
+   未確定のままにする(os_classify_addrが.textの判定だけを行わなくなる)。
+   実機での.text判定はtest/lisp/disassemble_test.lispが確認する */
+static void classify_init_text_range(void) {
+}
+#endif
+
+static void classify_ensure_ready(void) {
+    if (g_addr_regions_ready) {
+        return;
+    }
+    g_addr_regions_ready = 1;
+    classify_init_text_range();
+}
+
+os_addr_region_t os_classify_addr(lisp_addr_t addr) {
+    classify_ensure_ready();
+    UINT8 *p = (UINT8 *)addr;
+    /* Immobilized SpaceはカーネルイメージのBSS内にある静的配列なので、
+       .textより先に判定する(順序を入れ替えても.textの範囲はBSSを含まないため
+       結果は変わらないが、包含関係の意図を残しておく) */
+    if (p >= g_imm_space && p < g_imm_space + IMM_SPACE_SIZE) {
+        return OS_ADDR_IMMOBILIZED;
+    }
+    /* From/Toは連続しているが、片方だけが未初期化という状態を作らないため
+       それぞれ独立に判定する。どちらもGCヒープとして同じ扱いにする */
+    if (g_from_start != g_from_end && p >= g_from_start && p < g_from_end) {
+        return OS_ADDR_GC_HEAP;
+    }
+    if (g_to_start != g_to_end && p >= g_to_start && p < g_to_end) {
+        return OS_ADDR_GC_HEAP;
+    }
+    if (g_text_start != g_text_end && addr >= g_text_start && addr < g_text_end) {
+        return OS_ADDR_KERNEL_TEXT;
+    }
+    return OS_ADDR_UNKNOWN;
+}
+
+const char *os_addr_region_name(os_addr_region_t region) {
+    switch (region) {
+        case OS_ADDR_KERNEL_TEXT: return "kernel";
+        case OS_ADDR_IMMOBILIZED: return "immobilized";
+        case OS_ADDR_GC_HEAP:     return "gc-heap";
+        default:                  return 0;
+    }
+}
+
+int os_addr_region_bounds(os_addr_region_t region, lisp_addr_t *out_start, lisp_addr_t *out_end) {
+    classify_ensure_ready();
+    lisp_addr_t start = 0;
+    lisp_addr_t end = 0;
+    switch (region) {
+        case OS_ADDR_KERNEL_TEXT:
+            start = g_text_start;
+            end = g_text_end;
+            break;
+        case OS_ADDR_IMMOBILIZED:
+            start = (lisp_addr_t)(void *)g_imm_space;
+            end = start + IMM_SPACE_SIZE;
+            break;
+        case OS_ADDR_GC_HEAP:
+            /* From/Toは g_to_start == g_from_end で連続しているので1区間で表せる */
+            start = (lisp_addr_t)(void *)g_from_start;
+            end = (lisp_addr_t)(void *)g_to_end;
+            break;
+        default:
+            break;
+    }
+    if (out_start) { *out_start = start; }
+    if (out_end) { *out_end = end; }
+    return start != end;
+}
+
 /** [GC監査] GC実行中に入ったタイマー割り込みの回数を返す。
     0でなければ、タイマーハンドラが*current-process* / run-queue/PCBを
     GC途中の半端な状態で読む窓が実在する */
@@ -1267,6 +1408,10 @@ za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
     meta->cons_entry = cons_entry;
     meta->fixed_entry = 0;
     meta->arity = 0;
+    /* code_base/code_lenはza_try_compile_defunだけが後から埋める。0のままなら
+       「逆アセンブルできる機械語を持たない」(組み込みprimitive/AOT)を意味する */
+    meta->code_base = 0;
+    meta->code_len = 0;
     return meta;
 }
 
@@ -2997,6 +3142,28 @@ lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT
     meta->fixed_entry = fixed_entry;
     meta->arity = arity;
     return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(1), nil);
+}
+
+/**
+ * JITコンパイル済み関数のza_fn_meta_tへ、逆アセンブル用のコード範囲を記録する。
+ * @param fn os_make_jit_function(_dual)が返したMAGIC_FUNCTION_NATIVEの関数
+ * @param code_base 機械語ブロックの先頭アドレス(Immobilized Space上)
+ * @param code_len 同ブロックのバイト長
+ */
+void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE) {
+        return;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    if (meta == 0) {
+        return;
+    }
+    meta->code_base = code_base;
+    meta->code_len = code_len;
 }
 
 /**

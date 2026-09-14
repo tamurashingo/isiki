@@ -1105,3 +1105,8 @@
         (%%destroy-environment-reclaim env)
         (%%set-dynamic '*environments* (%environment-remove env (dynamic *environments*)))
         t)))
+
+;;; JIT生成コードの逆アセンブラ((disassemble 'fib))。
+;;; init.lispが定義するwhile/formatに依存するため、最後にloadする。
+;;; 実体のデコーダはsrc/c/disasm.c(documents/disasm-backend-decision.md)。
+(load "src/lisp/disassemble.lisp")
