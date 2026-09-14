@@ -709,10 +709,47 @@ r14 に `&nil` が割り当てられるのは、そのループのレジスタ�
 生成コードのスロット参照は rsp 相対なので、区間内の `za_load_slot` がずれて壊れる
 (実際に一度踏み、load が起動しなくなった)。
 
+### 全数確認(2026-09-14): 同じ穴は他に無い
+
+JIT が書き込むレジスタを、書き込み emitter(`jit_mov_reg_reg` / `jit_movabs_reg` /
+`jit_movabs_self_ref` / `jit_and_reg_imm8` / `jit_lea_reg_rsp` / `za_load_slot` /
+`za_addr_of_slot` / `jit_mov_reg_from_mem_disp8` / `jit_or|add|sub_reg_reg` /
+`za_emit_untag_instance`、固定レジスタ版 `jit_mov_rcx|rdx|r13_rax`、生バイトの
+`jit_movabs_r11`・`jit_call_r11`)の第1引数で全列挙した。
+
+| 書き込み先 | 回数 | ABI(MS x64) |
+|---|---|---|
+| r11 | 94 | caller-saved |
+| rcx | 68+5 | caller-saved |
+| rax | 47 | caller-saved |
+| rdx | 29+3 | caller-saved |
+| **r13** | 28+1 | **callee-saved → プロローグで退避、全出口で復元** |
+| r10 | 19 | caller-saved |
+| r8 | 15 | caller-saved |
+| r9 | 8 | caller-saved |
+| **r14** | 4 | **callee-saved → `ZA_OFF_SAVED_R14` で退避・復元(b1719be)** |
+| rbx | 0(push/popのみ) | callee-saved、書き込みなし |
+
+- callee-saved 集合 {rbx, rbp, rsi, rdi, r12〜r15} との交差は **{r13, r14}** のみ
+  (rbx は退避されるが書き込まれない)。rbp/rsi/rdi/r12/r15 への書き込みは無い。
+- C 側は mingw 既定の **MS x64 ABI**(`SYSV_ABI` は割り込み/例外/プロセス入口の
+  3関数だけ。`c_timer_switch` は asm から SysV で呼ばれる)。
+- xmm(MS ABI では xmm6〜15 が callee-saved)を書く命令の emit は **無い**。
+- 出口は `ret`×1、末尾呼び出しの `jmp`×2(3784/3808)の3つで、いずれも直前で
+  r14 を復元する。共有トランポリン内の `jmp`×2(1539/1549)はフレーム解体後に
+  入る場所で、書くのは caller-saved だけ。制御転送(throw/return-from/go)は
+  シグナル値の伝播で通常エピローグに合流するので、そこで復元される。
+- **陽性確認**: `%%ZA-DIAG-CLOBBER-PROBE`(za.c)が、r12 を退避せず書く断片(kind=1)を
+  Immobilized Space の実行可能ページに置いて C の inline asm から呼び、r12 が壊れる
+  ことを **1** として検出する。退避する断片(kind=0)は **0**。
+  `test/lisp/za_abi_probe_test.lisp` で両方を固定(全件 1637)。検出手段が機能する
+  ことの確認であり、将来 JIT が別の callee-saved を使い始めたときの型でもある。
+
 ### チェックリスト
 
 - [ ] 生成コードが書くレジスタのうち callee-saved(rbx/rbp/rsi/rdi/r12〜r15)は、
       **すべての出口**で復元されているか。出口は1つとは限らない(末尾呼び出し)。
+      新しい emitter を足したら、上の表に書き込み先を追記すること。
 - [ ] 「無関係な変更で消える」バグは、レジスタ割り当ての変化を疑う。
       バリア・レイアウト・パターン埋めで動かなければ、残るのはそれである。
 - [ ] `info symbol` の答えを鵜呑みにしない。static データは範囲外に見える。

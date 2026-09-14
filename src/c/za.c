@@ -46,6 +46,51 @@ lisp_val_t primitive_za_scan_synth(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(hits);
 }
 
+/**
+ * [陽性確認] %%ZA-DIAG-CLOBBER-PROBE kind
+ * JIT生成コードが callee-saved レジスタを壊した場合に、C側から検出できることの確認。
+ * kind=1: r12 を退避せずに書き換える断片(壊す側)、kind=0: push/popで退避する断片。
+ * C側は inline asm で r12 に既知の値を置いて断片を呼び、戻った後の r12 を読む。
+ * 戻り値: r12 が変わっていれば 1、変わっていなければ 0。
+ * 原則11(documents/pitfalls.md)の検出手段が機能することの確認でもある。
+ * 断片は Immobilized Space の1ページに置く(完成したJITコードと同じ実行可能領域)。
+ */
+lisp_val_t primitive_za_diag_clobber_probe(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+#if defined(__x86_64__) && !defined(ISIKIOS_UNIT_TEST)
+    static UINT8 *page = 0;
+    if (page == 0) {
+        page = (UINT8 *)os_imm_pages_alloc_contiguous(1);
+        if (page == 0) { return nil; }
+    }
+    UINT64 kind = os_fixnum_magnitude(cc_car(args));
+    UINT64 n = 0;
+    const UINT64 poison = 0xC0FFEE0000C0FFEEULL;
+    if (kind == 0) { page[n++] = 0x41; page[n++] = 0x54; }              /* push r12 */
+    page[n++] = 0x49; page[n++] = 0xBC;                                  /* movabs r12, imm64 */
+    for (UINT64 b = 0; b < 8; b++) { page[n++] = (UINT8)(poison >> (b * 8)); }
+    if (kind == 0) { page[n++] = 0x41; page[n++] = 0x5C; }              /* pop r12 */
+    page[n++] = 0xC3;                                                    /* ret */
+    __asm__ volatile("cpuid" : : "a"(0) : "rbx", "rcx", "rdx", "memory");
+    UINT64 before = 0x1234567800ABCDEFULL;
+    UINT64 after = 0;
+    void *fn = (void *)page;
+    __asm__ __volatile__(
+        "mov %1, %%r12\n\t"
+        "sub $32, %%rsp\n\t"
+        "call *%2\n\t"
+        "add $32, %%rsp\n\t"
+        "mov %%r12, %0\n\t"
+        : "=r"(after)
+        : "r"(before), "r"(fn)
+        : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "memory", "cc");
+    return os_make_fixnum(after != before ? 1 : 0);
+#else
+    (void)args;
+    return nil;
+#endif
+}
+
 lisp_val_t primitive_za_heap_imm_count(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum(g_za_heap_imm_count);
@@ -5806,6 +5851,7 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
     os_set_function(os_make_symbol("%%ZA-SCAN-SYNTH"), os_make_native_function((lisp_addr_t)(void *)primitive_za_scan_synth), global_environment);
+    os_set_function(os_make_symbol("%%ZA-DIAG-CLOBBER-PROBE"), os_make_native_function((lisp_addr_t)(void *)primitive_za_diag_clobber_probe), global_environment);
     os_set_function(os_make_symbol("%%ZA-HEAP-IMM-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_za_heap_imm_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
@@ -5836,6 +5882,7 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DESTROY-ENVIRONMENT-RECLAIM"), os_make_native_function((lisp_addr_t)(void *)primitive_destroy_environment_reclaim), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-LINE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_line), global_environment);
     os_set_function(os_make_symbol("%%ZA-SCAN-SYNTH"), os_make_native_function((lisp_addr_t)(void *)primitive_za_scan_synth), global_environment);
+    os_set_function(os_make_symbol("%%ZA-DIAG-CLOBBER-PROBE"), os_make_native_function((lisp_addr_t)(void *)primitive_za_diag_clobber_probe), global_environment);
     os_set_function(os_make_symbol("%%ZA-HEAP-IMM-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_za_heap_imm_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_addr), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-CODE-LEN"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_code_len), global_environment);
