@@ -13,8 +13,11 @@
 ;;;; init.lisp の末尾から load される。
 
 ;;; ---------------------------------------------------------------------------
-;;; %%disasm-item が返す1項目 (長さ 種別 ニモニック オペランド バイト列 整形済み行)
-;;; へのアクセサ。種別は 0=命令 / 1=コードに埋め込まれた文字列 / 2=デコード失敗。
+;;; %%disasm-item が返す1項目
+;;; (長さ 種別 ニモニック オペランド バイト列 整形済み行 注釈) へのアクセサ。
+;;; 種別は 0=命令 / 1=コードに埋め込まれた文字列 / 2=デコード失敗。
+;;; 注釈はその命令が指す絶対アドレスの所属領域("<kernel>"等)で、絶対アドレスを
+;;; 持たない命令や領域が引けなかった場合は空文字列。
 
 (defun disasm-item-length (item) (elt item 0))
 (defun disasm-item-kind (item) (elt item 1))
@@ -22,6 +25,13 @@
 (defun disasm-item-operands (item) (elt item 3))
 (defun disasm-item-bytes (item) (elt item 4))
 (defun disasm-item-line (item) (elt item 5))
+(defun disasm-item-comment (item) (elt item 6))
+
+;;; アドレスの所属領域(%%disasm-classify-addr / %%disasm-region-bounds の region 番号)
+(defglobal *disasm-region-unknown* 0)
+(defglobal *disasm-region-kernel* 1)
+(defglobal *disasm-region-immobilized* 2)
+(defglobal *disasm-region-gc-heap* 3)
 
 ;;; ---------------------------------------------------------------------------
 
@@ -111,8 +121,9 @@
           (subseq text 0 (- (length text) (length *disasm-end-marker*)))
         (string-append text *disasm-truncated-marker*)))))
 
-;; 逆アセンブル結果を (アドレス オフセット ニモニック オペランド バイト列) の
+;; 逆アセンブル結果を (アドレス オフセット ニモニック オペランド バイト列 注釈) の
 ;; リストとして返す。表示用の整形を通さず、そのまま検査したい場合に使う。
+;; 注釈は独立した要素にしてある(オペランドへ連結すると利用側がパースする羽目になる)。
 (defun disassemble-to-list (fn-or-name)
   (let* ((base (disasm-code-base fn-or-name))
          (len (%%disasm-code-len fn-or-name))
@@ -125,7 +136,8 @@
                             (car entry)
                             (disasm-item-mnemonic (cdr entry))
                             (disasm-item-operands (cdr entry))
-                            (disasm-item-bytes (cdr entry)))
+                            (disasm-item-bytes (cdr entry))
+                            (disasm-item-comment (cdr entry)))
                       acc))
       (setq rest (cdr rest)))
     (reverse acc)))

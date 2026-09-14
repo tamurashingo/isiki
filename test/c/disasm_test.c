@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "test_assert.h"
 #include "types.h"
@@ -175,6 +176,88 @@ void test_decode_branch_outside_code_is_marked(void) {
     assert(strstr(insn.operands, "outside") != 0, "コード範囲外の飛び先はoutsideと注記する");
 }
 
+/* ---- 絶対アドレスの抽出(領域注釈の材料) ---- */
+
+void test_movabs_exposes_immediate_as_target_addr(void) {
+    /* 「movabs r11, 0x0c1d41aa が何を指しているのか読めない」というのが
+       この機能の出発点。デコーダはその値をtarget_addrとして取り出すところまでを担う
+       (領域の判定はランタイム側のos_classify_addr) */
+    UINT8 code[] = { 0x49, 0xBB, 0xAA, 0x41, 0x1D, 0x0C, 0x00, 0x00, 0x00, 0x00 };
+    os_disasm_insn_t insn;
+    os_disasm_item(code, sizeof(code), 0, &insn);
+    assert(insn.has_target_addr == 1, "movabs は絶対アドレスを持つ");
+    assert(insn.target_addr == 0x0C1D41AAULL, "imm64 がそのまま target_addr になる");
+    assert(insn.comment[0] == 0, "デコーダは comment を空のままにする");
+}
+
+void test_in_block_branch_has_no_target_addr(void) {
+    /* ブロック内へ飛ぶ分岐は注釈の対象にしない。飛び先は定義上この関数自身と
+       同じ領域にあり、注釈しても情報が増えないまま全行が伸びるだけになる */
+    UINT8 code[] = {
+        0x0F, 0x84, 0x03, 0x00, 0x00, 0x00,  /* je 0x9 (ブロック内) */
+        0xE9, 0x00, 0x00, 0x00, 0x00,        /* jmp 0xb (ブロック内) */
+        0xC3
+    };
+    os_disasm_insn_t insn;
+    os_disasm_item(code, sizeof(code), 0, &insn);
+    assert(insn.has_target_addr == 0, "ブロック内へのjccは絶対アドレスを持たない");
+    os_disasm_item(code, sizeof(code), 6, &insn);
+    assert(insn.has_target_addr == 0, "ブロック内へのjmpは絶対アドレスを持たない");
+}
+
+void test_outside_branch_exposes_absolute_target(void) {
+    /* 末尾呼び出しの共有トランポリンへのjmpはコードブロックの外を指す。
+       オフセットでは表せないので、絶対アドレスを立てて領域を引けるようにする */
+    UINT8 code[16];
+    for (unsigned i = 0; i < sizeof(code); i++) { code[i] = 0x90; }
+    code[0] = 0xE9;
+    code[1] = 0x00; code[2] = 0x10; code[3] = 0x00; code[4] = 0x00; /* rel32 = +0x1000 */
+    os_disasm_insn_t insn;
+    os_disasm_item(code, sizeof(code), 0, &insn);
+    assert(insn.has_target_addr == 1, "ブロック外へのjmpは絶対アドレスを持つ");
+    assert(insn.target_addr == (UINT64)(lisp_addr_t)code + 5 + 0x1000,
+           "絶対アドレスは「次の命令の先頭 + rel32」");
+}
+
+void test_rip_relative_exposes_effective_address(void) {
+    /* mov rax, [rip+0x10]。実効アドレスは「**次の命令の先頭** + disp」なので、
+       命令長が確定してから計算する必要がある(ModRMを読んだ時点では分からない) */
+    UINT8 code[] = { 0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00, 0xC3 };
+    os_disasm_insn_t insn;
+    UINT64 n = os_disasm_item(code, sizeof(code), 0, &insn);
+    assert(n == 7, "RIP相対の mov は7バイト");
+    assert(strcmp(insn.operands, "rax, [rip+0x10]") == 0, "RIP相対として表示される");
+    assert(insn.has_target_addr == 1, "RIP相対は絶対アドレスを持つ");
+    assert(insn.target_addr == (UINT64)(lisp_addr_t)code + 7 + 0x10,
+           "実効アドレスは命令の**末尾**からの相対(先頭からではない)");
+}
+
+void test_plain_instruction_has_no_target_addr(void) {
+    UINT8 code[] = { 0x48, 0x89, 0xC1 };
+    os_disasm_insn_t insn;
+    os_disasm_item(code, sizeof(code), 0, &insn);
+    assert(insn.has_target_addr == 0, "mov reg,reg は絶対アドレスを持たない");
+}
+
+void test_format_line_appends_comment(void) {
+    /* comment はランタイム側が埋める。埋まっていれば行末へ ; <...> として付き、
+       空なら何も出ない(引けなかったことを示す表示は出さない) */
+    UINT8 code[] = { 0x49, 0xBB, 0xAA, 0x41, 0x1D, 0x0C, 0x00, 0x00, 0x00, 0x00 };
+    os_disasm_insn_t insn;
+    char line[192];
+
+    os_disasm_item(code, sizeof(code), 0, &insn);
+    os_disasm_format_line(&insn, line, sizeof(line));
+    assert(strstr(line, ";") == 0, "comment が空なら注釈は出ない");
+
+    strcpy(insn.comment, "<immobilized>");
+    os_disasm_format_line(&insn, line, sizeof(line));
+    assert(strstr(line, "movabs r11, 0xc1d41aa") != 0, "命令部分はそのまま");
+    assert(strstr(line, "; <immobilized>") != 0, "注釈が行末に付く");
+    /* operands へ連結していないこと(disassemble-to-list の利用側がパースせずに済む) */
+    assert(strstr(insn.operands, "immobilized") == 0, "注釈は operands に混ざらない");
+}
+
 /* ---- コードに埋め込まれた文字列(za_emit_symbol_name) ---- */
 
 void test_embedded_string_is_decoded_as_data(void) {
@@ -279,6 +362,7 @@ void test_format_line_does_not_truncate_large_offsets(void) {
        黙って上位桁を落とすと、存在しない位置を指す行になってしまう */
     os_disasm_insn_t insn;
     char line[192];
+    memset(&insn, 0, sizeof(insn));  /* comment等を含め全フィールドを確定させる */
     insn.kind = OS_DISASM_INSN;
     insn.offset = 0x12345;
     insn.length = 1;
@@ -333,6 +417,88 @@ void test_sweep_over_jit_prologue(void) {
     assert(count == 9, "9命令に分解される");
 }
 
+/* ---- 越境読み出しの検出(valgrind 併用) ---- */
+
+/**
+ * srcの先頭lenバイトを「ちょうどlenバイトのヒープ領域」へコピーしてから走査する。
+ * 静的配列やスタックに置いたままだと、バッファの直後にも有効なメモリが続くため
+ * **範囲外読み出しをvalgrindが検出できない**。正確なサイズで確保すれば、
+ * 1バイトでも踏み越えた時点で invalid read として報告される。
+ * @return 走査で進んだ合計バイト数(=len でなければ途中で止まっている)
+ */
+static UINT64 sweep_on_exact_heap_buffer(const UINT8 *src, UINT64 len) {
+    UINT8 *buf = (UINT8 *)malloc(len);
+    if (buf == 0) {
+        return 0;
+    }
+    memcpy(buf, src, len);
+
+    os_disasm_insn_t insn;
+    char line[192];
+    UINT64 offset = 0;
+    while (offset < len) {
+        UINT64 n = os_disasm_item(buf, len, offset, &insn);
+        if (n == 0) {
+            break;
+        }
+        os_disasm_format_line(&insn, line, sizeof(line));
+        offset += n;
+    }
+    free(buf);
+    return offset;
+}
+
+void test_sweep_never_reads_past_the_buffer(void) {
+    /* za.c が実際に出す並び。これを 1..sizeof(code) の**すべての長さ**で切り詰めて
+       走査する。どの切り口でも必ず命令の途中でバッファが終わる位置が現れるので、
+       命令長の計算が1バイトでも先を読めば valgrind が捕まえる。 */
+    static const UINT8 code[] = {
+        0x53, 0x41, 0x55,
+        0x48, 0x81, 0xEC, 0x38, 0x1D, 0x00, 0x00,
+        0x4C, 0x89, 0xB4, 0x24, 0x00, 0x1D, 0x00, 0x00,
+        0x49, 0xBB, 0x0B, 0x74, 0x79, 0x0C, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xEC, 0x20,
+        0x41, 0xFF, 0xD3,
+        0x48, 0x83, 0xC4, 0x20,
+        0x4C, 0x39, 0xD8,
+        0x0F, 0x84, 0x03, 0x00, 0x00, 0x00,
+        0xE9, 0x04, 0x00, 0x00, 0x00,
+        'C', 'A', 'R', 0x00,
+        0x48, 0x8D, 0x8C, 0x24, 0x10, 0x00, 0x00, 0x00,
+        0x49, 0x83, 0xE2, 0xF8,
+        0x4D, 0x8B, 0x5A, 0x08,
+        0x41, 0xFF, 0xE3,
+        0x41, 0x5D, 0x5B, 0xC3
+    };
+    int all_covered = 1;
+    for (UINT64 len = 1; len <= sizeof(code); len++) {
+        /* (bad) は1バイト進むので、走査は必ずバッファ全体を覆い切る */
+        if (sweep_on_exact_heap_buffer(code, len) != len) {
+            all_covered = 0;
+        }
+    }
+    assert(all_covered, "どの長さに切り詰めても走査が過不足なくバッファ全体を覆う");
+}
+
+void test_embedded_string_detection_stays_in_bounds(void) {
+    /* 埋め込み文字列の判定は直前5バイトを遡って読む。オフセットが小さいときや
+       文字列がバッファ末尾で切れているときに、前後どちらへも踏み越えないこと */
+    static const UINT8 code[] = {
+        0xE9, 0x20, 0x00, 0x00, 0x00,   /* rel32 が残りバイト数より大きい */
+        'A', 'B', 'C', 0x00
+    };
+    for (UINT64 len = 1; len <= sizeof(code); len++) {
+        UINT8 *buf = (UINT8 *)malloc(len);
+        memcpy(buf, code, len);
+        os_disasm_insn_t insn;
+        for (UINT64 off = 0; off < len; off++) {
+            os_disasm_item(buf, len, off, &insn);
+        }
+        free(buf);
+    }
+    assert(1, "埋め込み文字列の判定がバッファの前後を踏み越えない(valgrindで確認)");
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -347,6 +513,12 @@ int main(int argc, char **argv) {
     test_decode_indirect_call_and_jmp();
     test_decode_branches_resolve_offsets();
     test_decode_branch_outside_code_is_marked();
+    test_movabs_exposes_immediate_as_target_addr();
+    test_in_block_branch_has_no_target_addr();
+    test_outside_branch_exposes_absolute_target();
+    test_rip_relative_exposes_effective_address();
+    test_plain_instruction_has_no_target_addr();
+    test_format_line_appends_comment();
     test_embedded_string_is_decoded_as_data();
     test_jmp_over_code_is_not_mistaken_for_string();
     test_string_heuristic_requires_nul_and_printable();
@@ -357,6 +529,9 @@ int main(int argc, char **argv) {
     test_format_line_does_not_truncate_large_offsets();
     test_format_line_truncates_into_small_buffer();
     test_sweep_over_jit_prologue();
+
+    test_sweep_never_reads_past_the_buffer();
+    test_embedded_string_detection_stays_in_bounds();
 
     return g_test_failed ? 1 : 0;
 }

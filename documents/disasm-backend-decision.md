@@ -176,12 +176,40 @@ C側でストリームへ直接書く経路(`disassemble` を `%%DISASM-ITEM` �
 
 ```
 in use at exit: 0 bytes in 0 blocks
-total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated   (stdioのバッファのみ)
+total heap usage: 90 allocs, 90 frees, 7,381 bytes allocated
 ERROR SUMMARY: 0 errors from 0 contexts
 ```
 
 デコーダは確保を一切行わない(呼び出し側が渡した `os_disasm_insn_t` にだけ書く)ため、
-リークしうる資源がそもそも無い。指示書 3-1 のAPIは `za_disasm_result_t *` を
+リークしうる資源がそもそも無い。上記の90件はテスト側の確保で、次の理由で入れてある。
+
+**越境読み出しを検出可能にするため、テストは exact-size で `malloc` したバッファに
+コードをコピーしてから走査する。** 静的配列やスタックに置いたままだと、バッファの
+直後にも有効なメモリが続くので、命令長の計算が1バイト先を読んでも valgrind は
+何も言わない。正確なサイズで確保すれば invalid read として報告される。
+
+`test_sweep_never_reads_past_the_buffer` は代表的なコード列を **1バイトから全長まで
+すべての長さに切り詰めて**走査する。どの切り口でも必ず「命令の途中でバッファが終わる」
+位置が現れるので、境界の計算が甘ければそこで捕まる。
+`test_embedded_string_detection_stays_in_bounds` は、直前5バイトを遡って読む
+埋め込み文字列の判定が前方へ踏み越えないことを同じやり方で確認する。指示書 3-1 のAPIは `za_disasm_result_t *` を
 malloc して `za_disasm_free` で解放する形だったが、本リポジトリには `malloc`/`free` が
 存在しない(フリースタンディング、GCヒープと Immobilized Space しかない)ため、
 「1項目ずつ呼び出し側のバッファへ書く」形に変えてある。
+
+
+---
+
+## アドレス領域の注釈(2026-09-14 追加)
+
+`movabs r11, 0xc79740b` のような生アドレスに、その所属領域を注釈として付けるように
+した(`; <kernel>` / `; <immobilized>` / `; <gc-heap>`)。
+
+境界の取得方法、実測値、および「`0x0C1D41AA` が何だったか」の答えは
+`documents/disasm-addr-region.md` にある。
+
+デコーダ側(`disasm.c`)は絶対アドレスを `os_disasm_insn_t.has_target_addr` /
+`.target_addr` として取り出すところまでを担い、領域の判定と注釈文字列の生成は
+ランタイム側(`disasm_lisp.c` → `os_classify_addr`)が行う。この分担により、
+`disasm.c` がランタイムから独立していて `disasm_test.c` が単体でリンクできる、
+という性質が保たれている。

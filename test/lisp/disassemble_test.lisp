@@ -120,6 +120,59 @@
 (assert-equal "ret" (disasm-last-mnemonic 'dis-add))
 (assert-equal "ret" (disasm-last-mnemonic 'dis-caller))
 
+;;; --- アドレスの領域分類 ---
+
+;; 3領域の境界が実行時に確定していること。.text は PE/COFF ヘッダを辿って求めており、
+;; ヘッダが期待した形でなければ黙って未確定になる。それを検出する
+;; (documents/pitfalls.md 原則6: 失敗は観測可能にすること)
+(defglobal *disasm-kernel-bounds* (%%disasm-region-bounds *disasm-region-kernel*))
+(defglobal *disasm-imm-bounds* (%%disasm-region-bounds *disasm-region-immobilized*))
+(defglobal *disasm-heap-bounds* (%%disasm-region-bounds *disasm-region-gc-heap*))
+
+(assert-equal t (not (null *disasm-kernel-bounds*)))
+(assert-equal t (not (null *disasm-imm-bounds*)))
+(assert-equal t (not (null *disasm-heap-bounds*)))
+(assert-equal t (< (car *disasm-kernel-bounds*) (cdr *disasm-kernel-bounds*)))
+(assert-equal t (< (car *disasm-imm-bounds*) (cdr *disasm-imm-bounds*)))
+(assert-equal t (< (car *disasm-heap-bounds*) (cdr *disasm-heap-bounds*)))
+
+;; 半開区間であること(start は範囲内、end は範囲外)
+(assert-equal *disasm-region-immobilized*
+              (%%disasm-classify-addr (car *disasm-imm-bounds*)))
+(assert-equal *disasm-region-immobilized*
+              (%%disasm-classify-addr (- (cdr *disasm-imm-bounds*) 1)))
+(assert-equal t (not (= *disasm-region-immobilized*
+                        (%%disasm-classify-addr (cdr *disasm-imm-bounds*)))))
+
+;; 本物が期待どおりの領域に落ちること。
+;; JIT関数のコード先頭は Immobilized Space にある
+(assert-equal *disasm-region-immobilized*
+              (%%disasm-classify-addr (%%disasm-code-base 'dis-add)))
+;; どの領域にも属さないアドレス
+(assert-equal *disasm-region-unknown* (%%disasm-classify-addr 0))
+
+;; JIT が焼き込む movabs の即値は、Cのprimitive(kernel)か
+;; Immobilized Space 上のFunction Cell/リテラルスロットのいずれかでなければならない。
+;; GCヒープを指す即値が1つでもあれば原則8の再発(za_code_imm_test.lisp と同じ不変条件を、
+;; 今度は逆アセンブラ側から確認していることになる)
+(defun disasm-count-comment (name comment)
+  (let ((items (disasm-items (%%disasm-code-base name) (%%disasm-code-len name)))
+        (count 0))
+    (while (not (null items))
+      (if (string= comment (disasm-item-comment (cdr (car items))))
+          (setq count (+ count 1))
+        nil)
+      (setq items (cdr items)))
+    count))
+
+;; 生Cのprimitiveを呼ぶ movabs は必ずある(za_gc_current_head/cc_car/primitive_add2 等)
+(assert-equal t (> (disasm-count-comment 'dis-add "<kernel>") 0))
+;; GCヒープを指す即値は1つもあってはならない
+(assert-equal 0 (disasm-count-comment 'dis-add "<gc-heap>"))
+(assert-equal 0 (disasm-count-comment 'dis-caller "<gc-heap>"))
+;; 他の関数を名前で呼ぶ側には Function Cell(Immobilized Space)への参照が出る
+(assert-equal t (> (disasm-count-comment 'dis-caller "<immobilized>") 0))
+
 ;;; --- 出力(Phase 1.3 / 1.4) ---
 
 ;; disassemble-to-string は見出しと命令行を含む1つの文字列を返す
@@ -142,12 +195,14 @@
 ;; disassemble-to-list は (アドレス オフセット ニモニック オペランド バイト列)
 (defglobal *disasm-list* (disassemble-to-list 'dis-add))
 (assert-equal t (> (length *disasm-list*) 0))
-(assert-equal 5 (length (car *disasm-list*)))
+(assert-equal 6 (length (car *disasm-list*)))
 ;; 先頭項目のオフセットは0、アドレスはコード先頭
 (assert-equal 0 (elt (car *disasm-list*) 1))
 (assert-equal (%%disasm-code-base 'dis-add) (elt (car *disasm-list*) 0))
 (assert-equal "push" (elt (car *disasm-list*) 2))
 (assert-equal "53" (elt (car *disasm-list*) 4))
+;; push rbx は絶対アドレスを持たないので注釈は空文字列
+(assert-equal "" (elt (car *disasm-list*) 5))
 
 ;; disassemble自体は標準出力へ出してnilを返す
 (assert-output (disasm-result disasm-output) (disassemble 'dis-add)
@@ -162,4 +217,23 @@
 (format *isiki-test-stream* "~%--- (disassemble 'dis-caller) ---~%")
 (disassemble-to-stream *isiki-test-stream* 'dis-caller)
 (format *isiki-test-stream* "~%")
+
+;; 領域の境界と内訳を記録に残す(4-1「どの領域に落ちたか」の答えそのもの)
+(format *isiki-test-stream* "~%#region kernel      0x~X .. 0x~X~%"
+        (car *disasm-kernel-bounds*) (cdr *disasm-kernel-bounds*))
+(format *isiki-test-stream* "#region immobilized 0x~X .. 0x~X~%"
+        (car *disasm-imm-bounds*) (cdr *disasm-imm-bounds*))
+(format *isiki-test-stream* "#region gc-heap     0x~X .. 0x~X~%"
+        (car *disasm-heap-bounds*) (cdr *disasm-heap-bounds*))
+(format *isiki-test-stream* "#region dis-add code-base 0x~X (region ~D)~%"
+        (%%disasm-code-base 'dis-add)
+        (%%disasm-classify-addr (%%disasm-code-base 'dis-add)))
+(format *isiki-test-stream* "#count dis-add    kernel=~D immobilized=~D gc-heap=~D~%"
+        (disasm-count-comment 'dis-add "<kernel>")
+        (disasm-count-comment 'dis-add "<immobilized>")
+        (disasm-count-comment 'dis-add "<gc-heap>"))
+(format *isiki-test-stream* "#count dis-caller kernel=~D immobilized=~D gc-heap=~D~%"
+        (disasm-count-comment 'dis-caller "<kernel>")
+        (disasm-count-comment 'dis-caller "<immobilized>")
+        (disasm-count-comment 'dis-caller "<gc-heap>"))
 (finish-output *isiki-test-stream*)

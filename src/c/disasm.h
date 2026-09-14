@@ -46,6 +46,32 @@ typedef struct {
     char mnemonic[16];
     /** オペランド(Intel記法、dst, srcの順)。無い場合は空文字列 */
     char operands[OS_DISASM_TEXT_SIZE];
+    /**
+     * この命令が指す絶対アドレスを持つなら1。対象は
+     *  - movabs の imm64
+     *  - コードブロックの外へ飛ぶ call/jmp/jcc rel32 の解決先
+     *  - RIP相対のアドレッシングの実効アドレス
+     * の3つ。imm8/disp8は値域が狭く誤ヒットするので対象にしない。
+     *
+     * ブロック**内**へ飛ぶ分岐は対象外である。飛び先は定義上この関数自身と同じ
+     * 領域にあり、注釈しても情報が増えないまま全行が伸びるだけになる。
+     * 飛び先はoperandsにオフセットとして出ているので、そちらで足りる。
+     */
+    int has_target_addr;
+    /** has_target_addrが1のときの絶対アドレス */
+    UINT64 target_addr;
+    /**
+     * 表示用の注釈("<immobilized>"等)。空文字列なら何も表示しない。
+     *
+     * デコーダはここを**常に空文字列にする**。アドレスの所属領域を知るには
+     * ランタイム側の境界(os_classify_addr)が要り、デコーダをランタイムから
+     * 独立に保つためにここでは埋めない。埋めるのは src/c/disasm_lisp.c 側で、
+     * os_disasm_format_line は埋まっていれば行末へ付ける。
+     *
+     * operandsへ連結しないのは、disassemble-to-list の利用側が
+     * オペランドと注釈を分離するためにパースする羽目になるため。
+     */
+    char comment[64];
 } os_disasm_insn_t;
 
 /**

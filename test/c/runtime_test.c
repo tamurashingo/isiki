@@ -1930,6 +1930,96 @@ void test_gc_fires_during_string_append_and_result_is_correct() {
     #undef GC_STRING_TEST_N
 }
 
+/* ===================== disassembler用のアドレス分類 ===================== */
+
+/** 1領域ぶんの境界を、内側と外側の両方から確認する。
+    半開区間なので start は範囲内、end は**範囲外**でなければならない
+    (ここを取り違えると、隣接する領域の先頭1バイトを誤分類する) */
+static void check_region_boundaries(os_addr_region_t region, const char *label) {
+    lisp_addr_t start = 0;
+    lisp_addr_t end = 0;
+    char msg[160];
+
+    if (!os_addr_region_bounds(region, &start, &end)) {
+        sprintf(msg, "%s: 境界が未確定なら start/end は 0 になる", label);
+        assert(start == 0 && end == 0, msg);
+        return;
+    }
+
+    sprintf(msg, "%s: start < end", label);
+    assert(start < end, msg);
+
+    sprintf(msg, "%s: start は範囲内", label);
+    assert(os_classify_addr(start) == region, msg);
+
+    sprintf(msg, "%s: end-1 は範囲内(上端の1バイト手前)", label);
+    assert(os_classify_addr(end - 1) == region, msg);
+
+    sprintf(msg, "%s: end は範囲外(半開区間の上端)", label);
+    assert(os_classify_addr(end) != region, msg);
+
+    sprintf(msg, "%s: start-1 は範囲外", label);
+    assert(os_classify_addr(start - 1) != region, msg);
+}
+
+void test_os_classify_addr_boundaries() {
+    /* Immobilized Space はカーネルイメージ内の静的配列なので、ヒープ初期化とは
+       無関係に常に境界が確定している */
+    check_region_boundaries(OS_ADDR_IMMOBILIZED, "immobilized");
+    /* GCヒープは setup_heap() 済みなので確定している */
+    check_region_boundaries(OS_ADDR_GC_HEAP, "gc-heap");
+    /* .text はネイティブgccのユニットテストビルド(ELF)では取得できず未確定。
+       os_addr_region_bounds が 0 を返し、check_region_boundaries は
+       「start/end が 0」だけを確認する。実機での .text 判定は
+       test/lisp/disassemble_test.lisp が確認する */
+    check_region_boundaries(OS_ADDR_KERNEL_TEXT, "kernel-text");
+}
+
+void test_os_classify_addr_rejects_out_of_range() {
+    assert(os_classify_addr(0) == OS_ADDR_UNKNOWN, "0 はどの領域にも属さない");
+    assert(os_classify_addr((lisp_addr_t)~(UINT64)0) == OS_ADDR_UNKNOWN,
+           "UINTPTR_MAX はどの領域にも属さない");
+    /* Cスタック上のローカル変数は3領域のいずれでもない */
+    int on_stack = 0;
+    assert(os_classify_addr((lisp_addr_t)(void *)&on_stack) == OS_ADDR_UNKNOWN,
+           "Cスタック上のアドレスはどの領域にも属さない");
+}
+
+void test_os_classify_addr_regions_do_not_overlap() {
+    /* 領域同士が重なっていれば、判定順序によって結果が変わる設計上の誤りになる。
+       確定している領域の組み合わせだけを総当たりで確認する */
+    for (int a = OS_ADDR_KERNEL_TEXT; a <= OS_ADDR_GC_HEAP; a++) {
+        for (int b = a + 1; b <= OS_ADDR_GC_HEAP; b++) {
+            lisp_addr_t a_start = 0, a_end = 0, b_start = 0, b_end = 0;
+            if (!os_addr_region_bounds((os_addr_region_t)a, &a_start, &a_end)) { continue; }
+            if (!os_addr_region_bounds((os_addr_region_t)b, &b_start, &b_end)) { continue; }
+            char msg[160];
+            sprintf(msg, "領域 %d と %d が重なっていない", a, b);
+            assert(a_end <= b_start || b_end <= a_start, msg);
+        }
+    }
+}
+
+void test_os_addr_region_name() {
+    assert(strcmp(os_addr_region_name(OS_ADDR_KERNEL_TEXT), "kernel") == 0, "kernel の表示名");
+    assert(strcmp(os_addr_region_name(OS_ADDR_IMMOBILIZED), "immobilized") == 0, "immobilized の表示名");
+    assert(strcmp(os_addr_region_name(OS_ADDR_GC_HEAP), "gc-heap") == 0, "gc-heap の表示名");
+    assert(os_addr_region_name(OS_ADDR_UNKNOWN) == 0, "UNKNOWN は名前を持たない(NULL)");
+}
+
+void test_os_classify_addr_matches_real_objects() {
+    /* 実際に確保したオブジェクトとFunction Cellが、期待どおりの領域に落ちること。
+       境界値だけでなく「本物がそこにある」ことを確認する */
+    lisp_val_t cell = os_get_function_cell(os_make_symbol("CAR"), global_environment);
+    assert(cell != nil, "CAR の Function Cell が引ける");
+    assert(os_classify_addr((lisp_addr_t)(cell & ~TAG_MASK)) == OS_ADDR_IMMOBILIZED,
+           "Function Cell は Immobilized Space にある");
+
+    lisp_val_t cons = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    assert(os_classify_addr((lisp_addr_t)(cons & ~TAG_MASK)) == OS_ADDR_GC_HEAP,
+           "os_make_cons が返した cons は GCヒープにある");
+}
+
 int main(int argc, char** argv) {
    (void)argc;
    (void)argv;
@@ -1948,6 +2038,11 @@ int main(int argc, char** argv) {
    test_primitive_global_environment_returns_global_environment_regardless_of_caller_env();
    test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid_env();
    test_os_function_cell();
+   test_os_classify_addr_boundaries();
+   test_os_classify_addr_rejects_out_of_range();
+   test_os_classify_addr_regions_do_not_overlap();
+   test_os_addr_region_name();
+   test_os_classify_addr_matches_real_objects();
    test_os_make_fixnum_signed();
    test_os_make_integer_promotes_to_bignum();
    test_primitive_add_signed_and_bignum();

@@ -15,6 +15,31 @@
 /** %%DISASM-ITEMが返す整形済み1行の最大長 */
 #define OS_DISASM_LINE_SIZE 192
 
+/**
+ * insnが絶対アドレスを指しているなら、その所属領域を注釈として埋める。
+ * デコーダ(disasm.c)はランタイムの境界を知らないのでここで埋める
+ * (disasm.h の os_disasm_insn_t.comment のコメント参照)。
+ * どの領域にも当たらない場合は空文字列のままにする — 「引けなかった」ことを
+ * 示す表示は出さない(全行に無意味な注釈が付くだけになるため)。
+ */
+static void d_fill_region_comment(os_disasm_insn_t *insn) {
+    insn->comment[0] = 0;
+    if (!insn->has_target_addr) {
+        return;
+    }
+    const char *name = os_addr_region_name(os_classify_addr((lisp_addr_t)insn->target_addr));
+    if (name == 0) {
+        return;
+    }
+    UINT64 n = 0;
+    insn->comment[n++] = '<';
+    while (*name != 0 && n + 2 < sizeof(insn->comment)) {
+        insn->comment[n++] = *name++;
+    }
+    insn->comment[n++] = '>';
+    insn->comment[n] = 0;
+}
+
 /* ============================== 関数オブジェクト → コード範囲 ============================== */
 
 /**
@@ -95,8 +120,10 @@ static lisp_val_t primitive_disasm_entry_offset(lisp_val_t args, lisp_val_t env)
  * 組み込み関数%%DISASM-ITEM。addrから始まるcode-lenバイトのコードのうち、
  * offsetの位置にある1項目(命令、またはコードに埋め込まれた文字列)をデコードする。
  *
- * 戻り値のリストは (長さ 種別 ニモニック オペランド バイト列 整形済み1行) で、
+ * 戻り値のリストは (長さ 種別 ニモニック オペランド バイト列 整形済み1行 注釈) で、
  * 種別は 0=命令 / 1=埋め込み文字列 / 2=デコード失敗。
+ * 注釈はこの命令が指す絶対アドレスの所属領域("<kernel>"等)で、
+ * 絶対アドレスを持たない命令、および領域が引けなかった場合は空文字列。
  * offsetが範囲外ならnilを返すので、呼び出し側はこれをループの終端判定に使える。
  *
  * @param args (addr code-len offset)
@@ -116,6 +143,8 @@ static lisp_val_t primitive_disasm_item(lisp_val_t args, lisp_val_t env) {
         return nil;
     }
 
+    d_fill_region_comment(&insn);
+
     char line[OS_DISASM_LINE_SIZE];
     os_disasm_format_line(&insn, line, sizeof(line));
 
@@ -130,6 +159,8 @@ static lisp_val_t primitive_disasm_item(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(acc);
     GC_PROTECT(tmp);
 
+    tmp = os_make_string(insn.comment);
+    acc = os_make_cons(tmp, acc);
     tmp = os_make_string(line);
     acc = os_make_cons(tmp, acc);
     tmp = os_make_string(bytes_text);
@@ -145,6 +176,42 @@ static lisp_val_t primitive_disasm_item(lisp_val_t args, lisp_val_t env) {
     return acc;
 }
 
+/**
+ * 組み込み関数%%DISASM-CLASSIFY-ADDR。アドレスの所属領域を返す。
+ * 戻り値は os_addr_region_t の値そのもの(0=不明 1=kernel 2=immobilized 3=gc-heap)。
+ * @param args (addr)
+ * @param env 呼び出し時の環境(未使用)
+ * @return 領域番号のfixnum
+ */
+static lisp_val_t primitive_disasm_classify_addr(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_addr_t addr = (lisp_addr_t)os_fixnum_magnitude(cc_car(args));
+    return os_make_fixnum((UINT64)os_classify_addr(addr));
+}
+
+/**
+ * 組み込み関数%%DISASM-REGION-BOUNDS。領域の実行時の境界を(start . end)で返す。
+ * endは**範囲外**(半開区間の上端)。境界が未確定ならnil。
+ *
+ * .textの範囲はPE/COFFヘッダを辿って求めており、ヘッダが期待した形でなければ
+ * 黙って未確定のままになる。それが起きたことを外から確認できるようにするために
+ * 公開する(documents/pitfalls.md 原則6)。
+ * @param args (region) regionは os_addr_region_t の値
+ * @param env 呼び出し時の環境(未使用)
+ * @return (start . end) のcons、または境界が未確定ならnil
+ */
+static lisp_val_t primitive_disasm_region_bounds(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 region = os_fixnum_magnitude(cc_car(args));
+    lisp_addr_t start = 0;
+    lisp_addr_t end = 0;
+    if (!os_addr_region_bounds((os_addr_region_t)region, &start, &end)) {
+        return nil;
+    }
+    /* fixnum 2つを作ってからconsする。os_make_fixnumは確保しないのでGCは走らない */
+    return os_make_cons(os_make_fixnum(start), os_make_fixnum(end));
+}
+
 void os_register_disasm(void) {
     os_set_function(os_make_symbol("%%DISASM-CODE-BASE"),
                     os_make_native_function((lisp_addr_t)(void *)primitive_disasm_code_base), global_environment);
@@ -154,4 +221,8 @@ void os_register_disasm(void) {
                     os_make_native_function((lisp_addr_t)(void *)primitive_disasm_entry_offset), global_environment);
     os_set_function(os_make_symbol("%%DISASM-ITEM"),
                     os_make_native_function((lisp_addr_t)(void *)primitive_disasm_item), global_environment);
+    os_set_function(os_make_symbol("%%DISASM-CLASSIFY-ADDR"),
+                    os_make_native_function((lisp_addr_t)(void *)primitive_disasm_classify_addr), global_environment);
+    os_set_function(os_make_symbol("%%DISASM-REGION-BOUNDS"),
+                    os_make_native_function((lisp_addr_t)(void *)primitive_disasm_region_bounds), global_environment);
 }

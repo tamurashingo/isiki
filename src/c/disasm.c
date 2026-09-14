@@ -167,6 +167,10 @@ typedef struct {
     UINT64 code_len;
     UINT64 pos;      /* 次に読むバイトの位置 */
     int truncated;   /* code_lenを踏み越えて読もうとしたら1 */
+    /* RIP相対のアドレッシングを読んだら1。実効アドレスは「次の命令の先頭 + disp」
+       なので、命令長が確定するModRMの後まで計算を遅らせる必要がある */
+    int rip_relative;
+    INT64 rip_disp;
 } d_cursor_t;
 
 static UINT8 d_u8(d_cursor_t *c) {
@@ -241,6 +245,8 @@ static void d_decode_modrm(d_cursor_t *c, UINT8 rex, int wide,
     } else if (rm == 5 && mod == 0) {
         rip_relative = 1;
         disp = (INT64)(INT32)d_u32(c);
+        c->rip_relative = 1;
+        c->rip_disp = disp;
     } else {
         base_name = g_reg64[rm | ((rex & 1) << 3)];
     }
@@ -286,6 +292,11 @@ static void d_decode_modrm(d_cursor_t *c, UINT8 rex, int wide,
  * オフセットを、範囲外(共有トランポリンへの末尾呼び出し等)なら相対変位を出す。
  * @param next_offset 分岐命令の次の命令のオフセット(rel加算の基準)
  */
+static int d_branch_is_outside(UINT64 code_len, UINT64 next_offset, INT64 rel) {
+    INT64 target = (INT64)next_offset + rel;
+    return !(target >= 0 && (UINT64)target <= code_len);
+}
+
 static void d_branch_target(d_sb_t *sb, UINT64 code_len, UINT64 next_offset, INT64 rel) {
     INT64 target = (INT64)next_offset + rel;
     if (target >= 0 && (UINT64)target <= code_len) {
@@ -350,6 +361,9 @@ static UINT64 d_emit_bad(os_disasm_insn_t *out, const UINT8 *code, UINT64 code_l
     out->kind = OS_DISASM_BAD;
     out->offset = offset;
     out->length = 1;
+    out->has_target_addr = 0;
+    out->target_addr = 0;
+    out->comment[0] = 0;
     d_strcpy(out->mnemonic, sizeof(out->mnemonic), "(bad)");
     d_sb_t sb;
     sb_init(&sb, out->operands, sizeof(out->operands));
@@ -369,6 +383,9 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
         out->kind = OS_DISASM_DATA;
         out->offset = offset;
         out->length = str_len;
+        out->has_target_addr = 0;
+        out->target_addr = 0;
+        out->comment[0] = 0;
         d_strcpy(out->mnemonic, sizeof(out->mnemonic), ".asciz");
         d_sb_t sb;
         sb_init(&sb, out->operands, sizeof(out->operands));
@@ -391,6 +408,8 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
     c.code_len = code_len;
     c.pos = offset;
     c.truncated = 0;
+    c.rip_relative = 0;
+    c.rip_disp = 0;
 
     UINT8 rex = 0;
     while (c.pos < code_len && code[c.pos] >= 0x40 && code[c.pos] <= 0x4F) {
@@ -412,6 +431,9 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
     UINT8 reg = 0;
     UINT8 op = d_u8(&c);
     int ok = 1;
+    /* この命令が指す絶対アドレス(has_target_addr/target_addrの元。ヘッダのコメント参照) */
+    int has_target = 0;
+    UINT64 target = 0;
 
     switch (op) {
         /* ---- ALU r/m64, r64 (add/or/adc/sbb/and/sub/xor/cmp) ---- */
@@ -483,10 +505,15 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
         case 0xB8: case 0xB9: case 0xBA: case 0xBB:
         case 0xBC: case 0xBD: case 0xBE: case 0xBF: {
             UINT8 dst = (UINT8)((op - 0xB8) | ((rex & 1) << 3));
+            UINT64 imm = wide ? d_u64(&c) : (UINT64)d_u32(&c);
             d_strcpy(mnemonic, sizeof(mnemonic), wide ? "movabs" : "mov");
             sb_str(&ops, d_regname(dst, wide));
             sb_str(&ops, ", ");
-            sb_hex(&ops, wide ? d_u64(&c) : (UINT64)d_u32(&c));
+            sb_hex(&ops, imm);
+            /* za.cが関数アドレスやFunction Cellを焼き込むのはこの形。
+               「0x0c1d41aaとは何か」が読めないという問題の本体 */
+            has_target = 1;
+            target = imm;
             break;
         }
 
@@ -507,12 +534,20 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
             INT64 rel = (INT64)(INT32)d_u32(&c);
             d_strcpy(mnemonic, sizeof(mnemonic), op == 0xE8 ? "call" : "jmp");
             d_branch_target(&ops, code_len, c.pos, rel);
+            if (d_branch_is_outside(code_len, c.pos, rel)) {
+                has_target = 1;
+                target = (UINT64)(lisp_addr_t)code + (UINT64)((INT64)c.pos + rel);
+            }
             break;
         }
         case 0xEB: {
             INT64 rel = INT8_SIGN(d_u8(&c));
             d_strcpy(mnemonic, sizeof(mnemonic), "jmp");
             d_branch_target(&ops, code_len, c.pos, rel);
+            if (d_branch_is_outside(code_len, c.pos, rel)) {
+                has_target = 1;
+                target = (UINT64)(lisp_addr_t)code + (UINT64)((INT64)c.pos + rel);
+            }
             break;
         }
         case 0x70: case 0x71: case 0x72: case 0x73:
@@ -522,6 +557,10 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
             INT64 rel = INT8_SIGN(d_u8(&c));
             d_strcpy(mnemonic, sizeof(mnemonic), g_jcc[op - 0x70]);
             d_branch_target(&ops, code_len, c.pos, rel);
+            if (d_branch_is_outside(code_len, c.pos, rel)) {
+                has_target = 1;
+                target = (UINT64)(lisp_addr_t)code + (UINT64)((INT64)c.pos + rel);
+            }
             break;
         }
 
@@ -573,6 +612,10 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
                 INT64 rel = (INT64)(INT32)d_u32(&c);
                 d_strcpy(mnemonic, sizeof(mnemonic), g_jcc[op2 - 0x80]);
                 d_branch_target(&ops, code_len, c.pos, rel);
+                if (d_branch_is_outside(code_len, c.pos, rel)) {
+                    has_target = 1;
+                    target = (UINT64)(lisp_addr_t)code + (UINT64)((INT64)c.pos + rel);
+                }
             } else if (op2 >= 0x90 && op2 <= 0x9F) {
                 d_decode_modrm(&c, rex, 0, rm_text, sizeof(rm_text), &reg);
                 /* setcc: "set" + jccニモニックの条件部分 */
@@ -616,11 +659,22 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
         return d_emit_bad(out, code, code_len, offset);
     }
 
+    /* RIP相対の実効アドレスは「次の命令の先頭 + disp」なので、命令長が確定した
+       ここで初めて計算できる。movabs等で既にtargetが立っている場合は上書きしない */
+    if (!has_target && c.rip_relative) {
+        has_target = 1;
+        target = (UINT64)(lisp_addr_t)code + (UINT64)((INT64)c.pos + c.rip_disp);
+    }
+
     out->kind = OS_DISASM_INSN;
     out->offset = offset;
     out->length = c.pos - offset;
     d_strcpy(out->mnemonic, sizeof(out->mnemonic), mnemonic);
     d_strcpy(out->operands, sizeof(out->operands), operands);
+    out->has_target_addr = has_target;
+    out->target_addr = target;
+    /* 注釈はランタイム側(disasm_lisp.c)が埋める。ヘッダのcommentのコメント参照 */
+    out->comment[0] = 0;
     d_fill_bytes(out, code, code_len, offset);
     return out->length;
 }
@@ -629,6 +683,10 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
 
 /** バイト列の表示に使う最大バイト数(movabsの10バイトが収まる幅) */
 #define OS_DISASM_SHOWN_BYTES 10
+/** 行頭から命令欄の先頭までの桁数(オフセット4桁 + 空白2 + バイト欄) */
+#define OS_DISASM_INSN_COLUMN (4 + 2 + (OS_DISASM_SHOWN_BYTES + 1) * 3)
+/** 行頭から注釈(`; <...>`)の先頭までの桁数 */
+#define OS_DISASM_COMMENT_COLUMN (OS_DISASM_INSN_COLUMN + 34)
 
 UINT64 os_disasm_format_bytes(const os_disasm_insn_t *insn, char *buf, UINT64 buf_size) {
     d_sb_t sb;
@@ -680,6 +738,15 @@ UINT64 os_disasm_format_line(const os_disasm_insn_t *insn, char *buf, UINT64 buf
     if (insn->operands[0] != 0) {
         sb_char(&sb, ' ');
         sb_str(&sb, insn->operands);
+    }
+    if (insn->comment[0] != 0) {
+        /* 注釈の開始桁を揃える(命令欄の先頭から34桁目)。オペランドがそれより長い
+           場合は桁揃えを諦めて空白1つだけ空ける */
+        while (sb.len < OS_DISASM_COMMENT_COLUMN) {
+            sb_char(&sb, ' ');
+        }
+        sb_str(&sb, " ; ");
+        sb_str(&sb, insn->comment);
     }
     return sb.len;
 }
