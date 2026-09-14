@@ -8,6 +8,8 @@
 ;; 変数へ受けてから確認する
 (defglobal *isiki-test-syntax-load-result* (load "test/lisp/isiki_test_syntax.lisp"))
 (assert-equal t *isiki-test-syntax-load-result*)
+;; 同じ仕様例を defun の本体にして JIT コンパイラに通す版(tools/gen_isiki_test_jit.py で生成)
+(load "test/lisp/isiki_test_jit.lisp")
 (load "test/lisp/za_test.lisp")
 (load "test/lisp/za_test_ext5.lisp")
 (load "test/lisp/za_test_ext7.lisp")

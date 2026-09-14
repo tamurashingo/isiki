@@ -1076,7 +1076,9 @@ lisp_val_t primitive_boot_alloc_used_bytes(lisp_val_t args, lisp_val_t env) {
  * 既存のqemu_boot_test.lisp一式(init.lisp+全za_test*.lisp、トップレベルdefun約390個)を
  * 単一の生存し続けるREPL環境上で全て実行してもページ枯渇によるJITフォールバックが
  * 起きないよう、余裕を持って8倍(4MB)に拡張した。 */
-#define IMM_SPACE_SIZE (4 * 1024 * 1024)
+/* 2026-09-14: 4MB→16MB。ISLisp仕様例のJIT版(isiki_test_jit.lisp、約1200関数)を含む
+ * テスト一式を1ブートでJIT化すると4MBでは za_test_ext16 付近で枯渇(PANIC)する */
+#define IMM_SPACE_SIZE (16 * 1024 * 1024)
 
 static UINT8 g_imm_space[IMM_SPACE_SIZE] __attribute__((aligned(IMM_PAGE_SIZE)));
 /** 未使用領域のうち、まだページ切り出しに使っていない先頭アドレス */
@@ -1286,9 +1288,9 @@ int os_addr_region(lisp_addr_t addr);
  * だけで最大96、プロセス環境(PROCESS_COUNT)分を加えるとさらに増えるため、
  * 三者が同時に上限近くまで使われる状況を見込んで十分な余裕を持たせる。
  */
-/* za.cの各スロットプール(quote 40 + number 32 + lambda 64)とプロセスごとの
- * env/live_blocks(PROCESS_COUNT×2)を余裕を持って収める(2026-09-14: lambda 40→64に伴い160→256) */
-#define GC_MAX_EXTRA_ROOTS 256
+/* za.cの各スロットプール(quote 1024 + number 512 + lambda 256)とプロセスごとの
+ * env/live_blocks(PROCESS_COUNT×2)を余裕を持って収める(2026-09-14: 160→2048) */
+#define GC_MAX_EXTRA_ROOTS 2048
 static lisp_val_t *g_gc_extra_roots[GC_MAX_EXTRA_ROOTS];
 static UINT64 g_gc_extra_root_count = 0;
 
@@ -4136,6 +4138,20 @@ lisp_val_t primitive_car(lisp_val_t args, lisp_val_t env) {
  * @param env 呼び出し時の環境(未使用)
  * @return 第一引数のcdr
  */
+lisp_val_t os_car_checked(lisp_val_t x, lisp_val_t env) {
+    if (x == nil || (x & TAG_MASK) != TAG_CONS) {
+        return signal_domain_error_for_class(x, "<CONS>", env);
+    }
+    return cc_car(x);
+}
+
+lisp_val_t os_cdr_checked(lisp_val_t x, lisp_val_t env) {
+    if (x == nil || (x & TAG_MASK) != TAG_CONS) {
+        return signal_domain_error_for_class(x, "<CONS>", env);
+    }
+    return cc_cdr(x);
+}
+
 lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
     lisp_val_t target = cc_car(args); // 第一引数
     if (target == nil || (target & TAG_MASK) != TAG_CONS) {

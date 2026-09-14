@@ -147,11 +147,13 @@
 (assert-equal t (%%za-compiled-p (function isiki-za-test-let-capture-nested)))
 (assert-equal (list 6 7 101) (funcall (isiki-za-test-let-capture-nested 5)))
 
-;;; --- 9. &rest付きlambdaのIIFEは非対応でfallback ---
+;;; --- 9. &rest付きlambdaのIIFEはlet-IIFEインライン化の対象外だが、
+;;;        (funcall (lambda ...) args...) へ書き換えてJIT対象になる(ISLisp仕様例
+;;;        ((lambda (x y &rest z) z) 3 4 5 6) の対応) ---
 
 (defun isiki-za-test-let-rest-fallback (x)
   ((lambda (&rest xs) (car xs)) x (+ x 1)))
-(assert-equal nil (%%za-compiled-p (function isiki-za-test-let-rest-fallback)))
+(assert-equal t (%%za-compiled-p (function isiki-za-test-let-rest-fallback)))
 (assert-equal 10 (isiki-za-test-let-rest-fallback 10))
 
 ;;; --- 10. or(setqを使わないため、let対応後は自動的にコンパイル対象になることの回帰確認) ---

@@ -1007,6 +1007,15 @@ lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_v
 lisp_val_t os_signal_control_error(lisp_val_t env);
 
 /**
+ * (car x)/(cdr x)のJIT生成コード用。xがconsでなければ(nilを含む)<domain-error>をsignalする
+ * (primitive_car/primitive_cdrと同じ規則、ISLisp仕様§21.2)。
+ * @param x 対象
+ * @param env 呼び出し時の環境(signal-conditionに使う)
+ */
+lisp_val_t os_car_checked(lisp_val_t x, lisp_val_t env);
+lisp_val_t os_cdr_checked(lisp_val_t x, lisp_val_t env);
+
+/**
  * 現在のプロセスの「動的extentにあるblock」リスト(process_t.live_blocks)の先頭にnameを積む。
  * eval.cのeval_blockとza.c(JIT生成コード)のblockが、bodyの評価の直前に呼ぶ。
  * @param name blockの名前(symbolまたはnil)

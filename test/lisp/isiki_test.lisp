@@ -457,6 +457,10 @@
 (assert-equal nil (property 'a 'label))
 (assert-equal 'found (isiki-test-up-foo '(a b a c)))
 (assert-equal nil (property 'a 'label))
+;; この例の bar は (symbolp nil) が t のため末尾の nil にも label を付け、cleanup は
+;; リストの要素(a b c)しか外さないので nil の label が残る。同じ例を続けて実行する
+;; (isiki_test_jit.lisp)と 2 回目の '(a b c) で found になってしまうため、ここで外す
+(remove-property nil 'label)
 
 ;; cf. p.47 unwind-protect の例(2つ目: cleanup中に別のblockへreturn-fromするとエラー)。
 ;; test/test2/test3/test4 は isiki-test-up-test/-test2/-test3/-test4 に変更。
