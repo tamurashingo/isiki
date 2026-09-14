@@ -763,3 +763,134 @@
 
 (defun %%transpile-fixture-make-toynode ()
   (make-instance '%%transpile-fixture-toy-sub))
+
+;;;; --- [性能測定] Phase2: 即時lambda呼び出しのインライン展開の意味論確認 ---
+;;;; letは((lambda (vars) body) inits)へ展開され、束縛変数がネストしたlambdaに
+;;;; 捕捉されない場合はCブロックへインライン展開される。捕捉がある場合は
+;;;; 従来のクロージャ経路へフォールバックする。両経路の意味論を確認する。
+
+;; 並列束縛: 内側のbのinit aは「外側のa」(=1)を見なければならない
+(defun %%transpile-fixture-let-parallel ()
+  (let ((a 1))
+    (let ((a 2) (b a))
+      b)))
+
+;; 逐次束縛: let*のbのinit (+ a 1) は同じlet*のa(=1)を見る
+(defun %%transpile-fixture-let-star-sequential ()
+  (let* ((a 1) (b (+ a 1)))
+    b))
+
+;; 束縛変数へのsetq(捕捉が無いのでCローカルへの代入になる)
+(defun %%transpile-fixture-let-setq ()
+  (let ((a 1))
+    (progn (setq a (+ a 41)) a)))
+
+;; シャドーイング
+(defun %%transpile-fixture-let-shadow ()
+  (let ((a 1))
+    (+ a (let ((a 10)) a))))
+
+;; block/return-fromの貫通
+(defun %%transpile-fixture-let-return-from ()
+  (block done
+    (let ((a 1))
+      (progn (return-from done 7) a))))
+
+;; tagbody/goの貫通
+(defun %%transpile-fixture-let-tagbody ()
+  (let ((acc 0) (i 0))
+    (progn
+      (while (< i 4)
+        (progn (setq acc (+ acc i)) (setq i (+ i 1))))
+      acc)))
+
+;; init評価中に非局所脱出が起きたらbodyを評価しない
+(defun %%transpile-fixture-let-init-escape ()
+  (block done
+    (let ((a (return-from done 5)))
+      99)))
+
+;; 入れ子のlet/let*/for
+(defun %%transpile-fixture-let-nested-mix ()
+  (let ((base 100))
+    (let* ((x 1) (y (+ x 1)))
+      (for ((i 0 (+ i 1)) (s 0 (+ s i))) ((>= i 3) (+ base (+ x (+ y s))))))))
+
+;; 深い入れ子(10段)。GC_PROTECTはスタック上のノードを連結する方式なので
+;; 固定長スロットの溢れは起きないが、深い入れ子で壊れないことを確認する。
+;; 各段が1つ前に1を足すので結果は10になる
+(defun %%transpile-fixture-let-deep ()
+  (let ((a 1))
+    (let ((b (+ a 1)))
+      (let ((c (+ b 1)))
+        (let ((d (+ c 1)))
+          (let ((e (+ d 1)))
+            (let ((f (+ e 1)))
+              (let ((g (+ f 1)))
+                (let ((h (+ g 1)))
+                  (let ((i (+ h 1)))
+                    (let ((j (+ i 1)))
+                      j)))))))))))
+
+;; 束縛変数を捕捉するクロージャを外へ返す(=フォールバック経路が選ばれる)。
+;; インライン化されているとCローカルへの参照がdanglingするため、
+;; 正しい値が返ることでフォールバックが効いていることを確認する。
+(defun %%transpile-fixture-let-capture-escape ()
+  (funcall (let ((a 40)) (lambda (y) (+ a y))) 2))
+
+;; 捕捉ありかつsetqあり(box昇格経路)
+(defun %%transpile-fixture-let-capture-setq ()
+  (let ((a 1))
+    (progn
+      (funcall (lambda (y) (setq a (+ a y))) 41)
+      a)))
+
+;; GC誘発用: consセルを大量に作って捨てる
+(defun %%transpile-fixture-gc-churn (n)
+  (let ((i 0) (junk nil))
+    (progn
+      (while (< i n)
+        (progn (setq junk (cons i nil)) (setq i (+ i 1))))
+      (car junk))))
+
+;; インライン化されるlet(捕捉なし)とフォールバックするlet(捕捉あり)が
+;; 同一関数内に混在する状態でGCを跨ぐ。インライン化した束縛変数が
+;; GCルートとして保護されていなければ、ここでcar値が化ける
+(defun %%transpile-fixture-let-gc-mixed (n)
+  (let ((inlined (cons 11 22)))
+    (let ((captured (cons 31 44)))
+      (progn
+        (funcall (lambda (y) (cons captured y)) 0)
+        (%%transpile-fixture-gc-churn n)
+        (+ (car inlined) (car captured))))))
+
+;; [性能測定] Phase3 第0部: leaf判定でGC_PROTECTが省略される形の健全性確認。
+;; initは非box化ローカル(パラメータ)参照なのでleafと判定され保護が省略される。
+;; bodyでGCを誘発したあとに束縛変数を読む。省略された保護が不健全なら、
+;; GCで移動した先へ追随できずstaleなポインタを読む
+(defun %%transpile-fixture-let-leaf-gc (pair n)
+  (let ((x pair))
+    (progn
+      (%%transpile-fixture-gc-churn n)
+      (car x))))
+
+;; 同じ問題の関数引数版(Phase2以前からある経路)。第1引数pairはleafとして
+;; 保護を省略され、第2引数の評価でGCが走る
+(defun %%transpile-fixture-arg-leaf-gc (pair n)
+  (cons pair (%%transpile-fixture-gc-churn n)))
+
+;; [性能測定] Phase3 第0部: 直接呼び出し(引数consリストを組まない形)で
+;; GC_PROTECTを省略する経路の健全性確認。第1引数pairはヒープ値を持つ
+;; 非box化ローカル参照で保護が省略されるが、第2引数も割り付けを伴わない
+;; 読み出しなので使うまでGCは起こりえない。呼び出し先(os_make_cons)の
+;; 内部で割り付けが起きても、その時点で両引数は既に読み出し済み
+(defun %%transpile-fixture-direct-call-noprotect (pair other)
+  (car (cons pair other)))
+
+;; 同じ形で、呼び出し先が割り付けを何度も行う場合
+(defun %%transpile-fixture-direct-call-alloc-loop (pair n)
+  (let ((i 0) (last nil))
+    (progn
+      (while (< i n)
+        (progn (setq last (cons pair i)) (setq i (+ i 1))))
+      (car (car last)))))

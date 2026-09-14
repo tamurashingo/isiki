@@ -73,14 +73,13 @@ lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
 }
 
 // GC_PROTECTマクロ(runtime.h、stream.cのFAT分岐で新規使用)がget_current_process()->
-// gc_rootsを参照するため、process.cをリンクしない代わりに固定の1プロセス分の
-// フェイクを返す(このテストのGC_PROTECT自体は経路上呼ばれるが、GCそのものは
+// gc_rootsを参照するため、process.cをリンクしない代わりにその実体だけをここで
+// 定義する(このテストのGC_PROTECT自体は経路上呼ばれるが、GCそのものは
 // 動かないためgc_rootsの中身は使われない)。
-static process_t g_fake_process;
-
-process_t *get_current_process(void) {
-    return &g_fake_process;
-}
+// [性能測定] Phase4 第1部: get_current_process自体はprocess.hのstatic inlineへ
+// 移したため、ここで関数を定義すると重複定義になる。参照先のグローバルだけを置く
+process_t g_processes[PROCESS_COUNT];
+UINT32 g_current_process_index = 0;
 
 // virtio9p.c/p9.c/drivers/*.c はリンクしない(9Pプロトコルの実通信は
 // stream.c の責務ではないため)。os_virtio9p_open/read_chunk/close を

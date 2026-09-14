@@ -5,10 +5,10 @@
 #include "repl.h"
 
 /** @brief PROCESS_COUNT個のprocess_t本体(F1〜F4)。indexで直接アクセスされる */
-static process_t g_processes[PROCESS_COUNT];
+process_t g_processes[PROCESS_COUNT];
 
 /** @brief 現在アクティブ(表示フォーカスがある)プロセスのindex。switch_active_processが更新する */
-static UINT32 g_current_process_index = 0;
+UINT32 g_current_process_index = 0;
 
 /**
  * @brief プロセスごとの専用実行スタックのサイズ(バイト)
@@ -27,7 +27,238 @@ static UINT32 g_current_process_index = 0;
 #define STACK_SIZE (256 * 1024)
 
 /** @brief プロセスごとの専用実行スタック。GCが関知しないOS層の生メモリなので静的配列で確保する */
-static UINT8 g_stacks[PROCESS_COUNT][STACK_SIZE] __attribute__((aligned(16)));
+/* [原則6] 各スタックの**下**にガード領域を置く。ここを未マップにすることで、
+   溢れた瞬間に#PFが出てIDT/GDTへ到達する前に止まる。
+
+   ガードを複数ページ(64KB)取るのは、1ページだと大きなローカル配列を持つ関数が
+   SPを一気に下げてガードを**跨いで着地**しうるためである。踏まれなければ
+   フォルトは出ず、「IDTを壊してから死ぬ」に戻る。
+
+   レイアウト: slot[i] = [ガード64KB][実スタック256KB] を連続で並べ、**末尾にもガードを1つ足す**。
+   こうするとプロセスiの上端は必ずプロセスi+1のガード(未マップ)になり、
+   最後のプロセスの上端も末尾ガードで守られる。上下両側が塞がる。
+
+     [G0][stack0][G1][stack1][G2][stack2][G3][stack3][Gtop]
+
+   末尾ガードが要るのは、以前プロセス0の**上端**を越える読み出し(usagesの
+   ループ上限が壊れた件)を実際に踏んでいるためである。あのときは隣が
+   プロセス1のガードだったので捕まったが、最後のプロセスには隣が無かった。
+
+   配列を2次元ではなく平坦にするのは、末尾ガードとの連続性を宣言順に依存せず
+   保証するため(BSSの配置順は保証されない)。
+   4KB境界に揃えるのは、ページテーブルの粒度で未マップにするため。 */
+#define STACK_GUARD_SIZE (64 * 1024)
+#define STACK_SLOT_SIZE  (STACK_GUARD_SIZE + STACK_SIZE)
+#define STACK_AREA_SIZE  (PROCESS_COUNT * STACK_SLOT_SIZE + STACK_GUARD_SIZE)
+static UINT8 g_stack_area[STACK_AREA_SIZE] __attribute__((aligned(4096)));
+
+/** i番目のスロット先頭(=そのプロセスの下側ガードの先頭) */
+static UINT8 *stack_slot(UINT32 i) {
+    return g_stack_area + (UINT64)i * STACK_SLOT_SIZE;
+}
+
+/** i番目のプロセスが実際に使うスタックの下端(下側ガードの直上) */
+static UINT8 *stack_usable_base(UINT32 i) {
+    return stack_slot(i) + STACK_GUARD_SIZE;
+}
+
+/* ---- ガードページの設営 ----------------------------------------------------
+   UEFIが張った恒等マップは2MBページ(実測: %%DIAG-PAGE-LEVELが2を返す)なので、
+   ガードにしたい範囲を含む2MBページを4KBページへ**分割**してから、該当ページの
+   Presentビットを落とす。分割用のページテーブルは静的に持つ(ヒープはまだ
+   使えない段階で呼ぶため)。 */
+#define PT_POOL_COUNT 8
+static UINT64 g_pt_pool[PT_POOL_COUNT][512] __attribute__((aligned(4096)));
+static UINT32 g_pt_pool_used = 0;
+/** 分割済みの2MBページの先頭VA(同じ2MBページを二度分割しないための記録) */
+static UINT64 g_split_va[PT_POOL_COUNT];
+
+#define PTE_PRESENT 0x1ULL
+#define PTE_PS      0x80ULL
+#define PTE_ADDR    0x000FFFFFFFFFF000ULL
+
+/** vaに対応するPDエントリへのポインタを返す(辿れなければ0) */
+static UINT64 *pd_entry_for(UINT64 va) {
+    UINT64 cr3;
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+    UINT64 *pml4 = (UINT64 *)(cr3 & ~0xFFFULL);
+    UINT64 e4 = pml4[(va >> 39) & 0x1FF];
+    if (!(e4 & PTE_PRESENT)) { return 0; }
+    UINT64 *pdpt = (UINT64 *)(e4 & PTE_ADDR);
+    UINT64 e3 = pdpt[(va >> 30) & 0x1FF];
+    if (!(e3 & PTE_PRESENT) || (e3 & PTE_PS)) { return 0; }
+    UINT64 *pd = (UINT64 *)(e3 & PTE_ADDR);
+    return &pd[(va >> 21) & 0x1FF];
+}
+
+/** vaを含む2MBページを4KBページ512個へ分割する(既に4KBならそのまま) */
+static UINT64 *ensure_4k_table(UINT64 va) {
+    UINT64 *pde = pd_entry_for(va);
+    if (pde == 0) { return 0; }
+    if (!(*pde & PTE_PS)) {
+        return (UINT64 *)(*pde & PTE_ADDR); /* 既に4KB粒度 */
+    }
+    UINT64 base2m = va & ~0x1FFFFFULL;
+    for (UINT32 k = 0; k < g_pt_pool_used; k++) {
+        if (g_split_va[k] == base2m) {
+            return g_pt_pool[k];
+        }
+    }
+    if (g_pt_pool_used >= PT_POOL_COUNT) { return 0; }
+    UINT64 flags = *pde & ~(PTE_ADDR | PTE_PS);
+    UINT64 *pt = g_pt_pool[g_pt_pool_used];
+    for (UINT32 j = 0; j < 512; j++) {
+        pt[j] = (base2m + (UINT64)j * 4096ULL) | flags | PTE_PRESENT;
+    }
+    g_split_va[g_pt_pool_used] = base2m;
+    g_pt_pool_used++;
+    *pde = ((UINT64)(lisp_addr_t)pt & PTE_ADDR) | flags | PTE_PRESENT;
+    return pt;
+}
+
+/** [va, va+len) を未マップにする(4KB単位) */
+static void unmap_range(UINT64 va, UINT64 len) {
+    for (UINT64 off = 0; off < len; off += 4096) {
+        UINT64 a = va + off;
+        UINT64 *pt = ensure_4k_table(a);
+        if (pt == 0) { continue; }
+        pt[(a >> 12) & 0x1FF] &= ~PTE_PRESENT;
+        __asm__ __volatile__("invlpg (%0)" : : "r"(a) : "memory");
+    }
+}
+
+/** 全プロセスのスタック直下のガード領域を未マップにする。
+    kernel_mainがプロセスを起動する前に1回だけ呼ぶ */
+void os_process_install_stack_guards(void) {
+    /* UEFIが張ったページテーブルは書き込み保護されている(実測: PDエントリへの
+       書き込みが error_code=0x3 の#PFになった)。CPL0でもCR0.WP=1だと
+       read-onlyページへの書き込みはフォルトするため、この間だけWPを落とす。 */
+    UINT64 cr0;
+    __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0 & ~(1ULL << 16)));
+
+    /* 各スロット先頭のガード + 末尾ガード(最後のプロセスの上端側) */
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        unmap_range((UINT64)stack_slot(i), STACK_GUARD_SIZE);
+    }
+
+    __asm__ __volatile__("mov %0, %%cr0" : : "r"(cr0));
+}
+
+UINT64 os_process_guard_base(UINT32 i) {
+    if (i > PROCESS_COUNT) { return 0; }
+    return (UINT64)stack_slot(i);
+}
+
+UINT64 os_process_guard_size(void) { return STACK_GUARD_SIZE; }
+
+/** vaがいずれかのガード領域の中か。例外ハンドラが「ガードページを踏んだ」と
+    明示するために使う */
+/* [原則6] ガードのどちら側かで**原因が違う**ので区別する。
+   下端側 = スタック溢れ(再帰が深すぎる)。
+   上端側 = 溢れではなく、基底や上限の破壊・バッファオーバーラン。
+   実際に`usages`のループ上限が壊れて上端を越えた事例がある。
+   0=ガードでない 1=どれかのスタックの下端側 2=どれかのスタックの上端側 */
+int os_process_guard_side(UINT64 va) {
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        UINT64 lo = (UINT64)stack_slot(i);
+        if (va < lo || va >= lo + STACK_GUARD_SIZE) { continue; }
+        /* スロットiのガードは「プロセスiの下端側」であり、同時に
+           「プロセスi-1の上端側」でもある。rspがどちらのスタックに居るかで決める */
+        return 1;
+    }
+    return 0;
+}
+
+/** vaがガードのとき、rspから見て上端側の踏み越しかどうか。
+    rspがスロットi-1のスタック内にあり、vaがスロットiのガードなら上端側 */
+int os_process_guard_is_upper(UINT64 va, UINT64 rsp) {
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        UINT64 lo = (UINT64)stack_slot(i);
+        if (va < lo || va >= lo + STACK_GUARD_SIZE) { continue; }
+        if (i == 0) { return 0; }  /* 先頭スロットの下は誰の上端でもない */
+        UINT64 prev_lo = (UINT64)stack_usable_base(i - 1);
+        if (rsp >= prev_lo && rsp <= prev_lo + STACK_SIZE) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+int os_process_in_stack_guard(UINT64 va) {
+    for (UINT32 i = 0; i <= PROCESS_COUNT; i++) {
+        UINT64 lo = (UINT64)stack_slot(i);
+        if (va >= lo && va < lo + STACK_GUARD_SIZE) { return 1; }
+    }
+    return 0;
+}
+
+/* [性能測定] Phase5 第0部: スタックガード。
+   スタックにはガードページが無く、溢れてもページフォルトにならない。検出が無いと
+   ゲストは無反応のまま停止し、外からは「極端に遅い処理」と区別できない
+   (documents/pitfalls.md 原則5)。ページング機構をこの段階で触るのは影響範囲が
+   大きいため、(1)各スタックの最下端へカナリアを置き (2)タイマ割り込みで
+   rspの範囲とカナリアの両方を検査する、という方式にする。通常パスのコストは
+   ゼロで、検査はスケジューラの切り替え時にのみ走る。
+   ただし検出粒度はタイマ周期(約10ms)であり、深い再帰は10ms未満で256KBを
+   消費しうる。その場合でも「溢れた後の次のtickで診断付きpanicに到達する」ため、
+   無言の停止よりは大幅に切り分けやすくなる(完全な即時検出にはガードページか
+   関数プロローグでの検査が要るが、後者はPhase4で削った呼び出しコストを
+   再び載せることになる) */
+#define STACK_CANARY 0x5441434B47554152ULL /* "STACKGUAR" 相当のマジック */
+/** カナリアの直上に置く安全マージン。rspがここより下に来た時点で溢れたと判定する */
+#define STACK_GUARD_MARGIN 4096
+
+static void stack_canary_init(UINT32 proc_index) {
+    *(UINT64 *)stack_usable_base(proc_index) = STACK_CANARY;
+}
+
+/** [第0部] 診断用: i番目のプロセススタックの下端アドレス。フォルト時のrspが
+    どのスタックのどこにあったかを、外から突き合わせるために公開する */
+UINT64 os_process_stack_base(UINT32 i) {
+    if (i >= PROCESS_COUNT) { return 0; }
+    return (UINT64)stack_usable_base(i);
+}
+
+int os_process_stack_contains(UINT64 rsp) {
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        UINT64 low = (UINT64)stack_usable_base(i);
+        if (rsp >= low && rsp <= low + STACK_SIZE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used) {
+    // まず全プロセスのカナリアを見る。溢れたスタックのrspはg_stacksの範囲外へ
+    // 出てしまい下のループでは捕まらないため、破壊の痕跡はこちらで検出する
+    // (PROCESS_COUNTは数個なのでtickごとに全部見ても無視できるコスト)
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        if (*(UINT64 *)stack_usable_base(i) != STACK_CANARY) {
+            *out_low = (UINT64)stack_usable_base(i);
+            *out_used = STACK_SIZE;
+            return 0;
+        }
+    }
+    // rspが属するスタックを特定し、下端のマージンに食い込んでいないかを見る。
+    // 実行中のプロセスはスケジューラが*CURRENT-PROCESS*で管理しており
+    // g_current_process_index(表示フォーカス用)とは別物なので、indexではなく
+    // rspがどの範囲に入るかで判定する
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        UINT64 low = (UINT64)stack_usable_base(i);
+        UINT64 high = low + STACK_SIZE;
+        if (rsp >= low && rsp <= high) {
+            *out_low = low;
+            *out_used = high - rsp;
+            return rsp >= low + STACK_GUARD_MARGIN;
+        }
+    }
+    // どのプロセススタックにも属さない。起動直後の初回tickはkernelのidleループの
+    // スタック上で走るため、ここへ来るのは正常
+    *out_low = 0;
+    *out_used = 0;
+    return 1;
+}
 
 /**
  * @brief PCB(word2)に保存されているsaved_rspを読み出す
@@ -77,7 +308,8 @@ void SYSV_ABI process_trampoline_c(UINT64 proc_index) {
  * @return 構築したPCB
  */
 static lisp_val_t spawn(UINT32 proc_index) {
-    UINT64 stack_top = (UINT64)(g_stacks[proc_index] + STACK_SIZE);
+    stack_canary_init(proc_index);
+    UINT64 stack_top = (UINT64)(stack_usable_base(proc_index) + STACK_SIZE);
     // iretq後のRSPがmod 16 == 8となるよう調整(SysV ABIの関数入口の想定に揃える)
     if ((stack_top & 0xFULL) != 8) {
         stack_top -= 8;
@@ -178,9 +410,9 @@ void initialize_processes(frame_buffer *buffers) {
  * @brief 現在アクティブなプロセスを返す
  * @return 現在アクティブなプロセス
  */
-process_t* get_current_process(void) {
-    return &g_processes[g_current_process_index];
-}
+/* [性能測定] Phase4 第1部: process.hのstatic inlineへ移した
+   (GC_PROTECT 1箇所につきこの関数が3回呼ばれており、クロスTU呼び出しのままだと
+   その3回分がGC_PROTECTのコストの大半を占めていた) */
 
 /**
  * @brief 表示フォーカスとは無関係に、固定indexでプロセスを返す(スケジューラが全プロセスを巡回するために使う)

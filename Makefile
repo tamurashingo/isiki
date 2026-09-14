@@ -5,6 +5,31 @@ PWD = $(shell pwd)
 # `make test-qemu OVMF_CODE=/usr/share/OVMF/OVMF_CODE.fd` のように上書きする
 OVMF_CODE ?= /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
 
+# [測定] ゲストに与えるメモリ量。Lispヒープは起動時にUEFIの最大
+# EfiConventionalMemory領域から取るので、これを下げるとGC頻度が上がる。
+# **生成コードを一切変えずにGC圧を上げられる**のが要点で、
+# 「GC_DEBUGを有効にするとcc_carのインライン化が消えて観測できない」という
+# 壁を迂回できる(%%DIAG-GC-STRESSはGC_DEBUG専用)。
+#   make test-qemu QEMU_MEM=96M
+# 下げすぎるとinit.lispのload前に落ちる。ヒープ先頭アドレスも動くので、
+# os_heap_initのheap_base > MAGIC_MUST_BE_BELOW 検査も併せて効く。
+QEMU_MEM ?= 256M
+
+# [測定] カーネル本体へ渡す追加フラグ。未初期化スタック読み出しの追跡に使う:
+#   make build EXTRA_CFLAGS=-ftrivial-auto-var-init=pattern
+# スタックフレームをパターンで埋めるので、未初期化のまま読んだ値がそのパターンなら
+# その場で分かる。レイアウトが変わっても**ゴミはゴミのまま**読まれるので、
+# 「無関係な変更で症状が消える」形の問題が摂動で消えなくなる。
+EXTRA_CFLAGS ?=
+
+# 命令数ベースの性能計測(documents/performance-measurement.md参照)で使う
+# TCGプラグインのビルドに必要な、ホストにインストール済みのqemu-system-x86_64
+# バージョン(`qemu-system-x86_64 --version`で確認)。プラグインABI
+# (QEMU_PLUGIN_VERSION)はヘッダのバージョンとホストのQEMU本体バージョンが
+# 一致している必要があるため、`.envrc`等で実際のホスト側バージョンに
+# 合わせて上書きすること
+QEMU_VERSION_FOR_PLUGIN ?= 10.2.1
+
 TARGET = esp_dir/EFI/BOOT/BOOTX64.EFI
 SRCDIR = src/c
 # トランスパイラ(transpileターゲット)の生成物。git管理対象外で、これらの
@@ -13,16 +38,35 @@ SRCDIR = src/c
 # (テスト専用、global_environmentへは登録されない)で、本番のカーネルバイナリには
 # 含めず$(LISP_COMPILED_FIXTURE)という別ファイルへコンパイルする(transpile.lispの
 # main参照)
-TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/file-node.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp
+TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/file-node.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp src/lisp/bench_aot.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
-HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
+HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/bench_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+# [GCデバッグ] documents/pitfalls.md 原則4/原則6。GC_DEBUG=1でstale領域の
+# staleポインタのデリファレンス検査を有効にする(%%DIAG-GC-STRESSで実行時に
+# 強制GCの間隔も設定できる)。GC_PAINT=1を併用すると旧From空間をトラップパターンで
+# 塗り潰すが、GC非管理の生データ(os_stream_t等)を壊すため既定では無効。
+# 通常ビルドでは空なので影響しない
+GC_DEBUG_FLAGS = $(if $(GC_DEBUG),-DISIKIOS_GC_DEBUG,)$(if $(GC_PAINT), -DISIKIOS_GC_PAINT,)
+
 BUILD_TMPDIR = tmp
+
+# [GCデバッグ] $(TARGET)はSRC/HDRのファイル依存で追跡するため、**フラグだけ変えても
+# 再ビルドされない**。以前はrm -f $(TARGET)を手で打つ運用にしていたが、忘れると
+# 「塗り潰し有効のつもりで無効のバイナリを測る」ことになり、しかも無言で成立する
+# (documents/pitfalls.md 原則6)。使用したフラグをスタンプに残し、変わったときだけ
+# スタンプを更新して$(TARGET)の再ビルドを促す
+GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
+.PHONY: FORCE
+FORCE:
+$(GC_DEBUG_STAMP): FORCE
+	@mkdir -p $(BUILD_TMPDIR)
+	@echo '$(GC_DEBUG_FLAGS)' | cmp -s - $@ 2>/dev/null || echo '$(GC_DEBUG_FLAGS)' > $@
 OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
 
 # fat16_test.img/fat32_test.imgのような固定テストフィクスチャはtmp/に置くが、
@@ -133,17 +177,25 @@ transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 # 「実際にソース/ヘッダが変更された時だけ」再生成されるようにする土台になる
 # (buildをphonyのままにしていると、buildを経由するあらゆる後続ターゲットが
 # 常に再実行されてしまう)。
-$(TARGET): $(SRC) $(HDR)
+$(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
 	mkdir -p esp_dir/EFI/BOOT
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
 		-nostdlib -mno-red-zone -O1 -shared \
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
+		$(GC_DEBUG_FLAGS) $(EXTRA_CFLAGS) \
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
 
+# [測定の落とし穴] `build`は以前 $(TARGET)(= esp_dir/.../BOOTX64.EFI)だけを作って
+# いた。QEMUが実際に起動するのは $(BOOT_FAT32_IMG) の中にコピーされたEFIなので、
+# `make build` の後に手でqemuを起動すると**古いカーネルを測ってしまう**。
+# しかもEFIとイメージのmtimeが同じ秒に収まると make は「最新」と判断して
+# 作り直さないため、`make images/boot_fat32.img` を明示しても取りこぼす。
+# 実測で、cc_carインライン化の可否を2回とも誤判定しかけた。
+# buildにイメージまで含めて、`make build`だけで起動可能な状態が揃うようにする。
 build: $(TARGET)
 
 # ファイル単体のコンパイルチェック用。リンクは行わず、生成した .o は tmp/ に捨てる
@@ -498,6 +550,19 @@ $(MBR_MULTI_DISK_IMG): | $(BUILD_TMPDIR)
 # 区別してimages/(IMAGES_DIR)に置く。loopマウント/losetupはCAP_SYS_ADMIN相当の
 # 権限を要するため、FAT16_DISK_IMG/FAT32_DISK_IMGと同様--privilegedでdocker runする。
 BOOT_FAT32_IMG = $(IMAGES_DIR)/boot_fat32.img
+
+# [測定の落とし穴] buildにブートイメージまで含める。
+# QEMUが実際に起動するのは $(BOOT_FAT32_IMG) の中にコピーされたEFIであって
+# $(TARGET) ではない。`make build` の後に手でqemuを起動すると**古いカーネルを
+# 測ってしまう**。しかもEFIとイメージのmtimeが同じ秒に収まるとmakeは「最新」と
+# 判断するので、`make images/boot_fat32.img` を明示しても取りこぼす。
+# 実測で、cc_carインライン化の可否を2回とも誤判定しかけた
+# (documents/performance-measurement.md「測定の落とし穴」参照)。
+#
+# この行は $(BOOT_FAT32_IMG) の定義より**後**に書く必要がある。
+# 前置き部の `build: $(TARGET)` に足すと、prerequisiteはルール読み込み時に
+# 展開されるため空になり、黙って効かない(実際に一度踏んだ)。
+build: $(BOOT_FAT32_IMG)
 BOOT_FAT32_IMG_SIZE_MB = 64
 BOOT_FAT32_PART_SIZE_MB = 60
 BOOT_FAT32_PART_START_BYTES = 1048576
@@ -537,7 +602,7 @@ RUN_DISK_IMG ?= $(FAT16_DISK_IMG)
 
 run: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 	qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
@@ -546,7 +611,7 @@ run: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 
 debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 	qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
@@ -563,7 +628,7 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	rm -f .qemu-test-trigger test-results.txt
 	touch .qemu-test-trigger
 	qemu-system-x86_64 \
-		-m 256M \
+		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
@@ -598,6 +663,15 @@ test-qemu-all:
 test-qemu-stress:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m2_za_stress.lisp
 
+# [性能測定] documents/performance-measurement.md「read-file-into-vector-native」
+# 参照。READ-FILE-INTO-VECTOR-NATIVE(mount.c、命令数計測実験専用のFAT16
+# ルート直下限定・素のC実装)がread-file-into-vectorと完全に同じ結果を返す
+# ことを、0byte・クラスタサイズ未満・ちょうど1クラスタ・複数クラスタに
+# またがるサイズの各パターンで確認する。test-qemu-allには含めない(実験専用
+# プリミティブの検証であり、CIで恒常的に検証すべき正式APIではないため)
+test-qemu-read-file-native:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_read_file_native.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+
 # [ファイルI/O]#52(M9): カーネル自身のブートバイナリ(約1.76MB)の読み込み(#41)と
 # 65536byte超の書き込み(#39)を実データ規模で検証する。test-qemu-stressと同じ理由
 # (KVM無しのQEMU/TCGでは1MB超のファイルI/Oが現実的な時間で終わらない)でローカル
@@ -609,24 +683,199 @@ test-qemu-perf:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 
+# [性能測定] test-qemu-perfは#39(書き込み)と#41(読み込み)を同居させており、
+# documents/performance-measurement.mdの調査(残り約14.4億命令のホットスポット
+# 再探索)で「書き込み側には未解明の遅さ・再現する劣化がある」ことが判明した
+# ため、読み込み単体の計測にはこのノイズを排除する必要がある。そのため、
+# ゲスト内での書き込み・テストデータ生成を一切行わず、ホスト側で事前に
+# mkfs.vfat+mount+cpして焼き込んだファイル(100KB/1MB/2MB、i mod 256の
+# 決定論的パターン)をread-file-into-vectorで読むだけの専用ディスクイメージ・
+# マイルストーンを用意する(documents/performance-measurement.mdで確立した
+# 「ホスト側事前書き込み」手法の恒久化)。サイズはFAT16_DISK_IMG/FAT32_DISK_IMGと
+# 同じ理由(FAT32はmkfs.vfat -F 32のクラスタ数警告を避けるための実測済み安全
+# マージン)でFAT16=16MB/FAT32=40MBとする。
+PERF_READ_SIZE_100K = 100000
+PERF_READ_SIZE_1M = 1000000
+PERF_READ_SIZE_2M = 2000000
+PERF_READ_DATA_100K = $(BUILD_TMPDIR)/perf_read_100k.bin
+PERF_READ_DATA_1M = $(BUILD_TMPDIR)/perf_read_1m.bin
+PERF_READ_DATA_2M = $(BUILD_TMPDIR)/perf_read_2m.bin
+
+# ホスト側でi mod 256を反復する決定論的パターンのバイナリを生成する
+# (docker/gcc本体には依存しないため、isiki-builderコンテナ外・ホストの
+# python3で直接生成する)。ゲスト側(perf_read_fat16_test.lisp/
+# perf_read_fat32_test.lisp)は同じi mod 256パターンで期待値を再計算して照合する
+$(PERF_READ_DATA_100K): | $(BUILD_TMPDIR)
+	python3 -c "open('$@', 'wb').write(bytes([i % 256 for i in range($(PERF_READ_SIZE_100K))]))"
+
+$(PERF_READ_DATA_1M): | $(BUILD_TMPDIR)
+	python3 -c "open('$@', 'wb').write(bytes([i % 256 for i in range($(PERF_READ_SIZE_1M))]))"
+
+$(PERF_READ_DATA_2M): | $(BUILD_TMPDIR)
+	python3 -c "open('$@', 'wb').write(bytes([i % 256 for i in range($(PERF_READ_SIZE_2M))]))"
+
+PERF_READ_FAT16_IMG = $(BUILD_TMPDIR)/perf_read_fat16.img
+
+$(PERF_READ_FAT16_IMG): $(PERF_READ_DATA_100K) $(PERF_READ_DATA_1M) $(PERF_READ_DATA_2M) | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=16 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			mkfs.vfat -F 16 $@; \
+			mkdir -p /mnt/perf_read_fat16; \
+			mount -o loop $@ /mnt/perf_read_fat16; \
+			cp $(PERF_READ_DATA_100K) /mnt/perf_read_fat16/READ100K.BIN; \
+			cp $(PERF_READ_DATA_1M) /mnt/perf_read_fat16/READ1M.BIN; \
+			cp $(PERF_READ_DATA_2M) /mnt/perf_read_fat16/READ2M.BIN; \
+			umount /mnt/perf_read_fat16'
+
+PERF_READ_FAT32_IMG = $(BUILD_TMPDIR)/perf_read_fat32.img
+
+$(PERF_READ_FAT32_IMG): $(PERF_READ_DATA_100K) $(PERF_READ_DATA_1M) $(PERF_READ_DATA_2M) | $(BUILD_TMPDIR)
+	dd if=/dev/zero of=$@ bs=1M count=40 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			mkfs.vfat -F 32 $@; \
+			mkdir -p /mnt/perf_read_fat32; \
+			mount -o loop $@ /mnt/perf_read_fat32; \
+			cp $(PERF_READ_DATA_100K) /mnt/perf_read_fat32/READ100K.BIN; \
+			cp $(PERF_READ_DATA_1M) /mnt/perf_read_fat32/READ1M.BIN; \
+			cp $(PERF_READ_DATA_2M) /mnt/perf_read_fat32/READ2M.BIN; \
+			umount /mnt/perf_read_fat32'
+
+# 使い方: make test-qemu-perf-read。test-qemu-perfと同じくローカル専用
+# (KVM無しのQEMU/TCGでは1MB超のファイルI/Oが現実的な時間で終わらないため)
+# だが、書き込みを一切含まないため、test-qemu-perfよりも明確に短時間で完走する
+test-qemu-perf-read: $(PERF_READ_FAT16_IMG) $(PERF_READ_FAT32_IMG)
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_read_fat16.lisp QEMU_DISK_IMG=$(PERF_READ_FAT16_IMG)
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_perf_read_fat32.lisp QEMU_DISK_IMG=$(PERF_READ_FAT32_IMG)
+
 # test-qemuと同様だが、MILESTONE変数(boot-entryスクリプトのパス)を
 # .qemu-test-triggerの内容として書き込み、指定したmilestoneのみを実行する
 # (GitHub Actions側でハングと正常進行の区別をつけるためのmilestone分割用)
-test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
+# QEMU起動コマンドへ追加で渡す任意のフラグ。test-qemu-instcount/
+# test-qemu-icountが命令数計測プラグイン・-icountを差し込むのに使う
+# (documents/performance-measurement.md参照)。通常のtest-qemu-milestone
+# 単体実行では空のままで既存の振る舞いを変えない
+QEMU_EXTRA_FLAGS ?=
+
+# [GC監査] 塗り潰し(GC_PAINT=1)下で試験を流すための実行ターゲット。
+# test-qemu-milestoneとの違いは3点だけで、いずれも監査に必須のもの:
+#   1. AUDIT_TIMEOUT秒でQEMU自体をtimeoutで打ち切る(makeを殺すとQEMUが孤児に
+#      なるため、timeoutはQEMUに直接かける)。打ち切りは終了コード124で分かる。
+#   2. " 0 failed" の検証をしない。監査では失敗も結果であり、ホスト側の
+#      ドライバ(tools/bench/run_paint_audit.sh)が分類する。
+#   3. QEMUの終了コードを$(BUILD_TMPDIR)/qemu-exit.txtへ残す。タイムアウトと
+#      試験失敗を区別するのに使う(混同すると実在しないバグを追うことになる)。
+# test-results.txtは9p越しにホストのファイルへ直接書かれるため、ゲストが
+# ハングしてもそこまでの逐次出力は残る
+AUDIT_TIMEOUT ?= 1800
+
+# [性能測定] AOTのletインライナが発火していることを生成コードで確認する。
+# 発火しなくなってもエラーにならずテストも通り、命令数だけが戻る(原則6の形)ため、
+# 生成コードを直接見るテストとして常時回す
+test-inline-expansion: $(LISP_COMPILED)
+	tools/bench/check_inline_expansion.sh
+
+test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
-	rm -f .qemu-test-trigger test-results.txt
+	rm -f .qemu-test-trigger test-results.txt $(BUILD_TMPDIR)/qemu-exit.txt
 	echo "$(MILESTONE)" > .qemu-test-trigger
-	qemu-system-x86_64 \
-		-m 256M \
+	ec=0; timeout -k 10 $(AUDIT_TIMEOUT) qemu-system-x86_64 \
+		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		$(QEMU_EXTRA_FLAGS) \
+		-no-reboot || ec=$$?; \
+		echo $$ec > $(BUILD_TMPDIR)/qemu-exit.txt
+	rm -f .qemu-test-trigger
+
+test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
+	mkdir -p $(BUILD_TMPDIR)
+	test -n "$(MILESTONE)"
+	rm -f .qemu-test-trigger test-results.txt
+	echo "$(MILESTONE)" > .qemu-test-trigger
+	qemu-system-x86_64 \
+		-m $(QEMU_MEM) \
+		-display none \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
+		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
+		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		$(QEMU_EXTRA_FLAGS) \
 		-no-reboot
 	rm -f .qemu-test-trigger
 	test -f test-results.txt
 	cat test-results.txt
 	grep -q " 0 failed" test-results.txt
+
+# 命令数ベースの性能計測基盤(documents/performance-measurement.md参照)。
+# ゲストが実際に実行した命令数を、ホストの実行速度・スケジューリング
+# ノイズと無関係にカウントするTCGプラグイン(tools/plugins/
+# isiki_instcount.c)。プラグイン本体はisiki-builderコンテナ内で
+# (QEMU_VERSION_FOR_PLUGINに対応する)qemu-plugin.hを取得してビルドする
+# (ソースからの再ビルドを前提とし、.soはgit管理対象外)。stderrへ
+# `[isiki_instcount] total_insns=<N>` の形式で報告する。
+INSTCOUNT_PLUGIN = tools/plugins/isiki_instcount.so
+
+$(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
+	docker run --rm --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder -c '\
+		set -e; \
+		apt-get update -qq; \
+		apt-get install -y -qq libglib2.0-dev pkg-config curl >/dev/null; \
+		mkdir -p tools/plugins/build; \
+		curl -sL https://raw.githubusercontent.com/qemu/qemu/v$(QEMU_VERSION_FOR_PLUGIN)/include/qemu/qemu-plugin.h -o tools/plugins/build/qemu-plugin.h; \
+		gcc -shared -fPIC -Wall -Wextra -O2 -Itools/plugins/build $$(pkg-config --cflags glib-2.0) -o $(INSTCOUNT_PLUGIN) tools/plugins/isiki_instcount.c $$(pkg-config --libs glib-2.0)'
+
+# [性能測定] 構文別ベンチマークスイート(documents/performance-measurement.md
+# 「構文別ベンチマークスイート」節)。src/c/bench_subprimitive.cの素のC実装と
+# src/lisp/bench_aot.lispの同等Lispコード(AOTトランスパイル済み)を、構文
+# カテゴリごとに1対1で命令数比較する。ケースごとに別々のQEMU起動が必要
+# (total_insnsはブート全体の合計しか得られないため)なので21回起動し、
+# 10〜20分程度かかる。test-qemu-perf等と同じくローカル専用でCIには含めない。
+# transpile.lisp/生成コードを変更した後に再実行して、構文単位の改善/退行を追う
+BENCH_N_C ?= 10000000
+BENCH_N_AOT ?= 1000000
+
+test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
+	BENCH_N_C=$(BENCH_N_C) BENCH_N_AOT=$(BENCH_N_AOT) tools/bench/run_construct_bench.sh
+
+# [性能測定] Phase1の受け入れ条件(documents/performance-measurement.md
+# 「letのImmobilized Spaceリーク」節)。クロージャ生成が実行回数に比例して
+# Immobilized Space(4MB固定・GC非対象)を消費しないことを回帰として確認する。
+# 修正前はループ内の5変数let*が約24,300反復でOSを永久停止させていた
+test-qemu-imm-leak:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_imm_leak.lisp
+
+# [性能測定] forマクロの展開形変更(ループ本体のlet廃止)の意味論回帰テスト。
+# 並列束縛・step省略・入れ子・GC併走を確認する
+test-qemu-for-expansion:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_expansion.lisp
+
+# 構文別ベンチマークのC版/AOT版が同じ計算をしていることの確認(比に意味を
+# 持たせる前提条件)。計測と違い数秒で終わるため単独で実行できる
+test-qemu-bench-construct-check:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_construct.lisp
+
+# 使い方: make test-qemu-instcount MILESTONE=test/lisp/qemu_boot_xxx.lisp
+# [QEMU_DISK_IMG=...]。既存のtest-qemu-milestoneと同じ引数を受け付ける
+test-qemu-instcount: $(INSTCOUNT_PLUGIN)
+	$(MAKE) test-qemu-milestone QEMU_EXTRA_FLAGS="-plugin file=$(INSTCOUNT_PLUGIN)"
+
+# 決定論的実行モード(-icount)での計測(documents/performance-measurement.md
+# 参照)。1命令ごとに仮想時間を進めるため、ホストの実行速度と無関係に常に
+# 同じ結果が再現される。ただしI/Oが絡む大きなワークロード(IDE PIO読み込み等)
+# は実時間で非常に遅くなる(実測: 通常運転なら数秒で終わるN=1,000,000の
+# JITループが3分強かかった)ため、小規模な決定論的A/B比較に用途を限定する
+# こと。マルチスレッドTCGと非互換なのでaccelも合わせて上書きする
+ICOUNT_SHIFT ?= 7
+
+# 使い方: make test-qemu-icount MILESTONE=test/lisp/qemu_boot_xxx.lisp
+# [QEMU_DISK_IMG=...] [ICOUNT_SHIFT=N]
+test-qemu-icount:
+	$(MAKE) test-qemu-milestone QEMU_EXTRA_FLAGS="-accel tcg,thread=single -icount shift=$(ICOUNT_SHIFT)"

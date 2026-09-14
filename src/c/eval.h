@@ -89,7 +89,17 @@ lisp_val_t qq_append(lisp_val_t list, lisp_val_t tail);
  * @param v 判定対象の値
  * @return 非局所脱出シグナルならnon-zero
  */
-int os_is_control_transfer(lisp_val_t v);
+/* [性能測定] Phase4: 生成コード中に7,210箇所ある最頻の呼び出し。中身はタグ判定と
+   magic比較だけで、実測19.5命令のうち大半が呼び出しオーバーヘッドだった
+   (get_current_process/os_make_fixnumと同じ理由)。static inlineへ移す。
+   判定内容はeval.cのis_control_transferと同一で、意味論は変えていない */
+static inline int os_is_control_transfer(lisp_val_t v) {
+    if ((v & TAG_MASK) != TAG_INSTANCE) {
+        return 0;
+    }
+    UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
+    return obj[0] == MAGIC_BLOCK_EXIT || obj[0] == MAGIC_CATCH_EXIT || obj[0] == MAGIC_GO_EXIT;
+}
 
 /**
  * 非局所脱出シグナルのmagic(MAGIC_BLOCK_EXIT等、runtime.h)を取り出す。

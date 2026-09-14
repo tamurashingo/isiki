@@ -23,6 +23,24 @@
 /** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等)。fixnum/charと同様の即値として扱い、GCは素通しする(111) */
 #define TAG_RAW_POINTER 0x7ULL
 
+/**
+ * [単一の真実源] このタグの値はヒープオブジェクトへの参照か(=GCが追いかけるか)。
+ *
+ * gc_copy_valueが「その場で返す」タグと、生成コードの焼き込み検出器
+ * (%%ZA-HEAP-IMM-COUNT)が「GCで動く値」とみなすタグは、**同じ集合でなければ
+ * ならない**。別々に列挙するとomission listになり、片方に足したタグが
+ * もう片方から黙って漏れる(実際にTAG_FORWARDが検出器から漏れていた)。
+ *
+ * ここを唯一の判断元にして、両者から参照する。新しいタグを足したときは
+ * この関数だけを直せばよい。
+ */
+static inline int os_tag_is_heap_ref(UINT64 tag) {
+    /* FIXNUM/CHARは即値、RAW_POINTERはGC管理外の生ポインタ。それ以外は
+       ヒープ上のオブジェクトを指す(FORWARDはGC内部の転送ポインタだが、
+       これが外に現れたらそれ自体がバグなので検出対象に含める) */
+    return tag != TAG_FIXNUM && tag != TAG_CHAR && tag != TAG_RAW_POINTER;
+}
+
 /** TAG_FIXNUMの値フィールド最上位bit(bit63)。1なら負数を表す(0は常に非負に正規化) */
 #define FIXNUM_SIGN_BIT       0x8000000000000000ULL
 /** TAG_FIXNUMの値フィールドのうちマグニチュードに使う60bit(bit3〜62)分のマスク */
@@ -57,6 +75,35 @@
 #define MAGIC_BUILTIN_CLASS        0xEULL
 /** TAG_INSTANCEのword0に入る、ILOSの標準(standard)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<standard-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
 #define MAGIC_STANDARD_CLASS       0xFULL
+
+/* [転送済み判定の不変条件] gc_copy_valueは word0 の下位3bitが TAG_FORWARD(0x6)か
+   どうかで「転送済みかもしれない」と疑い、指す先がTo空間の範囲にあるかどうかで
+   確定させる。MAGIC_STREAM(0x6)とMAGIC_BUILTIN_CLASS(0xE)は下位3bitが
+   **実際に衝突している**ので、これらを弾いているのは範囲検査の下限だけである。
+   (STRINGのword0=生の長さも同じ理由で下限に守られている)
+
+   したがって「MAGIC値はヒープの先頭アドレスより遥かに小さい」ことが不変条件になる。
+   これを破るMAGICを足すと、そのインスタンスが転送済みと誤認され、word0が
+   転送ポインタとして解釈されてヒープが静かに壊れる。範囲検査を触った瞬間に効く罠でもある。
+   タグ側の衝突自体は防げないので、代わりに大きさの上限を機械的に保証する。
+
+   **これはコンパイル時定数どうしの比較にすぎない。** 「ヒープがこの定数より上に
+   置かれること」は保証できないので、そちらは os_heap_init で起動時に1回確認する。 */
+#define MAGIC_MUST_BE_BELOW 0x1000ULL
+_Static_assert(MAGIC_FUNCTION_NATIVE      < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_FUNCTION_INTERPRETED < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_PROCESS              < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_MACRO                < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_BLOCK_EXIT           < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_STREAM               < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_CLASS_INSTANCE       < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_CATCH_EXIT           < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_GO_EXIT              < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_BIGNUM               < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_VECTOR               < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_FLOAT                < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_BUILTIN_CLASS        < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+_Static_assert(MAGIC_STANDARD_CLASS       < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
 
 /** NIL */
 extern lisp_val_t nil;
@@ -330,12 +377,83 @@ void os_gc_register_root(lisp_val_t *root_ptr);
  */
 void os_gc_unregister_root(lisp_val_t *root_ptr);
 
+/** [GC監査] shadow stackのLIFO規律が破れた回数。
+    gc_unprotect_nodeは`cleanup`属性のハンドラで、GC_PROTECTを使うすべての関数の
+    スコープ脱出に現れる。ここに**関数呼び出しを置くと**インライン展開が効かなくなり、
+    za.cのJITコンパイルが数分かかるようになった(実測)。カウンタ変数を直接
+    インクリメントするだけにして、ハンドラを自明なままに保つこと */
+/** [GC監査] アドレスがどの領域に属するかを返す。生成コードに焼き込まれた即値が
+    「GCで動く領域」を指していないかを機械語のレベルで判定するために使う。
+    0=From空間(生きている側) 1=To空間(GCのコピー先) 2=Immobilized Space 4=その他 */
+int os_addr_region(lisp_addr_t addr);
+
+extern UINT64 g_gc_lifo_violations;
+
+/** [GC監査] gc_copy_valueがコピー不能なタグを渡された回数(0であるべき) */
+extern UINT64 g_gc_uncopyable_tag_hits;
+/** [GC監査] 転送先が未割り当て区間を指していた回数(0であるべき) */
+extern UINT64 g_gc_fwd_beyond_ptr_hits;
+/** [GC監査] gc_copy_valueがTo空間を指す値で呼ばれた回数(標準のCheneyなら0)。
+    2026-09-13の全件監査(AUDIT_STRESS=100、22試験)では0だった。
+    ガード導入時(ebb985c)には効果が出ていたので当時は発火していたはずで、
+    「二度スキャンはbignum破壊(781cf2a)の結果で、それを直したら消えた」と
+    読むのが整合的だが、**これは推定であって実証ではない**。当時の発火回数を
+    記録していない。再発したときに確定事実だと思って探すと遠回りになる。 */
+extern UINT64 g_gc_to_space_revisits;
+/** [測定] za_try_compile_defunの呼び出し回数(サンプラから読む) */
+extern UINT64 g_za_compile_calls;
+/** [測定] JITバッファの使用量(サンプラから読む) */
+UINT64 g_jit_used_for_diag(void);
+/** [測定] za_macroexpandの呼び出し回数(呼び出し元ごと。サンプラから読む) */
+extern UINT64 g_za_mx_calls[4];
+
+/** [GC監査] limb作業領域の最高水位(limb単位)。容量設計の妥当性を実測で言うため */
+extern UINT64 g_limb_arena_peak;
+
+#ifdef ISIKIOS_GC_DEBUG
+/** [GC監査] os_gc_collectの実行中なら1。割り込みハンドラから見るために公開している */
+extern int g_gc_debug_in_gc;
+/** [GC監査] GC実行中に入ったタイマー割り込みの回数 */
+extern UINT64 g_gc_tick_during_gc;
+#endif
+
+/** [GC監査] GC_PROTECTしようとした値が**すでにstale**なら記録する。
+    保護は「その変数」を追跡するだけで、入ってきた時点で古い値なら直せない。
+    ここで捕まえた関数の**呼び出し元**が、確保を跨いで保護せずに持っていた張本人である。
+
+    発生箇所は`__builtin_return_address(0)`ではなく`__FILE__`/`__LINE__`で取る。
+    戻りアドレスを使うと、GC_PROTECTを含む**すべての関数**がフレームポインタを
+    保持させられて最適化が阻害され、za.cのJITコンパイルが桁違いに遅くなった
+    (実行時スイッチで無効にしても、builtin自体は展開されるので効かない)。
+    ソース位置のほうが逆引き不要で読みやすくもある。
+
+    GC_PROTECTはインタプリタで最も多く通る場所なので、**既定では無効**にしてある
+    (`%%DIAG-GC-PROTECT-CHECK`で有効化する)。常時有効にすると、za.cの
+    labels+letのJITコンパイルが現実的な時間で終わらなくなる(実測で10分以上)。
+    フラグの読み出し1回ぶんのコストだけは残るが、それは無視できる */
+extern int g_gc_protect_check_enabled;
+void os_gc_debug_check_protect_slow(lisp_val_t *var, const char *file, int line);
+static inline void os_gc_debug_check_protect(lisp_val_t *var, const char *file, int line) {
+    if (g_gc_protect_check_enabled) {
+        os_gc_debug_check_protect_slow(var, file, line);
+    }
+}
+
 /**
  * GC_PROTECTされたローカル変数のcleanup(スコープ脱出時)ハンドラ。
  * 現在のプロセスのshadow stack先頭を、このノードのnextに巻き戻す。
  * GC_PROTECTマクロ内でのみ使う。
  */
 static inline void gc_unprotect_node(gc_rootnode *node) {
+#ifdef ISIKIOS_GC_DEBUG
+    // [GC監査] shadow stackはLIFOでなければならない。外そうとしているノードが
+    // 先頭でないなら、間に別の誰かがpushしたまま抜けていない = 規律が破れている。
+    // プリエンプティブな切り替えでプロセスを跨いで同じリストを使っていると、
+    // ここが必ず破れる(一方のスコープ脱出が他方のノードをリストから落とす)
+    if (get_current_process()->gc_roots != node) {
+        g_gc_lifo_violations++;
+    }
+#endif
     get_current_process()->gc_roots = node->next;
 }
 
@@ -346,10 +464,24 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
  * 対応するGC_UNPROTECTの呼び出しは不要。varは登録前に有効なlisp_val_t(nil等)で
  * 初期化しておくこと。
  */
+#ifdef ISIKIOS_GC_DEBUG
+#define GC_PROTECT(var) \
+    gc_rootnode _gcnode_##var __attribute__((cleanup(gc_unprotect_node))) = \
+        { (lisp_val_t *)&(var), get_current_process()->gc_roots }; \
+    get_current_process()->gc_roots = &_gcnode_##var; \
+    os_gc_debug_check_protect((lisp_val_t *)&(var), __FILE__, __LINE__)
+#else
 #define GC_PROTECT(var) \
     gc_rootnode _gcnode_##var __attribute__((cleanup(gc_unprotect_node))) = \
         { (lisp_val_t *)&(var), get_current_process()->gc_roots }; \
     get_current_process()->gc_roots = &_gcnode_##var
+#endif
+
+/* [GC安全性] **C構造体の中のlisp_val_tフィールドを守る機構は無い**
+   (documents/pitfalls.md 原則8)。GC_PROTECTは「変数」を守る機構でトークン連結により
+   内部ノード名を作るため、`arr[i].field`のような式は渡せない。構造体フィールドや
+   配列要素を守るには、za.cのza_gc_protect_batch_push/za_gc_protect_batch_cleanupの
+   ように、1要素ずつ手動でshadow stackへ繋ぐこと。 */
 
 /**
  * 非負のfixnumオブジェクトを作る(即値、ヒープ確保なし、符号は常に0)。
@@ -358,7 +490,12 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
  * @param fixnum 表現する値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum(const UINT64 fixnum);
+/* [性能測定] Phase4: 生成コード中に1,513箇所ある。中身はシフト1回だけなので、
+   process.cのget_current_processと同様クロスTU呼び出しのままだと呼び出し
+   オーバーヘッドが本体を上回る。ヘッダのstatic inlineへ移す */
+static inline lisp_val_t os_make_fixnum(const UINT64 fixnum) {
+    return (lisp_val_t)(fixnum << 3);
+}
 
 /**
  * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。
@@ -766,7 +903,87 @@ lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_e
  * @param captured_env 定義時に捕捉した自由変数を保持する環境
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 2、word3=captured_env)
  */
-lisp_val_t os_make_lifted_closure(lisp_addr_t fnptr, lisp_val_t captured_env);
+lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnptr, lisp_val_t captured_env);
+
+/**
+ * Immobilized Spaceの実消費バイト数をバイト粒度で返す(%%IMM-SPACE-USED-BYTESの実体)。
+ * @return 切り出し済みのバイト数
+ */
+UINT64 os_imm_space_used_bytes(void);
+
+/**
+ * 診断メッセージを表示して停止する。フックが登録されていればそれを呼ぶ
+ * (QEMUテスト実行時は電源断させ、ハングではなくテスト失敗として終わらせる)。
+ * @param msg 表示する診断メッセージ
+ */
+void os_panic(const char *msg);
+
+/* [性能測定] GCデバッグ機構(documents/pitfalls.md 原則4/原則6)。
+   ISIKIOS_GC_DEBUGを定義してビルドすると、コピーGC完了後に旧From空間
+   (=stale領域)をトラップパターンで塗り潰し、そこを指すポインタの
+   デリファレンスを検出できるようにする。
+
+   コピーGCでは、塗り潰さない限り旧コピーは上書きされるまで「正しく見える値」の
+   ままである。staleポインタを読んでも移動前の内容がそのまま読めてしまい、
+   多くの場合クラッシュしない。強制GCを毎回走らせても黙って成功し続けるため、
+   塗り潰しが無いと保護漏れは検出できない(原則6そのものの形)。
+
+   通常ビルドではこれらは何も行わない(マクロが空になる)ため性能に影響しない。 */
+#ifdef ISIKIOS_GC_DEBUG
+/** 旧From空間(stale領域)を指すアドレスかどうか */
+int os_gc_debug_is_stale(lisp_addr_t addr);
+/** 値が塗り潰しのトラップパターンそのものか(陽性対照が読んだ値の判定用) */
+int os_gc_debug_is_trap(lisp_val_t v);
+/** staleなオブジェクトのデリファレンスを検出したら診断付きで停止する */
+void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site);
+#define GC_DEBUG_ASSERT_LIVE(obj, where) \
+    os_gc_debug_assert_live((obj), (where), __builtin_return_address(0))
+/** 値がどの空間に属するかを分類して計数する(stale仮説の直接確認用) */
+void os_gc_debug_classify(lisp_val_t v);
+#define GC_DEBUG_CLASSIFY(v) os_gc_debug_classify(v)
+/** [GC監査] GCが「生きた構造の中の塗り潰し済み領域へのポインタ」を見つけたときに数える */
+void os_gc_debug_note_painted_field(void);
+/** [GC監査] 読み出した**結果**がトラップだった場合の記録。読み出し元のポインタが
+    塗り潰し済み領域を指していたことを意味する。ポインタ側の判定では捕まらない
+    (staleポインタ自体は「ふつうのアドレス」に見えるため)。
+
+    cc_car/cc_cdrは最も多く通る関数なので、**比較だけをインラインで行い**、
+    一致したときだけ関数呼び出しに落とす。ここを無条件の関数呼び出しにしたところ、
+    za.cのlabels+letのJITコンパイルが数分たっても終わらなくなった
+    (documents/pitfalls.md 原則6「計器が対象の実行時間を変えていないか」) */
+#define GC_DEBUG_TRAP_PATTERN_VALUE 0xDEADDEADDEADDEA7ULL
+void os_gc_debug_trap_result_hit(const char *where, void *site);
+#define GC_DEBUG_TRAP_RESULT(v, where) \
+    do { \
+        if ((v) == (lisp_val_t)GC_DEBUG_TRAP_PATTERN_VALUE) { \
+            os_gc_debug_trap_result_hit((where), __builtin_return_address(0)); \
+        } \
+    } while (0)
+#else
+#define GC_DEBUG_ASSERT_LIVE(obj, where) ((void)0)
+#define GC_DEBUG_CLASSIFY(v) ((void)0)
+#define GC_DEBUG_TRAP_RESULT(v, where) ((void)0)
+#endif
+
+/**
+ * スタック溢れを診断情報付きで報告して停止する([性能測定] Phase5 第0部)。
+ * @param rsp 検出時のスタックポインタ
+ * @param stack_low スタック下端アドレス
+ * @param stack_used 消費バイト数
+ */
+/** [原則6] 診断文字列をCOM1シリアルへ出す。panicの内容を-display noneでも読めるようにする
+    (実装はinterrupt.c。フレームバッファだけに出すと外からは電源断としか見えない) */
+void os_diag_serial_write(const char *s);
+UINT64 os_diag_idt_addr(void);
+UINT64 os_diag_gdt_addr(void);
+
+void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used);
+
+/**
+ * os_panicが停止前に呼ぶフックを登録する。
+ * @param hook 停止処理(QEMUテスト時の電源断等)
+ */
+void os_set_panic_hook(void (*hook)(void));
 
 /**
  * init.lisp の (make-instance class-sym . initargs) と (signal-condition condition nil) を
@@ -1679,6 +1896,19 @@ lisp_val_t os_make_vector_from_list(lisp_val_t list);
  * @return ブロック先頭へのポインタ(word0=rank, word[1..rank]=各次元のサイズ, word[rank+1..]=データ)
  */
 lisp_val_t *os_vector_header(lisp_val_t vec);
+
+/**
+ * [性能測定] documents/performance-measurement.md「read-file-into-vector-native」
+ * 参照。rank1・長さcountのgeneral-vectorを1回だけ確保し、要素は初期化せず
+ * データ部先頭へのポインタを*out_dataへ返す。呼び出し元はこのポインタへ
+ * 直接os_make_fixnum済みの値を書き込む(GC_PROTECT・primitive_set_elt経由の
+ * 1要素ずつの呼び出し規約を経由しないバルク書き込み用)。countが0の場合も
+ * 有効な(長さ0の)VECTORを返す。
+ * @param count 要素数
+ * @param out_data データ部先頭へのポインタの格納先(count==0でも書き込む)
+ * @return 確保したVECTOR
+ */
+lisp_val_t os_make_vector_raw(UINT64 count, lisp_val_t **out_data);
 
 /**
  * 組み込み関数VECTOR。評価済みの引数列をそのまま要素とするrank1のgeneral-vectorを返す。

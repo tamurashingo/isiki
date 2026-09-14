@@ -99,4 +99,12 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
 int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *relative_path,
                             UINT32 *out_len);
 
+/**
+ * [性能測定] documents/performance-measurement.md「read-file-into-vector-native」
+ * 参照。組み込み関数READ-FILE-INTO-VECTOR-NATIVEを登録する。Lisp呼び出し規約を
+ * 経由しない素のC実装でFAT16ルート直下のファイルを読み込む、命令数計測実験専用の
+ * ベンチマーク用プリミティブ(既存のread-file-into-vectorを置き換えるものではない)。
+ */
+void os_register_mount_native_subprimitives(void);
+
 #endif /* _MOUNT_H_ */

@@ -51,7 +51,47 @@ void initialize_processes(frame_buffer *buffers);
 /**
  * 現在アクティブなプロセスを返す
  */
-process_t* get_current_process(void);
+/* [性能測定] Phase4 第1部: GC_PROTECTはこの関数を1箇所につき3回呼ぶ
+   (マクロ本体で2回、スコープ脱出時のgc_unprotect_nodeで1回)。process.cに
+   実体を置いたままだと-O1・LTO無しでは3回とも本物のクロスTU呼び出しになり、
+   実測でGC_PROTECT 1箇所あたり34.9命令のうち大半を占めていた。中身は配列参照
+   だけなのでヘッダのstatic inlineへ移し、呼び出しを消す。za.cのJITランタイム
+   ヘルパー(za_gc_*)も同じ関数を呼ぶため、そちらにも効く。
+   アドレスを取っている箇所は無いことを確認済み */
+/**
+ * 現在のプロセスのスタックが溢れていないかを検査する([性能測定] Phase5 第0部)。
+ * カナリアの破壊と、rspがスタック範囲(下端からSTACK_GUARD_MARGINの余裕を含む)を
+ * 外れていないかの両方を見る。タイマ割り込みから呼ぶ想定で、通常パスには乗らない。
+ * @param rsp 検査する(割り込み時の)スタックポインタ
+ * @param out_low スタック下端アドレスの格納先
+ * @param out_used 消費バイト数の格納先
+ * @return 正常なら1、溢れていれば0
+ */
+/** rspがいずれかのプロセススタックの範囲内かどうか。例外ハンドラがスタックを
+    dumpしてよいかの判定に使う(スタック溢れではrspが範囲外を指しており、
+    そのまま読むとハンドラ自身がフォルトしてダブルフォルトになる) */
+/** 全プロセスのスタック直下のガード領域を未マップにする(ブート時に1回) */
+void os_process_install_stack_guards(void);
+/** i番目のガード領域の先頭とサイズ、およびvaがガード内かの判定 */
+UINT64 os_process_guard_base(UINT32 i);
+UINT64 os_process_guard_size(void);
+int os_process_in_stack_guard(UINT64 va);
+/** ガードのどちら側かを区別する。上端側は「溢れ」ではなく基底/上限の破壊である */
+int os_process_guard_is_upper(UINT64 va, UINT64 rsp);
+UINT64 os_process_stack_base(UINT32 i);
+int os_process_stack_contains(UINT64 rsp);
+
+int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used);
+
+/** プロセス1つあたりのスタックサイズ(panicの診断表示用) */
+#define STACK_SIZE_FOR_PANIC (256 * 1024)
+
+extern process_t g_processes[PROCESS_COUNT];
+extern UINT32 g_current_process_index;
+
+static inline process_t* get_current_process(void) {
+    return &g_processes[g_current_process_index];
+}
 
 /**
  * 表示フォーカスとは無関係に、固定indexでプロセスを返す(スケジューラが全プロセスを巡回するために使う)

@@ -12,21 +12,110 @@
 (defglobal *isiki-test-pass* 0)
 (defglobal *isiki-test-fail* 0)
 
+;; ---------------------------------------------------------------------------
+;; [GC監査] 塗り潰し(ISIKIOS_GC_PAINT)下で全試験を流すための逐次出力モード。
+;; documents/pitfalls.md 原則6。
+;;
+;; 監査で要るのは「最後にまとめて出す合計」ではなく「1件ごとの記録」である。
+;; 塗り潰し下ではゲストがハングしたりCPU例外で止まったりしうるため、まとめて
+;; 出す形だとそこまでの情報がすべて失われる。1件ごとにfinish-outputまで行い、
+;; ホスト側のtest-results.txtへ即座に反映させる。
+;;
+;; *isiki-audit*がnilの間は既存の振る舞いを変えない(assert-*の展開形に
+;; 実行時のifが1つ増えるだけで、出力も合計値も従来どおり)。
+(defglobal *isiki-audit* nil)          ; 監査モードの有効・無効
+(defglobal *isiki-audit-index* 0)      ; 通番(何件目のアサーションか)
+(defglobal *isiki-audit-label* "-")    ; いま流している試験ファイル名
+(defglobal *isiki-audit-gc-prev* 0)    ; 直前のアサーション時点のGC回数
+(defglobal *isiki-audit-time-prev* 0)  ; 直前のアサーション時点の時刻(tick)
+(defglobal *isiki-audit-first-ng* 0)   ; 最初にNGが出た通番(0なら未発生)
+;; %%DIAG-GC-STALE-HITSはISIKIOS_GC_DEBUGビルドにしか存在しない。通常ビルドでの
+;; 基準時間取得にも同じ経路を使うため、呼んでよいかをboot-entry側から明示する
+(defglobal *isiki-audit-stale-available* nil)
+
+;; 試験ファイルの切り替わりを記録する。boot-entryスクリプトがloadの直前に呼ぶ
+(defun isiki-audit-begin (label)
+  (setq *isiki-audit-label* label)
+  (if *isiki-audit*
+      (progn
+        (format *isiki-test-stream* "#file ~A~%" label)
+        (finish-output *isiki-test-stream*))
+    nil))
+
+(defun isiki-audit-stale-hits ()
+  (if *isiki-audit-stale-available* (%%diag-gc-stale-hits) 0))
+
+;; 塗り潰しのトラップを読んだ延べ回数。範囲検査(stale)と違いGC世代の偶奇に
+;; 依存しないので、監査で実際に見るのはこちら
+(defun isiki-audit-trap-hits ()
+  (if *isiki-audit-stale-available* (%%diag-gc-trap-hits) 0))
+
+;; 検出箇所の一覧。**件数は「回数」であって「箇所数」ではない**ので、
+;; 箇所ごとにdedupeした表をここで出す。addrはtools/bench/locate_rip.shで
+;; 関数名へ逆引きする(anchorが実行時の基準アドレス)
+(defun isiki-audit-trap-report ()
+  (if *isiki-audit-stale-available*
+      (let ((k (%%diag-gc-trap-sites)) (i 0))
+        (progn
+          (format *isiki-test-stream* "#trap hits=~D sites=~D painted-fields=~D anchor=~D~%"
+                  (%%diag-gc-trap-hits) k (%%diag-gc-painted-fields) (%%diag-image-anchor))
+          (while (< i k)
+            (progn
+              (format *isiki-test-stream* "#trapsite ~D addr=~D hits=~D~%"
+                      i (%%diag-gc-trap-site-addr i) (%%diag-gc-trap-site-hits i))
+              (setq i (+ i 1))))
+          (finish-output *isiki-test-stream*)))
+    nil))
+
+;; アサーション1件ぶんの記録。OK/NGにかかわらず記録し、**検出しても中断しない**
+;; (最初の1件で止まると以後が全部隠れるため)。最初のNGの通番を覚えておき、
+;; それ以降の結果は独立に再確認が必要であることをホスト側が判定できるようにする。
+;; 行はアサーションの**後**に出るので、ハングしたときは
+;; 「最後に出ている通番 + 1」がハングしたアサーションになる
+(defun isiki-audit-record (ok)
+  (if *isiki-audit*
+      (let ((gc (%%gc-collect-count)) (tm (get-internal-real-time)))
+        (setq *isiki-audit-index* (+ *isiki-audit-index* 1))
+        (if (and (not ok) (= *isiki-audit-first-ng* 0))
+            (setq *isiki-audit-first-ng* *isiki-audit-index*)
+          nil)
+        (format *isiki-test-stream* "#t ~D ~A ~A gc=~D tick=~D trap=~D stale=~D~%"
+                *isiki-audit-index* *isiki-audit-label*
+                (if ok "OK" "NG")
+                (- gc *isiki-audit-gc-prev*)
+                (- tm *isiki-audit-time-prev*)
+                (isiki-audit-trap-hits)
+                (isiki-audit-stale-hits))
+        (setq *isiki-audit-gc-prev* gc)
+        (setq *isiki-audit-time-prev* tm)
+        (finish-output *isiki-test-stream*))
+    nil))
+;; ---------------------------------------------------------------------------
+
 (defmacro assert-equal (expected form)
   `(let ((%isiki-expected ,expected) (%isiki-actual ,form))
      (if (equal %isiki-expected %isiki-actual)
-         (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
+         (progn
+           (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
+           (isiki-audit-record t))
          (progn
            (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+           ;; 監査記録を先に出す。塗り潰し下では%isiki-actualがトラップパターン
+           ;; (タグ=TAG_FORWARD)になりうるので、~Sでの印字が暴走する可能性がある。
+           ;; 先に通番を確定させておけば、印字で落ちても何件目かは残る
+           (isiki-audit-record nil)
            (format *isiki-test-stream* "[NG] ~S => ~S (expected ~S)~%"
                    ',form %isiki-actual %isiki-expected)))))
 
 (defmacro assert-float-close (expected form)
   `(let ((%isiki-expected ,expected) (%isiki-actual ,form))
      (if (< (abs (- %isiki-expected %isiki-actual)) 1.0e-6)
-         (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
+         (progn
+           (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
+           (isiki-audit-record t))
          (progn
            (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+           (isiki-audit-record nil)
            (format *isiki-test-stream* "[NG] ~S => ~S (expected ~~ ~S)~%"
                    ',form %isiki-actual %isiki-expected)))))
 
@@ -47,5 +136,9 @@
            ,@body)))))
 
 (defun isiki-test-report ()
+  (if *isiki-audit*
+      (format *isiki-test-stream* "#audit total=~D first-ng=~D~%"
+              *isiki-audit-index* *isiki-audit-first-ng*)
+    nil)
   (format *isiki-test-stream* "~%==== isiki tests: ~D passed, ~D failed ====~%"
           *isiki-test-pass* *isiki-test-fail*))

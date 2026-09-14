@@ -73,6 +73,14 @@
    *fs-lisp-paths*内での並び順=実際の登録順を守らないと未登録エラーになる)。
    このリストの並び順とMakefileのTRANSPILE_LISP_SRCの並び順は同期を保つ共通の
    ソースが無いため、どちらかにファイルを追加する際は両方を手動で更新すること")
+(defparameter *bench-lisp-path* "src/lisp/bench_aot.lisp"
+  "[性能測定] 構文別ベンチマークスイート(documents/performance-measurement.md)の
+   Lisp側実装。src/c/bench_subprimitive.cの%%BENCH-C-*と1対1で対応する
+   %%bench-aot-*を置く。init_aot.lisp/utility.lispと同じ制約・同じ
+   os_register_aot_init_functions経由の登録で、AOTトランスパイラが生成する
+   コードの構文単位のコストを継続的に再計測できるようにするためのもの
+   (本体機能ではないが、最適化作業のたびに再計測する標準ベンチマークとして
+   カーネルへ常駐させる)")
 (defparameter *output-c-path* "src/c/lisp_compiled.c")
 (defparameter *fixture-output-c-path* "test/c/lisp_compiled_fixture.c"
   "*runtime-lisp-path*(テスト専用フィクスチャ)のコンパイル結果の出力先。
@@ -537,6 +545,10 @@
     (< 2 . "primitive_less_than2")
     (> 2 . "primitive_greater_than2")
     (>= 2 . "primitive_greater_equal2")
+    ;; [ABI刷新] 2026-09-11: primitive_add2_inline(runtime.h、static inline
+    ;; +always_inline)を試したが、-O1ビルドでの実測で逆に命令数・壁時計時間
+    ;; とも悪化することを確認したため元に戻した(documents/performance-
+    ;; measurement.md「AOT側primitive_add2のstatic inline化」節参照)。
     (+ 2 . "primitive_add2")
     (- 2 . "primitive_subtract2")
     (set-car 2 . "primitive_set_car2")
@@ -714,26 +726,60 @@
       (cons (list (car (car bindings)) (car (cdr (car bindings))))
             (%%for-let-bindings (cdr bindings)))))
 
-(defun %%for-setqs (bindings list-expr)
+(defun %%for-temp-names (bindings n)
+  "並列更新用の一時変数名(%FOR-TMP-1, %FOR-TMP-2, ...)をbindingsの個数だけ作る"
   (if (null bindings)
       nil
-      (cons `(setq ,(car (car bindings)) (car ,list-expr))
-            (%%for-setqs (cdr bindings) `(cdr ,list-expr)))))
+      (cons (intern (format nil "%FOR-TMP-~A" n))
+            (%%for-temp-names (cdr bindings) (+ n 1)))))
+
+(defun %%for-temp-let-bindings (temps)
+  (if (null temps) nil (cons (list (car temps) nil) (%%for-temp-let-bindings (cdr temps)))))
+
+(defun %%for-step-setqs (bindings temps)
+  "全step式を一時変数へ評価する。束縛変数はまだ書き換えない(並列束縛の意味論)"
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car temps) ,(%%for-next (car bindings)))
+            (%%for-step-setqs (cdr bindings) (cdr temps)))))
+
+(defun %%for-commit-setqs (bindings temps)
+  "全step式の評価が終わってから、一時変数の値を各束縛変数へ書き戻す"
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car (car bindings)) ,(car temps))
+            (%%for-commit-setqs (cdr bindings) (cdr temps)))))
 
 (defun expand-for (form)
+  "ISLispのfor。ループ構造自体はwhileと同じくtagbody/goへ直接展開する。
+   [性能測定] 旧実装は並列束縛の意味論を満たすため、ループ本体の中で毎反復
+   (let ((%for-next-values (list step1 step2 ...))) (setq v1 (car ...)) ...)
+   を評価していた。この展開形は1反復ごとに (1)step値のconsリスト構築
+   (2)letによるクロージャ生成+consリスト構築+primitive_funcall経由の
+   動的ディスパッチ (3)変数N個に対するO(N^2)のcar/cdr連鎖、を発生させており、
+   構文別ベンチマークでforがlet単体の2.3倍・素のCの1711倍という最悪値を
+   示す原因になっていた(documents/performance-measurement.md参照)。
+   一時変数をループの外側のletで一度だけ束縛し、ループ本体では素のsetqだけを
+   使う形へ変更する。全step式を一時変数へ評価しきってから各束縛変数へ書き戻す
+   ため、並列束縛の意味論は保たれる((for ((a 0 b) (b 1 (+ a b)))...)のように
+   互いの旧値を参照するstepでも正しい)。
+   ide.lispが記録していた『forマクロはGCが特定のタイミングで走ると以後
+   永久に結果が壊れる』既知のバグも、その原因とされていた『ループ本体に毎回
+   新規生成されるlet』自体が無くなる"
   (destructuring-bind (for-kw bindings test-and-result &rest body) form
     (declare (ignore for-kw))
-    `(let ,(%%for-let-bindings bindings)
-       (block nil
-         (tagbody
-          %for-loop
-          (if ,(car test-and-result)
-              (return-from nil (progn ,@(cdr test-and-result)))
-              (progn
-                ,@body
-                (let ((%for-next-values (list ,@(%%for-nexts bindings))))
-                  ,@(%%for-setqs bindings '%for-next-values))
-                (go %for-loop))))))))
+    (let ((temps (%%for-temp-names bindings 1)))
+      `(let ,(append (%%for-let-bindings bindings) (%%for-temp-let-bindings temps))
+         (block nil
+           (tagbody
+            %for-loop
+            (if ,(car test-and-result)
+                (return-from nil (progn ,@(cdr test-and-result)))
+                (progn
+                  ,@body
+                  ,@(%%for-step-setqs bindings temps)
+                  ,@(%%for-commit-setqs bindings temps)
+                  (go %for-loop)))))))))
 
 (defun expand-while (form)
   (destructuring-bind (while-kw test &rest body) form
@@ -993,15 +1039,101 @@
      (transpile-call expr scope))
     ((and (consp expr) (consp (car expr)) (eq (car (car expr)) 'lambda) (= (length (car expr)) 3))
      ;; let/let*の展開((lambda (vars) body) inits)のような、演算子位置に直接
-     ;; lambda式が来る即時呼び出し形式。funcallプリミティブ(primitive_funcall、
-     ;; fnを第一引数、残りを実引数として受け取りapply_functionへ渡す)への
-     ;; 呼び出しへ書き換えることで、既存のtranspile-call/transpile-lambdaを
-     ;; そのまま再利用できる
-     (transpile-call (cons 'funcall expr) scope))
+     ;; lambda式が来る即時呼び出し形式。
+     ;; [性能測定] Phase2: 束縛変数がネストしたlambdaに捕捉されない場合は、
+     ;; クロージャ生成(os_make_lifted_closure)・引数リスト構築(os_make_cons)・
+     ;; primitive_funcallの動的ディスパッチのいずれも経由せず、Cのブロックへ
+     ;; 直接インライン展開する。実測でletのコストの91%がこの「1束縛あたりの
+     ;; オーバーヘッド」だった(documents/performance-measurement.md参照)。
+     ;; 捕捉がある場合は従来通りfuncallプリミティブへの呼び出しへ書き換え、
+     ;; 既存のtranspile-call/transpile-lambdaをそのまま使う
+     (if (immediate-lambda-inlinable-p (second (car expr)) (third (car expr)) (cdr expr))
+         (transpile-inline-immediate-lambda (car expr) (cdr expr) scope)
+         (transpile-call (cons 'funcall expr) scope)))
     ((symbolp expr)
      (error "transpile-expr: 未束縛の変数参照です: ~S" expr))
     (t (error "transpile-expr: 未対応の式です: ~S" expr))))
 
+
+(defparameter *inline-let-counter* 0
+  "[性能測定] Phase2: インライン展開した即時lambda呼び出しの束縛変数へ付ける
+   一意なCローカル変数名のカウンタ(入れ子のlet/let*で名前が衝突しないようにする)")
+
+(defparameter *inline-fallback-log* nil
+  "[性能測定] Phase2: インライン展開を見送った箇所と理由の記録。
+   『ベンチマークのletが実はフォールバックしていた』という取り違えを防ぐため、
+   mainの最後に集計を標準エラーへ出す")
+
+(defun immediate-lambda-inlinable-p (params body args)
+  "((lambda (params) body) args) をクロージャ生成を経由せずCブロックへ
+   インライン展開してよいかを判定する。判定に迷うものは必ずフォールバック側
+   (nil)へ倒す。インライン化し損ねた場合の損失は命令数だけだが、捕捉の
+   見落としはGCタイミング依存の破壊になるため。
+   捕捉の判定にはcaptured-params(transpile-lambdaのラムダリフティング判定と
+   同一のもの)をそのまま使う。独立した解析器を新たに書くと既存判定との
+   食い違いが将来のバグ源になるため、必ずこれを再利用すること"
+  (multiple-value-bind (fixed-params rest-param) (split-rest-param params)
+    (cond
+      ;; &restつきは固定引数への1対1束縛にならない
+      (rest-param (push (list :rest params) *inline-fallback-log*) nil)
+      ((not (every #'symbolp params)) (push (list :non-symbol-param params) *inline-fallback-log*) nil)
+      ((not (= (length fixed-params) (length args)))
+       (push (list :arity params) *inline-fallback-log*) nil)
+      ;; 束縛変数がネストしたlambdaに捕捉される場合、その変数はCローカルに
+      ;; 置けない(クロージャの寿命がCスタックフレームより長くなりdanglingする)
+      ((captured-params body fixed-params)
+       (push (list :captured (captured-params body fixed-params)) *inline-fallback-log*) nil)
+      (t t))))
+
+(defun transpile-inline-binds (params temps inits body outer-scope inner-scope)
+  "インライン展開した束縛を1つずつGC-safeに評価し、最後にBODYを展開する。
+   transpile-call-args-guardedと同じ短絡規則(いずれかのinit評価が非局所脱出
+   シグナルなら、残りのinit評価とbodyを一切実行せずそのシグナルを返す)に従う。
+   GC_PROTECTの省略条件がtranspile-call-args-guardedより厳しい点に注意:
+   関数呼び出しの引数は評価後すぐ呼び出しに消費されるためleafなら保護を
+   省けるが、letの束縛変数はbodyの実行中ずっと生き、body内でsetqされて
+   ヒープ上の値を持ちうる。そのためleafであっても、その変数がbody内で
+   setqされる場合は保護を省略しない(省略するとGC後にstaleなポインタが残る)"
+  (if (null params)
+      (transpile-expr body inner-scope)
+      (let* ((param (car params))
+             (temp (car temps))
+             (init (car inits))
+             (rest-c (transpile-inline-binds (cdr params) (cdr temps) (cdr inits) body
+                                             outer-scope inner-scope)))
+        ;; initはOUTER-SCOPEで展開する。これが並列束縛の意味論そのもので、
+        ;; INNER-SCOPEで展開すると (let ((a 1)) (let ((a 2) (b a)) b)) のbのinit aが
+        ;; 同じletのa(=2)を見てしまい逐次束縛になる(実測で検出済み)
+        (let ((init-c (transpile-expr init outer-scope))
+              (setq-p (and (member param (setq-targets body nil)) t)))
+          (cond
+            ;; 即値で、かつbody内でsetqされない(=ヒープ値を持ちえない)場合のみ
+            ;; GC_PROTECTを省略できる
+            ((and (aot-form-is-immediate init) (not setq-p))
+             (format nil "({ lisp_val_t ~A = (~A); ~A; })" temp init-c rest-c))
+            ((aot-form-is-signal-free init outer-scope)
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); ~A; })" temp init-c temp rest-c))
+            (t
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                     temp init-c temp temp temp rest-c)))))))
+
+(defun transpile-inline-immediate-lambda (lambda-form args scope)
+  "((lambda (params) body) args) をCのブロック(GCC statement expression)へ
+   インライン展開する。os_make_lifted_closure・引数リストのos_make_cons・
+   primitive_funcallのいずれも発生させない。
+   並列束縛の意味論は自然に満たされる: 各initは外側のSCOPEで展開され、
+   束縛変数には新しい一意のC名を割り当てるため、(let ((a 1)) (let ((a 2) (b a)) b))
+   のbのinit aは外側のaへ解決される。let*は入れ子のlambdaへ展開済みなので、
+   各段が個別にこの経路を通ることで逐次束縛になる"
+  (destructuring-bind (lambda-kw params body) lambda-form
+    (declare (ignore lambda-kw))
+    (let* ((temps (mapcar (lambda (p)
+                            (declare (ignore p))
+                            (format nil "__inl_~A" (incf *inline-let-counter*)))
+                          params))
+           (inner-scope (append (mapcar (lambda (p temp) (cons p (cons temp nil))) params temps)
+                                scope)))
+      (transpile-inline-binds params temps args body scope inner-scope))))
 
 (defparameter *ct-temp-counter* 0
   "M14基盤D: block/return-from/tagbody/go導入に伴い、testの結果や中間式の値を
@@ -1567,11 +1699,20 @@
    作る箇所(defmethodのメソッド呼び出しのたび等)で繰り返し実行されるため、
    環境名/各自由変数名のシンボル解決をos_make_symbol_cached+static局所変数の
    キャッシュ化に置き換える(transpile-quoted/emit-capture-fetch-stmtと同じ
-   パターン)"
+   パターン)。
+   [性能測定] Phase1: os_make_lifted_closureはクロージャ生成のたびに
+   za_fn_meta_tをImmobilized Space(4MB固定・GC非対象・解放手段なし)から
+   確保しており、ループ内のletが約24,300反復でOSを停止させていた
+   (documents/performance-measurement.md「letのImmobilized Spaceリーク」節)。
+   metaの内容はリフト先のC関数アドレスだけで決まるため、呼び出し箇所ごとに
+   C静的変数として1個だけ持たせ(静的記憶域はアドレスが不変で、GCにも
+   Immobilized Spaceにも依存しない)、そのポインタを
+   os_make_lifted_closure_with_metaへ渡す形に変更した。これにより
+   Immobilized Spaceの消費は実行回数比例からゼロになる"
   (if (null free-vars)
-      (format nil "os_make_lifted_closure((lisp_addr_t)(void *)~A, global_environment)" c-name)
+      (format nil "os_make_lifted_closure_with_meta(({ static za_fn_meta_t __closure_meta; &__closure_meta; }), (lisp_addr_t)(void *)~A, global_environment)" c-name)
       (let ((env-temp (format nil "__closure_env_~A" (incf *closure-temp-counter*))))
-        (format nil "({ lisp_val_t ~A = os_make_environment(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure((lisp_addr_t)(void *)~A, ~A); })"
+        (format nil "({ lisp_val_t ~A = os_make_environment(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure_with_meta(({ static za_fn_meta_t __closure_meta; &__closure_meta; }), (lisp_addr_t)(void *)~A, ~A); })"
                 env-temp
                 (c-string-literal c-name)
                 env-temp
@@ -1643,7 +1784,37 @@
 
 (defparameter *call-temp-counter* 0)
 
-(defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr)
+(defun aot-form-is-immediate (form)
+  "FORMの評価結果が必ず即値(fixnum/文字リテラル/nil)かどうか。即値は
+   TAG_FIXNUM/TAG_CHAR等のヒープ非経由の値でGCの再配置対象にならず、
+   呼び出しを一切含まないため非局所脱出シグナルにもなりえない。
+   したがってGC_PROTECTもos_is_control_transferも共に省略できる"
+  (or (integerp form) (characterp form) (null form)))
+
+(defun aot-form-is-signal-free (form scope)
+  "FORMの評価結果が非局所脱出シグナルになりえないかどうか
+   (os_is_control_transferチェックのみを省略してよいか)。即値に加えて、
+   非box化ローカル変数への参照を含む。Lisp側の代入(setq)は非局所脱出
+   シグナルを弾いてからでなければ実際の代入を行う生成コードにならないため、
+   正しく評価が完了したローカル変数がシグナル値そのものを保持することはない。
+
+   [性能測定] Phase3 第0部: **GC_PROTECTの省略はこの条件では行えない。**
+   以前は『束縛時に一度GC_PROTECTしたCローカル変数を読むだけだから再保護は
+   不要』としてGC_PROTECTも省略していたが、これは誤りだった。保護されている
+   のは元のCローカル変数であって、その値を写した一時変数(__call_arg_N /
+   __inl_N)は別のCローカルであり、GCはこちらを更新しない。ローカル変数は
+   ヒープ値(cons/vector/string等)を保持しうるため、写した後にGCが走ると
+   一時変数はstaleなアドレスを指したままになる。
+   実際に (let ((x pair)) (progn <GC誘発> (car x))) と
+   (cons pair <GC誘発>) の両方で値が壊れることをネイティブテストで再現した
+   (test/c/lisp_compiled_test.c)。そのためGC_PROTECTの省略は
+   aot-form-is-immediate(即値であることが確実な場合)に限る"
+  (or (aot-form-is-immediate form)
+      (and (symbolp form)
+           (not (eq form t))
+           (let ((binding (cdr (assoc form scope))))
+             (and binding (not (cdr binding)))))))
+(defun transpile-call-args-guarded (all-temps remaining-temps remaining-args scope final-c-expr direct-call-p)
   "ALL-TEMPSを1つずつGC-safeに評価し、いずれかが非局所脱出シグナル
    (os_is_control_transfer)であれば残りの引数評価とFINAL-C-EXPR(呼び出し本体)を
    一切実行せずそのシグナル自身を式全体の値として返す。M14基盤D:
@@ -1651,13 +1822,49 @@
    関数呼び出しの引数評価にも適用する(funcall経由でreturn-from/throwする
    エスケープするクロージャの結果が、letの脱糖((lambda (result) body) init)の
    ように別の呼び出しの引数として渡された場合、この規則が無いと非局所脱出
-   シグナルが素通しされずただの値として本体に渡ってしまう不具合があった)"
+   シグナルが素通しされずただの値として本体に渡ってしまう不具合があった)。
+   [ABI刷新] AOT改善 / [性能測定] Phase3 第0部で是正:
+   aot-form-is-immediate / aot-form-is-signal-free 参照。引数の(未評価の)
+   元のLisp式が即値(fixnum/文字リテラル/nil)ならGC_PROTECT・
+   os_is_control_transferの両方を省略し、非box化ローカル変数への参照なら
+   os_is_control_transferのみを省略する。ローカル変数参照でGC_PROTECTまで
+   省略していた以前の実装は、一時変数(__call_arg_N)へ写した値をGCが更新
+   しないためstaleなアドレスを残す不具合があり、ネイティブテストで再現して
+   是正した(documents/performance-measurement.md参照)"
   (if (null remaining-temps)
       (funcall final-c-expr all-temps)
-      (let ((temp (car remaining-temps)))
-        (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
-                temp (transpile-expr (car remaining-args) scope) temp temp temp
-                (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args) scope final-c-expr)))))
+      (let ((temp (car remaining-temps))
+            (arg-form (car remaining-args)))
+        (let* ((rest-c (transpile-call-args-guarded all-temps (cdr remaining-temps) (cdr remaining-args)
+                                                    scope final-c-expr direct-call-p))
+               (arg-c (transpile-expr arg-form scope))
+               ;; [性能測定] Phase3 第0部: この一時変数を代入してから実際に使うまでの
+               ;; 間にGCが起こりえないなら、ヒープ値を保持していてもstaleにならないので
+               ;; GC_PROTECTを省略できる。その条件は
+               ;;   - 呼び出し自体が引数consリストを組まない直接呼び出しであること
+               ;;     (name__fixed / primitive_add2形式。consリストを組む経路は
+               ;;      os_make_consが割り付けを行うためGCが起こりうる)
+               ;;   - 自分を含む以降の全引数が割り付けを伴わない評価であること
+               ;;     (即値または非box化ローカル変数の読み出しのみ)
+               ;; 呼び出し先の内部で割り付けが起きても、その時点で一時変数は既に
+               ;; 引数として読み出され済みで以後参照されないため問題にならない
+               (no-gc-until-use-p
+                 (and direct-call-p
+                      (every (lambda (a) (aot-form-is-signal-free a scope)) remaining-args))))
+          (cond
+            ;; 即値: GCの再配置対象でもシグナルでもないので常に両方省略できる
+            ((aot-form-is-immediate arg-form)
+             (format nil "({ lisp_val_t ~A = (~A); ~A; })" temp arg-c rest-c))
+            ;; 使うまでGCが起こりえないなら、非box化ローカル参照でも両方省略できる
+            ((and no-gc-until-use-p (aot-form-is-signal-free arg-form scope))
+             (format nil "({ lisp_val_t ~A = (~A); ~A; })" temp arg-c rest-c))
+            ;; 非box化ローカル参照: シグナルにはなりえないのでチェックは省くが、
+            ;; ヒープ値を保持しうるためGC_PROTECTは省略できない(上記参照)
+            ((aot-form-is-signal-free arg-form scope)
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); ~A; })" temp arg-c temp rest-c))
+            (t
+             (format nil "({ lisp_val_t ~A = (~A); GC_PROTECT(~A); os_is_control_transfer(~A) ? ~A : (~A); })"
+                     temp arg-c temp temp temp rest-c)))))))
 
 (defun transpile-call (expr scope)
   "(name arg*)。nameはdefunされた関数名またはプリミティブのホワイトリストに
@@ -1700,14 +1907,16 @@
                              args)))
          (transpile-call-args-guarded temps temps args scope
            (lambda (all-temps)
-             (format nil "~A__fixed(env, ~A)" (lisp-name-to-c-name name) (transpile-c-arg-list all-temps))))))
+             (format nil "~A__fixed(env, ~A)" (lisp-name-to-c-name name) (transpile-c-arg-list all-temps)))
+           t)))
       (fixed-c-name
        (let ((temps (mapcar (lambda (arg)
                                (declare (ignore arg))
                                (format nil "__call_arg_~A" (incf *call-temp-counter*)))
                              args)))
          (transpile-call-args-guarded temps temps args scope
-           (lambda (all-temps) (format nil "~A(~A)" fixed-c-name (transpile-c-arg-list all-temps))))))
+           (lambda (all-temps) (format nil "~A(~A)" fixed-c-name (transpile-c-arg-list all-temps)))
+           t)))
       (t
        (let ((c-name (call-target-c-name name)))
          (if (null args)
@@ -1717,7 +1926,8 @@
                                      (format nil "__call_arg_~A" (incf *call-temp-counter*)))
                                    args)))
                (transpile-call-args-guarded temps temps args scope
-                 (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps)))))))))))
+                 (lambda (all-temps) (format nil "~A(~A, env)" c-name (transpile-cons-chain all-temps)))
+                 nil))))))))
 
 (defun tail-return-final (c-expr)
   "末尾位置で、既に確定したC式c-exprの値をそのままtco_result_tとしてreturnする
@@ -2035,9 +2245,12 @@
          (fs-all-forms (%%expand-defgenerics-in-forms (mapcan #'read-all-forms *fs-lisp-paths*)))
          (fs-defuns (remove-if-not #'toplevel-defun-p fs-all-forms))
          (fs-toplevel-forms (remove-if #'toplevel-defun-p fs-all-forms))
+         (bench-all-forms (%%expand-defgenerics-in-forms (read-all-forms *bench-lisp-path*)))
+         (bench-defuns (remove-if-not #'toplevel-defun-p bench-all-forms))
+         (bench-toplevel-forms (remove-if #'toplevel-defun-p bench-all-forms))
          ;; M15: main-defunsが本番のカーネルバイナリ(*output-c-path*)へ実際に
          ;; 定義を出力する関数群。fixture-defuns(テスト専用)はここに含めない
-         (main-defuns (append aot-defuns utility-defuns fs-defuns))
+         (main-defuns (append aot-defuns utility-defuns fs-defuns bench-defuns))
          (all-defuns (append fixture-defuns main-defuns))
          (*known-function-names* (mapcar #'second all-defuns))
          ;; ABI-M6: known-function-fixed-arity(transpile-call/transpile-prototype/
@@ -2060,10 +2273,18 @@
          ;; -> utility.lisp -> fs-lisp-paths(依存関係の順)の順序で実行する必要がある
          ;; (fat16.lisp/fat32.lispのdefclassが<standard-object>等の組み込みクラスに
          ;; 依存するため)。この3ファイル群の読み込み順がそのまま実行順になる
-         (toplevel-runner (emit-toplevel-forms-runner (append aot-toplevel-forms utility-toplevel-forms fs-toplevel-forms))))
+         (toplevel-runner (emit-toplevel-forms-runner (append aot-toplevel-forms utility-toplevel-forms fs-toplevel-forms bench-toplevel-forms))))
     (emit-c-file *output-c-path* all-prototypes main-bodies
                  (format nil "~A~%~A" registration toplevel-runner))
     ;; M15: フィクスチャは登録(emit-aot-registration)もtoplevel-runnerも不要
     ;; (テスト専用でglobal_environmentへは登録しない、transpile_fixture.lisp
     ;; 自体もdefun以外のトップレベルフォームを持たない)
-    (emit-c-file *fixture-output-c-path* all-prototypes fixture-bodies "")))
+    (emit-c-file *fixture-output-c-path* all-prototypes fixture-bodies "")
+    ;; [性能測定] Phase2: インライン展開を見送った箇所の集計を出す。
+    ;; 「ベンチマークのletが実はフォールバックしていた」という取り違えを防ぐため
+    (let ((counts nil))
+      (dolist (entry *inline-fallback-log*)
+        (let ((hit (assoc (first entry) counts)))
+          (if hit (incf (cdr hit)) (push (cons (first entry) 1) counts))))
+      (format *error-output* "~&[transpile] 即時lambdaのインライン展開: 見送り ~A件~@[ ~S~]~%"
+              (length *inline-fallback-log*) counts))))

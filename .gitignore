@@ -9,3 +9,5 @@ src/c/lisp_compiled.c
 test/c/lisp_compiled_fixture.c
 
 .envrc
+tools/plugins/build/
+tools/plugins/*.so

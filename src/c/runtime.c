@@ -269,10 +269,35 @@ static UINT8 g_nil_cell[16] __attribute__((aligned(8)));
  * @param n 割り当てるバイト数
  * @return 割り当てたメモリの先頭アドレス
  */
+#ifdef ISIKIOS_GC_DEBUG
+/** [GCデバッグ] 強制GCの間隔(確保N回ごとに1回、0で無効)。実行時に
+    %%DIAG-GC-STRESSで設定する。ブート自体は膨大な確保を行うため、
+    コンパイル時に固定すると起動が終わらない。テスト直前に有効化する運用にする */
+static UINT64 g_gc_stress_interval = 0;
+
+lisp_val_t cc_diag_gc_stress(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_gc_stress_interval = os_fixnum_magnitude(cc_car(args));
+    return cc_car(args);
+}
+#endif
+
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
     UINT64 aligned = (n + 7) & ~7ULL;
 #ifndef ISIKIOS_UNIT_TEST
     __asm__ __volatile__ ("cli");
+#endif
+#ifdef ISIKIOS_GC_DEBUG
+    // [GCデバッグ] 強制GCモード。ISIKIOS_GC_STRESS回の確保ごとにGCを走らせ、
+    // 保護漏れが踏まれる確率を上げる。1にすると毎回GCが走り非常に遅くなるため、
+    // まず大きい値で全体を流し、当たりがついた経路で1にするという段階的な使い方をする
+    if (g_gc_stress_interval != 0) {
+        static UINT64 stress_counter = 0;
+        if (++stress_counter >= g_gc_stress_interval) {
+            stress_counter = 0;
+            os_gc_collect();
+        }
+    }
 #endif
     UINT8 *p = g_from_ptr;
     if (p + aligned > g_from_end) {
@@ -281,10 +306,7 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
         p = g_from_ptr;
         if (p + aligned > g_from_end) {
             // GC後もなお不足している場合は本当の枯渇として停止する
-            frame_buffer *fb = get_active_frame_buffer();
-            fb->write_string(fb, "out of memory...");
-            for (;;) {
-            }
+            os_panic("out of memory (lisp heap exhausted)");
         }
     }
     g_from_ptr = p + aligned;
@@ -292,6 +314,477 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     __asm__ __volatile__ ("sti");
 #endif
     return (UINT64)p;
+}
+
+/** os_panicがフック済みなら呼ぶ、環境依存の停止処理(QEMUテスト時の電源断等) */
+static void (*g_panic_hook)(void) = 0;
+
+void os_set_panic_hook(void (*hook)(void)) {
+    g_panic_hook = hook;
+}
+
+/* [原則6] panicの診断はフレームバッファとシリアルの両方へ出す。fbだけだと
+   -display noneでは誰も読めず、外からは「電源が落ちた」としか見えない。
+   実際、スタックガードは深度4000で正しく発動していたのに、診断が読めないために
+   「無反応で止まった」と区別がつかなかった。 */
+#ifdef ISIKIOS_UNIT_TEST
+/* os_diag_serial_writeの実体はinterrupt.cにあり、Cユニットテストのリンク対象では
+   ない。5a706ccでruntime.cのpanic経路がこれを参照するようになって以降、
+   `make test`がリンクエラーで通らなくなっていた(16コミットぶん、Cユニット
+   テストが一度も走っていなかった)。呼び出し側を#ifdefで囲うと診断コードが
+   読みにくくなるので、テスト時だけ何もしない実体を置く */
+void os_diag_serial_write(const char *s) { (void)s; }
+/* 同じ理由(実体はinterrupt.c)。タイマーサンプラの間隔もテストでは意味を持たない */
+UINT64 g_tick_sample_interval = 0;
+#endif
+
+static void panic_write_string(frame_buffer *fb, const char *s) {
+    fb->write_string(fb, s);
+#ifndef ISIKIOS_UNIT_TEST
+    os_diag_serial_write(s);
+#endif
+}
+
+/** 符号なし整数を10進文字列へ変換する(freestandingのためsnprintfは使えない) */
+static void panic_write_uint(frame_buffer *fb, UINT64 v) {
+    char buf[24];
+    char out[25];
+    int i = 0;
+    int o = 0;
+    if (v == 0) {
+        panic_write_string(fb, "0");
+        return;
+    }
+    while (v > 0 && i < (int)sizeof(buf)) {
+        buf[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (i > 0) {
+        out[o++] = buf[--i];
+    }
+    out[o] = '\0';
+    panic_write_string(fb, out);
+}
+
+/* Immobilized Spaceの各定義より後ろで定義する(前方宣言のみここに置く) */
+static void panic_write_imm_breakdown(frame_buffer *fb);
+
+/* [原則6] 数値をシリアルへ直接出す(スタックをほとんど使わない)。
+   スタック溢れの報告はフレームバッファより先にこちらで出す必要がある — 下記参照 */
+static void serial_write_uint(UINT64 v) {
+    char out[24];
+    int o = 0;
+    if (v == 0) { os_diag_serial_write("0"); return; }
+    while (v > 0 && o < 23) { out[o++] = (char)('0' + (v % 10)); v /= 10; }
+    char rev[25];
+    int r = 0;
+    while (o > 0) { rev[r++] = out[--o]; }
+    rev[r] = '\0';
+    os_diag_serial_write(rev);
+}
+
+void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
+    /* [原則6] **フレームバッファより先にシリアルへ出す。**
+       このハンドラはタイマー割り込みから、溢れているスタックの上で動く。
+       get_active_frame_buffer以降の描画経路はさらにスタックを使うため、
+       そこへ入る前に落ちると外からは「電源が落ちた」としか見えない。
+       実際、深度4000で溢れているのにシリアルには何も出ていなかった。
+       シリアル出力はローカルが数十byteで済むので、まずこちらを出し切る。 */
+#ifndef ISIKIOS_UNIT_TEST
+    os_diag_serial_write("\nPANIC: stack overflow\n  rsp=");
+    serial_write_uint(rsp);
+    os_diag_serial_write(" stack_low=");
+    serial_write_uint(stack_low);
+    os_diag_serial_write("\n  used=");
+    serial_write_uint(stack_used);
+    os_diag_serial_write(" byte (stack size=");
+    serial_write_uint((UINT64)STACK_SIZE_FOR_PANIC);
+    os_diag_serial_write(")\n");
+#endif
+    frame_buffer *fb = get_active_frame_buffer();
+    panic_write_string(fb, "PANIC: stack overflow\n  rsp=");
+    panic_write_uint(fb, rsp);
+    panic_write_string(fb, " stack_low=");
+    panic_write_uint(fb, stack_low);
+    panic_write_string(fb, "\n  used=");
+    panic_write_uint(fb, stack_used);
+    panic_write_string(fb, " byte (stack size=");
+    panic_write_uint(fb, (UINT64)STACK_SIZE_FOR_PANIC);
+    panic_write_string(fb, ")\n");
+    os_panic("stack overflow (see above)");
+}
+
+#ifdef ISIKIOS_GC_DEBUG
+/* [GCデバッグ] 塗り潰し(ISIKIOS_GC_PAINT)はGC_PAINT=1で有効になる。
+   かつては「os_alloc_rawの生データがGCヒープに置かれているので塗ると壊れる」と
+   していたが、これは誤りだった。os_stream_tとそのバッファはgc_relocate_streamが
+   コピーしており、実際に未管理だったのはprint.cのbignum印字用作業バッファ2箇所
+   だけである(fe97f45で解消)。 */
+/** [GCデバッグ] stale領域を塗るトラップパターン。
+   タグはTAG_RAW_POINTER(0x7)にする。**「タグとして不正な値」は作れない**
+   — 0x0〜0x7の8値はすべて使用中である(FIXNUM/CONS/SYMBOL/CHAR/STRING/
+   INSTANCE/FORWARD/RAW_POINTER)。そこで「GCが決して追いかけないタグ」を選ぶ。
+   gc_copy_valueはFIXNUM/CHAR/RAW_POINTERをその場で返すので、トラップを
+   デリファレンスしない。
+   当初はTAG_FORWARD(0x6)にしていたが、これはGCが転送ポインタとみなして
+   追いかけるタグであり、生きた構造の中にトラップが入るとGC自身が
+   canonicalでないアドレスを読んでGP例外で止まっていた(gc_copy_value+0x33)。 */
+#define GC_DEBUG_TRAP_PATTERN GC_DEBUG_TRAP_PATTERN_VALUE
+
+/** [GCデバッグ] staleなデリファレンスを検出した回数 */
+static UINT64 g_gc_debug_stale_hits = 0;
+
+/** [GC監査] GCが「生きた構造の中に塗り潰し済み領域へのポインタ」を見つけた回数。
+    保護漏れでstaleになった値がその後どこかへ書き込まれた、という形の漏れを表す */
+static UINT64 g_gc_painted_field_hits = 0;
+
+void os_gc_debug_note_painted_field(void) {
+    g_gc_painted_field_hits++;
+}
+
+/** [GC監査] shadow stackのLIFO規律が破れた回数。GC_PROTECTは
+    get_current_process()->gc_rootsへ繋ぐが、get_current_processが返すのは
+    g_current_process_index(=表示フォーカス)であって、スケジューラが実際に
+    走らせているプロセスではない。プリエンプティブな切り替えが起きると、
+    複数のプロセスのノードが1本のリストへ混ざる */
+UINT64 g_gc_lifo_violations = 0;
+
+int g_gc_debug_in_gc = 0;
+/* [GC監査] GCの実行中にタイマー割り込みが入った回数。c_timer_switchが数える。
+   タイマーハンドラは*current-process* / run-queue/PCBというGC管理データを読むので、
+   ここが0でないならGC途中の半端な状態を読む窓が実在することになる */
+UINT64 g_gc_tick_during_gc = 0;
+
+/* [GC監査] 保護しようとした時点で既にstaleだった回数と、その箇所。
+   GC_PROTECTは「その変数」を追跡するだけなので、入ってきた値が既に古ければ
+   保護しても直らない。ここで記録された関数そのものではなく、**その呼び出し元**が
+   確保を跨いで保護せずに値を持っていた張本人である */
+static UINT64 g_gc_protect_stale_hits = 0;
+#define GC_PROTECT_STALE_MAX_SITES 64
+static const char *g_gc_protect_stale_files[GC_PROTECT_STALE_MAX_SITES];
+static int g_gc_protect_stale_lines[GC_PROTECT_STALE_MAX_SITES];
+static UINT64 g_gc_protect_stale_site_hits[GC_PROTECT_STALE_MAX_SITES];
+static UINT32 g_gc_protect_stale_site_count = 0;
+
+int g_gc_protect_check_enabled = 0;
+
+/* [GC監査] 保護時の検査を実行時に切り替える。既定は無効。
+   常時有効だとGC_PROTECTが最も多く通る場所なので、za.cのlabels+letの
+   JITコンパイルが現実的な時間で終わらなくなる(実測で10分以上進まなかった) */
+lisp_val_t cc_diag_gc_protect_check(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_gc_protect_check_enabled = (cc_car(args) != nil) ? 1 : 0;
+    return nil;
+}
+
+void os_gc_debug_check_protect_slow(lisp_val_t *var, const char *file, int line) {
+    if (g_gc_debug_in_gc) {
+        return;
+    }
+    lisp_val_t v = *var;
+    UINT64 tag = v & TAG_MASK;
+    if (tag == TAG_FIXNUM || tag == TAG_CHAR || tag == TAG_RAW_POINTER) {
+        return;
+    }
+    UINT8 *addr = (UINT8 *)(lisp_addr_t)(v & ~TAG_MASK);
+    if (addr == 0) {
+        return;
+    }
+    // 旧From空間(=いまのTo空間)を指しているか。範囲検査は偶奇の影響を受けるが、
+    // 塗り潰し有効ならその中身がトラップパターンであることで確定できる
+    if (!(addr >= g_to_start && addr < g_to_end)) {
+        return;
+    }
+#ifdef ISIKIOS_GC_PAINT
+    if (*(lisp_val_t *)addr != (lisp_val_t)GC_DEBUG_TRAP_PATTERN) {
+        return; /* 塗り潰し済みでないなら、まだ上書きされていないだけの可能性がある */
+    }
+#endif
+    g_gc_protect_stale_hits++;
+    /* [GC監査] 最初の1件だけシリアルへ即出しする。検出のあとで落ちたり
+       ハングしたりすると %%DIAG-GC-PROTECT-STALE-FILE まで到達できず、
+       せっかく捕まえた発生箇所が読めない。 */
+    if (g_gc_protect_stale_hits == 1) {
+        os_diag_serial_write("\n[GC監査] GC_PROTECTに渡された時点で既にstale: ");
+        os_diag_serial_write(file);
+        os_diag_serial_write(":");
+        {
+            char buf[16]; int n = 0, x = line;
+            if (x == 0) { buf[n++] = '0'; }
+            while (x > 0) { buf[n++] = (char)('0' + x % 10); x /= 10; }
+            char rev[17]; int j = 0;
+            while (n > 0) { rev[j++] = buf[--n]; }
+            rev[j] = '\0';
+            os_diag_serial_write(rev);
+        }
+        os_diag_serial_write("\n  (この関数の**呼び出し元**が、確保を跨いで保護せずに持っていた)\n");
+    }
+    for (UINT32 i = 0; i < g_gc_protect_stale_site_count; i++) {
+        if (g_gc_protect_stale_files[i] == file && g_gc_protect_stale_lines[i] == line) {
+            g_gc_protect_stale_site_hits[i]++;
+            return;
+        }
+    }
+    if (g_gc_protect_stale_site_count < GC_PROTECT_STALE_MAX_SITES) {
+        g_gc_protect_stale_files[g_gc_protect_stale_site_count] = file;
+        g_gc_protect_stale_lines[g_gc_protect_stale_site_count] = line;
+        g_gc_protect_stale_site_hits[g_gc_protect_stale_site_count] = 1;
+        g_gc_protect_stale_site_count++;
+    }
+}
+
+lisp_val_t cc_diag_gc_protect_stale(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 which = os_fixnum_magnitude(cc_car(args));
+    if (which == 0) { return os_make_fixnum(g_gc_protect_stale_hits); }
+    return os_make_fixnum(g_gc_protect_stale_site_count);
+}
+
+/* 発生箇所はソースの行番号で返す(戻りアドレスと違い逆引きが要らない)。
+   どのファイルかはcc_diag_gc_protect_stale_fileで別に取る */
+lisp_val_t cc_diag_gc_protect_stale_site(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_protect_stale_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum((UINT64)g_gc_protect_stale_lines[i]);
+}
+
+lisp_val_t cc_diag_gc_protect_stale_file(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_protect_stale_site_count || g_gc_protect_stale_files[i] == 0) {
+        return os_make_string("");
+    }
+    return os_make_string(g_gc_protect_stale_files[i]);
+}
+
+lisp_val_t cc_diag_gc_lifo_violations(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_lifo_violations);
+}
+
+lisp_val_t cc_diag_gc_painted_fields(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_painted_field_hits);
+}
+
+/** [GCデバッグ] GC実行中フラグ。GC自身がコピー先(To空間)のオブジェクトを
+    cc_car/cc_cdrで走査するため、その参照までstaleと誤判定してしまう。
+    対照実験(za.cを通らないワークロード+強制GC)で2,044件の誤検出として
+    現れたことで判明した */
+
+lisp_val_t cc_diag_gc_stale_hits(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_debug_stale_hits);
+}
+
+int os_gc_debug_is_trap(lisp_val_t v) {
+    return v == (lisp_val_t)GC_DEBUG_TRAP_PATTERN;
+}
+
+int os_gc_debug_is_stale(lisp_addr_t addr) {
+    return addr >= (lisp_addr_t)g_to_start && addr < (lisp_addr_t)g_to_end;
+}
+
+/** [GCデバッグ] 検出した発生箇所(呼び出し元の戻りアドレス)ごとの回数。
+    2,035という数字が「箇所」ではなく「回数」である可能性が高いため、
+    dedupeして実際のバグ箇所数を出すために使う(同じ未保護変数が再帰の各段で
+    読まれれば1つのバグが深さぶんの検出を生む) */
+#define GC_DEBUG_MAX_SITES 64
+static void *g_gc_debug_sites[GC_DEBUG_MAX_SITES];
+static UINT64 g_gc_debug_site_hits[GC_DEBUG_MAX_SITES];
+static UINT32 g_gc_debug_site_count = 0;
+
+void os_gc_debug_assert_live(lisp_val_t obj, const char *where, void *site) {
+    (void)where;
+    lisp_addr_t addr = (lisp_addr_t)(obj & ~TAG_MASK);
+    if (addr == 0) {
+        return;
+    }
+    if (g_gc_debug_in_gc) {
+        return; /* GC自身の走査は対象外 */
+    }
+    if (!os_gc_debug_is_stale(addr)) {
+        return;
+    }
+    g_gc_debug_stale_hits++;
+    for (UINT32 i = 0; i < g_gc_debug_site_count; i++) {
+        if (g_gc_debug_sites[i] == site) {
+            g_gc_debug_site_hits[i]++;
+            return;
+        }
+    }
+    if (g_gc_debug_site_count < GC_DEBUG_MAX_SITES) {
+        g_gc_debug_sites[g_gc_debug_site_count] = site;
+        g_gc_debug_site_hits[g_gc_debug_site_count] = 1;
+        g_gc_debug_site_count++;
+    }
+}
+
+/* [GC監査] 塗り潰しのトラップパターンを**読もうとした**箇所の記録。
+   範囲検査(os_gc_debug_assert_live)と違い、GC世代の偶奇に依存しない。
+   トラップパターンそのものが観測されたということは、そのアドレスは
+   「直前のGCで捨てられた領域」であり、live/staleの範囲判定を経ずに確定する。
+
+   ただし塗り潰しにも固有の限界がある。旧From空間は次のGCでコピー先になるため、
+   2回以上GCを跨いだstaleアドレスは塗り潰しではなく**新しい生きたオブジェクト**を
+   指してしまい、トラップとしては観測されない(陽性対照をinterval=100で流すと
+   999ではなく190のような別の値が返るのはこれである)。
+   したがって「トラップ0件」もまた保護漏れが無いことの証明にはならない。 */
+#define GC_TRAP_MAX_SITES 64
+static void *g_gc_trap_sites[GC_TRAP_MAX_SITES];
+static UINT64 g_gc_trap_site_hits[GC_TRAP_MAX_SITES];
+static UINT32 g_gc_trap_site_count = 0;
+
+
+/* [GC監査] 読み出した結果がトラップだった箇所。**最初にstaleを読んだ場所**を
+   直接押さえられるのはこちらである。読み出し元のポインタ自体は塗り潰し済み領域を
+   指す「ふつうのアドレス」に見えるため、ポインタ側の判定では素通りしてしまい、
+   トラップは1段あとの読み出しで初めて現れる(実測でeval_argsが最初の検出箇所に
+   見えていたのはこのため) */
+static UINT64 g_gc_trap_result_hits = 0;
+
+/* 比較はGC_DEBUG_TRAP_RESULTマクロ側でインラインに行う。ここへ来るのは
+   実際にトラップを読んだときだけなので、呼び出しコストは問題にならない */
+void os_gc_debug_trap_result_hit(const char *where, void *site) {
+    (void)where;
+    if (g_gc_debug_in_gc) {
+        return;
+    }
+    g_gc_trap_result_hits++;
+    for (UINT32 i = 0; i < g_gc_trap_site_count; i++) {
+        if (g_gc_trap_sites[i] == site) {
+            g_gc_trap_site_hits[i]++;
+            return;
+        }
+    }
+    if (g_gc_trap_site_count < GC_TRAP_MAX_SITES) {
+        g_gc_trap_sites[g_gc_trap_site_count] = site;
+        g_gc_trap_site_hits[g_gc_trap_site_count] = 1;
+        g_gc_trap_site_count++;
+    }
+}
+
+lisp_val_t cc_diag_gc_trap_result_hits(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_trap_result_hits);
+}
+
+lisp_val_t cc_diag_gc_trap_sites(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_trap_site_count);
+}
+
+/* 発生箇所(呼び出し元の戻りアドレス)。tools/bench/locate_rip.shで関数名へ逆引きする。
+   **件数は「回数」であって「箇所数」ではない**(再帰の各段で読まれれば1つのバグが
+   深さぶんの検出を生む)ため、必ずこちらで箇所数を見ること */
+lisp_val_t cc_diag_gc_trap_site_addr(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_trap_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum((UINT64)(lisp_addr_t)g_gc_trap_sites[i]);
+}
+
+/* [GC監査] 対照を流した後など、既知の検出を差し引いて数え直すためのリセット。
+   対照は意図的にstaleを作るので、監査本体の計数に混ぜてはならない */
+lisp_val_t cc_diag_gc_trap_reset(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    g_gc_trap_result_hits = 0;
+    g_gc_trap_site_count = 0;
+    g_gc_painted_field_hits = 0;
+    return nil;
+}
+
+lisp_val_t cc_diag_gc_trap_site_hits(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_trap_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum(g_gc_trap_site_hits[i]);
+}
+
+/* イメージの読み込みアドレスは実行ごとに変わるため、絶対アドレスだけでは
+   逆引きできない。既知のシンボルのアドレスを基準として返す
+   (tools/bench/locate_rip.sh の handler= と同じ役割) */
+lisp_val_t cc_diag_image_anchor(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum((UINT64)(lisp_addr_t)(void *)os_gc_debug_check_protect_slow);
+}
+
+/* [GCデバッグ] stale仮説の直接確認。値がFrom空間(=生きている側)か
+   To空間(=旧From空間、stale)かその他(Immobilized/静的)かを入口で分類して数える。
+   検査点の列挙(cc_car等)では捉えられない経路のために、対象関数の入口へ直接置く */
+static UINT64 g_gc_cls_live = 0;   /* From空間 = 正常 */
+static UINT64 g_gc_cls_stale = 0;  /* To空間 = staleを指している */
+static UINT64 g_gc_cls_other = 0;  /* どちらでもない(Immobilized/静的) */
+
+void os_gc_debug_classify(lisp_val_t v) {
+    lisp_addr_t addr = (lisp_addr_t)(v & ~TAG_MASK);
+    if (addr == 0) { return; }
+    if (addr >= (lisp_addr_t)g_from_start && addr < (lisp_addr_t)g_from_end) {
+        g_gc_cls_live++;
+    } else if (addr >= (lisp_addr_t)g_to_start && addr < (lisp_addr_t)g_to_end) {
+        g_gc_cls_stale++;
+    } else {
+        g_gc_cls_other++;
+    }
+}
+
+lisp_val_t cc_diag_gc_cls(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 which = os_fixnum_magnitude(cc_car(args));
+    if (which == 0) { return os_make_fixnum(g_gc_cls_live); }
+    if (which == 1) { return os_make_fixnum(g_gc_cls_stale); }
+    if (which == 2) { return os_make_fixnum(g_gc_cls_other); }
+    g_gc_cls_live = 0; g_gc_cls_stale = 0; g_gc_cls_other = 0;
+    return nil;
+}
+
+lisp_val_t cc_diag_gc_stale_sites(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_debug_site_count);
+}
+
+lisp_val_t cc_diag_gc_stale_site_addr(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_debug_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum((UINT64)(lisp_addr_t)g_gc_debug_sites[i]);
+}
+
+lisp_val_t cc_diag_gc_stale_site_hits(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 i = os_fixnum_magnitude(cc_car(args));
+    if (i >= g_gc_debug_site_count) { return os_make_fixnum(0); }
+    return os_make_fixnum(g_gc_debug_site_hits[i]);
+}
+
+lisp_val_t cc_diag_gc_stale_reset(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    g_gc_debug_stale_hits = 0;
+    g_gc_debug_site_count = 0;
+    return nil;
+}
+#endif
+
+void os_panic(const char *msg) {
+    frame_buffer *fb = get_active_frame_buffer();
+    panic_write_string(fb, "PANIC: ");
+    panic_write_string(fb, msg);
+    panic_write_string(fb, "\n");
+    panic_write_imm_breakdown(fb);
+    // フックが登録されていれば(QEMUテスト実行時は電源断)そちらへ委ねる。
+    // 登録が無ければhltで止まる: 旧実装の空のfor(;;)はCPUを全力で回し続けるため
+    // 「異常停止」と「極端に遅い処理」を外から区別できなかった(letの
+    // Immobilized Spaceリークの調査で33分間ハングに気づけなかった実例がある)。
+    // hltなら停止中のCPU使用率がほぼ0になり、外から明確に判別できる
+    if (g_panic_hook) {
+        g_panic_hook();
+    }
+    for (;;) {
+#ifndef ISIKIOS_UNIT_TEST
+        __asm__ __volatile__ ("hlt");
+#endif
+    }
 }
 
 lisp_addr_t os_alloc_raw(UINT64 n) {
@@ -428,6 +921,19 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     for (int i = 0; i < SYMBOL_HASH_SIZE; i++) {
         g_symbol_hash[i] = -1;
     }
+
+    /* [転送済み判定の不変条件] gc_copy_valueは word0 の下位3bitが TAG_FORWARD かで
+       転送済みを疑い、指す先が半空間の範囲にあるかで確定させる。
+       MAGIC_STREAM(0x6)とMAGIC_BUILTIN_CLASS(0xE)は下位3bitが実際に衝突しているので、
+       これらを弾いているのは範囲検査の**下限**だけである。
+
+       runtime.hの_Static_assertが保証しているのは「MAGIC値がMAGIC_MUST_BE_BELOWより
+       小さい」というコンパイル時定数どうしの比較にすぎず、**ヒープがその定数より上に
+       置かれること**は保証していない。低位アドレスにヒープが置かれる構成に変われば、
+       静的アサートは通ったまま範囲検査だけが壊れる。実行時に1回だけ確かめる。 */
+    if (heap_base <= MAGIC_MUST_BE_BELOW) {
+        os_panic("heap base too low: MAGICが転送ポインタと誤認される");
+    }
 }
 
 double os_heap_used_ratio(void) {
@@ -466,6 +972,19 @@ lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env) {
 
 /** os_gc_collectが呼ばれた延べ回数。テストが「計算中に実際にGCが発火したか」を確認するために使う */
 static UINT64 g_gc_collect_count = 0;
+/** [GC監査] gc_copy_valueがコピー不能なタグ(TAG_FORWARD等)を渡された回数。
+    0でなければ、生きたフィールドが転送ポインタを保持している = どこかの保護漏れ */
+UINT64 g_gc_uncopyable_tag_hits = 0;
+/** [GC監査] 転送先が未割り当て区間(>= g_to_ptr)を指していた回数。0であるべき */
+UINT64 g_gc_fwd_beyond_ptr_hits = 0;
+/** [GC監査] gc_copy_valueがTo空間を指す値で呼ばれた回数(=二度目の走査)。
+    標準のCheneyなら0。0でなければ走査が重複している */
+UINT64 g_gc_to_space_revisits = 0;
+/** [GC監査] gc_scan_queueが今走査しているオブジェクトと、そのフィールド番号。
+    コピー不能なタグを見つけたときに「誰が持っていたか」を言うために使う。
+    ルート走査中(shadow stack等)は0で、その場合は保持元不明として出す */
+static lisp_val_t g_gc_scan_holder = 0;
+static UINT64 g_gc_scan_field = 0;
 
 UINT64 os_gc_collect_count(void) {
     return g_gc_collect_count;
@@ -585,9 +1104,10 @@ lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 組み込み関数%%IMM-SPACE-USED-BYTES。Immobilized Spaceのうちg_imm_bumpが
- * これまでに切り出した使用バイト数を返す(フリーリストに返却済みのページも
- * 「切り出し済み」として使用量に含まれる、os_imm_pages_used_for_testと同じ数え方)。
+ * 組み込み関数%%IMM-SPACE-USED-BYTES。Immobilized Spaceの実消費バイト数を
+ * バイト粒度で返す(os_imm_space_used_bytes参照)。以前はページ粒度
+ * (g_imm_bump - g_imm_space)を返していたため、4096byte未満の消費が「0 byte」に
+ * 見え、実行回数に比例するリークを回帰テストで検出できなかった。
  * @param args 評価済みの引数リスト(未使用)
  * @param env 呼び出し時の環境(未使用)
  * @return Immobilized Spaceの使用バイト数のfixnum
@@ -595,8 +1115,14 @@ lisp_val_t primitive_imm_space_total_bytes(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env) {
     (void)args;
     (void)env;
-    return os_make_fixnum((UINT64)(g_imm_bump - g_imm_space));
+    return os_make_fixnum(os_imm_space_used_bytes());
 }
+
+/* os_imm_space_used_bytesが参照する2本のスロットカーソル(実体は下方で定義) */
+static imm_slot_cursor_t g_function_cell_cursor;
+static imm_slot_cursor_t g_fn_meta_cursor;
+/** 直近にImmobilized Spaceへ要求された確保サイズ(枯渇時の診断表示用) */
+static UINT64 g_imm_last_request_bytes = 0;
 
 void *os_imm_page_alloc(void) {
     if (g_imm_free_list) {
@@ -605,14 +1131,82 @@ void *os_imm_page_alloc(void) {
         return page;
     }
     if (g_imm_bump + IMM_PAGE_SIZE > g_imm_space + IMM_SPACE_SIZE) {
-        frame_buffer *fb = get_active_frame_buffer();
-        fb->write_string(fb, "imm: space exhausted...");
-        for (;;) {
-        }
+        os_panic("immobilized space exhausted");
     }
     void *page = g_imm_bump;
     g_imm_bump += IMM_PAGE_SIZE;
     return page;
+}
+
+int os_addr_region(lisp_addr_t addr) {
+    UINT8 *p = (UINT8 *)addr;
+    if (p >= g_from_start && p < g_from_end) { return 0; }
+    if (p >= g_to_start && p < g_to_end) { return 1; }
+    if (p >= g_imm_space && p < g_imm_space + IMM_SPACE_SIZE) { return 2; }
+    return 4;
+}
+
+/** [GC監査] GC実行中に入ったタイマー割り込みの回数を返す。
+    0でなければ、タイマーハンドラが*current-process* / run-queue/PCBを
+    GC途中の半端な状態で読む窓が実在する */
+extern UINT64 g_tick_sample_interval;
+/** [測定] %%DIAG-TICK-SAMPLE。引数tick数ごとに割り込み時ripをシリアルへ出す(0で停止)。
+    GC_DEBUG限定にしない理由はinterrupt.c側のコメント参照 */
+lisp_val_t cc_diag_tick_sample_pub(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_tick_sample_interval = os_fixnum_magnitude(cc_car(args));
+    return cc_car(args);
+}
+/** [測定] %%DIAG-IMAGE-ANCHOR。ripをファイル上のアドレスへ逆引きする基準点。
+    ロードアドレスは実行ごとに変わるので、既知シンボルの実行時アドレスが要る */
+lisp_val_t cc_diag_image_anchor_pub(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum((UINT64)(lisp_addr_t)(void *)os_heap_used_ratio);
+}
+
+#ifdef ISIKIOS_GC_DEBUG
+/** [GC監査] limb作業領域の最高水位(limb単位)を返す */
+lisp_val_t cc_diag_limb_peak(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_limb_arena_peak);
+}
+/** [GC監査] gc_copy_valueがTo空間の値で呼ばれた回数を返す(標準のCheneyなら0) */
+lisp_val_t cc_diag_gc_to_revisits(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_to_space_revisits);
+}
+extern UINT64 g_tick_sample_interval;
+/** [GC監査] %%DIAG-TICK-SAMPLE。引数tick数ごとに割り込み時ripをシリアルへ出す(0で停止) */
+lisp_val_t cc_diag_tick_sample(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    g_tick_sample_interval = os_fixnum_magnitude(cc_car(args));
+    return cc_car(args);
+}
+
+lisp_val_t cc_diag_gc_tick_during_gc(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_gc_tick_during_gc);
+}
+#endif
+
+lisp_val_t cc_diag_addr_region(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum((UINT64)os_addr_region((lisp_addr_t)os_fixnum_magnitude(cc_car(args))));
+}
+
+UINT64 os_imm_space_used_bytes(void) {
+    // g_imm_bumpはページ単位でしか進まないため、そのままでは4096byte未満の
+    // 消費が見えない。各スロットカーソルが現在のページに残している未使用の
+    // 末尾分を差し引くことで、実際に切り出したバイト数を返す。
+    // (os_imm_pages_alloc_contiguousで取るJITコード用ページは全体が使用中)
+    UINT64 used = (UINT64)(g_imm_bump - g_imm_space);
+    if (g_fn_meta_cursor.page != 0) {
+        used -= (UINT64)(IMM_PAGE_SIZE - g_fn_meta_cursor.offset);
+    }
+    if (g_function_cell_cursor.page != 0) {
+        used -= (UINT64)(IMM_PAGE_SIZE - g_function_cell_cursor.offset);
+    }
+    return used;
 }
 
 void os_imm_page_free(void *page) {
@@ -630,8 +1224,24 @@ void *os_imm_pages_alloc_contiguous(UINT64 count) {
     return pages;
 }
 
+/** os_panicが表示するImmobilized Spaceの内訳(枯渇時の診断用) */
+static void panic_write_imm_breakdown(frame_buffer *fb) {
+    panic_write_string(fb, "  immobilized space: used=");
+    panic_write_uint(fb, os_imm_space_used_bytes());
+    panic_write_string(fb, " / total=");
+    panic_write_uint(fb, (UINT64)IMM_SPACE_SIZE);
+    panic_write_string(fb, " byte\n  cursor fn_meta: offset=");
+    panic_write_uint(fb, g_fn_meta_cursor.page ? g_fn_meta_cursor.offset : 0);
+    panic_write_string(fb, ", function_cell: offset=");
+    panic_write_uint(fb, g_function_cell_cursor.page ? g_function_cell_cursor.offset : 0);
+    panic_write_string(fb, "\n  last request=");
+    panic_write_uint(fb, g_imm_last_request_bytes);
+    panic_write_string(fb, " byte\n");
+}
+
 void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
     UINT64 aligned = (size + 15) & ~15ULL;
+    g_imm_last_request_bytes = aligned;
     if (cursor->page == 0 || cursor->offset + aligned > IMM_PAGE_SIZE) {
         cursor->page = (UINT8 *)os_imm_page_alloc();
         cursor->offset = 0;
@@ -644,11 +1254,11 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
 /** Function Cell(os_get_function_cell/os_set_function参照)の確保に使う
  * バンプカーソル。全environment共通の1本のみ持つ(現状はどのenvironmentが所有する
  * ページかを区別しない、Phase3でenvironmentごとの所有ページリストに置き換える予定) */
-static imm_slot_cursor_t g_function_cell_cursor = {0, 0};
+/* 実体は上方の前方宣言(ゼロ初期化) */
 
 /** ABI-M4: za_fn_meta_t(os_fn_meta_alloc参照)の確保に使うバンプカーソル。
  * Function Cellと同様、個別解放はせずOS生存期間中保持される前提 */
-static imm_slot_cursor_t g_fn_meta_cursor = {0, 0};
+/* 実体は上方の前方宣言(ゼロ初期化) */
 
 za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
     za_fn_meta_t *meta = (za_fn_meta_t *)os_imm_slot_alloc(&g_fn_meta_cursor, sizeof(za_fn_meta_t));
@@ -657,6 +1267,12 @@ za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
     meta->arity = 0;
     return meta;
 }
+
+/* [GC監査] アドレスがどの領域に属するかを返す。生成コードに焼き込まれた即値が
+   「GCで動く領域」を指していないかを、機械語のレベルで判定するために使う。
+   0=From空間(生きている側) 1=To空間(GCのコピー先) 2=Immobilized Space
+   3=JITステージングバッファ 4=それ以外(静的/スタック/未使用) */
+int os_addr_region(lisp_addr_t addr);
 
 /* ============================== GC (Cheney方式コピーGC) ============================== */
 
@@ -734,10 +1350,40 @@ static UINT8 *gc_to_alloc(UINT64 size) {
     UINT64 aligned = (size + 7) & ~7ULL;
     UINT8 *dst = g_to_ptr;
     if (dst + aligned > g_to_end) {
+        /* [原則6] 以前はフレームバッファへ1行書いて for(;;) で止まっていた。
+           GCは割り込み禁止のまま走るので、外からは**完全な無音のハング**にしか
+           見えず、シリアルにも何も残らない。実測で、塗り潰し監査の
+           za_test_ext8 / ext12 / ext14 の「静かなハング」の正体がこれだった
+           (QEMUモニタでRIPを採って gc_to_alloc+0x43 の jmp 自己ループと判明)。
+           数字を添えてシリアルへ出し、os_panicで止める。 */
+#ifndef ISIKIOS_UNIT_TEST
+        os_diag_serial_write("\nPANIC: gc: to-space exhausted\n  要求=");
+        serial_write_uint(aligned);
+        os_diag_serial_write("\n  to  =");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_start);
+        os_diag_serial_write("..");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_end);
+        os_diag_serial_write(" ptr=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_ptr);
+        os_diag_serial_write("\n  from=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_from_start);
+        os_diag_serial_write("..");
+        serial_write_uint((UINT64)(lisp_addr_t)g_from_end);
+        os_diag_serial_write(" ptr=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_from_ptr);
+        os_diag_serial_write("\n  to容量=");
+        serial_write_uint((UINT64)(g_to_end - g_to_start));
+        os_diag_serial_write(" to使用=");
+        serial_write_uint((UINT64)(g_to_ptr - g_to_start));
+        os_diag_serial_write(" from使用=");
+        serial_write_uint((UINT64)(g_from_ptr - g_from_start));
+        os_diag_serial_write(" GC回数=");
+        serial_write_uint(os_gc_collect_count());
+        os_diag_serial_write("\n");
+#endif
         frame_buffer *fb = get_active_frame_buffer();
         fb->write_string(fb, "gc: to-space exhausted...");
-        for (;;) {
-        }
+        os_panic("gc: to-space exhausted (see serial)");
     }
     g_to_ptr = dst + aligned;
     return dst;
@@ -754,21 +1400,92 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
         return obj;
     }
 
+#ifdef ISIKIOS_GC_PAINT
+    // [GC監査] 塗り潰したstale領域を**生きているオブジェクトのフィールドが
+    // 指していた**場合、ここへトラップパターンが渡ってくる。
+    // トラップのタグはTAG_FORWARD(0x6)なので、素通しすると下の転送ポインタ
+    // 判定でwords[0]を読みに行き、canonicalでないアドレスのデリファレンスで
+    // GP例外になりOSが止まる。監査ではそこで止めず、回数を数えてnilへ潰し、
+    // 1回の実行で全体像を取る(指示書 第0部2)。
+    //
+    // この経路で捕まるのは「保護漏れでstaleになった値が、その後**生きた構造へ
+    // 書き込まれた**」ケースである。読み出し側(cc_car/cc_cdr)の検出より後になるが、
+    // 読まずに保存しただけの漏れはこちらでしか捕まらない
+    // タグがTAG_RAW_POINTERなのでこの下のswitchは追いかけない(GCが転送ポインタと
+    // 誤認して落ちることはもう無い)。ここを残しているのは2つの理由による:
+    //   1. 計数。生きた構造のフィールドが塗り潰し済み領域を指していた、という形の
+    //      漏れはこれでしか数えられない。
+    //   2. 伝播を止める。そのまま残すと、後でその値をcarやcdrとして辿った側が
+    //      canonicalでないアドレスを読んでGP例外で停止し、監査がそこで終わる。
+    //      nilへ潰せば「そのフィールドは壊れていた」という記録を残したまま走り切れる
+    //      (指示書 第0部2「検出しても中断しない」)
+    if (obj == (lisp_val_t)GC_DEBUG_TRAP_PATTERN) {
+        os_gc_debug_note_painted_field();
+        return nil;
+    }
+#endif
+
     UINT64 tag = obj & TAG_MASK;
-    if (tag == TAG_FIXNUM || tag == TAG_CHAR || tag == TAG_RAW_POINTER) {
+    /* [単一の真実源] 追いかけるかどうかの判断はos_tag_is_heap_refに集約している
+       (生成コードの焼き込み検出器と同じ集合を使うため。runtime.h参照) */
+    if (!os_tag_is_heap_ref(tag)) {
         return obj;
     }
 
     lisp_addr_t addr = obj & ~TAG_MASK;
+
+    /* [転送済み判定の穴] すでにTo空間を指している値は、この回のGCで**もう転送済み**
+       である。Cheneyの転送済み判定はFrom側のword0に書いた転送ヘッダを見る仕組みなので、
+       To空間のオブジェクトには原理的に効かない。ここで止めないと、To空間のオブジェクトを
+       もう一度コピーし、**その word0 に転送ヘッダを焼き込む**。
+
+       焼き込まれたヘッダは次の世代で牙を剥く。世代NのToは世代N+1のFromなので、
+       そのオブジェクトは次の世代で生きたデータとしてコピーされ、
+       「SYMBOLのword0が転送ポインタを持っている」という状態になる。
+       実測(塗り潰し監査 isiki_test、AUDIT_STRESS=100):
+         保持元=24643394 tag=2(SYMBOL) 領域=To words=[110651760|6, nil, nil, nil]
+         to=24642240..110584160  from=110584160..196526080
+       word0が指す110651760は現Fromにある正常なシンボルで、これは前世代の
+       転送先アドレスそのものだった。
+
+       STRINGでこれが起きると word0(生の長さ)が壊れ、印字が
+       ヒープのバイト列になる。 */
+    if ((UINT8 *)addr >= g_to_start && (UINT8 *)addr < g_to_end) {
+        /* 標準のCheneyならここは0回のはずである。0でないなら同じ場所を二度
+           走査していて、正しさは保たれても走査コストが無駄になっている */
+        g_gc_to_space_revisits++;
+        return obj;
+    }
+
     UINT64 *words = (UINT64 *)addr;
     UINT64 word0 = words[0];
 
     if ((word0 & TAG_MASK) == TAG_FORWARD) {
         UINT8 *fwd_addr = (UINT8 *)(lisp_addr_t)(word0 & ~TAG_MASK);
-        // Stringのword0は生の整数長であり、たまたま下位3bitが0x6(TAG_FORWARD)と一致した
-        // だけの誤検知の可能性がある。転送先は必ずTo空間内のアドレスになるはずなので、
-        // 範囲外なら転送済みではないとみなし、下のcopy_freshへ進む
-        if (fwd_addr >= g_to_start && fwd_addr < g_to_ptr) {
+        /* word0のタグだけでは転送済みか判別できない。曖昧になるのは3種類ある:
+             - STRING       word0は生の整数長。長さ6/14/22…が下位3bit=0x6になる
+             - MAGIC_STREAM        0x6 -> &7 == 6
+             - MAGIC_BUILTIN_CLASS 0xE -> &7 == 6
+           これらを転送済みと誤認しないための判別が下の範囲検査である。
+           効いているのは**下限**のほう。長さもMAGIC値も0x10未満で、To空間の
+           先頭アドレスより遥かに小さいので確実に弾ける。
+
+           上限は以前 g_to_ptr だった。これは**コピー中に動く値**で、
+           fwd_addr == g_to_ptr の境界で正当な転送を見落とす。実測で外れており、
+           そうなると同じオブジェクトを二度コピーし、二度目はFrom側のword0
+           (すでに転送ヘッダ)をデータとしてTo側へ写してしまう。結果、To空間の
+           SYMBOLのword0が転送ポインタを持つ、という状態が世代を跨いで残る
+           (世代NのToは世代N+1のFromなので、次の世代からはFromを指して見える)。
+           判別に必要なのは「To空間の中か」であって「割り当て済みか」ではないので、
+           動かない g_to_end を使う。 */
+        if (fwd_addr >= g_to_start && fwd_addr < g_to_end) {
+#ifdef ISIKIOS_GC_DEBUG
+            /* 正当な転送先は必ず割り当て済み区間にある。ここへ来るのは、
+               上の境界問題か、転送ヘッダの二重書き込みが起きている証拠 */
+            if (fwd_addr >= g_to_ptr) {
+                g_gc_fwd_beyond_ptr_hits++;
+            }
+#endif
             return (lisp_val_t)((lisp_addr_t)fwd_addr | tag);
         }
     }
@@ -779,9 +1496,102 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
         case TAG_SYMBOL:   size = 32; break;
         case TAG_STRING:   size = 8 + word0; break;
         case TAG_INSTANCE: size = 32; break;
-        default:           size = 0; break;
+        default:
+            /* [原則6] コピーできるのはこの4タグだけである。以前はここが size=0 で、
+               そのまま下へ落ちていた。gc_to_alloc(0) は g_to_ptr を返すが**進めない**ので、
+               直後の words[0] = dst|TAG_FORWARD が「まだ誰も使っていない到達先」を指す
+               転送ヘッダを、**objが指す無関係なオブジェクトのword0へ書き込む**。
+               これは静かなヒープ破壊で、症状は遠く離れた場所に出る。
+
+               実測(塗り潰し監査、za_test_ext8/ext12/ext14):
+                 obj=24676182 tag=6(TAG_FORWARD) 領域=To size=0
+               で壊されたTAG_STRINGを後から訪れたとき、転送済み判定
+               (fwd_addr < g_to_ptr)が fwd_addr == g_to_ptr で外れ、word0 を
+               生の長さとして誤読して size=110644414(約105MB)を要求し、
+               To空間枯渇 → 割り込み禁止のまま for(;;) という無音のハングになった。
+
+               ここへ来る値そのものが既におかしい(生きたフィールドが転送ポインタを
+               保持している = どこかの保護漏れ)。しかしGCが**追加で**壊してよい理由には
+               ならないので、objはそのまま返して伝播を止め、記録だけ残す。
+               返した値はフリップ後に塗り潰されるので、塗り潰し検出器が拾う。 */
+            g_gc_uncopyable_tag_hits++;
+#ifdef ISIKIOS_GC_DEBUG
+            if (g_gc_uncopyable_tag_hits == 1) {
+                os_diag_serial_write("\n[GC監査] gc_copy_value: コピー不能なタグ obj=");
+                serial_write_uint((UINT64)obj);
+                os_diag_serial_write(" tag=");
+                serial_write_uint(tag);
+                os_diag_serial_write(" 領域=");
+                serial_write_uint((UINT64)os_addr_region((lisp_addr_t)addr));
+                os_diag_serial_write("\n  保持元=");
+                serial_write_uint((UINT64)g_gc_scan_holder);
+                os_diag_serial_write(" tag=");
+                serial_write_uint(g_gc_scan_holder & TAG_MASK);
+                os_diag_serial_write(" word[");
+                serial_write_uint(g_gc_scan_field);
+                os_diag_serial_write("] 領域=");
+                serial_write_uint((UINT64)os_addr_region((lisp_addr_t)(g_gc_scan_holder & ~TAG_MASK)));
+                if (g_gc_scan_holder != 0 && (g_gc_scan_holder & TAG_MASK) == TAG_INSTANCE) {
+                    os_diag_serial_write(" magic=");
+                    serial_write_uint(((UINT64 *)(g_gc_scan_holder & ~TAG_MASK))[0]);
+                }
+                os_diag_serial_write("\n  保持元words=");
+                if (g_gc_scan_holder != 0) {
+                    UINT64 *hw = (UINT64 *)(g_gc_scan_holder & ~TAG_MASK);
+                    for (int i = 0; i < 4; i++) { serial_write_uint(hw[i]); os_diag_serial_write(" "); }
+                }
+                os_diag_serial_write("\n  obj先words=");
+                {
+                    UINT64 *ow = (UINT64 *)(lisp_addr_t)(obj & ~TAG_MASK);
+                    for (int i = 0; i < 4; i++) { serial_write_uint(ow[i]); os_diag_serial_write(" "); }
+                }
+                os_diag_serial_write("\n  境界外転送=");
+                serial_write_uint(g_gc_fwd_beyond_ptr_hits);
+                os_diag_serial_write(" from=");
+                serial_write_uint((UINT64)(lisp_addr_t)g_from_start);
+                os_diag_serial_write("..");
+                serial_write_uint((UINT64)(lisp_addr_t)g_from_end);
+                os_diag_serial_write(" to=");
+                serial_write_uint((UINT64)(lisp_addr_t)g_to_start);
+                os_diag_serial_write("..");
+                serial_write_uint((UINT64)(lisp_addr_t)g_to_end);
+                os_diag_serial_write(" toptr=");
+                serial_write_uint((UINT64)(lisp_addr_t)g_to_ptr);
+                os_diag_serial_write(" GC回数=");
+                serial_write_uint(os_gc_collect_count());
+                os_diag_serial_write("\n");
+            }
+#endif
+            return obj;
     }
 
+#ifdef ISIKIOS_GC_DEBUG
+    /* [GC監査] sizeが半空間容量を超えるのは、word0を長さとして誤読したときだけ。
+       gc_to_allocのto-space枯渇として現れると発生源が分からないので、ここで出す。 */
+    if (size == 0 || size > (UINT64)(g_to_end - g_to_start)) {
+        os_diag_serial_write("\nPANIC: gc_copy_value: sizeが異常"
+                             "(size=0はコピー可能でないタグ、巨大はword0の誤読)\n  obj=");
+        serial_write_uint((UINT64)obj);
+        os_diag_serial_write(" tag=");
+        serial_write_uint(tag);
+        os_diag_serial_write(" addr領域=");
+        serial_write_uint((UINT64)os_addr_region((lisp_addr_t)addr));
+        os_diag_serial_write("\n  word0=");
+        serial_write_uint(word0);
+        os_diag_serial_write(" word1=");
+        serial_write_uint(words[1]);
+        os_diag_serial_write(" size=");
+        serial_write_uint(size);
+        os_diag_serial_write("\n  to=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_start);
+        os_diag_serial_write("..");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_end);
+        os_diag_serial_write(" ptr=");
+        serial_write_uint((UINT64)(lisp_addr_t)g_to_ptr);
+        os_diag_serial_write("\n");
+        os_panic("gc_copy_value: bogus size (see serial)");
+    }
+#endif
     UINT8 *dst = gc_to_alloc(size);
     UINT8 *src = (UINT8 *)addr;
     for (UINT64 i = 0; i < size; i++) {
@@ -800,6 +1610,11 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
 /** MAGIC_BIGNUM(word3=limb配列への生ポインタ、中身はLisp値を含まない生の32bit値の配列)を再配置する */
 static void gc_relocate_bignum(UINT64 *words) {
     UINT64 count = words[2];
+    /* count==0 は os_make_integer が limb配列を確保する前の構築中の状態
+       (MAGIC_VECTOR の word1==0 と同じ扱い)。再配置対象が無いので素通しする */
+    if (count == 0) {
+        return;
+    }
     UINT8 *dst = gc_to_alloc(8 * count);
     UINT8 *src = (UINT8 *)words[3];
     for (UINT64 i = 0; i < 8 * count; i++) {
@@ -905,26 +1720,26 @@ static void gc_scan_instance(UINT64 *words) {
             // word3にGC管理下の捕捉環境を持つのでトレースする。それ以外(fixnum 1/NIL)は
             // word3を使わずNIL固定なので何もしなくてよい
             if (words[2] == os_make_fixnum(2)) {
-                words[3] = gc_copy_value(words[3]); // 捕捉環境
+                g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // 捕捉環境
             }
             break;
 
         case MAGIC_FUNCTION_INTERPRETED:
         case MAGIC_MACRO:
-            words[1] = gc_copy_value(words[1]); // params
-            words[2] = gc_copy_value(words[2]); // body
-            words[3] = gc_copy_value(words[3]); // closure env
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // params
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // body
+            g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // closure env
             break;
 
         case MAGIC_PROCESS:
-            words[1] = gc_copy_value(words[1]); // fixnum(process index)
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // fixnum(process index)
             // word2(saved_rsp)は生アドレス(process.cの静的スタック領域、Lispヒープ外)。素通し
-            words[3] = gc_copy_value(words[3]); // state symbol
+            g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // state symbol
             break;
 
         case MAGIC_BLOCK_EXIT:
-            words[1] = gc_copy_value(words[1]); // block名symbol
-            words[2] = gc_copy_value(words[2]); // 戻り値
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // block名symbol
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // 戻り値
             break;
 
         case MAGIC_STREAM:
@@ -932,17 +1747,17 @@ static void gc_scan_instance(UINT64 *words) {
             break;
 
         case MAGIC_CLASS_INSTANCE:
-            words[1] = gc_copy_value(words[1]); // class
-            words[2] = gc_copy_value(words[2]); // slots-vector
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // class
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // slots-vector
             break;
 
         case MAGIC_CATCH_EXIT:
-            words[1] = gc_copy_value(words[1]); // tag
-            words[2] = gc_copy_value(words[2]); // throwされた値
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // tag
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // throwされた値
             break;
 
         case MAGIC_GO_EXIT:
-            words[1] = gc_copy_value(words[1]); // tag symbol
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // tag symbol
             break;
 
         case MAGIC_BIGNUM:
@@ -965,9 +1780,9 @@ static void gc_scan_instance(UINT64 *words) {
 
         case MAGIC_BUILTIN_CLASS:
         case MAGIC_STANDARD_CLASS:
-            words[1] = gc_copy_value(words[1]); // name symbol
-            words[2] = gc_copy_value(words[2]); // superclasses list
-            words[3] = gc_copy_value(words[3]); // slots list
+            g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]); // name symbol
+            g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]); // superclasses list
+            g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]); // slots list
             break;
 
         default:
@@ -985,20 +1800,25 @@ static void gc_scan_queue(void) {
     while (gc_queue_pop(&tagged)) {
         UINT64 tag = tagged & TAG_MASK;
         UINT64 *words = (UINT64 *)(tagged & ~TAG_MASK);
+        /* [GC監査] コピー不能なタグを見つけたとき、それを**保持していた側**を
+           言えるようにする。gc_copy_valueは値しか受け取らないので、
+           走査中のオブジェクトをここで控えておく */
+        g_gc_scan_holder = tagged;
+        g_gc_scan_field = 0;
 
         switch (tag) {
             case TAG_CONS:
-                words[0] = gc_copy_value(words[0]);
-                words[1] = gc_copy_value(words[1]);
+                g_gc_scan_field = 0; words[0] = gc_copy_value(words[0]);
+                g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]);
                 break;
 
             case TAG_SYMBOL:
                 // word0=name string。word1(gensymフラグ)/word2/word3(未使用)は常に
                 // nilまたはfixnumなのでgc_copy_valueに通しても素通しされるだけで安全
-                words[0] = gc_copy_value(words[0]);
-                words[1] = gc_copy_value(words[1]);
-                words[2] = gc_copy_value(words[2]);
-                words[3] = gc_copy_value(words[3]);
+                g_gc_scan_field = 0; words[0] = gc_copy_value(words[0]);
+                g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]);
+                g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]);
+                g_gc_scan_field = 3; words[3] = gc_copy_value(words[3]);
                 break;
 
             case TAG_STRING:
@@ -1054,7 +1874,50 @@ static void gc_fixup_environment_cells(lisp_val_t env) {
  * 全プロセスのshadow stack(GC_PROTECTされたCローカル変数)をルートとして
  * 生存オブジェクトをTo空間へコピーし、完了後にFrom/To空間を入れ替える。
  */
+static void os_gc_collect_body(void);
+
+/**
+ * GCの実行中はタイマー割り込みを止める。
+ *
+ * [原則9] **GCはスケジューラに割り込まれてはならない。**
+ * c_timer_switchは *current-process* / *RUN-QUEUE* / PCB という
+ * **GC管理データ**を読み書きする。コピーの途中で入ると、まだ更新されていない
+ * 参照や半分だけ書かれたオブジェクトを読むことになる。
+ *
+ * 実測(監査ビルド、塗り潰し監査の22試験): 9試験が
+ * 「c_timer_switchの復元先rspがどのプロセススタックにも無い」で落ち、
+ * 採取できた3件はいずれも in_gc=1 / tick_during_gc=1 で、
+ * os_get_variable(*current-process*) も *RUN-QUEUE* も同じゴミ値
+ * (0x0DB91DC9、ヒープ外)を返していた。読み出したsaved_rspは
+ * ヒープ末尾0x0BB6C000で、asm_timer_handlerがそれをrspに入れて
+ * iretqした先で #GP になる。
+ *
+ * os_alloc_bytes側は以前からcli/stiで囲ってあり、repl.cのセーフポイントGC
+ * (os_heap_used_ratio超過時)だけが素通しだった。呼び出し側ではなくGC本体を
+ * 囲うことで、将来増える呼び出し口も自動的に安全側になる。
+ *
+ * cli/stiではなくRFLAGSの退避・復帰にしてあるのは、os_alloc_bytes経由の
+ * 呼び出し(既に割り込み禁止中)で早すぎるstiをしないため。
+ */
 void os_gc_collect(void) {
+#ifndef ISIKIOS_UNIT_TEST
+    UINT64 saved_flags;
+    __asm__ __volatile__ ("pushfq\n\tpop %0\n\tcli" : "=r"(saved_flags) :: "memory");
+#endif
+    os_gc_collect_body();
+#ifndef ISIKIOS_UNIT_TEST
+    __asm__ __volatile__ ("push %0\n\tpopfq" :: "r"(saved_flags) : "memory", "cc");
+#endif
+}
+
+static void os_gc_collect_body(void) {
+#ifdef ISIKIOS_GC_DEBUG
+    g_gc_debug_in_gc = 1;
+#endif
+#ifdef ISIKIOS_GC_PAINT
+    // [GCデバッグ] 入れ替え後に塗り潰す範囲(旧From空間の使用済み末尾)を控える
+    UINT8 *gc_debug_old_used_end = g_from_ptr;
+#endif
     g_gc_collect_count++;
     g_to_ptr = g_to_start;
     g_gc_queue_head = 0;
@@ -1155,6 +2018,30 @@ void os_gc_collect(void) {
     g_to_start = new_to_start;
     g_to_end = new_to_end;
     g_to_ptr = g_to_start;
+
+#ifdef ISIKIOS_GC_DEBUG
+    g_gc_debug_in_gc = 0;
+#endif
+
+#ifdef ISIKIOS_GC_PAINT
+    // [GCデバッグ] 入れ替え後のTo空間(=旧From空間)がstale領域そのものなので、
+    // ここをトラップパターンで塗り潰す。**全コピーとfixupが終わった後**でなければ
+    // ならない(forwarding pointerを旧From空間へ書く実装なので、GC自身がまだ
+    // 旧From空間を読んでいる間に塗るとGCが壊れる)。
+    // 塗る値のタグはTAG_FORWARD(0x6)にする。forwarding pointerはGCの内部でしか
+    // 現れないはずの値なので、これを観測したコードは必ずバグである。タグ0〜7は
+    // すべて有効値として使われており「タグとして不正な値」は作れないため、
+    // 「本来ありえないタグ」を選ぶのが最も検出しやすい
+    {
+        // 旧From空間のうち実際に使われていた範囲だけを塗る。半ヒープ全体を毎GC
+        // 塗るのは高コストで、未使用部分にはstaleなオブジェクトが存在しない
+        UINT64 *p = (UINT64 *)g_to_start;
+        UINT64 *end = (UINT64 *)gc_debug_old_used_end;
+        while (p < end) {
+            *p++ = GC_DEBUG_TRAP_PATTERN;
+        }
+    }
+#endif
 }
 
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
@@ -1309,6 +2196,38 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%GLOBAL-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_global_environment), global_environment);
         os_set_function(os_make_symbol("%%SET-CURRENT-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_set_current_environment), global_environment);
         os_set_function(os_make_symbol("%%EVAL-IN-ENVIRONMENT"), os_make_native_function((lisp_addr_t)(void *)primitive_eval_in_environment), global_environment);
+        #ifdef ISIKIOS_GC_DEBUG
+
+        os_set_function(os_make_symbol("%%DIAG-GC-STRESS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stress), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_sites), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_site_addr), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-CLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_cls), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-STALE-RESET"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_stale_reset), global_environment);
+        /* [GC監査] 塗り潰しのトラップを読んだ箇所。偶奇に依存しない検出 */
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_result_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITES"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_sites), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-ADDR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_addr), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-SITE-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_site_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-LIMB-PEAK"), os_make_native_function((lisp_addr_t)(void *)cc_diag_limb_peak), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TO-REVISITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_to_revisits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TICK-DURING-GC"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_tick_during_gc), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-ADDR-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_addr_region), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PAINTED-FIELDS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_painted_fields), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-RESET"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_reset), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-TRAP-RESULT-HITS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_trap_result_hits), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-CHECK"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_check), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE-FILE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale_file), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-PROTECT-STALE-SITE"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_protect_stale_site), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-GC-LIFO-VIOLATIONS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_lifo_violations), global_environment);
+
+        #endif
+        os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample_pub), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
@@ -1378,6 +2297,7 @@ void os_bootstrap() {
  * @return 見つかった値。未定義の場合はnil
  */
 lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env) {
+    GC_DEBUG_ASSERT_LIVE(env, "os_get_variable");
     lisp_val_t current_env = env;
 
     /*
@@ -1491,9 +2411,7 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env) {
  * @param fixnum 表現する値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum(const UINT64 fixnum) {
-    return (lisp_val_t)(fixnum << 3);
-}
+/* [性能測定] Phase4: runtime.hのstatic inlineへ移した */
 
 /**
  * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。
@@ -2059,9 +2977,23 @@ lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT
  * @param captured_env 定義時に捕捉した自由変数を保持する環境
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 2、word3=captured_env)
  */
-lisp_val_t os_make_lifted_closure(UINT64 fnptr, lisp_val_t captured_env) {
+lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnptr, lisp_val_t captured_env) {
     GC_PROTECT(captured_env);
-    za_fn_meta_t *meta = os_fn_meta_alloc(fnptr);
+    // metaは呼び出し元(トランスパイラの生成コード)が持つC静的変数への
+    // ポインタ。静的記憶域はアドレスが不変でGCにもImmobilized Spaceにも
+    // 依存しないため、クロージャを作るたびに確保する必要が無い。
+    //
+    // 旧実装はここでos_fn_meta_allocを呼んでおり、letを1回評価するごとに
+    // Immobilized Space(4MB固定・GC非対象・解放手段なし)を32byteずつ消費して
+    // いた。ループ内のletは約24,300反復でこれを使い切り、os_imm_page_allocが
+    // OSを停止させる(documents/performance-measurement.md「letのImmobilized
+    // Spaceリーク」節)。
+    //
+    // metaの内容はfnptrだけで決まり(captured_envはmetaではなくインスタンスの
+    // word3に入る)、lifted closureではfixed_entry/arityは常に0のままなので、
+    // 同じlambdaから作られる全クロージャが1つのmetaを共有してよい。毎回同じ値を
+    // 書き込むだけなので初回判定の分岐すら不要
+    meta->cons_entry = fnptr;
     return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(2), captured_env);
 }
 
@@ -2641,6 +3573,70 @@ static void decompose(lisp_val_t v, signed_mag_t *out) {
  * 正規化後マグニチュードが60bit以内に収まる場合はFIXNUM(即値)に降格し、
  * それ以外はlimb配列をコピーしてヒープに確保しMAGIC_BIGNUMのINSTANCEを返す。
  */
+/* [原則7] limb作業バッファはGCヒープに置かない。
+ *
+ * bignum演算はmag_add/mag_divmod等の作業領域を必要とする。これを
+ * os_alloc_bytesでGCヒープから取ると、GCが知らない生データをGCヒープに置くことに
+ * なり、確保を1回跨いだだけで(塗り潰しビルドでは即座に)読めなくなる。
+ *
+ * 実際に23箇所を洗った結果、最終段のos_make_integerだけを跨ぐものは
+ * ステージングで救えていたが、**別のバッファの確保を跨ぐもの**が6箇所残っていた。
+ * 例(mag_isqrt): quot_bufにmag_divmodで書いた後、sum_bufの確保を跨いでから読む。
+ * これが (ISQRT 1000000000000002000000000000000) が誤った値を返す原因だった。
+ *
+ * 個々の箇所を並べ替えて回避してもまた漏れるので、作業領域そのものを
+ * GCヒープの外へ出す。LIMB_FRAME()を置いたスコープを抜けると自動で巻き戻る
+ * (ループ本体に置けばイテレーションごとに解放される)。
+ */
+#define LIMB_ARENA_LIMBS 32768
+static UINT64 g_limb_arena[LIMB_ARENA_LIMBS];
+static UINT64 g_limb_arena_used = 0;
+
+/** [GC監査] limb作業領域の最高水位。容量設計が妥当かを実測で言えるようにする */
+UINT64 g_limb_arena_peak = 0;
+
+static UINT64 *limb_alloc(UINT64 count) {
+    if (g_limb_arena_used + count > LIMB_ARENA_LIMBS) {
+        /* [原則6] 無言で溢れて隣を壊すと、これまで潰してきたのと同じ形が増える。
+           bignumの大きさは入力次第で上限が無いので「現実には起きない」では済まない。
+           数字を添えてシリアルへ出してから止める。 */
+#ifndef ISIKIOS_UNIT_TEST
+        os_diag_serial_write("\nPANIC: limb作業領域が枯渇\n  要求=");
+        serial_write_uint(count);
+        os_diag_serial_write(" limb 使用中=");
+        serial_write_uint(g_limb_arena_used);
+        os_diag_serial_write(" 容量=");
+        serial_write_uint((UINT64)LIMB_ARENA_LIMBS);
+        os_diag_serial_write(" 最高水位=");
+        serial_write_uint(g_limb_arena_peak);
+        os_diag_serial_write("\n  (bignumが大きすぎるか、LIMB_FRAME()の無い経路で"
+                             "確保が積み上がっている)\n");
+#endif
+        os_panic("limb scratch arena exhausted (see serial)");
+    }
+    UINT64 *p = g_limb_arena + g_limb_arena_used;
+    g_limb_arena_used += count;
+    if (g_limb_arena_used > g_limb_arena_peak) {
+        g_limb_arena_peak = g_limb_arena_used;
+    }
+    return p;
+}
+
+static void limb_frame_release(UINT64 *mark) { g_limb_arena_used = *mark; }
+
+/** limb作業領域のスコープ。抜けると確保分が巻き戻る */
+#define LIMB_FRAME() \
+    UINT64 __limb_mark __attribute__((cleanup(limb_frame_release))) = g_limb_arena_used; \
+    (void)__limb_mark
+
+/* [原則7] os_make_integerがlimbsを確保より前に写し取るための、GC非管理の作業領域。
+   32bit limbで16384個 = 524288bit(約157800桁)まで賄える。これを超える場合だけは
+   従来どおり確保後に読むが、その大きさの整数は現実には現れない。
+   os_make_integerは再入しない(間に走るのはos_alloc_bytesとGCだけで、
+   どちらもos_make_integerを呼ばない)ため、単一バッファで足りる。 */
+#define LIMB_STAGE_LIMBS 16384
+static UINT64 g_limb_stage[LIMB_STAGE_LIMBS];
+
 lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
     count = mag_len(limbs, count);
     if (count == 1 && limbs[0] == 0) {
@@ -2657,23 +3653,51 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
         }
     }
 
-    // limbsは呼び出し元が管理する生バッファで、GCのルートとして追跡されない。
-    // この後アロケーションを2回以上挟むとGCがfrom/to空間を2回フリップし得て、
-    // 2回目のフリップで元のfrom空間(=limbsの実体があった領域)が新たなto空間として
-    // 再利用され、まだ読んでいないlimbsの内容が上書きされる危険がある。そのため、
-    // limbsを読む最後の操作(このコピー)を、limbs確保後最初のアロケーション
-    // (limb配列自体の確保)の直後、他のアロケーションを一切挟まずに完了させる
+    // [原則7] limbsは呼び出し元が管理する生バッファで、GCのルートとして追跡されない。
+    // 呼び出し元(primitive_add等)はこれをos_alloc_bytesでGCヒープに取っているため、
+    // この直後のos_alloc_bytesでGCが1回でも走ると、フリップ直後の塗り潰しで
+    // limbsは読む前に壊れる。
+    //
+    // 以前は「フリップ1回なら旧From空間の中身は残る」という前提でコピー順だけを
+    // 工夫していたが、それはGC実装の内部事情に依存した暗黙の前提であり、
+    // 塗り潰し(ISIKIOS_GC_PAINT)を入れると即座に破れる。実測で、
+    // (isiki-za-test-bignum-add-loop ...) の結果が 0xDEADDEA7 の並びになった。
+    //
+    // そこで、確保より**前に**GC非管理の静的作業領域へ写し切る。
+    // os_make_integerに至るlimb作業バッファは23箇所あるが、いずれも最終段は
+    // ここなので、この一箇所でクラス全体が閉じる。
+    UINT64 *src = limbs;
+    if (count <= LIMB_STAGE_LIMBS) {
+        for (UINT64 i = 0; i < count; i++) {
+            g_limb_stage[i] = limbs[i];
+        }
+        src = g_limb_stage;
+    }
+    /* [原則7] 確保の順序を「入れ物が先、limb配列が後」にする。
+       以前は limb配列 -> os_make_instance の順で、**limb_addrという生ポインタが
+       os_make_instanceの確保を跨いでいた**。そこでGCが走ると limb_addr は旧From空間を
+       指したままになり、words[3] に死んだアドレスが入る。塗り潰しビルドでは
+       その先が 0xDEADDEADDEADDEA7 になる。
+       実測(mag_isqrtの反復トレース): GC直後の y の limb配列先頭がトラップパターン
+       そのものだった。これが (ISQRT ...) が誤った値を返す原因である。
+
+       入れ物を先に作ってGC_PROTECTしておけば、limb配列の確保でGCが走っても
+       bignum は追随する。srcはg_limb_stageかlimb arenaかCスタックで、
+       いずれもGC非管理なので確保を跨いでも動かない。
+       wordsは**確保のあとに**取り直すこと(bignum自身が動いているため)。
+
+       word3(limb配列アドセス) -> word2(count) の順に書くのは以前どおり。
+       「countだけ確定してaddrが未確定」という中間状態をGCに見せないため。
+       count=0 のプレースホルダ状態は gc_relocate_bignum が素通しする。 */
+    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
+    GC_PROTECT(bignum);
+
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
-        dst[i] = limbs[i];
+        dst[i] = src[i];
     }
 
-    // ここから先はlimbsを二度と読まないため、以降で何回アロケーションが発生しても安全。
-    // 書き込みはword3(limb配列アドレス)→word2(count)の順に行うことで、
-    // 「countだけ確定してaddrが未確定」という危険な中間状態を作らない
-    lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
-    GC_PROTECT(bignum);
     UINT64 *words = (UINT64 *)(bignum & ~TAG_MASK);
     words[3] = (UINT64)limb_addr;
     words[2] = count;
@@ -2805,6 +3829,7 @@ static int number_compare(lisp_val_t a, lisp_val_t b) {
  * @param div_by_zero z2が0の場合に1を設定する(このときdiv_out/mod_outは未定義)
  */
 static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp_val_t *mod_out, int *div_by_zero) {
+    LIMB_FRAME();
     GC_PROTECT(z1);
     GC_PROTECT(z2);
     signed_mag_t m1, m2;
@@ -2817,8 +3842,8 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
     }
     *div_by_zero = 0;
 
-    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
-    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * m1.count);
+    UINT64 *quot_buf = limb_alloc(m1.count);
+    UINT64 *rem_buf = limb_alloc(m1.count);
     // os_alloc_bytesを2回挟んだのでm1/m2のlimbsを再取得してから使う
     decompose(z1, &m1);
     decompose(z2, &m2);
@@ -2856,14 +3881,14 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
     UINT64 one[1] = {1};
     signed_mag_t mq;
     decompose(quot_wrapped, &mq);
-    UINT64 *div_mag_buf = (UINT64 *)os_alloc_bytes(8 * (mq.count + 1));
+    UINT64 *div_mag_buf = limb_alloc(mq.count + 1);
     decompose(quot_wrapped, &mq);
     UINT64 div_mag_len = mag_add(mq.limbs, mq.count, one, 1, div_mag_buf);
     lisp_val_t div_result = os_make_integer(1, div_mag_buf, div_mag_len);
     GC_PROTECT(div_result);
 
     decompose(z2, &m2);
-    UINT64 *mod_mag_buf = (UINT64 *)os_alloc_bytes(8 * m2.count);
+    UINT64 *mod_mag_buf = limb_alloc(m2.count);
     decompose(z2, &m2);
     signed_mag_t mr;
     decompose(rem_wrapped, &mr);
@@ -2879,6 +3904,7 @@ static void floor_divmod(lisp_val_t z1, lisp_val_t z2, lisp_val_t *div_out, lisp
  * @param out_len 結果の実効長の格納先
  */
 static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
+    LIMB_FRAME();
     // cur_a/cur_bはイテレーションを跨いで生き続ける必要があるため、生バッファのまま
     // 保持せず、確保直後にMAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
     GC_PROTECT(a_val);
@@ -2887,7 +3913,7 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
     decompose(a_val, &ma);
     decompose(b_val, &mb);
 
-    UINT64 *cur_a_buf = (UINT64 *)os_alloc_bytes(8 * ma.count);
+    UINT64 *cur_a_buf = limb_alloc(ma.count);
     decompose(a_val, &ma);
     for (UINT64 i = 0; i < ma.count; i++) {
         cur_a_buf[i] = ma.limbs[i];
@@ -2896,7 +3922,7 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
     GC_PROTECT(cur_a);
 
     decompose(b_val, &mb);
-    UINT64 *cur_b_buf = (UINT64 *)os_alloc_bytes(8 * mb.count);
+    UINT64 *cur_b_buf = limb_alloc(mb.count);
     decompose(b_val, &mb);
     for (UINT64 i = 0; i < mb.count; i++) {
         cur_b_buf[i] = mb.limbs[i];
@@ -2907,11 +3933,12 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
     signed_mag_t mcb;
     decompose(cur_b, &mcb);
     while (!(mcb.count == 1 && mcb.limbs[0] == 0)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t mca;
         decompose(cur_a, &mca);
         decompose(cur_b, &mcb);
-        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * mca.count);
-        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * mca.count);
+        UINT64 *quot_buf = limb_alloc(mca.count);
+        UINT64 *rem_buf = limb_alloc(mca.count);
         decompose(cur_a, &mca);
         decompose(cur_b, &mcb);
         UINT64 quot_len, rem_len;
@@ -2933,6 +3960,7 @@ static lisp_val_t mag_gcd(lisp_val_t a_val, lisp_val_t b_val) {
  * @param out_len 結果の実効長の格納先
  */
 static lisp_val_t mag_isqrt(lisp_val_t n_val) {
+    LIMB_FRAME();
     // x/yはイテレーションを跨いで生き続ける必要があるため、生バッファのまま保持せず、
     // 確保直後にMAGIC_BIGNUMへ包んでGC_PROTECTし、使う直前にdecomposeで取り直す
     GC_PROTECT(n_val);
@@ -2940,7 +3968,7 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
     decompose(n_val, &mn);
     UINT64 nlen = mn.count;
 
-    UINT64 *x_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+    UINT64 *x_buf = limb_alloc(nlen);
     decompose(n_val, &mn);
     for (UINT64 i = 0; i < nlen; i++) {
         x_buf[i] = mn.limbs[i];
@@ -2953,7 +3981,7 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
 
     signed_mag_t mx;
     decompose(x, &mx);
-    UINT64 *xp1_buf = (UINT64 *)os_alloc_bytes(8 * (mx.count + 1));
+    UINT64 *xp1_buf = limb_alloc(mx.count + 1);
     decompose(x, &mx);
     UINT64 xp1_len = mag_add(mx.limbs, mx.count, one, 1, xp1_buf);
     UINT64 ylen = mag_divmod_small(xp1_buf, xp1_len, 2, &dummy_rem);
@@ -2964,12 +3992,13 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
     decompose(y, &my_mag);
     decompose(x, &mx_mag);
     while (mag_compare(my_mag.limbs, my_mag.count, mx_mag.limbs, mx_mag.count) < 0) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         x = y;
 
         decompose(n_val, &mn);
         decompose(x, &mx_mag);
-        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
-        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * nlen);
+        UINT64 *quot_buf = limb_alloc(nlen);
+        UINT64 *rem_buf = limb_alloc(nlen);
         decompose(n_val, &mn);
         decompose(x, &mx_mag);
         UINT64 quot_len, rem_len;
@@ -2977,7 +4006,7 @@ static lisp_val_t mag_isqrt(lisp_val_t n_val) {
 
         decompose(x, &mx_mag);
         UINT64 cap = (mx_mag.count > quot_len ? mx_mag.count : quot_len) + 1;
-        UINT64 *sum_buf = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *sum_buf = limb_alloc(cap);
         decompose(x, &mx_mag);
         UINT64 sum_len = mag_add(mx_mag.limbs, mx_mag.count, quot_buf, quot_len, sum_buf);
 
@@ -3067,12 +4096,13 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; cur != nil; cur = cc_cdr(cur)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
 
         UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
-        UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *result = limb_alloc(cap);
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
         UINT64 result_len;
@@ -3214,12 +4244,13 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; rest != nil; rest = cc_cdr(rest)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(rest), &operand);
         decompose(acc_val, &acc);
 
         UINT64 cap = (acc.count > operand.count ? acc.count : operand.count) + 1;
-        UINT64 *result_buf = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *result_buf = limb_alloc(cap);
         decompose(cc_car(rest), &operand);
         decompose(acc_val, &acc);
         UINT64 result_len;
@@ -3351,12 +4382,13 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; cur != nil; cur = cc_cdr(cur)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
 
         UINT64 cap = acc.count + operand.count;
-        UINT64 *result = (UINT64 *)os_alloc_bytes(8 * cap);
+        UINT64 *result = limb_alloc(cap);
         decompose(cc_car(cur), &operand);
         decompose(acc_val, &acc);
         UINT64 result_len = mag_mul(acc.limbs, acc.count, operand.limbs, operand.count, result);
@@ -3445,6 +4477,7 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
     signed_mag_t acc;
 
     for (; rest != nil; rest = cc_cdr(rest)) {
+        LIMB_FRAME(); /* 反復ごとに作業領域を巻き戻す */
         signed_mag_t operand;
         decompose(cc_car(rest), &operand);
 
@@ -3453,9 +4486,9 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
         }
 
         decompose(acc_val, &acc);
-        UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        UINT64 *quot_buf = limb_alloc(acc.count);
         decompose(acc_val, &acc);
-        UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * acc.count);
+        UINT64 *rem_buf = limb_alloc(acc.count);
         decompose(cc_car(rest), &operand);
         decompose(acc_val, &acc);
         UINT64 quot_len, rem_len;
@@ -3750,6 +4783,7 @@ lisp_val_t primitive_gcd(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
     (void)env;
+    LIMB_FRAME();
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
     GC_PROTECT(z1);
@@ -3767,7 +4801,7 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
     signed_mag_t m1, m2;
     decompose(z1, &m1);
     decompose(z2, &m2);
-    UINT64 *prod_buf = (UINT64 *)os_alloc_bytes(8 * (m1.count + m2.count));
+    UINT64 *prod_buf = limb_alloc(m1.count + m2.count);
     decompose(z1, &m1);
     decompose(z2, &m2);
     UINT64 prod_len = mag_mul(m1.limbs, m1.count, m2.limbs, m2.count, prod_buf);
@@ -3778,8 +4812,8 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
     signed_mag_t mp;
     decompose(prod_val, &mp);
     decompose(gcd_val, &mg);
-    UINT64 *quot_buf = (UINT64 *)os_alloc_bytes(8 * mp.count);
-    UINT64 *rem_buf = (UINT64 *)os_alloc_bytes(8 * mp.count);
+    UINT64 *quot_buf = limb_alloc(mp.count);
+    UINT64 *rem_buf = limb_alloc(mp.count);
     decompose(prod_val, &mp);
     decompose(gcd_val, &mg);
     UINT64 quot_len, rem_len;
@@ -3834,6 +4868,7 @@ static double sqrt_fpu(double d) {
  */
 lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
     (void)env;
+    LIMB_FRAME();
     lisp_val_t val = cc_car(args);
 
     if (is_float(val)) {
@@ -3856,7 +4891,7 @@ lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
 
     signed_mag_t mr;
     decompose(root, &mr);
-    UINT64 *sq_buf = (UINT64 *)os_alloc_bytes(8 * mr.count * 2);
+    UINT64 *sq_buf = limb_alloc(mr.count * 2);
     decompose(root, &mr);
     UINT64 sq_len = mag_mul(mr.limbs, mr.count, mr.limbs, mr.count, sq_buf);
 
@@ -4095,6 +5130,7 @@ lisp_val_t primitive_atan2(lisp_val_t args, lisp_val_t env) {
  * @return dと数値として等しいfixnum/bignum
  */
 static lisp_val_t double_to_integer(double d) {
+    LIMB_FRAME();
     if (d == 0.0) {
         return os_make_fixnum(0);
     }
@@ -4117,7 +5153,7 @@ static lisp_val_t double_to_integer(double d) {
     }
 
     UINT64 capacity = (UINT64)((64 + shift + 31) / 32) + 1;
-    UINT64 *limbs = (UINT64 *)os_alloc_bytes(8 * capacity);
+    UINT64 *limbs = limb_alloc(capacity);
     limbs[0] = significand & 0xFFFFFFFFULL;
     limbs[1] = significand >> 32;
     for (UINT64 i = 2; i < capacity; i++) {
@@ -5291,6 +6327,18 @@ lisp_val_t os_make_vector_from_list(lisp_val_t list) {
         data[i++] = cc_car(cur);
     }
     ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
+    return vec;
+}
+
+lisp_val_t os_make_vector_raw(UINT64 count, lisp_val_t **out_data) {
+    // os_make_vector_from_list/primitive_create_vectorと同じ理由(コメント参照)で、
+    // まずword1=0のプレースホルダでVECTORをラップしGC_PROTECTしてから本体ブロックを
+    // 確保する
+    lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
+    GC_PROTECT(vec);
+    lisp_addr_t addr = alloc_vector_block(1, &count);
+    ((UINT64 *)(vec & ~TAG_MASK))[1] = (UINT64)addr;
+    *out_data = (lisp_val_t *)(addr + 16);
     return vec;
 }
 

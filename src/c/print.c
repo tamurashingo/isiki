@@ -48,7 +48,17 @@ static void print_bignum(os_char_sink_t *sink, lisp_val_t val) {
     UINT64 count = obj[2];
     UINT64 *src = (UINT64 *)obj[3];
 
-    UINT64 *work = (UINT64 *)os_alloc_raw(8 * count);
+    // [GC安全性] workとdigitsを別々にos_alloc_rawすると、2回目の確保がGCを誘発した
+    // 時点で1回目のworkが無効になる。os_alloc_rawで取る生バッファはGCのコピー対象
+    // ではないため、GC後も旧From空間に残ったまま「上書きされるまで」生き延びている
+    // だけであり、from-spaceが再利用された時点で内容が壊れる
+    // (documents/pitfalls.md 原則7)。1回の確保にまとめ、確保後は一切確保を
+    // 伴わない形にすることで解消する(sink_write_charは関数ポインタ経由の出力のみで
+    // 確保を伴わない)。
+    // 1limb(基数2^32)あたり最大10進10桁(log10(2^32) < 9.63)なので10*countで十分
+    UINT8 *scratch = (UINT8 *)os_alloc_raw(8 * count + 10 * count);
+    UINT64 *work = (UINT64 *)scratch;
+    char *digits = (char *)(scratch + 8 * count);
     for (UINT64 i = 0; i < count; i++) {
         work[i] = src[i];
     }
@@ -57,8 +67,6 @@ static void print_bignum(os_char_sink_t *sink, lisp_val_t val) {
         sink_write_char(sink, '-');
     }
 
-    // 1limb(基数2^32)あたり最大10進10桁(log10(2^32) < 9.63)なので10*countで十分
-    char *digits = (char *)os_alloc_raw(10 * count);
     int len = 0;
     while (count > 1 || work[0] != 0) {
         UINT64 rem;

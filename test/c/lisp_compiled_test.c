@@ -131,6 +131,25 @@ void os_wait_for_more_input(process_t *proc) {
     (void)proc;
 }
 
+
+/* [性能測定] Phase2: 即時lambda呼び出しのインライン展開の意味論確認 */
+extern lisp_val_t lisp_ll_transpile_fixture_let_parallel(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_star_sequential(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_setq(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_shadow(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_return_from(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_tagbody(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_init_escape(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_nested_mix(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_deep(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_capture_escape(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_capture_setq(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_gc_mixed(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_let_leaf_gc(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_arg_leaf_gc(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_direct_call_noprotect(lisp_val_t args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_direct_call_alloc_loop(lisp_val_t args, lisp_val_t env);
+
 extern lisp_val_t lisp_ll_transpile_fixture_answer(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_string(lisp_val_t args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_symbol(lisp_val_t args, lisp_val_t env);
@@ -1394,8 +1413,89 @@ static void test_transpile_fixture_patch_bytes(void) {
     assert(cc_car(cell) == os_make_fixnum(0), "patch-bytes: offset31に0が書き込まれる(すでに0だが明示的に上書きされる)");
 }
 
+
+/* [性能測定] Phase2: 即時lambda呼び出しのインライン展開の意味論確認。
+   letが((lambda (vars) body) inits)へ展開された後、束縛変数がネストした
+   lambdaに捕捉されない場合はCブロックへインライン展開される。捕捉がある
+   場合はクロージャ経路へフォールバックする。両経路を確認する */
+void test_transpile_fixture_let_inline(void) {
+    lisp_val_t env = global_environment;
+
+    assert(lisp_ll_transpile_fixture_let_parallel(nil, env) == os_make_fixnum(1),
+           "let: 並列束縛 (let ((a 1)) (let ((a 2) (b a)) b)) は外側のaを見て1");
+    assert(lisp_ll_transpile_fixture_let_star_sequential(nil, env) == os_make_fixnum(2),
+           "let*: 逐次束縛 (let* ((a 1) (b (+ a 1))) b) は2");
+    assert(lisp_ll_transpile_fixture_let_setq(nil, env) == os_make_fixnum(42),
+           "let: 束縛変数へのsetqがCローカルへの代入として効く");
+    assert(lisp_ll_transpile_fixture_let_shadow(nil, env) == os_make_fixnum(11),
+           "let: 内側のletによるシャドーイングが外側を壊さない");
+    assert(lisp_ll_transpile_fixture_let_return_from(nil, env) == os_make_fixnum(7),
+           "let: body内のreturn-fromが外側のblockまで貫通する");
+    assert(lisp_ll_transpile_fixture_let_tagbody(nil, env) == os_make_fixnum(6),
+           "let: body内のtagbody/go(while)が正しく回る(0+1+2+3)");
+    assert(lisp_ll_transpile_fixture_let_init_escape(nil, env) == os_make_fixnum(5),
+           "let: init評価中の非局所脱出でbodyを評価せず外へ抜ける");
+    assert(lisp_ll_transpile_fixture_let_nested_mix(nil, env) == os_make_fixnum(106),
+           "let/let*/forの入れ子が正しく合成される(100+1+2+3)");
+    assert(lisp_ll_transpile_fixture_let_deep(nil, env) == os_make_fixnum(10),
+           "letを10段入れ子にしても壊れない");
+
+    /* 以下はフォールバック経路(束縛変数がクロージャに捕捉される)。
+       インライン化されているとCローカルへの参照がdanglingするため、
+       正しい値が返ること自体がフォールバックが効いている証拠になる */
+    assert(lisp_ll_transpile_fixture_let_capture_escape(nil, env) == os_make_fixnum(42),
+           "let: 束縛変数を捕捉して外へ出るクロージャが正しい値を見る(フォールバック経路)");
+    assert(lisp_ll_transpile_fixture_let_capture_setq(nil, env) == os_make_fixnum(42),
+           "let: 捕捉+setq(box昇格)の経路が正しく動く(フォールバック経路)");
+
+    /* インライン化されたletとフォールバックしたletが同一関数内に混在する状態で
+       GCを跨ぐ。インライン化した束縛変数がGCルートとして保護されていなければ
+       car値が化ける */
+    lisp_val_t gc_args = os_make_cons(os_make_fixnum(200000), nil);
+    assert(lisp_ll_transpile_fixture_let_gc_mixed(gc_args, env) == os_make_fixnum(42),
+           "let: インライン化letとフォールバックletの混在でGCを跨いでも値が保たれる(11+31)");
+
+    /* [Phase3 第0部] leaf判定でGC_PROTECTを省略した束縛変数が、body内のGCに
+       追随できるか。initは非box化ローカル参照(leaf)でヒープ値を保持している */
+    lisp_val_t pair = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair);
+    lisp_val_t leaf_args = os_make_cons(pair, os_make_cons(os_make_fixnum(200000), nil));
+    GC_PROTECT(leaf_args);
+    assert(lisp_ll_transpile_fixture_let_leaf_gc(leaf_args, env) == os_make_fixnum(77),
+           "let: leaf判定で保護を省略した束縛変数がbody内のGCに追随する");
+
+    lisp_val_t pair2 = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair2);
+    lisp_val_t leaf_args2 = os_make_cons(pair2, os_make_cons(os_make_fixnum(200000), nil));
+    GC_PROTECT(leaf_args2);
+    lisp_val_t arg_result = lisp_ll_transpile_fixture_arg_leaf_gc(leaf_args2, env);
+    GC_PROTECT(arg_result);
+    assert(cc_car(cc_car(arg_result)) == os_make_fixnum(77),
+           "関数引数: leaf判定で保護を省略した引数が、後続引数の評価で起きたGCに追随する");
+
+    /* [Phase3 第0部] 直接呼び出し(引数consリストを組まない形)でGC_PROTECTを
+       省略する経路。使うまでGCが起こりえないことが省略の根拠なので、
+       呼び出し先の内部で割り付けが起きても壊れないことを確認する */
+    lisp_val_t pair3 = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair3);
+    lisp_val_t d_args = os_make_cons(pair3, os_make_cons(os_make_fixnum(5), nil));
+    GC_PROTECT(d_args);
+    lisp_val_t d_res = lisp_ll_transpile_fixture_direct_call_noprotect(d_args, env);
+    GC_PROTECT(d_res);
+    assert(cc_car(d_res) == os_make_fixnum(77),
+           "直接呼び出し: 保護を省略した引数が呼び出し先の割り付けを跨いでも正しい");
+
+    lisp_val_t pair4 = os_make_cons(os_make_fixnum(77), os_make_fixnum(88));
+    GC_PROTECT(pair4);
+    lisp_val_t d_args2 = os_make_cons(pair4, os_make_cons(os_make_fixnum(200000), nil));
+    GC_PROTECT(d_args2);
+    assert(lisp_ll_transpile_fixture_direct_call_alloc_loop(d_args2, env) == os_make_fixnum(77),
+           "直接呼び出し: 20万回の割り付けでGCを何度も跨いでも引数が正しい");
+}
+
 int main(void) {
     setup_heap();
+    test_transpile_fixture_let_inline();
     test_transpile_fixture_answer();
     test_transpile_fixture_string();
     test_transpile_fixture_symbol();

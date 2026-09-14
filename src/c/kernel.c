@@ -8,6 +8,7 @@
 #include "repl.h"
 #include "subprimitive.h"
 #include "ide_subprimitive.h"
+#include "bench_subprimitive.h"
 #include "virtio9p.h"
 #include "load.h"
 #include "eval.h"
@@ -16,6 +17,7 @@
 #include "clock.h"
 #include "stream.h"
 #include "za.h"
+#include "mount.h"
 
 // src/c/lisp_compiled.c(トランスパイラがsrc/lisp/init_aot.lispから生成する、
 // gitignore対象のビルド成果物)で定義される。init.lispから移動したmember/assoc等を
@@ -102,6 +104,8 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_bootstrap();
     os_register_subprimitives();
     os_register_ide_subprimitives();
+    os_register_mount_native_subprimitives();
+    os_register_bench_subprimitives();
     os_register_load();
     os_register_eval_primitives();
     os_register_streams();
@@ -149,11 +153,22 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
         qemu_test_mode = 1;
         g_qemu_test_power_off = power_off;
         os_set_qemu_test_mode(run_qemu_boot_test);
+        // ヒープ/Immobilized Spaceの枯渇等でos_panicへ落ちた場合、テスト実行中は
+        // 電源断して「テスト失敗」として終わらせる。旧実装は空のfor(;;)で永久に
+        // 停止し、-display noneでは診断メッセージも見えないため、外からは
+        // 「極端に遅い処理」と区別がつかなかった(letのImmobilized Spaceリークの
+        // 調査で33分間ハングに気づけなかった実例がある)
+        os_set_panic_hook(power_off);
     }
 
     if (!qemu_test_mode) {
         kernel_show_information(fb);
     }
+
+    // [原則6] 各プロセススタックの直下を未マップにする。溢れた瞬間に#PFが出て、
+    // IDT/GDT(BSS上、スタックの下側にある)へ到達する前に止まる。
+    // プロセスを起動する前に済ませる必要がある
+    os_process_install_stack_guards();
 
     process_scheduler_start();
 }
