@@ -2067,6 +2067,42 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
                             lisp_val_t env, int is_tail, UINT64 trampoline_offset,
                             UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth);
 
+/**
+ * za_compile_exprが自分自身へ再帰できる段数の上限。
+ *
+ * これは**Cスタックの容量から来る数字**であって、言語仕様上の制限ではない。
+ * za_compile_exprの1フレームは実測3,184 byte(sub $0xc38,%rsp = 3,128 byte +
+ * callee-savedのpush 6本 48 byte + 戻り番地 8 byte。
+ * `x86_64-w64-mingw32-objdump -d tmp/za.o`で確認できる)。
+ * 一方プロセススタックはSTACK_SIZE = 256KB(process.c)なので、
+ *
+ *     262,144 / 3,184 = 82.3 段
+ *
+ * が再帰だけで使い切る段数になる。実際にはこの上にos_eval→za_try_compile_defunの
+ * 呼び出し鎖が乗り、下にもza_compile_call(744 byte)等のリーフが乗るため、
+ * **実測では79段でガードページを踏んだ**((if (cc) 1 (if ...)) を深くネストした
+ * defunで再現。78段は80msで完了し、79段で#PF。
+ * documents/known-issue-deep-if-nesting-jit.md)。
+ *
+ * 60はその79から安全率を取った値である。
+ *
+ * [重要] **この数字はza_compile_exprのフレームサイズに依存している。**
+ * ローカル変数を増やせばフレームが太り、実際に踏める段数は79より下がる。
+ * za_compile_exprに大きなローカルを足したときや、STACK_SIZEを変えたときは、
+ * 上のobjdumpで新しいフレームサイズを測り、この値を測り直すこと。
+ * 確かめ方: STACK_SIZEを倍にすると崖も倍(79→165)へ動く(実測済み)。
+ */
+#define ZA_MAX_COMPILE_NEST 60
+
+/** za_compile_exprの本体。段数の計上はラッパ側(za_compile_expr)が行う */
+static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                            const za_local_scope_t *locals, const za_syms_t *syms,
+                            lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth);
+
+/** 現在のza_compile_expr再帰段数。za_try_compile_defunの冒頭で0に戻す */
+static UINT64 g_za_compile_nest = 0;
+
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
@@ -3188,6 +3224,31 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * @return 対応できれば1、できなければ0(何バイト書き込んだかは呼び出し元がロールバックする)
  */
 static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                            const za_local_scope_t *locals, const za_syms_t *syms,
+                            lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth) {
+    /* [原則5] 上限を超えたらコンパイルを断念してインタプリタへ落とす。これが無いと
+       深いネストでCスタックを踏み越え、ガードページ#PFでプロセスが止まる。
+       ガードのおかげでシリアルには"** STACK OVERFLOW **"が出るが、その式は
+       二度と評価されないので、外からは「固まった」ようにしか見えない。
+       断念すれば遅くなるだけで正しく動く。 */
+    if (g_za_compile_nest >= ZA_MAX_COMPILE_NEST) {
+        /* ZA_MAX_JIT_RELOCS等の固定上限と同じ形で知らせる(ZA_BAIL_LINEはこの位置では
+           まだ未定義なので使えない)。g_jit_overflowが立つとza_try_compile_defunは
+           コード生成を捨ててnilを返し、呼び出し元はインタプリタへ落ちる */
+        g_jit_overflow = 1;
+        return 0;
+    }
+    /* このラッパはform/params/envを触らずinnerへ渡すだけなので、GC_PROTECTは
+       inner側の分だけでよい(ここで積むと段数分だけシャドースタックを余計に消費する) */
+    g_za_compile_nest++;
+    int ok = za_compile_expr_inner(form, params, fixed_count, locals, syms, env, is_tail,
+                                   trampoline_offset, nlx_depth, tb_ctx, call_depth, arith_depth);
+    g_za_compile_nest--;
+    return ok;
+}
+
+static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms,
                             lisp_val_t env, int is_tail, UINT64 trampoline_offset,
                             UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth) {
@@ -5915,6 +5976,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     syms.setcdr = os_make_symbol("SET-CDR");
 
     g_jit_overflow = 0;
+    /* 前回の試行が途中で長いジャンプ(setjmp等)で抜けた場合に備えて0に戻す。
+       通常はラッパが必ずデクリメントするので0のままのはず */
+    g_za_compile_nest = 0;
     g_za_saw_flet_labels_escape = 0;
     g_jit_reloc_count = 0;
     g_jit_trampoline_jmp_count = 0;
