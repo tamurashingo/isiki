@@ -149,7 +149,7 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         GC_PROTECT(evaluated_args);
         GC_PROTECT(closure_env);
         GC_PROTECT(body);
-        lisp_val_t call_env = os_make_environment(os_make_symbol("CALL-ENV"), closure_env);
+        lisp_val_t call_env = os_make_frame(os_make_symbol("CALL-ENV"), closure_env);
         // bind_params内のGC_PROTECTはbind_params自身のスタックフレーム限りで、
         // ここ(呼び出し元)のcall_envローカルは別のスタックスロットなので追随しない。
         // bind_params完了後もcall_envをeval_prognに渡すため、ここでも保護する
@@ -271,14 +271,20 @@ static lisp_val_t eval_defvar(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(name);
     GC_PROTECT(env);
 
-    lisp_val_t var_slot = cc_car(cc_cdr(env)); // (variables . alist)
+    // 定義の書き込み先は呼び出し時のenvではなく、そこから最も近い「捨てられない環境」。
+    // 既存束縛の検査も同じ環境に対して行う(検査と書き込みが別の環境だと、
+    // frame側に無いからと評価したのにowner側では既に束縛済み、という食い違いになる)
+    lisp_val_t owner = os_definition_env(env);
+    GC_PROTECT(owner);
+
+    lisp_val_t var_slot = cc_car(cc_cdr(owner)); // (variables . alist)
     lisp_val_t existing = cc_assoc_eq(name, cc_cdr(var_slot));
     if (existing == nil) {
         lisp_val_t val = (value_rest != nil) ? os_eval(cc_car(value_rest), env) : nil;
         if (is_control_transfer(val)) {
             return val;
         }
-        os_set_variable(name, val, env);
+        os_set_variable(name, val, owner);
     }
     return name;
 }
@@ -295,12 +301,16 @@ static lisp_val_t eval_defconstant(lisp_val_t args, lisp_val_t env) {
     lisp_val_t value_form = cc_car(cc_cdr(args));
     GC_PROTECT(name);
     GC_PROTECT(env);
+    // 値と定数フラグは**必ず同じ環境へ**書くこと。片方だけownerにすると、
+    // 値はowner・フラグはframeに散らばり、setqでの上書き禁止が効かなくなる
+    lisp_val_t owner = os_definition_env(env);
+    GC_PROTECT(owner);
     lisp_val_t val = os_eval(value_form, env);
     if (is_control_transfer(val)) {
         return val;
     }
-    os_set_variable(name, val, env);
-    os_mark_constant(name, env);
+    os_set_variable(name, val, owner);
+    os_mark_constant(name, owner);
     return name;
 }
 
@@ -338,11 +348,13 @@ static lisp_val_t eval_defglobal(lisp_val_t args, lisp_val_t env) {
     lisp_val_t value_form = cc_car(cc_cdr(args));
     GC_PROTECT(name);
     GC_PROTECT(env);
+    lisp_val_t owner = os_definition_env(env);
+    GC_PROTECT(owner);
     lisp_val_t val = os_eval(value_form, env);
     if (is_control_transfer(val)) {
         return val;
     }
-    os_set_variable(name, val, env);
+    os_set_variable(name, val, owner);
     return name;
 }
 
@@ -379,11 +391,19 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(params);
     GC_PROTECT(body);
 
-    lisp_val_t fn = za_try_compile_defun(params, body, env);
+    // [重要] envとownerは役割が違う。
+    //   env   = 捕捉環境。関数オブジェクトのword3に入り、本体の自由変数を
+    //           実行時にos_get_variableが辿る起点になる。**frameでよい**
+    //   owner = 定義の登録先。letやflet等の捨てられる環境に書くと到達不能になる
+    // ここを取り違えると、テストは通るのに自由変数だけが静かに壊れる
+    lisp_val_t owner = os_definition_env(env);
+    GC_PROTECT(owner);
+
+    lisp_val_t fn = za_try_compile_defun(params, body, env, owner);
     if (fn == nil) {
         fn = make_interpreted_function(params, body, env);
     }
-    os_set_function(name, fn, env);
+    os_set_function(name, fn, owner);
     return name;
 }
 
@@ -437,7 +457,7 @@ static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
     lisp_val_t body = cc_cdr(args);
     GC_PROTECT(bindings);
     GC_PROTECT(body);
-    lisp_val_t new_env = os_make_environment(os_make_symbol("FLET-ENV"), env);
+    lisp_val_t new_env = os_make_frame(os_make_symbol("FLET-ENV"), env);
     GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
@@ -476,7 +496,7 @@ static lisp_val_t eval_labels(lisp_val_t args, lisp_val_t env) {
     lisp_val_t body = cc_cdr(args);
     GC_PROTECT(bindings);
     GC_PROTECT(body);
-    lisp_val_t new_env = os_make_environment(os_make_symbol("LABELS-ENV"), env);
+    lisp_val_t new_env = os_make_frame(os_make_symbol("LABELS-ENV"), env);
     GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
@@ -526,8 +546,11 @@ static lisp_val_t eval_defmacro(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(name);
     GC_PROTECT(env);
 
+    // defunと同じく、捕捉環境(env)と登録先(owner)を分ける
+    lisp_val_t owner = os_definition_env(env);
+    GC_PROTECT(owner);
     lisp_val_t macro = make_macro(params, body, env);
-    os_set_function(name, macro, env);
+    os_set_function(name, macro, owner);
     return name;
 }
 
@@ -559,7 +582,7 @@ static lisp_val_t apply_macro(lisp_val_t macro, lisp_val_t args) {
     GC_PROTECT(params);
     GC_PROTECT(args);
     GC_PROTECT(body);
-    lisp_val_t call_env = os_make_environment(os_make_symbol("MACRO-ENV"), closure_env);
+    lisp_val_t call_env = os_make_frame(os_make_symbol("MACRO-ENV"), closure_env);
     GC_PROTECT(call_env);
     bind_params(params, args, call_env);
     return eval_progn(body, call_env);

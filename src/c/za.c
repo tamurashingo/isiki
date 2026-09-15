@@ -2067,6 +2067,42 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
                             lisp_val_t env, int is_tail, UINT64 trampoline_offset,
                             UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth);
 
+/**
+ * za_compile_exprが自分自身へ再帰できる段数の上限。
+ *
+ * これは**Cスタックの容量から来る数字**であって、言語仕様上の制限ではない。
+ * za_compile_exprの1フレームは実測3,184 byte(sub $0xc38,%rsp = 3,128 byte +
+ * callee-savedのpush 6本 48 byte + 戻り番地 8 byte。
+ * `x86_64-w64-mingw32-objdump -d tmp/za.o`で確認できる)。
+ * 一方プロセススタックはSTACK_SIZE = 256KB(process.c)なので、
+ *
+ *     262,144 / 3,184 = 82.3 段
+ *
+ * が再帰だけで使い切る段数になる。実際にはこの上にos_eval→za_try_compile_defunの
+ * 呼び出し鎖が乗り、下にもza_compile_call(744 byte)等のリーフが乗るため、
+ * **実測では79段でガードページを踏んだ**((if (cc) 1 (if ...)) を深くネストした
+ * defunで再現。78段は80msで完了し、79段で#PF。
+ * documents/known-issue-deep-if-nesting-jit.md)。
+ *
+ * 60はその79から安全率を取った値である。
+ *
+ * [重要] **この数字はza_compile_exprのフレームサイズに依存している。**
+ * ローカル変数を増やせばフレームが太り、実際に踏める段数は79より下がる。
+ * za_compile_exprに大きなローカルを足したときや、STACK_SIZEを変えたときは、
+ * 上のobjdumpで新しいフレームサイズを測り、この値を測り直すこと。
+ * 確かめ方: STACK_SIZEを倍にすると崖も倍(79→165)へ動く(実測済み)。
+ */
+#define ZA_MAX_COMPILE_NEST 60
+
+/** za_compile_exprの本体。段数の計上はラッパ側(za_compile_expr)が行う */
+static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                            const za_local_scope_t *locals, const za_syms_t *syms,
+                            lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth);
+
+/** 現在のza_compile_expr再帰段数。za_try_compile_defunの冒頭で0に戻す */
+static UINT64 g_za_compile_nest = 0;
+
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
@@ -2661,14 +2697,14 @@ static void za_emit_build_capture_env(lisp_val_t params, UINT64 fixed_count, con
     jit_call_r11();
     za_store_slot(ZA_REG_RAX, saved_head_off);
 
-    // 2. 新規env = os_make_environment("LAMBDA-ENV", 現在のenv)を構築し、linkする。
+    // 2. 新規frame = os_make_frame("LAMBDA-ENV", 現在のenv)を構築し、linkする。
     UINT64 env_name_off = za_emit_symbol_name(os_make_symbol("LAMBDA-ENV"));
     jit_movabs_self_ref(ZA_REG_RCX, env_name_off);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
     jit_call_r11();
     jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
     za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_environment);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_frame);
     jit_call_r11();
     za_store_slot(ZA_REG_RAX, env_val_off);
     za_emit_gc_link_slot(env_val_off, env_node_off);
@@ -3191,6 +3227,31 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
                             const za_local_scope_t *locals, const za_syms_t *syms,
                             lisp_val_t env, int is_tail, UINT64 trampoline_offset,
                             UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth) {
+    /* [原則5] 上限を超えたらコンパイルを断念してインタプリタへ落とす。これが無いと
+       深いネストでCスタックを踏み越え、ガードページ#PFでプロセスが止まる。
+       ガードのおかげでシリアルには"** STACK OVERFLOW **"が出るが、その式は
+       二度と評価されないので、外からは「固まった」ようにしか見えない。
+       断念すれば遅くなるだけで正しく動く。 */
+    if (g_za_compile_nest >= ZA_MAX_COMPILE_NEST) {
+        /* ZA_MAX_JIT_RELOCS等の固定上限と同じ形で知らせる(ZA_BAIL_LINEはこの位置では
+           まだ未定義なので使えない)。g_jit_overflowが立つとza_try_compile_defunは
+           コード生成を捨ててnilを返し、呼び出し元はインタプリタへ落ちる */
+        g_jit_overflow = 1;
+        return 0;
+    }
+    /* このラッパはform/params/envを触らずinnerへ渡すだけなので、GC_PROTECTは
+       inner側の分だけでよい(ここで積むと段数分だけシャドースタックを余計に消費する) */
+    g_za_compile_nest++;
+    int ok = za_compile_expr_inner(form, params, fixed_count, locals, syms, env, is_tail,
+                                   trampoline_offset, nlx_depth, tb_ctx, call_depth, arith_depth);
+    g_za_compile_nest--;
+    return ok;
+}
+
+static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                            const za_local_scope_t *locals, const za_syms_t *syms,
+                            lisp_val_t env, int is_tail, UINT64 trampoline_offset,
+                            UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth, UINT64 arith_depth) {
     GC_PROTECT(form);
     GC_PROTECT(params);
     GC_PROTECT(env);
@@ -3581,7 +3642,28 @@ static void za_emit_fn_resolve_cached(lisp_val_t fn_sym) {
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
         jit_call_r11();
+
+        /* os_get_function_cellは未定義の名前に対してnilを返す(runtime.c)。これを
+           そのままキャッシュすると、上のキャッシュ有無判定(test r10,r10 / jne)は
+           **0かどうか**しか見ないため、nil(0ではないタグ付きヒープ値)が入った時点で
+           以後ずっと「解決済み」と見なされる。結果、呼び出し先を後から定義しても
+           永久に未定義のままになる:
+
+             (defun early () (later))   ; laterはまだ未定義
+             (early)                    ; EVAL-ERROR(ここまでは想定内)
+             (defun later () 99)
+             (early)                    ; ★ 修正前はEVAL-ERRORのまま
+
+           nilならストアを飛ばし、次回の呼び出しでもう一度解決させる。
+           nilの値は起動後は不変だが、即値として焼き込まず**グローバル変数nilの
+           アドレスをmovabsしてderef**する(global_environmentを同じ手口で扱っている
+           za_compile_flet_labelsの先例に合わせる)。 */
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&nil);
+        jit_mov_reg_from_mem_disp8(ZA_REG_R11, ZA_REG_R11, 0);
+        jit_cmp_rax_r11();
+        UINT64 fn_cache_skip_store_patch = jit_emit_je_rel32_placeholder();
         jit_mov_mem_disp8_from_reg(ZA_REG_R14, 0, ZA_REG_RAX);
+        jit_patch_rel32(fn_cache_skip_store_patch);
 
         jit_patch_rel32(fn_cache_have_patch);
     } else {
@@ -5816,7 +5898,8 @@ lisp_val_t cc_diag_jit_used(lisp_val_t args, lisp_val_t env) {
     「何度も呼ばれている」かを切り分けるため、タイマーサンプラから読む */
 UINT64 g_za_compile_calls = 0;
 
-lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
+                                lisp_val_t capture_env, lisp_val_t owner_env) {
     g_za_compile_calls++;
     g_za_analyze_steps = 0;
     g_za_analyze_over = 0;
@@ -5838,7 +5921,10 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     // 守るだけで、値渡しで入ってきたこちらのコピーには及ばない)。
     // bodyはformを取り出すまでしか使わないので、ここでは保護しない
     GC_PROTECT(params);
-    GC_PROTECT(env);
+    GC_PROTECT(capture_env);
+    /* owner_envはコード生成(大量の確保)を跨いで、末尾のページ/リテラルスロット登録まで
+       生存する。保護しないとGCが1回走った時点でstaleになる(原則4) */
+    GC_PROTECT(owner_env);
 
     UINT64 fixed_count;
     if (!za_validate_params(params, &fixed_count)) {
@@ -5890,6 +5976,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     syms.setcdr = os_make_symbol("SET-CDR");
 
     g_jit_overflow = 0;
+    /* 前回の試行が途中で長いジャンプ(setjmp等)で抜けた場合に備えて0に戻す。
+       通常はラッパが必ずデクリメントするので0のままのはず */
+    g_za_compile_nest = 0;
     g_za_saw_flet_labels_escape = 0;
     g_jit_reloc_count = 0;
     g_jit_trampoline_jmp_count = 0;
@@ -5989,7 +6078,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         jit_patch_rel32(jmp_to_body_patch);
     }
 
-    if (!za_compile_expr(form, params, fixed_count, 0, &syms, env, 1, trampoline_offset, 0, 0, 0, 0)) {
+    if (!za_compile_expr(form, params, fixed_count, 0, &syms, capture_env, 1, trampoline_offset, 0, 0, 0, 0)) {
         g_za_use_param_slots = 0;
         za_release_literal_slot_allocs();
         g_jit_used = entry;
@@ -6121,13 +6210,13 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         }
     }
 
-    os_environment_register_pages(env, dest, page_count);
+    os_environment_register_pages(owner_env, dest, page_count);
 
     // Phase3.6: このコンパイル試行で確保したリテラルスロットをenvの所有物として登録する
     // (pagesスロットと同じタイミング)。環境破棄時にos_environment_reclaim_literal_slotsが
     // za_free_literal_slotを呼んでフリーリストへ返却する。
     for (UINT32 i = 0; i < g_za_literal_slot_alloc_count; i++) {
-        os_environment_register_literal_slot(env, g_za_literal_slot_allocs[i]);
+        os_environment_register_literal_slot(owner_env, g_za_literal_slot_allocs[i]);
     }
     g_za_literal_slot_alloc_count = 0;
 
@@ -6141,9 +6230,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     lisp_addr_t cons_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (cons_entry_offset - entry));
     if (use_param_slots) {
         lisp_addr_t fixed_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (fixed_entry_offset - entry));
-        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, env);
+        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, capture_env);
     }
-    return os_make_jit_function(cons_entry_addr, env);
+    return os_make_jit_function(cons_entry_addr, capture_env);
 }
 
 /**
@@ -6217,10 +6306,12 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
 }
 
-lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
+                                lisp_val_t capture_env, lisp_val_t owner_env) {
     (void)params;
     (void)body;
-    (void)env;
+    (void)capture_env;
+    (void)owner_env;
     return nil;
 }
 

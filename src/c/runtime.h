@@ -132,6 +132,11 @@ extern lisp_val_t g_sym_progn;
 extern lisp_val_t g_sym_setq;
 /** defun特殊形式を表すシンボル */
 extern lisp_val_t g_sym_defun;
+/** 環境の1番目のスロットのcarに入れて「frame(定義の登録先にならない環境)」を表すシンボル。
+ * environmentでは同じ位置にNAMEが入る。スロット数も位置も変えずに判別できるようにするための
+ * タグで、os_make_frameだけが設定する(ユーザーがmake-environmentへ'frameを渡しても
+ * frameにはならない。名前はcdr側に入るため) */
+extern lisp_val_t g_sym_frame;
 /** lambda特殊形式を表すシンボル */
 extern lisp_val_t g_sym_lambda;
 /** defmacro特殊形式を表すシンボル */
@@ -653,6 +658,23 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3);
 lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env);
 
 /**
+ * os_make_environment と同じ 8 スロットの環境を作るが、1番目のスロットのcarを
+ * NAME ではなく FRAME にする。
+ *
+ * frame は「関数適用・マクロ展開・flet/labels・クロージャ捕捉のたびに作られ、
+ * 呼び出しが終われば捨てられる環境」で、**defun 等の定義の登録先にはならない**
+ * (os_definition_env が読み飛ばす)。変数・関数の**探索**は environment と
+ * まったく同じに辿られるので、flet/labels の束縛やパラメータ束縛は従来どおり効く。
+ *
+ * スロット数も位置も environment と同一なので、既存の位置依存アクセス
+ * (cc_cdr の連鎖)はすべて無変更で動く。
+ * @param env_symbol frameの名前を表すsymbol(1番目のスロットのcdrに入る)
+ * @param parent_env 親環境
+ * @return 作成したframe
+ */
+lisp_val_t os_make_frame(lisp_val_t env_symbol, lisp_val_t parent_env);
+
+/**
  * global_environmentの子として、nameを名前とする新しい環境を生成し、*environments*
  * (init.lispのdefdynamicで定義されるグローバルな環境一覧)へも登録する。
  * os_repl_step/primitive_current_environmentが各プロセスのproc->envを初回呼び出し時に
@@ -772,6 +794,23 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env);
  * @return val 自身
  */
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
+
+/**
+ * defun/defmacro/defvar/defconstant/defglobal が「どこへ定義を書くか」を決める。
+ *
+ * インタプリタは関数適用・マクロ展開・flet/labels のたびに新しい環境を作るが、
+ * それらは呼び出しが終われば捨てられる。定義をそこへ書くと到達不能になるため
+ * (`(let ((x 1)) (defun f () x))` が呼べない、というバグの原因)、
+ * 定義は最も近い「捨てられない環境」へ書く。
+ *
+ * **自由変数の捕捉には使わないこと。** 捕捉は呼び出し時の env をそのまま
+ * 関数オブジェクトの word3 に入れる必要がある(そうしないと `let` が束縛した
+ * 変数を関数本体から見られなくなる)。
+ *
+ * @param env 呼び出し時の(レキシカルな)環境
+ * @return 定義を書き込むべき環境。見つからなければ global_environment
+ */
+lisp_val_t os_definition_env(lisp_val_t env);
 
 /**
  * envおよびその親を順に辿り、symの関数定義に対応するFunction Cellを取得する。

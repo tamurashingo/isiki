@@ -79,12 +79,23 @@
  * 「&rest 任意のシンボル」を伴っても良いが、そのrest引数名をexpr中で参照することは
  * できない(参照した場合はコンパイル失敗)。
  * 対応できない形であれば何も書き込まずnilを返す(呼び出し側はインタプリタにフォールバックする)。
+ *
+ * [重要] envは2つに分かれている。取り違えるとテストは通るのに自由変数だけが
+ * 静かに壊れるので注意すること。
  * @param params 仮引数リスト(未評価のシンボルリスト。末尾に&rest 1個を許容)
  * @param body 関数本体(未評価のフォームのリスト)
- * @param env マクロ展開時にマクロ定義を解決する環境(defunの定義時環境)
+ * @param capture_env **捕捉環境**。コンパイル時のマクロ展開・呼び出し先の解決に使い、
+ *   さらに生成した関数オブジェクトのword3に入る。実行時に本体の自由変数を
+ *   os_get_variableが辿る起点になるので、**呼び出し時のレキシカルなenv
+ *   (frameでよい)をそのまま渡すこと**。ここにowner_envを渡すと
+ *   `(let ((x 1)) (defun f () x))` のfがxを見られなくなる
+ * @param owner_env **定義の登録先**(os_definition_envが解決したenvironment)。
+ *   確保したImmobilized Pageとリテラルスロットの所有者として登録する。
+ *   frameを渡すとdestroy-environmentの回収対象にならず、ページが永久に残る
  * @return コンパイル済み関数のMAGIC_FUNCTION_NATIVE INSTANCE、失敗時はnil
  */
-lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env);
+lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
+                                lisp_val_t capture_env, lisp_val_t owner_env);
 
 /**
  * za.c実装のネイティブ関数(%%DESTROY-ENVIRONMENT-RECLAIM、documents/environment.md
