@@ -363,6 +363,19 @@ void os_imm_page_free(void *page);
  */
 void *os_imm_pages_alloc_contiguous(UINT64 count);
 
+/**
+ * JITコードの配置先をImmobilized Spaceから切り出す(パッキング)。
+ * ページは環境ごとのbumpカーソルで分け合うが、**1ページは必ず1つの環境に属する**
+ * (destroy-environmentがページ単位で回収するため)。実装の詳細はruntime.c参照。
+ * @param owner_env 登録先の環境(capture_envではなくowner_env)
+ * @param size 必要なbyte数
+ * @param out_new_pages 新たに取ったページの先頭(取らなければ0)
+ * @param out_new_page_count 新たに取ったページ数(取らなければ0)
+ * @return 配置先アドレス(16byteアライン)。確保できなければ0
+ */
+void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
+                        void **out_new_pages, UINT64 *out_new_page_count);
+
 /** os_imm_slot_allocが使う、1ページ内でのバンプアロケーションの進行状況を保持するカーソル */
 typedef struct {
     UINT8 *page;   /* 現在切り出し中のページ(0ならまだページ未確保) */

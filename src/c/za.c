@@ -6120,8 +6120,16 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     // entryへロールバックして再利用する(呼び出し元が確保する512KBの予算は
     // コンパイル済み関数の総量ではなく「1関数分の最悪サイズ」だけで済む)。
     UINT64 code_len = g_jit_used - entry;
-    UINT64 page_count = (code_len + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
-    void *dest = os_imm_pages_alloc_contiguous(page_count);
+    /* [パッキング] 以前はcode_lenを4096へ切り上げて丸ごと1ページ以上を専有していたため、
+       200byteの関数でも4096byteを使い、実測の充填率は37.9%だった
+       (documents/measurement-jit-code-length-distribution.md)。os_imm_code_allocは
+       owner_envごとのbumpカーソルから必要なbyte数だけ切り出す。ページを環境ごとに
+       分けるのはdestroy-environmentがページ単位で回収するためで、混ぜると解放された
+       ページの先頭8byteがフリーリストのnextで上書きされ生きたコードが壊れる。
+       新しいページを取ったときだけ(new_page_count != 0)登録すればよい。 */
+    void *new_pages = 0;
+    UINT64 new_page_count = 0;
+    void *dest = os_imm_code_alloc(owner_env, code_len, &new_pages, &new_page_count);
     if (dest == 0) {
         za_release_literal_slot_allocs();
         g_jit_used = entry;
@@ -6210,7 +6218,12 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         }
     }
 
-    os_environment_register_pages(owner_env, dest, page_count);
+    /* [パッキング] 既存のカーソルページから切り出せた場合は、そのページは
+       前回の確保時に登録済みなので何もしない(二重登録するとdestroy-environmentが
+       同じページを2回os_imm_page_freeへ渡し、フリーリストが自分自身を指す輪になる) */
+    if (new_page_count != 0) {
+        os_environment_register_pages(owner_env, new_pages, new_page_count);
+    }
 
     // Phase3.6: このコンパイル試行で確保したリテラルスロットをenvの所有物として登録する
     // (pagesスロットと同じタイミング)。環境破棄時にos_environment_reclaim_literal_slotsが

@@ -1101,6 +1101,25 @@ static UINT8 *g_imm_bump = g_imm_space;
 /** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */
 static void *g_imm_free_list = 0;
 
+/* ---- JITコードのパッキング(環境ごとのbumpカーソル)の診断カウンタ ----
+   充填率が想定より低かったときに、原因が「環境の切り替え」なのか
+   「1ページに収まらない大きい関数」なのかを切り分けるために数える
+   (documents/pitfalls.md 原則6: 失敗は観測可能にすること)。 */
+/** カーソルから切り出せた回数(ページを新たに取らずに済んだ) */
+static UINT64 g_code_alloc_from_cursor = 0;
+/** 新しいページを取った回数(1ページ以内の関数) */
+static UINT64 g_code_alloc_new_page = 0;
+/** 1ページに収まらず連続確保へ回した回数 */
+static UINT64 g_code_alloc_multipage = 0;
+/** ページ末尾を使い切れずに捨てた回数(= 分断) */
+static UINT64 g_code_tail_abandoned = 0;
+/** 同、捨てたbyte数の合計 */
+static UINT64 g_code_tail_abandoned_bytes = 0;
+/** コードのために取ったページの総数(単一ページ+連続確保ぶん)。充填率の分母 */
+static UINT64 g_code_pages_taken = 0;
+/** 切り出したコードのbyte数の合計(16byteアライン後)。充填率の分子 */
+static UINT64 g_code_bytes_allocated = 0;
+
 /** g_imm_bumpがこれまでにg_imm_spaceから切り出した延べページ数。M13で、init.lispから
  * トランスパイル対象関数を移動したことによるImmobilized Space使用量の削減を測定する
  * テストのためのアクセサ(os_gc_collect_countと同じ、テスト専用の内部状態公開) */
@@ -1435,6 +1454,125 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
     void *slot = cursor->page + cursor->offset;
     cursor->offset += aligned;
     return slot;
+}
+
+/**
+ * environmentのcode-cursorスロット(9番目)を取り出す。frameは持たないのでnilになる。
+ * 戻り値はスロットのcons自体((code-cursor . 値))で、呼び出し元が値を読み書きする。
+ * @param env environment(frameやnilを渡してもnilが返るだけで壊れない)
+ * @return スロットのcons、持たない場合はnil
+ */
+static lisp_val_t imm_code_cursor_slot(lisp_val_t env) {
+    if (env == nil || env == 0) {
+        return nil;
+    }
+    /* 9番目 = cddddr(cddddr(env))のcar。8スロットしか持たないframeでは
+       cc_cdrがnilを返し続け、cc_car(nil)==nilになるので安全に「持たない」を表せる */
+    lisp_val_t rest = cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))))));
+    lisp_val_t slot = cc_car(rest);
+    /* nil(=frame、またはリストの終端)を書き込み先にしてはならない。
+       nilは自己参照consなので、cdrを書き換えるとnilそのものが壊れる */
+    if ((slot & TAG_MASK) != TAG_CONS || slot == nil) {
+        return nil;
+    }
+    return slot;
+}
+
+/**
+ * JITコードの配置先をImmobilized Spaceから切り出す(パッキング)。
+ *
+ * ページを環境ごとのbumpカーソルで分け合う。**1ページは必ず1つの環境に属する**:
+ * 別の環境のdefunが来たらそのページは使わず新しいページを取る。これは
+ * destroy-environmentがページ単位で回収するため(os_environment_reclaim_pages →
+ * os_imm_page_free)で、同居させると解放されたページの先頭8byteが
+ * フリーリストのnextポインタで上書きされ、生きているコードが壊れる。
+ *
+ * ページまたぎは行わない。1ページに収まらない関数は従来どおり
+ * os_imm_pages_alloc_contiguousで連続確保し、カーソルには影響させない。
+ *
+ * 単一ページの取得はos_imm_page_alloc(フリーリストを見る)を使う。これにより
+ * destroy-environmentで返ったページがコードとして再利用される。
+ *
+ * @param owner_env 登録先の環境(capture_envではなくowner_env。frameを渡すと
+ *                  カーソルを持たないので毎回新しいページになる)
+ * @param size 必要なbyte数
+ * @param out_new_pages 新たに取ったページの先頭(取らなかった場合は0)
+ * @param out_new_page_count 新たに取ったページ数(取らなかった場合は0)。
+ *                  呼び出し元はこれが非0のときだけos_environment_register_pagesを呼ぶ
+ * @return 配置先アドレス(16byteアライン)。確保できなければ0
+ */
+void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
+                        void **out_new_pages, UINT64 *out_new_page_count) {
+    *out_new_pages = 0;
+    *out_new_page_count = 0;
+    UINT64 aligned = (size + 15) & ~15ULL;
+    g_imm_last_request_bytes = aligned;
+
+    /* 1ページに収まらない関数は連続領域が要る。フリーリストは単一ページの鎖で
+       連続領域を切り出せないので、従来どおりbumpから取る */
+    if (aligned > IMM_PAGE_SIZE) {
+        UINT64 count = (aligned + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
+        void *pages = os_imm_pages_alloc_contiguous(count);
+        if (pages == 0) {
+            return 0;
+        }
+        g_code_alloc_multipage++;
+        g_code_pages_taken += count;
+        g_code_bytes_allocated += aligned;
+        *out_new_pages = pages;
+        *out_new_page_count = count;
+        return pages;
+    }
+
+    lisp_val_t slot = imm_code_cursor_slot(owner_env);
+    if (slot != nil) {
+        lisp_val_t cur = cc_cdr(slot);
+        if (cur != nil) {
+            UINT64 off = os_fixnum_magnitude(cur);
+            UINT64 in_page = off & (IMM_PAGE_SIZE - 1);
+            /* in_page==0 は「ページをちょうど使い切った」状態。次のページは
+               この環境のものではないので残り容量は0として扱う */
+            UINT64 remain = (in_page == 0) ? 0 : (IMM_PAGE_SIZE - in_page);
+            if (aligned <= remain) {
+                g_code_alloc_from_cursor++;
+                g_code_bytes_allocated += aligned;
+                ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum(off + aligned);
+                return (void *)(g_imm_space + off);
+            }
+            if (remain != 0) {
+                g_code_tail_abandoned++;
+                g_code_tail_abandoned_bytes += remain;
+            }
+        }
+    }
+
+    /* 新しいページを取る。os_imm_page_allocはフリーリストを先に見るので、
+       destroy-environmentで返ったページがここで再利用される */
+    void *page = os_imm_page_alloc();
+    g_code_alloc_new_page++;
+    g_code_pages_taken++;
+    g_code_bytes_allocated += aligned;
+    *out_new_pages = page;
+    *out_new_page_count = 1;
+    if (slot != nil) {
+        UINT64 off = (UINT64)((UINT8 *)page - g_imm_space);
+        ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum(off + aligned);
+    }
+    return page;
+}
+
+/** 組み込み関数%%DIAG-CODE-PACKING。パッキングの内訳を
+ * (カーソルから ページ新規 複数ページ 分断回数 分断byte 総ページ数 総確保byte)
+ * のリストで返す。充填率 = 総確保byte / (総ページ数 * 4096)。 */
+lisp_val_t primitive_diag_code_packing(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    lisp_val_t l7 = os_make_cons(os_make_fixnum(g_code_bytes_allocated), nil);
+    lisp_val_t l6 = os_make_cons(os_make_fixnum(g_code_pages_taken), l7);
+    lisp_val_t l5 = os_make_cons(os_make_fixnum(g_code_tail_abandoned_bytes), l6);
+    lisp_val_t l4 = os_make_cons(os_make_fixnum(g_code_tail_abandoned), l5);
+    lisp_val_t l3 = os_make_cons(os_make_fixnum(g_code_alloc_multipage), l4);
+    lisp_val_t l2 = os_make_cons(os_make_fixnum(g_code_alloc_new_page), l3);
+    return os_make_cons(os_make_fixnum(g_code_alloc_from_cursor), l2);
 }
 
 /** Function Cell(os_get_function_cell/os_set_function参照)の確保に使う
@@ -2434,6 +2572,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
         os_set_function(os_make_symbol("%%DIAG-FN-CELL-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_fn_cell_count), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-CODE-PACKING"), os_make_native_function((lisp_addr_t)(void *)primitive_diag_code_packing), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
@@ -2836,6 +2975,15 @@ void os_reset_runtime_state_for_test(void) {
     g_function_cell_count = 0;
     g_fn_meta_cursor.page = 0;
     g_fn_meta_cursor.offset = 0;
+    /* コードカーソルの実体は各環境のスロット側にあり、環境ごと作り直されるので
+       ここでリセットするのは診断カウンタだけでよい */
+    g_code_alloc_from_cursor = 0;
+    g_code_alloc_new_page = 0;
+    g_code_alloc_multipage = 0;
+    g_code_tail_abandoned = 0;
+    g_code_tail_abandoned_bytes = 0;
+    g_code_pages_taken = 0;
+    g_code_bytes_allocated = 0;
 }
 
 
@@ -3024,6 +3172,16 @@ static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env
     GC_PROTECT(pages_symbol);
     lisp_val_t literal_slots_symbol = os_make_symbol("literal-slots");
     GC_PROTECT(literal_slots_symbol);
+    /* 9番目のスロット(code-cursor)はenvironmentにだけ持たせる。frameは
+       let/fletの評価ごとに作られるhot pathなので、consを1つ増やさない。
+       defunの登録先はos_definition_envがframeを読み飛ばして必ずenvironmentを返すため、
+       frameがコードページを所有することは無い(os_imm_code_allocも念のため検査する)。 */
+    int want_code_cursor = (slot_tag != g_sym_frame);
+    lisp_val_t code_cursor_symbol = nil;
+    if (want_code_cursor) {
+        code_cursor_symbol = os_make_symbol("code-cursor");
+    }
+    GC_PROTECT(code_cursor_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     GC_PROTECT(name_slot);
@@ -3040,8 +3198,21 @@ static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env
     lisp_val_t pages_slot = os_make_cons(pages_symbol, nil);
     GC_PROTECT(pages_slot);
     lisp_val_t literal_slots_slot = os_make_cons(literal_slots_symbol, nil);
+    GC_PROTECT(literal_slots_slot);
 
-    lisp_val_t list_step7 = os_make_cons(literal_slots_slot, nil);
+    /* code-cursorの値は「g_imm_spaceの先頭からの、次に使えるbyteオフセット」を表す
+       fixnum、またはカーソル未設定を表すnil。fixnumは即値(os_make_fixnumは確保しない)
+       なので、切り出しのたびにconsを作らずスロットのcdrを書き換えるだけで済む。
+       (off & (IMM_PAGE_SIZE-1)) == 0 は「現在のページを使い切った」を意味する
+       (次のページの所有権は無いので、残り容量は0として扱う)。 */
+    lisp_val_t list_step8 = nil;
+    if (want_code_cursor) {
+        lisp_val_t code_cursor_slot = os_make_cons(code_cursor_symbol, nil);
+        list_step8 = os_make_cons(code_cursor_slot, nil);
+    }
+    GC_PROTECT(list_step8);
+
+    lisp_val_t list_step7 = os_make_cons(literal_slots_slot, list_step8);
     lisp_val_t list_step6 = os_make_cons(pages_slot, list_step7);
     lisp_val_t list_step5 = os_make_cons(cells_slot, list_step6);
     lisp_val_t list_step4 = os_make_cons(constants_slot, list_step5);
@@ -3702,6 +3873,13 @@ void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 coun
 }
 
 void os_environment_reclaim_pages(lisp_val_t env) {
+    /* コードカーソルは解放するページのどれかを指しているので、必ず先に畳む。
+       残したままにすると、破棄済み環境へdefunしたときに他の環境へ払い出された
+       ページへコードを書き込むことになる */
+    lisp_val_t cursor_slot = imm_code_cursor_slot(env);
+    if (cursor_slot != nil) {
+        ((lisp_val_t *)(cursor_slot & ~TAG_MASK))[1] = nil;
+    }
     lisp_val_t pages_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))))));
     lisp_val_t list = cc_cdr(pages_slot);
 

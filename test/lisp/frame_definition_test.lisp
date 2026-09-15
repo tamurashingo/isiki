@@ -121,6 +121,7 @@
 (defglobal *fd-a0* (%%imm-space-used-bytes))
 (defglobal *fd-w0* (fd-drive 512))
 (defglobal *fd-a1* (%%imm-space-used-bytes))
+(defglobal *fd-c0* (- *fd-a1* *fd-a0*))   ; 対照: 回収前に消費した量
 
 ;; 環境を作り、let 越しに defun してから破棄する
 (defglobal *fd-e* (make-environment 'fd-reclaim-env))
@@ -138,9 +139,21 @@
 ;; 破棄しても bump 基準の使用量は減らない(回収はフリーリストへの返却)
 (assert-equal *fd-a2* (%%imm-space-used-bytes))
 
-;; 破棄で4ページ以上が解放されたので、続く2ページ分の確保は
-;; フリーリストから取られ bump は一切進まない
+;; 破棄で解放されたページがフリーリストへ入るので、続く同じ処理は
+;; bump の消費が減る。
+;;
+;; [期待値の変更 2026-09-15] 以前はここが「0 byte」だった。JITコードのパッキング
+;; (documents/measurement-jit-code-length-distribution.md、os_imm_code_alloc)を
+;; 入れる前は fd-re1〜fd-re4 の4関数が**4ページを専有**していたため、破棄すると
+;; 4ページ返り、続く2ページ分の確保が全てフリーリストから賄えていた。
+;; パッキング後は同一環境の4関数が**1ページに同居する**ので、返るのは1ページだけ。
+;; 2ページ必要な処理のうち1ページはフリーリストから、1ページは bump から取る。
+;;
+;; つまり「0 になる」という性質はパッキングによって失われたが、
+;; **検証したい性質(回収したページがフリーリストを経由して再利用される)は
+;; 「同じ処理の消費が回収前より減る」で変わらず張れる。**
+;; ページ数に依存しない形にすることで、関数サイズが変わっても壊れなくなる。
 (defglobal *fd-w1* (fd-drive 512))
-(assert-equal 0 (- (%%imm-space-used-bytes) *fd-a2*))
-;; 対照: 回収前の同じ処理は bump を消費していた
-(assert-equal t (> (- *fd-a1* *fd-a0*) 0))
+(defglobal *fd-c1* (- (%%imm-space-used-bytes) *fd-a2*))
+(assert-equal t (> *fd-c0* 0))          ; 対照: 回収前は bump を消費していた
+(assert-equal t (< *fd-c1* *fd-c0*))    ; 回収後は減る(= フリーリストから取れている)
