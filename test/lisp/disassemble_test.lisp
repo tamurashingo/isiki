@@ -136,6 +136,25 @@
 (assert-equal t (< (car *disasm-imm-bounds*) (cdr *disasm-imm-bounds*)))
 (assert-equal t (< (car *disasm-heap-bounds*) (cdr *disasm-heap-bounds*)))
 
+;; GC を跨いでも境界が壊れないこと。
+;; From/To は GC のたびに入れ替わるため、「From が常に下位半分」と決め打つと
+;; **GC が奇数回走った後だけ** start==end になって「未確定」と誤報する
+;; (2026-09-15 に declaim のテストが GC を奇数回起こしたことで発覚。
+;;  os_addr_region_bounds の OS_ADDR_GC_HEAP を min/max で取るよう修正した)
+(defun dis-force-gc ()
+  (let ((c (%%gc-collect-count)))
+    (while (= (%%gc-collect-count) c) (cons 1 2))
+    (%%gc-collect-count)))
+(dis-force-gc)
+(defglobal *disasm-heap-bounds-odd* (%%disasm-region-bounds *disasm-region-gc-heap*))
+(assert-equal t (not (null *disasm-heap-bounds-odd*)))
+(assert-equal t (< (car *disasm-heap-bounds-odd*) (cdr *disasm-heap-bounds-odd*)))
+(dis-force-gc)
+(defglobal *disasm-heap-bounds-even* (%%disasm-region-bounds *disasm-region-gc-heap*))
+(assert-equal t (not (null *disasm-heap-bounds-even*)))
+;; 入れ替わっても同じ区間を指す
+(assert-equal *disasm-heap-bounds-odd* *disasm-heap-bounds-even*)
+
 ;; 半開区間であること(start は範囲内、end は範囲外)
 (assert-equal *disasm-region-immobilized*
               (%%disasm-classify-addr (car *disasm-imm-bounds*)))

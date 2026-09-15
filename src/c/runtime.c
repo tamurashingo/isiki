@@ -1344,9 +1344,15 @@ int os_addr_region_bounds(os_addr_region_t region, lisp_addr_t *out_start, lisp_
             end = start + IMM_SPACE_SIZE;
             break;
         case OS_ADDR_GC_HEAP:
-            /* From/Toは g_to_start == g_from_end で連続しているので1区間で表せる */
-            start = (lisp_addr_t)(void *)g_from_start;
-            end = (lisp_addr_t)(void *)g_to_end;
+            /* From/Toは隣接した2つの半分なので1区間で表せる。ただし**GCのたびに
+               入れ替わる**(os_gc_collect_body末尾のnew_from_start/new_to_start)ので、
+               「Fromが常に下位半分」と決め打ってはならない。
+               以前は start=g_from_start / end=g_to_end としており、GCが奇数回走った
+               後は start==end(どちらも中間点)になって「境界が未確定」と誤報していた
+               (実測: GC 0/2/4回後は正しく、1/3回後にnilが返る)。
+               両者の最小と最大を取ることで入れ替わりに依らなくなる */
+            start = (lisp_addr_t)(void *)(g_from_start < g_to_start ? g_from_start : g_to_start);
+            end = (lisp_addr_t)(void *)(g_from_end > g_to_end ? g_from_end : g_to_end);
             break;
         default:
             break;
