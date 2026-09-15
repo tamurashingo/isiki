@@ -303,8 +303,22 @@ void c_keyboard_handler(uint8_t scancode) {
     }
 
     if (scancode >= 0x3B && scancode <= 0x3E) {
-        // F1〜F4: アクティブなプロセスを切り替える(表示中の仮想バッファも同時に切り替わる)
+        // F1〜F4: アクティブなプロセスを切り替える(表示中の仮想バッファも同時に切り替わる)。
+        // view_offsetはバッファごとに保持しているので、ここでは触らない。
+        // **この判定を下の「任意のキーで最下部へ復帰」より先に置くこと。** 逆にすると
+        // 切り替えのたびに遡り位置がリセットされ、バッファごとの保持と矛盾する
         switch_active_process(scancode - 0x3B);
+        return;
+    }
+
+    // Shift+PageUp / Shift+PageDown: 表示中のバッファをスクロールバックする。
+    // 0x49/0x51はSCANCODE_NORMAL/SHIFTがどちらも0で従来は無視されていたため、
+    // 既存の入力動作には影響しない。拡張キーの0xE0プレフィックスは上の
+    // `scancode & 0x80` で破棄済みなので、テンキーとナビゲーションキーの
+    // PgUp/PgDnは区別されない(この用途では問題にならない)
+    if (key_shift_pressed && (scancode == 0x49 || scancode == 0x51)) {
+        INT32 page = (INT32)os_vbuf_screen_rows();
+        os_vbuf_scroll(scancode == 0x49 ? -page : page);
         return;
     }
 
@@ -312,6 +326,10 @@ void c_keyboard_handler(uint8_t scancode) {
     if (c == 0) {
         return;
     }
+
+    // 遡って表示している最中に何か打ったら最下部へ復帰する。
+    // **キーは握り潰さない。** 打った文字はこのまま通常どおり入力として通る
+    os_vbuf_scroll_to_bottom();
 
     process_t *current = get_current_process();
 

@@ -1025,16 +1025,30 @@ void os_boot_alloc_init(UINT64 base, UINT64 size) {
     g_boot_alloc_end = (UINT8 *)(base + size);
 }
 
-void *os_boot_alloc(UINT64 size, UINT64 align) {
+void *os_boot_alloc_try(UINT64 size, UINT64 align) {
     UINT64 addr = ((UINT64)g_boot_alloc_bump + align - 1) & ~(align - 1);
     if ((UINT8 *)(addr + size) > g_boot_alloc_end) {
-        frame_buffer *fb = get_active_frame_buffer();
-        fb->write_string(fb, "boot_alloc: space exhausted...");
-        for (;;) {
-        }
+        return 0;
     }
     g_boot_alloc_bump = (UINT8 *)(addr + size);
     return (void *)addr;
+}
+
+void *os_boot_alloc(UINT64 size, UINT64 align) {
+    void *p = os_boot_alloc_try(size, align);
+    if (p == 0) {
+        /* 仮想バッファの初期化より前に枯渇した場合、フレームバッファの
+           関数ポインタはまだ0なのでそのまま呼ぶとページフォルトになる。
+           表示できないなら黙って停止するしかないが、少なくとも
+           「別の場所で落ちた」ように見えるのは避ける */
+        frame_buffer *fb = get_active_frame_buffer();
+        if (fb != 0 && fb->write_string != 0) {
+            fb->write_string(fb, "boot_alloc: space exhausted...");
+        }
+        for (;;) {
+        }
+    }
+    return p;
 }
 
 UINT64 os_boot_alloc_finalize(UINT64 *out_heap_base, UINT64 *out_heap_size) {
