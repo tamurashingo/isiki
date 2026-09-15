@@ -1119,6 +1119,11 @@ static UINT64 g_code_tail_abandoned_bytes = 0;
 static UINT64 g_code_pages_taken = 0;
 /** 切り出したコードのbyte数の合計(16byteアライン後)。充填率の分子 */
 static UINT64 g_code_bytes_allocated = 0;
+/** 走行を延長してページ境界をまたいだ回数 */
+static UINT64 g_code_run_extended = 0;
+/** 1ページを超える関数をページ単位へ切り上げたことで生じた未使用byte。
+ * カーソルを介さないので、ここは詰められない(充填率の残る損失の内訳) */
+static UINT64 g_code_multipage_waste = 0;
 
 /** g_imm_bumpがこれまでにg_imm_spaceから切り出した延べページ数。M13で、init.lispから
  * トランスパイル対象関数を移動したことによるImmobilized Space使用量の削減を測定する
@@ -1509,7 +1514,7 @@ void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
     g_imm_last_request_bytes = aligned;
 
     /* 1ページに収まらない関数は連続領域が要る。フリーリストは単一ページの鎖で
-       連続領域を切り出せないので、従来どおりbumpから取る */
+       連続領域を切り出せないので、従来どおりbumpから取る。カーソルには影響させない */
     if (aligned > IMM_PAGE_SIZE) {
         UINT64 count = (aligned + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
         void *pages = os_imm_pages_alloc_contiguous(count);
@@ -1519,6 +1524,7 @@ void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
         g_code_alloc_multipage++;
         g_code_pages_taken += count;
         g_code_bytes_allocated += aligned;
+        g_code_multipage_waste += count * IMM_PAGE_SIZE - aligned;
         *out_new_pages = pages;
         *out_new_page_count = count;
         return pages;
@@ -1528,20 +1534,58 @@ void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
     if (slot != nil) {
         lisp_val_t cur = cc_cdr(slot);
         if (cur != nil) {
-            UINT64 off = os_fixnum_magnitude(cur);
-            UINT64 in_page = off & (IMM_PAGE_SIZE - 1);
-            /* in_page==0 は「ページをちょうど使い切った」状態。次のページは
-               この環境のものではないので残り容量は0として扱う */
-            UINT64 remain = (in_page == 0) ? 0 : (IMM_PAGE_SIZE - in_page);
-            if (aligned <= remain) {
+            UINT64 packed = os_fixnum_magnitude(cur);
+            UINT64 off = packed & 0xFFFFFFFFULL;
+            UINT64 end = packed >> 32;
+
+            /* (1) 走行の残りに収まる */
+            if (aligned <= end - off) {
                 g_code_alloc_from_cursor++;
                 g_code_bytes_allocated += aligned;
-                ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum(off + aligned);
+                ((lisp_val_t *)(slot & ~TAG_MASK))[1] =
+                    os_make_fixnum(((end) << 32) | (off + aligned));
                 return (void *)(g_imm_space + off);
             }
-            if (remain != 0) {
+
+            /* (2) 走行を延長できるならまたぐ。
+               成立条件は「走行の終端がg_imm_bumpと一致していること」で、そのときに限り
+               bumpから取る次のページが走行と物理的に連続する(g_imm_spaceは16MBの
+               連続した静的配列)。またいだ2ページはどちらも同じownerのもので、
+               両方ともpagesスロットへ登録されるためdestroy-environmentの回収単位は
+               壊れない。禁じたいのは「1ページに複数の環境」であって「1関数が2ページ」
+               ではない。
+
+               [仕様] 延長が成立するのはbump由来のページだけで、フリーリストから
+               取ったページでは基本的に成立しない(bumpは巻き戻らないので、
+               フリーリスト由来のページの直後がbumpになるのは、それが最後に
+               切り出されたページだった場合に限られる)。この非対称は意図したもので、
+               「空きが飛び飛びの位置にあるならまたがない」が自動的に満たされる。
+               なお仮に成立した場合も、2ページは物理的に連続しており両方とも
+               同じownerへ登録されるので安全である。
+
+               [重要] 1ページを超える要求は上で処理済みなので、ここでは
+               aligned <= IMM_PAGE_SIZE が保証される。したがって1ページ足せば
+               必ず収まる((end - off) + IMM_PAGE_SIZE >= aligned)。 */
+            if ((UINT8 *)(g_imm_space + end) == g_imm_bump) {
+                void *page = os_imm_pages_alloc_contiguous(1);
+                if (page != 0) {
+                    g_code_run_extended++;
+                    g_code_pages_taken++;
+                    g_code_bytes_allocated += aligned;
+                    UINT64 new_end = end + IMM_PAGE_SIZE;
+                    ((lisp_val_t *)(slot & ~TAG_MASK))[1] =
+                        os_make_fixnum((new_end << 32) | (off + aligned));
+                    *out_new_pages = page;
+                    *out_new_page_count = 1;
+                    return (void *)(g_imm_space + off);
+                }
+                /* 空間が尽きていた。下の新規ページ確保でもう一度試みる */
+            }
+
+            /* (3) 延長できないので走行を張り直す。末尾は捨てる(= 分断) */
+            if (end > off) {
                 g_code_tail_abandoned++;
-                g_code_tail_abandoned_bytes += remain;
+                g_code_tail_abandoned_bytes += (end - off);
             }
         }
     }
@@ -1556,17 +1600,21 @@ void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
     *out_new_page_count = 1;
     if (slot != nil) {
         UINT64 off = (UINT64)((UINT8 *)page - g_imm_space);
-        ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum(off + aligned);
+        UINT64 end = off + IMM_PAGE_SIZE;
+        ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum((end << 32) | (off + aligned));
     }
     return page;
 }
 
 /** 組み込み関数%%DIAG-CODE-PACKING。パッキングの内訳を
- * (カーソルから ページ新規 複数ページ 分断回数 分断byte 総ページ数 総確保byte)
+ * (カーソルから ページ新規 複数ページ 分断回数 分断byte 総ページ数 総確保byte 延長回数
+ *  複数ページ確保の端数byte)
  * のリストで返す。充填率 = 総確保byte / (総ページ数 * 4096)。 */
 lisp_val_t primitive_diag_code_packing(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
-    lisp_val_t l7 = os_make_cons(os_make_fixnum(g_code_bytes_allocated), nil);
+    lisp_val_t l9 = os_make_cons(os_make_fixnum(g_code_multipage_waste), nil);
+    lisp_val_t l8 = os_make_cons(os_make_fixnum(g_code_run_extended), l9);
+    lisp_val_t l7 = os_make_cons(os_make_fixnum(g_code_bytes_allocated), l8);
     lisp_val_t l6 = os_make_cons(os_make_fixnum(g_code_pages_taken), l7);
     lisp_val_t l5 = os_make_cons(os_make_fixnum(g_code_tail_abandoned_bytes), l6);
     lisp_val_t l4 = os_make_cons(os_make_fixnum(g_code_tail_abandoned), l5);
@@ -2984,6 +3032,8 @@ void os_reset_runtime_state_for_test(void) {
     g_code_tail_abandoned_bytes = 0;
     g_code_pages_taken = 0;
     g_code_bytes_allocated = 0;
+    g_code_run_extended = 0;
+    g_code_multipage_waste = 0;
 }
 
 
