@@ -38,6 +38,7 @@
 (load "test/lisp/frame_cell_gc_test.lisp")
 (load "test/lisp/jit_nest_depth_test.lisp")
 (load "test/lisp/jit_code_packing_test.lisp")
+(load "test/lisp/declaim_test.lisp")
 (load "test/lisp/disassemble_test.lisp")
 
 (isiki-test-report)

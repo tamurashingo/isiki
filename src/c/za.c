@@ -1706,11 +1706,16 @@ static int za_is_excluded_special_form(lisp_val_t head) {
     // flet/labels(za_compile_flet_labels)・quasiquote(za_compile_quasiquote)は
     // ここから除外する(za_compile_exprが一般呼び出し判定より前で無条件に認識するため、
     // ここに来た時点でどれでもない)。
+    // declaimはza.cが機械語を出せる形を持たない(environmentの10番目のスロットを
+    // 書き換える特殊形式)。ここへ入れておかないと一般呼び出しとしてコンパイルされ、
+    // 実行時にDECLAIMという関数が見つからずEVAL-ERRORになる。
+    // 本体にdeclaimを含む関数はインタプリタへ落とす(defun等と同じ扱い)
     return head == g_sym_quote ||
            head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
            head == g_sym_function ||
            head == g_sym_defvar || head == g_sym_defconstant ||
-           head == g_sym_defglobal;
+           head == g_sym_defglobal ||
+           head == g_sym_declaim;
 }
 
 /**
@@ -5899,7 +5904,8 @@ lisp_val_t cc_diag_jit_used(lisp_val_t args, lisp_val_t env) {
 UINT64 g_za_compile_calls = 0;
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
-                                lisp_val_t capture_env, lisp_val_t owner_env) {
+                                lisp_val_t capture_env, lisp_val_t owner_env,
+                                UINT64 optimize) {
     g_za_compile_calls++;
     g_za_analyze_steps = 0;
     g_za_analyze_over = 0;
@@ -6249,10 +6255,14 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         lisp_addr_t fixed_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (fixed_entry_offset - entry));
         lisp_val_t fn = os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, capture_env);
         os_fn_set_code_range(fn, (UINT64)(lisp_addr_t)dest_bytes, code_len);
+        /* [declaim] このコンパイルに効いていたoptimizeを事後確認用に記録する
+           (%%OPTIMIZE-OF)。本Phaseではコード生成に使っていない */
+        os_fn_set_optimize(fn, optimize);
         return fn;
     }
     lisp_val_t fn = os_make_jit_function(cons_entry_addr, capture_env);
     os_fn_set_code_range(fn, (UINT64)(lisp_addr_t)dest_bytes, code_len);
+    os_fn_set_optimize(fn, optimize);
     return fn;
 }
 
@@ -6328,7 +6338,9 @@ void os_register_za_primitives(void) {
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
-                                lisp_val_t capture_env, lisp_val_t owner_env) {
+                                lisp_val_t capture_env, lisp_val_t owner_env,
+                                UINT64 optimize) {
+    (void)optimize;
     (void)params;
     (void)body;
     (void)capture_env;

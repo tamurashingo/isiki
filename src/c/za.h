@@ -95,7 +95,8 @@
  * @return コンパイル済み関数のMAGIC_FUNCTION_NATIVE INSTANCE、失敗時はnil
  */
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
-                                lisp_val_t capture_env, lisp_val_t owner_env);
+                                lisp_val_t capture_env, lisp_val_t owner_env,
+                                UINT64 optimize);
 
 /**
  * za.c実装のネイティブ関数(%%DESTROY-ENVIRONMENT-RECLAIM、documents/environment.md
