@@ -774,6 +774,23 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env);
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t val, lisp_val_t env);
 
 /**
+ * defun/defmacro/defvar/defconstant/defglobal が「どこへ定義を書くか」を決める。
+ *
+ * インタプリタは関数適用・マクロ展開・flet/labels のたびに新しい環境を作るが、
+ * それらは呼び出しが終われば捨てられる。定義をそこへ書くと到達不能になるため
+ * (`(let ((x 1)) (defun f () x))` が呼べない、というバグの原因)、
+ * 定義は最も近い「捨てられない環境」へ書く。
+ *
+ * **自由変数の捕捉には使わないこと。** 捕捉は呼び出し時の env をそのまま
+ * 関数オブジェクトの word3 に入れる必要がある(そうしないと `let` が束縛した
+ * 変数を関数本体から見られなくなる)。
+ *
+ * @param env 呼び出し時の(レキシカルな)環境
+ * @return 定義を書き込むべき環境。見つからなければ global_environment
+ */
+lisp_val_t os_definition_env(lisp_val_t env);
+
+/**
  * envおよびその親を順に辿り、symの関数定義に対応するFunction Cellを取得する。
  * Function CellはImmobilized Space上の固定アドレスに置かれた8byteのセルで、現在の
  * 関数オブジェクトを保持する。cellのアドレス自体は(sym, env)の束縛が存在する間不変

@@ -3278,6 +3278,15 @@ lisp_val_t os_setcdr(lisp_val_t cons, lisp_val_t val) {
  * @param env 設定先の環境
  * @return fn_obj 自身
  */
+/**
+ * 定義(defun/defmacro/defvar/defconstant/defglobal)の書き込み先を決める。
+ * Step 2 の時点では恒等関数で、挙動は従来と完全に同じ。
+ * Step 3 で frame を読み飛ばす実装に差し替える。
+ */
+lisp_val_t os_definition_env(lisp_val_t env) {
+    return env;
+}
+
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
     // 新規追加パスではos_make_cons後にfn_obj/sym/envをreturnや後続のcellsスロット
     // 同期処理で読み直すため保護する(symは既存のfunctionsスロット処理では未使用の
