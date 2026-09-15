@@ -399,7 +399,7 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     lisp_val_t owner = os_definition_env(env);
     GC_PROTECT(owner);
 
-    lisp_val_t fn = za_try_compile_defun(params, body, env);
+    lisp_val_t fn = za_try_compile_defun(params, body, env, owner);
     if (fn == nil) {
         fn = make_interpreted_function(params, body, env);
     }

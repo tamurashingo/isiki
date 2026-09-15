@@ -5837,7 +5837,8 @@ lisp_val_t cc_diag_jit_used(lisp_val_t args, lisp_val_t env) {
     「何度も呼ばれている」かを切り分けるため、タイマーサンプラから読む */
 UINT64 g_za_compile_calls = 0;
 
-lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
+                                lisp_val_t capture_env, lisp_val_t owner_env) {
     g_za_compile_calls++;
     g_za_analyze_steps = 0;
     g_za_analyze_over = 0;
@@ -5859,7 +5860,10 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     // 守るだけで、値渡しで入ってきたこちらのコピーには及ばない)。
     // bodyはformを取り出すまでしか使わないので、ここでは保護しない
     GC_PROTECT(params);
-    GC_PROTECT(env);
+    GC_PROTECT(capture_env);
+    /* owner_envはコード生成(大量の確保)を跨いで、末尾のページ/リテラルスロット登録まで
+       生存する。保護しないとGCが1回走った時点でstaleになる(原則4) */
+    GC_PROTECT(owner_env);
 
     UINT64 fixed_count;
     if (!za_validate_params(params, &fixed_count)) {
@@ -6010,7 +6014,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         jit_patch_rel32(jmp_to_body_patch);
     }
 
-    if (!za_compile_expr(form, params, fixed_count, 0, &syms, env, 1, trampoline_offset, 0, 0, 0, 0)) {
+    if (!za_compile_expr(form, params, fixed_count, 0, &syms, capture_env, 1, trampoline_offset, 0, 0, 0, 0)) {
         g_za_use_param_slots = 0;
         za_release_literal_slot_allocs();
         g_jit_used = entry;
@@ -6142,13 +6146,13 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
         }
     }
 
-    os_environment_register_pages(env, dest, page_count);
+    os_environment_register_pages(owner_env, dest, page_count);
 
     // Phase3.6: このコンパイル試行で確保したリテラルスロットをenvの所有物として登録する
     // (pagesスロットと同じタイミング)。環境破棄時にos_environment_reclaim_literal_slotsが
     // za_free_literal_slotを呼んでフリーリストへ返却する。
     for (UINT32 i = 0; i < g_za_literal_slot_alloc_count; i++) {
-        os_environment_register_literal_slot(env, g_za_literal_slot_allocs[i]);
+        os_environment_register_literal_slot(owner_env, g_za_literal_slot_allocs[i]);
     }
     g_za_literal_slot_alloc_count = 0;
 
@@ -6162,9 +6166,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t e
     lisp_addr_t cons_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (cons_entry_offset - entry));
     if (use_param_slots) {
         lisp_addr_t fixed_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (fixed_entry_offset - entry));
-        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, env);
+        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, capture_env);
     }
-    return os_make_jit_function(cons_entry_addr, env);
+    return os_make_jit_function(cons_entry_addr, capture_env);
 }
 
 /**
@@ -6238,10 +6242,12 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
 }
 
-lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body, lisp_val_t env) {
+lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
+                                lisp_val_t capture_env, lisp_val_t owner_env) {
     (void)params;
     (void)body;
-    (void)env;
+    (void)capture_env;
+    (void)owner_env;
     return nil;
 }
 

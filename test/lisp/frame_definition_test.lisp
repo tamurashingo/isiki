@@ -101,3 +101,46 @@
 (defglobal *fd-r2* (with-environment *fd-env2* (defun fd-per-env () 'local)))
 (assert-equal 'global (fd-per-env))
 (assert-equal 'local (%%eval-in-environment '(fd-per-env) *fd-env2*))
+
+;;; --- Immobilized Page の所有者が frame ではなく environment であること ---
+;;
+;; za_try_compile_defun は「捕捉環境(capture_env)」と「登録先(owner_env)」を
+;; 別々に受け取る。ページとリテラルスロットを owner_env へ登録することで、
+;; destroy-environment の回収対象に入る。frame へ登録していた頃は
+;; frame が捨てられるだけでページは永久に残っていた。
+;;
+;; %%imm-space-used-bytes は bump 基準(高水位)なので回収では減らない。
+;; 代わりに「回収後はフリーリストからページが取れるので bump が進まない」ことを、
+;; Function Cell の大量確保(インタプリタの flet 1回 = 16 byte)で観測する。
+
+(defun fd-cellburn (x) (flet ((h () 1)) (setq x 0) (h)))   ; 固定引数setqでインタプリタ実行
+(defun fd-drive (n) (let ((i 0)) (while (< i n) (progn (fd-cellburn 1) (setq i (+ i 1))))))
+(assert-equal nil (%%za-compiled-p (function fd-cellburn)))
+
+;; 回収前: 512回 = 8192 byte = ちょうど2ページ分を bump から取る
+(defglobal *fd-a0* (%%imm-space-used-bytes))
+(defglobal *fd-w0* (fd-drive 512))
+(defglobal *fd-a1* (%%imm-space-used-bytes))
+
+;; 環境を作り、let 越しに defun してから破棄する
+(defglobal *fd-e* (make-environment 'fd-reclaim-env))
+(defglobal *fd-r1* (with-environment *fd-e* (let ((q 1)) (defun fd-re1 () q))))
+(defglobal *fd-r2* (with-environment *fd-e* (let ((q 2)) (defun fd-re2 () q))))
+(defglobal *fd-r3* (with-environment *fd-e* (let ((q 3)) (defun fd-re3 () q))))
+(defglobal *fd-r4* (with-environment *fd-e* (let ((q 4)) (defun fd-re4 () q))))
+
+;; frame ではなく環境 E に登録されていること。自由変数も見えること
+(assert-equal 1 (%%eval-in-environment '(fd-re1) *fd-e*))
+(assert-equal 4 (%%eval-in-environment '(fd-re4) *fd-e*))
+
+(defglobal *fd-a2* (%%imm-space-used-bytes))
+(assert-equal t (destroy-environment *fd-e*))
+;; 破棄しても bump 基準の使用量は減らない(回収はフリーリストへの返却)
+(assert-equal *fd-a2* (%%imm-space-used-bytes))
+
+;; 破棄で4ページ以上が解放されたので、続く2ページ分の確保は
+;; フリーリストから取られ bump は一切進まない
+(defglobal *fd-w1* (fd-drive 512))
+(assert-equal 0 (- (%%imm-space-used-bytes) *fd-a2*))
+;; 対照: 回収前の同じ処理は bump を消費していた
+(assert-equal t (> (- *fd-a1* *fd-a0*) 0))
