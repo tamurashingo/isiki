@@ -3581,7 +3581,28 @@ static void za_emit_fn_resolve_cached(lisp_val_t fn_sym) {
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
         jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_function_cell);
         jit_call_r11();
+
+        /* os_get_function_cellは未定義の名前に対してnilを返す(runtime.c)。これを
+           そのままキャッシュすると、上のキャッシュ有無判定(test r10,r10 / jne)は
+           **0かどうか**しか見ないため、nil(0ではないタグ付きヒープ値)が入った時点で
+           以後ずっと「解決済み」と見なされる。結果、呼び出し先を後から定義しても
+           永久に未定義のままになる:
+
+             (defun early () (later))   ; laterはまだ未定義
+             (early)                    ; EVAL-ERROR(ここまでは想定内)
+             (defun later () 99)
+             (early)                    ; ★ 修正前はEVAL-ERRORのまま
+
+           nilならストアを飛ばし、次回の呼び出しでもう一度解決させる。
+           nilの値は起動後は不変だが、即値として焼き込まず**グローバル変数nilの
+           アドレスをmovabsしてderef**する(global_environmentを同じ手口で扱っている
+           za_compile_flet_labelsの先例に合わせる)。 */
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&nil);
+        jit_mov_reg_from_mem_disp8(ZA_REG_R11, ZA_REG_R11, 0);
+        jit_cmp_rax_r11();
+        UINT64 fn_cache_skip_store_patch = jit_emit_je_rel32_placeholder();
         jit_mov_mem_disp8_from_reg(ZA_REG_R14, 0, ZA_REG_RAX);
+        jit_patch_rel32(fn_cache_skip_store_patch);
 
         jit_patch_rel32(fn_cache_have_patch);
     } else {
