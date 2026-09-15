@@ -35,6 +35,7 @@
 (load "test/lisp/fn_cell_cache_test.lisp")
 (load "test/lisp/frame_definition_test.lisp")
 (load "test/lisp/frame_variable_test.lisp")
+(load "test/lisp/frame_cell_gc_test.lisp")
 
 (isiki-test-report)
 (close *isiki-test-stream*)

@@ -1123,6 +1123,34 @@ lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env) {
 
 /* os_imm_space_used_bytesが参照する2本のスロットカーソル(実体は下方で定義) */
 static imm_slot_cursor_t g_function_cell_cursor;
+
+/**
+ * 全 Function Cell を繋ぐ単方向リストの先頭(最後に作られた cell)。
+ *
+ * cell は os_imm_slot_alloc へ 8byte を要求するが、同関数は 16byte 境界へ丸めるため
+ * 後半 8byte は元々未使用のまま確保されていた。そこを next ポインタに使うので、
+ * このリストは**追加のメモリを一切消費しない**。
+ *
+ * [重要] これを os_gc_register_root へ渡してはならない。指す先は Immobilized Space 上の
+ * 不動アドレスであり GC の移動対象ではない。gc_copy_value に渡すと、GCヒープでない
+ * アドレスを転送ポインタとして解釈しようとして壊れる。
+ */
+static lisp_val_t *g_function_cell_list_head = 0;
+
+/** これまでに作られた Function Cell の総数(= リストの長さ)。cell には解放経路が無く、
+ * flet/labels は呼び出しのたびに新しい cell を作るので単調増加する。
+ * GCの走査量がこれに比例するようになったため、外から観測できるようにしておく
+ * (documents/pitfalls.md 原則6: 失敗は観測可能にすること)。 */
+static UINT64 g_function_cell_count = 0;
+
+/** 組み込み関数%%DIAG-FN-CELL-COUNT。これまでに作られたFunction Cellの総数。
+ * GCがgc_fixup_all_function_cellsで毎回走査する件数でもある。 */
+lisp_val_t primitive_fn_cell_count(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(g_function_cell_count);
+}
+
 static imm_slot_cursor_t g_fn_meta_cursor;
 /** 直近にImmobilized Spaceへ要求された確保サイズ(枯渇時の診断表示用) */
 static UINT64 g_imm_last_request_bytes = 0;
@@ -1843,10 +1871,10 @@ static void gc_scan_queue(void) {
 }
 
 /**
- * envの`cells`スロット(Function Cell、os_get_function_cell/os_set_function参照)が
- * キャッシュしている関数オブジェクトのアドレスを、今回のGCで確定した転送先へ
- * 更新する。Function Cell自身(TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)
- * はgc_copy_valueが素通しするためcellsのalist構造自体は通常のcons走査
+ * 全Function Cell(os_get_function_cell/os_set_function参照)がキャッシュしている
+ * 関数オブジェクトのアドレスを、今回のGCで確定した転送先へ更新する。Function Cell自身
+ * (TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)はgc_copy_valueが素通しする
+ * ためcellsのalist構造自体は通常のcons走査
  * (gc_scan_queue)で正しく再配置されるが、各セルが指す先の中身(fn_obj)はImmobilized
  * Spaceという生メモリに生ポインタ越しに保存されているためgc_scan_queueの走査対象に
  * 含まれず、その関数オブジェクトが本来のfunctionsスロット経由で移動された後も
@@ -1854,24 +1882,34 @@ static void gc_scan_queue(void) {
  * 場所)を指し続けてしまう。放置すると、is_macro/apply_functionがこの転送ポインタを
  * 関数オブジェクトのマジックナンバーと誤読し、EVAL-ERRORを誤って生成する
  * (PART-M4調査で特定)。
- * @param env cellsスロットを持つ環境(nilなら何もしない)
+ *
+ * 走査はg_function_cell_list_headから始まる単方向リストを辿る。環境の`cells`スロットは
+ * 所有関係(どの環境のどの名前に紐づくか)を保持するために残っており、こちらの
+ * alist構造自体は通常のcons走査(gc_scan_queue)で正しく再配置される。
  */
-static void gc_fixup_environment_cells(lisp_val_t env) {
-    // env==0はheadless実行でF2〜F4のようにまだos_evalを一度も通っていない
-    // プロセスのenv初期値(process.cのproc->env=0)。nil(タグ付きシンボルの実アドレス、
-    // 0ではない)とは別物であり、この生の0をcc_car/cc_cdrへそのまま渡すと低位メモリを
-    // consとして辿ってしまい、実測でGCサイクル依存の無限ループ(ハング)を引き起こした
-    if (env == nil || env == 0) {
-        return;
-    }
-    lisp_val_t cells_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))));
-    lisp_val_t cells_alist = cc_cdr(cells_slot);
-    while (cells_alist != nil) {
-        lisp_val_t pair = cc_car(cells_alist);
-        lisp_val_t cell_tagged = cc_cdr(pair);
-        lisp_val_t *cell_ptr = (lisp_val_t *)(lisp_addr_t)(cell_tagged & ~TAG_MASK);
-        *cell_ptr = gc_copy_value(*cell_ptr);
-        cells_alist = cc_cdr(cells_alist);
+static void gc_fixup_all_function_cells(void) {
+    // cellsスロットが指す先(Function Cell本体)はImmobilized Space上の生メモリなので
+    // gc_scan_queueの走査対象外であり、個別に再配置する必要がある。
+    //
+    // 以前は「global_environmentと各proc->envのcellsスロットを辿る」形だったが、
+    // それでは flet/labels が作る frame の cells が漏れていた。frame は
+    // *environments* にも proc->env にも載らないので列挙できず、実際に
+    // 「flet束縛をJITから呼ぶとGC1回で壊れる」というバグになっていた
+    // (documents/known-bug-frame-cell-gc.md)。全cellを繋いだリストを辿ることで、
+    // どの環境に属するcellかに関わらず漏れなく再配置する。
+    //
+    // 強参照である(gc_copy_valueを無条件に呼ぶ)。cellが指す関数オブジェクトは
+    // cell自身によって生き延びる。これは「JITされたコードが呼ぶ相手は、そのコードと
+    // 同じ寿命を持つ」という設計判断で、JITコード自体がdestroy-environment以外で
+    // 回収されないことと一貫している。弱参照にすると、flet を抜けたあと束縛関数への
+    // 参照がcellだけになった時点でそれが回収され、呼び出し元がダングリングする。
+    lisp_val_t *cell = g_function_cell_list_head;
+    while (cell != 0) {
+        // cell[0]はos_set_functionが必ず実在のlisp_val_tで初期化する(未初期化のcellは
+        // リストに繋がらない)。nilが入ることはある(flet/labelsの束縛復元で、元々
+        // 未束縛だった名前にnilを書き戻す場合)が、gc_copy_valueはnilを素通しする
+        cell[0] = gc_copy_value(cell[0]);
+        cell = (lisp_val_t *)(lisp_addr_t)cell[1];
     }
 }
 
@@ -2002,16 +2040,12 @@ static void os_gc_collect_body(void) {
 
     gc_scan_queue();
 
-    // Function Cell(cellsスロット)の中身の再配置。global_environmentと各プロセスの
-    // env(上のg_gc_extra_rootsループで既にTo空間上の最新アドレスに更新済み)、いずれも
-    // 通常のcons構造としてはここまでで再配置済みだが、cellsが指す先のfn_objは
-    // Immobilized Space上の生メモリなのでgc_scan_queueの走査対象外のため個別に修正する。
+    // Function Cellの中身の再配置。cellはImmobilized Space上の生メモリで、環境の
+    // cellsスロットからはTAG_RAW_POINTERで参照されるためgc_scan_queueの走査対象外。
+    // 全cellを繋いだリストを辿って個別に修正する(gc_fixup_all_function_cells)。
     // gc_copy_valueが未発見のオブジェクトを新たにキューへ積む可能性に備え、直後に
     // 再度gc_scan_queueでキューを空にする
-    gc_fixup_environment_cells(global_environment);
-    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
-        gc_fixup_environment_cells(get_process(i)->env);
-    }
+    gc_fixup_all_function_cells();
     gc_scan_queue();
 
     UINT8 *new_from_start = g_to_start;
@@ -2240,6 +2274,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-FN-CELL-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_fn_cell_count), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
@@ -2636,6 +2671,10 @@ void os_reset_runtime_state_for_test(void) {
     g_imm_free_list = 0;
     g_function_cell_cursor.page = 0;
     g_function_cell_cursor.offset = 0;
+    // Immobilized Spaceごと巻き戻すので、cellリストも空にしないと
+    // 次のテストで再利用された領域を古いcellとして辿ってしまう
+    g_function_cell_list_head = 0;
+    g_function_cell_count = 0;
     g_fn_meta_cursor.page = 0;
     g_fn_meta_cursor.offset = 0;
 }
@@ -3317,7 +3356,7 @@ lisp_val_t os_definition_env(lisp_val_t env) {
     /* env==0 は、まだ一度もos_evalを通っていないプロセスのproc->env初期値
        (process.cのproc->env=0)。nil(タグ付きの実アドレス、0ではない)とは別物で、
        これをcc_carへ渡すと低位メモリをconsとして辿ってしまう
-       (gc_fixup_environment_cellsが同じ理由で同じ検査をしている) */
+       (旧gc_fixup_environment_cellsが同じ理由で同じ検査をしていた) */
     lisp_val_t cur = env;
     while (cur != nil && cur != 0) {
         /* 1番目のスロットのcar。environmentならNAME、frameならFRAME。
@@ -3382,9 +3421,20 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
         lisp_addr_t cell_addr = (lisp_addr_t)(cc_cdr(existing_cell_pair) & ~TAG_MASK);
         *(lisp_val_t *)cell_addr = fn_obj;
     } else {
-        // 新規セルをImmobilized Spaceに確保し、fn_objで初期化してcellsへ追加する
-        lisp_val_t *cell_ptr = (lisp_val_t *)os_imm_slot_alloc(&g_function_cell_cursor, sizeof(lisp_val_t));
-        *cell_ptr = fn_obj;
+        // 新規セルをImmobilized Spaceに確保し、fn_objで初期化してcellsへ追加する。
+        // 確保サイズは「cell本体8byte + nextポインタ8byte」を明示的に要求する。
+        // 従来は sizeof(lisp_val_t) を渡していたが os_imm_slot_alloc が 16byte へ
+        // 丸めるため実消費は同じで、後半8byteが未使用のまま残っていた。
+        lisp_val_t *cell_ptr = (lisp_val_t *)os_imm_slot_alloc(&g_function_cell_cursor, 2 * sizeof(lisp_val_t));
+        cell_ptr[0] = fn_obj;
+        // [重要] 値を書いた直後、**他の確保を一切挟まずに**リストへ繋ぐこと。
+        // 間に os_make_cons 等が入ると、そこで走ったGCがこのcellを取りこぼし、
+        // fn_objが移動したのにcellは旧アドレスを指したまま残る。
+        // ページはフリーリストから再利用されることがあり(os_imm_page_alloc)、
+        // ゼロ初期化は保証されないので next は必ず明示的に書く。
+        cell_ptr[1] = (lisp_val_t)(lisp_addr_t)g_function_cell_list_head;
+        g_function_cell_list_head = cell_ptr;
+        g_function_cell_count++;
         lisp_val_t tagged_cell = ((lisp_val_t)(lisp_addr_t)cell_ptr) | TAG_RAW_POINTER;
         lisp_val_t new_cell_pair = os_make_cons(sym, tagged_cell);
         lisp_val_t new_cells_alist = os_make_cons(new_cell_pair, cells_alist);
