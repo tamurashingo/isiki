@@ -32,6 +32,12 @@
 (load "test/lisp/aot_leaf_gc_test.lisp")
 (load "test/lisp/za_code_imm_test.lisp")
 (load "test/lisp/za_abi_probe_test.lisp")
+(load "test/lisp/fn_cell_cache_test.lisp")
+(load "test/lisp/frame_definition_test.lisp")
+(load "test/lisp/frame_variable_test.lisp")
+(load "test/lisp/frame_cell_gc_test.lisp")
+(load "test/lisp/jit_nest_depth_test.lisp")
+(load "test/lisp/jit_code_packing_test.lisp")
 (load "test/lisp/disassemble_test.lisp")
 
 (isiki-test-report)

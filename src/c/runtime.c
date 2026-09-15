@@ -136,6 +136,7 @@ lisp_val_t g_sym_progn;
 lisp_val_t g_sym_setq;
 /** defun特殊形式を表すシンボル */
 lisp_val_t g_sym_defun;
+lisp_val_t g_sym_frame;
 /** lambda特殊形式を表すシンボル */
 lisp_val_t g_sym_lambda;
 /** defmacro特殊形式を表すシンボル */
@@ -1100,6 +1101,30 @@ static UINT8 *g_imm_bump = g_imm_space;
 /** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */
 static void *g_imm_free_list = 0;
 
+/* ---- JITコードのパッキング(環境ごとのbumpカーソル)の診断カウンタ ----
+   充填率が想定より低かったときに、原因が「環境の切り替え」なのか
+   「1ページに収まらない大きい関数」なのかを切り分けるために数える
+   (documents/pitfalls.md 原則6: 失敗は観測可能にすること)。 */
+/** カーソルから切り出せた回数(ページを新たに取らずに済んだ) */
+static UINT64 g_code_alloc_from_cursor = 0;
+/** 新しいページを取った回数(1ページ以内の関数) */
+static UINT64 g_code_alloc_new_page = 0;
+/** 1ページに収まらず連続確保へ回した回数 */
+static UINT64 g_code_alloc_multipage = 0;
+/** ページ末尾を使い切れずに捨てた回数(= 分断) */
+static UINT64 g_code_tail_abandoned = 0;
+/** 同、捨てたbyte数の合計 */
+static UINT64 g_code_tail_abandoned_bytes = 0;
+/** コードのために取ったページの総数(単一ページ+連続確保ぶん)。充填率の分母 */
+static UINT64 g_code_pages_taken = 0;
+/** 切り出したコードのbyte数の合計(16byteアライン後)。充填率の分子 */
+static UINT64 g_code_bytes_allocated = 0;
+/** 走行を延長してページ境界をまたいだ回数 */
+static UINT64 g_code_run_extended = 0;
+/** 1ページを超える関数をページ単位へ切り上げたことで生じた未使用byte。
+ * カーソルを介さないので、ここは詰められない(充填率の残る損失の内訳) */
+static UINT64 g_code_multipage_waste = 0;
+
 /** g_imm_bumpがこれまでにg_imm_spaceから切り出した延べページ数。M13で、init.lispから
  * トランスパイル対象関数を移動したことによるImmobilized Space使用量の削減を測定する
  * テストのためのアクセサ(os_gc_collect_countと同じ、テスト専用の内部状態公開) */
@@ -1136,6 +1161,34 @@ lisp_val_t primitive_imm_space_used_bytes(lisp_val_t args, lisp_val_t env) {
 
 /* os_imm_space_used_bytesが参照する2本のスロットカーソル(実体は下方で定義) */
 static imm_slot_cursor_t g_function_cell_cursor;
+
+/**
+ * 全 Function Cell を繋ぐ単方向リストの先頭(最後に作られた cell)。
+ *
+ * cell は os_imm_slot_alloc へ 8byte を要求するが、同関数は 16byte 境界へ丸めるため
+ * 後半 8byte は元々未使用のまま確保されていた。そこを next ポインタに使うので、
+ * このリストは**追加のメモリを一切消費しない**。
+ *
+ * [重要] これを os_gc_register_root へ渡してはならない。指す先は Immobilized Space 上の
+ * 不動アドレスであり GC の移動対象ではない。gc_copy_value に渡すと、GCヒープでない
+ * アドレスを転送ポインタとして解釈しようとして壊れる。
+ */
+static lisp_val_t *g_function_cell_list_head = 0;
+
+/** これまでに作られた Function Cell の総数(= リストの長さ)。cell には解放経路が無く、
+ * flet/labels は呼び出しのたびに新しい cell を作るので単調増加する。
+ * GCの走査量がこれに比例するようになったため、外から観測できるようにしておく
+ * (documents/pitfalls.md 原則6: 失敗は観測可能にすること)。 */
+static UINT64 g_function_cell_count = 0;
+
+/** 組み込み関数%%DIAG-FN-CELL-COUNT。これまでに作られたFunction Cellの総数。
+ * GCがgc_fixup_all_function_cellsで毎回走査する件数でもある。 */
+lisp_val_t primitive_fn_cell_count(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(g_function_cell_count);
+}
+
 static imm_slot_cursor_t g_fn_meta_cursor;
 /** 直近にImmobilized Spaceへ要求された確保サイズ(枯渇時の診断表示用) */
 static UINT64 g_imm_last_request_bytes = 0;
@@ -1406,6 +1459,168 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
     void *slot = cursor->page + cursor->offset;
     cursor->offset += aligned;
     return slot;
+}
+
+/**
+ * environmentのcode-cursorスロット(9番目)を取り出す。frameは持たないのでnilになる。
+ * 戻り値はスロットのcons自体((code-cursor . 値))で、呼び出し元が値を読み書きする。
+ * @param env environment(frameやnilを渡してもnilが返るだけで壊れない)
+ * @return スロットのcons、持たない場合はnil
+ */
+static lisp_val_t imm_code_cursor_slot(lisp_val_t env) {
+    if (env == nil || env == 0) {
+        return nil;
+    }
+    /* 9番目 = cddddr(cddddr(env))のcar。8スロットしか持たないframeでは
+       cc_cdrがnilを返し続け、cc_car(nil)==nilになるので安全に「持たない」を表せる */
+    lisp_val_t rest = cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))))));
+    lisp_val_t slot = cc_car(rest);
+    /* nil(=frame、またはリストの終端)を書き込み先にしてはならない。
+       nilは自己参照consなので、cdrを書き換えるとnilそのものが壊れる */
+    if ((slot & TAG_MASK) != TAG_CONS || slot == nil) {
+        return nil;
+    }
+    return slot;
+}
+
+/**
+ * JITコードの配置先をImmobilized Spaceから切り出す(パッキング)。
+ *
+ * ページを環境ごとのbumpカーソルで分け合う。**1ページは必ず1つの環境に属する**:
+ * 別の環境のdefunが来たらそのページは使わず新しいページを取る。これは
+ * destroy-environmentがページ単位で回収するため(os_environment_reclaim_pages →
+ * os_imm_page_free)で、同居させると解放されたページの先頭8byteが
+ * フリーリストのnextポインタで上書きされ、生きているコードが壊れる。
+ *
+ * ページまたぎは行わない。1ページに収まらない関数は従来どおり
+ * os_imm_pages_alloc_contiguousで連続確保し、カーソルには影響させない。
+ *
+ * 単一ページの取得はos_imm_page_alloc(フリーリストを見る)を使う。これにより
+ * destroy-environmentで返ったページがコードとして再利用される。
+ *
+ * @param owner_env 登録先の環境(capture_envではなくowner_env。frameを渡すと
+ *                  カーソルを持たないので毎回新しいページになる)
+ * @param size 必要なbyte数
+ * @param out_new_pages 新たに取ったページの先頭(取らなかった場合は0)
+ * @param out_new_page_count 新たに取ったページ数(取らなかった場合は0)。
+ *                  呼び出し元はこれが非0のときだけos_environment_register_pagesを呼ぶ
+ * @return 配置先アドレス(16byteアライン)。確保できなければ0
+ */
+void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
+                        void **out_new_pages, UINT64 *out_new_page_count) {
+    *out_new_pages = 0;
+    *out_new_page_count = 0;
+    UINT64 aligned = (size + 15) & ~15ULL;
+    g_imm_last_request_bytes = aligned;
+
+    /* 1ページに収まらない関数は連続領域が要る。フリーリストは単一ページの鎖で
+       連続領域を切り出せないので、従来どおりbumpから取る。カーソルには影響させない */
+    if (aligned > IMM_PAGE_SIZE) {
+        UINT64 count = (aligned + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
+        void *pages = os_imm_pages_alloc_contiguous(count);
+        if (pages == 0) {
+            return 0;
+        }
+        g_code_alloc_multipage++;
+        g_code_pages_taken += count;
+        g_code_bytes_allocated += aligned;
+        g_code_multipage_waste += count * IMM_PAGE_SIZE - aligned;
+        *out_new_pages = pages;
+        *out_new_page_count = count;
+        return pages;
+    }
+
+    lisp_val_t slot = imm_code_cursor_slot(owner_env);
+    if (slot != nil) {
+        lisp_val_t cur = cc_cdr(slot);
+        if (cur != nil) {
+            UINT64 packed = os_fixnum_magnitude(cur);
+            UINT64 off = packed & 0xFFFFFFFFULL;
+            UINT64 end = packed >> 32;
+
+            /* (1) 走行の残りに収まる */
+            if (aligned <= end - off) {
+                g_code_alloc_from_cursor++;
+                g_code_bytes_allocated += aligned;
+                ((lisp_val_t *)(slot & ~TAG_MASK))[1] =
+                    os_make_fixnum(((end) << 32) | (off + aligned));
+                return (void *)(g_imm_space + off);
+            }
+
+            /* (2) 走行を延長できるならまたぐ。
+               成立条件は「走行の終端がg_imm_bumpと一致していること」で、そのときに限り
+               bumpから取る次のページが走行と物理的に連続する(g_imm_spaceは16MBの
+               連続した静的配列)。またいだ2ページはどちらも同じownerのもので、
+               両方ともpagesスロットへ登録されるためdestroy-environmentの回収単位は
+               壊れない。禁じたいのは「1ページに複数の環境」であって「1関数が2ページ」
+               ではない。
+
+               [仕様] 延長が成立するのはbump由来のページだけで、フリーリストから
+               取ったページでは基本的に成立しない(bumpは巻き戻らないので、
+               フリーリスト由来のページの直後がbumpになるのは、それが最後に
+               切り出されたページだった場合に限られる)。この非対称は意図したもので、
+               「空きが飛び飛びの位置にあるならまたがない」が自動的に満たされる。
+               なお仮に成立した場合も、2ページは物理的に連続しており両方とも
+               同じownerへ登録されるので安全である。
+
+               [重要] 1ページを超える要求は上で処理済みなので、ここでは
+               aligned <= IMM_PAGE_SIZE が保証される。したがって1ページ足せば
+               必ず収まる((end - off) + IMM_PAGE_SIZE >= aligned)。 */
+            if ((UINT8 *)(g_imm_space + end) == g_imm_bump) {
+                void *page = os_imm_pages_alloc_contiguous(1);
+                if (page != 0) {
+                    g_code_run_extended++;
+                    g_code_pages_taken++;
+                    g_code_bytes_allocated += aligned;
+                    UINT64 new_end = end + IMM_PAGE_SIZE;
+                    ((lisp_val_t *)(slot & ~TAG_MASK))[1] =
+                        os_make_fixnum((new_end << 32) | (off + aligned));
+                    *out_new_pages = page;
+                    *out_new_page_count = 1;
+                    return (void *)(g_imm_space + off);
+                }
+                /* 空間が尽きていた。下の新規ページ確保でもう一度試みる */
+            }
+
+            /* (3) 延長できないので走行を張り直す。末尾は捨てる(= 分断) */
+            if (end > off) {
+                g_code_tail_abandoned++;
+                g_code_tail_abandoned_bytes += (end - off);
+            }
+        }
+    }
+
+    /* 新しいページを取る。os_imm_page_allocはフリーリストを先に見るので、
+       destroy-environmentで返ったページがここで再利用される */
+    void *page = os_imm_page_alloc();
+    g_code_alloc_new_page++;
+    g_code_pages_taken++;
+    g_code_bytes_allocated += aligned;
+    *out_new_pages = page;
+    *out_new_page_count = 1;
+    if (slot != nil) {
+        UINT64 off = (UINT64)((UINT8 *)page - g_imm_space);
+        UINT64 end = off + IMM_PAGE_SIZE;
+        ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum((end << 32) | (off + aligned));
+    }
+    return page;
+}
+
+/** 組み込み関数%%DIAG-CODE-PACKING。パッキングの内訳を
+ * (カーソルから ページ新規 複数ページ 分断回数 分断byte 総ページ数 総確保byte 延長回数
+ *  複数ページ確保の端数byte)
+ * のリストで返す。充填率 = 総確保byte / (総ページ数 * 4096)。 */
+lisp_val_t primitive_diag_code_packing(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    lisp_val_t l9 = os_make_cons(os_make_fixnum(g_code_multipage_waste), nil);
+    lisp_val_t l8 = os_make_cons(os_make_fixnum(g_code_run_extended), l9);
+    lisp_val_t l7 = os_make_cons(os_make_fixnum(g_code_bytes_allocated), l8);
+    lisp_val_t l6 = os_make_cons(os_make_fixnum(g_code_pages_taken), l7);
+    lisp_val_t l5 = os_make_cons(os_make_fixnum(g_code_tail_abandoned_bytes), l6);
+    lisp_val_t l4 = os_make_cons(os_make_fixnum(g_code_tail_abandoned), l5);
+    lisp_val_t l3 = os_make_cons(os_make_fixnum(g_code_alloc_multipage), l4);
+    lisp_val_t l2 = os_make_cons(os_make_fixnum(g_code_alloc_new_page), l3);
+    return os_make_cons(os_make_fixnum(g_code_alloc_from_cursor), l2);
 }
 
 /** Function Cell(os_get_function_cell/os_set_function参照)の確保に使う
@@ -2001,10 +2216,10 @@ static void gc_scan_queue(void) {
 }
 
 /**
- * envの`cells`スロット(Function Cell、os_get_function_cell/os_set_function参照)が
- * キャッシュしている関数オブジェクトのアドレスを、今回のGCで確定した転送先へ
- * 更新する。Function Cell自身(TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)
- * はgc_copy_valueが素通しするためcellsのalist構造自体は通常のcons走査
+ * 全Function Cell(os_get_function_cell/os_set_function参照)がキャッシュしている
+ * 関数オブジェクトのアドレスを、今回のGCで確定した転送先へ更新する。Function Cell自身
+ * (TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)はgc_copy_valueが素通しする
+ * ためcellsのalist構造自体は通常のcons走査
  * (gc_scan_queue)で正しく再配置されるが、各セルが指す先の中身(fn_obj)はImmobilized
  * Spaceという生メモリに生ポインタ越しに保存されているためgc_scan_queueの走査対象に
  * 含まれず、その関数オブジェクトが本来のfunctionsスロット経由で移動された後も
@@ -2012,24 +2227,34 @@ static void gc_scan_queue(void) {
  * 場所)を指し続けてしまう。放置すると、is_macro/apply_functionがこの転送ポインタを
  * 関数オブジェクトのマジックナンバーと誤読し、EVAL-ERRORを誤って生成する
  * (PART-M4調査で特定)。
- * @param env cellsスロットを持つ環境(nilなら何もしない)
+ *
+ * 走査はg_function_cell_list_headから始まる単方向リストを辿る。環境の`cells`スロットは
+ * 所有関係(どの環境のどの名前に紐づくか)を保持するために残っており、こちらの
+ * alist構造自体は通常のcons走査(gc_scan_queue)で正しく再配置される。
  */
-static void gc_fixup_environment_cells(lisp_val_t env) {
-    // env==0はheadless実行でF2〜F4のようにまだos_evalを一度も通っていない
-    // プロセスのenv初期値(process.cのproc->env=0)。nil(タグ付きシンボルの実アドレス、
-    // 0ではない)とは別物であり、この生の0をcc_car/cc_cdrへそのまま渡すと低位メモリを
-    // consとして辿ってしまい、実測でGCサイクル依存の無限ループ(ハング)を引き起こした
-    if (env == nil || env == 0) {
-        return;
-    }
-    lisp_val_t cells_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))));
-    lisp_val_t cells_alist = cc_cdr(cells_slot);
-    while (cells_alist != nil) {
-        lisp_val_t pair = cc_car(cells_alist);
-        lisp_val_t cell_tagged = cc_cdr(pair);
-        lisp_val_t *cell_ptr = (lisp_val_t *)(lisp_addr_t)(cell_tagged & ~TAG_MASK);
-        *cell_ptr = gc_copy_value(*cell_ptr);
-        cells_alist = cc_cdr(cells_alist);
+static void gc_fixup_all_function_cells(void) {
+    // cellsスロットが指す先(Function Cell本体)はImmobilized Space上の生メモリなので
+    // gc_scan_queueの走査対象外であり、個別に再配置する必要がある。
+    //
+    // 以前は「global_environmentと各proc->envのcellsスロットを辿る」形だったが、
+    // それでは flet/labels が作る frame の cells が漏れていた。frame は
+    // *environments* にも proc->env にも載らないので列挙できず、実際に
+    // 「flet束縛をJITから呼ぶとGC1回で壊れる」というバグになっていた
+    // (documents/known-bug-frame-cell-gc.md)。全cellを繋いだリストを辿ることで、
+    // どの環境に属するcellかに関わらず漏れなく再配置する。
+    //
+    // 強参照である(gc_copy_valueを無条件に呼ぶ)。cellが指す関数オブジェクトは
+    // cell自身によって生き延びる。これは「JITされたコードが呼ぶ相手は、そのコードと
+    // 同じ寿命を持つ」という設計判断で、JITコード自体がdestroy-environment以外で
+    // 回収されないことと一貫している。弱参照にすると、flet を抜けたあと束縛関数への
+    // 参照がcellだけになった時点でそれが回収され、呼び出し元がダングリングする。
+    lisp_val_t *cell = g_function_cell_list_head;
+    while (cell != 0) {
+        // cell[0]はos_set_functionが必ず実在のlisp_val_tで初期化する(未初期化のcellは
+        // リストに繋がらない)。nilが入ることはある(flet/labelsの束縛復元で、元々
+        // 未束縛だった名前にnilを書き戻す場合)が、gc_copy_valueはnilを素通しする
+        cell[0] = gc_copy_value(cell[0]);
+        cell = (lisp_val_t *)(lisp_addr_t)cell[1];
     }
 }
 
@@ -2106,6 +2331,7 @@ static void os_gc_collect_body(void) {
     g_sym_progn = gc_copy_value(g_sym_progn);
     g_sym_setq = gc_copy_value(g_sym_setq);
     g_sym_defun = gc_copy_value(g_sym_defun);
+    g_sym_frame = gc_copy_value(g_sym_frame);
     g_sym_lambda = gc_copy_value(g_sym_lambda);
     g_sym_defmacro = gc_copy_value(g_sym_defmacro);
     g_sym_block = gc_copy_value(g_sym_block);
@@ -2159,16 +2385,12 @@ static void os_gc_collect_body(void) {
 
     gc_scan_queue();
 
-    // Function Cell(cellsスロット)の中身の再配置。global_environmentと各プロセスの
-    // env(上のg_gc_extra_rootsループで既にTo空間上の最新アドレスに更新済み)、いずれも
-    // 通常のcons構造としてはここまでで再配置済みだが、cellsが指す先のfn_objは
-    // Immobilized Space上の生メモリなのでgc_scan_queueの走査対象外のため個別に修正する。
+    // Function Cellの中身の再配置。cellはImmobilized Space上の生メモリで、環境の
+    // cellsスロットからはTAG_RAW_POINTERで参照されるためgc_scan_queueの走査対象外。
+    // 全cellを繋いだリストを辿って個別に修正する(gc_fixup_all_function_cells)。
     // gc_copy_valueが未発見のオブジェクトを新たにキューへ積む可能性に備え、直後に
     // 再度gc_scan_queueでキューを空にする
-    gc_fixup_environment_cells(global_environment);
-    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
-        gc_fixup_environment_cells(get_process(i)->env);
-    }
+    gc_fixup_all_function_cells();
     gc_scan_queue();
 
     UINT8 *new_from_start = g_to_start;
@@ -2256,6 +2478,7 @@ void os_bootstrap() {
         g_sym_progn = os_make_symbol("PROGN");
         g_sym_setq = os_make_symbol("SETQ");
         g_sym_defun = os_make_symbol("DEFUN");
+        g_sym_frame = os_make_symbol("FRAME");
         g_sym_lambda = os_make_symbol("LAMBDA");
         g_sym_defmacro = os_make_symbol("DEFMACRO");
         g_sym_block = os_make_symbol("BLOCK");
@@ -2396,6 +2619,8 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-FN-CELL-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_fn_cell_count), global_environment);
+        os_set_function(os_make_symbol("%%DIAG-CODE-PACKING"), os_make_native_function((lisp_addr_t)(void *)primitive_diag_code_packing), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
@@ -2792,8 +3017,23 @@ void os_reset_runtime_state_for_test(void) {
     g_imm_free_list = 0;
     g_function_cell_cursor.page = 0;
     g_function_cell_cursor.offset = 0;
+    // Immobilized Spaceごと巻き戻すので、cellリストも空にしないと
+    // 次のテストで再利用された領域を古いcellとして辿ってしまう
+    g_function_cell_list_head = 0;
+    g_function_cell_count = 0;
     g_fn_meta_cursor.page = 0;
     g_fn_meta_cursor.offset = 0;
+    /* コードカーソルの実体は各環境のスロット側にあり、環境ごと作り直されるので
+       ここでリセットするのは診断カウンタだけでよい */
+    g_code_alloc_from_cursor = 0;
+    g_code_alloc_new_page = 0;
+    g_code_alloc_multipage = 0;
+    g_code_tail_abandoned = 0;
+    g_code_tail_abandoned_bytes = 0;
+    g_code_pages_taken = 0;
+    g_code_bytes_allocated = 0;
+    g_code_run_extended = 0;
+    g_code_multipage_waste = 0;
 }
 
 
@@ -2922,8 +3162,17 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
  * @param parent_env 親環境。ルート環境の場合はnil
  * @return 作成した環境
  */
-lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
+/**
+ * os_make_environment / os_make_frame の共通実装。1番目のスロットのcarに入れる
+ * タグ(NAME または FRAME)だけが違う。
+ * @param slot_tag 1番目のスロットのcarに入れるシンボル
+ * @param env_symbol 環境の名前を表すsymbol(1番目のスロットのcdrに入る)
+ * @param parent_env 親環境。ルート環境の場合はnil
+ * @return 作成した環境またはframe
+ */
+static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env_symbol, lisp_val_t parent_env) {
     // TODO: env_name が TAG_SYMBOL のチェック
+    GC_PROTECT(slot_tag);
     GC_PROTECT(env_symbol);
     GC_PROTECT(parent_env);
 
@@ -2954,7 +3203,10 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
      * os_environment_register_literal_slotで登録し、環境破棄時に
      * os_environment_reclaim_literal_slotsがza.c側のフリーリストへ返却する(Phase3.6)。
      */
-    lisp_val_t name_symbol = os_make_symbol("name");
+    // 1番目のスロットのcarは呼び出し元が決める(NAME か FRAME)。
+    // g_sym_frameはos_bootstrapでinternされておりGCルートでもあるため、
+    // ここで新たに確保する必要は無い
+    lisp_val_t name_symbol = slot_tag;
     GC_PROTECT(name_symbol);
     lisp_val_t variables_symbol = os_make_symbol("variables");
     GC_PROTECT(variables_symbol);
@@ -2970,6 +3222,16 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     GC_PROTECT(pages_symbol);
     lisp_val_t literal_slots_symbol = os_make_symbol("literal-slots");
     GC_PROTECT(literal_slots_symbol);
+    /* 9番目のスロット(code-cursor)はenvironmentにだけ持たせる。frameは
+       let/fletの評価ごとに作られるhot pathなので、consを1つ増やさない。
+       defunの登録先はos_definition_envがframeを読み飛ばして必ずenvironmentを返すため、
+       frameがコードページを所有することは無い(os_imm_code_allocも念のため検査する)。 */
+    int want_code_cursor = (slot_tag != g_sym_frame);
+    lisp_val_t code_cursor_symbol = nil;
+    if (want_code_cursor) {
+        code_cursor_symbol = os_make_symbol("code-cursor");
+    }
+    GC_PROTECT(code_cursor_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     GC_PROTECT(name_slot);
@@ -2986,8 +3248,21 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     lisp_val_t pages_slot = os_make_cons(pages_symbol, nil);
     GC_PROTECT(pages_slot);
     lisp_val_t literal_slots_slot = os_make_cons(literal_slots_symbol, nil);
+    GC_PROTECT(literal_slots_slot);
 
-    lisp_val_t list_step7 = os_make_cons(literal_slots_slot, nil);
+    /* code-cursorの値は「g_imm_spaceの先頭からの、次に使えるbyteオフセット」を表す
+       fixnum、またはカーソル未設定を表すnil。fixnumは即値(os_make_fixnumは確保しない)
+       なので、切り出しのたびにconsを作らずスロットのcdrを書き換えるだけで済む。
+       (off & (IMM_PAGE_SIZE-1)) == 0 は「現在のページを使い切った」を意味する
+       (次のページの所有権は無いので、残り容量は0として扱う)。 */
+    lisp_val_t list_step8 = nil;
+    if (want_code_cursor) {
+        lisp_val_t code_cursor_slot = os_make_cons(code_cursor_symbol, nil);
+        list_step8 = os_make_cons(code_cursor_slot, nil);
+    }
+    GC_PROTECT(list_step8);
+
+    lisp_val_t list_step7 = os_make_cons(literal_slots_slot, list_step8);
     lisp_val_t list_step6 = os_make_cons(pages_slot, list_step7);
     lisp_val_t list_step5 = os_make_cons(cells_slot, list_step6);
     lisp_val_t list_step4 = os_make_cons(constants_slot, list_step5);
@@ -2997,6 +3272,21 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     lisp_val_t env_obj = os_make_cons(name_slot, list_step1);
 
     return env_obj;
+}
+
+lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
+    // [原則4] os_make_symbolは未internのシンボルに対して確保するため、その前に
+    // 引数を保護する。引数の評価順は未規定なので、保護より先に引数スロットへ
+    // 読み出されているとGCで古いまま渡ってしまう
+    GC_PROTECT(env_symbol);
+    GC_PROTECT(parent_env);
+    lisp_val_t slot_tag = os_make_symbol("name");
+    return os_make_environment_tagged(slot_tag, env_symbol, parent_env);
+}
+
+lisp_val_t os_make_frame(lisp_val_t env_symbol, lisp_val_t parent_env) {
+    // g_sym_frameはos_bootstrapでintern済みかつGCルートなので、ここでは確保が起きない
+    return os_make_environment_tagged(g_sym_frame, env_symbol, parent_env);
 }
 
 /**
@@ -3459,6 +3749,33 @@ lisp_val_t os_setcdr(lisp_val_t cons, lisp_val_t val) {
  * @param env 設定先の環境
  * @return fn_obj 自身
  */
+/**
+ * 定義(defun/defmacro/defvar/defconstant/defglobal)の書き込み先を決める。
+ * frame(1番目のスロットのcarがFRAME)を親方向へ読み飛ばし、最初に見つかった
+ * environmentを返す。
+ */
+lisp_val_t os_definition_env(lisp_val_t env) {
+    /* env==0 は、まだ一度もos_evalを通っていないプロセスのproc->env初期値
+       (process.cのproc->env=0)。nil(タグ付きの実アドレス、0ではない)とは別物で、
+       これをcc_carへ渡すと低位メモリをconsとして辿ってしまう
+       (旧gc_fixup_environment_cellsが同じ理由で同じ検査をしていた) */
+    lisp_val_t cur = env;
+    while (cur != nil && cur != 0) {
+        /* 1番目のスロットのcar。environmentならNAME、frameならFRAME。
+           スロットの**位置**は両者で同一なので、既存の位置依存アクセスには影響しない */
+        if (cc_car(cc_car(cur)) != g_sym_frame) {
+            return cur;
+        }
+        /* parentスロット(4番目)。os_get_function_cellの親辿りと同じ式 */
+        cur = cc_cdr(cc_car(cc_cdr(cc_cdr(cc_cdr(cur)))));
+    }
+    /* frameしか無いまま親チェーンが尽きた場合。AOTがリフトしたlambdaの捕捉環境は
+       **親を持たない**(transpile.lispの「親を持たない、この捕捉専用の環境」)ので
+       実際にここへ到達する。nilを返すと登録先が無くなって落ちるため、
+       全環境チェーンの根であるglobal_environmentへ落とす */
+    return global_environment;
+}
+
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
     // 新規追加パスではos_make_cons後にfn_obj/sym/envをreturnや後続のcellsスロット
     // 同期処理で読み直すため保護する(symは既存のfunctionsスロット処理では未使用の
@@ -3506,9 +3823,20 @@ lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {
         lisp_addr_t cell_addr = (lisp_addr_t)(cc_cdr(existing_cell_pair) & ~TAG_MASK);
         *(lisp_val_t *)cell_addr = fn_obj;
     } else {
-        // 新規セルをImmobilized Spaceに確保し、fn_objで初期化してcellsへ追加する
-        lisp_val_t *cell_ptr = (lisp_val_t *)os_imm_slot_alloc(&g_function_cell_cursor, sizeof(lisp_val_t));
-        *cell_ptr = fn_obj;
+        // 新規セルをImmobilized Spaceに確保し、fn_objで初期化してcellsへ追加する。
+        // 確保サイズは「cell本体8byte + nextポインタ8byte」を明示的に要求する。
+        // 従来は sizeof(lisp_val_t) を渡していたが os_imm_slot_alloc が 16byte へ
+        // 丸めるため実消費は同じで、後半8byteが未使用のまま残っていた。
+        lisp_val_t *cell_ptr = (lisp_val_t *)os_imm_slot_alloc(&g_function_cell_cursor, 2 * sizeof(lisp_val_t));
+        cell_ptr[0] = fn_obj;
+        // [重要] 値を書いた直後、**他の確保を一切挟まずに**リストへ繋ぐこと。
+        // 間に os_make_cons 等が入ると、そこで走ったGCがこのcellを取りこぼし、
+        // fn_objが移動したのにcellは旧アドレスを指したまま残る。
+        // ページはフリーリストから再利用されることがあり(os_imm_page_alloc)、
+        // ゼロ初期化は保証されないので next は必ず明示的に書く。
+        cell_ptr[1] = (lisp_val_t)(lisp_addr_t)g_function_cell_list_head;
+        g_function_cell_list_head = cell_ptr;
+        g_function_cell_count++;
         lisp_val_t tagged_cell = ((lisp_val_t)(lisp_addr_t)cell_ptr) | TAG_RAW_POINTER;
         lisp_val_t new_cell_pair = os_make_cons(sym, tagged_cell);
         lisp_val_t new_cells_alist = os_make_cons(new_cell_pair, cells_alist);
@@ -3595,6 +3923,13 @@ void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 coun
 }
 
 void os_environment_reclaim_pages(lisp_val_t env) {
+    /* コードカーソルは解放するページのどれかを指しているので、必ず先に畳む。
+       残したままにすると、破棄済み環境へdefunしたときに他の環境へ払い出された
+       ページへコードを書き込むことになる */
+    lisp_val_t cursor_slot = imm_code_cursor_slot(env);
+    if (cursor_slot != nil) {
+        ((lisp_val_t *)(cursor_slot & ~TAG_MASK))[1] = nil;
+    }
     lisp_val_t pages_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))))));
     lisp_val_t list = cc_cdr(pages_slot);
 

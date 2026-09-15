@@ -10,7 +10,7 @@
 ;;;; M10ではlambdaによる第一級(エスケープ可能)クロージャを追加する。lambda式は
 ;;;; トップレベルのC関数(defunと同じ__step/公開ラッパーの2関数構成)へリフトし、
 ;;;; 自由変数(パラメータでも他のdefun/プリミティブ名でもない裸の変数参照)だけを
-;;;; 含む最小限の環境(os_make_environment)に捕捉する。捕捉方式はza.cの拡張4と
+;;;; 含む最小限のframe(os_make_frame)に捕捉する。捕捉方式はza.cの拡張4と
 ;;;; 同じSBCL方式の変数単位box昇格: setqされ、かつ何らかのネストしたlambdaに
 ;;;; 捕捉される変数だけをbox((val . 実値)のcons、os_setcdrで書き換え、cc_cdrで
 ;;;; 読み出す)として扱い、それ以外は値コピーで捕捉する。boxは複数のクロージャが
@@ -1688,7 +1688,8 @@
    なりg_sym_eval_errorを返す。global_environmentは全ての環境チェーンの根なので
    代わりにこれを渡す(自由変数を捕捉しないため意味的にも安全)。自由変数がある
    場合は、
-   os_make_environment(親を持たない、この捕捉専用の環境)を作りGC_PROTECTしたのち、
+   os_make_frame(親を持たない、この捕捉専用のframe)を作りGC_PROTECTしたのち、
+   (定義の登録先にはならない。runtime.h の os_make_frame 参照)
    各自由変数についてOUTER-SCOPE(このlambda式が出現した時点の外側のscope)での
    現在の値(box化されていればboxそのもの、そうでなければ値そのもの)を
    os_env_add_binding_pairで(sym . 値)ペアとして連結する。boxそのものを共有
@@ -1712,7 +1713,7 @@
   (if (null free-vars)
       (format nil "os_make_lifted_closure_with_meta(({ static za_fn_meta_t __closure_meta; &__closure_meta; }), (lisp_addr_t)(void *)~A, global_environment)" c-name)
       (let ((env-temp (format nil "__closure_env_~A" (incf *closure-temp-counter*))))
-        (format nil "({ lisp_val_t ~A = os_make_environment(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure_with_meta(({ static za_fn_meta_t __closure_meta; &__closure_meta; }), (lisp_addr_t)(void *)~A, ~A); })"
+        (format nil "({ lisp_val_t ~A = os_make_frame(({ static int __closure_env_name_idx = -1; os_make_symbol_cached(&__closure_env_name_idx, ~A); }), nil); GC_PROTECT(~A); ~{~A~}os_make_lifted_closure_with_meta(({ static za_fn_meta_t __closure_meta; &__closure_meta; }), (lisp_addr_t)(void *)~A, ~A); })"
                 env-temp
                 (c-string-literal c-name)
                 env-temp
