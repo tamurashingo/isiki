@@ -2661,14 +2661,14 @@ static void za_emit_build_capture_env(lisp_val_t params, UINT64 fixed_count, con
     jit_call_r11();
     za_store_slot(ZA_REG_RAX, saved_head_off);
 
-    // 2. 新規env = os_make_environment("LAMBDA-ENV", 現在のenv)を構築し、linkする。
+    // 2. 新規frame = os_make_frame("LAMBDA-ENV", 現在のenv)を構築し、linkする。
     UINT64 env_name_off = za_emit_symbol_name(os_make_symbol("LAMBDA-ENV"));
     jit_movabs_self_ref(ZA_REG_RCX, env_name_off);
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_symbol);
     jit_call_r11();
     jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
     za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_environment);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_make_frame);
     jit_call_r11();
     za_store_slot(ZA_REG_RAX, env_val_off);
     za_emit_gc_link_slot(env_val_off, env_node_off);

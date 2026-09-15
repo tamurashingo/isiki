@@ -136,6 +136,7 @@ lisp_val_t g_sym_progn;
 lisp_val_t g_sym_setq;
 /** defun特殊形式を表すシンボル */
 lisp_val_t g_sym_defun;
+lisp_val_t g_sym_frame;
 /** lambda特殊形式を表すシンボル */
 lisp_val_t g_sym_lambda;
 /** defmacro特殊形式を表すシンボル */
@@ -1947,6 +1948,7 @@ static void os_gc_collect_body(void) {
     g_sym_progn = gc_copy_value(g_sym_progn);
     g_sym_setq = gc_copy_value(g_sym_setq);
     g_sym_defun = gc_copy_value(g_sym_defun);
+    g_sym_frame = gc_copy_value(g_sym_frame);
     g_sym_lambda = gc_copy_value(g_sym_lambda);
     g_sym_defmacro = gc_copy_value(g_sym_defmacro);
     g_sym_block = gc_copy_value(g_sym_block);
@@ -2097,6 +2099,7 @@ void os_bootstrap() {
         g_sym_progn = os_make_symbol("PROGN");
         g_sym_setq = os_make_symbol("SETQ");
         g_sym_defun = os_make_symbol("DEFUN");
+        g_sym_frame = os_make_symbol("FRAME");
         g_sym_lambda = os_make_symbol("LAMBDA");
         g_sym_defmacro = os_make_symbol("DEFMACRO");
         g_sym_block = os_make_symbol("BLOCK");
@@ -2763,8 +2766,17 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
  * @param parent_env 親環境。ルート環境の場合はnil
  * @return 作成した環境
  */
-lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
+/**
+ * os_make_environment / os_make_frame の共通実装。1番目のスロットのcarに入れる
+ * タグ(NAME または FRAME)だけが違う。
+ * @param slot_tag 1番目のスロットのcarに入れるシンボル
+ * @param env_symbol 環境の名前を表すsymbol(1番目のスロットのcdrに入る)
+ * @param parent_env 親環境。ルート環境の場合はnil
+ * @return 作成した環境またはframe
+ */
+static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env_symbol, lisp_val_t parent_env) {
     // TODO: env_name が TAG_SYMBOL のチェック
+    GC_PROTECT(slot_tag);
     GC_PROTECT(env_symbol);
     GC_PROTECT(parent_env);
 
@@ -2795,7 +2807,10 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
      * os_environment_register_literal_slotで登録し、環境破棄時に
      * os_environment_reclaim_literal_slotsがza.c側のフリーリストへ返却する(Phase3.6)。
      */
-    lisp_val_t name_symbol = os_make_symbol("name");
+    // 1番目のスロットのcarは呼び出し元が決める(NAME か FRAME)。
+    // g_sym_frameはos_bootstrapでinternされておりGCルートでもあるため、
+    // ここで新たに確保する必要は無い
+    lisp_val_t name_symbol = slot_tag;
     GC_PROTECT(name_symbol);
     lisp_val_t variables_symbol = os_make_symbol("variables");
     GC_PROTECT(variables_symbol);
@@ -2838,6 +2853,21 @@ lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
     lisp_val_t env_obj = os_make_cons(name_slot, list_step1);
 
     return env_obj;
+}
+
+lisp_val_t os_make_environment(lisp_val_t env_symbol, lisp_val_t parent_env) {
+    // [原則4] os_make_symbolは未internのシンボルに対して確保するため、その前に
+    // 引数を保護する。引数の評価順は未規定なので、保護より先に引数スロットへ
+    // 読み出されているとGCで古いまま渡ってしまう
+    GC_PROTECT(env_symbol);
+    GC_PROTECT(parent_env);
+    lisp_val_t slot_tag = os_make_symbol("name");
+    return os_make_environment_tagged(slot_tag, env_symbol, parent_env);
+}
+
+lisp_val_t os_make_frame(lisp_val_t env_symbol, lisp_val_t parent_env) {
+    // g_sym_frameはos_bootstrapでintern済みかつGCルートなので、ここでは確保が起きない
+    return os_make_environment_tagged(g_sym_frame, env_symbol, parent_env);
 }
 
 /**
@@ -3280,11 +3310,29 @@ lisp_val_t os_setcdr(lisp_val_t cons, lisp_val_t val) {
  */
 /**
  * 定義(defun/defmacro/defvar/defconstant/defglobal)の書き込み先を決める。
- * Step 2 の時点では恒等関数で、挙動は従来と完全に同じ。
- * Step 3 で frame を読み飛ばす実装に差し替える。
+ * frame(1番目のスロットのcarがFRAME)を親方向へ読み飛ばし、最初に見つかった
+ * environmentを返す。
  */
 lisp_val_t os_definition_env(lisp_val_t env) {
-    return env;
+    /* env==0 は、まだ一度もos_evalを通っていないプロセスのproc->env初期値
+       (process.cのproc->env=0)。nil(タグ付きの実アドレス、0ではない)とは別物で、
+       これをcc_carへ渡すと低位メモリをconsとして辿ってしまう
+       (gc_fixup_environment_cellsが同じ理由で同じ検査をしている) */
+    lisp_val_t cur = env;
+    while (cur != nil && cur != 0) {
+        /* 1番目のスロットのcar。environmentならNAME、frameならFRAME。
+           スロットの**位置**は両者で同一なので、既存の位置依存アクセスには影響しない */
+        if (cc_car(cc_car(cur)) != g_sym_frame) {
+            return cur;
+        }
+        /* parentスロット(4番目)。os_get_function_cellの親辿りと同じ式 */
+        cur = cc_cdr(cc_car(cc_cdr(cc_cdr(cc_cdr(cur)))));
+    }
+    /* frameしか無いまま親チェーンが尽きた場合。AOTがリフトしたlambdaの捕捉環境は
+       **親を持たない**(transpile.lispの「親を持たない、この捕捉専用の環境」)ので
+       実際にここへ到達する。nilを返すと登録先が無くなって落ちるため、
+       全環境チェーンの根であるglobal_environmentへ落とす */
+    return global_environment;
 }
 
 lisp_val_t os_set_function(lisp_val_t sym, lisp_val_t fn_obj, lisp_val_t env) {

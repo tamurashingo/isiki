@@ -149,7 +149,7 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         GC_PROTECT(evaluated_args);
         GC_PROTECT(closure_env);
         GC_PROTECT(body);
-        lisp_val_t call_env = os_make_environment(os_make_symbol("CALL-ENV"), closure_env);
+        lisp_val_t call_env = os_make_frame(os_make_symbol("CALL-ENV"), closure_env);
         // bind_params内のGC_PROTECTはbind_params自身のスタックフレーム限りで、
         // ここ(呼び出し元)のcall_envローカルは別のスタックスロットなので追随しない。
         // bind_params完了後もcall_envをeval_prognに渡すため、ここでも保護する
@@ -457,7 +457,7 @@ static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
     lisp_val_t body = cc_cdr(args);
     GC_PROTECT(bindings);
     GC_PROTECT(body);
-    lisp_val_t new_env = os_make_environment(os_make_symbol("FLET-ENV"), env);
+    lisp_val_t new_env = os_make_frame(os_make_symbol("FLET-ENV"), env);
     GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
@@ -496,7 +496,7 @@ static lisp_val_t eval_labels(lisp_val_t args, lisp_val_t env) {
     lisp_val_t body = cc_cdr(args);
     GC_PROTECT(bindings);
     GC_PROTECT(body);
-    lisp_val_t new_env = os_make_environment(os_make_symbol("LABELS-ENV"), env);
+    lisp_val_t new_env = os_make_frame(os_make_symbol("LABELS-ENV"), env);
     GC_PROTECT(new_env);
 
     for (lisp_val_t b = bindings; b != nil; b = cc_cdr(b)) {
@@ -582,7 +582,7 @@ static lisp_val_t apply_macro(lisp_val_t macro, lisp_val_t args) {
     GC_PROTECT(params);
     GC_PROTECT(args);
     GC_PROTECT(body);
-    lisp_val_t call_env = os_make_environment(os_make_symbol("MACRO-ENV"), closure_env);
+    lisp_val_t call_env = os_make_frame(os_make_symbol("MACRO-ENV"), closure_env);
     GC_PROTECT(call_env);
     bind_params(params, args, call_env);
     return eval_progn(body, call_env);
