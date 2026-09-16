@@ -1192,6 +1192,20 @@ static UINT64 g_function_cell_count = 0;
 
 /** 組み込み関数%%DIAG-FN-CELL-COUNT。これまでに作られたFunction Cellの総数。
  * GCがgc_fixup_all_function_cellsで毎回走査する件数でもある。 */
+/** [実験] 組み込み関数%%PINNED-REGISTER。r12の現在値をfixnumで返す。
+ * documents/bench-pinned-nil.md の 4-2(r12にnilが入っているかの確認)専用。
+ * 通常ビルドでは意味のある値ではない(gccがr12を作業用に使っているため)。 */
+lisp_val_t primitive_pinned_register(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+#if defined(__x86_64__) && !defined(ISIKIOS_UNIT_TEST)
+    UINT64 v = 0;
+    __asm__ __volatile__("mov %%r12, %0" : "=r"(v));
+    return os_make_fixnum(v);
+#else
+    return os_make_fixnum(0);
+#endif
+}
+
 lisp_val_t primitive_fn_cell_count(lisp_val_t args, lisp_val_t env) {
     (void)args;
     (void)env;
@@ -2787,6 +2801,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
         os_set_function(os_make_symbol("%%DIAG-FN-CELL-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_fn_cell_count), global_environment);
+        os_set_function(os_make_symbol("%%PINNED-REGISTER"), os_make_native_function((lisp_addr_t)(void *)primitive_pinned_register), global_environment);  /* [実験] */
         os_set_function(os_make_symbol("%%DIAG-CODE-PACKING"), os_make_native_function((lisp_addr_t)(void *)primitive_diag_code_packing), global_environment);
         os_set_function(os_make_symbol("%%CURRENT-OPTIMIZE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_optimize), global_environment);
         os_set_function(os_make_symbol("%%OPTIMIZE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_optimize_of), global_environment);
