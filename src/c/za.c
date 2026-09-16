@@ -144,9 +144,76 @@ static void jit_emit64(UINT64 v) {
     jit_emit32((UINT32)(v >> 32));
 }
 
+/* ---- 64bit即値の materialize ----------------------------------------------
+   movabs(REX.W + B8+rd + imm64)は常に10byte。一方 mov r32, imm32(B8+rd + imm32、
+   REXは上位レジスタのときだけ)は5〜6byteで、**書き込み時に上位32bitがゼロ拡張される**
+   ので、値が2^32未満なら完全に等価である。
+
+   実測(documents/jit-immediate-operands.md): JITが即値で焼くもの——nil(g_nil_cell)、
+   カーネル関数のアドレス、.bss上のスロットアドレス——はすべてカーネルイメージか
+   その.bssにあり、**RAMを8GBに増やしてもアドレスは3,036MB止まりで4GBを超えない**
+   (QEMUのPCIホールで低位RAMが約3GBに制限され、UEFIはそこへロードするため)。
+   4GB超のRAMではGCヒープだけが4GBを超えるが、**GCヒープのアドレスは設計上焼かない**
+   (移動するため。za_classify_operandを参照)。
+
+   したがって短い形がほぼ常に効くが、**収まらない場合は必ずmovabsへフォールバックする**。
+   判定はJIT時に実アドレスが分かっているので値を見るだけでよい。
+
+   [重要] jit_movabs_self_refはこの短縮を使ってはならない(後から即値を8byte書き換える
+   前提で patch_offset = g_jit_used + 2 を記録しているため)。専用に
+   jit_movabs_reg_full を使う。 */
+
+/* ---- 即値の発行位置の記録(原則8の監査用)--------------------------------
+   「生成コードにGCヒープのアドレスが焼かれていないか」をza_try_compile_defunの末尾で
+   確認している。以前は生成コードをバイト走査して movabs(10byte)のパターンを探して
+   いたが、短縮形 mov r32, imm32 は **先頭1byteが0xB8〜0xBF というだけ**なので、
+   バイト走査に足すと他の命令の途中に大量に誤マッチする(実測: RAM 4GBの構成で
+   GCヒープ範囲が広いため247件の誤検出)。
+
+   そこで**発行した時点で位置と幅を記録する**。デコードが要らないので誤検出がゼロになり、
+   短縮形も漏れなく拾える。 */
+#define ZA_MAX_IMM_SITES 4096
+static UINT64 g_za_imm_site_off[ZA_MAX_IMM_SITES];  /* g_jit_code内の即値フィールド先頭 */
+static UINT8  g_za_imm_site_width[ZA_MAX_IMM_SITES];/* 4 or 8 */
+static UINT64 g_za_imm_site_count = 0;
+/** 記録しきれなかった件数。0でなければ監査は「不完全」である */
+static UINT64 g_za_imm_site_overflow = 0;
+
+static void za_record_imm_site(UINT64 field_off, UINT8 width) {
+    if (g_za_imm_site_count < ZA_MAX_IMM_SITES) {
+        g_za_imm_site_off[g_za_imm_site_count] = field_off;
+        g_za_imm_site_width[g_za_imm_site_count] = width;
+        g_za_imm_site_count++;
+    } else {
+        g_za_imm_site_overflow++;
+    }
+}
+
+/** movabs reg, imm64。**常に10byte**。あとから即値を書き換える箇所専用 */
+static void jit_movabs_reg_full(UINT8 reg, UINT64 imm) {
+    jit_emit8((UINT8)(0x48 | ((reg >> 3) & 1)));
+    jit_emit8((UINT8)(0xB8 | (reg & 7)));
+    za_record_imm_site(g_jit_used, 8);
+    jit_emit64(imm);
+}
+
+/** 値をregへ置く。2^32未満なら mov r32, imm32(5〜6byte)、そうでなければ movabs(10byte) */
+static void jit_load_imm_reg(UINT8 reg, UINT64 imm) {
+    if (imm <= 0xFFFFFFFFULL) {
+        if (reg >= 8) {
+            jit_emit8(0x41);            /* REX.B。REX.Wは付けない(ゼロ拡張させる) */
+        }
+        jit_emit8((UINT8)(0xB8 | (reg & 7)));
+        za_record_imm_site(g_jit_used, 4);
+        jit_emit32((UINT32)imm);
+        return;
+    }
+    jit_movabs_reg_full(reg, imm);
+}
+
 // 手書き用の命令
-static void jit_movabs_rax(UINT64 imm) { jit_emit8(0x48); jit_emit8(0xB8); jit_emit64(imm); }
-static void jit_movabs_r11(UINT64 imm) { jit_emit8(0x49); jit_emit8(0xBB); jit_emit64(imm); }
+static void jit_movabs_rax(UINT64 imm) { jit_load_imm_reg(0, imm); }
+static void jit_movabs_r11(UINT64 imm) { jit_load_imm_reg(11, imm); }
 
 static void jit_push_rbx(void) { jit_emit8(0x53); }
 static void jit_pop_rbx(void) { jit_emit8(0x5B); }
@@ -225,12 +292,11 @@ static void jit_cmove_reg_reg(UINT8 dst, UINT8 src) {
     jit_emit8((UINT8)(0xC0 | ((dst & 7) << 3) | (src & 7)));
 }
 
-/** movabs reg, imm64 (任意レジスタ版。既存のjit_movabs_rax/r11の一般化) */
+/** 値をregへ置く(任意レジスタ版)。収まれば mov r32, imm32 へ短縮する。
+ * 名前は歴史的経緯でmovabsのままだが、常にmovabsを出すわけではない
+ * (書き換え前提の箇所は jit_movabs_reg_full を使うこと) */
 static void jit_movabs_reg(UINT8 reg, UINT64 imm) {
-    UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
-    jit_emit8(rex);
-    jit_emit8((UINT8)(0xB8 | (reg & 7)));
-    jit_emit64(imm);
+    jit_load_imm_reg(reg, imm);
 }
 
 /** g_jit_code内の自己参照movabs(g_jit_code+offset形式の即値)の最大記録数。
@@ -300,7 +366,9 @@ static void jit_movabs_self_ref(UINT8 reg, UINT64 target_off) {
     } else {
         g_jit_overflow = 1;
     }
-    jit_movabs_reg(reg, (UINT64)(void *)(g_jit_code + target_off));
+    /* [重要] 短縮してはならない。上で記録した patch_offset(= g_jit_used + 2)へ
+       za_try_compile_defunが後から8byteを書き込むため、命令長が変わると壊れる */
+    jit_movabs_reg_full(reg, (UINT64)(void *)(g_jit_code + target_off));
 }
 
 /** and reg, imm8 (符号拡張、"and r/m64, imm8"opcode0x83 /4でエンコード) */
@@ -5029,27 +5097,11 @@ lisp_val_t cc_diag_za_code_len(lisp_val_t args, lisp_val_t env) {
     動いたか」も分かる */
 lisp_val_t cc_diag_za_scan(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
-    g_za_scan_count = 0;
-    if (g_za_last_code == 0 || g_za_last_code_len < 10) {
-        return os_make_fixnum(0);
-    }
-    for (UINT64 i = 0; i + 10 <= g_za_last_code_len; i++) {
-        UINT8 rex = g_za_last_code[i];
-        UINT8 op = g_za_last_code[i + 1];
-        if ((rex != 0x48 && rex != 0x49) || (op & 0xF8) != 0xB8) {
-            continue;
-        }
-        UINT64 imm = 0;
-        for (UINT64 b = 0; b < 8; b++) {
-            imm |= ((UINT64)g_za_last_code[i + 2 + b]) << (b * 8);
-        }
-        if (g_za_scan_count < ZA_MAX_SCAN_IMM) {
-            g_za_scan_off[g_za_scan_count] = i;
-            g_za_scan_val[g_za_scan_count] = imm;
-            g_za_scan_count++;
-        }
-        i += 9; /* この命令の残りは読み飛ばす */
-    }
+    /* za_try_compile_defunの末尾(原則8の監査)が、発行時に記録した即値の位置から
+       g_za_scan_off/valを埋めている。ここではその件数を返すだけでよい。
+       以前はここで生成コードをバイト走査し直していたが、短縮形 mov r32, imm32 を
+       正しくデコードできず誤検出するため、記録ベースへ統一した
+       (documents/jit-immediate-operands.md)。 */
     return os_make_fixnum(g_za_scan_count);
 }
 
@@ -6121,6 +6173,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     /* [declaim] このコンパイル試行に効くoptimize/inline指定。emitterはg_za_declaimを
        見る(引数で持ち回ると署名が広範囲に波及するため) */
     g_za_declaim = optimize;
+    /* 即値サイトの記録をこのコンパイル試行ぶんだけにする(原則8の監査用) */
+    g_za_imm_site_count = 0;
+    g_za_imm_site_overflow = 0;
     /* 前回の試行が途中で長いジャンプ(setjmp等)で抜けた場合に備えて0に戻す。
        通常はラッパが必ずデクリメントするので0のままのはず */
     g_za_compile_nest = 0;
@@ -6335,20 +6390,32 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
        fixnum即値がたまたまヒープ範囲に落ちる誤検出を避けるため、タグが
        ヒープオブジェクトを表すもの(CONS/SYMBOL/STRING/INSTANCE)に限って判定する。
        FIXNUM(0)・CHAR(3)・RAW_POINTER(7)の即値は対象外。 */
-    for (UINT64 i = 0; i + 10 <= code_len; i++) {
-        UINT8 rex = dest_bytes[i];
-        UINT8 opc = dest_bytes[i + 1];
-        if ((rex != 0x48 && rex != 0x49) || (opc & 0xF8) != 0xB8) {
+    /* [記録ベース] バイト走査ではなく、発行時に記録した即値の位置を使う
+       (za_record_imm_site参照)。短縮形 mov r32, imm32 は先頭1byteが0xB8〜0xBFと
+       いうだけなので、バイト走査に足すと他の命令の途中へ大量に誤マッチする。
+       記録なら誤検出がゼロで、短縮形も漏れない。
+       オフセットはg_jit_code基準なのでentryを引いてdest_bytes基準へ直す。 */
+    g_za_scan_count = 0;
+    for (UINT64 k = 0; k < g_za_imm_site_count; k++) {
+        UINT64 off = g_za_imm_site_off[k];
+        if (off < entry || off >= g_jit_used) {
+            continue;   /* このコンパイル試行のものではない(ロールバック分など) */
+        }
+        UINT64 rel = off - entry;
+        UINT8 w = g_za_imm_site_width[k];
+        if (rel + w > code_len) {
             continue;
         }
         UINT64 imm = 0;
-        for (UINT64 b = 0; b < 8; b++) {
-            imm |= ((UINT64)dest_bytes[i + 2 + b]) << (b * 8);
+        for (UINT64 b = 0; b < w; b++) {
+            imm |= ((UINT64)dest_bytes[rel + b]) << (b * 8);
         }
-        i += 9;
+        if (g_za_scan_count < ZA_MAX_SCAN_IMM) {
+            g_za_scan_off[g_za_scan_count] = rel;
+            g_za_scan_val[g_za_scan_count] = imm;
+            g_za_scan_count++;
+        }
         /* [単一の真実源] 「GCで動く値か」はos_tag_is_heap_refに集約している。
-           かつてはCONS/SYMBOL/STRING/INSTANCEを直接列挙しており、
-           TAG_FORWARDが黙って漏れていた(runtime.h参照)。
            fixnum即値がたまたまヒープ範囲に落ちるのを拾わない性質は保たれる
            (FIXNUM/CHAR/RAW_POINTERはos_tag_is_heap_refが0を返す) */
         if (!os_tag_is_heap_ref(imm & TAG_MASK)) {
@@ -6358,7 +6425,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         if (region == 0 || region == 1) {
             g_za_heap_imm_count++;
             if (g_za_heap_imm_first_off == 0) {
-                g_za_heap_imm_first_off = i - 9;
+                g_za_heap_imm_first_off = rel;
             }
         }
     }
