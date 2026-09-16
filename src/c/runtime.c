@@ -152,6 +152,10 @@ lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 lisp_val_t g_sym_flet;
 lisp_val_t g_sym_declaim;
+lisp_val_t g_sym_null;
+lisp_val_t g_sym_eq;
+lisp_val_t g_sym_inline;
+lisp_val_t g_sym_notinline;
 lisp_val_t g_sym_optimize;
 lisp_val_t g_sym_speed;
 lisp_val_t g_sym_safety;
@@ -1208,6 +1212,42 @@ lisp_val_t primitive_current_optimize(lisp_val_t args, lisp_val_t env) {
     return optimize_to_list(os_env_optimize(env));
 }
 
+/** インラインビットを、指定されている名前のリストへ展開する。
+ * 順序は INLINE_BIT_* の並びに合わせる(car cdr null eq) */
+static lisp_val_t inline_to_list(UINT64 packed) {
+    UINT64 bits = DECLAIM_INLINE_BITS(packed);
+    lisp_val_t r = nil;
+    /* 末尾から積んで (car cdr null eq) の順にする */
+    if (bits & INLINE_BIT_EQ)   { r = os_make_cons(g_sym_eq, r); }
+    if (bits & INLINE_BIT_NULL) { r = os_make_cons(g_sym_null, r); }
+    if (bits & INLINE_BIT_CDR)  { r = os_make_cons(g_sym_cdr, r); }
+    if (bits & INLINE_BIT_CAR)  { r = os_make_cons(g_sym_car, r); }
+    return r;
+}
+
+/** 組み込み関数%%CURRENT-INLINE。現在の環境でinline指定されている名前のリスト。 */
+lisp_val_t primitive_current_inline(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    return inline_to_list(os_env_optimize(env));
+}
+
+/** 組み込み関数%%INLINE-OF。関数がコンパイルされたときのinline指定。
+ * インタプリタ実行の関数(metaを持たない)はnil。 */
+lisp_val_t primitive_inline_of(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_SYMBOL) {
+        val = os_get_function(val, env);
+    }
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE || obj[1] == 0) {
+        return nil;
+    }
+    return inline_to_list(((za_fn_meta_t *)obj[1])->optimize);
+}
+
 /** 組み込み関数%%OPTIMIZE-OF。関数がコンパイルされたときに有効だったoptimize指定を
  * (speed safety space) で返す。インタプリタ実行の関数(metaを持たない)はnil。 */
 lisp_val_t primitive_optimize_of(lisp_val_t args, lisp_val_t env) {
@@ -1550,6 +1590,21 @@ static lisp_val_t declaim_slot_of(lisp_val_t env) {
  * @param env 任意の環境(frame可)
  * @return 詰めたoptimize値(speed | safety<<2 | space<<4)。見つからなければ既定値
  */
+/**
+ * インライン展開の対象名に対応するビットを返す。
+ * 対象は「アロケーションせず、分岐しない」builtinのみ(documents/inline-builtin.md)。
+ * 対象外・未知の名前は0を返し、declaimはそれを黙って無視する。
+ * @param sym 関数名のシンボル
+ * @return INLINE_BIT_*、対象外なら0
+ */
+UINT64 os_inline_bit_of(lisp_val_t sym) {
+    if (sym == g_sym_car)  { return INLINE_BIT_CAR; }
+    if (sym == g_sym_cdr)  { return INLINE_BIT_CDR; }
+    if (sym == g_sym_null) { return INLINE_BIT_NULL; }
+    if (sym == g_sym_eq)   { return INLINE_BIT_EQ; }
+    return 0;
+}
+
 UINT64 os_env_optimize(lisp_val_t env) {
     lisp_val_t slot = declaim_slot_of(os_definition_env(env));
     if (slot == nil) {
@@ -2434,6 +2489,10 @@ static void os_gc_collect_body(void) {
     g_sym_function = gc_copy_value(g_sym_function);
     g_sym_flet = gc_copy_value(g_sym_flet);
     g_sym_declaim = gc_copy_value(g_sym_declaim);
+    g_sym_null = gc_copy_value(g_sym_null);
+    g_sym_eq = gc_copy_value(g_sym_eq);
+    g_sym_inline = gc_copy_value(g_sym_inline);
+    g_sym_notinline = gc_copy_value(g_sym_notinline);
     g_sym_optimize = gc_copy_value(g_sym_optimize);
     g_sym_speed = gc_copy_value(g_sym_speed);
     g_sym_safety = gc_copy_value(g_sym_safety);
@@ -2586,6 +2645,10 @@ void os_bootstrap() {
         g_sym_function = os_make_symbol("FUNCTION");
         g_sym_flet = os_make_symbol("FLET");
         g_sym_declaim = os_make_symbol("DECLAIM");
+        g_sym_null = os_make_symbol("NULL");
+        g_sym_eq = os_make_symbol("EQ");
+        g_sym_inline = os_make_symbol("INLINE");
+        g_sym_notinline = os_make_symbol("NOTINLINE");
         g_sym_optimize = os_make_symbol("OPTIMIZE");
         g_sym_speed = os_make_symbol("SPEED");
         g_sym_safety = os_make_symbol("SAFETY");
@@ -2727,6 +2790,8 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-CODE-PACKING"), os_make_native_function((lisp_addr_t)(void *)primitive_diag_code_packing), global_environment);
         os_set_function(os_make_symbol("%%CURRENT-OPTIMIZE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_optimize), global_environment);
         os_set_function(os_make_symbol("%%OPTIMIZE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_optimize_of), global_environment);
+        os_set_function(os_make_symbol("%%CURRENT-INLINE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_inline), global_environment);
+        os_set_function(os_make_symbol("%%INLINE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_of), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);

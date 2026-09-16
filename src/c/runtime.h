@@ -152,6 +152,10 @@ extern lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 extern lisp_val_t g_sym_flet;
 extern lisp_val_t g_sym_declaim;
+extern lisp_val_t g_sym_null;
+extern lisp_val_t g_sym_eq;
+extern lisp_val_t g_sym_inline;
+extern lisp_val_t g_sym_notinline;
 extern lisp_val_t g_sym_optimize;
 extern lisp_val_t g_sym_speed;
 extern lisp_val_t g_sym_safety;
@@ -375,6 +379,26 @@ void os_imm_page_free(void *page);
 /** 既定は speed/safety/space すべて1(CommonLispの慣習に合わせる) */
 #define OPTIMIZE_DEFAULT OPTIMIZE_PACK(1, 1, 1)
 
+/* ---- declaim(inline / notinline)。documents/inline-builtin.md ----
+   optimizeと同じ1つのfixnumへ相乗りさせる(bit8以降)。environmentへスロットを
+   増やさずに済み、za_try_compile_defunへ渡す値も1つのままでよい。
+   fixnumのマグニチュードは60bitあり、optimizeが下位6bit、inlineがbit8〜39
+   (32個分)を使う。対象が32個を超えたらここを広げる。 */
+#define DECLAIM_INLINE_SHIFT 8
+#define DECLAIM_INLINE_MASK  0xFFFFFFFFULL
+#define DECLAIM_INLINE_BITS(p) (((UINT64)(p) >> DECLAIM_INLINE_SHIFT) & DECLAIM_INLINE_MASK)
+#define DECLAIM_WITH_INLINE_BITS(p, b)     ((((UINT64)(p)) & ~(DECLAIM_INLINE_MASK << DECLAIM_INLINE_SHIFT)) |      ((((UINT64)(b)) & DECLAIM_INLINE_MASK) << DECLAIM_INLINE_SHIFT))
+
+/** インライン展開の対象。ビット位置はdeclaim値の中で固定(永続化はしていないので
+ * 並べ替えても互換性の問題は無いが、%%CURRENT-INLINEの出力順と揃えておくこと) */
+#define INLINE_BIT_CAR  (1ULL << 0)
+#define INLINE_BIT_CDR  (1ULL << 1)
+#define INLINE_BIT_NULL (1ULL << 2)
+#define INLINE_BIT_EQ   (1ULL << 3)
+
+/** インライン展開の対象名に対応するビットを返す。対象外の名前は0
+ * (declaimが未知の名前を黙って無視するための判定に使う) */
+UINT64 os_inline_bit_of(lisp_val_t sym);
 /** envが属するenvironmentのoptimize指定を読む(frameはos_definition_envで読み飛ばす) */
 UINT64 os_env_optimize(lisp_val_t env);
 /** envが属するenvironmentのoptimize指定を書き換える。書けたら1 */

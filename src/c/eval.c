@@ -475,8 +475,33 @@ static lisp_val_t eval_declaim(lisp_val_t args, lisp_val_t env) {
     while (rest != nil) {
         lisp_val_t spec = cc_car(rest);
         rest = cc_cdr(rest);
-        /* optimize以外の指定子(type/inline/ftype等)は黙って読み飛ばす */
-        if ((spec & TAG_MASK) != TAG_CONS || cc_car(spec) != g_sym_optimize) {
+        if ((spec & TAG_MASK) != TAG_CONS) {
+            continue;
+        }
+        lisp_val_t kind = cc_car(spec);
+        /* (inline f ...) / (notinline f ...) は関数名を列挙する形(CommonLispと同じ)。
+           **無効な関数名を指定してもエラーにしない。** 未実装のbuiltinや存在しない名前を
+           書いても黙って無視する(Phase4以降で対象が増えることを見越した措置で、
+           先行して書いたコードが動かなくなるのを避ける)。
+           指定されなかった関数の状態は変更しない */
+        if (kind == g_sym_inline || kind == g_sym_notinline) {
+            UINT64 bits = DECLAIM_INLINE_BITS(packed);
+            for (lisp_val_t names = cc_cdr(spec); names != nil; names = cc_cdr(names)) {
+                UINT64 bit = os_inline_bit_of(cc_car(names));
+                if (bit == 0) {
+                    continue;   /* 未知の名前は無視 */
+                }
+                if (kind == g_sym_inline) {
+                    bits |= bit;
+                } else {
+                    bits &= ~bit;
+                }
+            }
+            packed = DECLAIM_WITH_INLINE_BITS(packed, bits);
+            continue;
+        }
+        /* optimize以外の指定子(type/ftype等)は黙って読み飛ばす */
+        if (kind != g_sym_optimize) {
             continue;
         }
         lisp_val_t items = cc_cdr(spec);
@@ -502,6 +527,12 @@ static lisp_val_t eval_declaim(lisp_val_t args, lisp_val_t env) {
                 return os_signal_condition(g_sym_class_domain_error, nil, env);
             }
             UINT64 v = os_fixnum_magnitude(vval);
+            /* [重要] OPTIMIZE_PACKは下位6bitだけを組み立てるので、そのまま代入すると
+               同じfixnumへ相乗りしているinlineビット(bit8〜)が消える。
+               高位ビットを退避して被せ直すこと(この取りこぼしは
+               (declaim (optimize ...)) が直前の (declaim (inline ...)) を
+               無かったことにする、という形で回帰テストが捕まえた) */
+            UINT64 keep = DECLAIM_INLINE_BITS(packed);
             if (qual == g_sym_speed) {
                 packed = OPTIMIZE_PACK(v, OPTIMIZE_SAFETY(packed), OPTIMIZE_SPACE(packed));
             } else if (qual == g_sym_safety) {
@@ -509,6 +540,7 @@ static lisp_val_t eval_declaim(lisp_val_t args, lisp_val_t env) {
             } else if (qual == g_sym_space) {
                 packed = OPTIMIZE_PACK(OPTIMIZE_SPEED(packed), OPTIMIZE_SAFETY(packed), v);
             }
+            packed = DECLAIM_WITH_INLINE_BITS(packed, keep);
             /* 未知のqualityも無視する */
         }
     }

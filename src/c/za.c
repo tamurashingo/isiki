@@ -300,6 +300,16 @@ static void jit_and_reg_imm8(UINT8 reg, UINT8 imm8) {
     jit_emit8(imm8);
 }
 
+/** cmp reg, imm8 (符号拡張、"cmp r/m64, imm8"opcode0x83 /7でエンコード)。
+ * jit_and_reg_imm8と同じ0x83グループで、/digitだけが違う */
+static void jit_cmp_reg_imm8(UINT8 reg, UINT8 imm8) {
+    UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x83);
+    jit_emit8((UINT8)(0xC0 | (7 << 3) | (reg & 7)));
+    jit_emit8(imm8);
+}
+
 /** jmp reg (レジスタ間接ジャンプ、"jmp r/m64"opcode0xFF /4でエンコード) */
 static void jit_jmp_reg(UINT8 reg) {
     if ((reg >> 3) & 1) {
@@ -2108,6 +2118,17 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
 /** 現在のza_compile_expr再帰段数。za_try_compile_defunの冒頭で0に戻す */
 static UINT64 g_za_compile_nest = 0;
 
+/** このコンパイル試行に効いているdeclaim値(optimize下位6bit + inlineビットbit8〜)。
+ * za_try_compile_defunの冒頭でownerから読んだ値を入れる。emitterへ引数で持ち回ると
+ * 署名が広範囲に波及するため、g_jit_overflow等と同じくコンパイル単位のfile-staticにする
+ * (documents/inline-builtin.md)。 */
+static UINT64 g_za_declaim = OPTIMIZE_DEFAULT;
+
+/** nameのbuiltinがこのコンパイルでインライン展開対象か */
+static int za_inline_enabled(UINT64 bit) {
+    return (DECLAIM_INLINE_BITS(g_za_declaim) & bit) != 0;
+}
+
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
@@ -2527,6 +2548,10 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
                             call_depth, arith_depth, (void *)primitive_subtract2);
 }
 
+/* インライン展開のエミッタ(実体は下方。za_compile_unary/binaryから使う) */
+static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn);
+static void za_emit_inline_bool_from_je(UINT64 eq_patch);
+
 /**
  * 「(op operand)」(ちょうど1オペランド)を検証しつつ、1引数ラッパー(cc_car/cc_cdr/
  * primitive_null1/primitive_atom1)を呼んでraxへ結果を残す機械語を出力する。オペランドは
@@ -2538,7 +2563,7 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
 static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                              const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                              UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
-                             UINT64 arith_depth, void *wrapper_fn) {
+                             UINT64 arith_depth, void *wrapper_fn, UINT64 inline_bit) {
     GC_PROTECT(params);
     GC_PROTECT(env);
     lisp_val_t rest = cc_cdr(form);
@@ -2553,19 +2578,103 @@ static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     // 保護すべき値が無いので新規スロットは不要。制御転送ならwrapper呼び出しを
     // スキップしてrax(=転送値)のまま終端へ合流するだけでよい。
     UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
-    jit_mov_rcx_rax();
-    jit_movabs_r11((UINT64)wrapper_fn);
-    jit_call_r11();
+    if (inline_bit == INLINE_BIT_NULL && za_inline_enabled(INLINE_BIT_NULL)) {
+        /* [インライン展開] primitive_null1(a == nil ? t : nil)と等価 */
+        jit_movabs_reg(ZA_REG_R11, nil);
+        jit_cmp_rax_r11();
+        za_emit_inline_bool_from_je(jit_emit_je_rel32_placeholder());
+    } else {
+        jit_mov_rcx_rax();
+        jit_movabs_r11((UINT64)wrapper_fn);
+        jit_call_r11();
+    }
     jit_patch_rel32(ct_patch);
     return 1;
 }
 
 /** za_compile_unaryの、wrapper_fn(rcx=オペランド, rdx=env)に自分のenv(ZA_OFF_ENV_VAL)も
  * 渡す版。conditionをsignalしうる関数(os_car_checked等)用。 */
+/**
+ * [インライン展開] raxにある値に対するcar/cdrを、call無しの命令列として出力する。
+ *
+ * **os_car_checked / os_cdr_checked と等価でなければならない**(documents/inline-builtin.md)。
+ * どちらも「nilでも、TAG_CONSでもない」ならdomain-errorをsignalする。単なるタグ剥がし +
+ * オフセット読みに置き換えると (car nil) が domain-error にならず nil を返してしまう
+ * (nil自身が自己参照consなので、読めてしまう)。
+ *
+ * そこで速いpathの前に判定を置き、外れたら**従来と同じwrapper呼び出しへ落とす**。
+ * wrapperはenvを要るのでrdxへ積む。エラー経路の振る舞いは従来と1命令も変わらない。
+ *
+ *     mov  r10, rax
+ *     and  r10, 7
+ *     cmp  r10, TAG_CONS
+ *     jne  slow
+ *     movabs r11, nil        ; nilはTAG_CONSを持つので別途弾く必要がある
+ *     cmp  rax, r11
+ *     je   slow
+ *     and  rax, ~7           ; タグ剥がし
+ *     mov  rax, [rax + off]  ; car=+0 / cdr=+8
+ *     jmp  done
+ *   slow:
+ *     mov  rcx, rax / mov rdx, env / movabs r11, wrapper / call
+ *   done:
+ *
+ * GCは起こさない。cc_car/cc_cdrはメモリを読むだけで確保しないため、
+ * 中間値がGCから見えなくなる窓も生じない(展開前のwrapper呼び出しも同じ)。
+ * @param cdr_offset carなら0、cdrなら8
+ * @param wrapper_fn 判定を外れたときに呼ぶos_car_checked/os_cdr_checked
+ */
+static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn) {
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RAX);
+    jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
+    jit_cmp_reg_imm8(ZA_REG_R10, (UINT8)TAG_CONS);
+    UINT64 not_cons = jit_emit_jne_rel32_placeholder();
+
+    jit_movabs_reg(ZA_REG_R11, nil);
+    jit_cmp_rax_r11();
+    UINT64 is_nil = jit_emit_je_rel32_placeholder();
+
+    jit_and_reg_imm8(ZA_REG_RAX, 0xF8);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RAX, cdr_offset);
+    UINT64 done = jit_emit_jmp_rel32_placeholder();
+
+    jit_patch_rel32(not_cons);
+    jit_patch_rel32(is_nil);
+    jit_mov_rcx_rax();
+    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+    jit_movabs_r11((UINT64)wrapper_fn);
+    jit_call_r11();
+
+    jit_patch_rel32(done);
+}
+
+/**
+ * [インライン展開] raxとr10の比較結果から、g_sym_t / nil をraxへ置く。
+ * primitive_null1(a == nil ? t : nil)と primitive_eq2(a == b ? t : nil)の
+ * 「比較の後」の部分で、どちらも同じ形になる。
+ * 分岐で組む(cmovは使わない。まず正しく動くものを作る方針)。
+ * @param eq_patch 直前に発行した「等しければ飛ぶ」プレースホルダ
+ */
+static void za_emit_inline_bool_from_je(UINT64 eq_patch) {
+    jit_movabs_rax(nil);
+    UINT64 done = jit_emit_jmp_rel32_placeholder();
+    jit_patch_rel32(eq_patch);
+    /* [原則8] g_sym_tは**GCヒープ上にあり移動する**(os_gc_collect_bodyが
+       g_sym_t = gc_copy_value(g_sym_t) で更新する)。値を即値として焼き込むと、
+       GCが1回走った時点で旧From空間のアドレスを返すようになり、呼び出し元が
+       ゴミを掴む。実際にこれを踏み、printが壊れたオブジェクトを辿って
+       50MBの出力を吐いた。**グローバル変数のアドレスをmovabsしてderefする**こと。
+       nil(上)は g_nil_cell というFrom/To空間の外の固定領域にあり移動しないので
+       即値で焼いてよい(既存コードも jit_movabs_rax(nil) を多数使っている)。 */
+    jit_movabs_reg(ZA_REG_RAX, (UINT64)(void *)&g_sym_t);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RAX, 0);
+    jit_patch_rel32(done);
+}
+
 static int za_compile_unary_env(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                                  UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
-                                 UINT64 arith_depth, void *wrapper_fn) {
+                                 UINT64 arith_depth, void *wrapper_fn, UINT64 inline_bit) {
     GC_PROTECT(params);
     GC_PROTECT(env);
     lisp_val_t rest = cc_cdr(form);
@@ -2578,10 +2687,15 @@ static int za_compile_unary_env(lisp_val_t form, lisp_val_t params, UINT64 fixed
         return 0;
     }
     UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
-    jit_mov_rcx_rax();
-    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-    jit_movabs_r11((UINT64)wrapper_fn);
-    jit_call_r11();
+    if (inline_bit != 0 && za_inline_enabled(inline_bit)) {
+        /* car=+0 / cdr=+8。INLINE_BIT_CDRのときだけオフセット8 */
+        za_emit_inline_car_cdr((inline_bit == INLINE_BIT_CDR) ? 8 : 0, wrapper_fn);
+    } else {
+        jit_mov_rcx_rax();
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        jit_movabs_r11((UINT64)wrapper_fn);
+        jit_call_r11();
+    }
     jit_patch_rel32(ct_patch);
     return 1;
 }
@@ -2602,7 +2716,7 @@ static int za_compile_unary_env(lisp_val_t form, lisp_val_t params, UINT64 fixed
 static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                               const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                               UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
-                              UINT64 arith_depth, void *wrapper_fn) {
+                              UINT64 arith_depth, void *wrapper_fn, UINT64 inline_bit) {
     GC_PROTECT(params);
     GC_PROTECT(env);
     if (arith_depth >= ZA_MAX_ARITH_DEPTH) {
@@ -2648,8 +2762,15 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
 
     jit_mov_rdx_rax();
     za_load_slot(ZA_REG_RCX, val_off);
-    jit_movabs_r11((UINT64)wrapper_fn);
-    jit_call_r11();
+    if (inline_bit == INLINE_BIT_EQ && za_inline_enabled(INLINE_BIT_EQ)) {
+        /* [インライン展開] primitive_eq2(a == b ? t : nil)と等価。
+           rcx=第一オペランド、rdx=第二オペランドが揃っているのでそのまま比較する */
+        jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
+        za_emit_inline_bool_from_je(jit_emit_je_rel32_placeholder());
+    } else {
+        jit_movabs_r11((UINT64)wrapper_fn);
+        jit_call_r11();
+    }
 
     if (skip_protect) {
         // 何もlinkしていないためunlink/cleanupは不要。ct_patch1(op1はleafなので
@@ -3339,107 +3460,107 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
     }
     if (head == syms->lt) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_less_than2);
+                                  call_depth, arith_depth, (void *)primitive_less_than2, 0);
     }
     if (head == syms->eq) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_num_equal2);
+                                  call_depth, arith_depth, (void *)primitive_num_equal2, 0);
     }
     if (head == syms->gt) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_greater_than2);
+                                  call_depth, arith_depth, (void *)primitive_greater_than2, 0);
     }
     if (head == syms->le) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_less_equal2);
+                                  call_depth, arith_depth, (void *)primitive_less_equal2, 0);
     }
     if (head == syms->ge) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_greater_equal2);
+                                  call_depth, arith_depth, (void *)primitive_greater_equal2, 0);
     }
     if (head == g_sym_car) {
         // consでない引数はdomain-error(ISLisp仕様§21.2、primitive_carと同じ)。envが要るので
         // os_car_checked(x, env)をrdx=envで呼ぶ
         return za_compile_unary_env(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth,
-                                     tb_ctx, call_depth, arith_depth, (void *)os_car_checked);
+                                     tb_ctx, call_depth, arith_depth, (void *)os_car_checked, INLINE_BIT_CAR);
     }
     if (head == g_sym_cdr) {
         return za_compile_unary_env(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth,
-                                     tb_ctx, call_depth, arith_depth, (void *)os_cdr_checked);
+                                     tb_ctx, call_depth, arith_depth, (void *)os_cdr_checked, INLINE_BIT_CDR);
     }
     if (head == syms->nullsym) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_null1);
+                                 call_depth, arith_depth, (void *)primitive_null1, INLINE_BIT_NULL);
     }
     if (head == syms->notsym) {
         // NOTはnullとISLisp仕様上完全に同一(runtime.cのos_bootstrapがprimitive_null実体を
         // 共用しているのと同じ理由)なので、za側もprimitive_null1をそのまま再利用する。
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_null1);
+                                 call_depth, arith_depth, (void *)primitive_null1, INLINE_BIT_NULL);
     }
     if (head == syms->atom) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_atom1);
+                                 call_depth, arith_depth, (void *)primitive_atom1, 0);
     }
     if (head == syms->consp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_consp1);
+                                 call_depth, arith_depth, (void *)primitive_consp1, 0);
     }
     if (head == syms->listp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_listp1);
+                                 call_depth, arith_depth, (void *)primitive_listp1, 0);
     }
     if (head == syms->numberp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_numberp1);
+                                 call_depth, arith_depth, (void *)primitive_numberp1, 0);
     }
     if (head == syms->fixnump) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_fixnump1);
+                                 call_depth, arith_depth, (void *)primitive_fixnump1, 0);
     }
     if (head == syms->bignump) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_bignump1);
+                                 call_depth, arith_depth, (void *)primitive_bignump1, 0);
     }
     if (head == syms->floatp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_floatp1);
+                                 call_depth, arith_depth, (void *)primitive_floatp1, 0);
     }
     if (head == syms->symbolp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_symbolp1);
+                                 call_depth, arith_depth, (void *)primitive_symbolp1, 0);
     }
     if (head == syms->stringp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_stringp1);
+                                 call_depth, arith_depth, (void *)primitive_stringp1, 0);
     }
     if (head == syms->functionp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_functionp1);
+                                 call_depth, arith_depth, (void *)primitive_functionp1, 0);
     }
     if (head == syms->characterp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_characterp1);
+                                 call_depth, arith_depth, (void *)primitive_characterp1, 0);
     }
     if (head == syms->streamp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_streamp1);
+                                 call_depth, arith_depth, (void *)primitive_streamp1, 0);
     }
     if (head == syms->setcar) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_set_car2);
+                                  call_depth, arith_depth, (void *)primitive_set_car2, 0);
     }
     if (head == syms->setcdr) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_set_cdr2);
+                                  call_depth, arith_depth, (void *)primitive_set_cdr2, 0);
     }
     if (head == syms->eqp) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_eq2);
+                                  call_depth, arith_depth, (void *)primitive_eq2, INLINE_BIT_EQ);
     }
     if (head == g_sym_cons) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)os_make_cons);
+                                  call_depth, arith_depth, (void *)os_make_cons, 0);
     }
     if (za_is_raw_lambda(form)) {
         return za_compile_lambda(form, params, fixed_count, locals);
@@ -5982,6 +6103,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     syms.setcdr = os_make_symbol("SET-CDR");
 
     g_jit_overflow = 0;
+    /* [declaim] このコンパイル試行に効くoptimize/inline指定。emitterはg_za_declaimを
+       見る(引数で持ち回ると署名が広範囲に波及するため) */
+    g_za_declaim = optimize;
     /* 前回の試行が途中で長いジャンプ(setjmp等)で抜けた場合に備えて0に戻す。
        通常はラッパが必ずデクリメントするので0のままのはず */
     g_za_compile_nest = 0;
