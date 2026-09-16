@@ -1760,7 +1760,13 @@ void test_gc_reclaims_unreferenced_garbage() {
 // native関数1つ分(function object + Function Cellのcons 2つ + 環境alistのcons)が
 // さらに恒久消費になり、76KBではgcd/isqrtテストがGC後も確保不能になって停止する
 // ようになったため、その分だけ広げる
-#define SMALL_HEAP_SIZE (77 * 1024)
+//
+// 2026-09-15 declaim(Phase2): %%CURRENT-OPTIMIZE と %%OPTIMIZE-OF の2つを
+// os_bootstrapへ追加し、さらに全environmentへ10番目のスロット(declaim)を足した
+// ため、77KBではgcd/isqrtテストがGC後も確保不能になって停止するようになった。
+// 実測した窓は79〜80KBで、78KB以下はハング、81KB以上はisqrtテストでGCが発火せず
+// NG(runtime_test.c:1855)。中央を取って80KBにしている
+#define SMALL_HEAP_SIZE (80 * 1024)
 
 static void setup_small_heap(void) {
     void *heap = malloc(SMALL_HEAP_SIZE);

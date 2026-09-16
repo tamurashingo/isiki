@@ -399,7 +399,12 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     lisp_val_t owner = os_definition_env(env);
     GC_PROTECT(owner);
 
-    lisp_val_t fn = za_try_compile_defun(params, body, env, owner);
+    /* [declaim] optimizeはownerから読む。**新たに環境を探索しない**
+       (ownerは既にos_definition_envで求まっている。documents/declaim-design.md)。
+       本Phaseではza_try_compile_defunは受け取った値をmetaへ記録するだけで、
+       コード生成には使わない(Phase3以降) */
+    UINT64 optimize = os_env_optimize(owner);
+    lisp_val_t fn = za_try_compile_defun(params, body, env, owner, optimize);
     if (fn == nil) {
         fn = make_interpreted_function(params, body, env);
     }
@@ -445,6 +450,73 @@ static lisp_val_t eval_function(lisp_val_t args, lisp_val_t env) {
  * @param env 外側の環境。かつbindingsで作る各関数のクロージャ環境
  * @return bodyの最後の評価結果
  */
+/**
+ * declaim特殊形式。(declaim (optimize (speed 3) (safety 0)) ...)。
+ *
+ * **CommonLispとは意味論が異なる。** 本実装はenvironment単位で作用し、親からは
+ * 引き継がない(documents/declaim-design.md)。評価された環境から
+ * os_definition_envでenvironmentを求めてそこへ記録するので、let/flet等のframeの
+ * 中でdeclaimしても読み飛ばされて囲みのenvironmentへ届く。
+ *
+ * 本PhaseはoptimizeのみでtypeやinlineはPhase3以降。**未知の指定子はエラーにせず
+ * 無視する**(後のPhaseで実装予定のものを先に書いたコードが動かなくなるのを避ける)。
+ * 指定しなかった項目は現在値のまま変更しない。値域は0〜3で、外れたらエラー。
+ *
+ * @param args 宣言指定子のリスト
+ * @param env 評価時の環境(frameでよい)
+ * @return nil
+ */
+static lisp_val_t eval_declaim(lisp_val_t args, lisp_val_t env) {
+    GC_PROTECT(args);
+    GC_PROTECT(env);
+    UINT64 packed = os_env_optimize(env);
+
+    lisp_val_t rest = args;
+    while (rest != nil) {
+        lisp_val_t spec = cc_car(rest);
+        rest = cc_cdr(rest);
+        /* optimize以外の指定子(type/inline/ftype等)は黙って読み飛ばす */
+        if ((spec & TAG_MASK) != TAG_CONS || cc_car(spec) != g_sym_optimize) {
+            continue;
+        }
+        lisp_val_t items = cc_cdr(spec);
+        while (items != nil) {
+            lisp_val_t item = cc_car(items);
+            items = cc_cdr(items);
+            /* (speed 3) の形のみ受け付ける。裸の speed(= 3扱い)は本Phaseでは非対応 */
+            if ((item & TAG_MASK) != TAG_CONS) {
+                continue;
+            }
+            lisp_val_t qual = cc_car(item);
+            lisp_val_t vcell = cc_cdr(item);
+            if ((vcell & TAG_MASK) != TAG_CONS) {
+                continue;
+            }
+            lisp_val_t vval = cc_car(vcell);
+            /* 値域は0〜3。整数でない・負・4以上はいずれも<domain-error>にする。
+               負のfixnumはFIXNUM_SIGN_BITが立つのでマグニチュードだけ見ると-1が1に
+               化ける。符号ビットの有無をos_make_fixnumで作り直して比較することで弾く */
+            if ((vval & TAG_MASK) != TAG_FIXNUM ||
+                vval != os_make_fixnum(os_fixnum_magnitude(vval)) ||
+                os_fixnum_magnitude(vval) > 3) {
+                return os_signal_condition(g_sym_class_domain_error, nil, env);
+            }
+            UINT64 v = os_fixnum_magnitude(vval);
+            if (qual == g_sym_speed) {
+                packed = OPTIMIZE_PACK(v, OPTIMIZE_SAFETY(packed), OPTIMIZE_SPACE(packed));
+            } else if (qual == g_sym_safety) {
+                packed = OPTIMIZE_PACK(OPTIMIZE_SPEED(packed), v, OPTIMIZE_SPACE(packed));
+            } else if (qual == g_sym_space) {
+                packed = OPTIMIZE_PACK(OPTIMIZE_SPEED(packed), OPTIMIZE_SAFETY(packed), v);
+            }
+            /* 未知のqualityも無視する */
+        }
+    }
+
+    os_env_set_optimize(env, packed);
+    return nil;
+}
+
 static lisp_val_t eval_flet(lisp_val_t args, lisp_val_t env) {
     // [原則4] envはos_make_symbol("FLET-ENV")の確保より**前**に保護すること。
     // 引数の評価順は未規定なので、シンボル確保でGCが走った時点でenvが古いまま
@@ -1021,6 +1093,9 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
         }
         if (op == g_sym_function) {
             return eval_function(args, env);
+        }
+        if (op == g_sym_declaim) {
+            return eval_declaim(args, env);
         }
         if (op == g_sym_flet) {
             return eval_flet(args, env);

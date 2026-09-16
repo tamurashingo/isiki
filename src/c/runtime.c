@@ -151,6 +151,11 @@ lisp_val_t g_sym_unwind_protect;
 lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 lisp_val_t g_sym_flet;
+lisp_val_t g_sym_declaim;
+lisp_val_t g_sym_optimize;
+lisp_val_t g_sym_speed;
+lisp_val_t g_sym_safety;
+lisp_val_t g_sym_space;
 /** labels特殊形式を表すシンボル */
 lisp_val_t g_sym_labels;
 /** defvar特殊形式を表すシンボル */
@@ -1189,6 +1194,37 @@ lisp_val_t primitive_fn_cell_count(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(g_function_cell_count);
 }
 
+/** 詰めたoptimize値を (speed safety space) のリストへ展開する */
+static lisp_val_t optimize_to_list(UINT64 packed) {
+    lisp_val_t l3 = os_make_cons(os_make_fixnum(OPTIMIZE_SPACE(packed)), nil);
+    lisp_val_t l2 = os_make_cons(os_make_fixnum(OPTIMIZE_SAFETY(packed)), l3);
+    return os_make_cons(os_make_fixnum(OPTIMIZE_SPEED(packed)), l2);
+}
+
+/** 組み込み関数%%CURRENT-OPTIMIZE。現在の環境が属するenvironmentのoptimize指定を
+ * (speed safety space) で返す。frameの中で呼んでも囲みのenvironmentの値になる。 */
+lisp_val_t primitive_current_optimize(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    return optimize_to_list(os_env_optimize(env));
+}
+
+/** 組み込み関数%%OPTIMIZE-OF。関数がコンパイルされたときに有効だったoptimize指定を
+ * (speed safety space) で返す。インタプリタ実行の関数(metaを持たない)はnil。 */
+lisp_val_t primitive_optimize_of(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_SYMBOL) {
+        val = os_get_function(val, env);
+    }
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE || obj[1] == 0) {
+        return nil;
+    }
+    return optimize_to_list(((za_fn_meta_t *)obj[1])->optimize);
+}
+
 static imm_slot_cursor_t g_fn_meta_cursor;
 /** 直近にImmobilized Spaceへ要求された確保サイズ(枯渇時の診断表示用) */
 static UINT64 g_imm_last_request_bytes = 0;
@@ -1344,9 +1380,15 @@ int os_addr_region_bounds(os_addr_region_t region, lisp_addr_t *out_start, lisp_
             end = start + IMM_SPACE_SIZE;
             break;
         case OS_ADDR_GC_HEAP:
-            /* From/Toは g_to_start == g_from_end で連続しているので1区間で表せる */
-            start = (lisp_addr_t)(void *)g_from_start;
-            end = (lisp_addr_t)(void *)g_to_end;
+            /* From/Toは隣接した2つの半分なので1区間で表せる。ただし**GCのたびに
+               入れ替わる**(os_gc_collect_body末尾のnew_from_start/new_to_start)ので、
+               「Fromが常に下位半分」と決め打ってはならない。
+               以前は start=g_from_start / end=g_to_end としており、GCが奇数回走った
+               後は start==end(どちらも中間点)になって「境界が未確定」と誤報していた
+               (実測: GC 0/2/4回後は正しく、1/3回後にnilが返る)。
+               両者の最小と最大を取ることで入れ替わりに依らなくなる */
+            start = (lisp_addr_t)(void *)(g_from_start < g_to_start ? g_from_start : g_to_start);
+            end = (lisp_addr_t)(void *)(g_from_end > g_to_end ? g_from_end : g_to_end);
             break;
         default:
             break;
@@ -1481,6 +1523,58 @@ static lisp_val_t imm_code_cursor_slot(lisp_val_t env) {
         return nil;
     }
     return slot;
+}
+
+/**
+ * environmentのdeclaimスロット(10番目)を取り出す。frameは持たないのでnilになる。
+ * @param env environment(frameやnilを渡してもnilが返るだけで壊れない)
+ * @return スロットのcons、持たない場合はnil
+ */
+static lisp_val_t declaim_slot_of(lisp_val_t env) {
+    if (env == nil || env == 0) {
+        return nil;
+    }
+    /* 10番目 = 先頭から9個cdrを辿った先のcar。9スロットしか持たない旧環境や
+       8スロットのframeではcc_cdrがnilを返し続け、cc_car(nil)==nilになる */
+    lisp_val_t rest = cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))))))));
+    lisp_val_t slot = cc_car(rest);
+    /* nilを書き込み先にしてはならない(nilは自己参照consなのでcdrを書くと壊れる) */
+    if ((slot & TAG_MASK) != TAG_CONS || slot == nil) {
+        return nil;
+    }
+    return slot;
+}
+
+/**
+ * envが属するenvironmentのoptimize指定を読む。frameはos_definition_envで読み飛ばす。
+ * @param env 任意の環境(frame可)
+ * @return 詰めたoptimize値(speed | safety<<2 | space<<4)。見つからなければ既定値
+ */
+UINT64 os_env_optimize(lisp_val_t env) {
+    lisp_val_t slot = declaim_slot_of(os_definition_env(env));
+    if (slot == nil) {
+        return OPTIMIZE_DEFAULT;
+    }
+    lisp_val_t v = cc_cdr(slot);
+    if ((v & TAG_MASK) != TAG_FIXNUM) {
+        return OPTIMIZE_DEFAULT;
+    }
+    return os_fixnum_magnitude(v);
+}
+
+/**
+ * envが属するenvironmentのoptimize指定を書き換える。確保しないのでGCは走らない。
+ * @param env 任意の環境(frame可。os_definition_envで囲みのenvironmentへ届く)
+ * @param packed 詰めたoptimize値
+ * @return 書き込めたら1、declaimスロットを持たない環境だったら0
+ */
+int os_env_set_optimize(lisp_val_t env, UINT64 packed) {
+    lisp_val_t slot = declaim_slot_of(os_definition_env(env));
+    if (slot == nil) {
+        return 0;
+    }
+    ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum(packed);
+    return 1;
 }
 
 /**
@@ -2339,6 +2433,11 @@ static void os_gc_collect_body(void) {
     g_sym_unwind_protect = gc_copy_value(g_sym_unwind_protect);
     g_sym_function = gc_copy_value(g_sym_function);
     g_sym_flet = gc_copy_value(g_sym_flet);
+    g_sym_declaim = gc_copy_value(g_sym_declaim);
+    g_sym_optimize = gc_copy_value(g_sym_optimize);
+    g_sym_speed = gc_copy_value(g_sym_speed);
+    g_sym_safety = gc_copy_value(g_sym_safety);
+    g_sym_space = gc_copy_value(g_sym_space);
     g_sym_labels = gc_copy_value(g_sym_labels);
     g_sym_defvar = gc_copy_value(g_sym_defvar);
     g_sym_defconstant = gc_copy_value(g_sym_defconstant);
@@ -2486,6 +2585,11 @@ void os_bootstrap() {
         g_sym_unwind_protect = os_make_symbol("UNWIND-PROTECT");
         g_sym_function = os_make_symbol("FUNCTION");
         g_sym_flet = os_make_symbol("FLET");
+        g_sym_declaim = os_make_symbol("DECLAIM");
+        g_sym_optimize = os_make_symbol("OPTIMIZE");
+        g_sym_speed = os_make_symbol("SPEED");
+        g_sym_safety = os_make_symbol("SAFETY");
+        g_sym_space = os_make_symbol("SPACE");
         g_sym_labels = os_make_symbol("LABELS");
         g_sym_defvar = os_make_symbol("DEFVAR");
         g_sym_defconstant = os_make_symbol("DEFCONSTANT");
@@ -2621,6 +2725,8 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
         os_set_function(os_make_symbol("%%DIAG-FN-CELL-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_fn_cell_count), global_environment);
         os_set_function(os_make_symbol("%%DIAG-CODE-PACKING"), os_make_native_function((lisp_addr_t)(void *)primitive_diag_code_packing), global_environment);
+        os_set_function(os_make_symbol("%%CURRENT-OPTIMIZE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_optimize), global_environment);
+        os_set_function(os_make_symbol("%%OPTIMIZE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_optimize_of), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
@@ -3232,6 +3338,16 @@ static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env
         code_cursor_symbol = os_make_symbol("code-cursor");
     }
     GC_PROTECT(code_cursor_symbol);
+    /* 10番目のスロット(declaim)もenvironmentにだけ持たせる。frameが持たないのは
+       code-cursorと同じ理由(let/fletの評価ごとのhot path)で、加えて
+       「declaimを保持するのはenvironmentのみ」という仕様そのものでもある
+       (documents/declaim-design.md)。frame内でdeclaimしてもos_definition_envが
+       読み飛ばして囲みのenvironmentへ届く。 */
+    lisp_val_t declaim_symbol = nil;
+    if (want_code_cursor) {
+        declaim_symbol = os_make_symbol("declaim");
+    }
+    GC_PROTECT(declaim_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     GC_PROTECT(name_slot);
@@ -3255,10 +3371,21 @@ static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env
        なので、切り出しのたびにconsを作らずスロットのcdrを書き換えるだけで済む。
        (off & (IMM_PAGE_SIZE-1)) == 0 は「現在のページを使い切った」を意味する
        (次のページの所有権は無いので、残り容量は0として扱う)。 */
+    /* declaimの値は speed | (safety << 2) | (space << 4) を1つのfixnumへ詰めたもの。
+       各2bitで値域0〜3。**親からは引き継がず、必ずデフォルト(1 1 1)で始める。**
+       fixnumは即値なので、GCルートが増えず、値の更新でも確保が起きない
+       (Cheneyコピーはスロットのconsを普通に複製し、中身のfixnumは素通しする)。 */
+    lisp_val_t list_step9 = nil;
+    if (want_code_cursor) {
+        lisp_val_t declaim_slot = os_make_cons(declaim_symbol, os_make_fixnum(OPTIMIZE_DEFAULT));
+        list_step9 = os_make_cons(declaim_slot, nil);
+    }
+    GC_PROTECT(list_step9);
+
     lisp_val_t list_step8 = nil;
     if (want_code_cursor) {
         lisp_val_t code_cursor_slot = os_make_cons(code_cursor_symbol, nil);
-        list_step8 = os_make_cons(code_cursor_slot, nil);
+        list_step8 = os_make_cons(code_cursor_slot, list_step9);
     }
     GC_PROTECT(list_step8);
 
@@ -3454,6 +3581,28 @@ lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT
  * @param code_base 機械語ブロックの先頭アドレス(Immobilized Space上)
  * @param code_len 同ブロックのバイト長
  */
+/**
+ * 関数オブジェクトのmetaへ、コンパイル時に有効だったoptimize指定を記録する。
+ * %%OPTIMIZE-OFが事後確認のために読む。コンパイルへの入力ではない
+ * (入力はza_try_compile_defunの引数で渡す)。
+ * @param fn 関数オブジェクト
+ * @param packed 詰めたoptimize値
+ */
+void os_fn_set_optimize(lisp_val_t fn, UINT64 packed) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE) {
+        return;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    if (meta == 0) {
+        return;
+    }
+    meta->optimize = packed;
+}
+
 void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len) {
     if ((fn & TAG_MASK) != TAG_INSTANCE) {
         return;

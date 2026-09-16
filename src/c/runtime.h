@@ -151,6 +151,11 @@ extern lisp_val_t g_sym_unwind_protect;
 extern lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 extern lisp_val_t g_sym_flet;
+extern lisp_val_t g_sym_declaim;
+extern lisp_val_t g_sym_optimize;
+extern lisp_val_t g_sym_speed;
+extern lisp_val_t g_sym_safety;
+extern lisp_val_t g_sym_space;
 /** labels特殊形式を表すシンボル */
 extern lisp_val_t g_sym_labels;
 /** defvar特殊形式を表すシンボル */
@@ -361,6 +366,20 @@ void os_imm_page_free(void *page);
  * @param count 確保するページ数
  * @return 確保できた先頭ページのアドレス。空き不足の場合はNULL
  */
+/* ---- declaim(optimize)。documents/declaim-design.md ----
+   speed | (safety << 2) | (space << 4) を1つのfixnumへ詰める。各2bitで値域0〜3。 */
+#define OPTIMIZE_SPEED(p)  ((UINT64)((p) & 3))
+#define OPTIMIZE_SAFETY(p) ((UINT64)(((p) >> 2) & 3))
+#define OPTIMIZE_SPACE(p)  ((UINT64)(((p) >> 4) & 3))
+#define OPTIMIZE_PACK(sp, sa, spc) ((UINT64)(((sp) & 3) | (((sa) & 3) << 2) | (((spc) & 3) << 4)))
+/** 既定は speed/safety/space すべて1(CommonLispの慣習に合わせる) */
+#define OPTIMIZE_DEFAULT OPTIMIZE_PACK(1, 1, 1)
+
+/** envが属するenvironmentのoptimize指定を読む(frameはos_definition_envで読み飛ばす) */
+UINT64 os_env_optimize(lisp_val_t env);
+/** envが属するenvironmentのoptimize指定を書き換える。書けたら1 */
+int os_env_set_optimize(lisp_val_t env, UINT64 packed);
+
 void *os_imm_pages_alloc_contiguous(UINT64 count);
 
 /**
@@ -977,6 +996,12 @@ typedef struct {
        「逆アセンブル対象の機械語を持たない」ことをcode_len==0で表す。 */
     UINT64 code_base;
     UINT64 code_len;
+    /* offset 40: このコンパイル時に有効だったoptimize指定(詰めたfixnumのマグニチュード)。
+       %%OPTIMIZE-OF が事後確認のために読む。生成コードはoffset 0と16しか直接
+       dereferenceしないので、末尾への追加は機械語に影響しない。
+       5フィールド40byteはもともと16byte境界へ丸められて48byte確保されていたため、
+       6フィールド目を足しても実消費は変わらない(documents/declaim-design.md)。 */
+    UINT64 optimize;
 } za_fn_meta_t;
 
 /**
@@ -1028,6 +1053,8 @@ lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_e
  * @param code_len 同ブロックのバイト長
  */
 void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len);
+/** 関数オブジェクトのmetaへ、コンパイル時のoptimize指定を記録する */
+void os_fn_set_optimize(lisp_val_t fn, UINT64 packed);
 
 /**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
