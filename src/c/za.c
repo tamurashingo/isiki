@@ -2472,12 +2472,18 @@ static int za_compile_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
 /**
  * JIT算術インライン展開(Phase2、documents/abi-redesign.md参照): rcx=a, rdx=bとして
  * wrapper_fn(a, b)相当を計算しraxへ結果を残す。wrapper_fnが`primitive_add2`/
- * `primitive_subtract2`の場合、それぞれのC実装が持つfixnum高速path(共に非負fixnum
- * かつ結果が60bitに収まる)と完全に同一の条件・結果になるインラインアセンブリを
- * 生成し、条件を満たす限りwrapper_fnへの間接callを一切発行しない。条件を満たさない
- * 場合(型不一致・負数・オーバーフロー)、またはそれ以外のwrapper_fn(primitive_
- * multiply2等、オーバーフロー判定に除算を要し単純なインライン化が困難なもの)は、
- * 従来通りwrapper_fnへの間接callにフォールバックする。
+ * `primitive_subtract2`の場合、**両方が非負fixnumかつ結果が60bitに収まる**ときだけ
+ * インラインで計算し、条件を満たす限りwrapper_fnへの間接callを一切発行しない。
+ * 条件を満たさない場合(型不一致・負数・オーバーフロー)、またはそれ以外のwrapper_fn
+ * (primitive_multiply2等、オーバーフロー判定に除算を要し単純なインライン化が困難な
+ * もの)は、従来通りwrapper_fnへの間接callにフォールバックする。
+ *
+ * [改善A以降] ここがカバーする条件は、**C側(fixnum_add_signed)の高速pathの真部分集合**
+ * である。C側は符号が絡むfixnumどうしも処理するようになったが、ここは非負どうしに
+ * 限ったままなので、`(+ -1 1)` のような式はこのインラインを外れてprimitive_add2へ
+ * callする(そのcall先が速くなった)。**結果の値はどちらの経路でも同一である。**
+ * ここを符号込みに広げると分岐が増え、TCGでは命令数がそのままコストになるため
+ * 割に合わない可能性がある(未測定。documents/fixnum-signed-fastpath.md 参照)。
  *
  * rcx/rdxの値は、フォールバック時にそのままwrapper_fn(a=rcx, b=rdx)の引数として
  * 使う必要があるため、インライン試行部分は破壊せずr10を計算用スコッチとして使う
@@ -2504,15 +2510,17 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
     if (wrapper_fn == (void *)primitive_add2) {
         // 生のタグ付き値同士をそのまま加算するだけでよい(下位3bitは両方0のまま、
         // マグニチュード和が60bitを超えるとbit63(符号bit)が1になるので、
-        // それをオーバーフロー検出に使う。primitive_add2の
+        // それをオーバーフロー検出に使う。fixnum_add_signedの同符号側の
         // `sum <= FIXNUM_MAGNITUDE_MASK`判定と数学的に同値)。
         jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
         jit_add_reg_reg(ZA_REG_R10, ZA_REG_RDX);
         fallback_patches[fallback_count++] = jit_emit_js_rel32_placeholder();
     } else {
-        // primitive_subtract2の`mag_b <= mag_a`判定(=結果が非負)を、生のタグ付き
+        // 非負どうしのとき a-b が非負になる条件(`mag_b <= mag_a`)を、生のタグ付き
         // 値同士の符号無し比較(タグ・符号bitが両方0なので大小関係が保たれる)で
         // 直接判定する。満たせばそのままsubで正しいタグ付き結果が得られる。
+        // 満たさない場合(結果が負)はprimitive_subtract2へ落ちる。改善A以降、
+        // その落ち先はbignum機構を通らずfixnumのまま計算して返す。
         jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
         fallback_patches[fallback_count++] = jit_emit_jb_rel32_placeholder();
         jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
