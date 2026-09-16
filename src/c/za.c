@@ -213,6 +213,18 @@ static void jit_cmp_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x39, ds
 /** test dst, src (dst&srcのフラグのみ、"test r/m64, r64"opcode0x85) */
 static void jit_test_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x85, dst, src); }
 
+/** cmove dst, src (ZFが立っていればsrcをdstへ。"cmovcc r64, r/m64"はREX.W + 0F 4x /r)。
+ * jit_emit_reg_reg_opが使っている0x89系は reg=src / rm=dst だが、cmovccは
+ * **reg=dst / rm=src で向きが逆**なので個別に組む。
+ * 分岐を出さずに真偽値を選ぶために使う(documents/inline-builtin.md)。 */
+static void jit_cmove_reg_reg(UINT8 dst, UINT8 src) {
+    UINT8 rex = (UINT8)(0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x0F);
+    jit_emit8(0x44);
+    jit_emit8((UINT8)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
 /** movabs reg, imm64 (任意レジスタ版。既存のjit_movabs_rax/r11の一般化) */
 static void jit_movabs_reg(UINT8 reg, UINT64 imm) {
     UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
@@ -2550,7 +2562,7 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
 
 /* インライン展開のエミッタ(実体は下方。za_compile_unary/binaryから使う) */
 static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn);
-static void za_emit_inline_bool_from_je(UINT64 eq_patch);
+static void za_emit_inline_bool_from_flags(void);
 
 /**
  * 「(op operand)」(ちょうど1オペランド)を検証しつつ、1引数ラッパー(cc_car/cc_cdr/
@@ -2582,7 +2594,7 @@ static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
         /* [インライン展開] primitive_null1(a == nil ? t : nil)と等価 */
         jit_movabs_reg(ZA_REG_R11, nil);
         jit_cmp_rax_r11();
-        za_emit_inline_bool_from_je(jit_emit_je_rel32_placeholder());
+        za_emit_inline_bool_from_flags();
     } else {
         jit_mov_rcx_rax();
         jit_movabs_r11((UINT64)wrapper_fn);
@@ -2649,26 +2661,29 @@ static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn) {
 }
 
 /**
- * [インライン展開] raxとr10の比較結果から、g_sym_t / nil をraxへ置く。
+ * [インライン展開] 直前のcmpが立てたフラグから、g_sym_t / nil をraxへ置く。
  * primitive_null1(a == nil ? t : nil)と primitive_eq2(a == b ? t : nil)の
  * 「比較の後」の部分で、どちらも同じ形になる。
- * 分岐で組む(cmovは使わない。まず正しく動くものを作る方針)。
- * @param eq_patch 直前に発行した「等しければ飛ぶ」プレースホルダ
+ * **分岐を使わない(cmov)。** 呼び出し元はcmpを出した直後にこれを呼ぶこと。
  */
-static void za_emit_inline_bool_from_je(UINT64 eq_patch) {
-    jit_movabs_rax(nil);
-    UINT64 done = jit_emit_jmp_rel32_placeholder();
-    jit_patch_rel32(eq_patch);
+static void za_emit_inline_bool_from_flags(void) {
     /* [原則8] g_sym_tは**GCヒープ上にあり移動する**(os_gc_collect_bodyが
        g_sym_t = gc_copy_value(g_sym_t) で更新する)。値を即値として焼き込むと、
        GCが1回走った時点で旧From空間のアドレスを返すようになり、呼び出し元が
        ゴミを掴む。実際にこれを踏み、printが壊れたオブジェクトを辿って
        50MBの出力を吐いた。**グローバル変数のアドレスをmovabsしてderefする**こと。
-       nil(上)は g_nil_cell というFrom/To空間の外の固定領域にあり移動しないので
-       即値で焼いてよい(既存コードも jit_movabs_rax(nil) を多数使っている)。 */
-    jit_movabs_reg(ZA_REG_RAX, (UINT64)(void *)&g_sym_t);
-    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RAX, 0);
-    jit_patch_rel32(done);
+       nilは g_nil_cell というFrom/To空間の外の固定領域にあり移動しないので
+       即値で焼いてよい(既存コードも jit_movabs_rax(nil) を多数使っている)。
+
+       [重要] 呼び出し元のcmpが立てたフラグを、cmoveまで壊してはならない。
+       movabs(mov r64,imm64)もmov r64,[r64]もフラグを変えないので、この並びは安全。
+
+       分岐で組んだ版から cmov へ変えた理由は実測(documents/inline-builtin.md):
+       QEMU(TCG)では分岐の追加が重く、nullの展開が**呼び出しより 11% 遅かった**。 */
+    jit_movabs_reg(ZA_REG_R10, (UINT64)(void *)&g_sym_t);
+    jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);
+    jit_movabs_rax(nil);
+    jit_cmove_reg_reg(ZA_REG_RAX, ZA_REG_R10);
 }
 
 static int za_compile_unary_env(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
@@ -2766,7 +2781,7 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
         /* [インライン展開] primitive_eq2(a == b ? t : nil)と等価。
            rcx=第一オペランド、rdx=第二オペランドが揃っているのでそのまま比較する */
         jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
-        za_emit_inline_bool_from_je(jit_emit_je_rel32_placeholder());
+        za_emit_inline_bool_from_flags();
     } else {
         jit_movabs_r11((UINT64)wrapper_fn);
         jit_call_r11();
