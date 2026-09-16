@@ -197,8 +197,25 @@ static void jit_movabs_reg_full(UINT8 reg, UINT64 imm) {
     jit_emit64(imm);
 }
 
+#ifdef ISIKIOS_PINNED_NIL
+/* [実験] nil を r12 常駐にする場合に jit_load_imm_reg が使う。実体は下方 */
+#define ZA_PINNED_NIL_REG 12
+static void jit_mov_reg_reg(UINT8 dst, UINT8 src);
+#endif
+
 /** 値をregへ置く。2^32未満なら mov r32, imm32(5〜6byte)、そうでなければ movabs(10byte) */
 static void jit_load_imm_reg(UINT8 reg, UINT64 imm) {
+#ifdef ISIKIOS_PINNED_NIL
+    /* [実験] nil を r12 常駐にした場合の比較用(documents/bench-pinned-nil.md)。
+       **これは実装ではなく計測のための仕掛けである。** 全経路の r12 保存対応
+       (spawn の regs[3] 仕込み、診断プローブの移設)はしていないので、
+       -ffixed-r12 でビルドしたときにしか成立しない。
+       mov r64, r64 は 3 byte で、mov r32, imm32 の 5 byte より短い */
+    if (imm == nil && reg != ZA_PINNED_NIL_REG) {
+        jit_mov_reg_reg(reg, ZA_PINNED_NIL_REG);
+        return;
+    }
+#endif
     if (imm <= 0xFFFFFFFFULL) {
         if (reg >= 8) {
             jit_emit8(0x41);            /* REX.B。REX.Wは付けない(ゼロ拡張させる) */
@@ -378,6 +395,41 @@ static void jit_and_reg_imm8(UINT8 reg, UINT8 imm8) {
     jit_emit8(0x83);
     jit_emit8((UINT8)(0xC0 | (4 << 3) | (reg & 7)));
     jit_emit8(imm8);
+}
+
+/** [実験] プロローグで r12 へ nil を載せる(ISIKIOS_PINNED_NIL のときだけ)。
+ * mov r12d, imm32 を直接出す(jit_load_imm_reg を通すと nil→r12 の置換で
+ * mov r12,r12 になってしまうため)。
+ * **-ffixed-r12 でビルドすることが前提。** そうでなければ C 側が r12 を使うので
+ * 壊れる(documents/jit-pinned-register.md)。gcc が r12 を使わないなら
+ * JIT が壊しても C に影響しないので、保存・復元は要らない。 */
+static void za_emit_pin_nil(void) {
+#ifdef ISIKIOS_PINNED_NIL
+    jit_emit8(0x41);                 /* REX.B */
+    jit_emit8(0xB8 | (ZA_REG_R12 & 7));
+    jit_emit32((UINT32)nil);
+#endif
+}
+
+/* 実体は下方。za_emit_cmp_rax_nil がこの順序より前に使うため前方宣言する */
+static void jit_cmp_rax_r11(void);
+
+/** rax と nil を比較する(フラグだけを立てる)。
+ * 通常は mov r11, nil(5byte)+ cmp rax, r11(3byte)の2命令。
+ * [実験] ISIKIOS_PINNED_NIL では cmp rax, r12 の1命令(3byte)になる。
+ * **命令数が 2 → 1 に減るのはここだけで、速度差が出るとすればこの形である。** */
+static void za_emit_cmp_rax_nil(void) {
+#ifdef ISIKIOS_PINNED_NIL
+    jit_cmp_reg_reg(ZA_REG_RAX, ZA_PINNED_NIL_REG);
+#else
+    /* [注意] ここを「jit_movabs_reg(R11, nil); jit_cmp_rax_r11();」の形で書くと、
+       呼び出し側をこの関数へ機械的に置換したときに**自分自身も置換されて無限再帰**する。
+       実際に一度やってしまい、ビルドA(ISIKIOS_PINNED_NIL 無し)だけがスタック溢れで
+       落ちた(ビルドBは#ifdef側が選ばれるので露見しなかった)。
+       jit_load_imm_reg を直接呼ぶ形にして、パターンが一致しないようにしてある。 */
+    jit_load_imm_reg(ZA_REG_R11, nil);
+    jit_cmp_rax_r11();
+#endif
 }
 
 /** cmp reg, imm8 (符号拡張、"cmp r/m64, imm8"opcode0x83 /7でエンコード)。
@@ -1679,8 +1731,7 @@ static UINT64 za_ensure_trampoline(void) {
     // 差し替える。eval.cのapply_functionが行う分岐と同じ判断をここでも行う必要がある
     // (このtrampolineはapply_functionを経由しない直接jmpの高速pathだから)
     jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 24); // rax = obj[3] (word3)
-    jit_movabs_reg(ZA_REG_R11, nil);
-    jit_cmp_rax_r11();
+    za_emit_cmp_rax_nil();
     UINT64 je_no_env = jit_emit_je_rel32_placeholder();
     jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RAX); // rdx = obj[3] (definition/captured env)
     jit_patch_rel32(je_no_env);
@@ -2660,8 +2711,7 @@ static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
     if (inline_bit == INLINE_BIT_NULL && za_inline_enabled(INLINE_BIT_NULL)) {
         /* [インライン展開] primitive_null1(a == nil ? t : nil)と等価 */
-        jit_movabs_reg(ZA_REG_R11, nil);
-        jit_cmp_rax_r11();
+        za_emit_cmp_rax_nil();
         za_emit_inline_bool_from_flags();
     } else {
         jit_mov_rcx_rax();
@@ -2710,8 +2760,7 @@ static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn) {
     jit_cmp_reg_imm8(ZA_REG_R10, (UINT8)TAG_CONS);
     UINT64 not_cons = jit_emit_jne_rel32_placeholder();
 
-    jit_movabs_reg(ZA_REG_R11, nil);
-    jit_cmp_rax_r11();
+    za_emit_cmp_rax_nil();
     UINT64 is_nil = jit_emit_je_rel32_placeholder();
 
     jit_and_reg_imm8(ZA_REG_RAX, 0xF8);
@@ -3681,8 +3730,7 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
         // 評価を行わず、if全体の結果としてそのまま伝播する(ct_patchはif全体の終端、
         // つまり通常経路がthen/elseを評価し終えて流れ落ちる地点と同じ着地点へ合流する)。
         UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
-        jit_movabs_r11(nil);
-        jit_cmp_rax_r11();
+        za_emit_cmp_rax_nil();
         UINT64 je_patch = jit_emit_je_rel32_placeholder();
 
         if (!za_compile_expr(then_form, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth,
@@ -5775,8 +5823,7 @@ static void za_emit_load_callee_env_rcx(void) {
     jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);   // fn_obj(タグ付き)
     jit_and_reg_imm8(ZA_REG_R10, 0xF8);
     jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 24);  // rax = fn_obj word3
-    jit_movabs_reg(ZA_REG_R11, nil);
-    jit_cmp_rax_r11();
+    za_emit_cmp_rax_nil();
     UINT64 je_nil = jit_emit_je_rel32_placeholder();
     jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
     UINT64 jmp_done = jit_emit_jmp_rel32_placeholder();
@@ -6222,6 +6269,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         fixed_entry_offset = g_jit_used;
         jit_push_rbx();
         jit_push_r13();
+        za_emit_pin_nil();
         jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
         za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
         za_store_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
@@ -6250,6 +6298,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     // フレーム(env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
     jit_push_rbx();
     jit_push_r13();
+    za_emit_pin_nil();
     jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
         za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
     za_store_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
