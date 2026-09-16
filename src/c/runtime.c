@@ -4906,11 +4906,70 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * FIXNUMの符号を反転した新しいFIXNUMを返す(即値、ヒープ確保なし)。
+ * **valがTAG_FIXNUMであることは呼び出し側が保証すること。**
+ * 符号マグニチュード表現なので反転は常に正確で、2の補数のINT_MINのような
+ * 「反転できない値」は存在しない。マグニチュード0の場合はos_make_fixnum_signedが
+ * 符号を落とすため -0 にはならない。
+ */
+static lisp_val_t fixnum_negate(lisp_val_t val) {
+    return os_make_fixnum_signed(!os_fixnum_is_negative(val), os_fixnum_magnitude(val));
+}
+
+/**
+ * [改善A] FIXNUMどうしを**符号込みで**加算し、結果が60bitに収まればFIXNUMを*outへ
+ * 書いて1を返す。入力がFIXNUMでない、または結果が60bitを超える場合は0を返す
+ * (呼び出し元はbignumを含む一般パスへ落とす)。
+ *
+ * 以前はこの判定が「両方とも**非負**FIXNUM」に限られており、`(+ -1 1)` のような
+ * 両方FIXNUM・結果もFIXNUMの式が decompose → limb_alloc → mag_sub →
+ * os_make_integer というbignum用の機構を丸ごと通っていた(実測で9.7倍遅い。
+ * documents/type-system-survey.md §10-4)。符号マグニチュード表現のままでも、
+ * 符号の一致・不一致で加算と減算を選び分ければ済む。
+ *
+ * [表現への依存] fixnumは符号マグニチュード表現(bit63=符号、bit3〜62=絶対値60bit)
+ * であり、2の補数ではない。マグニチュードは高々2^60-1なので ma+mb は
+ * 2^61未満に収まり、UINT64の加算で桁あふれしない(この上限チェックの前に
+ * 溢れることはない)。表現を変える場合はここも作り直す必要がある。
+ *
+ * [-0を作らない] 結果が0になるのは (1) 符号が同じでma=mb=0、(2) 符号が違って
+ * ma==mb、の2通り。どちらもos_make_fixnum_signedがマグニチュード0のとき符号を
+ * 落とすため、必ず正のゼロ(生値0)になる。
+ */
+static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
+        return 0;
+    }
+    UINT64 mag_a = os_fixnum_magnitude(a);
+    UINT64 mag_b = os_fixnum_magnitude(b);
+    int neg_a = os_fixnum_is_negative(a);
+    int neg_b = os_fixnum_is_negative(b);
+
+    if (neg_a == neg_b) {
+        /* 同符号: マグニチュードを足す。60bitを超えたらbignumへ */
+        UINT64 sum = mag_a + mag_b;
+        if (sum > FIXNUM_MAGNITUDE_MASK) {
+            return 0;
+        }
+        *out = os_make_fixnum_signed(neg_a, sum);
+        return 1;
+    }
+    /* 異符号: マグニチュードの大きいほうから小さいほうを引き、符号は大きいほうに従う。
+       結果のマグニチュードは元の最大値以下なので60bitを超えることはない */
+    if (mag_a >= mag_b) {
+        *out = os_make_fixnum_signed(neg_a, mag_a - mag_b);
+    } else {
+        *out = os_make_fixnum_signed(neg_b, mag_b - mag_a);
+    }
+    return 1;
+}
+
+/**
  * 組み込み関数+。argsの全数値(FIXNUM/bignum/float、負数も可)を合計する。
  * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して合計する。
- * それ以外で全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの
- * 高速パスを使い、それ以外(負数・bignumが絡む、桁あふれの恐れがある)は符号付き
- * マグニチュードによる一般パスにフォールバックする。
+ * それ以外で全オペランドがFIXNUM(**符号は問わない**)かつ途中経過が60bitに
+ * 収まる場合はヒープ確保なしの高速パスを使い、それ以外(bignumが絡む、
+ * 桁あふれする)は符号付きマグニチュードによる一般パスにフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
  * @return 合計値の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
@@ -4925,22 +4984,18 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
         return os_make_float(sum);
     }
 
+    /* [改善A] 途中経過(sum_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない。
+       argsを辿るcc_cdrも確保しないため、このループ中にGCは走らない */
     int fast = 1;
-    UINT64 sum = 0;
+    lisp_val_t sum_val = os_make_fixnum(0);
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        lisp_val_t v = cc_car(cur);
-        if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
-            fast = 0;
-            break;
-        }
-        sum += os_fixnum_magnitude(v);
-        if (sum > FIXNUM_MAGNITUDE_MASK) {
+        if (!fixnum_add_signed(sum_val, cc_car(cur), &sum_val)) {
             fast = 0;
             break;
         }
     }
     if (fast) {
-        return os_make_fixnum(sum);
+        return sum_val;
     }
 
     // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -4992,19 +5047,19 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
  * 無くなっても呼び出し先(このラッパー自身)が同じconsを構築し続けており、
  * 正味のヒープ確保削減になっていなかった。両方が非負FIXNUMで和がオーバーフロー
  * しない(=primitive_add本体のfast-path条件と同じ)場合はconsを一切構築せず
- * 直接計算する高速pathを追加し、それ以外(負数・float・bignum昇格が絡む稀な
+ * 直接計算する高速pathを追加し、それ以外(float・bignum昇格が絡む稀な
  * ケース)のみ従来通りconsリストを組み立てて委譲する。
+ *
+ * [改善A] 高速pathの条件を fixnum_add_signed へ寄せた。以前は「両方とも非負」に
+ * 限られていたため `(+ -1 1)` がconsを2個作ってbignum機構を通っていた。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_addと同じ規則で計算した合計値
  */
 lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
-    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
-        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
-        UINT64 sum = os_fixnum_magnitude(a) + os_fixnum_magnitude(b);
-        if (sum <= FIXNUM_MAGNITUDE_MASK) {
-            return os_make_fixnum(sum);
-        }
+    lisp_val_t sum;
+    if (fixnum_add_signed(a, b, &sum)) {
+        return sum;
     }
     GC_PROTECT(a);
     GC_PROTECT(b);
@@ -5014,21 +5069,21 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
 
 /**
  * primitive_subtractを2引数固定で呼ぶためのラッパー。primitive_add2と同じ
- * 理由で高速pathを追加した。両方が非負FIXNUMでb<=a(=結果が非負、
- * primitive_subtract本体のfast-path条件と同じ)の場合はconsを一切構築せず
+ * 理由で高速pathを追加した。両方がFIXNUMで結果が60bitに収まる
+ * (=primitive_subtract本体のfast-path条件と同じ)場合はconsを一切構築せず
  * 直接計算し、それ以外は従来通りconsリストを組み立てて委譲する。
+ *
+ * [改善A] a-b を a+(-b) に帰着させて fixnum_add_signed へ寄せた。以前は
+ * 「両方とも非負」かつ「b<=a」に限られていたため、`(- 1 -1)` や `(- 1 2)` の
+ * ように**結果がFIXNUMに収まる式でも**bignum機構を通っていた。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_subtractと同じ規則で計算したa-b
  */
 lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
-    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
-        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
-        UINT64 mag_a = os_fixnum_magnitude(a);
-        UINT64 mag_b = os_fixnum_magnitude(b);
-        if (mag_b <= mag_a) {
-            return os_make_fixnum(mag_a - mag_b);
-        }
+    lisp_val_t diff;
+    if ((b & TAG_MASK) == TAG_FIXNUM && fixnum_add_signed(a, fixnum_negate(b), &diff)) {
+        return diff;
     }
     GC_PROTECT(a);
     GC_PROTECT(b);
@@ -5039,8 +5094,9 @@ lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
 /**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として
  * 符号を反転する。floatが1つでも含まれる場合は全オペランドをdoubleへ変換して減算する。
- * それ以外で全オペランドが非負FIXNUMかつ結果が負にならない場合はヒープ確保なしの
- * 高速パスを使い、それ以外は符号付きマグニチュードによる一般パスにフォールバックする。
+ * それ以外で全オペランドがFIXNUM(**符号は問わない**)かつ途中経過が60bitに収まる
+ * 場合はヒープ確保なしの高速パスを使い、それ以外は符号付きマグニチュードによる
+ * 一般パスにフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
  * @return 減算結果の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
@@ -5063,32 +5119,32 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     if (cc_cdr(args) == nil) {
         // 単項マイナス: 0 - x
         if ((first & TAG_MASK) == TAG_FIXNUM) {
-            return os_make_fixnum_signed(!os_fixnum_is_negative(first), os_fixnum_magnitude(first));
+            return fixnum_negate(first);   /* [改善A] 同じ式が2箇所にあったので寄せた */
         }
         signed_mag_t operand;
         decompose(first, &operand);
         return os_make_integer(!operand.sign, operand.limbs, operand.count);
     }
 
-    int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
-    UINT64 result = fast ? os_fixnum_magnitude(first) : 0;
+    /* [改善A] 符号を問わずFIXNUMどうしなら a-b = a+(-b) で処理する。
+       途中経過(result_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない */
+    int fast = (first & TAG_MASK) == TAG_FIXNUM;
+    lisp_val_t result_val = first;
     if (fast) {
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
             lisp_val_t v = cc_car(rest);
-            if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+            if ((v & TAG_MASK) != TAG_FIXNUM) {
                 fast = 0;
                 break;
             }
-            UINT64 mag = os_fixnum_magnitude(v);
-            if (mag > result) {
+            if (!fixnum_add_signed(result_val, fixnum_negate(v), &result_val)) {
                 fast = 0;
                 break;
             }
-            result -= mag;
         }
     }
     if (fast) {
-        return os_make_fixnum(result);
+        return result_val;
     }
 
     // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
