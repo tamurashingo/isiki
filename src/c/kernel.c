@@ -86,6 +86,11 @@ static char g_qemu_test_boot_script[256] = "test/lisp/qemu_boot_test.lisp";
 /** g_qemu_test_boot_scriptが指すboot-entryスクリプトをcc_loadしてからpower_offする(process 0専用スタック上で実行される) */
 static void run_qemu_boot_test(void) {
     cc_load(os_make_cons(os_make_string(g_qemu_test_boot_script), nil), global_environment);
+#ifdef ISIKIOS_ALIGN_AUDIT
+    /* [調査] 16byte境界監査(ALIGN_AUDIT=1ビルドのみ)。boot-entryスクリプトを
+       変えずにどのQEMU試験でも集計が取れるよう、電源断の直前でシリアルへ出す */
+    os_align_audit_report();
+#endif
     g_qemu_test_power_off();
 }
 

@@ -300,6 +300,51 @@ void os_gc_collect(void);
  */
 UINT64 os_gc_collect_count(void);
 
+/* ============================== [調査] 16byte境界監査 ==============================
+ * documents/alignment-survey-report.md。タグを下位4bitへ拡張できるかの判定材料
+ * (「Lisp値として現れるポインタが16byte境界に揃っているか」)を集める計測専用の
+ * 仕組み。ALIGN_AUDIT=1 でビルドしたときだけ有効になり、既定ビルドでは
+ * マクロが空になって1命令も増えない。
+ *
+ * 観測点は2系統ある:
+ *   1. 確保サイト。各アロケータが返したアドレスの下位4bitを、サイト別に数える。
+ *   2. 流通している値。gc_copy_valueはGCのたびに**全ルートと全生存オブジェクトの
+ *      全フィールド**を通るので、ここで数えればLisp値として現れるポインタを
+ *      タグ別に網羅できる(ヒープを線形走査する方法は、可変長の生ブロック
+ *      (bignumのlimb配列・vector本体)がヘッダを持たないため成立しない)。
+ */
+#ifdef ISIKIOS_ALIGN_AUDIT
+
+/** 確保サイトの識別子。os_align_audit_reportの出力順と対応する */
+#define ALIGN_SITE_ALLOC_BYTES   0  /* os_alloc_bytes(From空間バンプ) */
+#define ALIGN_SITE_GC_TO_ALLOC   1  /* gc_to_alloc(To空間、GCコピー先) */
+#define ALIGN_SITE_IMM_SLOT      2  /* os_imm_slot_alloc(Function Cell / za_fn_meta_t) */
+#define ALIGN_SITE_IMM_PAGE      3  /* os_imm_page_alloc(JITコードページ等) */
+#define ALIGN_SITE_BOOT_ALLOC    4  /* os_boot_alloc(ヒープ初期化前) */
+#define ALIGN_SITE_STATIC_NIL    5  /* g_nil_cell(静的領域のnilセル) */
+#define ALIGN_SITE_IMM_PAGES_CONTIG 6  /* os_imm_pages_alloc_contiguous(JITコードページ) */
+#define ALIGN_SITE_LITERAL_SLOT  7  /* os_environment_register_literal_slotがTAG_RAW_POINTER化するアドレス */
+#define ALIGN_SITE_ENV_PAGE      8  /* os_environment_register_pagesがTAG_RAW_POINTER化するアドレス */
+#define ALIGN_SITE_DEVICE_HANDLE 9  /* %%IDE-DEVICE-ATが返すblock_device_t*(TAG_RAW_POINTER) */
+#define ALIGN_SITE_COUNT        10
+
+/** 確保サイトが返したアドレスを1件記録する */
+void os_align_audit_note_alloc(int site, UINT64 addr, UINT64 size);
+/** Lisp値を1件記録する(ポインタを持つタグのみ数える) */
+void os_align_audit_note_value(lisp_val_t v);
+/** 集計結果をシリアル(カーネル)/標準出力(ユニットテスト)へ出す */
+void os_align_audit_report(void);
+
+#define ALIGN_AUDIT_NOTE_ALLOC(site, addr, size) os_align_audit_note_alloc((site), (UINT64)(addr), (UINT64)(size))
+#define ALIGN_AUDIT_NOTE_VALUE(v)                os_align_audit_note_value((v))
+
+#else
+
+#define ALIGN_AUDIT_NOTE_ALLOC(site, addr, size) ((void)0)
+#define ALIGN_AUDIT_NOTE_VALUE(v)                ((void)0)
+
+#endif /* ISIKIOS_ALIGN_AUDIT */
+
 /* ============================== Immobilized Space ==============================
  * GC(copy GC)が移動・破棄しない固定領域。JITコードやFunction Cellなど、Cのポインタとして
  * 直接掴んでおきたいデータの置き場所として使う。os_gc_collectのスキャン対象外であり、

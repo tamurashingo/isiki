@@ -34,6 +34,7 @@ lisp_val_t cc_ide_device_at(lisp_val_t args, lisp_val_t env) {
     if (dev == 0) {
         return nil;
     }
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_DEVICE_HANDLE, (UINT64)(lisp_addr_t)dev, sizeof(block_device_t));
     return ((lisp_val_t)(lisp_addr_t)dev) | TAG_RAW_POINTER;
 }
 
