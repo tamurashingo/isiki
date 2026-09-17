@@ -76,16 +76,20 @@ static void ide_probe_one(UINT16 io_base, UINT16 ctrl_base, UINT8 drive, const c
         return;
     }
 
-    /* [静的領域調査/試験] documents/static-align16-survey.md Step 3 実験C。
-       bdのアドレスは %%IDE-DEVICE-AT が TAG_RAW_POINTER 付きの Lisp値として返す。
-       align=8 かつ sizeof が 68/104 だと、どのデバイスでも必ず 8 mod 16 に落ちる
-       (実測100%)。slot側も揃えないとbdの位置がずれるので両方16にする */
-    ide_bd_slot_t *slot = (ide_bd_slot_t *)os_boot_alloc(sizeof(ide_bd_slot_t), 16);
+    /* [境界] bdのアドレスは %%IDE-DEVICE-AT が TAG_RAW_POINTER 付きの**Lisp値**として
+       返す(ide_subprimitive.c)。os_boot_allocは要求されたalignへ切り上げるだけなので、
+       align=8 のままだと sizeof が 68/104 という組み合わせ上どのデバイスでも
+       必ず 8 mod 16 に落ちていた(実測100%。documents/static-align16-survey.md 2.4)。
+       slot側を揃えないと後続のbdの位置がずれるので、両方OS_HEAP_ALIGNで確保する。 */
+    ide_bd_slot_t *slot = (ide_bd_slot_t *)os_boot_alloc(sizeof(ide_bd_slot_t), OS_HEAP_ALIGN);
     slot->io_base = io_base;
     slot->ctrl_base = ctrl_base;
     slot->drive = drive;
 
-    block_device_t *bd = (block_device_t *)os_boot_alloc(sizeof(block_device_t), 16);
+    block_device_t *bd = (block_device_t *)os_boot_alloc(sizeof(block_device_t), OS_HEAP_ALIGN);
+    /* [境界] 確保した時点で検査する。os_boot_allocはpanic経路を持たないので、
+       ここで崩れを見つけないと「Lisp値になってから監査で気づく」ことになる */
+    os_assert_lisp_aligned("block_device_t", (lisp_addr_t)(void *)bd);
     bd->name = name;
     bd->sector_size = IDE_SECTOR_BUFFER_SIZE;
     bd->total_sectors = 0;

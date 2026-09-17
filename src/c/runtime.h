@@ -82,11 +82,11 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
 #define OS_HEAP_ALIGN 16ULL
 #endif
 
-_Static_assert(OS_HEAP_ALIGN >= 8, "OS_HEAP_ALIGNは最低でもlisp_val_t(8byte)分が要る");
+_Static_assert(OS_HEAP_ALIGN >= 8, "OS_HEAP_ALIGN must be at least sizeof(lisp_val_t) (8)");
 _Static_assert((OS_HEAP_ALIGN & (OS_HEAP_ALIGN - 1)) == 0,
-               "OS_HEAP_ALIGNは2のべき乗でなければならない(下のマスク演算が成立しない)");
+               "OS_HEAP_ALIGN must be a power of two (mask arithmetic below depends on it)");
 _Static_assert(OS_HEAP_ALIGN > TAG_MASK,
-               "OS_HEAP_ALIGNがタグのbit幅を下回ると、タグとアドレスが衝突する");
+               "OS_HEAP_ALIGN must exceed TAG_MASK, otherwise tag bits collide with the address");
 
 /**
  * nをOS_HEAP_ALIGNの倍数へ切り上げる。
@@ -96,6 +96,20 @@ _Static_assert(OS_HEAP_ALIGN > TAG_MASK,
 static inline UINT64 os_heap_align_up(UINT64 n) {
     return (n + (OS_HEAP_ALIGN - 1)) & ~(OS_HEAP_ALIGN - 1);
 }
+
+/**
+ * [境界] addrがOS_HEAP_ALIGN境界に乗っていなければ、nameとアドレスを添えてos_panicする。
+ *
+ * 「Lispの値として現れるポインタはすべて16byte境界」という不変条件を、
+ * **ブート時に実物のアドレスで**確かめるための検査。コンパイル時の
+ * _Static_assert は型のサイズとアラインしか見られず、リンカやローダが
+ * 実際にどこへ置いたかまでは保証しないので、両方要る。
+ *
+ * 既定ビルドでも常に有効。ブート中に数回比較するだけでコストは無視できる。
+ * @param name panicメッセージに出す対象の名前
+ * @param addr 検査するアドレス(タグを外したもの)
+ */
+void os_assert_lisp_aligned(const char *name, lisp_addr_t addr);
 
 
 /** TAG_INSTANCEのword0に入る、ネイティブ(C)関数であることを示すMAGIC NUMBER */

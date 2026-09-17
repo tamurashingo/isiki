@@ -451,3 +451,229 @@ static za_slot_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS] __attribute__((aligned(16)
 | 実機（非QEMU）での確認 | 環境が無いため未実施。静的領域の配置はリンカとビルドフラグに依存するので、実機ビルドでの再確認が要る |
 | `AllocatePool` を将来使い始めた場合 | 現在1度も呼んでいないため未確認。UEFI 仕様は `AllocatePool` に8byte境界しか要求していないので、使い始めるなら Lisp 値にする前にアラインの確認が要る |
 | 実験A/B/C の性能への影響 | 本調査では境界の成立だけを見ており、BSS が +30,720 byte 増えること以外の性能測定はしていない。JIT の出力バイト列が変わらないことは確認済みなので、実行時コストの増分は無いと見込まれるが、計測はしていない |
+
+---
+
+## 8. 本採用（2026-09-17）
+
+第4章の実験A・B・Cを本採用し、16byte境界が**後から崩れたときに必ず検出される**
+状態にした。以降「Lispの値として現れるポインタは、例外なく16byte境界」が
+コンパイル時・ブート時・監査の3段階で検査される。
+
+### 8.1 rebase / base の確認
+
+**PR #73 の内容は main に入っていなかった。** 指示書は「PR #72・#73 はマージ済み」を
+前提にしていたが、実際には:
+
+| PR | マージ先 | 時刻 |
+|---|---|---|
+| #72 | `main` | 15:38:36 |
+| #73 | **`feature/alignment-audit`** | 15:38:48 |
+
+`feature/alignment-audit` は #72 で main へマージされた**後**に #73 を受け取ったため、
+#73 のコミット `9e6822b`（ヒープの16byte境界化）は main に到達していない。
+
+```
+$ git merge-base --is-ancestor 9e6822b origin/main; echo $?
+1                      # = 入っていない
+$ git show origin/main:src/c/runtime.h | grep -c OS_HEAP_ALIGN
+0                      # main には OS_HEAP_ALIGN が無い
+$ git log --oneline origin/main..origin/feature/alignment-audit
+1911cd6 Merge pull request #73 from tamurashingo/feature/heap-align16
+9e6822b feat(gc): Lispヒープのバンプアロケータを16byte境界にする
+```
+
+このため **main へ rebase していない**。rebase すると PR #74 の差分に #73 の内容
+（`Makefile` / `runtime.h` / `runtime_test.c` / `heap-align16-report.md`）が混ざり、
+指示書が求める「PR #74 の変更だけになっていること」という確認自体が成立しないうえ、
+#73 の作業が #74 経由で再配達される形になる。
+
+現在の base（`feature/heap-align16`）に対する差分は、本採用分を含めても
+**PR #74 自身の変更だけ**である:
+
+```
+$ git diff --stat origin/feature/alignment-audit..HEAD
+ documents/static-align16-survey.md | ...
+ src/c/block_device.c               | ...
+ src/c/runtime.c                    | ...
+ src/c/za.c                         | ...
+```
+
+**必要な対処**: `feature/alignment-audit` を main へマージし直すと #73 が main に入る
+（`main` は `feature/alignment-audit` の祖先ではないので fast-forward ではなく
+通常のマージになる）。それが済んだ時点で、PR #74 の base を main へ切り替えられる。
+
+### 8.2 Step 1: 本採用した変更
+
+実験用の `#ifdef` やフラグ切り替えは**一切残していない**（常に有効）。
+アライン値はすべて `OS_HEAP_ALIGN` 経由で、`16` の直書きはしていない。
+`-DOS_HEAP_ALIGN=8ULL` の比較ビルドでは、ヒープと静的領域が**一緒に**8へ戻る。
+
+| # | 対象 | 変更 | 箇所 |
+|---|---|---|---|
+| A | `g_nil_cell` | `aligned(8)` → `aligned(OS_HEAP_ALIGN)` | `runtime.c:271` |
+| B | JITリテラルスロット4本 | 要素を `za_slot_t`（`union { lisp_val_t v; UINT8 _pad[OS_HEAP_ALIGN]; }`、型に `aligned(OS_HEAP_ALIGN)`）にし、配列にも `aligned(OS_HEAP_ALIGN)` | `za.c:578-590` ほか約24行 |
+| C | `block_device_t` / `ide_bd_slot_t` | `os_boot_alloc(..., 8)` → `..., OS_HEAP_ALIGN` | `block_device.c:79,88` |
+
+`za_slot_t` を **struct + パディング配列ではなく union** にしたのは、
+`OS_HEAP_ALIGN == sizeof(lisp_val_t)` のとき（= `-DOS_HEAP_ALIGN=8ULL` の比較ビルド）に
+パディング配列がサイズ0になって壊れるのを避けるため。union なら素直に8byteへ縮む。
+
+`aligned(16)` の直書きが残っている3箇所（`g_ist_stack` / `g_fpu_default_state` /
+`g_jit_code`）は**Lisp値ではない**。割り込みスタックとFXSAVE領域はx86-64 ABIが16を
+要求するもの、`g_jit_code` はJITのステージングバッファで、いずれも `OS_HEAP_ALIGN` と
+連動させるべきものではないため、意図的に16のままにしてある。
+
+#### JIT 出力が変わらないことの確認
+
+スロットのアドレスは `&g_za_*_slots[i].v` として **C 側で計算した絶対値**を
+`jit_movabs_reg` の即値に埋めるだけで、生成コードに `base + 8*i` のような
+インデックス計算は無い。読み書きは `jit_mov_reg_from_mem_disp8(..., 0)` /
+`jit_mov_mem_disp8_from_reg(..., 0, ...)`、いずれも REX.W + `disp8=0` の
+**64bitアクセス1回**で、オフセット0（= `.v`）しか触らない。
+
+実地の裏付けとして、`make test`（既定ビルド）が **8170 OK / 0 NG** で
+PR #73 と同数のまま通っており、JIT を厚く踏む強制GC条件（GC 231回）も
+**733 passed / 0 failed** で変わっていない。
+
+### 8.3 Step 2: コンパイル時の検査
+
+| 検査 | 箇所 |
+|---|---|
+| `OS_HEAP_ALIGN >= 8` | `runtime.h:85` |
+| `OS_HEAP_ALIGN` が2のべき乗 | `runtime.h:86` |
+| `OS_HEAP_ALIGN > TAG_MASK` | `runtime.h:88` |
+| `sizeof(g_nil_cell) % OS_HEAP_ALIGN == 0` | `runtime.c:273` |
+| `__alignof__(g_nil_cell) >= OS_HEAP_ALIGN` | `runtime.c:278` |
+| `sizeof(za_slot_t) % OS_HEAP_ALIGN == 0` | `za.c:585` |
+| `_Alignof(za_slot_t) >= OS_HEAP_ALIGN` | `za.c:589` |
+
+`g_nil_cell` は `aligned` を**変数**に付けているので、型を取る `_Alignof` では見られない。
+GCC拡張の `__alignof__`（式を取れる）を使っている。
+
+`block_device_t` については、指示書が挙げていた2つの検査は**該当しない**:
+
+- **配列で持っていない**。`g_block_devices` は `block_device_t *` の配列（ポインタの配列）で、
+  実体はすべて `os_boot_alloc` で個別に確保される。要素サイズの制約は生じない
+- **型に `aligned` を付けていない**。確保のたびに `os_boot_alloc(..., OS_HEAP_ALIGN)` が
+  開始位置を切り上げるので、型のアラインに依存しない。代わりに確保直後の
+  実アドレスを検査している（8.4）
+
+### 8.4 Step 3: ブート時の検査
+
+`os_assert_lisp_aligned(name, addr)`（`runtime.c`、宣言は `runtime.h:112`）。
+外れていれば対象名とアドレスを出して `os_panic` する。**既定ビルドでも常に有効**。
+
+| 対象 | 呼び出し箇所 | 位置の根拠 |
+|---|---|---|
+| `g_nil_cell` | `runtime.c:2623`（`os_bootstrap` 内、nil を組み立てる直前） | nil が**初めて使われる前**。これより早い位置は無い |
+| JITリテラルスロット4本の配列先頭 | `za.c:1116-1119`（`za_assert_slot_alignment`）、`kernel.c:109` から呼ぶ | 最初のJITコンパイルより前。要素サイズは 8.3 の `_Static_assert` が保証するので、先頭だけ見れば全要素が揃う |
+| `block_device_t` | `block_device.c:92`（`os_boot_alloc` の直後） | `os_boot_alloc` は panic 経路を持たないので、確保した時点で見ないと「Lisp値になってから監査で気づく」ことになる |
+
+**panic hook がまだ入っていない点について**: これらの検査は
+`os_set_panic_hook(power_off)`（`kernel.c:171`）より前に走るので、発火すると
+`os_panic` は電源断ではなく `for(;;) hlt` で止まる。QEMU からは**タイムアウト**
+（終了コード124）として見える。ただし診断は**シリアルへ先に**出しているので、
+何が外れたかは確実に読める（`os_panic_stack_overflow` と同じ方針）。
+既存の `os_heap_init` のヒープ先頭検査もまったく同じ位置・同じ性質であり、
+本採用で新たに持ち込んだ制約ではない。
+
+### 8.5 Step 4: スロット配列のパディングとルート走査
+
+| 確認項目 | 結果 | 根拠 |
+|---|---|---|
+| GC はスロット配列をどう走査するか | **要素の型単位ですらなく、登録された個々のポインタを辿るだけ**。バイト範囲の走査ではない | `runtime.c:2546-2548` `for (i...) *g_gc_extra_roots[i] = gc_copy_value(*g_gc_extra_roots[i]);`。`g_gc_extra_roots` は `lisp_val_t *` の配列（`runtime.c:1835`）で、`os_gc_register_root(&g_za_*_slots[i].v)` が登録した**そのアドレス**しか読まない |
+| 直す必要があるか | **無し**。パディングはルートとして一度も読まれない | 登録されるのは `&arr[i].v`（union のオフセット0）だけ |
+| パディングへの書き込みはあるか | **無し** | C 側の代入は9箇所すべて `arr[i].v = ...`。`_pad` はメンバ宣言（`za.c:579`）の1箇所にしか現れず、読み書きするコードは無い。JIT 側も `disp8=0` の64bitアクセスのみ |
+| 塗り潰し監査が BSS / スロット配列を塗るか | **塗らない** | トラップパターンの書き込みは `runtime.c:2605` の1箇所だけで、範囲は `g_to_start` 〜 `gc_debug_old_used_end`、つまり**Lispヒープ内の旧From空間**に限られる。BSS は対象外 |
+
+したがって Step 4 は**確認のみで、変更は不要**だった。
+
+### 8.6 Step 5: 監査をタグだけの判定に切り替え
+
+| 変更前 | 変更後 |
+|---|---|
+| `align_tag_is_enforced(tag) && align_addr_is_in_lisp_heap(addr) && OFFENDS(addr)` | `align_tag_is_enforced(tag) && OFFENDS(addr)` |
+| 対象タグ: CONS / SYMBOL / STRING / INSTANCE / FORWARD | **`tag != TAG_FIXNUM && tag != TAG_CHAR`**（= RAW_POINTER も含む全ポインタ型タグ） |
+| 確保サイト: 6/10 サイトのみ強制 | **全10サイト**（例外なし） |
+
+- `align_addr_is_in_lisp_heap` は**失敗判定から外した**。削除はせず、
+  ヒープ外ポインタをアドレス別に採取して `nm` へ逆引きする **分類用**として残し、
+  その用途をコメントに明記した（`runtime.c:558-566`）
+- 確保サイトの「サイズ」検査は、**バンプアロケータ3サイトのみ**に限定する
+  `align_site_stride_is_enforced` を新設した。`os_boot_alloc` は確保ごとに開始位置を
+  切り上げるし、リテラルスロット/`block_device` ハンドルの登録は「既にあるアドレスを
+  記録するだけ」で、そこで渡す size は次のアドレスを決めない。全サイトに
+  サイズ検査をかけると `sizeof(block_device_t)=104` のような**正当な値で誤検出**する
+- **例外リストは空**である
+
+### 8.7 Step 6: ネガティブテスト（コミットしていない）
+
+3段階の検査が実際に崩れを捕まえることを確認した。いずれも一時的な変更で行い、
+確認後にソースを復元してある（`grep -c "NEGATIVE TEST" src/c/*.c` = 0）。
+
+| # | 崩し方 | どの検査が | どう失敗したか |
+|---|---|---|---|
+| NT1 | `g_nil_cell` を `aligned(8)` に戻す | **コンパイル時** | `runtime.c:278: error: static assertion failed: "alignof(g_nil_cell) < OS_HEAP_ALIGN: nil would not be aligned"` |
+| NT2 | `za_slot_t` を 8byte（`union { lisp_val_t v; }`）に戻す | **コンパイル時** | `za.c:584` と `za.c:588` の2本が同時に失敗（サイズとアラインの両方） |
+| NT3 | nil のアドレスを `g_nil_cell + 8` にする | **ブート時** | シリアルに `PANIC: not 16-byte aligned: g_nil_cell addr=63242296 low bits=8`。`test-results.txt` は**書かれず**、試験に到達する前に停止した（qemu-exit=124 = 8.4 のとおりタイムアウト） |
+| NT4 | NT3 に加えてブート時検査だけ無効化 | **監査** | `[ALIGN] VIOLATION alloc g_nil_cell value=63240984 low4bit=8` / `violations=1`。**監査だけでも単独で検出できる** |
+
+NT4 が `alloc` サイト（`ALIGN_SITE_STATIC_NIL`）で捕まえている点は、8.6 で
+確保サイトの例外を無くしたことがそのまま効いている。
+
+#### 副産物: `_Static_assert` のメッセージを ASCII にした
+
+NT1/NT2 で、メッセージを日本語にすると GCC が非ASCIIを8進エスケープで出力し、
+**読めない**ことが分かった:
+
+```
+error: static assertion failed: "g_nil_cell\37777777743\37777777601\37777777656...
+```
+
+読めない失敗メッセージは無いのとほぼ同じなので、本採用した `_Static_assert` の
+メッセージはすべて ASCII にした（日本語の説明は直前のコメントに残してある）。
+
+### 8.8 Step 7: 検証結果
+
+#### 正しさ（すべて PR #74 の実験時と同じ）
+
+| 検証 | 結果 |
+|---|---|
+| `make test`（既定ビルド、`ALIGN_AUDIT` 無し） | **8170 OK / 0 NG**、`[ALIGN]` 行 **0行** |
+| QEMU全試験 `QEMU_MEM=96M`（GC 72回） | **3269 passed / 0 failed** |
+| QEMU全試験 `QEMU_MEM=256M`（GC 14回） | **3269 passed / 0 failed** |
+| 強制GC（`gc-stress 1000` + `GC_DEBUG=1`、GC 231回） | **733 passed / 0 failed** |
+| 塗り潰し監査22試験 | **21 OK / 1 FAIL**、全22グループが `heap-align=16 violations=0`、`VIOLATION` 行 0件 |
+
+`aot_leaf_gc_test` の1 FAIL は
+`(> (- LEAF-GC-STRESS-GC-AFTER LEAF-GC-STRESS-GC-BEFORE) 1)`、`gc=0` の記録つきで、
+PR #72 以来の「単独起動するとGCが1回も走らない」既存の性質。**同条件・同内容**である。
+
+#### 新しい判定（タグのみ）での違反件数
+
+| 条件 | region 2（Immobilized Space） | region 4（静的・ブート時確保） | `violations=` |
+|---|---|---|---|
+| 96M | 195,079 / **0** | 900,658 / **0** | **0** |
+| 256M | 39,035 / **0** | 259,340 / **0** | **0** |
+| 強制GC（GC 231回） | 210,517 / **0** | 1,168,121 / **0** | **0** |
+| 22試験（各グループ） | — | — | **全22グループで 0** |
+
+範囲の絞りを外した状態で、延べ **270万回超**のポインタ観測に対して違反 0 件。
+
+#### `.bss` の増加量
+
+`feature/alignment-audit`（= main + PR #73）を同条件でビルドして比較した。
+
+| | `.bss` サイズ |
+|---|---|
+| 本採用前 | `0x013613c0` = 20,321,216 byte |
+| 本採用後 | `0x013683c0` = 20,349,888 byte |
+| **差分** | **+28,672 byte（+0.141%）** |
+
+PR #74 の見積もりは +30,720 byte（スロット 3,840個 × 8byte）だった。実測が
+2,048 byte 少ないのは、BSS のシンボル配置が変わって既存の詰め物が一部吸収された
+ため（`nm` でスロット配列の間隔を見ると、本採用前後でどちらも配列間に他の
+シンボルと余白が入っており、その並びが変わっている）。
+**理論値の内訳ではなく実測値を採る。**
+

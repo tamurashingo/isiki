@@ -17,6 +17,7 @@ UINT64 g_za_heap_imm_first_off = 0;
    引数のタグを持つ「ヒープを指す即値」を含む合成movabsを作り、
    za_try_compile_defunと同じ判定(os_tag_is_heap_ref + os_addr_region)にかける。
    ヒープ参照タグなら1、そうでなければ0を返さなければならない。 */
+
 lisp_val_t primitive_za_scan_synth(lisp_val_t args, lisp_val_t env) {
     (void)env;
     UINT64 tag = os_fixnum_magnitude(cc_car(args)) & TAG_MASK;
@@ -557,24 +558,39 @@ typedef struct {
 /* 2026-09-14: ISLisp仕様例のJIT版(isiki_test_jit.lisp、約600関数が文字列/リスト/
  * ベクタのリテラルを持つ)を1ブートで全てJIT化できるよう40→1024へ拡張。number/lambdaと
  * GC_MAX_EXTRA_ROOTS(runtime.c)も同時に拡張した */
-/* [静的領域調査/試験] documents/static-align16-survey.md Step 3 実験B。
- *
- * リテラルスロットのアドレスは os_environment_register_literal_slot 経由で
- * TAG_RAW_POINTER 付きの**Lisp値として流通する**。配列を aligned(16) にしても
+/* [境界] リテラルスロットのアドレスは os_environment_register_literal_slot 経由で
+ * TAG_RAW_POINTER 付きの**Lisp値として流通する**。配列に aligned を付けても
  * 要素アドレスは「先頭 + 要素サイズ × i」なので、要素が8byteのままだと
- * 奇数添字が必ず 8 mod 16 になる(実測でちょうど50%が外れていた)。
+ * 奇数添字が必ず 8 mod 16 になる(実測でちょうど50%が外れていた。
+ * documents/static-align16-survey.md 2.3)。
  *
- * そこで1要素を16byteにする。中身は今までどおり lisp_val_t 1個で、後半8byteは
- * 純粋なパディングである。生成コードはスロットの**絶対アドレス**を movabs の
- * 即値として埋めており(za.c の jit_movabs_reg 呼び出し)、base + 8*i のような
- * インデックス計算を持たないので、出力される機械語の形は変わらない。 */
-typedef struct {
+ * そこで1要素を OS_HEAP_ALIGN byte にする。中身は今までどおり lisp_val_t 1個で、
+ * 残りは純粋なパディングである。
+ *
+ * union にしてあるのは、OS_HEAP_ALIGN を変えたときに素直に追随させるため。
+ * struct + パディング配列だと OS_HEAP_ALIGN == sizeof(lisp_val_t) のときに
+ * サイズ0の配列になってしまい、-DOS_HEAP_ALIGN=8ULL の比較ビルドが壊れる。
+ *
+ * 生成コードはスロットの**絶対アドレス**を movabs の即値として埋めており
+ * (下の jit_movabs_reg 呼び出し)、base + 8*i のようなインデックス計算を
+ * 持たないので、要素サイズを変えても**出力される機械語は1バイトも変わらない**。 */
+typedef union {
     lisp_val_t v;
-    UINT64     _pad;   /* 要素strideを16byteにするためだけのパディング */
-} za_slot_t;
+    UINT8      _pad[OS_HEAP_ALIGN];
+} __attribute__((aligned(OS_HEAP_ALIGN))) za_slot_t;
+
+/* [境界] 要素サイズが OS_HEAP_ALIGN の倍数でなければ、配列先頭を揃えても
+   奇数番目の要素がずれる。ここが崩れると監査でしか気づけないので、
+   コンパイル時に止める */
+_Static_assert(sizeof(za_slot_t) % OS_HEAP_ALIGN == 0,
+               "sizeof(za_slot_t) must be a multiple of OS_HEAP_ALIGN: slot elements would not be aligned");
+/* 型そのものにアラインを付けてあるので、この先誰かが za_slot_t を単体変数や
+   別の配列で持っても自動的に揃う(配列側の aligned 指定に頼らない) */
+_Static_assert(_Alignof(za_slot_t) >= OS_HEAP_ALIGN,
+               "alignof(za_slot_t) < OS_HEAP_ALIGN: slots would not be aligned");
 
 #define ZA_MAX_QUOTE_SLOTS 1024
-static za_slot_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS] __attribute__((aligned(16)));
+static za_slot_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS] __attribute__((aligned(OS_HEAP_ALIGN)));
 static UINT64 g_za_quote_slot_count = 0;
 /** Phase3.6: 環境破棄時にza_free_literal_slotが返却したスロットindexのフリーリスト
  * (スタック、LIFO)。za_alloc_quote_slotはここを先に見て、空ならモノトニック
@@ -647,7 +663,7 @@ static int za_classify_quoted_value(lisp_val_t quoted, za_operand_t *out) {
  * プロセス生涯で解放しない(g_za_quote_slotsと同じ考え方)。
  */
 #define ZA_MAX_NUMBER_SLOTS 512  /* 2026-09-14: 32→512(ZA_MAX_QUOTE_SLOTS参照) */
-static za_slot_t g_za_number_slots[ZA_MAX_NUMBER_SLOTS] __attribute__((aligned(16)));
+static za_slot_t g_za_number_slots[ZA_MAX_NUMBER_SLOTS] __attribute__((aligned(OS_HEAP_ALIGN)));
 static UINT64 g_za_number_slot_count = 0;
 /** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
 static UINT64 g_za_number_slot_free[ZA_MAX_NUMBER_SLOTS];
@@ -1063,7 +1079,7 @@ _Static_assert(sizeof(za_syms_t) == 25 * sizeof(lisp_val_t),
  * JIT化できる」確認が40では枯渇して失敗するようになったため、64へ広げる
  * (GC_MAX_EXTRA_ROOTSも同時に160→256へ) */
 #define ZA_MAX_LAMBDA_SLOTS 256  /* 2026-09-14: 64→256(ZA_MAX_QUOTE_SLOTS参照) */
-static za_slot_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS] __attribute__((aligned(16)));
+static za_slot_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS] __attribute__((aligned(OS_HEAP_ALIGN)));
 static UINT64 g_za_lambda_slot_count = 0;
 /** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
 static UINT64 g_za_lambda_slot_free[ZA_MAX_LAMBDA_SLOTS];
@@ -1091,7 +1107,20 @@ static UINT64 g_za_lambda_slot_free_count = 0;
  * であるTAG_RAW_POINTER付きアドレスとは値域が重ならないため安全に判別できる)。
  */
 #define ZA_MAX_FN_CELL_CACHE_SLOTS 2048
-static za_slot_t g_za_fn_cell_cache_slots[ZA_MAX_FN_CELL_CACHE_SLOTS] __attribute__((aligned(16)));
+static za_slot_t g_za_fn_cell_cache_slots[ZA_MAX_FN_CELL_CACHE_SLOTS] __attribute__((aligned(OS_HEAP_ALIGN)));
+
+void za_assert_slot_alignment(void) {
+    /* [境界] 要素サイズが OS_HEAP_ALIGN の倍数であることは _Static_assert が
+       保証しているので、**配列の先頭さえ揃っていれば全要素が揃う**。
+       先頭4本だけ実アドレスで確かめればよい。
+       リンカ/ローダが実際にどこへ置いたかはコンパイル時には分からないので、
+       この検査はブート時にしか行えない(documents/static-align16-survey.md 3.4)。 */
+    os_assert_lisp_aligned("g_za_quote_slots",         (lisp_addr_t)(void *)g_za_quote_slots);
+    os_assert_lisp_aligned("g_za_number_slots",        (lisp_addr_t)(void *)g_za_number_slots);
+    os_assert_lisp_aligned("g_za_lambda_slots",        (lisp_addr_t)(void *)g_za_lambda_slots);
+    os_assert_lisp_aligned("g_za_fn_cell_cache_slots", (lisp_addr_t)(void *)g_za_fn_cell_cache_slots);
+}
+
 static UINT64 g_za_fn_cell_cache_slot_count = 0;
 static UINT64 g_za_fn_cell_cache_slot_free[ZA_MAX_FN_CELL_CACHE_SLOTS];
 static UINT64 g_za_fn_cell_cache_slot_free_count = 0;

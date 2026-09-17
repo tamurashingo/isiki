@@ -263,10 +263,20 @@ static UINT8 *g_to_end;
  * nil(自己参照するconsセル)専用の固定領域。From/To空間のどちらにも属さず、GCの
  * コピー/スワップの対象にならない(g_symbol_table等と同じ静的配列パターン)。
  */
-/* [静的領域調査/試験] documents/static-align16-survey.md Step 3 実験A。
-   aligned(8) のままだと nil(= g_nil_cell | TAG_CONS)の下位4bitがビルド依存で
-   0 になったり 8 になったりする。16 を明示すればどうなるかを試す */
-static UINT8 g_nil_cell[16] __attribute__((aligned(16)));
+/* [境界] nil(= g_nil_cell | TAG_CONS)は**TAG_CONS付きのLisp値**である。
+   aligned(8) のままだと下位4bitがビルド依存で 0 になったり 8 になったりし、
+   「揃っているように見えるビルド」が実在した(既定ビルドで 8、GC_DEBUGビルドで 0。
+   documents/static-align16-survey.md 2.5)。
+   OS_HEAP_ALIGN を渡すことで、-DOS_HEAP_ALIGN=8ULL の比較ビルドでは
+   ヒープと一緒にこちらも 8 へ戻る(境界を片方だけ動かすと比較にならない)。 */
+static UINT8 g_nil_cell[16] __attribute__((aligned(OS_HEAP_ALIGN)));
+_Static_assert(sizeof(g_nil_cell) % OS_HEAP_ALIGN == 0,
+               "sizeof(g_nil_cell) must be a multiple of OS_HEAP_ALIGN");
+/* aligned属性は「変数」に付けているので、型ではなく変数のアラインを見る
+   (_Alignofは型専用なのでGCC拡張の__alignof__を使う)。
+   属性を消す/減らす変更をコンパイル時に捕まえるための検査 */
+_Static_assert(__alignof__(g_nil_cell) >= OS_HEAP_ALIGN,
+               "alignof(g_nil_cell) < OS_HEAP_ALIGN: nil would not be aligned");
 
 /**
  * From空間からnバイト(OS_HEAP_ALIGN境界に整列)を割り当てる。枯渇した場合は停止する。
@@ -523,41 +533,58 @@ static const char *align_tag_name(UINT64 tag);
  * 既知の未対応に埋もれて見えなくなる。
  */
 static int align_site_is_enforced(int site) {
+    /* [境界] PR #74 で全経路を16byte境界にしたので、**例外は無い**。
+       以前は静的nilセル/JITリテラルスロット/block_deviceハンドル/boot allocatorを
+       除外していたが、いずれも揃うようになった */
+    (void)site;
+    return 1;
+}
+
+/**
+ * [境界] このサイトでは「切り上げ後のサイズ」も強制対象か。
+ *
+ * バンプアロケータ(os_alloc_bytes / gc_to_alloc / os_imm_slot_alloc)は
+ * **返したサイズぶん進めて次の確保位置にする**ので、サイズが境界の倍数でないと
+ * 次の確保がずれる。したがってサイズも見る必要がある。
+ *
+ * 一方、os_boot_alloc は確保ごとに開始位置を切り上げるし、リテラルスロットや
+ * block_deviceハンドルの登録は「既にあるアドレスを記録するだけ」で、
+ * そこで渡している size は次のアドレスを決めない。これらにサイズ検査を
+ * かけると、揃っているのに落ちる誤検出になる
+ * (sizeof(block_device_t)=104 など、16の倍数でないものが正当に存在する)。
+ */
+static int align_site_stride_is_enforced(int site) {
     switch (site) {
-        case ALIGN_SITE_ALLOC_BYTES:       /* Lispヒープ From空間 */
-        case ALIGN_SITE_GC_TO_ALLOC:       /* Lispヒープ To空間 */
-        case ALIGN_SITE_IMM_SLOT:          /* Immobilized Spaceのスロット */
-        case ALIGN_SITE_IMM_PAGE:
-        case ALIGN_SITE_IMM_PAGES_CONTIG:
-        case ALIGN_SITE_ENV_PAGE:
+        case ALIGN_SITE_ALLOC_BYTES:
+        case ALIGN_SITE_GC_TO_ALLOC:
+        case ALIGN_SITE_IMM_SLOT:
             return 1;
         default:
             return 0;
     }
 }
 
-/** [境界] このタグの値はLispヒープ上のオブジェクトを指しうるか。
-    TAG_RAW_POINTERはJITリテラルスロットとblock_deviceハンドルを含むため対象外 */
+/** [境界] このタグの値はアドレスを持つか(= 16byte境界を強制する対象か)。
+ *
+ * FIXNUM/CHAR は即値でアドレスを含まないので対象外。それ以外の6タグはすべて対象で、
+ * **TAG_RAW_POINTER も含む**。PR #74 の分類で、TAG_RAW_POINTER として流通する値は
+ * JITリテラルスロット・block_deviceハンドル・Function Cell・環境ページの4種だけで、
+ * どれも16byte境界に置けることが分かったため(documents/static-align16-survey.md 1章)。
+ */
 static int align_tag_is_enforced(UINT64 tag) {
-    return tag == TAG_CONS || tag == TAG_SYMBOL || tag == TAG_STRING ||
-           tag == TAG_INSTANCE || tag == TAG_FORWARD;
+    return tag != TAG_FIXNUM && tag != TAG_CHAR;
 }
 
 /**
- * [境界] この**アドレス**が本フェーズの保証範囲(Lispヒープの中)にあるか。
+ * [集計用] このアドレスがLispヒープ(From/To空間)の中にあるか。
  *
- * 本フェーズが保証するのは「Lispヒープ上のオブジェクトが16byte境界にあること」
- * であって、ヒープ外にある静的オブジェクトは対象外である
- * (documents/heap-align16-report.md 6章)。タグだけで判定すると、
- * **nil がここに引っかかる**: nilは `g_nil_cell | TAG_CONS` という、
- * From/To空間のどちらにも属さない静的領域への TAG_CONS 付きポインタで、
- * g_nil_cell は `__attribute__((aligned(8)))` のままだからである。
- * 実測(2026-09-17、既定ビルド): g_nil_cell は `...a68` に置かれ、
- * nil の下位4bitは 9 になる。GC_DEBUG ビルドでは16境界に落ちるため、
- * 「ビルドによって出たり出なかったりする違反」になってしまう。
+ * **失敗判定にはもう使っていない。** PR #73 の時点ではヒープ外の保証が無く、
+ * 範囲で絞らないと nil(静的領域)やJITリテラルスロットが常に引っかかったため
+ * 強制対象をヒープ内に限っていた。PR #74 で全経路を16byte境界にしたので、
+ * 判定はタグだけで足りる(align_tag_is_enforced)。
  *
- * 領域で切ることで、対象外のものを機械的に外せる。タグ側の列挙に
- * 「nilは除く」という例外を足すより、保証の範囲そのものを述語にする方がよい。
+ * 現在の用途は**分類のみ**: ヒープ外のポインタをアドレス別に採取して
+ * nm へ逆引きする align_ext_note の振り分けに使う。
  */
 static int align_addr_is_in_lisp_heap(lisp_addr_t addr) {
     int region = os_addr_region(addr);
@@ -608,7 +635,7 @@ void os_align_audit_note_alloc(int site, UINT64 addr, UINT64 size) {
     /* [境界] サイズがOS_HEAP_ALIGNの倍数でないと、確保自体は揃っていても
        **次の**確保がずれる。切り上げている以上、強制対象のサイトでは0でなければ
        ならない */
-    if (align_site_is_enforced(site) && ALIGN_AUDIT_OFFENDS(size)) {
+    if (align_site_stride_is_enforced(site) && ALIGN_AUDIT_OFFENDS(size)) {
         align_audit_violation("stride", align_site_name(site), size);
     }
 }
@@ -637,9 +664,9 @@ void os_align_audit_note_value(lisp_val_t v) {
             g_align_val_first_bad[tag] = v;
         }
     }
-    if (align_tag_is_enforced(tag) &&
-        align_addr_is_in_lisp_heap((lisp_addr_t)(v & ~TAG_MASK)) &&
-        ALIGN_AUDIT_OFFENDS(v & ~TAG_MASK)) {
+    /* [境界] アドレスの範囲では絞らない。「Lispの値として現れるポインタは
+       例外なく16byte境界」を強制する(PR #74)。例外リストは**空**である */
+    if (align_tag_is_enforced(tag) && ALIGN_AUDIT_OFFENDS(v & ~TAG_MASK)) {
         align_audit_violation("value", align_tag_name(tag), v);
     }
 
@@ -648,9 +675,8 @@ void os_align_audit_note_value(lisp_val_t v) {
        対象に含める — 「Lispの値として現れるポインタ」はこれも含むため */
     {
         lisp_addr_t addr = (lisp_addr_t)(v & ~TAG_MASK);
-        int region = os_addr_region(addr);
-        if (region != 0 && region != 1) {
-            align_ext_note((UINT64)addr, tag, region);
+        if (!align_addr_is_in_lisp_heap(addr)) {
+            align_ext_note((UINT64)addr, tag, os_addr_region(addr));
         }
     }
 }
@@ -1379,6 +1405,32 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
         (((UINT64)(lisp_addr_t)g_to_start)   & (OS_HEAP_ALIGN - 1)) != 0) {
         os_panic("heap half-space not aligned to OS_HEAP_ALIGN");
     }
+}
+
+void os_assert_lisp_aligned(const char *name, lisp_addr_t addr) {
+    if ((addr & (OS_HEAP_ALIGN - 1)) == 0) {
+        return;
+    }
+    /* [原則6] どれが外れたのか分からないpanicは追えない。名前とアドレスを出す。
+       os_panicはメッセージを1本しか取らないので、先に個別の行を出しておく */
+#ifndef ISIKIOS_UNIT_TEST
+    os_diag_serial_write("\nPANIC: not 16-byte aligned: ");
+    os_diag_serial_write(name);
+    os_diag_serial_write(" addr=");
+    serial_write_uint((UINT64)addr);
+    os_diag_serial_write(" low bits=");
+    serial_write_uint((UINT64)(addr & (OS_HEAP_ALIGN - 1)));
+    os_diag_serial_write("\n");
+#endif
+    {
+        frame_buffer *fb = get_active_frame_buffer();
+        panic_write_string(fb, "PANIC: not 16-byte aligned: ");
+        panic_write_string(fb, name);
+        panic_write_string(fb, " addr=");
+        panic_write_uint(fb, (UINT64)addr);
+        panic_write_string(fb, "\n");
+    }
+    os_panic("Lisp値になるアドレスがOS_HEAP_ALIGN境界にない(上の行に対象名)");
 }
 
 void os_heap_bounds_for_test(UINT64 *out_from_start, UINT64 *out_from_end,
@@ -2566,6 +2618,10 @@ void os_bootstrap() {
     // NIL の作成。From/To空間どちらにも属さない専用の固定領域(g_nil_cell)を使う
     {
         lisp_addr_t addr = (lisp_addr_t)g_nil_cell;
+        /* [境界] nilはTAG_CONS付きのLisp値になる。**使われる前に**確かめる。
+           aligned属性を付けてもリンカ/ローダが実際にどこへ置いたかは
+           コンパイル時には分からないので、実アドレスで見る必要がある */
+        os_assert_lisp_aligned("g_nil_cell", addr);
         ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_STATIC_NIL, (UINT64)addr, sizeof(g_nil_cell));
         lisp_val_t tagged = (lisp_val_t)(addr | TAG_CONS);
         lisp_val_t *cell = (lisp_val_t *)addr;
