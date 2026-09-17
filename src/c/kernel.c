@@ -106,6 +106,11 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_boot_alloc_finalize(&lisp_heap_base, &lisp_heap_size);
 
     os_heap_init(lisp_heap_base, lisp_heap_size);
+    /* [境界] JITリテラルスロットの配列先頭を、最初のJITコンパイルより前に確かめる。
+       os_bootstrap内でnil自身が検査されるのと同じ趣旨(documents/static-align16-survey.md
+       「本採用」節)。ここより早く置けないのは、os_panicが使う診断経路
+       (シリアル/フレームバッファ)がこの時点で初めて使える状態になるため */
+    za_assert_slot_alignment();
     os_bootstrap();
     os_register_subprimitives();
     os_register_ide_subprimitives();

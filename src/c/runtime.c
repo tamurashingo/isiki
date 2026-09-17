@@ -263,7 +263,20 @@ static UINT8 *g_to_end;
  * nil(自己参照するconsセル)専用の固定領域。From/To空間のどちらにも属さず、GCの
  * コピー/スワップの対象にならない(g_symbol_table等と同じ静的配列パターン)。
  */
-static UINT8 g_nil_cell[16] __attribute__((aligned(8)));
+/* [境界] nil(= g_nil_cell | TAG_CONS)は**TAG_CONS付きのLisp値**である。
+   aligned(8) のままだと下位4bitがビルド依存で 0 になったり 8 になったりし、
+   「揃っているように見えるビルド」が実在した(既定ビルドで 8、GC_DEBUGビルドで 0。
+   documents/static-align16-survey.md 2.5)。
+   OS_HEAP_ALIGN を渡すことで、-DOS_HEAP_ALIGN=8ULL の比較ビルドでは
+   ヒープと一緒にこちらも 8 へ戻る(境界を片方だけ動かすと比較にならない)。 */
+static UINT8 g_nil_cell[16] __attribute__((aligned(OS_HEAP_ALIGN)));
+_Static_assert(sizeof(g_nil_cell) % OS_HEAP_ALIGN == 0,
+               "sizeof(g_nil_cell) must be a multiple of OS_HEAP_ALIGN");
+/* aligned属性は「変数」に付けているので、型ではなく変数のアラインを見る
+   (_Alignofは型専用なのでGCC拡張の__alignof__を使う)。
+   属性を消す/減らす変更をコンパイル時に捕まえるための検査 */
+_Static_assert(__alignof__(g_nil_cell) >= OS_HEAP_ALIGN,
+               "alignof(g_nil_cell) < OS_HEAP_ALIGN: nil would not be aligned");
 
 /**
  * From空間からnバイト(OS_HEAP_ALIGN境界に整列)を割り当てる。枯渇した場合は停止する。
@@ -403,6 +416,94 @@ static void align_audit_write(const char *s) { os_diag_serial_write(s); }
 static void align_audit_write_uint(UINT64 v) { serial_write_uint(v); }
 #endif
 
+/* [静的領域調査] nm/readelfの出力と突き合わせるので16進で出す。
+   serial_write_uintは10進なので、ここだけ専用に用意する */
+static void align_audit_write_hex(UINT64 v) {
+    char out[19];
+    int o = 0;
+    out[o++] = '0'; out[o++] = 'x';
+    int started = 0;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        UINT64 nib = (v >> shift) & 0xF;
+        if (!started && nib == 0 && shift != 0) { continue; }
+        started = 1;
+        out[o++] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+    }
+    out[o] = '\0';
+    align_audit_write(out);
+}
+
+/* ===== [静的領域調査] ヒープ外ポインタの採取 =====
+ * documents/static-align16-survey.md Step 1。
+ * From/To空間の外を指すタグ付き値を分類する。gc_copy_valueは全ルートと全生存
+ * オブジェクトの全フィールドを通るので、ここで数えれば「Lispの値として流通して
+ * いるヒープ外ポインタ」を網羅できる。
+ *
+ * 2段構えにしてある:
+ *   1. 領域別の延べ件数(region 2 = Immobilized Space、4 = それ以外)。
+ *      Immobilized Space はページ/スロットのアロケータが16境界を保証している
+ *      ことが分かっており、個々のアドレスを見る意味が薄い。延べ件数と
+ *      境界外れ件数だけ数える。
+ *   2. region 4(静的領域・ブート時確保・その他)だけ、**アドレスごと**に
+ *      オープンアドレッシングのハッシュ表で数える。nm と突き合わせて
+ *      シンボルへ逆引きするので、値そのものを残す必要があるのはこちらだけ。
+ *
+ * 最初は全領域を線形表(512件)で持っていたが、Immobilized Space のスロットで
+ * 埋まって 23.8% が overflow になり「分類できなかった割合」が大きくなった。
+ * 見たい対象で表を分けると、overflow を 0 にできる。 */
+/* g_imm_space(static)の実体は下方のImmobilized Spaceの節にある。報告で領域の
+   先頭を出したいが、staticな配列は前方宣言できないので、アクセサを前方宣言する */
+static UINT64 align_audit_imm_base(void);
+
+#define ALIGN_EXT_CAPACITY 8192   /* 2のべき乗であること(下のマスクで剰余を取る) */
+typedef struct {
+    UINT64 addr;   /* タグを外した実アドレス。0 = 空きスロット */
+    UINT64 tag;
+    UINT64 count;
+} align_ext_entry_t;
+static align_ext_entry_t g_align_ext[ALIGN_EXT_CAPACITY];
+static UINT64 g_align_ext_count = 0;      /* 表に入っている種類数 */
+static UINT64 g_align_ext_overflow = 0;   /* 表に入りきらなかった延べ観測回数 */
+
+/** 領域別の延べ観測回数(os_addr_regionの戻り値で添字。0/1はヒープなので常に0) */
+static UINT64 g_align_ext_region_total[8];
+/** 領域別の、16境界を外れていた延べ観測回数 */
+static UINT64 g_align_ext_region_bad[8];
+
+static void align_ext_note(UINT64 addr, UINT64 tag, int region) {
+    if (region < 0 || region >= 8) { region = 7; }
+    g_align_ext_region_total[region]++;
+    if ((addr & (OS_HEAP_ALIGN - 1)) != 0) { g_align_ext_region_bad[region]++; }
+
+    /* Immobilized Space(region 2)はアロケータ側で境界が保証済みなので、
+       アドレス単位の表には入れない(表を本命の region 4 に空けておく) */
+    if (region == 2) { return; }
+
+    /* アドレスの下位ビットはアラインで0が続くので、そのままだと衝突する。
+       4bit右シフトしてから混ぜる */
+    UINT64 h = (addr >> 4) * 1099511628211ULL;
+    for (UINT64 probe = 0; probe < ALIGN_EXT_CAPACITY; probe++) {
+        UINT64 i = (h + probe) & (ALIGN_EXT_CAPACITY - 1);
+        if (g_align_ext[i].addr == addr && g_align_ext[i].tag == tag) {
+            g_align_ext[i].count++;
+            return;
+        }
+        if (g_align_ext[i].addr == 0) {
+            if (g_align_ext_count >= ALIGN_EXT_CAPACITY / 2) {
+                /* 負荷率0.5を超えたら探査が伸びるので、そこで打ち切って数えるだけにする */
+                g_align_ext_overflow++;
+                return;
+            }
+            g_align_ext[i].addr = addr;
+            g_align_ext[i].tag = tag;
+            g_align_ext[i].count = 1;
+            g_align_ext_count++;
+            return;
+        }
+    }
+    g_align_ext_overflow++;
+}
+
 /** 確保サイト別・返却アドレスの下位4bitのヒストグラム */
 static UINT64 g_align_alloc_hist[ALIGN_SITE_COUNT][16];
 /** 確保サイト別・「切り上げ後のサイズが16の倍数でなかった」回数。
@@ -432,41 +533,58 @@ static const char *align_tag_name(UINT64 tag);
  * 既知の未対応に埋もれて見えなくなる。
  */
 static int align_site_is_enforced(int site) {
+    /* [境界] PR #74 で全経路を16byte境界にしたので、**例外は無い**。
+       以前は静的nilセル/JITリテラルスロット/block_deviceハンドル/boot allocatorを
+       除外していたが、いずれも揃うようになった */
+    (void)site;
+    return 1;
+}
+
+/**
+ * [境界] このサイトでは「切り上げ後のサイズ」も強制対象か。
+ *
+ * バンプアロケータ(os_alloc_bytes / gc_to_alloc / os_imm_slot_alloc)は
+ * **返したサイズぶん進めて次の確保位置にする**ので、サイズが境界の倍数でないと
+ * 次の確保がずれる。したがってサイズも見る必要がある。
+ *
+ * 一方、os_boot_alloc は確保ごとに開始位置を切り上げるし、リテラルスロットや
+ * block_deviceハンドルの登録は「既にあるアドレスを記録するだけ」で、
+ * そこで渡している size は次のアドレスを決めない。これらにサイズ検査を
+ * かけると、揃っているのに落ちる誤検出になる
+ * (sizeof(block_device_t)=104 など、16の倍数でないものが正当に存在する)。
+ */
+static int align_site_stride_is_enforced(int site) {
     switch (site) {
-        case ALIGN_SITE_ALLOC_BYTES:       /* Lispヒープ From空間 */
-        case ALIGN_SITE_GC_TO_ALLOC:       /* Lispヒープ To空間 */
-        case ALIGN_SITE_IMM_SLOT:          /* Immobilized Spaceのスロット */
-        case ALIGN_SITE_IMM_PAGE:
-        case ALIGN_SITE_IMM_PAGES_CONTIG:
-        case ALIGN_SITE_ENV_PAGE:
+        case ALIGN_SITE_ALLOC_BYTES:
+        case ALIGN_SITE_GC_TO_ALLOC:
+        case ALIGN_SITE_IMM_SLOT:
             return 1;
         default:
             return 0;
     }
 }
 
-/** [境界] このタグの値はLispヒープ上のオブジェクトを指しうるか。
-    TAG_RAW_POINTERはJITリテラルスロットとblock_deviceハンドルを含むため対象外 */
+/** [境界] このタグの値はアドレスを持つか(= 16byte境界を強制する対象か)。
+ *
+ * FIXNUM/CHAR は即値でアドレスを含まないので対象外。それ以外の6タグはすべて対象で、
+ * **TAG_RAW_POINTER も含む**。PR #74 の分類で、TAG_RAW_POINTER として流通する値は
+ * JITリテラルスロット・block_deviceハンドル・Function Cell・環境ページの4種だけで、
+ * どれも16byte境界に置けることが分かったため(documents/static-align16-survey.md 1章)。
+ */
 static int align_tag_is_enforced(UINT64 tag) {
-    return tag == TAG_CONS || tag == TAG_SYMBOL || tag == TAG_STRING ||
-           tag == TAG_INSTANCE || tag == TAG_FORWARD;
+    return tag != TAG_FIXNUM && tag != TAG_CHAR;
 }
 
 /**
- * [境界] この**アドレス**が本フェーズの保証範囲(Lispヒープの中)にあるか。
+ * [集計用] このアドレスがLispヒープ(From/To空間)の中にあるか。
  *
- * 本フェーズが保証するのは「Lispヒープ上のオブジェクトが16byte境界にあること」
- * であって、ヒープ外にある静的オブジェクトは対象外である
- * (documents/heap-align16-report.md 6章)。タグだけで判定すると、
- * **nil がここに引っかかる**: nilは `g_nil_cell | TAG_CONS` という、
- * From/To空間のどちらにも属さない静的領域への TAG_CONS 付きポインタで、
- * g_nil_cell は `__attribute__((aligned(8)))` のままだからである。
- * 実測(2026-09-17、既定ビルド): g_nil_cell は `...a68` に置かれ、
- * nil の下位4bitは 9 になる。GC_DEBUG ビルドでは16境界に落ちるため、
- * 「ビルドによって出たり出なかったりする違反」になってしまう。
+ * **失敗判定にはもう使っていない。** PR #73 の時点ではヒープ外の保証が無く、
+ * 範囲で絞らないと nil(静的領域)やJITリテラルスロットが常に引っかかったため
+ * 強制対象をヒープ内に限っていた。PR #74 で全経路を16byte境界にしたので、
+ * 判定はタグだけで足りる(align_tag_is_enforced)。
  *
- * 領域で切ることで、対象外のものを機械的に外せる。タグ側の列挙に
- * 「nilは除く」という例外を足すより、保証の範囲そのものを述語にする方がよい。
+ * 現在の用途は**分類のみ**: ヒープ外のポインタをアドレス別に採取して
+ * nm へ逆引きする align_ext_note の振り分けに使う。
  */
 static int align_addr_is_in_lisp_heap(lisp_addr_t addr) {
     int region = os_addr_region(addr);
@@ -517,7 +635,7 @@ void os_align_audit_note_alloc(int site, UINT64 addr, UINT64 size) {
     /* [境界] サイズがOS_HEAP_ALIGNの倍数でないと、確保自体は揃っていても
        **次の**確保がずれる。切り上げている以上、強制対象のサイトでは0でなければ
        ならない */
-    if (align_site_is_enforced(site) && ALIGN_AUDIT_OFFENDS(size)) {
+    if (align_site_stride_is_enforced(site) && ALIGN_AUDIT_OFFENDS(size)) {
         align_audit_violation("stride", align_site_name(site), size);
     }
 }
@@ -546,10 +664,20 @@ void os_align_audit_note_value(lisp_val_t v) {
             g_align_val_first_bad[tag] = v;
         }
     }
-    if (align_tag_is_enforced(tag) &&
-        align_addr_is_in_lisp_heap((lisp_addr_t)(v & ~TAG_MASK)) &&
-        ALIGN_AUDIT_OFFENDS(v & ~TAG_MASK)) {
+    /* [境界] アドレスの範囲では絞らない。「Lispの値として現れるポインタは
+       例外なく16byte境界」を強制する(PR #74)。例外リストは**空**である */
+    if (align_tag_is_enforced(tag) && ALIGN_AUDIT_OFFENDS(v & ~TAG_MASK)) {
         align_audit_violation("value", align_tag_name(tag), v);
+    }
+
+    /* [静的領域調査] ヒープ外を指す値は、アドレスごとに採取してnmへ逆引きする。
+       TAG_RAW_POINTER(JITリテラルスロット/block_deviceハンドル/Function Cell)も
+       対象に含める — 「Lispの値として現れるポインタ」はこれも含むため */
+    {
+        lisp_addr_t addr = (lisp_addr_t)(v & ~TAG_MASK);
+        if (!align_addr_is_in_lisp_heap(addr)) {
+            align_ext_note((UINT64)addr, tag, os_addr_region(addr));
+        }
     }
 }
 
@@ -638,6 +766,52 @@ void os_align_audit_report(void) {
             align_audit_write_uint(g_align_val_hist[tag][i]);
             align_audit_write(i == 15 ? "\n" : ",");
         }
+    }
+    /* [静的領域調査] ヒープ外ポインタの一覧。nm -n の出力と突き合わせる */
+    {
+        UINT64 ext_total = 0;
+        for (int r = 0; r < 8; r++) { ext_total += g_align_ext_region_total[r]; }
+        align_audit_write("[ALIGN] ext-summary distinct=");
+        align_audit_write_uint(g_align_ext_count);
+        align_audit_write(" total=");
+        align_audit_write_uint(ext_total);
+        align_audit_write(" overflow=");
+        align_audit_write_uint(g_align_ext_overflow);
+        align_audit_write(" capacity=");
+        align_audit_write_uint((UINT64)ALIGN_EXT_CAPACITY);
+        align_audit_write("\n");
+        for (int r = 0; r < 8; r++) {
+            if (g_align_ext_region_total[r] == 0) { continue; }
+            align_audit_write("[ALIGN] ext-region ");
+            align_audit_write_uint((UINT64)r);
+            align_audit_write(" total=");
+            align_audit_write_uint(g_align_ext_region_total[r]);
+            align_audit_write(" misaligned=");
+            align_audit_write_uint(g_align_ext_region_bad[r]);
+            align_audit_write("\n");
+        }
+    }
+    /* 実行時アドレス <-> nmのアドレス を対応づけるための基準点。
+       UEFIのロードアドレスは起動ごとに変わるので、既知シンボルの実行時
+       アドレスが無いと逆引きできない(cc_diag_image_anchor_pubと同じ手口) */
+    align_audit_write("[ALIGN] ext-anchor os_heap_used_ratio=");
+    align_audit_write_hex((UINT64)(lisp_addr_t)(void *)os_heap_used_ratio);
+    align_audit_write(" g_nil_cell=");
+    align_audit_write_hex((UINT64)(lisp_addr_t)g_nil_cell);
+    align_audit_write(" imm_space=");
+    align_audit_write_hex(align_audit_imm_base());
+    align_audit_write("\n");
+    for (UINT64 i = 0; i < ALIGN_EXT_CAPACITY; i++) {
+        if (g_align_ext[i].addr == 0) { continue; }
+        align_audit_write("[ALIGN] ext addr=");
+        align_audit_write_hex(g_align_ext[i].addr);
+        align_audit_write(" tag=");
+        align_audit_write(align_tag_name(g_align_ext[i].tag));
+        align_audit_write(" low4=");
+        align_audit_write_uint(g_align_ext[i].addr & 0xF);
+        align_audit_write(" count=");
+        align_audit_write_uint(g_align_ext[i].count);
+        align_audit_write("\n");
     }
     align_audit_write("[ALIGN] ==== end ====\n");
 }
@@ -1233,6 +1407,32 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     }
 }
 
+void os_assert_lisp_aligned(const char *name, lisp_addr_t addr) {
+    if ((addr & (OS_HEAP_ALIGN - 1)) == 0) {
+        return;
+    }
+    /* [原則6] どれが外れたのか分からないpanicは追えない。名前とアドレスを出す。
+       os_panicはメッセージを1本しか取らないので、先に個別の行を出しておく */
+#ifndef ISIKIOS_UNIT_TEST
+    os_diag_serial_write("\nPANIC: not 16-byte aligned: ");
+    os_diag_serial_write(name);
+    os_diag_serial_write(" addr=");
+    serial_write_uint((UINT64)addr);
+    os_diag_serial_write(" low bits=");
+    serial_write_uint((UINT64)(addr & (OS_HEAP_ALIGN - 1)));
+    os_diag_serial_write("\n");
+#endif
+    {
+        frame_buffer *fb = get_active_frame_buffer();
+        panic_write_string(fb, "PANIC: not 16-byte aligned: ");
+        panic_write_string(fb, name);
+        panic_write_string(fb, " addr=");
+        panic_write_uint(fb, (UINT64)addr);
+        panic_write_string(fb, "\n");
+    }
+    os_panic("Lisp値になるアドレスがOS_HEAP_ALIGN境界にない(上の行に対象名)");
+}
+
 void os_heap_bounds_for_test(UINT64 *out_from_start, UINT64 *out_from_end,
                              UINT64 *out_to_start, UINT64 *out_to_end) {
     if (out_from_start) { *out_from_start = (UINT64)(lisp_addr_t)g_from_start; }
@@ -1390,6 +1590,11 @@ lisp_val_t primitive_boot_alloc_used_bytes(lisp_val_t args, lisp_val_t env) {
 #define IMM_SPACE_SIZE (16 * 1024 * 1024)
 
 static UINT8 g_imm_space[IMM_SPACE_SIZE] __attribute__((aligned(IMM_PAGE_SIZE)));
+
+#ifdef ISIKIOS_ALIGN_AUDIT
+/* [静的領域調査] 報告でImmobilized Spaceの先頭を出すためのアクセサ(前方宣言は上方) */
+static UINT64 align_audit_imm_base(void) { return (UINT64)(lisp_addr_t)g_imm_space; }
+#endif
 /** 未使用領域のうち、まだページ切り出しに使っていない先頭アドレス */
 static UINT8 *g_imm_bump = g_imm_space;
 /** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */
@@ -2413,6 +2618,10 @@ void os_bootstrap() {
     // NIL の作成。From/To空間どちらにも属さない専用の固定領域(g_nil_cell)を使う
     {
         lisp_addr_t addr = (lisp_addr_t)g_nil_cell;
+        /* [境界] nilはTAG_CONS付きのLisp値になる。**使われる前に**確かめる。
+           aligned属性を付けてもリンカ/ローダが実際にどこへ置いたかは
+           コンパイル時には分からないので、実アドレスで見る必要がある */
+        os_assert_lisp_aligned("g_nil_cell", addr);
         ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_STATIC_NIL, (UINT64)addr, sizeof(g_nil_cell));
         lisp_val_t tagged = (lisp_val_t)(addr | TAG_CONS);
         lisp_val_t *cell = (lisp_val_t *)addr;
