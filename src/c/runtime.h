@@ -47,6 +47,23 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
 #define FIXNUM_MAGNITUDE_MASK ((1ULL << 60) - 1)
 
 /**
+ * [単一の真実源] FIXNUMの値をタグ付き表現へ入れるためのシフト量。
+ *
+ * **TAG_MASK のビット幅(現在3)と値が同じだが、別の概念である。**
+ * ポインタのタグ幅だけを広げて即値の表現は据え置く、という案がありうる
+ * (documents/alignment-survey-report.md 5.5)。両者を同じ定数にまとめると、
+ * 片方だけを動かしたい改修で必ず事故になる。値が一致しているのは今たまたまである。
+ */
+#define FIXNUM_VALUE_SHIFT 3
+
+/**
+ * [単一の真実源] CHARの文字コードをタグ付き表現へ入れるためのシフト量。
+ * FIXNUM_VALUE_SHIFT と同じ理由で、値が同じでも別の定数として扱う
+ * (CHARだけ表現を変える改修がありうる)。
+ */
+#define CHAR_VALUE_SHIFT 3
+
+/**
  * [単一の真実源] タグ付きLisp値が指しうるメモリの配置境界。
  *
  * タグは値の**下位ビット**に入るので、「アドレスの下位何bitが常に0か」が
@@ -625,7 +642,7 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
    process.cのget_current_processと同様クロスTU呼び出しのままだと呼び出し
    オーバーヘッドが本体を上回る。ヘッダのstatic inlineへ移す */
 static inline lisp_val_t os_make_fixnum(const UINT64 fixnum) {
-    return (lisp_val_t)(fixnum << 3);
+    return (lisp_val_t)(fixnum << FIXNUM_VALUE_SHIFT);
 }
 
 /**

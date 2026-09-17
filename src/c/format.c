@@ -64,7 +64,7 @@ lisp_val_t cc_format_char(lisp_val_t args, lisp_val_t env) {
     (void)env;
     os_stream_t *raw = os_stream_from_lisp(cc_car(args));
     lisp_val_t ch = cc_car(cc_cdr(args));
-    os_stream_write_char(raw, (char)(ch >> 3));
+    os_stream_write_char(raw, (char)(ch >> CHAR_VALUE_SHIFT));
     return nil;
 }
 
@@ -202,7 +202,7 @@ lisp_val_t cc_format(lisp_val_t args, lisp_val_t env) {
             case 'C': case 'c': {
                 lisp_val_t obj = cc_car(objs);
                 objs = cc_cdr(objs);
-                sink.write_char(sink.ctx, (UINT8)(obj >> 3));
+                sink.write_char(sink.ctx, (UINT8)(obj >> CHAR_VALUE_SHIFT));
                 break;
             }
             case 'G': case 'g': {

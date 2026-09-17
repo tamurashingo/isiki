@@ -7,6 +7,11 @@ typedef unsigned short UINT16;
 typedef unsigned int UINT32;
 typedef unsigned long long UINT64;
 typedef unsigned long long UINTN;
+/* INT8はINT16/INT32/INT64と揃える形で後から足した。
+   x86-64の imm8/disp8 は符号付き8bitなので、JITが埋め込む即値が
+   「符号拡張した結果、意図した64bit値になるか」を _Static_assert で
+   確かめるのに要る(za_jit_tags.h) */
+typedef signed char INT8;
 typedef short INT16;
 typedef int INT32;
 typedef long long INT64;

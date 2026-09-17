@@ -29,7 +29,7 @@ lisp_val_t cc_ide_device_count(lisp_val_t args, lisp_val_t env) {
 
 lisp_val_t cc_ide_device_at(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT32 index = (UINT32)(cc_car(args) >> 3);
+    UINT32 index = (UINT32)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
     block_device_t *dev = os_block_device_at(index);
     if (dev == 0) {
         return nil;
@@ -61,7 +61,7 @@ lisp_val_t cc_ide_sector_buffer_address(lisp_val_t args, lisp_val_t env) {
 lisp_val_t cc_ide_read_sector(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t device = cc_car(args);
-    UINT32 lba = (UINT32)(cc_car(cc_cdr(args)) >> 3);
+    UINT32 lba = (UINT32)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
 
     block_device_t *dev = (block_device_t *)(lisp_addr_t)(device & ~TAG_MASK);
     UINT8 *buf = os_block_device_ide_sector_buffer();
@@ -77,7 +77,7 @@ lisp_val_t cc_ide_read_sector(lisp_val_t args, lisp_val_t env) {
 lisp_val_t cc_ide_write_sector(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t device = cc_car(args);
-    UINT32 lba = (UINT32)(cc_car(cc_cdr(args)) >> 3);
+    UINT32 lba = (UINT32)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
 
     block_device_t *dev = (block_device_t *)(lisp_addr_t)(device & ~TAG_MASK);
     UINT8 *buf = os_block_device_ide_sector_buffer();

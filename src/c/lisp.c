@@ -79,7 +79,7 @@ lisp_val_t cc_assoc_eq(lisp_val_t k, lisp_val_t alist) {
             return pair;
         }
         // fixnum
-        else if (k & TAG_FIXNUM && (k >> 3) == (key >> 3)) {
+        else if (k & TAG_FIXNUM && (k >> FIXNUM_VALUE_SHIFT) == (key >> FIXNUM_VALUE_SHIFT)) {
             return pair;
         }
         current = cc_cdr(current); // cdr -> next
