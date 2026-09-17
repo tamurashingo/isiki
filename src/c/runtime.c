@@ -314,6 +314,7 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
 #ifndef ISIKIOS_UNIT_TEST
     __asm__ __volatile__ ("sti");
 #endif
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_ALLOC_BYTES, (UINT64)p, aligned);
     return (UINT64)p;
 }
 
@@ -383,6 +384,136 @@ static void serial_write_uint(UINT64 v) {
     rev[r] = '\0';
     os_diag_serial_write(rev);
 }
+
+/* ============================== [調査] 16byte境界監査 ==============================
+ * ALIGN_AUDIT=1 のときだけコンパイルされる計測コード(runtime.hの宣言部参照)。
+ * 既定ビルドではこのブロック全体が消える。
+ */
+#ifdef ISIKIOS_ALIGN_AUDIT
+
+#ifdef ISIKIOS_UNIT_TEST
+#include <stdio.h>
+#include <stdlib.h>
+static void align_audit_write(const char *s) { fputs(s, stdout); }
+static void align_audit_write_uint(UINT64 v) { printf("%llu", (unsigned long long)v); }
+#else
+static void align_audit_write(const char *s) { os_diag_serial_write(s); }
+static void align_audit_write_uint(UINT64 v) { serial_write_uint(v); }
+#endif
+
+/** 確保サイト別・返却アドレスの下位4bitのヒストグラム */
+static UINT64 g_align_alloc_hist[ALIGN_SITE_COUNT][16];
+/** 確保サイト別・「切り上げ後のサイズが16の倍数でなかった」回数。
+    確保自体が16境界でも、次の確保をずらすのはこの件数である */
+static UINT64 g_align_alloc_stride_break[ALIGN_SITE_COUNT];
+/** 確保サイト別・返却アドレスが16境界でなかった回数 */
+static UINT64 g_align_alloc_bad[ALIGN_SITE_COUNT];
+
+/** タグ別・Lisp値(ポインタを持つタグのみ)の下位4bitのヒストグラム */
+static UINT64 g_align_val_hist[8][16];
+/** タグ別・下位4bitが0でなかった値のうち最初に観測したもの(診断用) */
+static UINT64 g_align_val_first_bad[8];
+
+void os_align_audit_note_alloc(int site, UINT64 addr, UINT64 size) {
+    if (site < 0 || site >= ALIGN_SITE_COUNT) { return; }
+    g_align_alloc_hist[site][addr & 0xF]++;
+    if ((addr & 0xF) != 0) { g_align_alloc_bad[site]++; }
+    if ((size & 0xF) != 0) { g_align_alloc_stride_break[site]++; }
+}
+
+void os_align_audit_note_value(lisp_val_t v) {
+    UINT64 tag = v & TAG_MASK;
+    /* FIXNUM/CHARは即値でアドレスを含まない。それ以外の6タグはアドレスを持つ
+       (FORWARDはGC内部の転送ポインタだが、下位bitを使う以上は観測対象) */
+    if (tag == TAG_FIXNUM || tag == TAG_CHAR) { return; }
+    UINT64 low = v & 0xF;
+    g_align_val_hist[tag][low]++;
+    if (low != tag && g_align_val_first_bad[tag] == 0) {
+        /* 16境界なら「下位4bit == タグ値」になる。そうでない値を最初の1件だけ控える */
+        g_align_val_first_bad[tag] = v;
+    }
+}
+
+static const char *align_tag_name(UINT64 tag) {
+    switch (tag) {
+        case TAG_CONS:        return "CONS";
+        case TAG_SYMBOL:      return "SYMBOL";
+        case TAG_STRING:      return "STRING";
+        case TAG_INSTANCE:    return "INSTANCE";
+        case TAG_FORWARD:     return "FORWARD";
+        case TAG_RAW_POINTER: return "RAWPTR";
+        default:              return "?";
+    }
+}
+
+static const char *align_site_name(int site) {
+    switch (site) {
+        case ALIGN_SITE_ALLOC_BYTES: return "os_alloc_bytes";
+        case ALIGN_SITE_GC_TO_ALLOC: return "gc_to_alloc";
+        case ALIGN_SITE_IMM_SLOT:    return "os_imm_slot_alloc";
+        case ALIGN_SITE_IMM_PAGE:    return "os_imm_page_alloc";
+        case ALIGN_SITE_BOOT_ALLOC:  return "os_boot_alloc";
+        case ALIGN_SITE_STATIC_NIL:  return "g_nil_cell";
+        case ALIGN_SITE_IMM_PAGES_CONTIG: return "os_imm_pages_alloc_contiguous";
+        case ALIGN_SITE_LITERAL_SLOT: return "jit_literal_slot";
+        case ALIGN_SITE_ENV_PAGE:    return "env_page_handle";
+        case ALIGN_SITE_DEVICE_HANDLE: return "block_device_handle";
+        default:                     return "?";
+    }
+}
+
+void os_align_audit_report(void) {
+    align_audit_write("\n[ALIGN] ==== 16byte境界監査 ====\n");
+    align_audit_write("[ALIGN] gc-count=");
+    align_audit_write_uint(os_gc_collect_count());
+    align_audit_write("\n");
+
+    for (int site = 0; site < ALIGN_SITE_COUNT; site++) {
+        UINT64 total = 0;
+        for (int i = 0; i < 16; i++) { total += g_align_alloc_hist[site][i]; }
+        if (total == 0) { continue; }
+        align_audit_write("[ALIGN] alloc site=");
+        align_audit_write(align_site_name(site));
+        align_audit_write(" total=");
+        align_audit_write_uint(total);
+        align_audit_write(" misaligned=");
+        align_audit_write_uint(g_align_alloc_bad[site]);
+        align_audit_write(" stride-break=");
+        align_audit_write_uint(g_align_alloc_stride_break[site]);
+        align_audit_write(" hist=");
+        for (int i = 0; i < 16; i++) {
+            align_audit_write_uint(g_align_alloc_hist[site][i]);
+            align_audit_write(i == 15 ? "\n" : ",");
+        }
+    }
+
+    for (UINT64 tag = 0; tag < 8; tag++) {
+        if (tag == TAG_FIXNUM || tag == TAG_CHAR) { continue; }
+        UINT64 total = 0;
+        UINT64 bad = 0;
+        for (int i = 0; i < 16; i++) {
+            total += g_align_val_hist[tag][i];
+            if ((UINT64)i != tag) { bad += g_align_val_hist[tag][i]; }
+        }
+        if (total == 0) { continue; }
+        align_audit_write("[ALIGN] value tag=");
+        align_audit_write(align_tag_name(tag));
+        align_audit_write(" total=");
+        align_audit_write_uint(total);
+        align_audit_write(" misaligned=");
+        align_audit_write_uint(bad);
+        align_audit_write(" first-bad=");
+        align_audit_write_uint(g_align_val_first_bad[tag]);
+        align_audit_write(" hist=");
+        for (int i = 0; i < 16; i++) {
+            align_audit_write_uint(g_align_val_hist[tag][i]);
+            align_audit_write(i == 15 ? "\n" : ",");
+        }
+    }
+    align_audit_write("[ALIGN] ==== end ====\n");
+}
+
+#endif /* ISIKIOS_ALIGN_AUDIT */
 
 void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
     /* [原則6] **フレームバッファより先にシリアルへ出す。**
@@ -904,6 +1035,15 @@ static lisp_val_t os_make_string_for(const char *s, int uppercase_flag) {
  * @param heap_size ヒープのサイズ(バイト)
  */
 void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
+#if defined(ISIKIOS_ALIGN_AUDIT) && defined(ISIKIOS_UNIT_TEST)
+    /* [調査] 16byte境界監査。ネイティブのユニットテストは19本のmain()に分かれて
+       いるので、テスト本体へ手を入れずに済むようatexitで報告する(os_heap_initは
+       どのテストでも必ず通る。複数回呼ばれても登録は1回に抑える) */
+    {
+        static int registered = 0;
+        if (!registered) { registered = 1; atexit(os_align_audit_report); }
+    }
+#endif
     // 将来的にCOPY GCを実装するためヒープを同サイズのFrom/To 2領域に分割しておく
     UINT64 half = (heap_size / 2) & ~7ULL;
     g_from_start = (UINT8 *)heap_base;
@@ -1035,6 +1175,7 @@ void *os_boot_alloc(UINT64 size, UINT64 align) {
         }
     }
     g_boot_alloc_bump = (UINT8 *)(addr + size);
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_BOOT_ALLOC, addr, size);
     return (void *)addr;
 }
 
@@ -1159,6 +1300,7 @@ void *os_imm_page_alloc(void) {
     if (g_imm_free_list) {
         void *page = g_imm_free_list;
         g_imm_free_list = *(void **)page;
+        ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_IMM_PAGE, (UINT64)(lisp_addr_t)page, IMM_PAGE_SIZE);
         return page;
     }
     if (g_imm_bump + IMM_PAGE_SIZE > g_imm_space + IMM_SPACE_SIZE) {
@@ -1166,6 +1308,7 @@ void *os_imm_page_alloc(void) {
     }
     void *page = g_imm_bump;
     g_imm_bump += IMM_PAGE_SIZE;
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_IMM_PAGE, (UINT64)(lisp_addr_t)page, IMM_PAGE_SIZE);
     return page;
 }
 
@@ -1252,6 +1395,7 @@ void *os_imm_pages_alloc_contiguous(UINT64 count) {
     }
     void *pages = g_imm_bump;
     g_imm_bump += needed;
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_IMM_PAGES_CONTIG, (UINT64)(lisp_addr_t)pages, needed);
     return pages;
 }
 
@@ -1279,6 +1423,7 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
     }
     void *slot = cursor->page + cursor->offset;
     cursor->offset += aligned;
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_IMM_SLOT, (UINT64)(lisp_addr_t)slot, aligned);
     return slot;
 }
 
@@ -1419,6 +1564,7 @@ static UINT8 *gc_to_alloc(UINT64 size) {
         os_panic("gc: to-space exhausted (see serial)");
     }
     g_to_ptr = dst + aligned;
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_GC_TO_ALLOC, (UINT64)dst, aligned);
     return dst;
 }
 
@@ -1429,6 +1575,9 @@ static UINT8 *gc_to_alloc(UINT64 size) {
  * @return To空間上の(同じ意味を持つ)値
  */
 static lisp_val_t gc_copy_value(lisp_val_t obj) {
+    /* [調査] 16byte境界監査。gc_copy_valueはGCのたびに全ルートと全生存オブジェクトの
+       全フィールドを通るので、Lisp値として流通しているポインタはここで網羅できる */
+    ALIGN_AUDIT_NOTE_VALUE(obj);
     if (obj == nil) {
         return obj;
     }
@@ -2091,6 +2240,7 @@ void os_bootstrap() {
     // NIL の作成。From/To空間どちらにも属さない専用の固定領域(g_nil_cell)を使う
     {
         lisp_addr_t addr = (lisp_addr_t)g_nil_cell;
+        ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_STATIC_NIL, (UINT64)addr, sizeof(g_nil_cell));
         lisp_val_t tagged = (lisp_val_t)(addr | TAG_CONS);
         lisp_val_t *cell = (lisp_val_t *)addr;
         cell[0] = tagged;
@@ -3511,6 +3661,7 @@ void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 coun
         lisp_val_t alist = cc_cdr(pages_slot);
         GC_PROTECT(alist);
         void *page = (UINT8 *)first_page + i * IMM_PAGE_SIZE;
+        ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_ENV_PAGE, (UINT64)(lisp_addr_t)page, IMM_PAGE_SIZE);
         lisp_val_t tagged_page = ((lisp_val_t)(lisp_addr_t)page) | TAG_RAW_POINTER;
         lisp_val_t new_list = os_make_cons(tagged_page, alist);
         // functionsスロットの追加パスと同じ理由で、書き込み先アドレスはos_make_cons
@@ -3543,6 +3694,7 @@ void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr)
 
     lisp_val_t list = cc_cdr(literal_slots_slot);
     GC_PROTECT(list);
+    ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_LITERAL_SLOT, (UINT64)(lisp_addr_t)slot_addr, sizeof(lisp_val_t));
     lisp_val_t tagged_slot = ((lisp_val_t)(lisp_addr_t)slot_addr) | TAG_RAW_POINTER;
     lisp_val_t new_list = os_make_cons(tagged_slot, list);
     // pagesスロットの追加パスと同じ理由で、書き込み先アドレスはos_make_cons
