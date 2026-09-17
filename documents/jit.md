@@ -348,15 +348,16 @@ JIT対象です。1つの`flet`/`labels`で同時に束縛できるのは`ZA_MAX
 | 1let内の同時束縛変数数 | `ZA_MAX_LOCALS_PER_LET` | 4 |
 | 呼び出し引数位置の式ネスト段数 | `ZA_MAX_CALL_DEPTH` | 4 |
 | 算術/比較式のネスト段数 | `ZA_MAX_ARITH_DEPTH` | 4 |
-| 非局所脱出のスパニング段数 | `ZA_MAX_NLX_DEPTH` | 4 |
-| lambdaスロット数(1関数あたり) | `ZA_MAX_LAMBDA_SLOTS` | 32 |
-| シンボルquoteスロット数 | `ZA_MAX_QUOTE_SLOTS` | 32 |
-| 裸float/bignumリテラルスロット数 | `ZA_MAX_NUMBER_SLOTS` | 32 |
+| 非局所脱出のスパニング段数 | `ZA_MAX_NLX_DEPTH` | 8 |
+| lambdaスロット数(1関数あたり) | `ZA_MAX_LAMBDA_SLOTS` | 256 |
+| シンボルquoteスロット数 | `ZA_MAX_QUOTE_SLOTS` | 1024 |
+| 裸float/bignumリテラルスロット数 | `ZA_MAX_NUMBER_SLOTS` | 512 |
 | tagbodyラベル数 | `ZA_MAX_TAGBODY_TAGS` | 16 |
 | 1ラベルあたりgoの個数 | `ZA_MAX_TAGBODY_GOTOS_PER_TAG` | 8 |
 | 1flet/labelsあたりの同時束縛関数数 | `ZA_MAX_FLET_BINDINGS` | 4 |
-| quasiquoteのネスト段数 | `ZA_MAX_QQ_DEPTH` | 4 |
+| quasiquoteのネスト段数 | `ZA_MAX_QQ_DEPTH` | 6 |
 | quasiquote 1レベルあたりの要素数 | `ZA_MAX_QQ_ELEMENTS` | 16 |
+| コンパイル時の再帰ネスト段数 | `ZA_MAX_COMPILE_NEST` | 60 |
 | JITコード全体のバッファサイズ | `JIT_CODE_SIZE` | 512KB |
 
 ## 参考: `za_is_excluded_special_form`に残るシンボル
