@@ -68,12 +68,22 @@ BUILD_TMPDIR = tmp
 # 「塗り潰し有効のつもりで無効のバイナリを測る」ことになり、しかも無言で成立する
 # (documents/pitfalls.md 原則6)。使用したフラグをスタンプに残し、変わったときだけ
 # スタンプを更新して$(TARGET)の再ビルドを促す
+#
+# EXTRA_CFLAGSもスタンプに含める。これは「計測のための一時的なフラグ」を渡す口で、
+# まさに**同じセッション中に付けたり外したりする**使われ方をする。含めていなかった
+# ために実際に踏んだ(2026-09-17、16byte境界化の前後比較):
+#   make ... EXTRA_CFLAGS=-DOS_HEAP_ALIGN=8ULL   # 比較用のバイナリを作る
+#   make ...                                     # 戻したつもり
+# 2回目はSRC/HDRが更新されていないので再ビルドされず、**8byte版のバイナリのまま
+# 測って heap-align=8 と報告された**。ALIGN_AUDITが使用値を出力に混ぜていたので
+# 気づけたが、出していなければそのまま誤った比較表になっていた。
 GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
+BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(EXTRA_CFLAGS)
 .PHONY: FORCE
 FORCE:
 $(GC_DEBUG_STAMP): FORCE
 	@mkdir -p $(BUILD_TMPDIR)
-	@echo '$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS)' | cmp -s - $@ 2>/dev/null || echo '$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS)' > $@
+	@echo '$(BUILD_FLAG_SIGNATURE)' | cmp -s - $@ 2>/dev/null || echo '$(BUILD_FLAG_SIGNATURE)' > $@
 OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
 
 # fat16_test.img/fat32_test.imgのような固定テストフィクスチャはtmp/に置くが、

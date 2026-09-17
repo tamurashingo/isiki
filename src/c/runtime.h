@@ -46,6 +46,57 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
 /** TAG_FIXNUMの値フィールドのうちマグニチュードに使う60bit(bit3〜62)分のマスク */
 #define FIXNUM_MAGNITUDE_MASK ((1ULL << 60) - 1)
 
+/**
+ * [単一の真実源] タグ付きLisp値が指しうるメモリの配置境界。
+ *
+ * タグは値の**下位ビット**に入るので、「アドレスの下位何bitが常に0か」が
+ * 「タグに何bit使えるか」の上限を決める。現在のタグは3bit(TAG_MASK)なので
+ * 必要なのは8byte境界だけだが、16byteに揃えておくと下位4bit目まで空く。
+ *
+ * この定数を参照するのは、**タグ付きLisp値として外へ出るアドレスを返す
+ * アロケータ**である:
+ *   - os_alloc_bytes  (Lispヒープ From空間のバンプ確保)
+ *   - gc_to_alloc     (Lispヒープ To空間、GCのコピー先)
+ *   - os_heap_init    (From/To空間の先頭アドレスと半空間サイズ)
+ *   - os_imm_slot_alloc (Immobilized Spaceのスロット。TAG_RAW_POINTER化される)
+ *   - os_boot_alloc_finalize (Lispヒープの先頭になるアドレス)
+ *
+ * **切り上げ単位をここ以外に直書きしないこと。** 確保側とGCのコピー側で
+ * 単位がずれると、To空間が枯渇したりオブジェクトが重なったりする。
+ * documents/alignment-survey-report.md 7.1 に、~TAG_MASK を 0xF8 として
+ * 9箇所へ独立に直書きしていたために「TAG_MASKを変えても追随しない」状態に
+ * なっていた実例がある。同じ形を作らないための集約である。
+ *
+ * 適用**されない**もの(documents/heap-align16-report.md 6章):
+ *   - g_nil_cell 等の静的オブジェクト(aligned属性で別途指定する)
+ *   - os_boot_alloc(size, align) の align は呼び出し側指定のまま
+ *   - JITリテラルスロット(&g_za_*_slots[i]、8byte刻みの静的配列の要素)
+ *
+ * 既定は16。**コマンドラインから上書きできるのは計測のためだけ**である
+ * (-DOS_HEAP_ALIGN=8ULL で「8byte切り上げだった頃」の消費量・GC回数を、
+ * 同じバイナリ構成のまま測り直せる)。ALIGN_AUDITの報告に heap-align=N を
+ * 出しているので、どちらで測った結果かは出力自体に残る。
+ * **製品ビルドで下げてはならない。**
+ */
+#ifndef OS_HEAP_ALIGN
+#define OS_HEAP_ALIGN 16ULL
+#endif
+
+_Static_assert(OS_HEAP_ALIGN >= 8, "OS_HEAP_ALIGNは最低でもlisp_val_t(8byte)分が要る");
+_Static_assert((OS_HEAP_ALIGN & (OS_HEAP_ALIGN - 1)) == 0,
+               "OS_HEAP_ALIGNは2のべき乗でなければならない(下のマスク演算が成立しない)");
+_Static_assert(OS_HEAP_ALIGN > TAG_MASK,
+               "OS_HEAP_ALIGNがタグのbit幅を下回ると、タグとアドレスが衝突する");
+
+/**
+ * nをOS_HEAP_ALIGNの倍数へ切り上げる。
+ * @param n 切り上げる値(バイト数またはアドレス)
+ * @return n以上で最小のOS_HEAP_ALIGNの倍数
+ */
+static inline UINT64 os_heap_align_up(UINT64 n) {
+    return (n + (OS_HEAP_ALIGN - 1)) & ~(OS_HEAP_ALIGN - 1);
+}
+
 
 /** TAG_INSTANCEのword0に入る、ネイティブ(C)関数であることを示すMAGIC NUMBER */
 #define MAGIC_FUNCTION_NATIVE      0x1ULL
@@ -300,6 +351,18 @@ void os_gc_collect(void);
  */
 UINT64 os_gc_collect_count(void);
 
+/**
+ * From/To両空間の範囲を返す(テスト専用。os_gc_collect_countと同様、本体の
+ * ロジックでは使用しない)。半空間の先頭がOS_HEAP_ALIGN境界にあること、
+ * 2つの半空間が同サイズであることを、テストから直接確かめるために使う。
+ * @param out_from_start From空間の先頭(不要ならNULL可)
+ * @param out_from_end   From空間の終端(不要ならNULL可)
+ * @param out_to_start   To空間の先頭(不要ならNULL可)
+ * @param out_to_end     To空間の終端(不要ならNULL可)
+ */
+void os_heap_bounds_for_test(UINT64 *out_from_start, UINT64 *out_from_end,
+                             UINT64 *out_to_start, UINT64 *out_to_end);
+
 /* ============================== [調査] 16byte境界監査 ==============================
  * documents/alignment-survey-report.md。タグを下位4bitへ拡張できるかの判定材料
  * (「Lisp値として現れるポインタが16byte境界に揃っているか」)を集める計測専用の
@@ -332,16 +395,20 @@ UINT64 os_gc_collect_count(void);
 void os_align_audit_note_alloc(int site, UINT64 addr, UINT64 size);
 /** Lisp値を1件記録する(ポインタを持つタグのみ数える) */
 void os_align_audit_note_value(lisp_val_t v);
+/** GC1回分の生存バイト数(To空間へコピーし終えた量)を記録する */
+void os_align_audit_note_gc_live(UINT64 live_bytes);
 /** 集計結果をシリアル(カーネル)/標準出力(ユニットテスト)へ出す */
 void os_align_audit_report(void);
 
 #define ALIGN_AUDIT_NOTE_ALLOC(site, addr, size) os_align_audit_note_alloc((site), (UINT64)(addr), (UINT64)(size))
 #define ALIGN_AUDIT_NOTE_VALUE(v)                os_align_audit_note_value((v))
+#define ALIGN_AUDIT_NOTE_GC_LIVE(bytes)          os_align_audit_note_gc_live((UINT64)(bytes))
 
 #else
 
 #define ALIGN_AUDIT_NOTE_ALLOC(site, addr, size) ((void)0)
 #define ALIGN_AUDIT_NOTE_VALUE(v)                ((void)0)
+#define ALIGN_AUDIT_NOTE_GC_LIVE(bytes)          ((void)0)
 
 #endif /* ISIKIOS_ALIGN_AUDIT */
 

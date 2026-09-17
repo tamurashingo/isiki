@@ -156,7 +156,11 @@ void test_os_boot_alloc_finalize_returns_remaining_region_after_usage() {
 
     assert(used >= 300, "finalizeが返す使用量は、それまでのos_boot_alloc要求の合計以上である");
     assert(out_base >= (UINT64)region + used, "残り領域の先頭は使用済み分より後ろにある");
-    assert(out_base % 8 == 0, "残り領域の先頭は8byte境界に整列される");
+    /* [境界] この戻り値がそのままos_heap_initへ渡りLispヒープの先頭になる。
+       確保を16byteに切り上げても先頭が8 mod 16ならオブジェクトが全部ずれるので、
+       ここはOS_HEAP_ALIGN境界であることまで要求する(以前は8byte境界だった) */
+    assert(out_base % OS_HEAP_ALIGN == 0,
+           "残り領域の先頭はOS_HEAP_ALIGN境界に整列される(Lispヒープの先頭になるため)");
     assert(out_base + out_size == (UINT64)region + BOOT_ALLOC_TEST_SIZE,
            "残り領域は元の領域の末尾まで隙間なく続く");
 
@@ -1760,7 +1764,32 @@ void test_gc_reclaims_unreferenced_garbage() {
 // native関数1つ分(function object + Function Cellのcons 2つ + 環境alistのcons)が
 // さらに恒久消費になり、76KBではgcd/isqrtテストがGC後も確保不能になって停止する
 // ようになったため、その分だけ広げる
-#define SMALL_HEAP_SIZE (77 * 1024)
+//
+// [境界] os_alloc_bytes/gc_to_allocの切り上げ単位を8→16(OS_HEAP_ALIGN)へ変えた
+// ことで、os_bootstrap直後の生存量が実測 21,120 → 21,536 byte(+416 byte、+2.0%)に
+// 増えた。増えるのはSTRINGだけで(CONS 16/SYMBOL 32/INSTANCE 32は元々16の倍数)、
+// 8+len が 8の奇数倍になる長さのsymbol名がここに当たる。
+// 77KBのままだとgcd/isqrtテストがGC後も確保不能になって停止するため、
+// 実測した最小値(下記の掃引)に基づいて広げる。
+//
+// 値を変えるときのために可変にしてある。-DSMALL_HEAP_SIZE=... で上書きして
+// 掃引すれば、「ぎりぎり通る最小値」を推測ではなく実測で決められる。
+//
+// 掃引結果(2026-09-17、16byte切り上げ後):
+//   77KB: ハング  — GC後も確保不能(os_panicがユニットテストでは無限ループになる)
+//   78KB: 5331 OK / 0 NG
+//   79KB: 5331 OK / 0 NG   ← 採用
+//   80KB: 5331 OK / 0 NG
+//   82KB: isqrtテストの「GCが発火する」アサーションがNG(ヒープが広すぎて発火しない)
+//   84KB: bignum加算テストの同アサーションもNG
+// 変更前(8byte切り上げ)の同じ掃引では 77〜79KB が窓だった(75/76KBはハング、
+// 80KBからGC未発火のNG)。**窓の幅は3KBのまま1KB上へずれただけ**で、これは
+// 生存量が一定量(+416 byte)増えたことと整合する。
+// 79KBは新旧どちらの窓にも入る唯一の値なので、これを採る
+// (「新しい実装でだけ通る値」へ逃げていないことが、この掃引から言える)。
+#ifndef SMALL_HEAP_SIZE
+#define SMALL_HEAP_SIZE (79 * 1024)
+#endif
 
 static void setup_small_heap(void) {
     void *heap = malloc(SMALL_HEAP_SIZE);
@@ -1930,6 +1959,109 @@ void test_gc_fires_during_string_append_and_result_is_correct() {
     #undef GC_STRING_TEST_N
 }
 
+/* [境界] 可変長オブジェクトの長さが端数になるケースを、確保 -> GC -> 内容確認まで
+   通す。STRINGのサイズは 8+len なので、len が 0/7/8/9/15/16/17 のとき切り上げ前の
+   要求は 8/15/16/17/23/24/25 byte になり、8byte切り上げだと 8/16/16/24/24/24/32 と
+   「16の倍数でない値」が混ざる。そこが os_alloc_bytes / gc_to_alloc の切り上げ単位を
+   8 から OS_HEAP_ALIGN へ変えた本命のケースである。
+
+   確認するのは2点:
+     1. 確保したアドレスが OS_HEAP_ALIGN 境界にあること(確保直後とGC後の両方)
+     2. GCでコピーされた後も中身が壊れていないこと
+   ALIGN_AUDIT ビルドでなくても回るよう、アドレス検査はこのテスト自身で行う。 */
+static const UINT64 g_align_edge_lens[] = { 0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25 };
+#define ALIGN_EDGE_CASES (sizeof(g_align_edge_lens) / sizeof(g_align_edge_lens[0]))
+
+static void align_edge_fill(char *buf, UINT64 len) {
+    for (UINT64 i = 0; i < len; i++) {
+        buf[i] = (char)('a' + (i % 26));
+    }
+    buf[len] = '\0';
+}
+
+void test_heap_align_holds_for_variable_length_objects_across_gc() {
+    setup_small_heap();
+
+    lisp_val_t list = nil;
+    GC_PROTECT(list);
+
+    int alloc_misaligned = 0;
+    for (UINT64 c = 0; c < ALIGN_EDGE_CASES; c++) {
+        char piece[32];
+        align_edge_fill(piece, g_align_edge_lens[c]);
+        lisp_val_t str = os_make_string(piece);
+        if (((str & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { alloc_misaligned++; }
+        list = os_make_cons(str, list);
+        if (((list & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { alloc_misaligned++; }
+    }
+    assert(alloc_misaligned == 0,
+           "長さ0/1/7/8/9/15/16/17/23/24/25のstringとその間のconsが、確保直後にすべてOS_HEAP_ALIGN境界にある");
+
+    /* ガベージを作りながらGCを確実に発火させる。GCを跨いだ後に、
+       同じオブジェクトが再びすべて境界に乗っていることを確かめる */
+    UINT64 gc_before = os_gc_collect_count();
+    for (int i = 0; i < 4000; i++) {
+        char piece[4] = { 'x', (char)('0' + (i % 10)), 'y', '\0' };
+        os_make_cons(os_make_string(piece), nil);
+    }
+    UINT64 gc_after = os_gc_collect_count();
+    assert(gc_after > gc_before,
+           "境界テストの途中でos_gc_collectが実際に発火する(発火しなければコピー後の検査に意味がない)");
+
+    int after_misaligned = 0;
+    int content_mismatch = 0;
+    UINT64 seen = 0;
+    /* listはconsで積んだので、長さ列の逆順に並んでいる */
+    for (lisp_val_t p = list; p != nil; p = cc_cdr(p)) {
+        UINT64 expected_len = g_align_edge_lens[ALIGN_EDGE_CASES - 1 - seen];
+        lisp_val_t str = cc_car(p);
+        if (((p   & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { after_misaligned++; }
+        if (((str & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { after_misaligned++; }
+
+        char expected[32];
+        align_edge_fill(expected, expected_len);
+        char buf[32];
+        os_string_to_cstr(str, buf, sizeof(buf));
+        if (strcmp(buf, expected) != 0) { content_mismatch++; }
+        seen++;
+    }
+    assert(seen == ALIGN_EDGE_CASES, "GC後もリストの要素数が変わらない");
+    assert(after_misaligned == 0,
+           "GCでTo空間へコピーされた後も、端数長のstringとconsがすべてOS_HEAP_ALIGN境界にある");
+    assert(content_mismatch == 0, "GCでコピーされた後も端数長のstringの内容が一致する");
+}
+
+/* [境界] From/To両空間の先頭が OS_HEAP_ALIGN に乗っていること、および2つの
+   半空間が同サイズであることを、境界に乗っていないbaseを渡して確かめる。
+   os_heap_initは受け取ったbaseを切り上げる責務を負っている(呼び出し元の
+   os_boot_alloc_finalizeだけに任せると、mallocから直接渡すこの経路が漏れる)。 */
+void test_heap_init_aligns_both_half_spaces() {
+    UINT64 total = 1024 * 1024;
+    UINT8 *raw = (UINT8 *)malloc(total);
+    assert(raw != NULL, "半空間境界テスト用のヒープをmallocで確保できる");
+
+    /* 意図的に8 mod 16のbaseを作る。mallocは16境界を返すので+8でずらす */
+    UINT64 skewed_base = (UINT64)raw + 8;
+    UINT64 skewed_size = total - 8;
+    os_heap_init(skewed_base, skewed_size);
+
+    UINT64 from_start = 0, from_end = 0, to_start = 0, to_end = 0;
+    os_heap_bounds_for_test(&from_start, &from_end, &to_start, &to_end);
+
+    assert((from_start & (OS_HEAP_ALIGN - 1)) == 0,
+           "baseが8 mod 16でもFrom空間の先頭はOS_HEAP_ALIGN境界へ切り上げられる");
+    assert((to_start & (OS_HEAP_ALIGN - 1)) == 0,
+           "To空間の先頭もOS_HEAP_ALIGN境界にある");
+    assert((from_end - from_start) == (to_end - to_start),
+           "From空間とTo空間のサイズが等しい(フリップしても容量が減らない)");
+    assert(((from_end - from_start) & (OS_HEAP_ALIGN - 1)) == 0,
+           "半空間のサイズがOS_HEAP_ALIGNの倍数である");
+    assert(from_start >= skewed_base && to_end <= skewed_base + skewed_size,
+           "2つの半空間は渡された領域の内側に収まっている");
+
+    free(raw);
+}
+
 int main(int argc, char** argv) {
    (void)argc;
    (void)argv;
@@ -2038,6 +2170,10 @@ int main(int argc, char** argv) {
    test_gc_fires_during_gcd_and_isqrt_and_results_are_correct();
    test_gc_fires_during_vector_construction_and_elements_are_preserved();
    test_gc_fires_during_string_append_and_result_is_correct();
+
+   test_heap_align_holds_for_variable_length_objects_across_gc();
+   /* os_heap_initを別のヒープで呼び直すので、他のテストより後に置く */
+   test_heap_init_aligns_both_half_spaces();
 
    return g_test_failed ? 1 : 0;
 }

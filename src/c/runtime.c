@@ -266,7 +266,9 @@ static UINT8 *g_to_end;
 static UINT8 g_nil_cell[16] __attribute__((aligned(8)));
 
 /**
- * From空間からnバイト(8byte境界に整列)を割り当てる。枯渇した場合は停止する。
+ * From空間からnバイト(OS_HEAP_ALIGN境界に整列)を割り当てる。枯渇した場合は停止する。
+ * 返すアドレスは必ずOS_HEAP_ALIGNの倍数であり、進めた分もその倍数なので、
+ * 以降の確保も境界に乗り続ける(可変長オブジェクトが端数を要求しても崩れない)。
  * @param n 割り当てるバイト数
  * @return 割り当てたメモリの先頭アドレス
  */
@@ -284,7 +286,7 @@ lisp_val_t cc_diag_gc_stress(lisp_val_t args, lisp_val_t env) {
 #endif
 
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
-    UINT64 aligned = (n + 7) & ~7ULL;
+    UINT64 aligned = os_heap_align_up(n);
 #ifndef ISIKIOS_UNIT_TEST
     __asm__ __volatile__ ("cli");
 #endif
@@ -414,11 +416,121 @@ static UINT64 g_align_val_hist[8][16];
 /** タグ別・下位4bitが0でなかった値のうち最初に観測したもの(診断用) */
 static UINT64 g_align_val_first_bad[8];
 
+/** [境界] 違反(強制対象なのに境界に乗っていない)を観測した延べ回数 */
+static UINT64 g_align_violations = 0;
+
+static const char *align_site_name(int site);
+static const char *align_tag_name(UINT64 tag);
+
+/**
+ * [境界] このサイトが返すアドレスはOS_HEAP_ALIGN境界でなければならないか。
+ *
+ * 「揃っているべきなのに揃っていない」を**失敗**として扱う対象を、ここ1箇所で
+ * 決める。未対応として意図的に残している経路(documents/heap-align16-report.md
+ * 6章: boot allocator / 静的nilセル / JITリテラルスロット / block_deviceハンドル)は
+ * 集計だけ続け、失敗にはしない。未対応なものを失敗にすると、本当の退行が
+ * 既知の未対応に埋もれて見えなくなる。
+ */
+static int align_site_is_enforced(int site) {
+    switch (site) {
+        case ALIGN_SITE_ALLOC_BYTES:       /* Lispヒープ From空間 */
+        case ALIGN_SITE_GC_TO_ALLOC:       /* Lispヒープ To空間 */
+        case ALIGN_SITE_IMM_SLOT:          /* Immobilized Spaceのスロット */
+        case ALIGN_SITE_IMM_PAGE:
+        case ALIGN_SITE_IMM_PAGES_CONTIG:
+        case ALIGN_SITE_ENV_PAGE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/** [境界] このタグの値はLispヒープ上のオブジェクトを指しうるか。
+    TAG_RAW_POINTERはJITリテラルスロットとblock_deviceハンドルを含むため対象外 */
+static int align_tag_is_enforced(UINT64 tag) {
+    return tag == TAG_CONS || tag == TAG_SYMBOL || tag == TAG_STRING ||
+           tag == TAG_INSTANCE || tag == TAG_FORWARD;
+}
+
+/**
+ * [境界] この**アドレス**が本フェーズの保証範囲(Lispヒープの中)にあるか。
+ *
+ * 本フェーズが保証するのは「Lispヒープ上のオブジェクトが16byte境界にあること」
+ * であって、ヒープ外にある静的オブジェクトは対象外である
+ * (documents/heap-align16-report.md 6章)。タグだけで判定すると、
+ * **nil がここに引っかかる**: nilは `g_nil_cell | TAG_CONS` という、
+ * From/To空間のどちらにも属さない静的領域への TAG_CONS 付きポインタで、
+ * g_nil_cell は `__attribute__((aligned(8)))` のままだからである。
+ * 実測(2026-09-17、既定ビルド): g_nil_cell は `...a68` に置かれ、
+ * nil の下位4bitは 9 になる。GC_DEBUG ビルドでは16境界に落ちるため、
+ * 「ビルドによって出たり出なかったりする違反」になってしまう。
+ *
+ * 領域で切ることで、対象外のものを機械的に外せる。タグ側の列挙に
+ * 「nilは除く」という例外を足すより、保証の範囲そのものを述語にする方がよい。
+ */
+static int align_addr_is_in_lisp_heap(lisp_addr_t addr) {
+    int region = os_addr_region(addr);
+    return region == 0 /* From空間 */ || region == 1 /* To空間 */;
+}
+
+/** [境界] 強制対象の違反を観測したときに、記録してから停止する。
+    集計だけ続けても、以降の観測はすべて壊れたヒープ上の話になるので意味が無い */
+static void align_audit_violation(const char *kind, const char *who, UINT64 value) {
+    g_align_violations++;
+    align_audit_write("\n[ALIGN] VIOLATION ");
+    align_audit_write(kind);
+    align_audit_write(" ");
+    align_audit_write(who);
+    align_audit_write(" value=");
+    align_audit_write_uint(value);
+    align_audit_write(" low4bit=");
+    align_audit_write_uint(value & (OS_HEAP_ALIGN - 1));
+    align_audit_write("\n");
+    os_align_audit_report();
+#ifdef ISIKIOS_UNIT_TEST
+    /* ネイティブテストではos_panicが無限ループに入りmake testがハングするので、
+       終了コードで落とす(原則6: 失敗は観測可能に、かつ区別可能に) */
+    exit(1);
+#else
+    os_panic("ALIGN_AUDIT: Lispヒープのオブジェクトが16byte境界にない");
+#endif
+}
+
+/* [報告と強制の切り分け] ヒストグラムは常に下位4bit(16ビン)で取る。
+   一方「違反」の判定は OS_HEAP_ALIGN 基準にする。両者を分けておくと、
+   -DOS_HEAP_ALIGN=8ULL で「8byte切り上げだった頃」を測り直すときに、
+   停止せずに 8 mod 16 の分布だけを取れる(比較のための計測ができる)。 */
+#define ALIGN_AUDIT_OFFENDS(v) (((v) & (OS_HEAP_ALIGN - 1)) != 0)
+
 void os_align_audit_note_alloc(int site, UINT64 addr, UINT64 size) {
     if (site < 0 || site >= ALIGN_SITE_COUNT) { return; }
     g_align_alloc_hist[site][addr & 0xF]++;
-    if ((addr & 0xF) != 0) { g_align_alloc_bad[site]++; }
-    if ((size & 0xF) != 0) { g_align_alloc_stride_break[site]++; }
+    if ((addr & 0xF) != 0) {
+        g_align_alloc_bad[site]++;
+    }
+    if (align_site_is_enforced(site) && ALIGN_AUDIT_OFFENDS(addr)) {
+        align_audit_violation("alloc", align_site_name(site), addr);
+    }
+    if ((size & 0xF) != 0) {
+        g_align_alloc_stride_break[site]++;
+    }
+    /* [境界] サイズがOS_HEAP_ALIGNの倍数でないと、確保自体は揃っていても
+       **次の**確保がずれる。切り上げている以上、強制対象のサイトでは0でなければ
+       ならない */
+    if (align_site_is_enforced(site) && ALIGN_AUDIT_OFFENDS(size)) {
+        align_audit_violation("stride", align_site_name(site), size);
+    }
+}
+
+/** [計測] 直近のGCの生存バイト数と、これまでの最大値・累計 */
+static UINT64 g_align_gc_live_last = 0;
+static UINT64 g_align_gc_live_peak = 0;
+static UINT64 g_align_gc_live_total = 0;
+
+void os_align_audit_note_gc_live(UINT64 live_bytes) {
+    g_align_gc_live_last = live_bytes;
+    if (live_bytes > g_align_gc_live_peak) { g_align_gc_live_peak = live_bytes; }
+    g_align_gc_live_total += live_bytes;
 }
 
 void os_align_audit_note_value(lisp_val_t v) {
@@ -428,9 +540,16 @@ void os_align_audit_note_value(lisp_val_t v) {
     if (tag == TAG_FIXNUM || tag == TAG_CHAR) { return; }
     UINT64 low = v & 0xF;
     g_align_val_hist[tag][low]++;
-    if (low != tag && g_align_val_first_bad[tag] == 0) {
-        /* 16境界なら「下位4bit == タグ値」になる。そうでない値を最初の1件だけ控える */
-        g_align_val_first_bad[tag] = v;
+    if (low != tag) {
+        /* 16境界なら「下位4bit == タグ値」になる */
+        if (g_align_val_first_bad[tag] == 0) {
+            g_align_val_first_bad[tag] = v;
+        }
+    }
+    if (align_tag_is_enforced(tag) &&
+        align_addr_is_in_lisp_heap((lisp_addr_t)(v & ~TAG_MASK)) &&
+        ALIGN_AUDIT_OFFENDS(v & ~TAG_MASK)) {
+        align_audit_violation("value", align_tag_name(tag), v);
     }
 }
 
@@ -466,6 +585,16 @@ void os_align_audit_report(void) {
     align_audit_write("\n[ALIGN] ==== 16byte境界監査 ====\n");
     align_audit_write("[ALIGN] gc-count=");
     align_audit_write_uint(os_gc_collect_count());
+    align_audit_write(" heap-align=");
+    align_audit_write_uint(OS_HEAP_ALIGN);
+    align_audit_write(" violations=");
+    align_audit_write_uint(g_align_violations);
+    align_audit_write("\n[ALIGN] gc-live last=");
+    align_audit_write_uint(g_align_gc_live_last);
+    align_audit_write(" peak=");
+    align_audit_write_uint(g_align_gc_live_peak);
+    align_audit_write(" total=");
+    align_audit_write_uint(g_align_gc_live_total);
     align_audit_write("\n");
 
     for (int site = 0; site < ALIGN_SITE_COUNT; site++) {
@@ -1044,14 +1173,33 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
         if (!registered) { registered = 1; atexit(os_align_audit_report); }
     }
 #endif
-    // 将来的にCOPY GCを実装するためヒープを同サイズのFrom/To 2領域に分割しておく
-    UINT64 half = (heap_size / 2) & ~7ULL;
-    g_from_start = (UINT8 *)heap_base;
+    /* [境界] ヒープを同サイズのFrom/To 2領域に分割する。
+       os_alloc_bytes/gc_to_allocがOS_HEAP_ALIGN単位で切り上げても、
+       **区画の先頭がその境界に乗っていなければ**全オブジェクトがずれる。
+       そこで次の3つを揃える:
+         1. From空間の先頭 = heap_baseをOS_HEAP_ALIGNへ切り上げた位置
+         2. 半空間サイズ  = OS_HEAP_ALIGNの倍数(→ To空間の先頭も自動的に乗る)
+         3. To空間の終端  = To空間の先頭 + 半空間サイズ
+
+       呼び出し元(os_boot_alloc_finalize)も先頭を揃えているので1は通常no-opだが、
+       ユニットテストのようにmallocから直接渡される経路もあるため、ここでも
+       切り上げる(切り上げたぶんは容量から差し引く)。
+
+       以前は g_to_end = heap_base + heap_size として**残り全部**をTo空間にしていた。
+       このときTo空間はFrom空間より最大8byte大きく、フリップすると今度はFrom空間の
+       方が大きくなる。コピーGCは「From空間を埋めきってもTo空間へ必ず入る」ことが
+       前提なので、両半空間を等しくしておく。 */
+    UINT64 base   = os_heap_align_up(heap_base);
+    UINT64 lost   = base - heap_base;
+    UINT64 usable = (heap_size > lost) ? (heap_size - lost) : 0;
+    UINT64 half   = (usable / 2) & ~(OS_HEAP_ALIGN - 1);
+
+    g_from_start = (UINT8 *)base;
     g_from_ptr   = g_from_start;
     g_from_end   = g_from_start + half;
     g_to_start   = g_from_end;
-    g_to_end     = (UINT8 *)(heap_base + heap_size);
     g_to_ptr     = g_to_start;
+    g_to_end     = g_to_start + half;
 
     // g_symbol_hash(静的配列)はCのゼロ初期化任せだと全スロットが0=「添字0が
     // 占有中」という誤った状態になってしまう(空きスロットの番兵は-1)。
@@ -1072,9 +1220,25 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
        小さい」というコンパイル時定数どうしの比較にすぎず、**ヒープがその定数より上に
        置かれること**は保証していない。低位アドレスにヒープが置かれる構成に変われば、
        静的アサートは通ったまま範囲検査だけが壊れる。実行時に1回だけ確かめる。 */
-    if (heap_base <= MAGIC_MUST_BE_BELOW) {
+    if (base <= MAGIC_MUST_BE_BELOW) {
         os_panic("heap base too low: MAGICが転送ポインタと誤認される");
     }
+
+    /* [境界] 上の算出が意図通りになっているかを起動時に1回だけ確かめる。
+       半空間の先頭がずれたままだと、症状は「タグを広げた将来のどこかで、
+       特定のビルドでだけ壊れる」という形で遠くに出る。ここで即座に止める。 */
+    if ((((UINT64)(lisp_addr_t)g_from_start) & (OS_HEAP_ALIGN - 1)) != 0 ||
+        (((UINT64)(lisp_addr_t)g_to_start)   & (OS_HEAP_ALIGN - 1)) != 0) {
+        os_panic("heap half-space not aligned to OS_HEAP_ALIGN");
+    }
+}
+
+void os_heap_bounds_for_test(UINT64 *out_from_start, UINT64 *out_from_end,
+                             UINT64 *out_to_start, UINT64 *out_to_end) {
+    if (out_from_start) { *out_from_start = (UINT64)(lisp_addr_t)g_from_start; }
+    if (out_from_end)   { *out_from_end   = (UINT64)(lisp_addr_t)g_from_end; }
+    if (out_to_start)   { *out_to_start   = (UINT64)(lisp_addr_t)g_to_start; }
+    if (out_to_end)     { *out_to_end     = (UINT64)(lisp_addr_t)g_to_end; }
 }
 
 double os_heap_used_ratio(void) {
@@ -1181,7 +1345,10 @@ void *os_boot_alloc(UINT64 size, UINT64 align) {
 
 UINT64 os_boot_alloc_finalize(UINT64 *out_heap_base, UINT64 *out_heap_size) {
     UINT64 used = (UINT64)(g_boot_alloc_bump - g_boot_alloc_base);
-    UINT64 aligned_base = ((UINT64)g_boot_alloc_bump + 7) & ~7ULL;
+    /* [境界] ここで返すアドレスがそのままLispヒープの先頭(os_heap_init)になる。
+       確保を16byteに切り上げても先頭が8 mod 16なら全オブジェクトがずれるので、
+       先頭もOS_HEAP_ALIGNへ揃える */
+    UINT64 aligned_base = os_heap_align_up((UINT64)g_boot_alloc_bump);
     *out_heap_base = aligned_base;
     *out_heap_size = (UINT64)g_boot_alloc_end - aligned_base;
     g_boot_alloc_used_at_finalize = used;
@@ -1415,7 +1582,7 @@ static void panic_write_imm_breakdown(frame_buffer *fb) {
 }
 
 void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
-    UINT64 aligned = (size + 15) & ~15ULL;
+    UINT64 aligned = os_heap_align_up(size);
     g_imm_last_request_bytes = aligned;
     if (cursor->page == 0 || cursor->offset + aligned > IMM_PAGE_SIZE) {
         cursor->page = (UINT8 *)os_imm_page_alloc();
@@ -1525,7 +1692,9 @@ static int gc_queue_pop(lisp_val_t *out) {
 
 /** To空間にsizeバイトを確保して返す(枯渇時は診断メッセージを表示して停止する) */
 static UINT8 *gc_to_alloc(UINT64 size) {
-    UINT64 aligned = (size + 7) & ~7ULL;
+    /* [境界] 切り上げ単位はos_alloc_bytesと**必ず同じ**でなければならない。
+       To空間の方が粗いと、From空間を埋めきった状態のコピーが入りきらなくなる */
+    UINT64 aligned = os_heap_align_up(size);
     UINT8 *dst = g_to_ptr;
     if (dst + aligned > g_to_end) {
         /* [原則6] 以前はフレームバッファへ1行書いて for(;;) で止まっていた。
@@ -2196,6 +2365,10 @@ static void os_gc_collect_body(void) {
     // 再度gc_scan_queueでキューを空にする
     gc_fixup_all_function_cells();
     gc_scan_queue();
+
+    /* [計測] フリップ直前のg_to_ptrが、このGCで生き残った総バイト数である
+       (切り上げ後の値なので、切り上げ単位を変えた影響がそのまま出る) */
+    ALIGN_AUDIT_NOTE_GC_LIVE((UINT64)(g_to_ptr - g_to_start));
 
     UINT8 *new_from_start = g_to_start;
     UINT8 *new_from_end = g_to_end;
