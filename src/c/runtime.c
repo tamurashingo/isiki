@@ -263,7 +263,10 @@ static UINT8 *g_to_end;
  * nil(自己参照するconsセル)専用の固定領域。From/To空間のどちらにも属さず、GCの
  * コピー/スワップの対象にならない(g_symbol_table等と同じ静的配列パターン)。
  */
-static UINT8 g_nil_cell[16] __attribute__((aligned(8)));
+/* [静的領域調査/試験] documents/static-align16-survey.md Step 3 実験A。
+   aligned(8) のままだと nil(= g_nil_cell | TAG_CONS)の下位4bitがビルド依存で
+   0 になったり 8 になったりする。16 を明示すればどうなるかを試す */
+static UINT8 g_nil_cell[16] __attribute__((aligned(16)));
 
 /**
  * From空間からnバイト(OS_HEAP_ALIGN境界に整列)を割り当てる。枯渇した場合は停止する。
@@ -402,6 +405,94 @@ static void align_audit_write_uint(UINT64 v) { printf("%llu", (unsigned long lon
 static void align_audit_write(const char *s) { os_diag_serial_write(s); }
 static void align_audit_write_uint(UINT64 v) { serial_write_uint(v); }
 #endif
+
+/* [静的領域調査] nm/readelfの出力と突き合わせるので16進で出す。
+   serial_write_uintは10進なので、ここだけ専用に用意する */
+static void align_audit_write_hex(UINT64 v) {
+    char out[19];
+    int o = 0;
+    out[o++] = '0'; out[o++] = 'x';
+    int started = 0;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        UINT64 nib = (v >> shift) & 0xF;
+        if (!started && nib == 0 && shift != 0) { continue; }
+        started = 1;
+        out[o++] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+    }
+    out[o] = '\0';
+    align_audit_write(out);
+}
+
+/* ===== [静的領域調査] ヒープ外ポインタの採取 =====
+ * documents/static-align16-survey.md Step 1。
+ * From/To空間の外を指すタグ付き値を分類する。gc_copy_valueは全ルートと全生存
+ * オブジェクトの全フィールドを通るので、ここで数えれば「Lispの値として流通して
+ * いるヒープ外ポインタ」を網羅できる。
+ *
+ * 2段構えにしてある:
+ *   1. 領域別の延べ件数(region 2 = Immobilized Space、4 = それ以外)。
+ *      Immobilized Space はページ/スロットのアロケータが16境界を保証している
+ *      ことが分かっており、個々のアドレスを見る意味が薄い。延べ件数と
+ *      境界外れ件数だけ数える。
+ *   2. region 4(静的領域・ブート時確保・その他)だけ、**アドレスごと**に
+ *      オープンアドレッシングのハッシュ表で数える。nm と突き合わせて
+ *      シンボルへ逆引きするので、値そのものを残す必要があるのはこちらだけ。
+ *
+ * 最初は全領域を線形表(512件)で持っていたが、Immobilized Space のスロットで
+ * 埋まって 23.8% が overflow になり「分類できなかった割合」が大きくなった。
+ * 見たい対象で表を分けると、overflow を 0 にできる。 */
+/* g_imm_space(static)の実体は下方のImmobilized Spaceの節にある。報告で領域の
+   先頭を出したいが、staticな配列は前方宣言できないので、アクセサを前方宣言する */
+static UINT64 align_audit_imm_base(void);
+
+#define ALIGN_EXT_CAPACITY 8192   /* 2のべき乗であること(下のマスクで剰余を取る) */
+typedef struct {
+    UINT64 addr;   /* タグを外した実アドレス。0 = 空きスロット */
+    UINT64 tag;
+    UINT64 count;
+} align_ext_entry_t;
+static align_ext_entry_t g_align_ext[ALIGN_EXT_CAPACITY];
+static UINT64 g_align_ext_count = 0;      /* 表に入っている種類数 */
+static UINT64 g_align_ext_overflow = 0;   /* 表に入りきらなかった延べ観測回数 */
+
+/** 領域別の延べ観測回数(os_addr_regionの戻り値で添字。0/1はヒープなので常に0) */
+static UINT64 g_align_ext_region_total[8];
+/** 領域別の、16境界を外れていた延べ観測回数 */
+static UINT64 g_align_ext_region_bad[8];
+
+static void align_ext_note(UINT64 addr, UINT64 tag, int region) {
+    if (region < 0 || region >= 8) { region = 7; }
+    g_align_ext_region_total[region]++;
+    if ((addr & (OS_HEAP_ALIGN - 1)) != 0) { g_align_ext_region_bad[region]++; }
+
+    /* Immobilized Space(region 2)はアロケータ側で境界が保証済みなので、
+       アドレス単位の表には入れない(表を本命の region 4 に空けておく) */
+    if (region == 2) { return; }
+
+    /* アドレスの下位ビットはアラインで0が続くので、そのままだと衝突する。
+       4bit右シフトしてから混ぜる */
+    UINT64 h = (addr >> 4) * 1099511628211ULL;
+    for (UINT64 probe = 0; probe < ALIGN_EXT_CAPACITY; probe++) {
+        UINT64 i = (h + probe) & (ALIGN_EXT_CAPACITY - 1);
+        if (g_align_ext[i].addr == addr && g_align_ext[i].tag == tag) {
+            g_align_ext[i].count++;
+            return;
+        }
+        if (g_align_ext[i].addr == 0) {
+            if (g_align_ext_count >= ALIGN_EXT_CAPACITY / 2) {
+                /* 負荷率0.5を超えたら探査が伸びるので、そこで打ち切って数えるだけにする */
+                g_align_ext_overflow++;
+                return;
+            }
+            g_align_ext[i].addr = addr;
+            g_align_ext[i].tag = tag;
+            g_align_ext[i].count = 1;
+            g_align_ext_count++;
+            return;
+        }
+    }
+    g_align_ext_overflow++;
+}
 
 /** 確保サイト別・返却アドレスの下位4bitのヒストグラム */
 static UINT64 g_align_alloc_hist[ALIGN_SITE_COUNT][16];
@@ -551,6 +642,17 @@ void os_align_audit_note_value(lisp_val_t v) {
         ALIGN_AUDIT_OFFENDS(v & ~TAG_MASK)) {
         align_audit_violation("value", align_tag_name(tag), v);
     }
+
+    /* [静的領域調査] ヒープ外を指す値は、アドレスごとに採取してnmへ逆引きする。
+       TAG_RAW_POINTER(JITリテラルスロット/block_deviceハンドル/Function Cell)も
+       対象に含める — 「Lispの値として現れるポインタ」はこれも含むため */
+    {
+        lisp_addr_t addr = (lisp_addr_t)(v & ~TAG_MASK);
+        int region = os_addr_region(addr);
+        if (region != 0 && region != 1) {
+            align_ext_note((UINT64)addr, tag, region);
+        }
+    }
 }
 
 static const char *align_tag_name(UINT64 tag) {
@@ -638,6 +740,52 @@ void os_align_audit_report(void) {
             align_audit_write_uint(g_align_val_hist[tag][i]);
             align_audit_write(i == 15 ? "\n" : ",");
         }
+    }
+    /* [静的領域調査] ヒープ外ポインタの一覧。nm -n の出力と突き合わせる */
+    {
+        UINT64 ext_total = 0;
+        for (int r = 0; r < 8; r++) { ext_total += g_align_ext_region_total[r]; }
+        align_audit_write("[ALIGN] ext-summary distinct=");
+        align_audit_write_uint(g_align_ext_count);
+        align_audit_write(" total=");
+        align_audit_write_uint(ext_total);
+        align_audit_write(" overflow=");
+        align_audit_write_uint(g_align_ext_overflow);
+        align_audit_write(" capacity=");
+        align_audit_write_uint((UINT64)ALIGN_EXT_CAPACITY);
+        align_audit_write("\n");
+        for (int r = 0; r < 8; r++) {
+            if (g_align_ext_region_total[r] == 0) { continue; }
+            align_audit_write("[ALIGN] ext-region ");
+            align_audit_write_uint((UINT64)r);
+            align_audit_write(" total=");
+            align_audit_write_uint(g_align_ext_region_total[r]);
+            align_audit_write(" misaligned=");
+            align_audit_write_uint(g_align_ext_region_bad[r]);
+            align_audit_write("\n");
+        }
+    }
+    /* 実行時アドレス <-> nmのアドレス を対応づけるための基準点。
+       UEFIのロードアドレスは起動ごとに変わるので、既知シンボルの実行時
+       アドレスが無いと逆引きできない(cc_diag_image_anchor_pubと同じ手口) */
+    align_audit_write("[ALIGN] ext-anchor os_heap_used_ratio=");
+    align_audit_write_hex((UINT64)(lisp_addr_t)(void *)os_heap_used_ratio);
+    align_audit_write(" g_nil_cell=");
+    align_audit_write_hex((UINT64)(lisp_addr_t)g_nil_cell);
+    align_audit_write(" imm_space=");
+    align_audit_write_hex(align_audit_imm_base());
+    align_audit_write("\n");
+    for (UINT64 i = 0; i < ALIGN_EXT_CAPACITY; i++) {
+        if (g_align_ext[i].addr == 0) { continue; }
+        align_audit_write("[ALIGN] ext addr=");
+        align_audit_write_hex(g_align_ext[i].addr);
+        align_audit_write(" tag=");
+        align_audit_write(align_tag_name(g_align_ext[i].tag));
+        align_audit_write(" low4=");
+        align_audit_write_uint(g_align_ext[i].addr & 0xF);
+        align_audit_write(" count=");
+        align_audit_write_uint(g_align_ext[i].count);
+        align_audit_write("\n");
     }
     align_audit_write("[ALIGN] ==== end ====\n");
 }
@@ -1390,6 +1538,11 @@ lisp_val_t primitive_boot_alloc_used_bytes(lisp_val_t args, lisp_val_t env) {
 #define IMM_SPACE_SIZE (16 * 1024 * 1024)
 
 static UINT8 g_imm_space[IMM_SPACE_SIZE] __attribute__((aligned(IMM_PAGE_SIZE)));
+
+#ifdef ISIKIOS_ALIGN_AUDIT
+/* [静的領域調査] 報告でImmobilized Spaceの先頭を出すためのアクセサ(前方宣言は上方) */
+static UINT64 align_audit_imm_base(void) { return (UINT64)(lisp_addr_t)g_imm_space; }
+#endif
 /** 未使用領域のうち、まだページ切り出しに使っていない先頭アドレス */
 static UINT8 *g_imm_bump = g_imm_space;
 /** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */

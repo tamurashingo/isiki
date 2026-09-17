@@ -557,8 +557,24 @@ typedef struct {
 /* 2026-09-14: ISLisp仕様例のJIT版(isiki_test_jit.lisp、約600関数が文字列/リスト/
  * ベクタのリテラルを持つ)を1ブートで全てJIT化できるよう40→1024へ拡張。number/lambdaと
  * GC_MAX_EXTRA_ROOTS(runtime.c)も同時に拡張した */
+/* [静的領域調査/試験] documents/static-align16-survey.md Step 3 実験B。
+ *
+ * リテラルスロットのアドレスは os_environment_register_literal_slot 経由で
+ * TAG_RAW_POINTER 付きの**Lisp値として流通する**。配列を aligned(16) にしても
+ * 要素アドレスは「先頭 + 要素サイズ × i」なので、要素が8byteのままだと
+ * 奇数添字が必ず 8 mod 16 になる(実測でちょうど50%が外れていた)。
+ *
+ * そこで1要素を16byteにする。中身は今までどおり lisp_val_t 1個で、後半8byteは
+ * 純粋なパディングである。生成コードはスロットの**絶対アドレス**を movabs の
+ * 即値として埋めており(za.c の jit_movabs_reg 呼び出し)、base + 8*i のような
+ * インデックス計算を持たないので、出力される機械語の形は変わらない。 */
+typedef struct {
+    lisp_val_t v;
+    UINT64     _pad;   /* 要素strideを16byteにするためだけのパディング */
+} za_slot_t;
+
 #define ZA_MAX_QUOTE_SLOTS 1024
-static lisp_val_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS];
+static za_slot_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS] __attribute__((aligned(16)));
 static UINT64 g_za_quote_slot_count = 0;
 /** Phase3.6: 環境破棄時にza_free_literal_slotが返却したスロットindexのフリーリスト
  * (スタック、LIFO)。za_alloc_quote_slotはここを先に見て、空ならモノトニック
@@ -585,9 +601,9 @@ static int za_alloc_quote_slot(lisp_val_t value, UINT64 *out_slot_idx) {
     } else {
         return 0;
     }
-    g_za_quote_slots[slot_idx] = value;
-    os_gc_register_root(&g_za_quote_slots[slot_idx]);
-    za_track_literal_slot_alloc(&g_za_quote_slots[slot_idx]);
+    g_za_quote_slots[slot_idx].v = value;
+    os_gc_register_root(&g_za_quote_slots[slot_idx].v);
+    za_track_literal_slot_alloc(&g_za_quote_slots[slot_idx].v);
     *out_slot_idx = slot_idx;
     return 1;
 }
@@ -631,7 +647,7 @@ static int za_classify_quoted_value(lisp_val_t quoted, za_operand_t *out) {
  * プロセス生涯で解放しない(g_za_quote_slotsと同じ考え方)。
  */
 #define ZA_MAX_NUMBER_SLOTS 512  /* 2026-09-14: 32→512(ZA_MAX_QUOTE_SLOTS参照) */
-static lisp_val_t g_za_number_slots[ZA_MAX_NUMBER_SLOTS];
+static za_slot_t g_za_number_slots[ZA_MAX_NUMBER_SLOTS] __attribute__((aligned(16)));
 static UINT64 g_za_number_slot_count = 0;
 /** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
 static UINT64 g_za_number_slot_free[ZA_MAX_NUMBER_SLOTS];
@@ -884,9 +900,9 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
         } else {
             return 0;
         }
-        g_za_number_slots[slot_idx] = form;
-        os_gc_register_root(&g_za_number_slots[slot_idx]);
-        za_track_literal_slot_alloc(&g_za_number_slots[slot_idx]);
+        g_za_number_slots[slot_idx].v = form;
+        os_gc_register_root(&g_za_number_slots[slot_idx].v);
+        za_track_literal_slot_alloc(&g_za_number_slots[slot_idx].v);
         out->is_literal = 7;
         out->param_index = slot_idx;
         return 1;
@@ -1047,7 +1063,7 @@ _Static_assert(sizeof(za_syms_t) == 25 * sizeof(lisp_val_t),
  * JIT化できる」確認が40では枯渇して失敗するようになったため、64へ広げる
  * (GC_MAX_EXTRA_ROOTSも同時に160→256へ) */
 #define ZA_MAX_LAMBDA_SLOTS 256  /* 2026-09-14: 64→256(ZA_MAX_QUOTE_SLOTS参照) */
-static lisp_val_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS];
+static za_slot_t g_za_lambda_slots[ZA_MAX_LAMBDA_SLOTS] __attribute__((aligned(16)));
 static UINT64 g_za_lambda_slot_count = 0;
 /** Phase3.6: g_za_quote_slot_freeと同じ考え方のフリーリスト。 */
 static UINT64 g_za_lambda_slot_free[ZA_MAX_LAMBDA_SLOTS];
@@ -1075,7 +1091,7 @@ static UINT64 g_za_lambda_slot_free_count = 0;
  * であるTAG_RAW_POINTER付きアドレスとは値域が重ならないため安全に判別できる)。
  */
 #define ZA_MAX_FN_CELL_CACHE_SLOTS 2048
-static lisp_val_t g_za_fn_cell_cache_slots[ZA_MAX_FN_CELL_CACHE_SLOTS];
+static za_slot_t g_za_fn_cell_cache_slots[ZA_MAX_FN_CELL_CACHE_SLOTS] __attribute__((aligned(16)));
 static UINT64 g_za_fn_cell_cache_slot_count = 0;
 static UINT64 g_za_fn_cell_cache_slot_free[ZA_MAX_FN_CELL_CACHE_SLOTS];
 static UINT64 g_za_fn_cell_cache_slot_free_count = 0;
@@ -1102,8 +1118,8 @@ static int za_alloc_fn_cell_cache_slot(UINT64 *out_slot_idx) {
     // 沈黙してNILを返す事態を引き起こした、調査の経緯はdocuments/abi-redesign.md
     // 参照)。0が安全な番兵として使える一般的な条件(TAG_RAW_POINTERタグ付き値は
     // 下位3bitが常に非ゼロ)はdocuments/pitfalls.md「原則1」参照。
-    g_za_fn_cell_cache_slots[slot_idx] = (lisp_val_t)0;
-    za_track_literal_slot_alloc(&g_za_fn_cell_cache_slots[slot_idx]);
+    g_za_fn_cell_cache_slots[slot_idx].v = (lisp_val_t)0;
+    za_track_literal_slot_alloc(&g_za_fn_cell_cache_slots[slot_idx].v);
     *out_slot_idx = slot_idx;
     return 1;
 }
@@ -1120,26 +1136,36 @@ static int za_alloc_fn_cell_cache_slot(UINT64 *out_slot_idx) {
  */
 static void za_free_literal_slot(lisp_val_t *addr) {
     os_gc_unregister_root(addr);
-    if (addr >= g_za_quote_slots && addr < g_za_quote_slots + ZA_MAX_QUOTE_SLOTS) {
-        UINT64 idx = (UINT64)(addr - g_za_quote_slots);
+    if ((UINT8 *)addr >= (UINT8 *)g_za_quote_slots &&
+        (UINT8 *)addr < (UINT8 *)(g_za_quote_slots + ZA_MAX_QUOTE_SLOTS)) {
+        /* [静的領域調査/試験] 要素が za_slot_t(16byte)になったので、
+           lisp_val_t* のままでの引き算では添字にならない。byte差を要素サイズで割る */
+        UINT64 idx = (UINT64)(((UINT8 *)addr - (UINT8 *)g_za_quote_slots) / sizeof(za_slot_t));
         g_za_quote_slot_free[g_za_quote_slot_free_count++] = idx;
         return;
     }
-    if (addr >= g_za_number_slots && addr < g_za_number_slots + ZA_MAX_NUMBER_SLOTS) {
-        UINT64 idx = (UINT64)(addr - g_za_number_slots);
+    if ((UINT8 *)addr >= (UINT8 *)g_za_number_slots &&
+        (UINT8 *)addr < (UINT8 *)(g_za_number_slots + ZA_MAX_NUMBER_SLOTS)) {
+        /* [静的領域調査/試験] 要素が za_slot_t(16byte)になったので、
+           lisp_val_t* のままでの引き算では添字にならない。byte差を要素サイズで割る */
+        UINT64 idx = (UINT64)(((UINT8 *)addr - (UINT8 *)g_za_number_slots) / sizeof(za_slot_t));
         g_za_number_slot_free[g_za_number_slot_free_count++] = idx;
         return;
     }
-    if (addr >= g_za_lambda_slots && addr < g_za_lambda_slots + ZA_MAX_LAMBDA_SLOTS) {
-        UINT64 idx = (UINT64)(addr - g_za_lambda_slots);
+    if ((UINT8 *)addr >= (UINT8 *)g_za_lambda_slots &&
+        (UINT8 *)addr < (UINT8 *)(g_za_lambda_slots + ZA_MAX_LAMBDA_SLOTS)) {
+        /* [静的領域調査/試験] 要素が za_slot_t(16byte)になったので、
+           lisp_val_t* のままでの引き算では添字にならない。byte差を要素サイズで割る */
+        UINT64 idx = (UINT64)(((UINT8 *)addr - (UINT8 *)g_za_lambda_slots) / sizeof(za_slot_t));
         g_za_lambda_slot_free[g_za_lambda_slot_free_count++] = idx;
         return;
     }
-    if (addr >= g_za_fn_cell_cache_slots && addr < g_za_fn_cell_cache_slots + ZA_MAX_FN_CELL_CACHE_SLOTS) {
+    if ((UINT8 *)addr >= (UINT8 *)g_za_fn_cell_cache_slots &&
+        (UINT8 *)addr < (UINT8 *)(g_za_fn_cell_cache_slots + ZA_MAX_FN_CELL_CACHE_SLOTS)) {
         // os_gc_unregister_root(上でこの関数冒頭に呼び済み)は、このプールの
         // アドレスに対しては元々登録していないため何もしない(該当なしとして
         // 静かに無視される、os_gc_unregister_root参照)。
-        UINT64 idx = (UINT64)(addr - g_za_fn_cell_cache_slots);
+        UINT64 idx = (UINT64)(((UINT8 *)addr - (UINT8 *)g_za_fn_cell_cache_slots) / sizeof(za_slot_t));
         g_za_fn_cell_cache_slot_free[g_za_fn_cell_cache_slot_free_count++] = idx;
         return;
     }
@@ -1467,7 +1493,7 @@ static void za_emit_operand(const za_operand_t *op) {
         // そこから都度dereferenceして現在値を読む(za_compile_lambdaのクロージャ
         // params/bodyスロット読み出しと同じ手口。スロットの値そのものではなく
         // アドレスを埋め込むので、GCでスロットの中身が指す先が移動しても安全)。
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_quote_slots[op->param_index]);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_quote_slots[op->param_index].v);
         jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R11, 0);
         return;
     }
@@ -1475,7 +1501,7 @@ static void za_emit_operand(const za_operand_t *op) {
         // 拡張13: 裸のfloat/bignumリテラル。is_literal==5と全く同じ手口
         // (g_za_number_slots[param_index]のアドレスをmovabsで埋め込み、都度
         // dereferenceして現在値を読む)。
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_number_slots[op->param_index]);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_number_slots[op->param_index].v);
         jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R11, 0);
         return;
     }
@@ -2823,9 +2849,9 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     } else {
         return 0;
     }
-    g_za_lambda_slots[slot_idx] = os_make_cons(lambda_params, lambda_body);
-    os_gc_register_root(&g_za_lambda_slots[slot_idx]);
-    lisp_val_t *slot_addr = &g_za_lambda_slots[slot_idx];
+    g_za_lambda_slots[slot_idx].v = os_make_cons(lambda_params, lambda_body);
+    os_gc_register_root(&g_za_lambda_slots[slot_idx].v);
+    lisp_val_t *slot_addr = &g_za_lambda_slots[slot_idx].v;
     za_track_literal_slot_alloc(slot_addr);
 
     za_emit_build_capture_env(params, fixed_count, locals, ZA_OFF_LAMBDA_SAVED_HEAD, ZA_OFF_LAMBDA_ENV_VAL,
@@ -3625,7 +3651,7 @@ static void za_emit_call_build_acc_and_unlink(UINT64 call_depth, UINT64 argc) {
 static void za_emit_fn_resolve_cached(lisp_val_t fn_sym) {
     UINT64 fn_cache_slot_idx;
     if (za_alloc_fn_cell_cache_slot(&fn_cache_slot_idx)) {
-        lisp_val_t *fn_cache_slot_addr = &g_za_fn_cell_cache_slots[fn_cache_slot_idx];
+        lisp_val_t *fn_cache_slot_addr = &g_za_fn_cell_cache_slots[fn_cache_slot_idx].v;
         jit_movabs_reg(ZA_REG_R14, (UINT64)(void *)fn_cache_slot_addr);
         jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R14, 0);
         jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RAX);
@@ -5379,7 +5405,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
             { ZA_BAIL_LINE(); return 0; }
         }
         new_scope.bindings[i].orig_name = name_syms[i];
-        new_scope.bindings[i].gensym_slot_addr = &g_za_quote_slots[slot_idx];
+        new_scope.bindings[i].gensym_slot_addr = &g_za_quote_slots[slot_idx].v;
     }
     for (UINT64 i = 0; i < binding_count; i++) {
         za_gc_protect_batch_push(&flet_gc_nodes[ZA_MAX_FLET_BINDINGS * 3 + i],
@@ -5435,9 +5461,9 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
         } else {
             { ZA_BAIL_LINE(); return 0; }
         }
-        g_za_lambda_slots[lambda_slot_idx] = os_make_cons(binding_params[i], binding_bodies[i]);
-        os_gc_register_root(&g_za_lambda_slots[lambda_slot_idx]);
-        lisp_val_t *lambda_slot_addr = &g_za_lambda_slots[lambda_slot_idx];
+        g_za_lambda_slots[lambda_slot_idx].v = os_make_cons(binding_params[i], binding_bodies[i]);
+        os_gc_register_root(&g_za_lambda_slots[lambda_slot_idx].v);
+        lisp_val_t *lambda_slot_addr = &g_za_lambda_slots[lambda_slot_idx].v;
         za_track_literal_slot_alloc(lambda_slot_addr);
         lisp_val_t *gensym_slot_addr = new_scope.bindings[i].gensym_slot_addr;
 
@@ -5555,7 +5581,7 @@ static int za_emit_symbol_to_reg(lisp_val_t sym, UINT8 reg) {
         if (!za_alloc_quote_slot(sym, &slot_idx)) {
             return 0;
         }
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_quote_slots[slot_idx]);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_quote_slots[slot_idx].v);
         jit_mov_reg_from_mem_disp8(reg, ZA_REG_R11, 0);
         return 1;
     }

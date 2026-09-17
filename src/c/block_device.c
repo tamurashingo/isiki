@@ -76,12 +76,16 @@ static void ide_probe_one(UINT16 io_base, UINT16 ctrl_base, UINT8 drive, const c
         return;
     }
 
-    ide_bd_slot_t *slot = (ide_bd_slot_t *)os_boot_alloc(sizeof(ide_bd_slot_t), 8);
+    /* [静的領域調査/試験] documents/static-align16-survey.md Step 3 実験C。
+       bdのアドレスは %%IDE-DEVICE-AT が TAG_RAW_POINTER 付きの Lisp値として返す。
+       align=8 かつ sizeof が 68/104 だと、どのデバイスでも必ず 8 mod 16 に落ちる
+       (実測100%)。slot側も揃えないとbdの位置がずれるので両方16にする */
+    ide_bd_slot_t *slot = (ide_bd_slot_t *)os_boot_alloc(sizeof(ide_bd_slot_t), 16);
     slot->io_base = io_base;
     slot->ctrl_base = ctrl_base;
     slot->drive = drive;
 
-    block_device_t *bd = (block_device_t *)os_boot_alloc(sizeof(block_device_t), 8);
+    block_device_t *bd = (block_device_t *)os_boot_alloc(sizeof(block_device_t), 16);
     bd->name = name;
     bd->sector_size = IDE_SECTOR_BUFFER_SIZE;
     bd->total_sectors = 0;
