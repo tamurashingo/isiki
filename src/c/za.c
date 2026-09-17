@@ -397,6 +397,15 @@ static void jit_and_reg_imm8(UINT8 reg, UINT8 imm8) {
     jit_emit8(imm8);
 }
 
+
+/** test eax, eax (2byte、REXなし)。"os_is_control_transferの戻り値が0か"のような
+ *  int(32bit)の真偽判定専用。`mov r11d, 0` + `cmp rax, r11`(2命令9byte)の置き換えで、
+ *  MS x64 ABIではintの戻り値はeaxにあり上位32bitは未定義なので32bitで見るのが正しい。 */
+static void jit_test_eax_eax(void) {
+    jit_emit8(0x85);
+    jit_emit8(0xC0);
+}
+
 /** [実験] プロローグで r12 へ nil を載せる(ISIKIOS_PINNED_NIL のときだけ)。
  * mov r12d, imm32 を直接出す(jit_load_imm_reg を通すと nil→r12 の置換で
  * mov r12,r12 になってしまうため)。
@@ -535,6 +544,38 @@ static UINT64 jit_emit_jne_rel32_placeholder(void) {
     return offset;
 }
 
+/**
+ * jne rel8(1byte変位)のプレースホルダ。**着地点までの距離が構造的に127byte以内だと
+ * 言い切れる短い前方ジャンプにだけ使うこと。** 距離が可変な(=式のコンパイル結果を
+ * 跨ぐ)ジャンプには使ってはならない。
+ * 使い方はjit_emit_jne_rel32_placeholderと同じで、jit_patch_rel8でpatchする。
+ */
+static UINT64 jit_emit_jne_rel8_placeholder(void) {
+    jit_emit8(0x75);
+    UINT64 offset = g_jit_used;
+    jit_emit8(0);
+    return offset;
+}
+
+/**
+ * patch_offsetにある1バイトのrel8フィールドへ現在位置までの相対距離を書き込む。
+ * **届かない場合はg_jit_overflowを立てる。** そうするとza_try_compile_defunが
+ * この関数のコンパイルを丸ごとロールバックしてインタプリタへフォールバックする
+ * (既存のグレースフル・フォールバックに乗せる)。黙って壊れたjmpを残さないための保険で、
+ * 呼び出し元が距離を固定している限り実際には発火しない。
+ */
+static void jit_patch_rel8(UINT64 patch_offset) {
+    if (g_jit_overflow || patch_offset + 1 > JIT_CODE_SIZE) {
+        return;
+    }
+    INT64 rel = (INT64)g_jit_used - (INT64)(patch_offset + 1);
+    if (rel < -128 || rel > 127) {
+        g_jit_overflow = 1;
+        return;
+    }
+    g_jit_code[patch_offset] = (UINT8)((UINT64)rel & 0xFF);
+}
+
 /** js rel32(サインフラグ=1)のプレースホルダ。jit_emit_je_rel32_placeholderと同様 */
 static UINT64 jit_emit_js_rel32_placeholder(void) {
     jit_emit8(0x0F);
@@ -609,28 +650,57 @@ static void jit_serialize_icache(void) {
 
 /**
  * 制御転送チェック&早期脱出パターン(拡張5: block/return-from/catch/throw/tagbody)。
- * raxに評価済みの値がある状態で呼ぶ: os_is_control_transfer(rax)(eval.h:82、
+ * raxに評価済みの値がある状態で呼ぶ: os_is_control_transfer(rax)(eval.h、
  * TAG_INSTANCE+MAGIC_BLOCK_EXIT/MAGIC_CATCH_EXIT/MAGIC_GO_EXITのいずれかを判定する
- * ヒープ確保無しの単純な比較)を呼び出し、
- *  - 制御転送でなければraxを元の値に復元してフォールスルーする。
- *  - 制御転送であればraxを元の値に復元した上でプレースホルダjmpを発行し、そのオフセット
+ * ヒープ確保無しの単純な比較)と**同一の判定**を行い、
+ *  - 制御転送でなければraxを元の値のままフォールスルーする。
+ *  - 制御転送であればraxを元の値に復元した上でプレースホルダjneを発行し、そのオフセット
  *    を返す(呼び出し元がjit_patch_rel32/jit_patch_rel32_targetで伝播先へpatchする)。
- * os_is_control_transferはヒープ確保を一切しないため、呼び出し前後でr13へ元の値を
- * 退避するだけで安全(GCによる再配置を心配しなくてよい)。
+ *
+ * [改善B-α] **タグ判定を生成コードへインライン展開し、大多数の値でcallを回避する。**
+ * 制御転送値は3種(BLOCK_EXIT/CATCH_EXIT/GO_EXIT)ともTAG_INSTANCEのヒープオブジェクト
+ * なので、**タグがTAG_INSTANCEでなければその時点で「制御転送でない」が確定する**。
+ * fixnum/cons/symbol/string等はここで4命令で抜けられる。
+ *
+ *   旧: 常にcall。通常経路で16命令(JIT側10 + 呼び先6)/ 49byte
+ *   新: 通常経路は4命令 / 47byte。TAG_INSTANCEのときだけ従来どおりcallする
+ *
+ * 3つのmagic比較まではインライン展開しない。os_is_control_transferの実体は
+ * lea/cmp/setbe/sete/orで分岐無しに書かれており、同じ形をJITで出すのは手間の割に
+ * 効果が薄い(TAG_INSTANCE自体が稀なため)。
+ *
+ * [レジスタ] タグ判定にrdxを使う。**この関数は従来から無条件にcallを発行しており、
+ * MS x64 ABIでrdxはvolatile(呼び出しで破壊される)なので、呼び出し元がこの
+ * ヘルパーを跨いでrdxを生かしているケースは元から存在しない。** 破壊するレジスタの
+ * 集合は従来と同じか、早期脱出経路ではむしろ小さくなる(rcx/r8/r9/r10/r11を壊さない)。
+ *
+ * [GC安全性] 早期脱出経路はcallを一切発行しないので退避も不要(raxはそのまま)。
+ * call経路は従来どおりr13へ退避する。os_is_control_transferはヒープ確保を一切
+ * しないため、これでGC安全(GCによる再配置を心配しなくてよい)。
+ *
+ * [フラグ] `test eax, eax`の後にraxを復元してからjneする。movはフラグを変えないので
+ * 順序を入れ替えても判定は変わらず、`mov rax, r13`とjmpを1組ずつ減らせる。
  */
 static UINT64 za_emit_ct_check_and_jmp_if_transfer(void) {
+    /* 早期脱出: タグがTAG_INSTANCEでなければ制御転送ではありえない */
+    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RAX);
+    jit_and_reg_imm8(ZA_REG_RDX, (UINT8)TAG_MASK);
+    jit_cmp_reg_imm8(ZA_REG_RDX, (UINT8)TAG_INSTANCE);
+    /* 着地点はこの関数の末尾で固定(下の命令列の合計byte数ぶんだけ先)なので、
+       距離は常にrel8に収まる。万一収まらなければjit_patch_rel8がg_jit_overflowを
+       立ててコンパイル全体をロールバックする */
+    UINT64 jne_not_instance = jit_emit_jne_rel8_placeholder();
+
     jit_mov_rcx_rax();
     jit_mov_r13_rax();
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_is_control_transfer);
     jit_call_r11();
-    jit_movabs_r11(0);
-    jit_cmp_rax_r11();
-    UINT64 je_not_transfer = jit_emit_je_rel32_placeholder();
-    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
-    UINT64 jmp_transfer = jit_emit_jmp_rel32_placeholder();
-    jit_patch_rel32(je_not_transfer);
-    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
-    return jmp_transfer;
+    jit_test_eax_eax();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);   /* movはフラグを変えない */
+    UINT64 jne_transfer = jit_emit_jne_rel32_placeholder();
+
+    jit_patch_rel8(jne_not_instance);
+    return jne_transfer;
 }
 
 /** src_reg(TAG_INSTANCEでタグ付けされた値)のタグを外した実アドレスをdst_regへ計算する
@@ -1405,7 +1475,8 @@ static UINT64 g_za_block_level_mask = 0;
  * 引数スロットは内側呼び出しの実行中も生き続ける必要があり、単一スロットでは
  * 内側が同じ番地を上書きしてしまう(ZA_OFF_FN_VAL/ZA_OFF_ACC_VALは呼び出し引数loopが
  * 完全に終わった後にしか書き込まれないため、こちらは単一スロットのままで安全)。 */
-#define ZA_MAX_CALL_DEPTH 4  /* ZA_MAX_NLX_DEPTHと同じ値。392mod16=8のため偶数を保つ */
+#define ZA_MAX_CALL_DEPTH 4  /* ZA_MAX_ARITH_DEPTHと同じ値(ZA_MAX_NLX_DEPTHは8で別物)。
+                               392mod16=8のため偶数を保つ */
 #define ZA_OFF_CALL_BASE (ZA_OFF_LET_SAVED_HEAD_BASE + ZA_MAX_LET_DEPTH * 8)
 #define ZA_CALL_SLOT_SIZE (8 + ZA_MAX_OPERANDS * ZA_ARG_SLOT_SIZE)  /* SAVED_HEAD(8)+引数16本(24*16=384)=392 */
 /* 拡張16(算術/比較/car/cdr/null/atom/eq/consのオペランド位置への複合式ネスト対応):
