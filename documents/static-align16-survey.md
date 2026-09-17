@@ -1,12 +1,19 @@
 # 静的領域（BSS / DATA / RODATA 等）のオブジェクトを16byte境界に置けるか
 
-調査日: 2026-09-17 / ブランチ: `feature/static-align-survey`
-派生元: **`feature/heap-align16`（PR #73、2026-09-17時点で未マージ）**。
-PR #73 で Lispヒープ側が16byte境界になった状態を前提にするため、main ではなく
-そちらから派生している。PR #73 → PR #72 の順に先行マージが要る。
+調査日: 2026-09-17 / ブランチ: `feature/static-align-survey` / base: **`main`**
+PR #72・#73 が main へ取り込まれたのち、main へ rebase 済み（第8.1節）。
+PR #73 で Lispヒープ側が16byte境界になった状態が前提。
 
-本書は判定材料をそろえる調査であり、**本採用の実装は行っていない**。
-Step 3 の試験的な変更はこのブランチ上にのみ存在する（第4章に明記）。
+本書は2部構成である。
+
+- **第1〜7章: 調査**（2026-09-17 前半）。ヒープ外オブジェクトを16byte境界に
+  置けるかの判定材料。第4章の実験A・B・Cは、この時点では**試験的な変更**だった。
+- **第8章: 本採用**（同日後半）。実験A・B・Cを本採用し、境界が崩れたときに
+  必ず検出される状態にした。**以降「Lispの値として現れるポインタは例外なく
+  16byte境界」がコンパイル時・ブート時・監査の3段階で検査される。**
+
+第1〜7章は調査時点の記述をそのまま残してある（「本採用の判断はしていない」等の
+記述はその時点のもの）。最終的な結論は第8章を見ること。
 
 ---
 
@@ -462,46 +469,50 @@ static za_slot_t g_za_quote_slots[ZA_MAX_QUOTE_SLOTS] __attribute__((aligned(16)
 
 ### 8.1 rebase / base の確認
 
-**PR #73 の内容は main に入っていなかった。** 指示書は「PR #72・#73 はマージ済み」を
-前提にしていたが、実際には:
+PR #72・#73 が main へ取り込まれたのち、本ブランチを **main へ rebase した**。
+
+```
+$ git log --oneline origin/main -3
+250ff5b Merge branch 'main' of github.com:tamurashingo/isiki
+1911cd6 Merge pull request #73 from tamurashingo/feature/heap-align16
+f70724d Merge pull request #72 from tamurashingo/feature/alignment-audit
+
+$ git merge-base --is-ancestor 9e6822b origin/main; echo $?
+0                      # #73 のコミットが main に入っている
+$ git show origin/main:src/c/runtime.h | grep -c OS_HEAP_ALIGN
+12                     # main に OS_HEAP_ALIGN がある
+```
+
+rebase 後の `origin/main..HEAD` の差分は、本 PR 自身の7ファイルだけである:
+
+```
+ documents/static-align16-survey.md | 679 +++++++++++++++++
+ src/c/block_device.c               |  12 +-
+ src/c/kernel.c                     |   5 +
+ src/c/runtime.c                    | 263 ++++++++--
+ src/c/runtime.h                    |  20 +-
+ src/c/za.c                         | 117 +++--
+ src/c/za.h                         |   9 +
+```
+
+PR #73 由来のファイル（`Makefile` / `documents/heap-align16-report.md` /
+`test/c/runtime_test.c`）は**差分に含まれていない**ことを個別に確認した。
+
+#### 経緯（記録）
+
+当初この確認を行った時点では、**PR #73 の内容が main に入っていなかった**。
+`feature/alignment-audit` が PR #72 で main へマージされた**12秒後**に PR #73 を
+受け取ったため、#73 のコミット `9e6822b` が main へ到達していなかった。
 
 | PR | マージ先 | 時刻 |
 |---|---|---|
 | #72 | `main` | 15:38:36 |
-| #73 | **`feature/alignment-audit`** | 15:38:48 |
+| #73 | `feature/alignment-audit` | 15:38:48 |
 
-`feature/alignment-audit` は #72 で main へマージされた**後**に #73 を受け取ったため、
-#73 のコミット `9e6822b`（ヒープの16byte境界化）は main に到達していない。
-
-```
-$ git merge-base --is-ancestor 9e6822b origin/main; echo $?
-1                      # = 入っていない
-$ git show origin/main:src/c/runtime.h | grep -c OS_HEAP_ALIGN
-0                      # main には OS_HEAP_ALIGN が無い
-$ git log --oneline origin/main..origin/feature/alignment-audit
-1911cd6 Merge pull request #73 from tamurashingo/feature/heap-align16
-9e6822b feat(gc): Lispヒープのバンプアロケータを16byte境界にする
-```
-
-このため **main へ rebase していない**。rebase すると PR #74 の差分に #73 の内容
-（`Makefile` / `runtime.h` / `runtime_test.c` / `heap-align16-report.md`）が混ざり、
-指示書が求める「PR #74 の変更だけになっていること」という確認自体が成立しないうえ、
-#73 の作業が #74 経由で再配達される形になる。
-
-現在の base（`feature/heap-align16`）に対する差分は、本採用分を含めても
-**PR #74 自身の変更だけ**である:
-
-```
-$ git diff --stat origin/feature/alignment-audit..HEAD
- documents/static-align16-survey.md | ...
- src/c/block_device.c               | ...
- src/c/runtime.c                    | ...
- src/c/za.c                         | ...
-```
-
-**必要な対処**: `feature/alignment-audit` を main へマージし直すと #73 が main に入る
-（`main` は `feature/alignment-audit` の祖先ではないので fast-forward ではなく
-通常のマージになる）。それが済んだ時点で、PR #74 の base を main へ切り替えられる。
+この状態で main へ rebase すると、本 PR の差分に #73 の内容が混ざり、
+「PR #74 の変更だけになっていること」という確認自体が成立しなくなる。
+そのため一度 rebase を保留して報告し、`feature/alignment-audit` を main へ
+マージし直してもらってから rebase した。上の差分確認はその後の結果である。
 
 ### 8.2 Step 1: 本採用した変更
 
