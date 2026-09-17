@@ -6251,10 +6251,28 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         { ZA_BAIL_LINE(); return nil; }
     }
 
-    if (body == nil || (body & TAG_MASK) != TAG_CONS || cc_cdr(body) != nil) {
+    if (body == nil || (body & TAG_MASK) != TAG_CONS) {
         { ZA_BAIL_LINE(); return nil; }
     }
-    lisp_val_t form = cc_car(body);
+
+    /* [Phase 4a-1] bodyが2式以上なら `(progn . body)` で包んでからコンパイルする。
+       以前はここで `cc_cdr(body) != nil` を見て断念していたため、
+       `(defun f (x) a b)` はJIT化されず、`(defun f (x) (progn a b))` だけが通っていた
+       (documents/type-system-survey.md §6-3の実測)。包んでいなかっただけで、
+       za_compile_prognは既にbodyの複数式を正しく扱える。
+
+       [なぜprognで足りるか] za_compile_prognは非最終フォームごとに
+       za_emit_ct_check_and_jmp_if_transferを出すので、bodyの途中でreturn-from/throw/go
+       が起きたら残りのフォームを評価せずに伝播する(インタプリタのeval_prognと同じ規約)。
+       またcall_depth/arith_depth/nlx_depth/let深さのいずれも増やさずに素通しするため、
+       **包むことで既存のネスト上限が実質的に厳しくなることはない**。
+       唯一増える制約は非最終フォーム数の上限(ZA_MAX_OPERANDS=16、つまりbody 17式まで)。
+
+       [GC安全性] bodyはここまで保護していない(関数冒頭のコメント参照)。
+       os_make_consは確保を伴うので、その前に繋ぐ。os_make_cons自身も引数を
+       GC_PROTECTするため、確保中にGCが走っても正しいbodyがcdrに入る。 */
+    GC_PROTECT(body);
+    lisp_val_t form = (cc_cdr(body) == nil) ? cc_car(body) : os_make_cons(g_sym_progn, body);
     GC_PROTECT(form);
     za_syms_t syms;
     /* [原則8] 埋める**前に**全フィールドをnilにしてshadow stackへ繋ぐ。

@@ -517,6 +517,13 @@ PR #66 のベンチで `tagbody`/`go` が JIT に乗らなかったのも
 **したがって既存コードへの影響は小さい**が、
 Phase 4 で `(declare ...)` を導入すると **全部の宣言付き defun がここに当たる**。
 
+> **【2026-09-17 追記】Phase 4a-1 で解消済み。** `za_try_compile_defun` が body 2 式以上を
+> `(progn . body)` で包むようになり、`(defun f (x) a b)` も JIT 化される。
+> `progn` は call/arith/nlx/let のどの深さも消費しないので既存のネスト上限は変わらず、
+> 新たに増える制約は非最終フォーム数の上限(`ZA_MAX_OPERANDS` = 16、body 17 式まで)だけ。
+> init.lisp の `property` / `set-property` / `remove-property` が新たに JIT 化された。
+> なお **body 0 式(`(defun f (x))`)は従来どおり断念する**(挙動を変えていない)。
+
 ### 6-4 常に除外される特殊形式
 
 `za_is_excluded_special_form`(`za.c:1854`):
@@ -675,7 +682,7 @@ TCG のブロック分割か分岐方向の違いが効いている可能性が�
 | `(+ a b)` の経路 | JIT が `test`(型ガード)→ `add` → `js`(桁溢れガード)の **2 段のガード**でインライン処理。外れたら `primitive_add2` → `primitive_add` → 符号マグニチュード一般パス |
 | クラスオブジェクトの場所 | **GC ヒープ上**(`os_make_instance` → `os_alloc_bytes`)。移動する。JIT から即値で焼いてはならない |
 | 型判定のコスト | `fixnump` = 0.33 µs(本体 4 命令 + 呼び出し規約 + 制御転送チェック)、`typep` = 63.9 µs(**191 倍**) |
-| JIT が断念する条件 | §6。**最大は「defun の body が 1 式でないこと」**。あとは容量上限(引数 16・let 束縛 4・flet 束縛 4・算術/呼び出しネスト 4)と、`quote`/`defun`/`lambda`/`declaim` 等の除外 |
+| JIT が断念する条件 | §6。**最大は「defun の body が 1 式でないこと」**(→ 2026-09-17 に Phase 4a-1 で解消、§6-3 の追記参照)。あとは容量上限(引数 16・let 束縛 4・flet 束縛 4・算術/呼び出しネスト 4)と、`quote`/`defun`/`lambda`/`declaim` 等の除外 |
 | 算術の現状測定 | §7。`(+ a b)` = 739 byte / 即値 20 / 加算の高速 path 40 byte / 1 回 0.63 µs |
 
 ---
@@ -732,8 +739,10 @@ Phase 4 は原則8 のリスクをまったく負わない。**
 - 実際、`optimize` は既に `za_try_compile_defun(params, body, env, owner, optimize)` の
   形で**引数として渡している**(`eval_defun`)。**同じ経路に型情報を足すのが自然**
 
-`declare` を導入する場合は §6-3 の「body は 1 式」制約に必ず当たる。
-`eval_defun` 側で `declare` を body から取り除いてから `za_try_compile_defun` へ渡す前処理が要る。
+`declare` を導入する場合は §6-3 の「body は 1 式」制約に必ず当たる
+(この制約自体は Phase 4a-1 で解消済み)。**ただし `declare` は `za_is_excluded_special_form`
+の対象になるため、`eval_defun` 側で body から取り除いてから `za_try_compile_defun` へ渡す
+前処理は依然として要る。**
 
 ### 9-4 オーバーフロー検査を入れる余地 → **すでにある。ただし表現に依存している**
 
