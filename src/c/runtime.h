@@ -170,38 +170,52 @@ void os_assert_lisp_aligned(const char *name, lisp_addr_t addr);
 
 
 /** TAG_INSTANCEのword0に入る、ネイティブ(C)関数であることを示すMAGIC NUMBER */
-#define MAGIC_FUNCTION_NATIVE      0x1ULL
+#define MAGIC_FUNCTION_NATIVE      0x0EULL
 /** TAG_INSTANCEのword0に入る、Lisp(defun)で定義された関数であることを示すMAGIC NUMBER */
-#define MAGIC_FUNCTION_INTERPRETED 0x2ULL
+#define MAGIC_FUNCTION_INTERPRETED 0x1EULL
 /** TAG_INSTANCEのword0に入る、プロセスのPCBであることを示すMAGIC NUMBER */
-#define MAGIC_PROCESS              0x3ULL
+#define MAGIC_PROCESS              0x2EULL
 /** TAG_INSTANCEのword0に入る、Lisp(defmacro)で定義されたマクロであることを示すMAGIC NUMBER */
-#define MAGIC_MACRO                0x4ULL
+#define MAGIC_MACRO                0x3EULL
 /** TAG_INSTANCEのword0に入る、block/return-from/unwind-protectの非局所脱出シグナルであることを示すMAGIC NUMBER */
-#define MAGIC_BLOCK_EXIT           0x5ULL
+#define MAGIC_BLOCK_EXIT           0x4EULL
 /** TAG_INSTANCEのword0に入る、streamオブジェクトであることを示すMAGIC NUMBER */
-#define MAGIC_STREAM               0x6ULL
+#define MAGIC_STREAM               0x5EULL
 /** TAG_INSTANCEのword0に入る、ILOSのクラスインスタンスであることを示すMAGIC NUMBER。word1=class、word2=slots-vector(MAGIC_VECTOR)、word3=未使用 */
-#define MAGIC_CLASS_INSTANCE       0x8ULL
+#define MAGIC_CLASS_INSTANCE       0x6EULL
 /** TAG_INSTANCEのword0に入る、catch/throwの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(evalされた値)、word2=throwされた値 */
-#define MAGIC_CATCH_EXIT           0x9ULL
+#define MAGIC_CATCH_EXIT           0x7EULL
 /** TAG_INSTANCEのword0に入る、tagbody/goの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(未評価のsymbol) */
-#define MAGIC_GO_EXIT              0xAULL
+#define MAGIC_GO_EXIT              0x8EULL
 /** TAG_INSTANCEのword0に入る、60bitを超える整数(bignum)であることを示すMAGIC NUMBER。word1=sign(0:非負/1:負)、word2=limb数、word3=limb配列(基数2^32、下位32bitのみ使用、limbs[0]が最下位)への生ポインタ */
-#define MAGIC_BIGNUM               0xBULL
+#define MAGIC_BIGNUM               0x9EULL
 /** TAG_INSTANCEのword0に入る、多次元配列(vector/general array)であることを示すMAGIC NUMBER。word1=配列本体(rank+各次元サイズ+要素データを格納した可変長ブロック)への生ポインタ、word2/word3=未使用 */
-#define MAGIC_VECTOR               0xCULL
+#define MAGIC_VECTOR               0xAEULL
 /** TAG_INSTANCEのword0に入る、ISLispのfloat(IEEE754 binary64)であることを示すMAGIC NUMBER。word1=doubleのビットパターン、word2/word3=未使用 */
-#define MAGIC_FLOAT                0xDULL
+#define MAGIC_FLOAT                0xBEULL
 /** TAG_INSTANCEのword0に入る、ILOSの組み込み(built-in)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<built-in-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
-#define MAGIC_BUILTIN_CLASS        0xEULL
+#define MAGIC_BUILTIN_CLASS        0xCEULL
 /** TAG_INSTANCEのword0に入る、ILOSの標準(standard)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<standard-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
-#define MAGIC_STANDARD_CLASS       0xFULL
+#define MAGIC_STANDARD_CLASS       0xDEULL
+
+/* [MAGIC値の下位4bit] 全MAGICの下位4bitを 0xE でそろえてある。
+
+   4bitタグ体系(documents/tag4-design.md)では TAG_FORWARD が 0xF になる。
+   下位4bitを 0xE に固定しておけば、そのときMAGICがタグとして
+   TAG_FORWARD に一致することが**構造的に**なくなる。値そのものはどこにも
+   外から見えない(word0の内部識別子)ので、振り直しは挙動を変えない。
+
+   **移行中(タグ3bitのあいだ)の注意**: 0xE の下位3bitは 0x6 = TAG_FORWARD
+   なので、この期間は全14個のMAGICが下位3bitで TAG_FORWARD と衝突する
+   (振り直し前は MAGIC_STREAM と MAGIC_BUILTIN_CLASS の2個だけだった)。
+   衝突を実際に弾いているのは下の範囲検査であり、そちらの余裕は
+   MAGIC最大 0xDE(222) 対 ヒープ先頭 > 0x1000 と5桁近くある。
+   os_heap_init はヒープ先頭が 0x1000 以下ならpanicする。 */
 
 /* [転送済み判定の不変条件] gc_copy_valueは word0 の下位3bitが TAG_FORWARD(0x6)か
    どうかで「転送済みかもしれない」と疑い、指す先がTo空間の範囲にあるかどうかで
-   確定させる。MAGIC_STREAM(0x6)とMAGIC_BUILTIN_CLASS(0xE)は下位3bitが
-   **実際に衝突している**ので、これらを弾いているのは範囲検査の下限だけである。
+   確定させる。上記のとおり下位bitでの衝突は防げないので、これらを弾いているのは
+   範囲検査の下限だけである。
    (STRINGのword0=生の長さも同じ理由で下限に守られている)
 
    したがって「MAGIC値はヒープの先頭アドレスより遥かに小さい」ことが不変条件になる。
@@ -226,6 +240,40 @@ _Static_assert(MAGIC_VECTOR               < MAGIC_MUST_BE_BELOW, "MAGICが大き
 _Static_assert(MAGIC_FLOAT                < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
 _Static_assert(MAGIC_BUILTIN_CLASS        < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
 _Static_assert(MAGIC_STANDARD_CLASS       < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+/* 全MAGICの下位4bitが 0xE であること。4bitタグ化で TAG_FORWARD(0xF) と
+   構造的に衝突しないことの土台になる。メッセージはASCIIで書く */
+#define MAGIC_LOW_NIBBLE 0xEULL
+_Static_assert((MAGIC_FUNCTION_NATIVE & 0xFULL) == MAGIC_LOW_NIBBLE,      "MAGIC_FUNCTION_NATIVE low nibble is not 0xE");
+_Static_assert((MAGIC_FUNCTION_INTERPRETED & 0xFULL) == MAGIC_LOW_NIBBLE, "MAGIC_FUNCTION_INTERPRETED low nibble is not 0xE");
+_Static_assert((MAGIC_PROCESS & 0xFULL) == MAGIC_LOW_NIBBLE,              "MAGIC_PROCESS low nibble is not 0xE");
+_Static_assert((MAGIC_MACRO & 0xFULL) == MAGIC_LOW_NIBBLE,                "MAGIC_MACRO low nibble is not 0xE");
+_Static_assert((MAGIC_BLOCK_EXIT & 0xFULL) == MAGIC_LOW_NIBBLE,           "MAGIC_BLOCK_EXIT low nibble is not 0xE");
+_Static_assert((MAGIC_STREAM & 0xFULL) == MAGIC_LOW_NIBBLE,               "MAGIC_STREAM low nibble is not 0xE");
+_Static_assert((MAGIC_CLASS_INSTANCE & 0xFULL) == MAGIC_LOW_NIBBLE,       "MAGIC_CLASS_INSTANCE low nibble is not 0xE");
+_Static_assert((MAGIC_CATCH_EXIT & 0xFULL) == MAGIC_LOW_NIBBLE,           "MAGIC_CATCH_EXIT low nibble is not 0xE");
+_Static_assert((MAGIC_GO_EXIT & 0xFULL) == MAGIC_LOW_NIBBLE,              "MAGIC_GO_EXIT low nibble is not 0xE");
+_Static_assert((MAGIC_BIGNUM & 0xFULL) == MAGIC_LOW_NIBBLE,               "MAGIC_BIGNUM low nibble is not 0xE");
+_Static_assert((MAGIC_VECTOR & 0xFULL) == MAGIC_LOW_NIBBLE,               "MAGIC_VECTOR low nibble is not 0xE");
+_Static_assert((MAGIC_FLOAT & 0xFULL) == MAGIC_LOW_NIBBLE,                "MAGIC_FLOAT low nibble is not 0xE");
+_Static_assert((MAGIC_BUILTIN_CLASS & 0xFULL) == MAGIC_LOW_NIBBLE,        "MAGIC_BUILTIN_CLASS low nibble is not 0xE");
+_Static_assert((MAGIC_STANDARD_CLASS & 0xFULL) == MAGIC_LOW_NIBBLE,       "MAGIC_STANDARD_CLASS low nibble is not 0xE");
+/* MAGICどうしが重複しないこと(下位4bitをそろえた以上、区別は上位側だけが担う) */
+_Static_assert(__builtin_popcountll(
+                   (1ULL << (MAGIC_FUNCTION_NATIVE      >> 4)) |
+                   (1ULL << (MAGIC_FUNCTION_INTERPRETED >> 4)) |
+                   (1ULL << (MAGIC_PROCESS              >> 4)) |
+                   (1ULL << (MAGIC_MACRO                >> 4)) |
+                   (1ULL << (MAGIC_BLOCK_EXIT           >> 4)) |
+                   (1ULL << (MAGIC_STREAM               >> 4)) |
+                   (1ULL << (MAGIC_CLASS_INSTANCE       >> 4)) |
+                   (1ULL << (MAGIC_CATCH_EXIT           >> 4)) |
+                   (1ULL << (MAGIC_GO_EXIT              >> 4)) |
+                   (1ULL << (MAGIC_BIGNUM               >> 4)) |
+                   (1ULL << (MAGIC_VECTOR               >> 4)) |
+                   (1ULL << (MAGIC_FLOAT                >> 4)) |
+                   (1ULL << (MAGIC_BUILTIN_CLASS        >> 4)) |
+                   (1ULL << (MAGIC_STANDARD_CLASS       >> 4))) == 14,
+               "MAGIC_* values are not all distinct");
 
 /** NIL */
 extern lisp_val_t nil;

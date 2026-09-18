@@ -513,9 +513,12 @@ static UINT64 g_align_alloc_stride_break[ALIGN_SITE_COUNT];
 static UINT64 g_align_alloc_bad[ALIGN_SITE_COUNT];
 
 /** タグ別・Lisp値(ポインタを持つタグのみ)の下位4bitのヒストグラム */
-static UINT64 g_align_val_hist[8][16];
+/* タグ値の取りうる数。TAG_MASKから導く(タグ幅を広げたら配列も自動で伸びる。
+   直書きの8のままだと、新しいタグの観測が隣の要素を踏む) */
+#define ALIGN_TAG_COUNT ((int)(TAG_MASK + 1))
+static UINT64 g_align_val_hist[ALIGN_TAG_COUNT][16];
 /** タグ別・下位4bitが0でなかった値のうち最初に観測したもの(診断用) */
-static UINT64 g_align_val_first_bad[8];
+static UINT64 g_align_val_first_bad[ALIGN_TAG_COUNT];
 
 /** [境界] 違反(強制対象なのに境界に乗っていない)を観測した延べ回数 */
 static UINT64 g_align_violations = 0;
@@ -744,7 +747,7 @@ void os_align_audit_report(void) {
         }
     }
 
-    for (UINT64 tag = 0; tag < 8; tag++) {
+    for (UINT64 tag = 0; tag < (UINT64)ALIGN_TAG_COUNT; tag++) {
         if (tag == TAG_FIXNUM || tag == TAG_CHAR) { continue; }
         UINT64 total = 0;
         UINT64 bad = 0;
