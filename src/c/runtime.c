@@ -14,43 +14,23 @@
 #endif
 
 /*
- * ---- タグ付きポインタによるLispオブジェクトの表現 ----
- *
- * タグ位置: 64bit値の下位3bit (LSB側)
- *   obj & TAG_MASK       -> タグを取り出す
- *   obj & ~TAG_MASK      -> 実体アドレス(またはデコード前の値)を取り出す
- *
- * ヒープ確保は常に8byte境界になるため、確保したアドレスの下位3bitは常に0となり、
- * そこにタグを詰め込む。
- *
- * #define TAG_MASK        0x7ULL
- * #define TAG_FIXNUM      0x0ULL // 000 即値
- * #define TAG_CONS        0x1ULL // 001 アドレス
- * #define TAG_SYMBOL      0x2ULL // 010 アドレス
- * #define TAG_CHAR        0x3ULL // 011 即値
- * #define TAG_STRING      0x4ULL // 100 アドレス
- * #define TAG_INSTANCE    0x5ULL // 101 アドレス
- * #define TAG_FORWARD     0x6ULL // 110 アドレス
- * #define TAG_RAW_POINTER 0x7ULL // 111 アドレス
- *
  * ---- タグ別メモリ配置 ----
  *
- * TAG_FIXNUM: 即値、ヒープなし(符号付き、60bitマグニチュード+1bit符号)
- *  [s][ magnitude(60bit) .............................. ][0 0 0]
- *    最上位bit(bit63)が符号(1:負、0は0を含む非負に正規化)、残り60bitがマグニチュード。
- *    表現範囲は-(2^60-1)〜2^60-1。マグニチュードが60bitを超える場合はMAGIC_BIGNUM
- *    (TAG_INSTANCE)に昇格する。
+ * タグの値・幅・即値/アドレスの区別は **runtime.h の「タグ体系」** が唯一の記述である。
+ * ここではタグごとの**ヒープ上のレイアウト**(何byte確保し、各wordに何が入るか)だけを書く。
+ *
+ * TAG_FIXNUM: 即値、ヒープなし(符号+マグニチュード)
+ *    bit63が符号(1:負、0は0を含む非負に正規化)、マグニチュードはFIXNUM_MAGNITUDE_MASK分。
+ *    2の補数ではないので下端は上端の符号反転ちょうどで、-0は存在しない。
+ *    マグニチュードが収まらない場合はMAGIC_BIGNUM(TAG_INSTANCE)に昇格する。
  *
  * TAG_CONS: アドレス、ヒープ16byte
- *  [ car-addr(61bit) ................................. ][0 0 1]
- *    carのアドレスが入っている
  *    consはLispオブジェクト格納用に連続した16byteを確保している
  *    - word0: car
  *    - word1: cdr
  *
  * TAG_SYMBOL: アドレス、ヒープ32Byte
- *  [ sym-addr(61bit) ................................. ][0 1 0]
- *    symbol用に確保した32byteへのアドレスが入っている
+ *    symbol用に確保した32byte
  *    - word0: 名前のstringへのポインタ(STRINGオブジェクト)
  *             symbol の値や関数は環境(environment)から取得する
  *    - word1: gensymフラグ。nilなら通常のinterned symbol(g_symbol_tableに登録済み)、
@@ -59,18 +39,13 @@
  *    - word2, word3: 未使用(予約)
  *
  * TAG_CHAR: 即値、ヒープなし
- *  [ val(61bit) ...................................... ][0 1 1]
- *    61bitの中に値を埋め込む
+ *    Unicodeコードポイントを CHAR_VALUE_SHIFT 分ずらして埋め込む(runtime.h参照)
  *
- * TAG_STRING: アドレス、ヒープ可変長(8 + lenbyte, 8byte境界に整列)
- *  [ string-addr(61bit) .............................. ][1 0 0]
- *    string情報へのアドレスが入っている
+ * TAG_STRING: アドレス、ヒープ可変長(8 + lenbyte, OS_HEAP_ALIGN境界に整列)
  *    - word0:       文字列長さ(タグなしの整数)
  *    - byte[8....]: 文字のデータ本体
  *
  * TAG_INSTANCE: アドレス、ヒープ32byte
- *  [ inst-addr(61bit) ................................ ][1 0 1]
- *    instanceへのアドレス
  *    - word0: このinstanceの種別を表わすMAGIC NUMBER
  *    - word1: MAGIC_FUNCTION_NATIVEの場合: za_fn_meta_t(ABI-M4、Immobilized Space上)
  *             への生ポインタ。meta->cons_entryが従来通りのconsリストABI
@@ -86,22 +61,20 @@
  *             MAGIC_FUNCTION_NATIVEでword2がfixnum 2の場合: 定義時に捕捉した
  *             自由変数を保持する環境のアドレス(それ以外のword2ではNIL固定)
  *             MAGIC_VECTORの場合: word1に多次元配列(general array)本体への生ポインタを
- *             持つ(ヒープ可変長、8*(1+rank+total)byte、8byte境界に整列)。
+ *             持つ(ヒープ可変長、8*(1+rank+total)byte、OS_HEAP_ALIGN境界に整列)。
  *             本体のレイアウトは以下の通り:
  *               - word0:          次元数(rank、タグなしの整数)
  *               - word[1..rank]:  各次元のサイズ(タグなしの整数)
  *               - word[rank+1..]: 要素本体(タグ付きのlisp_val_t、行優先(row-major)順)
  *
  * TAG_FORWARD: アドレス、ヒープ(コピー元のサイズ)
- *  [ forward-addr(61bit) ............................. ][1 1 0]
  *    From空間からTo空間へコピー済みのオブジェクト
  *    移動先アドレス | TAG_FORWARD で上書きする
  *
- * TAG_RAW_POINTER: アドレス、即値
- *  [ raw-addr(61bit) ................................. ][1 1 1]
+ * TAG_RAW_POINTER: アドレス、ヒープ外(GC管理外)
  *    Lispから生の64bitアドレス(c構造体・MMIOレジスタ等)を安全に持てるようにするためのタグ。
  *    中身は「タグを外した生アドレス」そのもので、fixnumのようなシフトエンコードは行わない。
- *    GCはfixnum(0)・char(3)と同様にこのタグを即値として素通しスキャンしない。
+ *    アドレスを持つがGCは追いかけない(os_tag_is_heap_refが偽を返す)。
  *
  *
  */
@@ -1396,10 +1369,12 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
         g_symbol_hash[i] = -1;
     }
 
-    /* [転送済み判定の不変条件] gc_copy_valueは word0 の下位3bitが TAG_FORWARD かで
+    /* [転送済み判定の不変条件] gc_copy_valueは word0 の下位4bitが TAG_FORWARD かで
        転送済みを疑い、指す先が半空間の範囲にあるかで確定させる。
-       MAGIC_STREAM(0x6)とMAGIC_BUILTIN_CLASS(0xE)は下位3bitが実際に衝突しているので、
-       これらを弾いているのは範囲検査の**下限**だけである。
+       MAGIC_*の下位4bitは TAG_MARKER で TAG_FORWARD とは一致しないが、
+       STRINGのword0(生の長さ)は Lisp プログラムが決めるので制御できず、
+       長さが TAG_FORWARD と同じ下位4bitを持つ文字列は必ず存在する。
+       これを弾いているのは範囲検査の**下限**だけである。
 
        runtime.hの_Static_assertが保証しているのは「MAGIC値がMAGIC_MUST_BE_BELOWより
        小さい」というコンパイル時定数どうしの比較にすぎず、**ヒープがその定数より上に
@@ -2029,13 +2004,17 @@ static lisp_val_t gc_copy_value(lisp_val_t obj) {
 
     if ((word0 & TAG_MASK) == TAG_FORWARD) {
         UINT8 *fwd_addr = (UINT8 *)(lisp_addr_t)(word0 & ~TAG_MASK);
-        /* word0のタグだけでは転送済みか判別できない。曖昧になるのは3種類ある:
-             - STRING       word0は生の整数長。長さ6/14/22…が下位3bit=0x6になる
-             - MAGIC_STREAM        0x6 -> &7 == 6
-             - MAGIC_BUILTIN_CLASS 0xE -> &7 == 6
-           これらを転送済みと誤認しないための判別が下の範囲検査である。
-           効いているのは**下限**のほう。長さもMAGIC値も0x10未満で、To空間の
-           先頭アドレスより遥かに小さいので確実に弾ける。
+        /* word0のタグだけでは転送済みか判別できない。曖昧になるのは STRING である:
+             - STRING  word0は生の整数長。長さ15/31/47…が下位4bit=TAG_FORWARD(0xF)になる
+           長さはLispプログラムが決めるので**下位4bitを制御できない**
+           (documents/tag4-design.md 5.4「範囲検査は廃止できない」)。
+           誤認しないための判別が下の範囲検査である。効いているのは**下限**のほうで、
+           長さはTo空間の先頭アドレスより遥かに小さいので確実に弾ける。
+
+           MAGIC_*は下位4bitを TAG_MARKER(0xE) にそろえてあるので(PR #77)、
+           **タグとして TAG_FORWARD(0xF) に一致することは構造的にない**。
+           3bitのころは MAGIC_STREAM と MAGIC_BUILTIN_CLASS が衝突しており、
+           これも範囲検査だけが弾いていた。
 
            上限は以前 g_to_ptr だった。これは**コピー中に動く値**で、
            fwd_addr == g_to_ptr の境界で正当な転送を見落とす。実測で外れており、
@@ -3301,8 +3280,8 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
     // MAGIC_FLOATのdoubleビットパターン等)であることもある。os_alloc_bytesが
     // OOM時にos_gc_collectを発火させうるため、GCで再配置されても追随できるよう
     // 確保前にGC_PROTECTする必要があるが、これは「実際にタグ付きlisp_val_tである
-    // フィールド」に限る。生のビットパターンをGC_PROTECTすると、たまたま下位3bitが
-    // 本物のタグ(TAG_CONS等、TAG_FIXNUM/TAG_CHAR/TAG_RAW_POINTER以外)と一致した
+    // フィールド」に限る。生のビットパターンをGC_PROTECTすると、たまたま下位4bitが
+    // GCが追いかけるタグ(os_tag_is_heap_refが真を返す値)と一致した
     // 場合にgc_copy_valueがその生アドレスを誤ってヒープオブジェクトとして複製し、
     // word0へ転送先アドレスを書き込んでしまう(関数ポインタなら実行コード自体を
     // 破壊する致命的なバグ。[ファイルI/O]#49の調査で発覚。発生はw1のビットパターン
@@ -4318,7 +4297,7 @@ typedef struct {
     int sign;
     UINT64 *limbs;
     UINT64 count;
-    UINT64 fixnum_buf[2]; /* FIXNUM(60bit、最大2limb)を展開する場合の受け皿 */
+    UINT64 fixnum_buf[2]; /* FIXNUMのマグニチュード(最大2limb)を展開する場合の受け皿 */
 } signed_mag_t;
 
 /**
@@ -4343,7 +4322,7 @@ static void decompose(lisp_val_t v, signed_mag_t *out) {
 
 /**
  * 符号付きマグニチュード(limbs, count)から整数オブジェクトを作る。
- * 正規化後マグニチュードが60bit以内に収まる場合はFIXNUM(即値)に降格し、
+ * 正規化後マグニチュードがFIXNUM_MAGNITUDE_MASK以内に収まる場合はFIXNUM(即値)に降格し、
  * それ以外はlimb配列をコピーしてヒープに確保しMAGIC_BIGNUMのINSTANCEを返す。
  */
 /* [原則7] limb作業バッファはGCヒープに置かない。
@@ -4847,7 +4826,7 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
  * マグニチュードによる一般パスにフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 合計値の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
+ * @return 合計値の数値(floatが絡まなければFIXNUM_MAGNITUDE_MASK以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -4977,7 +4956,7 @@ lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
  * 高速パスを使い、それ以外は符号付きマグニチュードによる一般パスにフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 減算結果の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
+ * @return 減算結果の数値(floatが絡まなければFIXNUM_MAGNITUDE_MASK以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -5132,7 +5111,7 @@ lisp_val_t primitive_null1(lisp_val_t a) {
  * それ以外は符号付きマグニチュードによる一般パス(素朴なO(n*m)乗算)にフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 積の数値(floatが絡まなければ60bit以内ならFIXNUM、それを超えるならbignum)
+ * @return 積の数値(floatが絡まなければFIXNUM_MAGNITUDE_MASK以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -6127,7 +6106,7 @@ lisp_val_t primitive_fixnump1(lisp_val_t val) {
 }
 
 /**
- * 組み込み関数BIGNUMP。第一引数が60bitを超える整数(bignum、MAGIC_BIGNUMのINSTANCE)かどうかを判定する。
+ * 組み込み関数BIGNUMP。第一引数がFIXNUM_MAGNITUDE_MASKを超える整数(bignum、MAGIC_BIGNUMのINSTANCE)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return bignumならg_sym_t、そうでなければnil
