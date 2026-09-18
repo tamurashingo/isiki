@@ -896,6 +896,15 @@
 (defconstant *most-positive-float* 1.7976931348623157E308)
 (defconstant *most-negative-float* -1.7976931348623157E308)
 
+;;; --- number class (§19) fixnum の境界 ---
+;;; fixnumが表現できる範囲の両端。値は必ずC側の FIXNUM_MAGNITUDE_MASK
+;;; (runtime.h) から導く。Lisp側に 2^60-1 を直書きすると、タグ幅や
+;;; FIXNUM_VALUE_SHIFT を動かしたときにC側と黙ってずれる。
+;;; fixnumは2の補数ではなく「符号＋絶対値」なので、負側の端は正側の符号反転
+;;; ちょうどになる(-2^60 のような非対称な端は存在しない)。
+(defconstant *most-positive-fixnum* (%%fixnum-magnitude-mask))
+(defconstant *most-negative-fixnum* (- 0 *most-positive-fixnum*))
+
 ;;; --- number class (§19) quotient/reciprocal/expt/三角・双曲線関数/*pi* ---
 ;;; sqrt/log/exp/sin/cos/atan2/floor/ceiling/truncate/round/parse-numberは
 ;;; 生FPU命令が必要なためCプリミティブ(runtime.c)として実装済み。ここではそれらを

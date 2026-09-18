@@ -816,31 +816,50 @@
 
 ;; bignumは同じ値でも独立に計算すると別オブジェクトになりうるため、raw eqである
 ;; assert-equalではなく数値比較の=をtと比較する形でテストする
-;; 1152921504606846976 = 2^60(FIXNUM_MAGNITUDE_MASK=2^60-1を超えるのでbignumになる)
-(assert-equal t (bignump 1152921504606846976))
-(assert-equal nil (fixnump 1152921504606846976))
-(assert-equal t (integerp 1152921504606846976))
-(assert-equal t (numberp 1152921504606846976))
-(assert-equal t (fixnump 1152921504606846975)) ; FIXNUM_MAGNITUDE_MASKはまだFIXNUM
-(assert-equal nil (bignump 1152921504606846975))
+;;
+;; まず境界定数そのものの確認。*most-positive-fixnum* の値がC側の
+;; FIXNUM_MAGNITUDE_MASK と一致すること(%%fixnum-magnitude-mask はその値を
+;; そのまま返す組み込み)と、その値が本当に処理系のfixnum境界であること
+;; (1つ外はfixnumでなくなる)の両方を見る。
+(assert-equal t (= *most-positive-fixnum* (%%fixnum-magnitude-mask)))
+(assert-equal t (fixnump *most-positive-fixnum*))
+(assert-equal t (fixnump *most-negative-fixnum*))
+(assert-equal t (= *most-negative-fixnum* (- 0 *most-positive-fixnum*)))
+(assert-equal nil (fixnump (+ *most-positive-fixnum* 1)))
+(assert-equal nil (fixnump (- *most-negative-fixnum* 1)))
+;; fixnum/bignumの境界そのものは *most-positive-fixnum* から作る。この定数は
+;; C側の FIXNUM_MAGNITUDE_MASK (runtime.h) 由来なので、タグ幅や
+;; FIXNUM_VALUE_SHIFT を変えるとここも自動で追随する。10進で直書きすると、
+;; 境界が動いたときにテストだけが古い境界を見続けてしまう。
+(defglobal fx-max *most-positive-fixnum*)          ; 現在は 2^60-1 = 1152921504606846975
+(defglobal fx-over (+ *most-positive-fixnum* 1))   ; 境界の1つ外、bignum
+(defglobal fx-over2 (+ *most-positive-fixnum* 2))  ; さらに1つ外、bignum
+(assert-equal t (bignump fx-over))
+(assert-equal nil (fixnump fx-over))
+(assert-equal t (integerp fx-over))
+(assert-equal t (numberp fx-over))
+(assert-equal t (fixnump fx-max)) ; FIXNUM_MAGNITUDE_MASKはまだFIXNUM
+(assert-equal nil (bignump fx-max))
 (assert-equal t (integerp 5)) ; FIXNUMもintegerp=T
 
-;; 60bit超えの加算でbignumに昇格し、引き戻すと再度fixnumに降格する
-(assert-equal t (= 1152921504606846976 (+ 1152921504606846975 1)))
-(assert-equal t (bignump (+ 1152921504606846975 1)))
-(assert-equal 1152921504606846975 (- (+ 1152921504606846975 1) 1))
-(assert-equal t (fixnump (- (+ 1152921504606846975 1) 1)))
+;; 境界超えの加算でbignumに昇格し、引き戻すと再度fixnumに降格する
+(assert-equal t (= fx-over (+ fx-max 1)))
+(assert-equal t (bignump (+ fx-max 1)))
+(assert-equal fx-max (- (+ fx-max 1) 1))
+(assert-equal t (fixnump (- (+ fx-max 1) 1)))
 
 ;; bignumの負数・比較・大小関係
+;; 1行目は「負のbignumリテラルをreaderが読めること」が対象なので直書きのまま残す
+;; (fixnumの上限が狭まる方向にしか動かない以上、-2^60 は常にbignumである)
 (assert-equal t (= -1152921504606846976 (- 0 1152921504606846976)))
-(assert-equal t (< 1152921504606846975 1152921504606846976))
-(assert-equal t (> 1152921504606846976 1152921504606846975))
-(assert-equal t (< -1152921504606846976 1152921504606846975))
+(assert-equal t (< fx-max fx-over))
+(assert-equal t (> fx-over fx-max))
+(assert-equal t (< (- 0 fx-over) fx-max))
 
 ;; eql/equalはbignumも異なるオブジェクトでも内容が同じならT
-(assert-equal t (eql (+ 1152921504606846976 0) (+ 0 1152921504606846976)))
-(assert-equal nil (eql 1152921504606846976 1152921504606846977))
-(assert-equal t (equal (cons 1152921504606846976 nil) (cons (+ 1152921504606846976 0) nil)))
+(assert-equal t (eql (+ fx-over 0) (+ 0 fx-over)))
+(assert-equal nil (eql fx-over fx-over2))
+(assert-equal t (equal (cons fx-over nil) (cons (+ fx-over 0) nil)))
 (assert-equal nil (instancep (make-instance 'point) (class point3d)))
 
 ;;; --- number class (§19): 整数リテラルの符号(+)とradix表記(#b/#o/#x) ---
@@ -855,9 +874,12 @@
 (assert-equal -5 #b-101) ; radixリテラルも符号付き
 (assert-equal 15 #o+17) ; radixリテラルの明示的な'+'
 
-;; 16進数なら15桁でも60bitを超えるのでbignumになる(#x1000000000000000 = 16^15 = 2^60)
+;; radixリテラルでも桁あふれを判定してbignumを作ることの確認。ここはreader側の
+;; 桁あふれ処理そのものが対象なので、境界定数ではなく直書きのリテラルで試す
+;; (#x1000000000000000 = 16^15 = 2^60。fixnumの上限が今後狭まる方向にしか
+;;  動かない以上、この値は常に範囲外である)
 (assert-equal t (bignump #x1000000000000000))
-(assert-equal t (= 1152921504606846976 #x1000000000000000))
+(assert-equal t (= 1152921504606846976 #x1000000000000000)) ; 10進表記と16進表記が同じ値を読む
 
 ;;; --- number class (§19): /= ・>= ・<= ・max/min/abs・div/mod・gcd/lcm・isqrt ---
 
@@ -911,9 +933,9 @@
 (assert-equal 1 (isqrt 1))
 (assert-equal 1 (isqrt 2))
 (assert-equal 'eval-error (isqrt -1))
-;; bignum境界: 1152921504606846975(FIXNUM_MAGNITUDE_MASK)の2乗の平方根が元に戻る
-(assert-equal t (= 1152921504606846975 (isqrt (* 1152921504606846975 1152921504606846975))))
-(assert-equal t (= 1152921504606846975 (isqrt (+ 1 (* 1152921504606846975 1152921504606846975)))))
+;; bignum境界: fixnumの上限(*most-positive-fixnum*)の2乗の平方根が元に戻る
+(assert-equal t (= fx-max (isqrt (* fx-max fx-max))))
+(assert-equal t (= fx-max (isqrt (+ 1 (* fx-max fx-max)))))
 
 ;;; --- number class (§19): sqrt/log/exp/sin/cos/tan/atan/atan2・双曲線関数・floor系 ---
 ;;; ・parse-number・quotient/reciprocal/expt・*pi*・domain-error(sqrt/log/asin/acos) ---

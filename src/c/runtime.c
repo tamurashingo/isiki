@@ -513,9 +513,12 @@ static UINT64 g_align_alloc_stride_break[ALIGN_SITE_COUNT];
 static UINT64 g_align_alloc_bad[ALIGN_SITE_COUNT];
 
 /** タグ別・Lisp値(ポインタを持つタグのみ)の下位4bitのヒストグラム */
-static UINT64 g_align_val_hist[8][16];
+/* タグ値の取りうる数。TAG_MASKから導く(タグ幅を広げたら配列も自動で伸びる。
+   直書きの8のままだと、新しいタグの観測が隣の要素を踏む) */
+#define ALIGN_TAG_COUNT ((int)(TAG_MASK + 1))
+static UINT64 g_align_val_hist[ALIGN_TAG_COUNT][16];
 /** タグ別・下位4bitが0でなかった値のうち最初に観測したもの(診断用) */
-static UINT64 g_align_val_first_bad[8];
+static UINT64 g_align_val_first_bad[ALIGN_TAG_COUNT];
 
 /** [境界] 違反(強制対象なのに境界に乗っていない)を観測した延べ回数 */
 static UINT64 g_align_violations = 0;
@@ -744,7 +747,7 @@ void os_align_audit_report(void) {
         }
     }
 
-    for (UINT64 tag = 0; tag < 8; tag++) {
+    for (UINT64 tag = 0; tag < (UINT64)ALIGN_TAG_COUNT; tag++) {
         if (tag == TAG_FIXNUM || tag == TAG_CHAR) { continue; }
         UINT64 total = 0;
         UINT64 bad = 0;
@@ -2803,6 +2806,7 @@ void os_bootstrap() {
         #endif
         os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample_pub), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
+        os_set_function(os_make_symbol("%%FIXNUM-MAGNITUDE-MASK"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnum_magnitude_mask), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
@@ -2990,6 +2994,26 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env) {
  * @return タグ付けされたFIXNUM
  */
 /* [性能測定] Phase4: runtime.hのstatic inlineへ移した */
+
+/**
+ * 組み込み関数%%FIXNUM-MAGNITUDE-MASK。
+ *
+ * fixnumのマグニチュード部が表現できる最大値(= FIXNUM_MAGNITUDE_MASK)を返す。
+ * Lisp側の *most-positive-fixnum* / *most-negative-fixnum* は、この値から
+ * 導出する(init.lisp)。Lisp側に 2^60-1 を10進で直書きすると、タグ幅や
+ * FIXNUM_VALUE_SHIFT を動かしたときにC側とLisp側が黙ってずれるため。
+ *
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return FIXNUM_MAGNITUDE_MASK のfixnum
+ */
+lisp_val_t primitive_fixnum_magnitude_mask(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    /* この値がfixnumとして表現できること(符号bit・タグに食い込まないこと)は
+       runtime.hの語レイアウト_Static_assertで保証済み */
+    return os_make_fixnum(FIXNUM_MAGNITUDE_MASK);
+}
 
 /**
  * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。
