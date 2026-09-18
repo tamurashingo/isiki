@@ -3,6 +3,7 @@
 #include "runtime.h"
 #include "eval.h"
 #include "za.h"
+#include "za_jit_tags.h"
 
 /* [GC安全性] 生成コードへ「GCで動く領域を指す即値」を焼き込んだ回数(累計)。
    0以外なら原則8のバグクラスが再発している。test/lisp/za_code_imm_test.lispが
@@ -140,9 +141,48 @@ static void jit_emit32(UINT32 v) {
     jit_emit8((UINT8)(v >> 24));
 }
 
+#ifdef ISIKIOS_JIT_DUMP
+/* ===== [検証] JIT出力の差分検証(JIT_DUMP=1 のときだけ) =====
+ * documents/jit-tag-constants.md Step 1。
+ * タグ定数の整理が「出力バイト列を1バイトも変えていない」ことを確かめるための仕組み。
+ *
+ * 素朴にバイト列をハッシュすると、movabsに埋め込む**絶対アドレス**が起動ごとに
+ * 変わる(UEFIのロードアドレス・Lispヒープ・nil等)ため、同じバイナリでも
+ * ハッシュが一致しない。そこでアドレスの即値だけをマスクしてからハッシュする。
+ *
+ * アドレスかどうかは jit_emit64 の時点で値で判定する:
+ *   タグを外した値が [JIT_DUMP_ADDR_FLOOR, 2^48) に入っていればアドレスとみなす。
+ * 上限が 2^48 なのは x86-64 のcanonicalな下位半分の上限で、
+ * TAG_MASK|FIXNUM_SIGN_BIT(0x8000000000000007)のような「大きいが定数」を
+ * アドレスと誤認しないため。下限は、MAGIC値・タグ値・argc・os_make_fixnum(n)
+ * といった小さな定数をマスクしないため。
+ * この判定が安定していることは「同じ条件で2回流してダンプが一致する」ことで
+ * 確かめる(報告書 Step 1)。 */
+#define JIT_DUMP_ADDR_FLOOR   0x10000ULL
+#define JIT_DUMP_ADDR_CEILING (1ULL << 48)
+
+/** g_jit_code と同じ添字で「このバイトはアドレス即値の一部か」を持つ */
+static UINT8 g_jit_dump_addr_mask[JIT_CODE_SIZE];
+
+static int jit_dump_value_is_address(UINT64 v) {
+    UINT64 untagged = v & ~(UINT64)TAG_MASK;
+    return untagged >= JIT_DUMP_ADDR_FLOOR && untagged < JIT_DUMP_ADDR_CEILING;
+}
+#endif
+
 static void jit_emit64(UINT64 v) {
+#ifdef ISIKIOS_JIT_DUMP
+    UINT64 start = g_jit_used;
+#endif
     jit_emit32((UINT32)v);
     jit_emit32((UINT32)(v >> 32));
+#ifdef ISIKIOS_JIT_DUMP
+    if (jit_dump_value_is_address(v)) {
+        for (UINT64 i = start; i < g_jit_used && i < JIT_CODE_SIZE; i++) {
+            g_jit_dump_addr_mask[i] = 1;
+        }
+    }
+#endif
 }
 
 // 手書き用の命令
@@ -499,7 +539,7 @@ static UINT64 za_emit_ct_check_and_jmp_if_transfer(void) {
  * TAG_MASK+obj[0]比較を行っているのと同じ手口)。 */
 static void za_emit_untag_instance(UINT8 dst_reg, UINT8 src_reg) {
     jit_mov_reg_reg(dst_reg, src_reg);
-    jit_and_reg_imm8(dst_reg, (UINT8)0xF8);
+    jit_and_reg_imm8(dst_reg, JIT_IMM8_UNTAG_MASK);
 }
 
 /** valがfloat(MAGIC_FLOATのTAG_INSTANCE)かどうかを判定する。runtime.cのis_floatは
@@ -1626,12 +1666,12 @@ static UINT64 za_ensure_trampoline(void) {
     // 中身(現在のfn、TAG_INSTANCE)を読み出してr8を差し替えてから、以降は従来通り
     // fn自体に対する分岐を行う(拡張: 間接呼び出し化)。
     jit_mov_reg_reg(ZA_REG_R10, ZA_REG_R8);
-    jit_and_reg_imm8(ZA_REG_R10, 0xF8); // ~TAG_MASK(0x7)
+    jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK); // タグを落として実アドレスにする
     jit_mov_reg_from_mem_disp8(ZA_REG_R8, ZA_REG_R10, 0); // r8 = *cell (fn, タグ付き)
 
     // r10 = fn(r8)からTAG_INSTANCEを外した生アドレス
     jit_mov_reg_reg(ZA_REG_R10, ZA_REG_R8);
-    jit_and_reg_imm8(ZA_REG_R10, 0xF8); // ~TAG_MASK(0x7)
+    jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK); // タグを落として実アドレスにする
 
     // rax = obj[0] (magic)。MAGIC_FUNCTION_NATIVEでなければfallbackへ
     jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 0);
@@ -3906,9 +3946,9 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             fast_patches[fast_patch_count++] = jit_emit_je_rel32_placeholder();
 
             // r10 = *cell(fn_obj、タグ付き)。さらにタグを外してr10=fn_objの生アドレス。
-            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+            jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK);
             jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);
-            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+            jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK);
 
             // obj[0](magic)がMAGIC_FUNCTION_NATIVEでなければ高速pathは使えない
             // (MAGIC_FUNCTION_INTERPRETEDはword1がparamsリストでありmetaポインタ
@@ -4004,9 +4044,9 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             fast_patches[fast_patch_count++] = jit_emit_je_rel32_placeholder();
 
             // r10 = *cell(fn_obj、タグ付き)。さらにタグを外してr10=fn_objの生アドレス。
-            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+            jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK);
             jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);
-            jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+            jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK);
 
             // obj[0](magic)がMAGIC_FUNCTION_NATIVEでなければ高速pathは使えない。
             jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 0);
@@ -4783,7 +4823,7 @@ static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     // 結果がTAG_INSTANCEでobj[0]==MAGIC_CATCH_EXITかつobj[1]==tag(スロットの現在値)
     // ならobj[2]を、そうでなければ結果をそのまま返す(eval_catchと同じ)。
     jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
-    jit_and_reg_imm8(ZA_REG_RAX, (UINT8)TAG_MASK);
+    jit_and_reg_imm8(ZA_REG_RAX, JIT_IMM8_TAG_MASK);
     jit_movabs_r11(TAG_INSTANCE);
     jit_cmp_rax_r11();
     UINT64 je_is_instance = jit_emit_je_rel32_placeholder();
@@ -5633,9 +5673,9 @@ static int za_emit_symbol_to_reg(lisp_val_t sym, UINT8 reg) {
  */
 static void za_emit_load_callee_env_rcx(void) {
     za_load_slot(ZA_REG_R10, ZA_OFF_FN_VAL);                 // cell(タグ付き)
-    jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+    jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK);
     jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);   // fn_obj(タグ付き)
-    jit_and_reg_imm8(ZA_REG_R10, 0xF8);
+    jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK);
     jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 24);  // rax = fn_obj word3
     jit_movabs_reg(ZA_REG_R11, nil);
     jit_cmp_rax_r11();
@@ -6274,6 +6314,52 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         os_environment_register_literal_slot(owner_env, g_za_literal_slot_allocs[i]);
     }
     g_za_literal_slot_alloc_count = 0;
+
+#ifdef ISIKIOS_JIT_DUMP
+    /* [検証] この関数が出力したバイト列のハッシュを出す。アドレス即値はマスク済み。
+       同じソース・同じ条件なら、起動が変わってもこの行は一致しなければならない */
+    {
+        UINT64 h = 1469598103934665603ULL;   /* FNV-1a 64bit */
+        UINT64 masked = 0;
+        for (UINT64 i = 0; i < code_len; i++) {
+            UINT8 byte = g_jit_dump_addr_mask[entry + i] ? (UINT8)0xAA : dest_bytes[i];
+            if (g_jit_dump_addr_mask[entry + i]) { masked++; }
+            h ^= (UINT64)byte;
+            h *= 1099511628211ULL;
+        }
+        os_diag_serial_write("[JITDUMP] size=");
+        {
+            char buf[24]; int o = 0; UINT64 v = code_len;
+            if (v == 0) { buf[o++] = '0'; }
+            while (v > 0 && o < 23) { buf[o++] = (char)('0' + (v % 10)); v /= 10; }
+            char rev[25]; int r = 0; while (o > 0) { rev[r++] = buf[--o]; } rev[r] = '\0';
+            os_diag_serial_write(rev);
+        }
+        os_diag_serial_write(" maskedbytes=");
+        {
+            char buf[24]; int o = 0; UINT64 v = masked;
+            if (v == 0) { buf[o++] = '0'; }
+            while (v > 0 && o < 23) { buf[o++] = (char)('0' + (v % 10)); v /= 10; }
+            char rev[25]; int r = 0; while (o > 0) { rev[r++] = buf[--o]; } rev[r] = '\0';
+            os_diag_serial_write(rev);
+        }
+        os_diag_serial_write(" hash=");
+        {
+            char hex[17]; int o = 0;
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                UINT64 nib = (h >> shift) & 0xF;
+                hex[o++] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+            }
+            hex[o] = '\0';
+            os_diag_serial_write(hex);
+        }
+        os_diag_serial_write("\n");
+        /* 次のコンパイルへマスクを持ち越さない */
+        for (UINT64 i = entry; i < entry + code_len && i < JIT_CODE_SIZE; i++) {
+            g_jit_dump_addr_mask[i] = 0;
+        }
+    }
+#endif
 
     g_jit_used = entry;
 

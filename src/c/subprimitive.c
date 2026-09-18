@@ -13,7 +13,7 @@
  */
 lisp_val_t cc_in_8(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint16_t port = (uint16_t)(cc_car(args) >> 3);
+    uint16_t port = (uint16_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
     return os_make_fixnum(inb(port));
 }
 
@@ -25,8 +25,8 @@ lisp_val_t cc_in_8(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_out_8(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint16_t port = (uint16_t)(cc_car(args) >> 3);
-    uint8_t value = (uint8_t)(cc_car(cc_cdr(args)) >> 3);
+    uint16_t port = (uint16_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
+    uint8_t value = (uint8_t)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
     outb(port, value);
     return os_make_fixnum(value);
 }
@@ -39,7 +39,7 @@ lisp_val_t cc_out_8(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_peek(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_addr_t addr = (lisp_addr_t)(cc_car(args) >> 3);
+    lisp_addr_t addr = (lisp_addr_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
     UINT8 value = *(volatile UINT8 *)addr;
     return os_make_fixnum(value);
 }
@@ -52,8 +52,8 @@ lisp_val_t cc_peek(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_poke(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    lisp_addr_t addr = (lisp_addr_t)(cc_car(args) >> 3);
-    UINT8 value = (UINT8)(cc_car(cc_cdr(args)) >> 3);
+    lisp_addr_t addr = (lisp_addr_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
+    UINT8 value = (UINT8)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
     *(volatile UINT8 *)addr = value;
     return os_make_fixnum(value);
 }
@@ -66,7 +66,7 @@ lisp_val_t cc_poke(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_in_16(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint16_t port = (uint16_t)(cc_car(args) >> 3);
+    uint16_t port = (uint16_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
     return os_make_fixnum(inw(port));
 }
 
@@ -78,8 +78,8 @@ lisp_val_t cc_in_16(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_out_16(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint16_t port = (uint16_t)(cc_car(args) >> 3);
-    uint16_t value = (uint16_t)(cc_car(cc_cdr(args)) >> 3);
+    uint16_t port = (uint16_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
+    uint16_t value = (uint16_t)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
     outw(port, value);
     return os_make_fixnum(value);
 }
@@ -92,8 +92,8 @@ lisp_val_t cc_out_16(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_logand(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint64_t a = (uint64_t)(cc_car(args) >> 3);
-    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> 3);
+    uint64_t a = (uint64_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
+    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
     return os_make_fixnum(a & b);
 }
 
@@ -105,8 +105,8 @@ lisp_val_t cc_logand(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_logior(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint64_t a = (uint64_t)(cc_car(args) >> 3);
-    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> 3);
+    uint64_t a = (uint64_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
+    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
     return os_make_fixnum(a | b);
 }
 
@@ -118,8 +118,8 @@ lisp_val_t cc_logior(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_logxor(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint64_t a = (uint64_t)(cc_car(args) >> 3);
-    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> 3);
+    uint64_t a = (uint64_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
+    uint64_t b = (uint64_t)(cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT);
     return os_make_fixnum(a ^ b);
 }
 
@@ -132,7 +132,7 @@ lisp_val_t cc_logxor(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_ash(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint64_t value = (uint64_t)(cc_car(args) >> 3);
+    uint64_t value = (uint64_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
     lisp_val_t count_val = cc_car(cc_cdr(args));
     UINT64 magnitude = os_fixnum_magnitude(count_val);
     uint64_t result = os_fixnum_is_negative(count_val) ? (value >> magnitude) : (value << magnitude);
@@ -149,7 +149,7 @@ lisp_val_t cc_ash(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_char_code(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint64_t code = (uint64_t)(cc_car(args) >> 3);
+    uint64_t code = (uint64_t)(cc_car(args) >> CHAR_VALUE_SHIFT);
     return os_make_fixnum(code);
 }
 
@@ -161,8 +161,8 @@ lisp_val_t cc_char_code(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t cc_code_char(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    uint64_t code = (uint64_t)(cc_car(args) >> 3);
-    return ((lisp_val_t)code << 3) | TAG_CHAR;
+    uint64_t code = (uint64_t)(cc_car(args) >> FIXNUM_VALUE_SHIFT);
+    return ((lisp_val_t)code << CHAR_VALUE_SHIFT) | TAG_CHAR;
 }
 
 /** %%IN-8/%%OUT-8/%%PEEK/%%POKE/%%IN-16/%%OUT-16/%%LOGAND/%%LOGIOR/%%LOGXOR/%%ASH/%%CHAR-CODE/%%CODE-CHARをglobal_environmentに関数として登録する */

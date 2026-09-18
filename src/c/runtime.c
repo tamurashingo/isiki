@@ -2998,7 +2998,7 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env) {
  * @return タグ付けされたFIXNUM
  */
 lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
-    lisp_val_t val = (lisp_val_t)(magnitude << 3);
+    lisp_val_t val = (lisp_val_t)(magnitude << FIXNUM_VALUE_SHIFT);
     if (negative && magnitude != 0) {
         val |= FIXNUM_SIGN_BIT;
     }
@@ -3011,7 +3011,7 @@ lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
  * @return 0〜2^60-1のマグニチュード
  */
 UINT64 os_fixnum_magnitude(lisp_val_t val) {
-    return (val >> 3) & FIXNUM_MAGNITUDE_MASK;
+    return (val >> FIXNUM_VALUE_SHIFT) & FIXNUM_MAGNITUDE_MASK;
 }
 
 /**
@@ -3218,7 +3218,7 @@ void os_reset_runtime_state_for_test(void) {
  * @return タグ付けされたCHAR
  */
 lisp_val_t os_make_char(const char c) {
-    return ((lisp_val_t)c) << 3 | TAG_CHAR;
+    return ((lisp_val_t)c) << CHAR_VALUE_SHIFT | TAG_CHAR;
 }
 
 /**
@@ -6408,8 +6408,8 @@ lisp_val_t primitive_characterp1(lisp_val_t val) {
  * @return a<bなら負、a==bなら0、a>bなら正
  */
 static int char_compare(lisp_val_t a, lisp_val_t b) {
-    int code_a = (int)(UINT8)(a >> 3);
-    int code_b = (int)(UINT8)(b >> 3);
+    int code_a = (int)(UINT8)(a >> CHAR_VALUE_SHIFT);
+    int code_b = (int)(UINT8)(b >> CHAR_VALUE_SHIFT);
     return code_a - code_b;
 }
 
@@ -6643,12 +6643,12 @@ lisp_val_t primitive_char_index(lisp_val_t args, lisp_val_t env) {
     lisp_val_t ch = cc_car(args);
     lisp_val_t str = cc_car(cc_cdr(args));
     lisp_val_t rest = cc_cdr(cc_cdr(args));
-    UINT64 start = (rest != nil) ? (UINT64)(cc_car(rest) >> 3) : 0;
+    UINT64 start = (rest != nil) ? (UINT64)(cc_car(rest) >> FIXNUM_VALUE_SHIFT) : 0;
 
     lisp_addr_t addr = str & ~TAG_MASK;
     UINT64 len = ((lisp_val_t *)addr)[0];
     UINT8 *bytes = (UINT8 *)(addr + 8);
-    UINT8 target = (UINT8)(ch >> 3);
+    UINT8 target = (UINT8)(ch >> CHAR_VALUE_SHIFT);
     for (UINT64 i = start; i < len; i++) {
         if (bytes[i] == target) {
             return os_make_fixnum(i);
@@ -6670,7 +6670,7 @@ lisp_val_t primitive_string_index(lisp_val_t args, lisp_val_t env) {
     lisp_val_t sub = cc_car(args);
     lisp_val_t str = cc_car(cc_cdr(args));
     lisp_val_t rest = cc_cdr(cc_cdr(args));
-    UINT64 start = (rest != nil) ? (UINT64)(cc_car(rest) >> 3) : 0;
+    UINT64 start = (rest != nil) ? (UINT64)(cc_car(rest) >> FIXNUM_VALUE_SHIFT) : 0;
 
     lisp_addr_t sub_addr = sub & ~TAG_MASK;
     lisp_addr_t str_addr = str & ~TAG_MASK;
@@ -7122,7 +7122,7 @@ lisp_val_t primitive_vector(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 count = cc_car(args) >> 3;
+    UINT64 count = cc_car(args) >> FIXNUM_VALUE_SHIFT;
     lisp_val_t rest = cc_cdr(args);
     lisp_val_t init = (rest != nil) ? cc_car(rest) : nil;
     GC_PROTECT(init);
@@ -7208,10 +7208,10 @@ lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
     UINT64 rank = 0;
 
     if ((dims_arg & TAG_MASK) == TAG_FIXNUM) {
-        dims[rank++] = dims_arg >> 3;
+        dims[rank++] = dims_arg >> FIXNUM_VALUE_SHIFT;
     } else {
         for (lisp_val_t cur = dims_arg; cur != nil && rank < MAX_ARRAY_RANK; cur = cc_cdr(cur)) {
-            dims[rank++] = cc_car(cur) >> 3;
+            dims[rank++] = cc_car(cur) >> FIXNUM_VALUE_SHIFT;
         }
     }
 
@@ -7245,7 +7245,7 @@ static UINT64 array_offset(lisp_val_t *header, UINT64 rank, lisp_val_t cur, int 
     UINT64 offset = 0;
     *out_of_bounds = 0;
     for (UINT64 i = 0; i < rank; i++) {
-        UINT64 idx = cc_car(cur) >> 3;
+        UINT64 idx = cc_car(cur) >> FIXNUM_VALUE_SHIFT;
         UINT64 dim = header[1 + i];
         if (idx >= dim) {
             *out_of_bounds = 1;
@@ -7399,11 +7399,11 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 len = cc_car(args) >> 3;
+    UINT64 len = cc_car(args) >> FIXNUM_VALUE_SHIFT;
     lisp_val_t char_arg = cc_cdr(args);
     UINT8 fill = ' ';
     if (char_arg != nil) {
-        fill = (UINT8)(cc_car(char_arg) >> 3);
+        fill = (UINT8)(cc_car(char_arg) >> CHAR_VALUE_SHIFT);
     }
 
     lisp_addr_t addr = os_alloc_bytes(8 + len);
@@ -7425,7 +7425,7 @@ lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t str = cc_car(args);
-    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
+    UINT64 idx = cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT;
 
     lisp_addr_t addr = str & ~TAG_MASK;
     UINT64 len = ((lisp_val_t *)addr)[0];
@@ -7540,12 +7540,12 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
 lisp_val_t primitive_elt(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t seq = cc_car(args);
-    UINT64 idx = cc_car(cc_cdr(args)) >> 3;
+    UINT64 idx = cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT;
     return primitive_elt_impl(seq, idx);
 }
 
 lisp_val_t primitive_elt2(lisp_val_t seq, lisp_val_t idx) {
-    return primitive_elt_impl(seq, idx >> 3);
+    return primitive_elt_impl(seq, idx >> FIXNUM_VALUE_SHIFT);
 }
 
 /**
@@ -7577,7 +7577,7 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
                 return g_sym_eval_error;
             }
             UINT8 *bytes = (UINT8 *)(addr + 8);
-            bytes[idx] = (UINT8)(obj >> 3);
+            bytes[idx] = (UINT8)(obj >> CHAR_VALUE_SHIFT);
             return obj;
         }
         case TAG_INSTANCE: {
@@ -7614,12 +7614,12 @@ lisp_val_t primitive_set_elt(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t obj = cc_car(args);
     lisp_val_t seq = cc_car(cc_cdr(args));
-    UINT64 idx = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+    UINT64 idx = cc_car(cc_cdr(cc_cdr(args))) >> FIXNUM_VALUE_SHIFT;
     return primitive_set_elt_impl(obj, seq, idx);
 }
 
 lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx) {
-    return primitive_set_elt_impl(obj, seq, idx >> 3);
+    return primitive_set_elt_impl(obj, seq, idx >> FIXNUM_VALUE_SHIFT);
 }
 
 /**
@@ -7633,8 +7633,8 @@ lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx) {
 lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t seq = cc_car(args);
-    UINT64 z1 = cc_car(cc_cdr(args)) >> 3;
-    UINT64 z2 = cc_car(cc_cdr(cc_cdr(args))) >> 3;
+    UINT64 z1 = cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT;
+    UINT64 z2 = cc_car(cc_cdr(cc_cdr(args))) >> FIXNUM_VALUE_SHIFT;
     UINT64 out_len = z2 - z1;
 
     switch (seq & TAG_MASK) {

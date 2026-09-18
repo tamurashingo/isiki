@@ -356,7 +356,7 @@ static void print_value(os_char_sink_t *sink, lisp_val_t val, int escaped) {
         case TAG_CHAR: {
             // prin1相当(escaped)ではISLisp仕様§20の文字リテラル表記 #\x で出力する。
             // 名前を持つ文字(space/newline/tab)は名前で出す
-            UINT8 ch = (UINT8)(val >> 3);
+            UINT8 ch = (UINT8)(val >> CHAR_VALUE_SHIFT);
             if (!escaped) {
                 sink_write_char(sink, ch);
                 return;
