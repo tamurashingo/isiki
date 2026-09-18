@@ -1681,6 +1681,194 @@ void test_gc_symbol_survives_via_symbol_table() {
     assert(strncmp(buf, "GC-TEST-SYMBOL", 14) == 0, "GCを跨いでもsymbol名の内容は保たれる");
 }
 
+/* ===== 4bitタグ体系の網羅テスト =========================================
+ *
+ * タグは16値ある。**未割当の値も含めて全16値を固定する**のが要点で、
+ * 「今使っている値だけ」を試すと、未割当タグの扱いが決まっていないことが
+ * テストからは見えない。GCが即値をポインタとして追いかけると静かに
+ * ヒープが壊れるので、ここは網羅でなければ意味がない。
+ */
+
+/** タグ1つぶんの期待値。documents/tag4-step2.md の表と同じ内容 */
+typedef struct {
+    UINT64 tag;
+    const char *name;
+    int holds_address;   /* bit0。アドレスを持つか */
+    int is_heap_ref;     /* GCが追いかけるか */
+} tag_expectation_t;
+
+static const tag_expectation_t g_tag_expectations[16] = {
+    /* tag                 name              addr  heap */
+    { 0x0ULL,              "FIXNUM",            0,   0 },
+    { 0x1ULL,              "CONS",              1,   1 },
+    { 0x2ULL,              "CHAR",              0,   0 },
+    { 0x3ULL,              "SYMBOL",            1,   1 },
+    { 0x4ULL,              "SINGLE-FLOAT(予約)", 0,   0 },
+    { 0x5ULL,              "STRING",            1,   1 },
+    { 0x6ULL,              "即値・未割当",        0,   0 },
+    { 0x7ULL,              "INSTANCE",          1,   1 },
+    { 0x8ULL,              "即値・未割当",        0,   0 },
+    { 0x9ULL,              "RAW_POINTER",       1,   0 },
+    { 0xAULL,              "即値・未割当",        0,   0 },
+    { 0xBULL,              "アドレス・未割当",     1,   0 },
+    { 0xCULL,              "即値・未割当",        0,   0 },
+    { 0xDULL,              "アドレス・未割当",     1,   0 },
+    { 0xEULL,              "MARKER(予約)",       0,   0 },
+    { 0xFULL,              "FORWARD",           1,   1 },
+};
+
+void test_tag_table_covers_all_sixteen_values() {
+    assert(TAG_MASK == 0xFULL, "TAG_MASKは4bit(0xF)である");
+
+    /* 名前付き定数が表のどこに座っているか。表と定数がずれたらここで落ちる */
+    assert(TAG_FIXNUM       == 0x0ULL, "TAG_FIXNUMは0x0");
+    assert(TAG_CONS         == 0x1ULL, "TAG_CONSは0x1");
+    assert(TAG_CHAR         == 0x2ULL, "TAG_CHARは0x2");
+    assert(TAG_SYMBOL       == 0x3ULL, "TAG_SYMBOLは0x3");
+    assert(TAG_SINGLE_FLOAT == 0x4ULL, "TAG_SINGLE_FLOATは0x4(予約のみ)");
+    assert(TAG_STRING       == 0x5ULL, "TAG_STRINGは0x5");
+    assert(TAG_INSTANCE     == 0x7ULL, "TAG_INSTANCEは0x7");
+    assert(TAG_RAW_POINTER  == 0x9ULL, "TAG_RAW_POINTERは0x9");
+    assert(TAG_MARKER       == 0xEULL, "TAG_MARKERは0xE");
+    assert(TAG_FORWARD      == 0xFULL, "TAG_FORWARDは0xF");
+
+    int addr_mismatch = 0, heap_mismatch = 0, index_mismatch = 0;
+    for (UINT64 t = 0; t < 16; t++) {
+        const tag_expectation_t *e = &g_tag_expectations[t];
+        if (e->tag != t) { index_mismatch++; }
+        if (os_tag_holds_address(t) != e->holds_address) { addr_mismatch++; }
+        if (os_tag_is_heap_ref(t)   != e->is_heap_ref)   { heap_mismatch++; }
+    }
+    assert(index_mismatch == 0, "期待値テーブルの添字とタグ値が一致している");
+    assert(addr_mismatch == 0,
+           "os_tag_holds_addressが全16値で期待どおり(bit0=1がアドレス側)");
+    assert(heap_mismatch == 0,
+           "os_tag_is_heap_refが全16値で期待どおり(未割当・予約・raw pointerは偽)");
+}
+
+void test_tag_immediate_pointer_split_is_bit0() {
+    int mismatch = 0;
+    for (UINT64 t = 0; t < 16; t++) {
+        /* bit0 が即値/ポインタの唯一の判断材料であること */
+        if (((t & 0x1ULL) != 0) != (os_tag_holds_address(t) != 0)) { mismatch++; }
+    }
+    assert(mismatch == 0, "即値とアドレスの区別は全16値でbit0だけで決まる");
+
+    /* GCが追いかけるタグは必ずアドレスを持つ(逆は成り立たない) */
+    int follows_immediate = 0;
+    for (UINT64 t = 0; t < 16; t++) {
+        if (os_tag_is_heap_ref(t) && !os_tag_holds_address(t)) { follows_immediate++; }
+    }
+    assert(follows_immediate == 0,
+           "GCが追いかけるタグに即値(bit0=0)は1つもない");
+}
+
+void test_unassigned_and_reserved_tags_are_not_followed_by_gc() {
+    /* 未割当・予約タグは「まだ誰も作らない」だけで「安全」ではない。
+       GCが追いかけると生のビットパターンをヒープオブジェクトとして複製し、
+       word0へ転送先を書き込む(= 静かなヒープ破壊)。偽であることを固定する */
+    const UINT64 unassigned[] = { 0x6ULL, 0x8ULL, 0xAULL, 0xCULL, 0xBULL, 0xDULL };
+    int followed = 0;
+    for (UINT64 i = 0; i < sizeof(unassigned) / sizeof(unassigned[0]); i++) {
+        if (os_tag_is_heap_ref(unassigned[i])) { followed++; }
+    }
+    assert(followed == 0, "未割当6値はどれもos_tag_is_heap_refが偽");
+    assert(!os_tag_is_heap_ref(TAG_SINGLE_FLOAT), "予約のTAG_SINGLE_FLOATは追いかけない");
+    assert(!os_tag_is_heap_ref(TAG_MARKER), "予約のTAG_MARKERは追いかけない");
+    assert(!os_tag_is_heap_ref(TAG_RAW_POINTER),
+           "TAG_RAW_POINTERはアドレスを持つがGC管理外なので追いかけない");
+}
+
+void test_immediate_encode_decode_round_trip() {
+    /* fixnum: 0・1・境界値・境界値-1 */
+    const UINT64 mags[] = { 0ULL, 1ULL, 42ULL, FIXNUM_MAGNITUDE_MASK - 1, FIXNUM_MAGNITUDE_MASK };
+    int bad_tag = 0, bad_value = 0;
+    for (UINT64 i = 0; i < sizeof(mags) / sizeof(mags[0]); i++) {
+        lisp_val_t v = os_make_fixnum(mags[i]);
+        if ((v & TAG_MASK) != TAG_FIXNUM) { bad_tag++; }
+        if (os_fixnum_magnitude(v) != mags[i]) { bad_value++; }
+    }
+    assert(bad_tag == 0, "fixnumのエンコードは全ケースでTAG_FIXNUMになる");
+    assert(bad_value == 0, "fixnumはエンコード→デコードで値が保たれる");
+
+    /* 符号付き。符号絶対値なので下端は上端の符号反転ちょうど */
+    lisp_val_t neg = os_make_fixnum_signed(1, FIXNUM_MAGNITUDE_MASK);
+    assert((neg & TAG_MASK) == TAG_FIXNUM, "負のfixnumもTAG_FIXNUM");
+    assert(os_fixnum_is_negative(neg), "負のfixnumは符号bitが立つ");
+    assert(os_fixnum_magnitude(neg) == FIXNUM_MAGNITUDE_MASK, "負のfixnumもマグニチュードが保たれる");
+    assert(os_make_fixnum_signed(1, 0) == os_make_fixnum(0), "-0は0に正規化される");
+
+    /* character: ASCII・0x80境界・BMP・コードポイント上限 */
+    const UINT32 codes[] = { 0x00u, 0x41u, 0x7Fu, 0x80u, 0xFFu, 0x3042u, 0xFFFFu, 0x10FFFFu, 0xFFFFFFFFu };
+    int c_bad_tag = 0, c_bad_value = 0;
+    for (UINT64 i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+        lisp_val_t v = os_make_char(codes[i]);
+        if ((v & TAG_MASK) != TAG_CHAR) { c_bad_tag++; }
+        if ((UINT32)(v >> CHAR_VALUE_SHIFT) != codes[i]) { c_bad_value++; }
+    }
+    assert(c_bad_tag == 0, "characterのエンコードは全ケースでTAG_CHARになる");
+    assert(c_bad_value == 0, "characterはエンコード→デコードでコードポイントが保たれる");
+}
+
+void test_char_high_code_points_do_not_corrupt_upper_bits() {
+    /* [4bit化] os_make_char の引数が const char だったころ、0x80以上で符号拡張が
+       起きて上位ビットがすべて1になっていた。UINT32化で解消したことを固定する */
+    lisp_val_t c80 = os_make_char(0x80u);
+    assert((c80 & TAG_MASK) == TAG_CHAR, "0x80のcharacterはTAG_CHAR");
+    assert((UINT32)(c80 >> CHAR_VALUE_SHIFT) == 0x80u, "0x80のコードポイントがそのまま戻る");
+    /* 符号拡張が起きていれば bit32-63 が全部1になり、この比較で落ちる */
+    assert((c80 >> CHAR_VALUE_SHIFT) == 0x80ULL, "0x80で上位ビットが1で埋まらない");
+
+    lisp_val_t cff = os_make_char(0xFFu);
+    assert((cff >> CHAR_VALUE_SHIFT) == 0xFFULL, "0xFFで上位ビットが1で埋まらない");
+
+    /* タグ領域とコードポイント領域の**外側**(bit4-31の空き)には何も入らない */
+    const lisp_val_t char_used_bits = TAG_MASK | (0xFFFFFFFFULL << CHAR_VALUE_SHIFT);
+    assert((c80 & ~char_used_bits) == 0, "0x80のcharacterはタグ/コード以外のビットを持たない");
+    assert((cff & ~char_used_bits) == 0, "0xFFのcharacterはタグ/コード以外のビットを持たない");
+    assert((os_make_char(0x10FFFFu) & ~char_used_bits) == 0,
+           "コードポイント上限のcharacterもタグ/コード以外のビットを持たない");
+}
+
+void test_immediates_survive_gc_unchanged() {
+    /* 即値はGCが素通しする。GCを挟んで値が変わらないことを確かめる。
+       未割当タグの値も一緒に通し、GCが追いかけて落ちないことを見る */
+    lisp_val_t fix = os_make_fixnum(123456789ULL);
+    lisp_val_t neg = os_make_fixnum_signed(1, 987654321ULL);
+    lisp_val_t chr = os_make_char(0x3042u);
+    os_gc_register_root(&fix);
+    os_gc_register_root(&neg);
+    os_gc_register_root(&chr);
+
+    /* 未割当タグ・予約タグの値をルートに置く。GCが追いかけたら
+       canonicalでないアドレスを読んで落ちるか、値が書き換わる */
+    lisp_val_t unassigned = (lisp_val_t)0xDEADBEEF0000ULL | 0x6ULL;
+    lisp_val_t marker     = (lisp_val_t)0xDEADBEEF0000ULL | TAG_MARKER;
+    lisp_val_t sfloat     = (lisp_val_t)0xDEADBEEF0000ULL | TAG_SINGLE_FLOAT;
+    os_gc_register_root(&unassigned);
+    os_gc_register_root(&marker);
+    os_gc_register_root(&sfloat);
+
+    lisp_val_t fix_before = fix, neg_before = neg, chr_before = chr;
+    lisp_val_t un_before = unassigned, mk_before = marker, sf_before = sfloat;
+
+    os_gc_collect();
+
+    assert(fix == fix_before, "fixnumはGCを跨いでも値が変わらない");
+    assert(neg == neg_before, "負のfixnumはGCを跨いでも値が変わらない");
+    assert(chr == chr_before, "characterはGCを跨いでも値が変わらない");
+    assert(unassigned == un_before, "未割当タグの値はGCを跨いでも変わらない(追いかけられていない)");
+    assert(marker == mk_before, "TAG_MARKERの値はGCを跨いでも変わらない");
+    assert(sfloat == sf_before, "TAG_SINGLE_FLOATの値はGCを跨いでも変わらない");
+
+    os_gc_unregister_root(&sfloat);
+    os_gc_unregister_root(&marker);
+    os_gc_unregister_root(&unassigned);
+    os_gc_unregister_root(&chr);
+    os_gc_unregister_root(&neg);
+    os_gc_unregister_root(&fix);
+}
+
 void test_gc_string_with_forward_tag_colliding_length_is_not_misdetected() {
     /* STRINGのword0は**生の長さ**なので、長さの下位ビットがたまたま TAG_FORWARD と
        一致する文字列が必ず存在する。長さは Lisp プログラムが決めるので制御できない
@@ -2182,6 +2370,12 @@ int main(int argc, char** argv) {
 
    test_gc_cons_survives_and_relocates();
    test_gc_symbol_survives_via_symbol_table();
+   test_tag_table_covers_all_sixteen_values();
+   test_tag_immediate_pointer_split_is_bit0();
+   test_unassigned_and_reserved_tags_are_not_followed_by_gc();
+   test_immediate_encode_decode_round_trip();
+   test_char_high_code_points_do_not_corrupt_upper_bits();
+   test_immediates_survive_gc_unchanged();
    test_gc_string_with_forward_tag_colliding_length_is_not_misdetected();
    test_gc_instance_survives();
    test_gc_circular_cons_list_does_not_hang();
