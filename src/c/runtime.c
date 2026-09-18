@@ -569,13 +569,15 @@ static int align_site_stride_is_enforced(int site) {
 
 /** [境界] このタグの値はアドレスを持つか(= 16byte境界を強制する対象か)。
  *
- * FIXNUM/CHAR は即値でアドレスを含まないので対象外。それ以外の6タグはすべて対象で、
- * **TAG_RAW_POINTER も含む**。PR #74 の分類で、TAG_RAW_POINTER として流通する値は
- * JITリテラルスロット・block_deviceハンドル・Function Cell・環境ページの4種だけで、
- * どれも16byte境界に置けることが分かったため(documents/static-align16-survey.md 1章)。
+ * [4bit化] 判断は bit0 (os_tag_holds_address) に集約した。除外リストのままだと
+ * 未割当タグが全部「強制対象」に落ちる。
+ * **TAG_RAW_POINTER も対象に含まれる**(bit0=1)。PR #74 の分類で、
+ * TAG_RAW_POINTER として流通する値はJITリテラルスロット・block_deviceハンドル・
+ * Function Cell・環境ページの4種だけで、どれも16byte境界に置けることが
+ * 分かったため(documents/static-align16-survey.md 1章)。
  */
 static int align_tag_is_enforced(UINT64 tag) {
-    return tag != TAG_FIXNUM && tag != TAG_CHAR;
+    return os_tag_holds_address(tag);
 }
 
 /**
@@ -656,9 +658,9 @@ void os_align_audit_note_gc_live(UINT64 live_bytes) {
 
 void os_align_audit_note_value(lisp_val_t v) {
     UINT64 tag = v & TAG_MASK;
-    /* FIXNUM/CHARは即値でアドレスを含まない。それ以外の6タグはアドレスを持つ
-       (FORWARDはGC内部の転送ポインタだが、下位bitを使う以上は観測対象) */
-    if (tag == TAG_FIXNUM || tag == TAG_CHAR) { return; }
+    /* 即値(bit0=0)はアドレスを含まないので観測しない。アドレスを持つタグは
+       すべて観測対象(FORWARDはGC内部の転送ポインタだが、下位bitを使う以上は含める) */
+    if (!os_tag_holds_address(tag)) { return; }
     UINT64 low = v & 0xF;
     g_align_val_hist[tag][low]++;
     if (low != tag) {
@@ -692,6 +694,9 @@ static const char *align_tag_name(UINT64 tag) {
         case TAG_INSTANCE:    return "INSTANCE";
         case TAG_FORWARD:     return "FORWARD";
         case TAG_RAW_POINTER: return "RAWPTR";
+        /* [4bit化] アドレス側(bit0=1)の未割当。値が現れたら報告に出したい */
+        case 0xBULL:          return "UNASSIGNED-B";
+        case 0xDULL:          return "UNASSIGNED-D";
         default:              return "?";
     }
 }
@@ -859,14 +864,15 @@ void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
    コピーしており、実際に未管理だったのはprint.cのbignum印字用作業バッファ2箇所
    だけである(fe97f45で解消)。 */
 /** [GCデバッグ] stale領域を塗るトラップパターン。
-   タグはTAG_RAW_POINTER(0x7)にする。**「タグとして不正な値」は作れない**
-   — 0x0〜0x7の8値はすべて使用中である(FIXNUM/CONS/SYMBOL/CHAR/STRING/
-   INSTANCE/FORWARD/RAW_POINTER)。そこで「GCが決して追いかけないタグ」を選ぶ。
-   gc_copy_valueはFIXNUM/CHAR/RAW_POINTERをその場で返すので、トラップを
-   デリファレンスしない。
-   当初はTAG_FORWARD(0x6)にしていたが、これはGCが転送ポインタとみなして
-   追いかけるタグであり、生きた構造の中にトラップが入るとGC自身が
-   canonicalでないアドレスを読んでGP例外で止まっていた(gc_copy_value+0x33)。 */
+   [4bit化] タグは TAG_MARKER(0xE) にする。満たすべき条件は2つある:
+     1. GCが追いかけないこと(os_tag_is_heap_ref が偽)。追いかけるタグを選ぶと、
+        生きた構造の中にトラップが入ったときGC自身がcanonicalでないアドレスを
+        読んでGP例外で止まる。3bit時代に TAG_FORWARD を選んで実際にそうなった
+        (gc_copy_value+0x33)ため TAG_RAW_POINTER へ移した経緯がある
+     2. Lisp値のタグとして決して現れないこと。現れるタグだと、トラップを
+        観測しても「バグかどうか」が言えない
+   3bitでは8値すべてが使用中で 2 を満たす枠が無く、1 だけで妥協していた。
+   4bitで TAG_MARKER(MAGIC_*の下位4bit専用の予約値)ができ、両方を満たせる。 */
 #define GC_DEBUG_TRAP_PATTERN GC_DEBUG_TRAP_PATTERN_VALUE
 
 /** [GCデバッグ] staleなデリファレンスを検出した回数 */
@@ -921,7 +927,9 @@ void os_gc_debug_check_protect_slow(lisp_val_t *var, const char *file, int line)
     }
     lisp_val_t v = *var;
     UINT64 tag = v & TAG_MASK;
-    if (tag == TAG_FIXNUM || tag == TAG_CHAR || tag == TAG_RAW_POINTER) {
+    /* [4bit化] 「GCが追いかける値か」は os_tag_is_heap_ref が唯一の判断元。
+       即値・raw pointer・未割当タグはここで返る */
+    if (!os_tag_is_heap_ref(tag)) {
         return;
     }
     UINT8 *addr = (UINT8 *)(lisp_addr_t)(v & ~TAG_MASK);
@@ -2600,10 +2608,12 @@ static void os_gc_collect_body(void) {
     // ここをトラップパターンで塗り潰す。**全コピーとfixupが終わった後**でなければ
     // ならない(forwarding pointerを旧From空間へ書く実装なので、GC自身がまだ
     // 旧From空間を読んでいる間に塗るとGCが壊れる)。
-    // 塗る値のタグはTAG_FORWARD(0x6)にする。forwarding pointerはGCの内部でしか
-    // 現れないはずの値なので、これを観測したコードは必ずバグである。タグ0〜7は
-    // すべて有効値として使われており「タグとして不正な値」は作れないため、
-    // 「本来ありえないタグ」を選ぶのが最も検出しやすい
+    // 塗る値のタグは TAG_MARKER(0xE) にする。即値側(bit0=0)なので
+    // os_tag_is_heap_ref が偽を返し、GCがトラップをデリファレンスすることはない。
+    // かつ TAG_MARKER は MAGIC_* の下位4bit専用の予約値で、**Lisp値のタグとしては
+    // 決して現れない**ので、これを値として観測したコードは必ずバグである。
+    // (3bit時代は「GCが追いかけない」条件しか満たせず TAG_RAW_POINTER を使っていた。
+    //  4bit化で「追いかけない」かつ「値として現れない」の両方を満たす枠ができた)
     {
         // 旧From空間のうち実際に使われていた範囲だけを塗る。半ヒープ全体を毎GC
         // 塗るのは高コストで、未使用部分にはstaleなオブジェクトが存在しない
@@ -3237,12 +3247,16 @@ void os_reset_runtime_state_for_test(void) {
 
 
 /**
- * charオブジェクトを作る(即値、ヒープ確保なし)。
- * @param c 表現する文字
- * @return タグ付けされたCHAR
+ * characterオブジェクトを作る(即値、ヒープ確保なし)。
+ * @param code Unicodeコードポイント(32bit、bit32-63に入る)
+ * @return タグ付けされたCHARACTER
+ *
+ * [4bit化] 引数は UINT32。以前は `const char` で、0x80以上の文字を渡すと
+ * 符号拡張が起きて上位ビットがすべて1になっていた(3bit時代は
+ * CHAR_VALUE_SHIFT=3 で上位が捨てられず、値がそのまま汚れていた)。
  */
-lisp_val_t os_make_char(const char c) {
-    return ((lisp_val_t)c) << CHAR_VALUE_SHIFT | TAG_CHAR;
+lisp_val_t os_make_char(const UINT32 code) {
+    return ((lisp_val_t)code) << CHAR_VALUE_SHIFT | TAG_CHAR;
 }
 
 /**
@@ -7457,7 +7471,7 @@ lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
         return g_sym_eval_error;
     }
     UINT8 *bytes = (UINT8 *)(addr + 8);
-    return os_make_char((char)bytes[idx]);
+    return os_make_char(bytes[idx])  /* [4bit化] bytesはUINT8*。charへ落とすと符号拡張する */;
 }
 
 /**
@@ -7531,7 +7545,7 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
                 return g_sym_eval_error;
             }
             UINT8 *bytes = (UINT8 *)(addr + 8);
-            return os_make_char((char)bytes[idx]);
+            return os_make_char(bytes[idx])  /* [4bit化] bytesはUINT8*。charへ落とすと符号拡張する */;
         }
         case TAG_INSTANCE: {
             if (!is_vector(seq)) {

@@ -122,7 +122,7 @@ static void setup_heap() {
 
 void test_os_make_fixnum() {
     lisp_val_t f1 = os_make_fixnum(42);
-    assert(f1 >> 3 == 42, "os_make_fixnum(42)は3bit右シフトで42に戻る");
+    assert(f1 >> FIXNUM_VALUE_SHIFT == 42, "os_make_fixnum(42)はFIXNUM_VALUE_SHIFT分の右シフトで42に戻る");
 }
 
 #define BOOT_ALLOC_TEST_SIZE (64 * 1024)
@@ -197,7 +197,7 @@ void test_os_make_cons() {
 void test_os_make_char() {
     lisp_val_t c = os_make_char('A');
     assert((c & TAG_MASK) == TAG_CHAR, "os_make_charの戻り値はTAG_CHARを持つ");
-    assert((c >> 3) == 'A', "os_make_char('A')は3bit右シフトで'A'に戻る");
+    assert((c >> CHAR_VALUE_SHIFT) == 'A', "os_make_char('A')はCHAR_VALUE_SHIFT分の右シフトで'A'に戻る");
 }
 
 void test_os_make_string() {
@@ -267,7 +267,7 @@ void test_os_get_variable() {
     // base_env にしかない変数も current_env から(親を辿って)取得できること
     lisp_val_t v1 = os_get_variable(os_make_symbol("sym1"), current_env);
     assert((v1 & TAG_MASK) == TAG_FIXNUM, "fixnumが返ること");
-    assert(v1 >> 3 == 1, "1であること");
+    assert(v1 >> FIXNUM_VALUE_SHIFT == 1, "1であること");
 
     // current_env 自身の変数が取得できること。シンボル名は大文字小文字を区別しない
     lisp_val_t v2 = os_get_variable(os_make_symbol("SYM2"), current_env);
@@ -281,10 +281,10 @@ void test_os_get_variable() {
 
     lisp_val_t v3 = os_get_variable(os_make_symbol("sym1"), current_env);
     assert((v3 & TAG_MASK) == TAG_FIXNUM, "fixnumが返ること");
-    assert(v3 >> 3 == 42, "current_envにセットした42が優先して返る");
+    assert(v3 >> FIXNUM_VALUE_SHIFT == 42, "current_envにセットした42が優先して返る");
 
     lisp_val_t v4 = os_get_variable(os_make_symbol("sym1"), base_env);
-    assert(v4 >> 3 == 1, "base_env自身の値は書き換えられていないこと");
+    assert(v4 >> FIXNUM_VALUE_SHIFT == 1, "base_env自身の値は書き換えられていないこと");
 
     // 未定義のシンボルはnilが返ること
     lisp_val_t v5 = os_get_variable(os_make_symbol("undefined"), current_env);
@@ -573,18 +573,18 @@ void test_primitive_arithmetic_with_float() {
 
 void test_primitive_multiply() {
     lisp_val_t r = primitive_multiply(make_arg_list(3, 2, 3, 4), nil);
-    assert(r >> 3 == 24, "(* 2 3 4) は24");
+    assert(r >> FIXNUM_VALUE_SHIFT == 24, "(* 2 3 4) は24");
 
     lisp_val_t r2 = primitive_multiply(make_arg_list(1, 5), nil);
-    assert(r2 >> 3 == 5, "(* 5) は5");
+    assert(r2 >> FIXNUM_VALUE_SHIFT == 5, "(* 5) は5");
 }
 
 void test_primitive_divide() {
     lisp_val_t r = primitive_divide(make_arg_list(2, 12, 3), nil);
-    assert(r >> 3 == 4, "(/ 12 3) は4");
+    assert(r >> FIXNUM_VALUE_SHIFT == 4, "(/ 12 3) は4");
 
     lisp_val_t r2 = primitive_divide(make_arg_list(3, 24, 4, 2), nil);
-    assert(r2 >> 3 == 3, "(/ 24 4 2) は3");
+    assert(r2 >> FIXNUM_VALUE_SHIFT == 3, "(/ 24 4 2) は3");
 
     lisp_val_t r3 = primitive_divide(make_arg_list(2, 5, 0), nil);
     assert(r3 == g_sym_eval_error, "(/ 5 0) はg_sym_eval_error");
@@ -618,8 +618,8 @@ void test_primitive_num_not_equal_ge_le() {
 }
 
 void test_primitive_max_min_abs() {
-    assert(primitive_max(make_arg_list(3, 1, 5, 3), nil) >> 3 == 5, "(max 1 5 3) は5");
-    assert(primitive_min(make_arg_list(3, 5, 1, 3), nil) >> 3 == 1, "(min 5 1 3) は1");
+    assert(primitive_max(make_arg_list(3, 1, 5, 3), nil) >> FIXNUM_VALUE_SHIFT == 5, "(max 1 5 3) は5");
+    assert(primitive_min(make_arg_list(3, 5, 1, 3), nil) >> FIXNUM_VALUE_SHIFT == 1, "(min 5 1 3) は1");
 
     lisp_val_t vals1[2] = {os_make_fixnum_signed(1, 5), os_make_fixnum(3)};
     assert(primitive_max(make_arg_list_vals(2, vals1), nil) == os_make_fixnum(3), "(max -5 3) は3");
@@ -1109,8 +1109,8 @@ void test_primitive_array_dimensions() {
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
 
     lisp_val_t result = primitive_array_dimensions(os_make_cons(array, nil), nil);
-    assert(cc_car(result) >> 3 == 2, "(array-dimensions a)の1番目は2");
-    assert(cc_car(cc_cdr(result)) >> 3 == 3, "(array-dimensions a)の2番目は3");
+    assert(cc_car(result) >> FIXNUM_VALUE_SHIFT == 2, "(array-dimensions a)の1番目は2");
+    assert(cc_car(cc_cdr(result)) >> FIXNUM_VALUE_SHIFT == 3, "(array-dimensions a)の2番目は3");
     assert(cc_cdr(cc_cdr(result)) == nil, "(array-dimensions a)の終端はnil");
 }
 
@@ -1118,7 +1118,7 @@ void test_primitive_array_dimensions_on_string() {
     lisp_val_t str = os_make_string("foo");
 
     lisp_val_t result = primitive_array_dimensions(os_make_cons(str, nil), nil);
-    assert(cc_car(result) >> 3 == 3, "(array-dimensions \"foo\")の1番目は3");
+    assert(cc_car(result) >> FIXNUM_VALUE_SHIFT == 3, "(array-dimensions \"foo\")の1番目は3");
     assert(cc_cdr(result) == nil, "(array-dimensions \"foo\")の終端はnil");
 }
 
@@ -1132,12 +1132,12 @@ void test_primitive_aref_reads_back_value() {
         os_make_cons(os_make_fixnum(1),
         os_make_cons(os_make_fixnum(2), nil))));
     lisp_val_t set_result = primitive_set_aref(set_args, nil);
-    assert(set_result >> 3 == 99, "(set-aref 99 a 1 2)は書き込んだ99を返す");
+    assert(set_result >> FIXNUM_VALUE_SHIFT == 99, "(set-aref 99 a 1 2)は書き込んだ99を返す");
 
     lisp_val_t aref_args = os_make_cons(array,
         os_make_cons(os_make_fixnum(1),
         os_make_cons(os_make_fixnum(2), nil)));
-    assert(primitive_aref(aref_args, nil) >> 3 == 99, "(aref a 1 2)は書き込んだ99を返す");
+    assert(primitive_aref(aref_args, nil) >> FIXNUM_VALUE_SHIFT == 99, "(aref a 1 2)は書き込んだ99を返す");
 
     lisp_val_t other_args = os_make_cons(array,
         os_make_cons(os_make_fixnum(0),
@@ -1166,29 +1166,29 @@ void test_primitive_vector() {
     assert(primitive_aref(aref_args, nil) == os_make_symbol("b"), "(aref (vector 'a 'b 'c) 1)は'b");
 
     lisp_val_t empty = primitive_vector(nil, nil);
-    assert(primitive_length(os_make_cons(empty, nil), nil) >> 3 == 0, "(vector)は空のvectorを返す");
+    assert(primitive_length(os_make_cons(empty, nil), nil) >> FIXNUM_VALUE_SHIFT == 0, "(vector)は空のvectorを返す");
 }
 
 void test_primitive_create_vector() {
     lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
-    assert(primitive_length(os_make_cons(vec, nil), nil) >> 3 == 3, "(create-vector 3)の長さは3");
+    assert(primitive_length(os_make_cons(vec, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(create-vector 3)の長さは3");
     lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(0), nil));
     assert(primitive_aref(aref_args, nil) == nil, "初期値省略時は各要素がnil");
 
     lisp_val_t vec_filled = primitive_create_vector(
         os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(99), nil)), nil);
     lisp_val_t aref_args2 = os_make_cons(vec_filled, os_make_cons(os_make_fixnum(1), nil));
-    assert(primitive_aref(aref_args2, nil) >> 3 == 99, "初期値指定時は各要素がその値で初期化される");
+    assert(primitive_aref(aref_args2, nil) >> FIXNUM_VALUE_SHIFT == 99, "初期値指定時は各要素がその値で初期化される");
 }
 
 void test_primitive_garef_set_garef() {
     lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
     lisp_val_t set_args = os_make_cons(os_make_fixnum(42),
         os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_set_aref(set_args, nil) >> 3 == 42, "set-garefはset-arefと同じ実体で書き込める");
+    assert(primitive_set_aref(set_args, nil) >> FIXNUM_VALUE_SHIFT == 42, "set-garefはset-arefと同じ実体で書き込める");
 
     lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil));
-    assert(primitive_aref(aref_args, nil) >> 3 == 42, "garefはarefと同じ実体で読み込める");
+    assert(primitive_aref(aref_args, nil) >> FIXNUM_VALUE_SHIFT == 42, "garefはarefと同じ実体で読み込める");
 }
 
 void test_primitive_set_car() {
@@ -1196,9 +1196,9 @@ void test_primitive_set_car() {
     lisp_val_t args = os_make_cons(c, os_make_cons(os_make_fixnum(99), nil));
 
     lisp_val_t r = primitive_set_car(args, nil);
-    assert(r >> 3 == 99, "(set-car c 99)は書き込んだ99を返す");
-    assert(cc_car(c) >> 3 == 99, "carが99に書き換えられている");
-    assert(cc_cdr(c) >> 3 == 2, "cdrは書き換えられていない");
+    assert(r >> FIXNUM_VALUE_SHIFT == 99, "(set-car c 99)は書き込んだ99を返す");
+    assert(cc_car(c) >> FIXNUM_VALUE_SHIFT == 99, "carが99に書き換えられている");
+    assert(cc_cdr(c) >> FIXNUM_VALUE_SHIFT == 2, "cdrは書き換えられていない");
 }
 
 void test_primitive_set_cdr() {
@@ -1206,9 +1206,9 @@ void test_primitive_set_cdr() {
     lisp_val_t args = os_make_cons(c, os_make_cons(os_make_fixnum(99), nil));
 
     lisp_val_t r = primitive_set_cdr(args, nil);
-    assert(r >> 3 == 99, "(set-cdr c 99)は書き込んだ99を返す");
-    assert(cc_cdr(c) >> 3 == 99, "cdrが99に書き換えられている");
-    assert(cc_car(c) >> 3 == 1, "carは書き換えられていない");
+    assert(r >> FIXNUM_VALUE_SHIFT == 99, "(set-cdr c 99)は書き込んだ99を返す");
+    assert(cc_cdr(c) >> FIXNUM_VALUE_SHIFT == 99, "cdrが99に書き換えられている");
+    assert(cc_car(c) >> FIXNUM_VALUE_SHIFT == 1, "carは書き換えられていない");
 }
 
 void test_primitive_set_aref_out_of_bounds() {
@@ -1244,7 +1244,7 @@ void test_primitive_string_elt() {
     lisp_val_t str = os_make_string("hello");
     lisp_val_t r = primitive_string_elt(os_make_cons(str, os_make_cons(os_make_fixnum(1), nil)), nil);
     assert((r & TAG_MASK) == TAG_CHAR, "(string-elt \"hello\" 1)の戻り値はTAG_CHARを持つ");
-    assert((r >> 3) == 'e', "(string-elt \"hello\" 1)は'e'を返す");
+    assert((r >> CHAR_VALUE_SHIFT) == 'e', "(string-elt \"hello\" 1)は'e'を返す");
 }
 
 void test_primitive_string_elt_out_of_bounds() {
@@ -1288,12 +1288,12 @@ void test_primitive_string_comparisons() {
 
 void test_primitive_char_index() {
     lisp_val_t str = os_make_string("abcab");
-    assert(primitive_char_index(os_make_cons(os_make_char('b'), os_make_cons(str, nil)), nil) >> 3 == 1,
+    assert(primitive_char_index(os_make_cons(os_make_char('b'), os_make_cons(str, nil)), nil) >> FIXNUM_VALUE_SHIFT == 1,
            "(char-index #\\b \"abcab\") は1");
     assert(primitive_char_index(os_make_cons(os_make_char('B'), os_make_cons(str, nil)), nil) == nil,
            "(char-index #\\B \"abcab\") はnil(大文字小文字を区別する)");
     lisp_val_t args_with_start = os_make_cons(os_make_char('b'), os_make_cons(str, os_make_cons(os_make_fixnum(2), nil)));
-    assert(primitive_char_index(args_with_start, nil) >> 3 == 4, "(char-index #\\b \"abcab\" 2) は4");
+    assert(primitive_char_index(args_with_start, nil) >> FIXNUM_VALUE_SHIFT == 4, "(char-index #\\b \"abcab\" 2) は4");
     assert(primitive_char_index(os_make_cons(os_make_char('d'), os_make_cons(str, nil)), nil) == nil,
            "(char-index #\\d \"abcab\") はnil");
     lisp_val_t args_a_from_4 = os_make_cons(os_make_char('a'), os_make_cons(str, os_make_cons(os_make_fixnum(4), nil)));
@@ -1302,19 +1302,19 @@ void test_primitive_char_index() {
 
 void test_primitive_string_index() {
     lisp_val_t foobar = os_make_string("foobar");
-    assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(foobar, nil)), nil) >> 3 == 0,
+    assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(foobar, nil)), nil) >> FIXNUM_VALUE_SHIFT == 0,
            "(string-index \"foo\" \"foobar\") は0");
-    assert(primitive_string_index(os_make_cons(os_make_string("bar"), os_make_cons(foobar, nil)), nil) >> 3 == 3,
+    assert(primitive_string_index(os_make_cons(os_make_string("bar"), os_make_cons(foobar, nil)), nil) >> FIXNUM_VALUE_SHIFT == 3,
            "(string-index \"bar\" \"foobar\") は3");
     assert(primitive_string_index(os_make_cons(os_make_string("FOO"), os_make_cons(foobar, nil)), nil) == nil,
            "(string-index \"FOO\" \"foobar\") はnil(大文字小文字を区別する)");
     lisp_val_t foo_from_1 = os_make_cons(os_make_string("foo"), os_make_cons(foobar, os_make_cons(os_make_fixnum(1), nil)));
     assert(primitive_string_index(foo_from_1, nil) == nil, "(string-index \"foo\" \"foobar\" 1) はnil");
     lisp_val_t bar_from_1 = os_make_cons(os_make_string("bar"), os_make_cons(foobar, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_string_index(bar_from_1, nil) >> 3 == 3, "(string-index \"bar\" \"foobar\" 1) は3");
+    assert(primitive_string_index(bar_from_1, nil) >> FIXNUM_VALUE_SHIFT == 3, "(string-index \"bar\" \"foobar\" 1) は3");
     assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(os_make_string(""), nil)), nil) == nil,
            "(string-index \"foo\" \"\") はnil");
-    assert(primitive_string_index(os_make_cons(os_make_string(""), os_make_cons(os_make_string("foo"), nil)), nil) >> 3 == 0,
+    assert(primitive_string_index(os_make_cons(os_make_string(""), os_make_cons(os_make_string("foo"), nil)), nil) >> FIXNUM_VALUE_SHIFT == 0,
            "(string-index \"\" \"foo\") は0(空文字列は即マッチ)");
 }
 
@@ -1339,15 +1339,15 @@ void test_primitive_length() {
     lisp_val_t list = os_make_cons(os_make_fixnum(1),
                         os_make_cons(os_make_fixnum(2),
                           os_make_cons(os_make_fixnum(3), nil)));
-    assert(primitive_length(os_make_cons(list, nil), nil) >> 3 == 3, "(length '(1 2 3))は3");
-    assert(primitive_length(os_make_cons(nil, nil), nil) >> 3 == 0, "(length nil)は0");
+    assert(primitive_length(os_make_cons(list, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(length '(1 2 3))は3");
+    assert(primitive_length(os_make_cons(nil, nil), nil) >> FIXNUM_VALUE_SHIFT == 0, "(length nil)は0");
 
     lisp_val_t str = os_make_string("hello");
-    assert(primitive_length(os_make_cons(str, nil), nil) >> 3 == 5, "(length \"hello\")は5");
+    assert(primitive_length(os_make_cons(str, nil), nil) >> FIXNUM_VALUE_SHIFT == 5, "(length \"hello\")は5");
 
     lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
-    assert(primitive_length(os_make_cons(array, nil), nil) >> 3 == 6, "(length (make-array '(2 3)))は次元に関わらず全要素数の6");
+    assert(primitive_length(os_make_cons(array, nil), nil) >> FIXNUM_VALUE_SHIFT == 6, "(length (make-array '(2 3)))は次元に関わらず全要素数の6");
 }
 
 void test_primitive_elt() {
@@ -1388,14 +1388,14 @@ void test_primitive_set_elt() {
                         os_make_cons(os_make_fixnum(2),
                           os_make_cons(os_make_fixnum(3), nil)));
     lisp_val_t set_list_args = os_make_cons(os_make_fixnum(99), os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_set_elt(set_list_args, nil) >> 3 == 99, "(set-elt 99 list 1) は書き込んだ99を返す");
-    assert(primitive_elt(os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)), nil) >> 3 == 99,
+    assert(primitive_set_elt(set_list_args, nil) >> FIXNUM_VALUE_SHIFT == 99, "(set-elt 99 list 1) は書き込んだ99を返す");
+    assert(primitive_elt(os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)), nil) >> FIXNUM_VALUE_SHIFT == 99,
            "set-eltで書き換えた後のlistの1番目は99");
 
     lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
     lisp_val_t set_vec_args = os_make_cons(os_make_fixnum(42), os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_set_elt(set_vec_args, nil) >> 3 == 42, "(set-elt 42 vec 1) は書き込んだ42を返す");
-    assert(primitive_elt(os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)), nil) >> 3 == 42,
+    assert(primitive_set_elt(set_vec_args, nil) >> FIXNUM_VALUE_SHIFT == 42, "(set-elt 42 vec 1) は書き込んだ42を返す");
+    assert(primitive_elt(os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)), nil) >> FIXNUM_VALUE_SHIFT == 42,
            "set-eltで書き換えた後のvecの1番目は42");
 
     lisp_val_t out_of_range_args = os_make_cons(os_make_fixnum(1), os_make_cons(list, os_make_cons(os_make_fixnum(5), nil)));
@@ -1423,13 +1423,13 @@ void test_primitive_subseq() {
            "(subseq '(a b c d e f) 1 4) の1番目はc");
     assert(primitive_elt(os_make_cons(list_result, os_make_cons(os_make_fixnum(2), nil)), nil) == os_make_symbol("D"),
            "(subseq '(a b c d e f) 1 4) の2番目はd");
-    assert(primitive_length(os_make_cons(list_result, nil), nil) >> 3 == 3, "(subseq '(a b c d e f) 1 4) の長さは3");
+    assert(primitive_length(os_make_cons(list_result, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(subseq '(a b c d e f) 1 4) の長さは3");
 
     lisp_val_t vec = primitive_vector(list, nil);
     lisp_val_t vec_result = primitive_subseq(
         os_make_cons(vec, os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(4), nil))), nil);
     assert((vec_result & TAG_MASK) == TAG_INSTANCE, "(subseq (vector ...) 1 4) の戻り値はTAG_INSTANCEを持つ(VECTOR)");
-    assert(primitive_length(os_make_cons(vec_result, nil), nil) >> 3 == 3, "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の長さは3");
+    assert(primitive_length(os_make_cons(vec_result, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の長さは3");
     assert(primitive_elt(os_make_cons(vec_result, os_make_cons(os_make_fixnum(0), nil)), nil) == os_make_symbol("B"),
            "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の0番目はb");
     assert(primitive_elt(os_make_cons(vec_result, os_make_cons(os_make_fixnum(2), nil)), nil) == os_make_symbol("D"),
@@ -1613,18 +1613,27 @@ static void test_literal_slot_reclaim_callback(lisp_val_t *slot_addr) {
 }
 void test_os_environment_register_and_reclaim_literal_slots() {
     lisp_val_t env = os_make_environment(os_make_symbol("LITERAL-SLOTS-TEST-ENV"), nil);
-    lisp_val_t fake_slot_a = os_make_fixnum(111);
-    lisp_val_t fake_slot_b = os_make_fixnum(222);
+    /* [4bit化] スロットのアドレスは TAG_RAW_POINTER を付けて保存されるので、
+       **16byte境界に置かないと下位4bitが落ちて別々のスロットが同一視される**。
+       本番のリテラルスロットは za_slot_t(16byteストライド、PR #74)なので条件を
+       満たしている。テスト側のダミーも同じ条件にそろえる
+       (3bitタグのころは8byte間隔のスタック変数でもたまたま区別できていた) */
+    static lisp_val_t fake_slots[2] __attribute__((aligned(OS_HEAP_ALIGN)));
+    _Static_assert(sizeof(lisp_val_t) * 2 <= 2 * OS_HEAP_ALIGN, "fake_slots stride assumption");
+    lisp_val_t *fake_slot_a = &fake_slots[0];
+    lisp_val_t *fake_slot_b = (lisp_val_t *)((UINT8 *)&fake_slots[0] + OS_HEAP_ALIGN);
+    *fake_slot_a = os_make_fixnum(111);
+    *fake_slot_b = os_make_fixnum(222);
 
     g_literal_slot_reclaim_seen_count = 0;
-    os_environment_register_literal_slot(env, &fake_slot_a);
-    os_environment_register_literal_slot(env, &fake_slot_b);
+    os_environment_register_literal_slot(env, fake_slot_a);
+    os_environment_register_literal_slot(env, fake_slot_b);
     os_environment_reclaim_literal_slots(env, test_literal_slot_reclaim_callback);
 
     assert(g_literal_slot_reclaim_seen_count == 2, "登録した2件それぞれについてコールバックが呼ばれる");
-    assert((g_literal_slot_reclaim_seen[0] == &fake_slot_a || g_literal_slot_reclaim_seen[0] == &fake_slot_b),
+    assert((g_literal_slot_reclaim_seen[0] == fake_slot_a || g_literal_slot_reclaim_seen[0] == fake_slot_b),
            "コールバックに渡されるのは登録したアドレスのいずれか");
-    assert((g_literal_slot_reclaim_seen[1] == &fake_slot_a || g_literal_slot_reclaim_seen[1] == &fake_slot_b),
+    assert((g_literal_slot_reclaim_seen[1] == fake_slot_a || g_literal_slot_reclaim_seen[1] == fake_slot_b),
            "コールバックに渡されるのは登録したアドレスのいずれか");
     assert(g_literal_slot_reclaim_seen[0] != g_literal_slot_reclaim_seen[1], "同じアドレスが重複して渡されない");
 
@@ -1673,25 +1682,37 @@ void test_gc_symbol_survives_via_symbol_table() {
 }
 
 void test_gc_string_with_forward_tag_colliding_length_is_not_misdetected() {
-    // 長さ6の文字列はword0(=6)の下位3bitがTAG_FORWARD(6)と一致してしまう。
-    // gc_copy_valueがTo空間の範囲外であることを見て誤検知を回避できているかを確認する
-    lisp_val_t sym = os_make_symbol("GC-TEST-STRING-LEN6");
-    lisp_val_t str = os_make_string("abcdef");
+    /* STRINGのword0は**生の長さ**なので、長さの下位ビットがたまたま TAG_FORWARD と
+       一致する文字列が必ず存在する。長さは Lisp プログラムが決めるので制御できない
+       (documents/tag4-design.md 5.4 が「範囲検査は廃止できない」と結論した理由)。
+       gc_copy_value が To空間の範囲外であることを見て誤検知を回避できているかを確認する。
+
+       [4bit化] 長さは TAG_FORWARD から作る。直書きの6のままだと、タグ値を動かした
+       ときにこのテストだけが「衝突しない長さ」を試し続けて黙って無意味になる。 */
+    const UINT64 colliding_len = TAG_FORWARD;
+    char content[64];
+    assert(colliding_len < sizeof(content), "衝突する長さがテスト用バッファに収まる");
+    for (UINT64 i = 0; i < colliding_len; i++) { content[i] = (char)('a' + (i % 26)); }
+    content[colliding_len] = '\0';
+
+    lisp_val_t sym = os_make_symbol("GC-TEST-STRING-FWD-LEN");
+    lisp_val_t str = os_make_string(content);
     UINT64 *header = (UINT64 *)(str & ~TAG_MASK);
-    assert((header[0] & TAG_MASK) == TAG_FORWARD, "長さ6の文字列はword0の下位3bitがTAG_FORWARDと一致する(前提条件)");
+    assert((header[0] & TAG_MASK) == TAG_FORWARD,
+           "長さがTAG_FORWARDと同値の文字列は、word0の下位ビットがTAG_FORWARDと一致する(前提条件)");
     os_set_variable(sym, str, global_environment);
     lisp_addr_t addr_before = str & ~TAG_MASK;
 
     os_gc_collect();
 
     // symはGC前のFrom空間アドレスのままなので、検索にはGC後に取り直したsymbolを使う
-    lisp_val_t after = os_get_variable(os_make_symbol("GC-TEST-STRING-LEN6"), global_environment);
+    lisp_val_t after = os_get_variable(os_make_symbol("GC-TEST-STRING-FWD-LEN"), global_environment);
     assert((after & TAG_MASK) == TAG_STRING, "誤検知が起きてもGC後のタグはTAG_STRINGのまま");
     assert((after & ~TAG_MASK) != addr_before, "誤検知が起きても文字列はTo空間へ再配置される");
 
-    char buf[16];
+    char buf[64];
     os_string_to_cstr(after, buf, sizeof(buf));
-    assert(strncmp(buf, "abcdef", 6) == 0, "誤検知が起きても文字列の内容は破壊されず保たれる");
+    assert(strncmp(buf, content, (size_t)colliding_len) == 0, "誤検知が起きても文字列の内容は破壊されず保たれる");
 }
 
 void test_gc_instance_survives() {

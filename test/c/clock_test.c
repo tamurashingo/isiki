@@ -132,23 +132,23 @@ static void setup_heap() {
 
 void test_get_internal_real_time_returns_tick_counter() {
     lisp_val_t result = primitive_get_internal_real_time(nil, nil);
-    assert(result >> 3 == g_fake_tick_counter, "get-internal-real-timeはtickカウンタをそのまま返す");
+    assert(result >> FIXNUM_VALUE_SHIFT == g_fake_tick_counter, "get-internal-real-timeはtickカウンタをそのまま返す");
 }
 
 void test_get_internal_run_time_returns_tick_counter() {
     lisp_val_t result = primitive_get_internal_run_time(nil, nil);
-    assert(result >> 3 == g_fake_tick_counter, "get-internal-run-timeはget-internal-real-timeと同じtickカウンタを流用する");
+    assert(result >> FIXNUM_VALUE_SHIFT == g_fake_tick_counter, "get-internal-run-timeはget-internal-real-timeと同じtickカウンタを流用する");
 }
 
 void test_internal_time_units_per_second_returns_100() {
     lisp_val_t result = primitive_internal_time_units_per_second(nil, nil);
-    assert(result >> 3 == 100, "internal-time-units-per-secondはPITの約100Hzに対応する100を返す");
+    assert(result >> FIXNUM_VALUE_SHIFT == 100, "internal-time-units-per-secondはPITの約100Hzに対応する100を返す");
 }
 
 void test_get_universal_time_adds_elapsed_seconds_to_boot_epoch() {
     lisp_val_t result = primitive_get_universal_time(nil, nil);
     UINT64 expected = g_fake_boot_epoch_seconds + (g_fake_tick_counter / 100);
-    assert(result >> 3 == expected, "get-universal-timeは起動時UTCにtickカウンタ由来の経過秒数を加算する");
+    assert(result >> FIXNUM_VALUE_SHIFT == expected, "get-universal-timeは起動時UTCにtickカウンタ由来の経過秒数を加算する");
 }
 
 void test_os_register_clock_binds_symbols() {

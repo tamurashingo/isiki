@@ -4,24 +4,64 @@
 #include "types.h"
 #include "process.h"
 
-/** タグ位置(下位3bit)を取り出すマスク */
-#define TAG_MASK     0x7ULL
-/** 即値のfixnum(000) */
+/* ===== タグ体系(4bit) =====================================================
+ *
+ * **bit0 = 0 が即値、bit0 = 1 がアドレスを持つ値**。この1bitで
+ * 「下位4bitを0にできる値か(= 16byte境界を要求してよいか)」が決まる。
+ *
+ *   値   種別    型
+ *   0x0  即値    fixnum
+ *   0x2  即値    character
+ *   0x4  即値    single-float (**予約のみ。実装していない**)
+ *   0x6  即値    未割当
+ *   0x8  即値    未割当
+ *   0xA  即値    未割当
+ *   0xC  即値    未割当
+ *   0xE  即値    予約(マーカー一族。MAGIC_* の下位4bit)
+ *   0x1  アドレス cons
+ *   0x3  アドレス symbol
+ *   0x5  アドレス string
+ *   0x7  アドレス instance
+ *   0x9  アドレス raw pointer (GC管理外)
+ *   0xB  アドレス 未割当(将来の double-float 用に空けておく)
+ *   0xD  アドレス 未割当(将来の ratio 用に空けておく)
+ *   0xF  アドレス forward (GC中のみ)
+ *
+ * 「アドレスを持つ」と「GCが追いかける」は**別の概念**である。raw pointer は
+ * アドレスを持つがGC管理外で、forward はGC内部専用。どのタグをGCが追いかけるかは
+ * os_tag_is_heap_ref が唯一の判断元。
+ */
+
+/** タグ位置(下位4bit)を取り出すマスク */
+#define TAG_MASK     0xFULL
+
+/** [単一の真実源] タグがアドレスを持つ値を表すか(bit0)。0なら即値 */
+#define TAG_IS_POINTER_BIT 0x1ULL
+
+/** 即値のfixnum(0000) */
 #define TAG_FIXNUM   0x0ULL
-/** cons cellへのアドレス(001) */
+/** cons cellへのアドレス(0001) */
 #define TAG_CONS     0x1ULL
-/** symbolへのアドレス(010) */
-#define TAG_SYMBOL   0x2ULL
-/** 即値のchar(011) */
-#define TAG_CHAR     0x3ULL
-/** stringへのアドレス(100) */
-#define TAG_STRING   0x4ULL
-/** instance(function/process等)へのアドレス(101) */
-#define TAG_INSTANCE 0x5ULL
-/** GCが転送済みオブジェクトの新しい位置を指すために使う、転送先アドレス(110)。ヒープ上のオブジェクトのword0にのみ現れる */
-#define TAG_FORWARD  0x6ULL
-/** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等)。fixnum/charと同様の即値として扱い、GCは素通しする(111) */
-#define TAG_RAW_POINTER 0x7ULL
+/** 即値のcharacter(0010)。コードポイントはbit32-63の32bit */
+#define TAG_CHAR     0x2ULL
+/** symbolへのアドレス(0011) */
+#define TAG_SYMBOL   0x3ULL
+/** 即値のsingle-float(0100)。**枠を予約しているだけで実装していない**。
+    <float>はIEEE754 binary64のままヒープ(MAGIC_FLOAT)に置く */
+#define TAG_SINGLE_FLOAT 0x4ULL
+/** stringへのアドレス(0101) */
+#define TAG_STRING   0x5ULL
+/** instance(function/process等)へのアドレス(0111) */
+#define TAG_INSTANCE 0x7ULL
+/** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等、1001)。GCは素通しする */
+#define TAG_RAW_POINTER 0x9ULL
+/** GCが転送済みオブジェクトの新しい位置を指すために使う、転送先アドレス(1111)。
+    ヒープ上のオブジェクトのword0にのみ現れる。MAGIC_*の下位4bitは0xEなので、
+    **MAGIC値がこのタグと一致することは構造的にない**(PR #77) */
+#define TAG_FORWARD  0xFULL
+
+/** MAGIC_*の下位4bitに使う予約値(1110)。即値側なのでGCは追いかけない */
+#define TAG_MARKER   0xEULL
 
 /* --- タグ値の不変条件 ---------------------------------------------------
    タグ幅を広げる改修(TAG_MASK を 0xF にする等)で最初に壊れるのがここ。
@@ -37,13 +77,48 @@ _Static_assert(TAG_STRING      <= TAG_MASK, "TAG_STRING does not fit in TAG_MASK
 _Static_assert(TAG_INSTANCE    <= TAG_MASK, "TAG_INSTANCE does not fit in TAG_MASK");
 _Static_assert(TAG_FORWARD     <= TAG_MASK, "TAG_FORWARD does not fit in TAG_MASK");
 _Static_assert(TAG_RAW_POINTER <= TAG_MASK, "TAG_RAW_POINTER does not fit in TAG_MASK");
+_Static_assert(TAG_SINGLE_FLOAT <= TAG_MASK, "TAG_SINGLE_FLOAT does not fit in TAG_MASK");
+_Static_assert(TAG_MARKER       <= TAG_MASK, "TAG_MARKER does not fit in TAG_MASK");
 /* タグ値が互いに重複しないこと。ビット位置に1を立てて数を数える形で確かめる
-   (同じ値が2つあれば立つビットが8本に満たない) */
+   (同じ値が2つあれば立つビットが10本に満たない) */
 _Static_assert(__builtin_popcountll((1ULL << TAG_FIXNUM) | (1ULL << TAG_CONS) |
                                     (1ULL << TAG_SYMBOL) | (1ULL << TAG_CHAR) |
                                     (1ULL << TAG_STRING) | (1ULL << TAG_INSTANCE) |
-                                    (1ULL << TAG_FORWARD) | (1ULL << TAG_RAW_POINTER)) == 8,
+                                    (1ULL << TAG_FORWARD) | (1ULL << TAG_RAW_POINTER) |
+                                    (1ULL << TAG_SINGLE_FLOAT) | (1ULL << TAG_MARKER)) == 10,
                "TAG_* values are not all distinct");
+
+/* --- bit0 = 「アドレスを持つ」の割り当て ---------------------------------
+   この規約が崩れると os_tag_holds_address が嘘をつき、16byte境界の要求が
+   即値にまで及ぶ(または必要なポインタに及ばなくなる) */
+_Static_assert((TAG_FIXNUM       & TAG_IS_POINTER_BIT) == 0, "TAG_FIXNUM must be an immediate (bit0 = 0)");
+_Static_assert((TAG_CHAR         & TAG_IS_POINTER_BIT) == 0, "TAG_CHAR must be an immediate (bit0 = 0)");
+_Static_assert((TAG_SINGLE_FLOAT & TAG_IS_POINTER_BIT) == 0, "TAG_SINGLE_FLOAT must be an immediate (bit0 = 0)");
+_Static_assert((TAG_MARKER       & TAG_IS_POINTER_BIT) == 0, "TAG_MARKER must be an immediate (bit0 = 0)");
+_Static_assert((TAG_CONS        & TAG_IS_POINTER_BIT) != 0, "TAG_CONS must be a pointer (bit0 = 1)");
+_Static_assert((TAG_SYMBOL      & TAG_IS_POINTER_BIT) != 0, "TAG_SYMBOL must be a pointer (bit0 = 1)");
+_Static_assert((TAG_STRING      & TAG_IS_POINTER_BIT) != 0, "TAG_STRING must be a pointer (bit0 = 1)");
+_Static_assert((TAG_INSTANCE    & TAG_IS_POINTER_BIT) != 0, "TAG_INSTANCE must be a pointer (bit0 = 1)");
+_Static_assert((TAG_RAW_POINTER & TAG_IS_POINTER_BIT) != 0, "TAG_RAW_POINTER must be a pointer (bit0 = 1)");
+_Static_assert((TAG_FORWARD     & TAG_IS_POINTER_BIT) != 0, "TAG_FORWARD must be a pointer (bit0 = 1)");
+
+/* MAGIC_* の下位4bitが TAG_MARKER であることは MAGIC_LOW_NIBBLE 側で確かめる。
+   ここでは TAG_FORWARD と一致しないこと(= PR #77 の振り直しの目的)を固定する */
+_Static_assert(TAG_MARKER != TAG_FORWARD,
+               "MAGIC low nibble (TAG_MARKER) collides with TAG_FORWARD");
+
+/** [GCデバッグ] stale領域を塗るトラップパターンの、タグを除いた土台。
+ *
+ * 上位16bitが 0xDEAD で non-canonical なので、これをデリファレンスすると
+ * ページフォルトではなく **#GP** になる。例外時のレジスタにこの値が載っていれば
+ * staleポインタの参照そのものだと分かる(interrupt.c の例外ダンプが使う)。
+ *
+ * 塗り潰し本体(ISIKIOS_GC_PAINT)と例外ダンプの両方が参照するので、
+ * `#ifdef` の外に置く。タグ付きの実際の値は GC_DEBUG_TRAP_PATTERN_VALUE。
+ */
+#define GC_PAINT_TRAP_PATTERN_BASE 0xDEADDEADDEADDEA0ULL
+_Static_assert((GC_PAINT_TRAP_PATTERN_BASE & TAG_MASK) == 0,
+               "GC_PAINT_TRAP_PATTERN_BASE must have a zero tag field");
 
 /**
  * [単一の真実源] このタグの値はヒープオブジェクトへの参照か(=GCが追いかけるか)。
@@ -57,16 +132,56 @@ _Static_assert(__builtin_popcountll((1ULL << TAG_FIXNUM) | (1ULL << TAG_CONS) |
  * この関数だけを直せばよい。
  */
 static inline int os_tag_is_heap_ref(UINT64 tag) {
-    /* FIXNUM/CHARは即値、RAW_POINTERはGC管理外の生ポインタ。それ以外は
-       ヒープ上のオブジェクトを指す(FORWARDはGC内部の転送ポインタだが、
-       これが外に現れたらそれ自体がバグなので検出対象に含める) */
-    return tag != TAG_FIXNUM && tag != TAG_CHAR && tag != TAG_RAW_POINTER;
+    /* [4bit化] **除外リストではなく列挙にする。** 除外リストのままだと、
+       未割当の10値すべてが「GCが追いかける」側に落ちる。GCが即値をポインタと
+       して追いかけると、生のビットパターンをヒープオブジェクトとして複製し
+       word0へ転送先を書き込む(= 静かなヒープ破壊)。
+       未割当タグは「まだ誰も作らない」だけで「安全」ではないので、
+       明示的に偽を返す側へ置く。 */
+    switch (tag) {
+        case TAG_CONS:
+        case TAG_SYMBOL:
+        case TAG_STRING:
+        case TAG_INSTANCE:
+        /* FORWARDはGC内部の転送ポインタだが、これが外に現れたらそれ自体が
+           バグなので検出対象に含める(PR #72 でこの漏れを直した経緯がある) */
+        case TAG_FORWARD:
+            return 1;
+        /* 即値(bit0=0)はアドレスを持たない */
+        case TAG_FIXNUM:
+        case TAG_CHAR:
+        case TAG_SINGLE_FLOAT:   /* 予約。値は作られない */
+        case TAG_MARKER:         /* 予約。MAGIC_*の下位4bit */
+        case 0x6ULL:             /* 即値・未割当 */
+        case 0x8ULL:             /* 即値・未割当 */
+        case 0xAULL:             /* 即値・未割当 */
+        case 0xCULL:             /* 即値・未割当 */
+        /* アドレスを持つがGC管理外 */
+        case TAG_RAW_POINTER:
+        /* アドレス側の未割当。**将来ここに入る型はヒープ上に置かれる**
+           (double-float / ratio はどちらも即値にできない)ので、いずれ真へ
+           移る枠である。値が存在しない今は偽にしておく — GCが未定義の
+           ビットパターンを追いかけないことのほうが、先回りして真にしておく
+           ことより安全だからである */
+        case 0xBULL:
+        case 0xDULL:
+            return 0;
+        default:
+            return 0;   /* 到達しない(下の_Static_assertが16値を網羅している) */
+    }
+}
+
+/** [単一の真実源] このタグの値はアドレスを保持するか(= 16byte境界を要求してよいか)。
+ *  os_tag_is_heap_ref(GCが追いかけるか)とは**別の概念**である。
+ *  raw pointer と forward はアドレスを持つがGCは追いかけない。 */
+static inline int os_tag_holds_address(UINT64 tag) {
+    return (tag & TAG_IS_POINTER_BIT) != 0;
 }
 
 /** TAG_FIXNUMの値フィールド最上位bit(bit63)。1なら負数を表す(0は常に非負に正規化) */
 #define FIXNUM_SIGN_BIT       0x8000000000000000ULL
-/** TAG_FIXNUMの値フィールドのうちマグニチュードに使う60bit(bit3〜62)分のマスク */
-#define FIXNUM_MAGNITUDE_MASK ((1ULL << 60) - 1)
+/** TAG_FIXNUMの値フィールドのうちマグニチュードに使う59bit(bit4〜62)分のマスク */
+#define FIXNUM_MAGNITUDE_MASK ((1ULL << 59) - 1)
 
 /**
  * [単一の真実源] FIXNUMの値をタグ付き表現へ入れるためのシフト量。
@@ -76,14 +191,14 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
  * (documents/alignment-survey-report.md 5.5)。両者を同じ定数にまとめると、
  * 片方だけを動かしたい改修で必ず事故になる。値が一致しているのは今たまたまである。
  */
-#define FIXNUM_VALUE_SHIFT 3
+#define FIXNUM_VALUE_SHIFT 4
 
 /**
  * [単一の真実源] CHARの文字コードをタグ付き表現へ入れるためのシフト量。
  * FIXNUM_VALUE_SHIFT と同じ理由で、値が同じでも別の定数として扱う
  * (CHARだけ表現を変える改修がありうる)。
  */
-#define CHAR_VALUE_SHIFT 3
+#define CHAR_VALUE_SHIFT 32
 
 /* --- fixnum / char の64bit語レイアウトの不変条件 -------------------------
    1語を「符号bit + マグニチュード + タグ」で分け合っているので、シフト量と
@@ -242,7 +357,7 @@ _Static_assert(MAGIC_BUILTIN_CLASS        < MAGIC_MUST_BE_BELOW, "MAGICが大き
 _Static_assert(MAGIC_STANDARD_CLASS       < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
 /* 全MAGICの下位4bitが 0xE であること。4bitタグ化で TAG_FORWARD(0xF) と
    構造的に衝突しないことの土台になる。メッセージはASCIIで書く */
-#define MAGIC_LOW_NIBBLE 0xEULL
+#define MAGIC_LOW_NIBBLE TAG_MARKER
 _Static_assert((MAGIC_FUNCTION_NATIVE & 0xFULL) == MAGIC_LOW_NIBBLE,      "MAGIC_FUNCTION_NATIVE low nibble is not 0xE");
 _Static_assert((MAGIC_FUNCTION_INTERPRETED & 0xFULL) == MAGIC_LOW_NIBBLE, "MAGIC_FUNCTION_INTERPRETED low nibble is not 0xE");
 _Static_assert((MAGIC_PROCESS & 0xFULL) == MAGIC_LOW_NIBBLE,              "MAGIC_PROCESS low nibble is not 0xE");
@@ -858,7 +973,16 @@ void os_reset_runtime_state_for_test(void);
  * @param c 表現する文字
  * @return タグ付けされたCHAR
  */
-lisp_val_t os_make_char(const char c);
+/**
+ * characterオブジェクトを作る(即値、ヒープ確保なし)。
+ * @param code Unicodeコードポイント(32bit、bit32-63に入る)
+ * @return タグ付けされたCHARACTER
+ *
+ * [4bit化] 引数は **UINT32**。以前は `const char` で、0x80以上の文字を渡すと
+ * 符号拡張で上位ビットがすべて1になっていた。呼び出し側は符号付きの char を
+ * そのまま渡さないこと(UINT8 を経由する)。
+ */
+lisp_val_t os_make_char(const UINT32 code);
 
 /**
  * sをコピーしてstringオブジェクトを作る。
@@ -1227,7 +1351,7 @@ void os_gc_debug_note_painted_field(void);
     一致したときだけ関数呼び出しに落とす。ここを無条件の関数呼び出しにしたところ、
     za.cのlabels+letのJITコンパイルが数分たっても終わらなくなった
     (documents/pitfalls.md 原則6「計器が対象の実行時間を変えていないか」) */
-#define GC_DEBUG_TRAP_PATTERN_VALUE 0xDEADDEADDEADDEA7ULL
+#define GC_DEBUG_TRAP_PATTERN_VALUE (GC_PAINT_TRAP_PATTERN_BASE | TAG_MARKER)
 void os_gc_debug_trap_result_hit(const char *where, void *site);
 #define GC_DEBUG_TRAP_RESULT(v, where) \
     do { \

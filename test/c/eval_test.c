@@ -589,7 +589,7 @@ void test_primitive_apply_calls_interpreted_function_with_list() {
 // 第1引数(evaluated_argsのcar)に加算して返す
 static lisp_val_t lifted_closure_body_add_captured_n(lisp_val_t evaluated_args, lisp_val_t env) {
     lisp_val_t n = os_get_variable(os_make_symbol("N"), env);
-    return os_make_fixnum((cc_car(evaluated_args) >> 3) + (n >> 3));
+    return os_make_fixnum((cc_car(evaluated_args) >> FIXNUM_VALUE_SHIFT) + (n >> FIXNUM_VALUE_SHIFT));
 }
 
 void test_lifted_closure_uses_captured_env_not_caller_env() {

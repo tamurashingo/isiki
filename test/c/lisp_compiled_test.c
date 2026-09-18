@@ -269,7 +269,7 @@ static void setup_heap(void) {
 static void test_transpile_fixture_answer(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_answer(0, 0);
     assert((result & TAG_MASK) == TAG_FIXNUM, "transpiled function returns a fixnum");
-    assert((result >> 3) == 42, "transpiled function returns 42");
+    assert((result >> FIXNUM_VALUE_SHIFT) == 42, "transpiled function returns 42");
 }
 
 static void test_transpile_fixture_string(void) {
@@ -302,7 +302,7 @@ static void test_transpile_fixture_t(void) {
 static void test_transpile_fixture_quoted_fixnum(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_quoted_fixnum(0, 0);
     assert((result & TAG_MASK) == TAG_FIXNUM, "quoted fixnum is still a fixnum");
-    assert((result >> 3) == 99, "quoted fixnum keeps its value");
+    assert((result >> FIXNUM_VALUE_SHIFT) == 99, "quoted fixnum keeps its value");
 }
 
 static void test_transpile_fixture_identity(void) {
@@ -322,15 +322,15 @@ static void test_transpile_fixture_second_param(void) {
 
 static void test_transpile_fixture_if(void) {
     lisp_val_t result_true = lisp_ll_transpile_fixture_if(os_make_cons(os_make_fixnum(5), nil), 0);
-    assert((result_true >> 3) == 1, "if: xがnil以外ならthen節(1)を返す");
+    assert((result_true >> FIXNUM_VALUE_SHIFT) == 1, "if: xがnil以外ならthen節(1)を返す");
 
     lisp_val_t result_false = lisp_ll_transpile_fixture_if(os_make_cons(nil, nil), 0);
-    assert((result_false >> 3) == 2, "if: xがnilならelse節(2)を返す");
+    assert((result_false >> FIXNUM_VALUE_SHIFT) == 2, "if: xがnilならelse節(2)を返す");
 }
 
 static void test_transpile_fixture_if_no_else(void) {
     lisp_val_t result_true = lisp_ll_transpile_fixture_if_no_else(os_make_cons(os_make_fixnum(5), nil), 0);
-    assert((result_true >> 3) == 42, "if(else省略): xがnil以外ならthen節(42)を返す");
+    assert((result_true >> FIXNUM_VALUE_SHIFT) == 42, "if(else省略): xがnil以外ならthen節(42)を返す");
 
     lisp_val_t result_false = lisp_ll_transpile_fixture_if_no_else(os_make_cons(nil, nil), 0);
     assert(result_false == nil, "if(else省略): xがnilならelse省略時のデフォルトnilを返す");
@@ -338,12 +338,12 @@ static void test_transpile_fixture_if_no_else(void) {
 
 static void test_transpile_fixture_progn(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_progn(os_make_cons(os_make_fixnum(1), nil), 0);
-    assert((result >> 3) == 99, "progn: 先頭のxは評価されるが値は捨てられ、最後の式(99)が返る");
+    assert((result >> FIXNUM_VALUE_SHIFT) == 99, "progn: 先頭のxは評価されるが値は捨てられ、最後の式(99)が返る");
 }
 
 static void test_transpile_fixture_setq(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_setq(os_make_cons(os_make_fixnum(1), nil), 0);
-    assert((result >> 3) == 7, "setq: 代入後の新しい値(7)がsetq式自体の値になる");
+    assert((result >> FIXNUM_VALUE_SHIFT) == 7, "setq: 代入後の新しい値(7)がsetq式自体の値になる");
 }
 
 static void test_transpile_fixture_and(void) {
@@ -414,7 +414,7 @@ static void test_transpile_fixture_or_three(void) {
 static void test_transpile_fixture_count_down(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_count_down(os_make_cons(os_make_fixnum(3), nil), 0);
     assert((result & TAG_MASK) == TAG_FIXNUM, "count-down: 自己再帰の結果はfixnum");
-    assert((result >> 3) == 42, "count-down: 3から0まで自己再帰しeqで停止して42を返す");
+    assert((result >> FIXNUM_VALUE_SHIFT) == 42, "count-down: 3から0まで自己再帰しeqで停止して42を返す");
 
     // 末尾呼び出しのトランポリン化の検証: 実測(160バイト/フレーム、64KB・
     // ガード無しのプロセススタック)では素朴なC再帰は約410段でスタックが
@@ -422,7 +422,7 @@ static void test_transpile_fixture_count_down(void) {
     // 呼び出しが起きるフラットなループになるため、100000段の自己再帰でも
     // クラッシュせず定数スタックで完了することを確認する
     lisp_val_t deep_result = lisp_ll_transpile_fixture_count_down(os_make_cons(os_make_fixnum(100000), nil), 0);
-    assert((deep_result >> 3) == 42, "count-down: トランポリンにより100000段の自己再帰でもスタックを溢れさせずに42を返す");
+    assert((deep_result >> FIXNUM_VALUE_SHIFT) == 42, "count-down: トランポリンにより100000段の自己再帰でもスタックを溢れさせずに42を返す");
 }
 
 static void test_transpile_fixture_is_even(void) {
@@ -450,14 +450,14 @@ static void test_transpile_fixture_lambda_capture_value(void) {
 static void test_transpile_fixture_lambda_box_mutate(void) {
     lisp_val_t n = os_make_fixnum(1);
     lisp_val_t result = lisp_ll_transpile_fixture_lambda_box_mutate(os_make_cons(n, nil), 0);
-    assert((result >> 3) == 99, "lambda-box-mutate: ネストしたlambda内のsetqがboxを介して外側のnに伝播し99を返す");
+    assert((result >> FIXNUM_VALUE_SHIFT) == 99, "lambda-box-mutate: ネストしたlambda内のsetqがboxを介して外側のnに伝播し99を返す");
 }
 
 static void test_transpile_fixture_make_counter_and_call_twice(void) {
     lisp_val_t initial = os_make_fixnum(5);
     lisp_val_t closure = lisp_ll_transpile_fixture_make_counter(os_make_cons(initial, nil), 0);
     lisp_val_t result = lisp_ll_transpile_fixture_call_twice(os_make_cons(closure, nil), 0);
-    assert((result >> 3) == 3,
+    assert((result >> FIXNUM_VALUE_SHIFT) == 3,
            "make-counter/call-twice: make-counterのスタックフレームが失われた後も、"
            "返されたクロージャをcall-twiceが2回funcallすることでboxを共有したまま5→4→3とデクリメントする");
 }
@@ -471,7 +471,7 @@ static void test_transpile_fixture_defdynamic(void) {
 
 static void test_transpile_fixture_dynamic_read(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_dynamic_read(nil, 0);
-    assert((result >> 3) == 42,
+    assert((result >> FIXNUM_VALUE_SHIFT) == 42,
            "dynamic: レキシカルな親子関係を持たない別の関数呼び出しからでも、"
            "直前のdefdynamicがg_dynamic_bindingsへ書き込んだ%%test-dynamic-varの値がそのまま読める");
 }
@@ -556,7 +556,7 @@ static void test_transpile_fixture_case_using(void) {
 
 static void test_transpile_fixture_setf_setq(void) {
     lisp_val_t result = lisp_ll_transpile_fixture_setf_setq(os_make_cons(os_make_fixnum(1), nil), 0);
-    assert((result >> 3) == 42, "setf: placeがsymbolならsetqへ展開され新しい値(42)が返る");
+    assert((result >> FIXNUM_VALUE_SHIFT) == 42, "setf: placeがsymbolならsetqへ展開され新しい値(42)が返る");
 }
 
 static void test_transpile_fixture_setf_car(void) {
@@ -1230,7 +1230,7 @@ static void test_apply(void) {
         os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), os_make_cons(tail_list, nil))));
 
     lisp_val_t result = lisp_ll_apply(evaluated_args, 0);
-    assert((result >> 3) == 10,
+    assert((result >> FIXNUM_VALUE_SHIFT) == 10,
            "apply: (apply #'+ 1 2 '(3 4))はobj*(1 2)と末尾list(3 4)を1本の引数リストに"
            "組み立てて+へ渡し10を返す");
 }
@@ -1241,9 +1241,9 @@ static void test_mapcar(void) {
     lisp_val_t list2 = os_make_cons(os_make_fixnum(10), os_make_cons(os_make_fixnum(20), os_make_cons(os_make_fixnum(30), nil)));
 
     lisp_val_t result = lisp_ll_mapcar(os_make_cons(add_fn, os_make_cons(list1, os_make_cons(list2, nil))), 0);
-    assert((cc_car(result) >> 3) == 11, "mapcar: (mapcar #'+ '(1 2 3) '(10 20 30))の1番目は1+10=11");
-    assert((cc_car(cc_cdr(result)) >> 3) == 22, "mapcar: 2番目は2+20=22");
-    assert((cc_car(cc_cdr(cc_cdr(result))) >> 3) == 33, "mapcar: 3番目は3+30=33");
+    assert((cc_car(result) >> FIXNUM_VALUE_SHIFT) == 11, "mapcar: (mapcar #'+ '(1 2 3) '(10 20 30))の1番目は1+10=11");
+    assert((cc_car(cc_cdr(result)) >> FIXNUM_VALUE_SHIFT) == 22, "mapcar: 2番目は2+20=22");
+    assert((cc_car(cc_cdr(cc_cdr(result))) >> FIXNUM_VALUE_SHIFT) == 33, "mapcar: 3番目は3+30=33");
     assert(cc_cdr(cc_cdr(cc_cdr(result))) == nil, "mapcar: 3要素で終端する");
 }
 
@@ -1251,7 +1251,7 @@ static void test_mapcar(void) {
 static int g_mapc_side_effect_sum = 0;
 static lisp_val_t test_mapc_side_effect_fn(lisp_val_t evaluated_args, lisp_val_t env) {
     (void)env;
-    g_mapc_side_effect_sum += (cc_car(evaluated_args) >> 3);
+    g_mapc_side_effect_sum += (cc_car(evaluated_args) >> FIXNUM_VALUE_SHIFT);
     return nil;
 }
 
@@ -1277,10 +1277,10 @@ static void test_mapcan(void) {
     lisp_val_t list1 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
 
     lisp_val_t result = lisp_ll_mapcan(os_make_cons(fn, os_make_cons(list1, nil)), 0);
-    assert((cc_car(result) >> 3) == 1, "mapcan: (mapcan fn '(1 2))の1番目は1");
-    assert((cc_car(cc_cdr(result)) >> 3) == 1, "mapcan: 2番目もfn(1)がappendした2つ目の1");
-    assert((cc_car(cc_cdr(cc_cdr(result))) >> 3) == 2, "mapcan: 3番目はfn(2)がappendした1つ目の2");
-    assert((cc_car(cc_cdr(cc_cdr(cc_cdr(result)))) >> 3) == 2, "mapcan: 4番目はfn(2)がappendした2つ目の2");
+    assert((cc_car(result) >> FIXNUM_VALUE_SHIFT) == 1, "mapcan: (mapcan fn '(1 2))の1番目は1");
+    assert((cc_car(cc_cdr(result)) >> FIXNUM_VALUE_SHIFT) == 1, "mapcan: 2番目もfn(1)がappendした2つ目の1");
+    assert((cc_car(cc_cdr(cc_cdr(result))) >> FIXNUM_VALUE_SHIFT) == 2, "mapcan: 3番目はfn(2)がappendした1つ目の2");
+    assert((cc_car(cc_cdr(cc_cdr(cc_cdr(result)))) >> FIXNUM_VALUE_SHIFT) == 2, "mapcan: 4番目はfn(2)がappendした2つ目の2");
     assert(cc_cdr(cc_cdr(cc_cdr(cc_cdr(result)))) == nil, "mapcan: 4要素で終端する");
 }
 
@@ -1298,10 +1298,10 @@ static void test_mapcon(void) {
     lisp_val_t list1 = os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(2), nil));
 
     lisp_val_t result = lisp_ll_mapcon(os_make_cons(fn, os_make_cons(list1, nil)), 0);
-    assert((cc_car(result) >> 3) == 1, "mapcon: (mapcon fn '(1 2))の1番目はfnがsublist(1 2)のcar(1)から作る1");
-    assert((cc_car(cc_cdr(result)) >> 3) == 1, "mapcon: 2番目もfn(sublist (1 2))がappendした2つ目の1");
-    assert((cc_car(cc_cdr(cc_cdr(result))) >> 3) == 2, "mapcon: 3番目はfn(sublist (2))がappendした1つ目の2");
-    assert((cc_car(cc_cdr(cc_cdr(cc_cdr(result)))) >> 3) == 2, "mapcon: 4番目はfn(sublist (2))がappendした2つ目の2");
+    assert((cc_car(result) >> FIXNUM_VALUE_SHIFT) == 1, "mapcon: (mapcon fn '(1 2))の1番目はfnがsublist(1 2)のcar(1)から作る1");
+    assert((cc_car(cc_cdr(result)) >> FIXNUM_VALUE_SHIFT) == 1, "mapcon: 2番目もfn(sublist (1 2))がappendした2つ目の1");
+    assert((cc_car(cc_cdr(cc_cdr(result))) >> FIXNUM_VALUE_SHIFT) == 2, "mapcon: 3番目はfn(sublist (2))がappendした1つ目の2");
+    assert((cc_car(cc_cdr(cc_cdr(cc_cdr(result)))) >> FIXNUM_VALUE_SHIFT) == 2, "mapcon: 4番目はfn(sublist (2))がappendした2つ目の2");
     assert(cc_cdr(cc_cdr(cc_cdr(cc_cdr(result)))) == nil, "mapcon: 4要素で終端する");
 }
 
@@ -1316,9 +1316,9 @@ static void test_map_into(void) {
     lisp_val_t result = lisp_ll_map_into(evaluated_args, 0);
 
     assert(result == destination, "map-into: destinationを破壊的に書き換えて返す");
-    assert((cc_car(result) >> 3) == 11, "map-into: 0番目は(+ (elt seq1 0) (elt seq2 0)) = 1+10=11");
-    assert((cc_car(cc_cdr(result)) >> 3) == 22, "map-into: 1番目は2+20=22");
-    assert((cc_car(cc_cdr(cc_cdr(result))) >> 3) == 33, "map-into: 2番目は3+30=33");
+    assert((cc_car(result) >> FIXNUM_VALUE_SHIFT) == 11, "map-into: 0番目は(+ (elt seq1 0) (elt seq2 0)) = 1+10=11");
+    assert((cc_car(cc_cdr(result)) >> FIXNUM_VALUE_SHIFT) == 22, "map-into: 1番目は2+20=22");
+    assert((cc_car(cc_cdr(cc_cdr(result))) >> FIXNUM_VALUE_SHIFT) == 33, "map-into: 2番目は3+30=33");
 }
 
 // M7: パラメータのGC_PROTECT統合の検証。生成物(lisp_ll_transpile_fixture_gc_protect)は

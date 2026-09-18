@@ -419,7 +419,7 @@ void test_cc_ide_device_primitives() {
 
     lisp_val_t addr = cc_ide_sector_buffer_address(make_args(1, dev0_args), nil);
     assert((addr & TAG_MASK) == TAG_FIXNUM, "cc_ide_sector_buffer_addressは素のFIXNUMを返す(TAG_RAW_POINTERではない)");
-    assert((UINT8 *)(lisp_addr_t)(addr >> 3) == os_block_device_ide_sector_buffer(), "cc_ide_sector_buffer_addressは共有バッファの先頭アドレスを返す");
+    assert((UINT8 *)(lisp_addr_t)(addr >> FIXNUM_VALUE_SHIFT) == os_block_device_ide_sector_buffer(), "cc_ide_sector_buffer_addressは共有バッファの先頭アドレスを返す");
 
     fake_reset();
     fake_push_status(0x00);
