@@ -38,18 +38,34 @@
 ;;
 ;; タグごとに確認する。1つ通ったから全部通るとは限らない
 ;; (かつてCONS/SYMBOL/STRING/INSTANCEだけを列挙しており、TAG_FORWARDが漏れていた)。
+;;
+;; [4bit化] **全16値を並べる**。使用中の値だけを試すと、未割当タグを検出器が
+;; どう扱うかがテストから見えない。検出器が未割当タグを「ヒープ参照」と誤判定
+;; すると、生の即値を焼き込み扱いして偽陽性を出し続ける。
+;; 値は documents/tag4-design.md 2.4 の割り当て表と同じ(bit0=0が即値)。
 
 ;; GCが追いかけるタグ = 検出されなければならない
-(assert-equal 1 (%%za-scan-synth 1))   ; TAG_CONS
-(assert-equal 1 (%%za-scan-synth 2))   ; TAG_SYMBOL
-(assert-equal 1 (%%za-scan-synth 4))   ; TAG_STRING
-(assert-equal 1 (%%za-scan-synth 5))   ; TAG_INSTANCE(VECTOR/BIGNUM/FLOATもこれ)
-(assert-equal 1 (%%za-scan-synth 6))   ; TAG_FORWARD(以前は漏れていた)
+(assert-equal 1 (%%za-scan-synth 1))   ; 0x1 TAG_CONS
+(assert-equal 1 (%%za-scan-synth 3))   ; 0x3 TAG_SYMBOL
+(assert-equal 1 (%%za-scan-synth 5))   ; 0x5 TAG_STRING
+(assert-equal 1 (%%za-scan-synth 7))   ; 0x7 TAG_INSTANCE(VECTOR/BIGNUM/FLOATもこれ)
+(assert-equal 1 (%%za-scan-synth 15))  ; 0xF TAG_FORWARD(以前は漏れていた)
 
-;; GCが追いかけないタグ = 検出されてはならない(fixnum即値の誤検出を防ぐ性質)
-(assert-equal 0 (%%za-scan-synth 0))   ; TAG_FIXNUM
-(assert-equal 0 (%%za-scan-synth 3))   ; TAG_CHAR
-(assert-equal 0 (%%za-scan-synth 7))   ; TAG_RAW_POINTER
+;; GCが追いかけないタグ = 検出されてはならない(即値の誤検出を防ぐ性質)
+(assert-equal 0 (%%za-scan-synth 0))   ; 0x0 TAG_FIXNUM
+(assert-equal 0 (%%za-scan-synth 2))   ; 0x2 TAG_CHAR
+(assert-equal 0 (%%za-scan-synth 4))   ; 0x4 TAG_SINGLE_FLOAT(予約のみ)
+(assert-equal 0 (%%za-scan-synth 14))  ; 0xE TAG_MARKER(MAGIC_*の下位4bit)
+(assert-equal 0 (%%za-scan-synth 9))   ; 0x9 TAG_RAW_POINTER(アドレスは持つがGC管理外)
+
+;; 未割当タグ。即値側(bit0=0)もアドレス側(bit0=1)も、値が存在しない今は
+;; 「追いかけない」に倒してある(documents/tag4-step2.md 3章)
+(assert-equal 0 (%%za-scan-synth 6))   ; 0x6 即値・未割当
+(assert-equal 0 (%%za-scan-synth 8))   ; 0x8 即値・未割当
+(assert-equal 0 (%%za-scan-synth 10))  ; 0xA 即値・未割当
+(assert-equal 0 (%%za-scan-synth 12))  ; 0xC 即値・未割当
+(assert-equal 0 (%%za-scan-synth 11))  ; 0xB アドレス・未割当(将来のdouble-float)
+(assert-equal 0 (%%za-scan-synth 13))  ; 0xD アドレス・未割当(将来のratio)
 
 ;; 陽性対照を流した後も、本物の焼き込みは0のままであること
 (assert-equal 0 (%%za-heap-imm-count))

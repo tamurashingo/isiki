@@ -140,9 +140,10 @@ lisp_val_t cc_ash(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
- * 文字コード変換の組み込み関数%%CHAR-CODE。文字をタグ(TAG_CHAR)を外した文字コードの
- * FIXNUMにする(文字はFIXNUMと同じ即値表現で下位3bitのタグのみ異なるため、タグの
- * 付け替えだけで変換できる)。
+ * 文字コード変換の組み込み関数%%CHAR-CODE。CHARACTERを文字コードのFIXNUMにする。
+ * [4bit化] CHARACTERはbit32-63に32bitのコードポイント、FIXNUMはbit4-62に
+ * マグニチュードを置く。**シフト量が違うので、タグの付け替えだけでは変換できない**
+ * (3bitのころは両方shift=3で、実質タグの差だけだった)。
  * @param args (char) charはCHARACTER
  * @param env 呼び出し時の環境(未使用)
  * @return 文字コードのFIXNUM
@@ -155,6 +156,8 @@ lisp_val_t cc_char_code(lisp_val_t args, lisp_val_t env) {
 
 /**
  * 文字コード変換の組み込み関数%%CODE-CHAR。文字コードのFIXNUMをCHARACTER(TAG_CHAR)にする。
+ * [4bit化] 範囲検査(0x10FFFF超をエラーにする)は**入れていない**。入れると挙動が
+ * 変わるため、別途判断する(documents/tag4-step2.md)。
  * @param args (code) codeはFIXNUM(文字コード)
  * @param env 呼び出し時の環境(未使用)
  * @return 対応するCHARACTER

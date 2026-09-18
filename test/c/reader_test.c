@@ -820,7 +820,7 @@ void test_os_read_char_literal_simple() {
 
     lisp_val_t v = os_read(proc);
     assert((v & TAG_MASK) == TAG_CHAR, "#\\aはTAG_CHARを持つ");
-    assert((v >> 3) == 'a', "#\\aは大文字化されずに小文字'a'として読める");
+    assert((v >> CHAR_VALUE_SHIFT) == 'a', "#\\aは大文字化されずに小文字'a'として読める");
 }
 
 void test_os_read_char_literal_paren() {
@@ -831,7 +831,7 @@ void test_os_read_char_literal_paren() {
 
     lisp_val_t v = os_read(proc);
     assert((v & TAG_MASK) == TAG_CHAR, "#\\(はTAG_CHARを持つ");
-    assert((v >> 3) == '(', "#\\(は'('自身のCHARとして読める");
+    assert((v >> CHAR_VALUE_SHIFT) == '(', "#\\(は'('自身のCHARとして読める");
 }
 
 void test_os_read_char_literal_space() {
@@ -842,7 +842,7 @@ void test_os_read_char_literal_space() {
 
     lisp_val_t v = os_read(proc);
     assert((v & TAG_MASK) == TAG_CHAR, "#\\SpaceはTAG_CHARを持つ");
-    assert((v >> 3) == ' ', "#\\Spaceはスペース文字として読める");
+    assert((v >> CHAR_VALUE_SHIFT) == ' ', "#\\Spaceはスペース文字として読める");
 }
 
 void test_os_read_char_literal_newline() {
@@ -853,7 +853,7 @@ void test_os_read_char_literal_newline() {
 
     lisp_val_t v = os_read(proc);
     assert((v & TAG_MASK) == TAG_CHAR, "#\\NewlineはTAG_CHARを持つ");
-    assert((v >> 3) == '\n', "#\\Newlineは改行文字として読める");
+    assert((v >> CHAR_VALUE_SHIFT) == '\n', "#\\Newlineは改行文字として読める");
 }
 
 void test_os_read_char_literal_unknown_name_is_read_error() {

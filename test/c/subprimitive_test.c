@@ -243,7 +243,7 @@ void test_cc_ash() {
 }
 
 void test_cc_char_code() {
-    lisp_val_t args[1] = { ((lisp_val_t)0x41 << 3) | TAG_CHAR };
+    lisp_val_t args[1] = { os_make_char(0x41) };
     lisp_val_t v = cc_char_code(make_args(1, args), nil);
 
     assert(v == os_make_fixnum(0x41), "cc_char_codeは文字'A'(0x41)のタグを外した文字コードをfixnumで返す");
@@ -254,7 +254,7 @@ void test_cc_code_char() {
     lisp_val_t v = cc_code_char(make_args(1, args), nil);
 
     assert((v & TAG_MASK) == TAG_CHAR, "cc_code_charはTAG_CHARタグ付きの値を返す");
-    assert((v >> 3) == 0x41, "cc_code_charは文字コード0x41をタグ付けした値を返す");
+    assert((v >> CHAR_VALUE_SHIFT) == 0x41, "cc_code_charは文字コード0x41をタグ付けした値を返す");
 }
 
 void test_os_register_subprimitives() {
