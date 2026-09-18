@@ -107,6 +107,104 @@ _Static_assert((TAG_FORWARD     & TAG_IS_POINTER_BIT) != 0, "TAG_FORWARD must be
 _Static_assert(TAG_MARKER != TAG_FORWARD,
                "MAGIC low nibble (TAG_MARKER) collides with TAG_FORWARD");
 
+/* ===== タグ別メモリ配置 =================================================
+ *
+ * 上の「タグ体系」がタグの値・幅・即値/アドレスの区別を決める。
+ * ここではタグごとの**ヒープ上のレイアウト**(何byte確保し、各wordに何が入るか)を書く。
+ *
+ * word番号はタグを外したアドレスからの8byte単位の添字である
+ * (word0 = ((UINT64 *)(v & ~TAG_MASK))[0])。
+ * 確保はすべて os_alloc_bytes を通り、要求サイズは OS_HEAP_ALIGN(16byte)へ
+ * 切り上げられる。したがって**実際に占める領域は下記サイズの16byte切り上げ**である。
+ *
+ * どのフィールドをGCが辿るかの正本は gc_scan_instance(runtime.c)であり、
+ * 下の表はその写しである。食い違ったらコードが正しい。
+ *
+ * ---- 即値(bit0 = 0) ----
+ *
+ * TAG_FIXNUM: ヒープなし。符号+マグニチュード(2の補数ではない)
+ *    bit63          符号(1:負)。0は常に非負へ正規化され、-0は存在しない
+ *    bit4-62        マグニチュード(FIXNUM_VALUE_SHIFT分ずらした FIXNUM_MAGNITUDE_MASK)
+ *    bit0-3         タグ
+ *    下端は上端の符号反転ちょうど。収まらない値は MAGIC_BIGNUM(TAG_INSTANCE)へ昇格する。
+ *
+ * TAG_CHAR: ヒープなし
+ *    bit32-63       Unicodeコードポイント(32bit、CHAR_VALUE_SHIFT分ずらす)
+ *    bit4-31        未使用(0)
+ *    bit0-3         タグ
+ *
+ * TAG_SINGLE_FLOAT / TAG_MARKER / 未割当の即値: 値を作る経路が無い(枠の予約のみ)。
+ *
+ * ---- アドレス(bit0 = 1) ----
+ *
+ * TAG_CONS: ヒープ16byte
+ *    word0: car
+ *    word1: cdr
+ *
+ * TAG_SYMBOL: ヒープ32byte
+ *    word0: 名前のstringへのポインタ(TAG_STRING)。
+ *           symbolの値や関数は環境(environment)側が持つ
+ *    word1: gensymフラグ。nilなら通常のinterned symbol(g_symbol_tableに登録済み)、
+ *           非nilなら os_make_uninterned_symbol が作ったgensym由来
+ *    word2, word3: 未使用(nilで予約)
+ *
+ * TAG_STRING: ヒープ可変長(8 + 長さbyte)
+ *    word0:       文字列長さ(**タグなしの生の整数**)
+ *    byte[8...]:  文字のデータ本体(バイト列)
+ *    word0が生の整数なので、長さの下位4bitが TAG_FORWARD と一致する文字列は
+ *    必ず存在する。転送済み判定が範囲検査を必要とする理由がこれである
+ *    (documents/tag4-design.md 5.4)。
+ *
+ * TAG_INSTANCE: ヒープ32byte。word0のMAGICで種別を区別する
+ *    word0 = MAGIC_FUNCTION_NATIVE
+ *      word1: za_fn_meta_t(ABI-M4、Immobilized Space上)への**生ポインタ**。
+ *             meta->cons_entry が fn(evaluated_args, env) の実体を指す。
+ *             metaもコード領域も動かないのでGCは辿らない
+ *      word2: fixnum 1(za.cがJITコンパイルした関数) / fixnum 2(トランスパイラが
+ *             リフトしたlambdaのクロージャ) / NIL(組み込みprimitive)
+ *      word3: 定義時の環境または捕捉した環境。**word2の種別によらず、
+ *             非nilならGCが辿る**(fixnum 1 のJIT関数も定義時環境を持つ)
+ *    word0 = MAGIC_FUNCTION_INTERPRETED / MAGIC_MACRO
+ *      word1: 仮引数リスト  word2: 本体(未評価のフォーム列)  word3: 定義時の環境
+ *    word0 = MAGIC_PROCESS
+ *      word1: fixnum(プロセス番号)  word3: 状態symbol
+ *      word2: saved_rsp。process.cの静的スタック領域への生アドレス(GCは辿らない)
+ *    word0 = MAGIC_BLOCK_EXIT     word1: block名symbol  word2: 戻り値
+ *    word0 = MAGIC_CATCH_EXIT     word1: tag(評価済みの値)  word2: throwされた値
+ *    word0 = MAGIC_GO_EXIT        word1: tag symbol(未評価)
+ *    word0 = MAGIC_STREAM
+ *      word1: os_stream_t への生ポインタ。GCは構造体ごとコピーし、
+ *             文字列ストリームなら str_buf も別途コピーして張り替える
+ *    word0 = MAGIC_CLASS_INSTANCE word1: class  word2: slots-vector(MAGIC_VECTOR)
+ *    word0 = MAGIC_BUILTIN_CLASS / MAGIC_STANDARD_CLASS
+ *      word1: name symbol  word2: superclasses(list)  word3: slots(list、継承分含む)
+ *    word0 = MAGIC_BIGNUM
+ *      word1: sign(0:非負 / 1:負、生のint)  word2: limb数(生のint)
+ *      word3: limb配列(基数2^32、下位32bitのみ使用、limbs[0]が最下位)への生ポインタ。
+ *             GCは 8*limb数 byte をコピーして張り替える。
+ *             word2 == 0 は limb配列を確保する前の構築中の状態
+ *    word0 = MAGIC_VECTOR
+ *      word1: 多次元配列(general array)本体への生ポインタ。本体は可変長
+ *             8*(1+rank+total) byte:
+ *               word0:          次元数 rank(生の整数)
+ *               word[1..rank]:  各次元のサイズ(生の整数)
+ *               word[rank+1..]: 要素本体(タグ付き lisp_val_t、行優先(row-major)順)
+ *             word1 == 0 は本体を確保する前の構築中の状態
+ *    word0 = MAGIC_FLOAT
+ *      word1: double(IEEE754 binary64)のビットパターン(生の64bit値。GCは辿らない)
+ *
+ * TAG_RAW_POINTER: ヒープ外(GC管理外)
+ *    Lispから生の64bitアドレス(C構造体・MMIOレジスタ等)を持つためのタグ。
+ *    中身は「タグを外した生アドレス」そのもので、fixnumのようなシフトはしない。
+ *    アドレスを持つがGCは追いかけない(os_tag_is_heap_ref が偽)。
+ *    実際に流通するのはJITリテラルスロット・block_deviceハンドル・Function Cell・
+ *    環境ページの4種で、どれも16byte境界にある(documents/static-align16-survey.md)。
+ *
+ * TAG_FORWARD: GC中のみ、From空間のword0に現れる
+ *    From空間からTo空間へコピー済みのオブジェクトの印。
+ *    コピー元のword0を「移動先アドレス | TAG_FORWARD」で上書きする。
+ */
+
 /** [GCデバッグ] stale領域を塗るトラップパターンの、タグを除いた土台。
  *
  * 上位16bitが 0xDEAD で non-canonical なので、これをデリファレンスすると
