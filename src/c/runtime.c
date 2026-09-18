@@ -2803,6 +2803,7 @@ void os_bootstrap() {
         #endif
         os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample_pub), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
+        os_set_function(os_make_symbol("%%FIXNUM-MAGNITUDE-MASK"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnum_magnitude_mask), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
@@ -2990,6 +2991,26 @@ lisp_val_t os_get_function(lisp_val_t sym, lisp_val_t env) {
  * @return タグ付けされたFIXNUM
  */
 /* [性能測定] Phase4: runtime.hのstatic inlineへ移した */
+
+/**
+ * 組み込み関数%%FIXNUM-MAGNITUDE-MASK。
+ *
+ * fixnumのマグニチュード部が表現できる最大値(= FIXNUM_MAGNITUDE_MASK)を返す。
+ * Lisp側の *most-positive-fixnum* / *most-negative-fixnum* は、この値から
+ * 導出する(init.lisp)。Lisp側に 2^60-1 を10進で直書きすると、タグ幅や
+ * FIXNUM_VALUE_SHIFT を動かしたときにC側とLisp側が黙ってずれるため。
+ *
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return FIXNUM_MAGNITUDE_MASK のfixnum
+ */
+lisp_val_t primitive_fixnum_magnitude_mask(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    /* この値がfixnumとして表現できること(符号bit・タグに食い込まないこと)は
+       runtime.hの語レイアウト_Static_assertで保証済み */
+    return os_make_fixnum(FIXNUM_MAGNITUDE_MASK);
+}
 
 /**
  * 符号付きのfixnumオブジェクトを作る(即値、ヒープ確保なし)。

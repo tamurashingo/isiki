@@ -23,6 +23,28 @@
 /** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等)。fixnum/charと同様の即値として扱い、GCは素通しする(111) */
 #define TAG_RAW_POINTER 0x7ULL
 
+/* --- タグ値の不変条件 ---------------------------------------------------
+   タグ幅を広げる改修(TAG_MASK を 0xF にする等)で最初に壊れるのがここ。
+   コンパイル時に落ちるようにしておき、実行時まで持ち越さない。
+   メッセージはASCIIで書く(GCCは非ASCIIを8進エスケープで出すため読めなくなる) */
+_Static_assert((TAG_MASK & (TAG_MASK + 1)) == 0,
+               "TAG_MASK must be a contiguous run of low bits (2^n - 1)");
+_Static_assert(TAG_FIXNUM      <= TAG_MASK, "TAG_FIXNUM does not fit in TAG_MASK");
+_Static_assert(TAG_CONS        <= TAG_MASK, "TAG_CONS does not fit in TAG_MASK");
+_Static_assert(TAG_SYMBOL      <= TAG_MASK, "TAG_SYMBOL does not fit in TAG_MASK");
+_Static_assert(TAG_CHAR        <= TAG_MASK, "TAG_CHAR does not fit in TAG_MASK");
+_Static_assert(TAG_STRING      <= TAG_MASK, "TAG_STRING does not fit in TAG_MASK");
+_Static_assert(TAG_INSTANCE    <= TAG_MASK, "TAG_INSTANCE does not fit in TAG_MASK");
+_Static_assert(TAG_FORWARD     <= TAG_MASK, "TAG_FORWARD does not fit in TAG_MASK");
+_Static_assert(TAG_RAW_POINTER <= TAG_MASK, "TAG_RAW_POINTER does not fit in TAG_MASK");
+/* タグ値が互いに重複しないこと。ビット位置に1を立てて数を数える形で確かめる
+   (同じ値が2つあれば立つビットが8本に満たない) */
+_Static_assert(__builtin_popcountll((1ULL << TAG_FIXNUM) | (1ULL << TAG_CONS) |
+                                    (1ULL << TAG_SYMBOL) | (1ULL << TAG_CHAR) |
+                                    (1ULL << TAG_STRING) | (1ULL << TAG_INSTANCE) |
+                                    (1ULL << TAG_FORWARD) | (1ULL << TAG_RAW_POINTER)) == 8,
+               "TAG_* values are not all distinct");
+
 /**
  * [単一の真実源] このタグの値はヒープオブジェクトへの参照か(=GCが追いかけるか)。
  *
@@ -62,6 +84,24 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
  * (CHARだけ表現を変える改修がありうる)。
  */
 #define CHAR_VALUE_SHIFT 3
+
+/* --- fixnum / char の64bit語レイアウトの不変条件 -------------------------
+   1語を「符号bit + マグニチュード + タグ」で分け合っているので、シフト量と
+   マスクとタグ幅のどれか1つだけを動かすと静かに食い違う。隙間も重なりも
+   ないことをコンパイル時に確かめる */
+_Static_assert((1ULL << FIXNUM_VALUE_SHIFT) > TAG_MASK,
+               "FIXNUM_VALUE_SHIFT is too small: the value field would overlap the tag");
+_Static_assert((1ULL << CHAR_VALUE_SHIFT) > TAG_MASK,
+               "CHAR_VALUE_SHIFT is too small: the char code would overlap the tag");
+_Static_assert((FIXNUM_SIGN_BIT & (FIXNUM_SIGN_BIT - 1)) == 0 && FIXNUM_SIGN_BIT != 0,
+               "FIXNUM_SIGN_BIT must be exactly one bit");
+_Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) & FIXNUM_SIGN_BIT) == 0,
+               "fixnum magnitude field overlaps FIXNUM_SIGN_BIT");
+_Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) & TAG_MASK) == 0,
+               "fixnum magnitude field overlaps the tag");
+_Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) | FIXNUM_SIGN_BIT | TAG_MASK)
+                   == ~0ULL,
+               "sign bit + fixnum magnitude + tag do not cover all 64 bits (a gap would silently lose range)");
 
 /**
  * [単一の真実源] タグ付きLisp値が指しうるメモリの配置境界。
@@ -319,6 +359,12 @@ void os_bootstrap();
  * @return 使用中バイト数 / From空間全体のバイト数
  */
 double os_heap_used_ratio(void);
+
+/**
+ * 組み込み関数%%FIXNUM-MAGNITUDE-MASK。fixnumのマグニチュード部の最大値を返す。
+ * Lisp側の *most-positive-fixnum* / *most-negative-fixnum* はこれを起点に作る。
+ */
+lisp_val_t primitive_fixnum_magnitude_mask(lisp_val_t args, lisp_val_t env);
 
 /** 組み込み関数%%HEAP-TOTAL-BYTES。From空間(ヒープ全体の半分)の総バイト数を返す */
 lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env);
