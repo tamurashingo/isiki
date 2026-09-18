@@ -1067,20 +1067,44 @@ int os_symbol_table_count(void);
 void os_reset_runtime_state_for_test(void);
 
 /**
- * charオブジェクトを作る(即値、ヒープ確保なし)。
- * @param c 表現する文字
- * @return タグ付けされたCHAR
- */
-/**
  * characterオブジェクトを作る(即値、ヒープ確保なし)。
  * @param code Unicodeコードポイント(32bit、bit32-63に入る)
  * @return タグ付けされたCHARACTER
  *
- * [4bit化] 引数は **UINT32**。以前は `const char` で、0x80以上の文字を渡すと
- * 符号拡張で上位ビットがすべて1になっていた。呼び出し側は符号付きの char を
- * そのまま渡さないこと(UINT8 を経由する)。
+ * **直接呼ばず、下の os_make_char マクロを使うこと。**
+ * 引数は UINT32 なので、呼び出し側が signed char を渡すと暗黙変換で
+ * 符号拡張し、0x80以上の文字で上位ビットが1で埋まる。コンパイラは
+ * 既定では警告しないので、マクロ側で型を見て弾いている。
  */
-lisp_val_t os_make_char(const UINT32 code);
+lisp_val_t os_make_char_from_code(const UINT32 code);
+
+/**
+ * [誤用の検出用] 呼ばれることのないダミー宣言。
+ *
+ * os_make_char に signed char を渡すと _Generic がこちらを選び、
+ * GCC の attribute error でコンパイルが止まる。定義は無いが、
+ * attribute error のほうが先に効くのでリンクまで到達しない。
+ *
+ * メッセージはASCIIで書く(GCCは非ASCIIを8進エスケープで出して読めなくなる)。
+ */
+__attribute__((error("os_make_char: pass an unsigned code point, not a signed char. Cast via UINT8 (e.g. os_make_char((UINT8)ch)) or use UINT32.")))
+lisp_val_t os_make_char_rejects_signed_char(int);
+
+/**
+ * characterオブジェクトを作る。**signed char を渡すとコンパイルエラーになる。**
+ *
+ * `char` は処理系によって符号の有無が変わるが、環境で挙動が変わるほうが
+ * 厄介なので、符号の有無にかかわらず `char` と `signed char` の両方を弾く。
+ * 通したいときは `(UINT8)` を噛ませる。
+ *
+ * 文字リテラル(`'A'`)はCでは int なので通る。int を弾いていないのは、
+ * `getchar()` 系の戻り値をそのまま渡す既存の書き方を壊さないため
+ * (documents/make-char-typesafe.md 3章)。
+ */
+#define os_make_char(code) _Generic((code), \
+    char:        os_make_char_rejects_signed_char, \
+    signed char: os_make_char_rejects_signed_char, \
+    default:     os_make_char_from_code)(code)
 
 /**
  * sをコピーしてstringオブジェクトを作る。

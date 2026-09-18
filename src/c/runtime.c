@@ -3168,7 +3168,7 @@ void os_reset_runtime_state_for_test(void) {
  * 符号拡張が起きて上位ビットがすべて1になっていた(3bit時代は
  * CHAR_VALUE_SHIFT=3 で上位が捨てられず、値がそのまま汚れていた)。
  */
-lisp_val_t os_make_char(const UINT32 code) {
+lisp_val_t os_make_char_from_code(const UINT32 code) {
     return ((lisp_val_t)code) << CHAR_VALUE_SHIFT | TAG_CHAR;
 }
 
