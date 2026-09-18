@@ -42,7 +42,7 @@ TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp sr
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
 SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
-HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/disasm.h $(SRCDIR)/disasm_lisp.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/bench_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
+HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/za_jit_tags.h $(SRCDIR)/disasm.h $(SRCDIR)/disasm_lisp.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/bench_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -54,6 +54,20 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 # 通常ビルドでは空なので影響しない
 GC_DEBUG_FLAGS = $(if $(GC_DEBUG),-DISIKIOS_GC_DEBUG,)$(if $(GC_PAINT), -DISIKIOS_GC_PAINT,)
 
+# [調査] 16byte境界監査(documents/alignment-survey-report.md)。ALIGN_AUDIT=1 の
+# ときだけ各アロケータとgc_copy_valueに計数を入れ、QEMU試験なら電源断の直前に、
+# ネイティブのユニットテストならatexitでヒストグラムを出す。
+# 既定では空なので通常ビルドの挙動・性能は変わらない(runtime.hのマクロが
+# ((void)0)に畳まれる)
+ALIGN_AUDIT_FLAGS = $(if $(ALIGN_AUDIT),-DISIKIOS_ALIGN_AUDIT,)
+
+# [検証] JIT_DUMP=1 で、JITがコンパイルした関数ごとに
+# 「出力サイズ・マスクしたバイト数・バイト列のハッシュ」をシリアルへ出す。
+# タグ定数の整理が出力を変えていないことを確かめるための計測専用フラグで、
+# 既定では空なので通常ビルドには1命令も入らない
+# (documents/jit-tag-constants.md Step 1)
+JIT_DUMP_FLAGS = $(if $(JIT_DUMP),-DISIKIOS_JIT_DUMP,)
+
 BUILD_TMPDIR = tmp
 
 # [GCデバッグ] $(TARGET)はSRC/HDRのファイル依存で追跡するため、**フラグだけ変えても
@@ -61,12 +75,22 @@ BUILD_TMPDIR = tmp
 # 「塗り潰し有効のつもりで無効のバイナリを測る」ことになり、しかも無言で成立する
 # (documents/pitfalls.md 原則6)。使用したフラグをスタンプに残し、変わったときだけ
 # スタンプを更新して$(TARGET)の再ビルドを促す
+#
+# EXTRA_CFLAGSもスタンプに含める。これは「計測のための一時的なフラグ」を渡す口で、
+# まさに**同じセッション中に付けたり外したりする**使われ方をする。含めていなかった
+# ために実際に踏んだ(2026-09-17、16byte境界化の前後比較):
+#   make ... EXTRA_CFLAGS=-DOS_HEAP_ALIGN=8ULL   # 比較用のバイナリを作る
+#   make ...                                     # 戻したつもり
+# 2回目はSRC/HDRが更新されていないので再ビルドされず、**8byte版のバイナリのまま
+# 測って heap-align=8 と報告された**。ALIGN_AUDITが使用値を出力に混ぜていたので
+# 気づけたが、出していなければそのまま誤った比較表になっていた。
 GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
+BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(EXTRA_CFLAGS)
 .PHONY: FORCE
 FORCE:
 $(GC_DEBUG_STAMP): FORCE
 	@mkdir -p $(BUILD_TMPDIR)
-	@echo '$(GC_DEBUG_FLAGS)' | cmp -s - $@ 2>/dev/null || echo '$(GC_DEBUG_FLAGS)' > $@
+	@echo '$(BUILD_FLAG_SIGNATURE)' | cmp -s - $@ 2>/dev/null || echo '$(BUILD_FLAG_SIGNATURE)' > $@
 OBJ = $(patsubst $(SRCDIR)/%.c,$(BUILD_TMPDIR)/%.o,$(SRC))
 
 # fat16_test.img/fat32_test.imgのような固定テストフィクスチャはtmp/に置くが、
@@ -194,7 +218,7 @@ $(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
-		$(GC_DEBUG_FLAGS) $(EXTRA_CFLAGS) \
+		$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(EXTRA_CFLAGS) \
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
@@ -220,6 +244,7 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-nostdlib -mno-red-zone -O1 -c \
 		-Wall -Wextra \
 		-mno-stack-arg-probe \
+		$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
 		-o $@ $<
@@ -228,97 +253,97 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_RUNTIME) $(TEST_SRC_RUNTIME) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_LISP) $(TEST_SRC_LISP) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_PROCESS) $(TEST_SRC_PROCESS) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_READER) $(TEST_SRC_READER) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_EVAL) $(TEST_SRC_EVAL) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_PRINT) $(TEST_SRC_PRINT) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_REPL) $(TEST_SRC_REPL) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_SUBPRIMITIVE) $(TEST_SRC_SUBPRIMITIVE) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_SCRIPT) $(TEST_SRC_SCRIPT) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_STREAM) $(TEST_SRC_STREAM)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_LOAD) $(TEST_SRC_LOAD) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_STREAM_LISP) $(TEST_SRC_STREAM_LISP) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_FORMAT) $(TEST_SRC_FORMAT) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_CLOCK) $(TEST_SRC_CLOCK) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_P9) $(TEST_SRC_P9)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_VIRTIO9P) $(TEST_SRC_VIRTIO9P)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_LISP_COMPILED) $(TEST_SRC_LISP_COMPILED) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_IDE) $(TEST_SRC_IDE) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_MOUNT) $(TEST_SRC_MOUNT) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \

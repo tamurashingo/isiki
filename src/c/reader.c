@@ -649,7 +649,8 @@ static lisp_val_t read_char_literal(reader_source_t *src) {
     }
 
     if (len == 1) {
-        return os_make_char(buf[0]);
+        /* [4bit化] bufはsigned char配列。UINT8を経由して符号拡張を避ける */
+        return os_make_char((UINT8)buf[0]);
     }
     if (char_name_matches(buf, len, "SPACE")) {
         return os_make_char(' ');

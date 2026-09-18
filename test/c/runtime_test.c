@@ -122,7 +122,7 @@ static void setup_heap() {
 
 void test_os_make_fixnum() {
     lisp_val_t f1 = os_make_fixnum(42);
-    assert(f1 >> 3 == 42, "os_make_fixnum(42)は3bit右シフトで42に戻る");
+    assert(f1 >> FIXNUM_VALUE_SHIFT == 42, "os_make_fixnum(42)はFIXNUM_VALUE_SHIFT分の右シフトで42に戻る");
 }
 
 #define BOOT_ALLOC_TEST_SIZE (64 * 1024)
@@ -156,7 +156,11 @@ void test_os_boot_alloc_finalize_returns_remaining_region_after_usage() {
 
     assert(used >= 300, "finalizeが返す使用量は、それまでのos_boot_alloc要求の合計以上である");
     assert(out_base >= (UINT64)region + used, "残り領域の先頭は使用済み分より後ろにある");
-    assert(out_base % 8 == 0, "残り領域の先頭は8byte境界に整列される");
+    /* [境界] この戻り値がそのままos_heap_initへ渡りLispヒープの先頭になる。
+       確保を16byteに切り上げても先頭が8 mod 16ならオブジェクトが全部ずれるので、
+       ここはOS_HEAP_ALIGN境界であることまで要求する(以前は8byte境界だった) */
+    assert(out_base % OS_HEAP_ALIGN == 0,
+           "残り領域の先頭はOS_HEAP_ALIGN境界に整列される(Lispヒープの先頭になるため)");
     assert(out_base + out_size == (UINT64)region + BOOT_ALLOC_TEST_SIZE,
            "残り領域は元の領域の末尾まで隙間なく続く");
 
@@ -193,7 +197,7 @@ void test_os_make_cons() {
 void test_os_make_char() {
     lisp_val_t c = os_make_char('A');
     assert((c & TAG_MASK) == TAG_CHAR, "os_make_charの戻り値はTAG_CHARを持つ");
-    assert((c >> 3) == 'A', "os_make_char('A')は3bit右シフトで'A'に戻る");
+    assert((c >> CHAR_VALUE_SHIFT) == 'A', "os_make_char('A')はCHAR_VALUE_SHIFT分の右シフトで'A'に戻る");
 }
 
 void test_os_make_string() {
@@ -263,7 +267,7 @@ void test_os_get_variable() {
     // base_env にしかない変数も current_env から(親を辿って)取得できること
     lisp_val_t v1 = os_get_variable(os_make_symbol("sym1"), current_env);
     assert((v1 & TAG_MASK) == TAG_FIXNUM, "fixnumが返ること");
-    assert(v1 >> 3 == 1, "1であること");
+    assert(v1 >> FIXNUM_VALUE_SHIFT == 1, "1であること");
 
     // current_env 自身の変数が取得できること。シンボル名は大文字小文字を区別しない
     lisp_val_t v2 = os_get_variable(os_make_symbol("SYM2"), current_env);
@@ -277,10 +281,10 @@ void test_os_get_variable() {
 
     lisp_val_t v3 = os_get_variable(os_make_symbol("sym1"), current_env);
     assert((v3 & TAG_MASK) == TAG_FIXNUM, "fixnumが返ること");
-    assert(v3 >> 3 == 42, "current_envにセットした42が優先して返る");
+    assert(v3 >> FIXNUM_VALUE_SHIFT == 42, "current_envにセットした42が優先して返る");
 
     lisp_val_t v4 = os_get_variable(os_make_symbol("sym1"), base_env);
-    assert(v4 >> 3 == 1, "base_env自身の値は書き換えられていないこと");
+    assert(v4 >> FIXNUM_VALUE_SHIFT == 1, "base_env自身の値は書き換えられていないこと");
 
     // 未定義のシンボルはnilが返ること
     lisp_val_t v5 = os_get_variable(os_make_symbol("undefined"), current_env);
@@ -569,18 +573,18 @@ void test_primitive_arithmetic_with_float() {
 
 void test_primitive_multiply() {
     lisp_val_t r = primitive_multiply(make_arg_list(3, 2, 3, 4), nil);
-    assert(r >> 3 == 24, "(* 2 3 4) は24");
+    assert(r >> FIXNUM_VALUE_SHIFT == 24, "(* 2 3 4) は24");
 
     lisp_val_t r2 = primitive_multiply(make_arg_list(1, 5), nil);
-    assert(r2 >> 3 == 5, "(* 5) は5");
+    assert(r2 >> FIXNUM_VALUE_SHIFT == 5, "(* 5) は5");
 }
 
 void test_primitive_divide() {
     lisp_val_t r = primitive_divide(make_arg_list(2, 12, 3), nil);
-    assert(r >> 3 == 4, "(/ 12 3) は4");
+    assert(r >> FIXNUM_VALUE_SHIFT == 4, "(/ 12 3) は4");
 
     lisp_val_t r2 = primitive_divide(make_arg_list(3, 24, 4, 2), nil);
-    assert(r2 >> 3 == 3, "(/ 24 4 2) は3");
+    assert(r2 >> FIXNUM_VALUE_SHIFT == 3, "(/ 24 4 2) は3");
 
     lisp_val_t r3 = primitive_divide(make_arg_list(2, 5, 0), nil);
     assert(r3 == g_sym_eval_error, "(/ 5 0) はg_sym_eval_error");
@@ -614,8 +618,8 @@ void test_primitive_num_not_equal_ge_le() {
 }
 
 void test_primitive_max_min_abs() {
-    assert(primitive_max(make_arg_list(3, 1, 5, 3), nil) >> 3 == 5, "(max 1 5 3) は5");
-    assert(primitive_min(make_arg_list(3, 5, 1, 3), nil) >> 3 == 1, "(min 5 1 3) は1");
+    assert(primitive_max(make_arg_list(3, 1, 5, 3), nil) >> FIXNUM_VALUE_SHIFT == 5, "(max 1 5 3) は5");
+    assert(primitive_min(make_arg_list(3, 5, 1, 3), nil) >> FIXNUM_VALUE_SHIFT == 1, "(min 5 1 3) は1");
 
     lisp_val_t vals1[2] = {os_make_fixnum_signed(1, 5), os_make_fixnum(3)};
     assert(primitive_max(make_arg_list_vals(2, vals1), nil) == os_make_fixnum(3), "(max -5 3) は3");
@@ -1105,8 +1109,8 @@ void test_primitive_array_dimensions() {
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
 
     lisp_val_t result = primitive_array_dimensions(os_make_cons(array, nil), nil);
-    assert(cc_car(result) >> 3 == 2, "(array-dimensions a)の1番目は2");
-    assert(cc_car(cc_cdr(result)) >> 3 == 3, "(array-dimensions a)の2番目は3");
+    assert(cc_car(result) >> FIXNUM_VALUE_SHIFT == 2, "(array-dimensions a)の1番目は2");
+    assert(cc_car(cc_cdr(result)) >> FIXNUM_VALUE_SHIFT == 3, "(array-dimensions a)の2番目は3");
     assert(cc_cdr(cc_cdr(result)) == nil, "(array-dimensions a)の終端はnil");
 }
 
@@ -1114,7 +1118,7 @@ void test_primitive_array_dimensions_on_string() {
     lisp_val_t str = os_make_string("foo");
 
     lisp_val_t result = primitive_array_dimensions(os_make_cons(str, nil), nil);
-    assert(cc_car(result) >> 3 == 3, "(array-dimensions \"foo\")の1番目は3");
+    assert(cc_car(result) >> FIXNUM_VALUE_SHIFT == 3, "(array-dimensions \"foo\")の1番目は3");
     assert(cc_cdr(result) == nil, "(array-dimensions \"foo\")の終端はnil");
 }
 
@@ -1128,12 +1132,12 @@ void test_primitive_aref_reads_back_value() {
         os_make_cons(os_make_fixnum(1),
         os_make_cons(os_make_fixnum(2), nil))));
     lisp_val_t set_result = primitive_set_aref(set_args, nil);
-    assert(set_result >> 3 == 99, "(set-aref 99 a 1 2)は書き込んだ99を返す");
+    assert(set_result >> FIXNUM_VALUE_SHIFT == 99, "(set-aref 99 a 1 2)は書き込んだ99を返す");
 
     lisp_val_t aref_args = os_make_cons(array,
         os_make_cons(os_make_fixnum(1),
         os_make_cons(os_make_fixnum(2), nil)));
-    assert(primitive_aref(aref_args, nil) >> 3 == 99, "(aref a 1 2)は書き込んだ99を返す");
+    assert(primitive_aref(aref_args, nil) >> FIXNUM_VALUE_SHIFT == 99, "(aref a 1 2)は書き込んだ99を返す");
 
     lisp_val_t other_args = os_make_cons(array,
         os_make_cons(os_make_fixnum(0),
@@ -1162,29 +1166,29 @@ void test_primitive_vector() {
     assert(primitive_aref(aref_args, nil) == os_make_symbol("b"), "(aref (vector 'a 'b 'c) 1)は'b");
 
     lisp_val_t empty = primitive_vector(nil, nil);
-    assert(primitive_length(os_make_cons(empty, nil), nil) >> 3 == 0, "(vector)は空のvectorを返す");
+    assert(primitive_length(os_make_cons(empty, nil), nil) >> FIXNUM_VALUE_SHIFT == 0, "(vector)は空のvectorを返す");
 }
 
 void test_primitive_create_vector() {
     lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
-    assert(primitive_length(os_make_cons(vec, nil), nil) >> 3 == 3, "(create-vector 3)の長さは3");
+    assert(primitive_length(os_make_cons(vec, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(create-vector 3)の長さは3");
     lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(0), nil));
     assert(primitive_aref(aref_args, nil) == nil, "初期値省略時は各要素がnil");
 
     lisp_val_t vec_filled = primitive_create_vector(
         os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(99), nil)), nil);
     lisp_val_t aref_args2 = os_make_cons(vec_filled, os_make_cons(os_make_fixnum(1), nil));
-    assert(primitive_aref(aref_args2, nil) >> 3 == 99, "初期値指定時は各要素がその値で初期化される");
+    assert(primitive_aref(aref_args2, nil) >> FIXNUM_VALUE_SHIFT == 99, "初期値指定時は各要素がその値で初期化される");
 }
 
 void test_primitive_garef_set_garef() {
     lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
     lisp_val_t set_args = os_make_cons(os_make_fixnum(42),
         os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_set_aref(set_args, nil) >> 3 == 42, "set-garefはset-arefと同じ実体で書き込める");
+    assert(primitive_set_aref(set_args, nil) >> FIXNUM_VALUE_SHIFT == 42, "set-garefはset-arefと同じ実体で書き込める");
 
     lisp_val_t aref_args = os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil));
-    assert(primitive_aref(aref_args, nil) >> 3 == 42, "garefはarefと同じ実体で読み込める");
+    assert(primitive_aref(aref_args, nil) >> FIXNUM_VALUE_SHIFT == 42, "garefはarefと同じ実体で読み込める");
 }
 
 void test_primitive_set_car() {
@@ -1192,9 +1196,9 @@ void test_primitive_set_car() {
     lisp_val_t args = os_make_cons(c, os_make_cons(os_make_fixnum(99), nil));
 
     lisp_val_t r = primitive_set_car(args, nil);
-    assert(r >> 3 == 99, "(set-car c 99)は書き込んだ99を返す");
-    assert(cc_car(c) >> 3 == 99, "carが99に書き換えられている");
-    assert(cc_cdr(c) >> 3 == 2, "cdrは書き換えられていない");
+    assert(r >> FIXNUM_VALUE_SHIFT == 99, "(set-car c 99)は書き込んだ99を返す");
+    assert(cc_car(c) >> FIXNUM_VALUE_SHIFT == 99, "carが99に書き換えられている");
+    assert(cc_cdr(c) >> FIXNUM_VALUE_SHIFT == 2, "cdrは書き換えられていない");
 }
 
 void test_primitive_set_cdr() {
@@ -1202,9 +1206,9 @@ void test_primitive_set_cdr() {
     lisp_val_t args = os_make_cons(c, os_make_cons(os_make_fixnum(99), nil));
 
     lisp_val_t r = primitive_set_cdr(args, nil);
-    assert(r >> 3 == 99, "(set-cdr c 99)は書き込んだ99を返す");
-    assert(cc_cdr(c) >> 3 == 99, "cdrが99に書き換えられている");
-    assert(cc_car(c) >> 3 == 1, "carは書き換えられていない");
+    assert(r >> FIXNUM_VALUE_SHIFT == 99, "(set-cdr c 99)は書き込んだ99を返す");
+    assert(cc_cdr(c) >> FIXNUM_VALUE_SHIFT == 99, "cdrが99に書き換えられている");
+    assert(cc_car(c) >> FIXNUM_VALUE_SHIFT == 1, "carは書き換えられていない");
 }
 
 void test_primitive_set_aref_out_of_bounds() {
@@ -1240,7 +1244,7 @@ void test_primitive_string_elt() {
     lisp_val_t str = os_make_string("hello");
     lisp_val_t r = primitive_string_elt(os_make_cons(str, os_make_cons(os_make_fixnum(1), nil)), nil);
     assert((r & TAG_MASK) == TAG_CHAR, "(string-elt \"hello\" 1)の戻り値はTAG_CHARを持つ");
-    assert((r >> 3) == 'e', "(string-elt \"hello\" 1)は'e'を返す");
+    assert((r >> CHAR_VALUE_SHIFT) == 'e', "(string-elt \"hello\" 1)は'e'を返す");
 }
 
 void test_primitive_string_elt_out_of_bounds() {
@@ -1284,12 +1288,12 @@ void test_primitive_string_comparisons() {
 
 void test_primitive_char_index() {
     lisp_val_t str = os_make_string("abcab");
-    assert(primitive_char_index(os_make_cons(os_make_char('b'), os_make_cons(str, nil)), nil) >> 3 == 1,
+    assert(primitive_char_index(os_make_cons(os_make_char('b'), os_make_cons(str, nil)), nil) >> FIXNUM_VALUE_SHIFT == 1,
            "(char-index #\\b \"abcab\") は1");
     assert(primitive_char_index(os_make_cons(os_make_char('B'), os_make_cons(str, nil)), nil) == nil,
            "(char-index #\\B \"abcab\") はnil(大文字小文字を区別する)");
     lisp_val_t args_with_start = os_make_cons(os_make_char('b'), os_make_cons(str, os_make_cons(os_make_fixnum(2), nil)));
-    assert(primitive_char_index(args_with_start, nil) >> 3 == 4, "(char-index #\\b \"abcab\" 2) は4");
+    assert(primitive_char_index(args_with_start, nil) >> FIXNUM_VALUE_SHIFT == 4, "(char-index #\\b \"abcab\" 2) は4");
     assert(primitive_char_index(os_make_cons(os_make_char('d'), os_make_cons(str, nil)), nil) == nil,
            "(char-index #\\d \"abcab\") はnil");
     lisp_val_t args_a_from_4 = os_make_cons(os_make_char('a'), os_make_cons(str, os_make_cons(os_make_fixnum(4), nil)));
@@ -1298,19 +1302,19 @@ void test_primitive_char_index() {
 
 void test_primitive_string_index() {
     lisp_val_t foobar = os_make_string("foobar");
-    assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(foobar, nil)), nil) >> 3 == 0,
+    assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(foobar, nil)), nil) >> FIXNUM_VALUE_SHIFT == 0,
            "(string-index \"foo\" \"foobar\") は0");
-    assert(primitive_string_index(os_make_cons(os_make_string("bar"), os_make_cons(foobar, nil)), nil) >> 3 == 3,
+    assert(primitive_string_index(os_make_cons(os_make_string("bar"), os_make_cons(foobar, nil)), nil) >> FIXNUM_VALUE_SHIFT == 3,
            "(string-index \"bar\" \"foobar\") は3");
     assert(primitive_string_index(os_make_cons(os_make_string("FOO"), os_make_cons(foobar, nil)), nil) == nil,
            "(string-index \"FOO\" \"foobar\") はnil(大文字小文字を区別する)");
     lisp_val_t foo_from_1 = os_make_cons(os_make_string("foo"), os_make_cons(foobar, os_make_cons(os_make_fixnum(1), nil)));
     assert(primitive_string_index(foo_from_1, nil) == nil, "(string-index \"foo\" \"foobar\" 1) はnil");
     lisp_val_t bar_from_1 = os_make_cons(os_make_string("bar"), os_make_cons(foobar, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_string_index(bar_from_1, nil) >> 3 == 3, "(string-index \"bar\" \"foobar\" 1) は3");
+    assert(primitive_string_index(bar_from_1, nil) >> FIXNUM_VALUE_SHIFT == 3, "(string-index \"bar\" \"foobar\" 1) は3");
     assert(primitive_string_index(os_make_cons(os_make_string("foo"), os_make_cons(os_make_string(""), nil)), nil) == nil,
            "(string-index \"foo\" \"\") はnil");
-    assert(primitive_string_index(os_make_cons(os_make_string(""), os_make_cons(os_make_string("foo"), nil)), nil) >> 3 == 0,
+    assert(primitive_string_index(os_make_cons(os_make_string(""), os_make_cons(os_make_string("foo"), nil)), nil) >> FIXNUM_VALUE_SHIFT == 0,
            "(string-index \"\" \"foo\") は0(空文字列は即マッチ)");
 }
 
@@ -1335,15 +1339,15 @@ void test_primitive_length() {
     lisp_val_t list = os_make_cons(os_make_fixnum(1),
                         os_make_cons(os_make_fixnum(2),
                           os_make_cons(os_make_fixnum(3), nil)));
-    assert(primitive_length(os_make_cons(list, nil), nil) >> 3 == 3, "(length '(1 2 3))は3");
-    assert(primitive_length(os_make_cons(nil, nil), nil) >> 3 == 0, "(length nil)は0");
+    assert(primitive_length(os_make_cons(list, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(length '(1 2 3))は3");
+    assert(primitive_length(os_make_cons(nil, nil), nil) >> FIXNUM_VALUE_SHIFT == 0, "(length nil)は0");
 
     lisp_val_t str = os_make_string("hello");
-    assert(primitive_length(os_make_cons(str, nil), nil) >> 3 == 5, "(length \"hello\")は5");
+    assert(primitive_length(os_make_cons(str, nil), nil) >> FIXNUM_VALUE_SHIFT == 5, "(length \"hello\")は5");
 
     lisp_val_t dims = os_make_cons(os_make_fixnum(2), os_make_cons(os_make_fixnum(3), nil));
     lisp_val_t array = primitive_make_array(os_make_cons(dims, nil), nil);
-    assert(primitive_length(os_make_cons(array, nil), nil) >> 3 == 6, "(length (make-array '(2 3)))は次元に関わらず全要素数の6");
+    assert(primitive_length(os_make_cons(array, nil), nil) >> FIXNUM_VALUE_SHIFT == 6, "(length (make-array '(2 3)))は次元に関わらず全要素数の6");
 }
 
 void test_primitive_elt() {
@@ -1384,14 +1388,14 @@ void test_primitive_set_elt() {
                         os_make_cons(os_make_fixnum(2),
                           os_make_cons(os_make_fixnum(3), nil)));
     lisp_val_t set_list_args = os_make_cons(os_make_fixnum(99), os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_set_elt(set_list_args, nil) >> 3 == 99, "(set-elt 99 list 1) は書き込んだ99を返す");
-    assert(primitive_elt(os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)), nil) >> 3 == 99,
+    assert(primitive_set_elt(set_list_args, nil) >> FIXNUM_VALUE_SHIFT == 99, "(set-elt 99 list 1) は書き込んだ99を返す");
+    assert(primitive_elt(os_make_cons(list, os_make_cons(os_make_fixnum(1), nil)), nil) >> FIXNUM_VALUE_SHIFT == 99,
            "set-eltで書き換えた後のlistの1番目は99");
 
     lisp_val_t vec = primitive_create_vector(os_make_cons(os_make_fixnum(3), nil), nil);
     lisp_val_t set_vec_args = os_make_cons(os_make_fixnum(42), os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)));
-    assert(primitive_set_elt(set_vec_args, nil) >> 3 == 42, "(set-elt 42 vec 1) は書き込んだ42を返す");
-    assert(primitive_elt(os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)), nil) >> 3 == 42,
+    assert(primitive_set_elt(set_vec_args, nil) >> FIXNUM_VALUE_SHIFT == 42, "(set-elt 42 vec 1) は書き込んだ42を返す");
+    assert(primitive_elt(os_make_cons(vec, os_make_cons(os_make_fixnum(1), nil)), nil) >> FIXNUM_VALUE_SHIFT == 42,
            "set-eltで書き換えた後のvecの1番目は42");
 
     lisp_val_t out_of_range_args = os_make_cons(os_make_fixnum(1), os_make_cons(list, os_make_cons(os_make_fixnum(5), nil)));
@@ -1419,13 +1423,13 @@ void test_primitive_subseq() {
            "(subseq '(a b c d e f) 1 4) の1番目はc");
     assert(primitive_elt(os_make_cons(list_result, os_make_cons(os_make_fixnum(2), nil)), nil) == os_make_symbol("D"),
            "(subseq '(a b c d e f) 1 4) の2番目はd");
-    assert(primitive_length(os_make_cons(list_result, nil), nil) >> 3 == 3, "(subseq '(a b c d e f) 1 4) の長さは3");
+    assert(primitive_length(os_make_cons(list_result, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(subseq '(a b c d e f) 1 4) の長さは3");
 
     lisp_val_t vec = primitive_vector(list, nil);
     lisp_val_t vec_result = primitive_subseq(
         os_make_cons(vec, os_make_cons(os_make_fixnum(1), os_make_cons(os_make_fixnum(4), nil))), nil);
     assert((vec_result & TAG_MASK) == TAG_INSTANCE, "(subseq (vector ...) 1 4) の戻り値はTAG_INSTANCEを持つ(VECTOR)");
-    assert(primitive_length(os_make_cons(vec_result, nil), nil) >> 3 == 3, "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の長さは3");
+    assert(primitive_length(os_make_cons(vec_result, nil), nil) >> FIXNUM_VALUE_SHIFT == 3, "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の長さは3");
     assert(primitive_elt(os_make_cons(vec_result, os_make_cons(os_make_fixnum(0), nil)), nil) == os_make_symbol("B"),
            "(subseq (vector 'a 'b 'c 'd 'e 'f) 1 4) の0番目はb");
     assert(primitive_elt(os_make_cons(vec_result, os_make_cons(os_make_fixnum(2), nil)), nil) == os_make_symbol("D"),
@@ -1609,18 +1613,27 @@ static void test_literal_slot_reclaim_callback(lisp_val_t *slot_addr) {
 }
 void test_os_environment_register_and_reclaim_literal_slots() {
     lisp_val_t env = os_make_environment(os_make_symbol("LITERAL-SLOTS-TEST-ENV"), nil);
-    lisp_val_t fake_slot_a = os_make_fixnum(111);
-    lisp_val_t fake_slot_b = os_make_fixnum(222);
+    /* [4bit化] スロットのアドレスは TAG_RAW_POINTER を付けて保存されるので、
+       **16byte境界に置かないと下位4bitが落ちて別々のスロットが同一視される**。
+       本番のリテラルスロットは za_slot_t(16byteストライド、PR #74)なので条件を
+       満たしている。テスト側のダミーも同じ条件にそろえる
+       (3bitタグのころは8byte間隔のスタック変数でもたまたま区別できていた) */
+    static lisp_val_t fake_slots[2] __attribute__((aligned(OS_HEAP_ALIGN)));
+    _Static_assert(sizeof(lisp_val_t) * 2 <= 2 * OS_HEAP_ALIGN, "fake_slots stride assumption");
+    lisp_val_t *fake_slot_a = &fake_slots[0];
+    lisp_val_t *fake_slot_b = (lisp_val_t *)((UINT8 *)&fake_slots[0] + OS_HEAP_ALIGN);
+    *fake_slot_a = os_make_fixnum(111);
+    *fake_slot_b = os_make_fixnum(222);
 
     g_literal_slot_reclaim_seen_count = 0;
-    os_environment_register_literal_slot(env, &fake_slot_a);
-    os_environment_register_literal_slot(env, &fake_slot_b);
+    os_environment_register_literal_slot(env, fake_slot_a);
+    os_environment_register_literal_slot(env, fake_slot_b);
     os_environment_reclaim_literal_slots(env, test_literal_slot_reclaim_callback);
 
     assert(g_literal_slot_reclaim_seen_count == 2, "登録した2件それぞれについてコールバックが呼ばれる");
-    assert((g_literal_slot_reclaim_seen[0] == &fake_slot_a || g_literal_slot_reclaim_seen[0] == &fake_slot_b),
+    assert((g_literal_slot_reclaim_seen[0] == fake_slot_a || g_literal_slot_reclaim_seen[0] == fake_slot_b),
            "コールバックに渡されるのは登録したアドレスのいずれか");
-    assert((g_literal_slot_reclaim_seen[1] == &fake_slot_a || g_literal_slot_reclaim_seen[1] == &fake_slot_b),
+    assert((g_literal_slot_reclaim_seen[1] == fake_slot_a || g_literal_slot_reclaim_seen[1] == fake_slot_b),
            "コールバックに渡されるのは登録したアドレスのいずれか");
     assert(g_literal_slot_reclaim_seen[0] != g_literal_slot_reclaim_seen[1], "同じアドレスが重複して渡されない");
 
@@ -1668,26 +1681,226 @@ void test_gc_symbol_survives_via_symbol_table() {
     assert(strncmp(buf, "GC-TEST-SYMBOL", 14) == 0, "GCを跨いでもsymbol名の内容は保たれる");
 }
 
+/* ===== 4bitタグ体系の網羅テスト =========================================
+ *
+ * タグは16値ある。**未割当の値も含めて全16値を固定する**のが要点で、
+ * 「今使っている値だけ」を試すと、未割当タグの扱いが決まっていないことが
+ * テストからは見えない。GCが即値をポインタとして追いかけると静かに
+ * ヒープが壊れるので、ここは網羅でなければ意味がない。
+ */
+
+/** タグ1つぶんの期待値。documents/tag4-step2.md の表と同じ内容 */
+typedef struct {
+    UINT64 tag;
+    const char *name;
+    int holds_address;   /* bit0。アドレスを持つか */
+    int is_heap_ref;     /* GCが追いかけるか */
+} tag_expectation_t;
+
+static const tag_expectation_t g_tag_expectations[16] = {
+    /* tag                 name              addr  heap */
+    { 0x0ULL,              "FIXNUM",            0,   0 },
+    { 0x1ULL,              "CONS",              1,   1 },
+    { 0x2ULL,              "CHAR",              0,   0 },
+    { 0x3ULL,              "SYMBOL",            1,   1 },
+    { 0x4ULL,              "SINGLE-FLOAT(予約)", 0,   0 },
+    { 0x5ULL,              "STRING",            1,   1 },
+    { 0x6ULL,              "即値・未割当",        0,   0 },
+    { 0x7ULL,              "INSTANCE",          1,   1 },
+    { 0x8ULL,              "即値・未割当",        0,   0 },
+    { 0x9ULL,              "RAW_POINTER",       1,   0 },
+    { 0xAULL,              "即値・未割当",        0,   0 },
+    { 0xBULL,              "アドレス・未割当",     1,   0 },
+    { 0xCULL,              "即値・未割当",        0,   0 },
+    { 0xDULL,              "アドレス・未割当",     1,   0 },
+    { 0xEULL,              "MARKER(予約)",       0,   0 },
+    { 0xFULL,              "FORWARD",           1,   1 },
+};
+
+void test_tag_table_covers_all_sixteen_values() {
+    assert(TAG_MASK == 0xFULL, "TAG_MASKは4bit(0xF)である");
+
+    /* 名前付き定数が表のどこに座っているか。表と定数がずれたらここで落ちる */
+    assert(TAG_FIXNUM       == 0x0ULL, "TAG_FIXNUMは0x0");
+    assert(TAG_CONS         == 0x1ULL, "TAG_CONSは0x1");
+    assert(TAG_CHAR         == 0x2ULL, "TAG_CHARは0x2");
+    assert(TAG_SYMBOL       == 0x3ULL, "TAG_SYMBOLは0x3");
+    assert(TAG_SINGLE_FLOAT == 0x4ULL, "TAG_SINGLE_FLOATは0x4(予約のみ)");
+    assert(TAG_STRING       == 0x5ULL, "TAG_STRINGは0x5");
+    assert(TAG_INSTANCE     == 0x7ULL, "TAG_INSTANCEは0x7");
+    assert(TAG_RAW_POINTER  == 0x9ULL, "TAG_RAW_POINTERは0x9");
+    assert(TAG_MARKER       == 0xEULL, "TAG_MARKERは0xE");
+    assert(TAG_FORWARD      == 0xFULL, "TAG_FORWARDは0xF");
+
+    int addr_mismatch = 0, heap_mismatch = 0, index_mismatch = 0;
+    for (UINT64 t = 0; t < 16; t++) {
+        const tag_expectation_t *e = &g_tag_expectations[t];
+        if (e->tag != t) { index_mismatch++; }
+        if (os_tag_holds_address(t) != e->holds_address) { addr_mismatch++; }
+        if (os_tag_is_heap_ref(t)   != e->is_heap_ref)   { heap_mismatch++; }
+    }
+    assert(index_mismatch == 0, "期待値テーブルの添字とタグ値が一致している");
+    assert(addr_mismatch == 0,
+           "os_tag_holds_addressが全16値で期待どおり(bit0=1がアドレス側)");
+    assert(heap_mismatch == 0,
+           "os_tag_is_heap_refが全16値で期待どおり(未割当・予約・raw pointerは偽)");
+}
+
+void test_tag_immediate_pointer_split_is_bit0() {
+    int mismatch = 0;
+    for (UINT64 t = 0; t < 16; t++) {
+        /* bit0 が即値/ポインタの唯一の判断材料であること */
+        if (((t & 0x1ULL) != 0) != (os_tag_holds_address(t) != 0)) { mismatch++; }
+    }
+    assert(mismatch == 0, "即値とアドレスの区別は全16値でbit0だけで決まる");
+
+    /* GCが追いかけるタグは必ずアドレスを持つ(逆は成り立たない) */
+    int follows_immediate = 0;
+    for (UINT64 t = 0; t < 16; t++) {
+        if (os_tag_is_heap_ref(t) && !os_tag_holds_address(t)) { follows_immediate++; }
+    }
+    assert(follows_immediate == 0,
+           "GCが追いかけるタグに即値(bit0=0)は1つもない");
+}
+
+void test_unassigned_and_reserved_tags_are_not_followed_by_gc() {
+    /* 未割当・予約タグは「まだ誰も作らない」だけで「安全」ではない。
+       GCが追いかけると生のビットパターンをヒープオブジェクトとして複製し、
+       word0へ転送先を書き込む(= 静かなヒープ破壊)。偽であることを固定する */
+    const UINT64 unassigned[] = { 0x6ULL, 0x8ULL, 0xAULL, 0xCULL, 0xBULL, 0xDULL };
+    int followed = 0;
+    for (UINT64 i = 0; i < sizeof(unassigned) / sizeof(unassigned[0]); i++) {
+        if (os_tag_is_heap_ref(unassigned[i])) { followed++; }
+    }
+    assert(followed == 0, "未割当6値はどれもos_tag_is_heap_refが偽");
+    assert(!os_tag_is_heap_ref(TAG_SINGLE_FLOAT), "予約のTAG_SINGLE_FLOATは追いかけない");
+    assert(!os_tag_is_heap_ref(TAG_MARKER), "予約のTAG_MARKERは追いかけない");
+    assert(!os_tag_is_heap_ref(TAG_RAW_POINTER),
+           "TAG_RAW_POINTERはアドレスを持つがGC管理外なので追いかけない");
+}
+
+void test_immediate_encode_decode_round_trip() {
+    /* fixnum: 0・1・境界値・境界値-1 */
+    const UINT64 mags[] = { 0ULL, 1ULL, 42ULL, FIXNUM_MAGNITUDE_MASK - 1, FIXNUM_MAGNITUDE_MASK };
+    int bad_tag = 0, bad_value = 0;
+    for (UINT64 i = 0; i < sizeof(mags) / sizeof(mags[0]); i++) {
+        lisp_val_t v = os_make_fixnum(mags[i]);
+        if ((v & TAG_MASK) != TAG_FIXNUM) { bad_tag++; }
+        if (os_fixnum_magnitude(v) != mags[i]) { bad_value++; }
+    }
+    assert(bad_tag == 0, "fixnumのエンコードは全ケースでTAG_FIXNUMになる");
+    assert(bad_value == 0, "fixnumはエンコード→デコードで値が保たれる");
+
+    /* 符号付き。符号絶対値なので下端は上端の符号反転ちょうど */
+    lisp_val_t neg = os_make_fixnum_signed(1, FIXNUM_MAGNITUDE_MASK);
+    assert((neg & TAG_MASK) == TAG_FIXNUM, "負のfixnumもTAG_FIXNUM");
+    assert(os_fixnum_is_negative(neg), "負のfixnumは符号bitが立つ");
+    assert(os_fixnum_magnitude(neg) == FIXNUM_MAGNITUDE_MASK, "負のfixnumもマグニチュードが保たれる");
+    assert(os_make_fixnum_signed(1, 0) == os_make_fixnum(0), "-0は0に正規化される");
+
+    /* character: ASCII・0x80境界・BMP・コードポイント上限 */
+    const UINT32 codes[] = { 0x00u, 0x41u, 0x7Fu, 0x80u, 0xFFu, 0x3042u, 0xFFFFu, 0x10FFFFu, 0xFFFFFFFFu };
+    int c_bad_tag = 0, c_bad_value = 0;
+    for (UINT64 i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+        lisp_val_t v = os_make_char(codes[i]);
+        if ((v & TAG_MASK) != TAG_CHAR) { c_bad_tag++; }
+        if ((UINT32)(v >> CHAR_VALUE_SHIFT) != codes[i]) { c_bad_value++; }
+    }
+    assert(c_bad_tag == 0, "characterのエンコードは全ケースでTAG_CHARになる");
+    assert(c_bad_value == 0, "characterはエンコード→デコードでコードポイントが保たれる");
+}
+
+void test_char_high_code_points_do_not_corrupt_upper_bits() {
+    /* [4bit化] os_make_char の引数が const char だったころ、0x80以上で符号拡張が
+       起きて上位ビットがすべて1になっていた。UINT32化で解消したことを固定する */
+    lisp_val_t c80 = os_make_char(0x80u);
+    assert((c80 & TAG_MASK) == TAG_CHAR, "0x80のcharacterはTAG_CHAR");
+    assert((UINT32)(c80 >> CHAR_VALUE_SHIFT) == 0x80u, "0x80のコードポイントがそのまま戻る");
+    /* 符号拡張が起きていれば bit32-63 が全部1になり、この比較で落ちる */
+    assert((c80 >> CHAR_VALUE_SHIFT) == 0x80ULL, "0x80で上位ビットが1で埋まらない");
+
+    lisp_val_t cff = os_make_char(0xFFu);
+    assert((cff >> CHAR_VALUE_SHIFT) == 0xFFULL, "0xFFで上位ビットが1で埋まらない");
+
+    /* タグ領域とコードポイント領域の**外側**(bit4-31の空き)には何も入らない */
+    const lisp_val_t char_used_bits = TAG_MASK | (0xFFFFFFFFULL << CHAR_VALUE_SHIFT);
+    assert((c80 & ~char_used_bits) == 0, "0x80のcharacterはタグ/コード以外のビットを持たない");
+    assert((cff & ~char_used_bits) == 0, "0xFFのcharacterはタグ/コード以外のビットを持たない");
+    assert((os_make_char(0x10FFFFu) & ~char_used_bits) == 0,
+           "コードポイント上限のcharacterもタグ/コード以外のビットを持たない");
+}
+
+void test_immediates_survive_gc_unchanged() {
+    /* 即値はGCが素通しする。GCを挟んで値が変わらないことを確かめる。
+       未割当タグの値も一緒に通し、GCが追いかけて落ちないことを見る */
+    lisp_val_t fix = os_make_fixnum(123456789ULL);
+    lisp_val_t neg = os_make_fixnum_signed(1, 987654321ULL);
+    lisp_val_t chr = os_make_char(0x3042u);
+    os_gc_register_root(&fix);
+    os_gc_register_root(&neg);
+    os_gc_register_root(&chr);
+
+    /* 未割当タグ・予約タグの値をルートに置く。GCが追いかけたら
+       canonicalでないアドレスを読んで落ちるか、値が書き換わる */
+    lisp_val_t unassigned = (lisp_val_t)0xDEADBEEF0000ULL | 0x6ULL;
+    lisp_val_t marker     = (lisp_val_t)0xDEADBEEF0000ULL | TAG_MARKER;
+    lisp_val_t sfloat     = (lisp_val_t)0xDEADBEEF0000ULL | TAG_SINGLE_FLOAT;
+    os_gc_register_root(&unassigned);
+    os_gc_register_root(&marker);
+    os_gc_register_root(&sfloat);
+
+    lisp_val_t fix_before = fix, neg_before = neg, chr_before = chr;
+    lisp_val_t un_before = unassigned, mk_before = marker, sf_before = sfloat;
+
+    os_gc_collect();
+
+    assert(fix == fix_before, "fixnumはGCを跨いでも値が変わらない");
+    assert(neg == neg_before, "負のfixnumはGCを跨いでも値が変わらない");
+    assert(chr == chr_before, "characterはGCを跨いでも値が変わらない");
+    assert(unassigned == un_before, "未割当タグの値はGCを跨いでも変わらない(追いかけられていない)");
+    assert(marker == mk_before, "TAG_MARKERの値はGCを跨いでも変わらない");
+    assert(sfloat == sf_before, "TAG_SINGLE_FLOATの値はGCを跨いでも変わらない");
+
+    os_gc_unregister_root(&sfloat);
+    os_gc_unregister_root(&marker);
+    os_gc_unregister_root(&unassigned);
+    os_gc_unregister_root(&chr);
+    os_gc_unregister_root(&neg);
+    os_gc_unregister_root(&fix);
+}
+
 void test_gc_string_with_forward_tag_colliding_length_is_not_misdetected() {
-    // 長さ6の文字列はword0(=6)の下位3bitがTAG_FORWARD(6)と一致してしまう。
-    // gc_copy_valueがTo空間の範囲外であることを見て誤検知を回避できているかを確認する
-    lisp_val_t sym = os_make_symbol("GC-TEST-STRING-LEN6");
-    lisp_val_t str = os_make_string("abcdef");
+    /* STRINGのword0は**生の長さ**なので、長さの下位ビットがたまたま TAG_FORWARD と
+       一致する文字列が必ず存在する。長さは Lisp プログラムが決めるので制御できない
+       (documents/tag4-design.md 5.4 が「範囲検査は廃止できない」と結論した理由)。
+       gc_copy_value が To空間の範囲外であることを見て誤検知を回避できているかを確認する。
+
+       [4bit化] 長さは TAG_FORWARD から作る。直書きの6のままだと、タグ値を動かした
+       ときにこのテストだけが「衝突しない長さ」を試し続けて黙って無意味になる。 */
+    const UINT64 colliding_len = TAG_FORWARD;
+    char content[64];
+    assert(colliding_len < sizeof(content), "衝突する長さがテスト用バッファに収まる");
+    for (UINT64 i = 0; i < colliding_len; i++) { content[i] = (char)('a' + (i % 26)); }
+    content[colliding_len] = '\0';
+
+    lisp_val_t sym = os_make_symbol("GC-TEST-STRING-FWD-LEN");
+    lisp_val_t str = os_make_string(content);
     UINT64 *header = (UINT64 *)(str & ~TAG_MASK);
-    assert((header[0] & TAG_MASK) == TAG_FORWARD, "長さ6の文字列はword0の下位3bitがTAG_FORWARDと一致する(前提条件)");
+    assert((header[0] & TAG_MASK) == TAG_FORWARD,
+           "長さがTAG_FORWARDと同値の文字列は、word0の下位ビットがTAG_FORWARDと一致する(前提条件)");
     os_set_variable(sym, str, global_environment);
     lisp_addr_t addr_before = str & ~TAG_MASK;
 
     os_gc_collect();
 
     // symはGC前のFrom空間アドレスのままなので、検索にはGC後に取り直したsymbolを使う
-    lisp_val_t after = os_get_variable(os_make_symbol("GC-TEST-STRING-LEN6"), global_environment);
+    lisp_val_t after = os_get_variable(os_make_symbol("GC-TEST-STRING-FWD-LEN"), global_environment);
     assert((after & TAG_MASK) == TAG_STRING, "誤検知が起きてもGC後のタグはTAG_STRINGのまま");
     assert((after & ~TAG_MASK) != addr_before, "誤検知が起きても文字列はTo空間へ再配置される");
 
-    char buf[16];
+    char buf[64];
     os_string_to_cstr(after, buf, sizeof(buf));
-    assert(strncmp(buf, "abcdef", 6) == 0, "誤検知が起きても文字列の内容は破壊されず保たれる");
+    assert(strncmp(buf, content, (size_t)colliding_len) == 0, "誤検知が起きても文字列の内容は破壊されず保たれる");
 }
 
 void test_gc_instance_survives() {
@@ -1762,11 +1975,44 @@ void test_gc_reclaims_unreferenced_garbage() {
 // ようになったため、その分だけ広げる
 //
 // 2026-09-15 declaim(Phase2): %%CURRENT-OPTIMIZE と %%OPTIMIZE-OF の2つを
-// os_bootstrapへ追加し、さらに全environmentへ10番目のスロット(declaim)を足した
-// ため、77KBではgcd/isqrtテストがGC後も確保不能になって停止するようになった。
-// 実測した窓は79〜80KBで、78KB以下はハング、81KB以上はisqrtテストでGCが発火せず
-// NG(runtime_test.c:1855)。中央を取って80KBにしている
-#define SMALL_HEAP_SIZE (80 * 1024)
+// os_bootstrapへ追加し、さらに全environmentへ10番目のスロット(declaim)を足した。
+//
+// [境界] さらに os_alloc_bytes/gc_to_alloc の切り上げ単位を 8→16(OS_HEAP_ALIGN)へ
+// 変えたことで、os_bootstrap直後の生存量が実測 21,120 → 21,536 byte(+416 byte)に
+// 増えた。増えるのはSTRINGだけで(CONS 16/SYMBOL 32/INSTANCE 32は元々16の倍数)、
+// 8+len が 8の奇数倍になる長さのsymbol名がここに当たる。
+//
+// **この2つは独立に効き、生存量の増加が足し合わさる。** そのため
+// マージ後の窓は、どちらのブランチが単独で決めた値とも一致しない。
+//   declaim側(feature/compiler-optimization)単独の窓: 79〜80KB → 80KBを採用していた
+//   16byte切り上げ側(main)単独の窓:                  78〜80KB → 79KBを採用していた
+//   **マージ後の窓: 81〜84KB**
+// 両ブランチの値(79/80KB)はどちらもマージ後にはハングする。実際に80KBで
+// runtime_testが無限ループした(os_panicがユニットテストでは抜けないため、
+// CPU100%のまま止まらない)。
+//
+// 掃引結果(マージ後のツリー、2026-09-18):
+//   80KB: ハング  — GC後も確保不能
+//   81KB: 5395 OK / 0 NG
+//   82KB: 5395 OK / 0 NG   ← 採用(窓の中央。ハング側へ2KB、GC未発火側へ3KBの余裕)
+//   83KB: 5395 OK / 0 NG
+//   84KB: 5395 OK / 0 NG
+//   85KB: isqrtテスト(runtime_test.c:2090)の「GCが発火する」アサーションがNG
+//   86KB: bignum加算テスト(同2029)のアサーションもNG
+//
+// 中央付近を採るのは、両端のどちらに寄っても壊れ方が違うためである。
+// 小さすぎるとGC後も確保不能でハングし(os_panicがユニットテストでは無限ループ)、
+// 大きすぎるとGCが発火せず「GCを跨いでも正しい」系のアサーションがNGになる。
+// ハングのほうが切り分けに時間がかかるので、下側に寄せない。
+//
+// 値を変えるときのために可変にしてある。-DSMALL_HEAP_SIZE=... で上書きして
+// 掃引すれば、「ぎりぎり通る値」を推測ではなく実測で決められる。
+// 掃引するときは timeout を**コンテナの中**で効かせること。
+// `timeout N docker run ...` は docker クライアントしか殺さず、ハングした
+// コンテナが生き残って掃引が進まなくなる。
+#ifndef SMALL_HEAP_SIZE
+#define SMALL_HEAP_SIZE (82 * 1024)
+#endif
 
 static void setup_small_heap(void) {
     void *heap = malloc(SMALL_HEAP_SIZE);
@@ -2026,6 +2272,109 @@ void test_os_classify_addr_matches_real_objects() {
            "os_make_cons が返した cons は GCヒープにある");
 }
 
+/* [境界] 可変長オブジェクトの長さが端数になるケースを、確保 -> GC -> 内容確認まで
+   通す。STRINGのサイズは 8+len なので、len が 0/7/8/9/15/16/17 のとき切り上げ前の
+   要求は 8/15/16/17/23/24/25 byte になり、8byte切り上げだと 8/16/16/24/24/24/32 と
+   「16の倍数でない値」が混ざる。そこが os_alloc_bytes / gc_to_alloc の切り上げ単位を
+   8 から OS_HEAP_ALIGN へ変えた本命のケースである。
+
+   確認するのは2点:
+     1. 確保したアドレスが OS_HEAP_ALIGN 境界にあること(確保直後とGC後の両方)
+     2. GCでコピーされた後も中身が壊れていないこと
+   ALIGN_AUDIT ビルドでなくても回るよう、アドレス検査はこのテスト自身で行う。 */
+static const UINT64 g_align_edge_lens[] = { 0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25 };
+#define ALIGN_EDGE_CASES (sizeof(g_align_edge_lens) / sizeof(g_align_edge_lens[0]))
+
+static void align_edge_fill(char *buf, UINT64 len) {
+    for (UINT64 i = 0; i < len; i++) {
+        buf[i] = (char)('a' + (i % 26));
+    }
+    buf[len] = '\0';
+}
+
+void test_heap_align_holds_for_variable_length_objects_across_gc() {
+    setup_small_heap();
+
+    lisp_val_t list = nil;
+    GC_PROTECT(list);
+
+    int alloc_misaligned = 0;
+    for (UINT64 c = 0; c < ALIGN_EDGE_CASES; c++) {
+        char piece[32];
+        align_edge_fill(piece, g_align_edge_lens[c]);
+        lisp_val_t str = os_make_string(piece);
+        if (((str & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { alloc_misaligned++; }
+        list = os_make_cons(str, list);
+        if (((list & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { alloc_misaligned++; }
+    }
+    assert(alloc_misaligned == 0,
+           "長さ0/1/7/8/9/15/16/17/23/24/25のstringとその間のconsが、確保直後にすべてOS_HEAP_ALIGN境界にある");
+
+    /* ガベージを作りながらGCを確実に発火させる。GCを跨いだ後に、
+       同じオブジェクトが再びすべて境界に乗っていることを確かめる */
+    UINT64 gc_before = os_gc_collect_count();
+    for (int i = 0; i < 4000; i++) {
+        char piece[4] = { 'x', (char)('0' + (i % 10)), 'y', '\0' };
+        os_make_cons(os_make_string(piece), nil);
+    }
+    UINT64 gc_after = os_gc_collect_count();
+    assert(gc_after > gc_before,
+           "境界テストの途中でos_gc_collectが実際に発火する(発火しなければコピー後の検査に意味がない)");
+
+    int after_misaligned = 0;
+    int content_mismatch = 0;
+    UINT64 seen = 0;
+    /* listはconsで積んだので、長さ列の逆順に並んでいる */
+    for (lisp_val_t p = list; p != nil; p = cc_cdr(p)) {
+        UINT64 expected_len = g_align_edge_lens[ALIGN_EDGE_CASES - 1 - seen];
+        lisp_val_t str = cc_car(p);
+        if (((p   & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { after_misaligned++; }
+        if (((str & ~TAG_MASK) & (OS_HEAP_ALIGN - 1)) != 0) { after_misaligned++; }
+
+        char expected[32];
+        align_edge_fill(expected, expected_len);
+        char buf[32];
+        os_string_to_cstr(str, buf, sizeof(buf));
+        if (strcmp(buf, expected) != 0) { content_mismatch++; }
+        seen++;
+    }
+    assert(seen == ALIGN_EDGE_CASES, "GC後もリストの要素数が変わらない");
+    assert(after_misaligned == 0,
+           "GCでTo空間へコピーされた後も、端数長のstringとconsがすべてOS_HEAP_ALIGN境界にある");
+    assert(content_mismatch == 0, "GCでコピーされた後も端数長のstringの内容が一致する");
+}
+
+/* [境界] From/To両空間の先頭が OS_HEAP_ALIGN に乗っていること、および2つの
+   半空間が同サイズであることを、境界に乗っていないbaseを渡して確かめる。
+   os_heap_initは受け取ったbaseを切り上げる責務を負っている(呼び出し元の
+   os_boot_alloc_finalizeだけに任せると、mallocから直接渡すこの経路が漏れる)。 */
+void test_heap_init_aligns_both_half_spaces() {
+    UINT64 total = 1024 * 1024;
+    UINT8 *raw = (UINT8 *)malloc(total);
+    assert(raw != NULL, "半空間境界テスト用のヒープをmallocで確保できる");
+
+    /* 意図的に8 mod 16のbaseを作る。mallocは16境界を返すので+8でずらす */
+    UINT64 skewed_base = (UINT64)raw + 8;
+    UINT64 skewed_size = total - 8;
+    os_heap_init(skewed_base, skewed_size);
+
+    UINT64 from_start = 0, from_end = 0, to_start = 0, to_end = 0;
+    os_heap_bounds_for_test(&from_start, &from_end, &to_start, &to_end);
+
+    assert((from_start & (OS_HEAP_ALIGN - 1)) == 0,
+           "baseが8 mod 16でもFrom空間の先頭はOS_HEAP_ALIGN境界へ切り上げられる");
+    assert((to_start & (OS_HEAP_ALIGN - 1)) == 0,
+           "To空間の先頭もOS_HEAP_ALIGN境界にある");
+    assert((from_end - from_start) == (to_end - to_start),
+           "From空間とTo空間のサイズが等しい(フリップしても容量が減らない)");
+    assert(((from_end - from_start) & (OS_HEAP_ALIGN - 1)) == 0,
+           "半空間のサイズがOS_HEAP_ALIGNの倍数である");
+    assert(from_start >= skewed_base && to_end <= skewed_base + skewed_size,
+           "2つの半空間は渡された領域の内側に収まっている");
+
+    free(raw);
+}
+
 int main(int argc, char** argv) {
    (void)argc;
    (void)argv;
@@ -2130,6 +2479,12 @@ int main(int argc, char** argv) {
 
    test_gc_cons_survives_and_relocates();
    test_gc_symbol_survives_via_symbol_table();
+   test_tag_table_covers_all_sixteen_values();
+   test_tag_immediate_pointer_split_is_bit0();
+   test_unassigned_and_reserved_tags_are_not_followed_by_gc();
+   test_immediate_encode_decode_round_trip();
+   test_char_high_code_points_do_not_corrupt_upper_bits();
+   test_immediates_survive_gc_unchanged();
    test_gc_string_with_forward_tag_colliding_length_is_not_misdetected();
    test_gc_instance_survives();
    test_gc_circular_cons_list_does_not_hang();
@@ -2139,6 +2494,10 @@ int main(int argc, char** argv) {
    test_gc_fires_during_gcd_and_isqrt_and_results_are_correct();
    test_gc_fires_during_vector_construction_and_elements_are_preserved();
    test_gc_fires_during_string_append_and_result_is_correct();
+
+   test_heap_align_holds_for_variable_length_objects_across_gc();
+   /* os_heap_initを別のヒープで呼び直すので、他のテストより後に置く */
+   test_heap_init_aligns_both_half_spaces();
 
    return g_test_failed ? 1 : 0;
 }

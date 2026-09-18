@@ -242,7 +242,7 @@ static lisp_val_t primitive_assert_equal(lisp_val_t args, lisp_val_t env) {
     lisp_val_t actual = cc_car(cc_cdr(args));
     char msg[128];
     snprintf(msg, sizeof(msg), "assert-equal: expected=%lld actual=%lld",
-             (long long)(expected >> 3), (long long)(actual >> 3));
+             (long long)(expected >> FIXNUM_VALUE_SHIFT), (long long)(actual >> FIXNUM_VALUE_SHIFT));
     assert(expected == actual, msg);
     return actual;
 }

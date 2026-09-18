@@ -780,7 +780,9 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
             diag_write_string(fb, names[i]);
             diag_write_string(fb, "=");
             fb_write_hex64(fb, regs[i]);
-            if ((regs[i] & ~(uint64_t)0x7) == (0xDEADDEADDEADDEA6ULL & ~(uint64_t)0x7)) {
+            // タグを落として比較する(塗り潰しパターンはタグ付きの値として
+            // 流通するので、下位のタグ分は無視する)。土台もタグ幅もマクロから導く
+            if ((regs[i] & ~(uint64_t)TAG_MASK) == GC_PAINT_TRAP_PATTERN_BASE) {
                 trap_seen = 1;
             }
         }

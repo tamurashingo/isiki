@@ -87,6 +87,11 @@ static char g_qemu_test_boot_script[256] = "test/lisp/qemu_boot_test.lisp";
 /** g_qemu_test_boot_scriptが指すboot-entryスクリプトをcc_loadしてからpower_offする(process 0専用スタック上で実行される) */
 static void run_qemu_boot_test(void) {
     cc_load(os_make_cons(os_make_string(g_qemu_test_boot_script), nil), global_environment);
+#ifdef ISIKIOS_ALIGN_AUDIT
+    /* [調査] 16byte境界監査(ALIGN_AUDIT=1ビルドのみ)。boot-entryスクリプトを
+       変えずにどのQEMU試験でも集計が取れるよう、電源断の直前でシリアルへ出す */
+    os_align_audit_report();
+#endif
     g_qemu_test_power_off();
 }
 
@@ -129,6 +134,11 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_boot_alloc_finalize(&lisp_heap_base, &lisp_heap_size);
 
     os_heap_init(lisp_heap_base, lisp_heap_size);
+    /* [境界] JITリテラルスロットの配列先頭を、最初のJITコンパイルより前に確かめる。
+       os_bootstrap内でnil自身が検査されるのと同じ趣旨(documents/static-align16-survey.md
+       「本採用」節)。ここより早く置けないのは、os_panicが使う診断経路
+       (シリアル/フレームバッファ)がこの時点で初めて使える状態になるため */
+    za_assert_slot_alignment();
     os_bootstrap();
     os_register_subprimitives();
     os_register_ide_subprimitives();

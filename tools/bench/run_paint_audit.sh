@@ -33,6 +33,9 @@
 #                  GC 0回の試験が多かった場合に、集計を見てから使う
 #   AUDIT_FILES    流す試験ファイル(空白区切り)。既定はqemu_boot_test.lispと同じ列
 #   AUDIT_DISK_IMG QEMUのhd0に与えるイメージ(既定はMakefileのIDE_DISK_IMG)
+#   ALIGN_AUDIT    [調査] 16byte境界監査(documents/alignment-survey-report.md)の
+#                  ビルドフラグ。1にすると各グループのserialへ[ALIGN]行が出る。
+#                  既定(空)では通常ビルドのままで何も変わらない
 #   GC_DEBUG / GC_PAINT  ビルドフラグ。**必ず環境から引き継ぐこと。**
 #                  各グループはmake経由で走るので、ここで渡さないと途中で
 #                  ソースが更新された瞬間にフラグ無しで再ビルドされ、
@@ -104,7 +107,7 @@ warmup_boot="tmp/audit_warmup.lisp"
   echo '(isiki-test-report)'
   echo '(close *isiki-test-stream*)'; } > "$warmup_boot"
 echo "--- ウォームアップ(捨てる) ---"
-make test-qemu-audit-run MILESTONE="$warmup_boot" AUDIT_TIMEOUT="$TIMEOUT_SEC"     GC_DEBUG="${GC_DEBUG:-}" GC_PAINT="${GC_PAINT:-}" >/dev/null 2>&1 || true
+make test-qemu-audit-run MILESTONE="$warmup_boot" AUDIT_TIMEOUT="$TIMEOUT_SEC"     GC_DEBUG="${GC_DEBUG:-}" GC_PAINT="${GC_PAINT:-}" ALIGN_AUDIT="${ALIGN_AUDIT:-}" >/dev/null 2>&1 || true
 
 echo "=== 塗り潰し監査: outdir=$OUTDIR timeout=${TIMEOUT_SEC}s control=$USE_CONTROL stress=$STRESS ==="
 echo "    ビルドフラグ: GC_DEBUG=${GC_DEBUG:-(なし)} GC_PAINT=${GC_PAINT:-(なし)}"
@@ -126,7 +129,7 @@ for name in $FILES; do
     start=$(date +%s)
     set +e
     make test-qemu-audit-run \
-        GC_DEBUG="${GC_DEBUG:-}" GC_PAINT="${GC_PAINT:-}" \
+        GC_DEBUG="${GC_DEBUG:-}" GC_PAINT="${GC_PAINT:-}" ALIGN_AUDIT="${ALIGN_AUDIT:-}" \
         MILESTONE="$boot" \
         AUDIT_TIMEOUT="$TIMEOUT_SEC" \
         QEMU_EXTRA_FLAGS="-serial file:$PWD/$serial" \

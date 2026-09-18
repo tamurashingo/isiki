@@ -74,12 +74,10 @@ lisp_val_t cc_assoc_eq(lisp_val_t k, lisp_val_t alist) {
         lisp_val_t pair = cc_car(current); // car -> (key . val)
         lisp_val_t key = cc_car(pair); // car of pair -> key
 
-        // symbol
+        // symbolもfixnumもタグ付きの値そのものが一意なので、raw eqで足りる
+        // (fixnumは下位3bitがタグ0、残りが符号+マグニチュードなので、
+        //  値が等しいことと64bit語が等しいことが一致する)
         if (k == key) {
-            return pair;
-        }
-        // fixnum
-        else if (k & TAG_FIXNUM && (k >> 3) == (key >> 3)) {
             return pair;
         }
         current = cc_cdr(current); // cdr -> next

@@ -105,4 +105,13 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
  */
 void os_register_za_primitives(void);
 
+/**
+ * [境界] JITリテラルスロット4本の配列先頭がOS_HEAP_ALIGN境界にあることを確かめ、
+ * 外れていればos_panicする。スロットのアドレスはTAG_RAW_POINTER付きのLisp値として
+ * 流通するため、ここが崩れると「Lisp値はすべて16byte境界」の不変条件が破れる。
+ * 要素サイズ側は za.c の _Static_assert が保証するので、先頭だけ見ればよい。
+ * ブート時に1回呼ぶ(kernel_main)。
+ */
+void za_assert_slot_alignment(void);
+
 #endif /* _ZA_H_ */

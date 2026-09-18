@@ -201,14 +201,15 @@ lisp_val_t cc_read_char(lisp_val_t args, lisp_val_t env) {
     if (!os_stream_read_char(raw, &ch)) {
         return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
-    return os_make_char(ch);
+    /* [4bit化] chはsigned char。UINT8を経由しないと0x80以上で符号拡張する */
+    return os_make_char((UINT8)ch);
 }
 
 lisp_val_t cc_write_char(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t ch = cc_car(args);
     os_stream_t *raw = stream_raw(cc_car(cc_cdr(args)));
-    os_stream_write_char(raw, (char)(ch >> 3));
+    os_stream_write_char(raw, (char)(ch >> CHAR_VALUE_SHIFT));
     return ch;
 }
 
@@ -406,7 +407,8 @@ lisp_val_t cc_preview_char(lisp_val_t args, lisp_val_t env) {
     if (!os_stream_preview_char(raw, &ch)) {
         return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
-    return os_make_char(ch);
+    /* [4bit化] chはsigned char。UINT8を経由しないと0x80以上で符号拡張する */
+    return os_make_char((UINT8)ch);
 }
 
 lisp_val_t cc_read_line(lisp_val_t args, lisp_val_t env) {

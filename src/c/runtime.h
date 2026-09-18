@@ -4,24 +4,219 @@
 #include "types.h"
 #include "process.h"
 
-/** タグ位置(下位3bit)を取り出すマスク */
-#define TAG_MASK     0x7ULL
-/** 即値のfixnum(000) */
+/* ===== タグ体系(4bit) =====================================================
+ *
+ * **bit0 = 0 が即値、bit0 = 1 がアドレスを持つ値**。この1bitで
+ * 「下位4bitを0にできる値か(= 16byte境界を要求してよいか)」が決まる。
+ *
+ *   値   種別    型
+ *   0x0  即値    fixnum
+ *   0x2  即値    character
+ *   0x4  即値    single-float (**予約のみ。実装していない**)
+ *   0x6  即値    未割当
+ *   0x8  即値    未割当
+ *   0xA  即値    未割当
+ *   0xC  即値    未割当
+ *   0xE  即値    予約(マーカー一族。MAGIC_* の下位4bit)
+ *   0x1  アドレス cons
+ *   0x3  アドレス symbol
+ *   0x5  アドレス string
+ *   0x7  アドレス instance
+ *   0x9  アドレス raw pointer (GC管理外)
+ *   0xB  アドレス 未割当(将来の double-float 用に空けておく)
+ *   0xD  アドレス 未割当(将来の ratio 用に空けておく)
+ *   0xF  アドレス forward (GC中のみ)
+ *
+ * 「アドレスを持つ」と「GCが追いかける」は**別の概念**である。raw pointer は
+ * アドレスを持つがGC管理外で、forward はGC内部専用。どのタグをGCが追いかけるかは
+ * os_tag_is_heap_ref が唯一の判断元。
+ */
+
+/** タグ位置(下位4bit)を取り出すマスク */
+#define TAG_MASK     0xFULL
+
+/** [単一の真実源] タグがアドレスを持つ値を表すか(bit0)。0なら即値 */
+#define TAG_IS_POINTER_BIT 0x1ULL
+
+/** 即値のfixnum(0000) */
 #define TAG_FIXNUM   0x0ULL
-/** cons cellへのアドレス(001) */
+/** cons cellへのアドレス(0001) */
 #define TAG_CONS     0x1ULL
-/** symbolへのアドレス(010) */
-#define TAG_SYMBOL   0x2ULL
-/** 即値のchar(011) */
-#define TAG_CHAR     0x3ULL
-/** stringへのアドレス(100) */
-#define TAG_STRING   0x4ULL
-/** instance(function/process等)へのアドレス(101) */
-#define TAG_INSTANCE 0x5ULL
-/** GCが転送済みオブジェクトの新しい位置を指すために使う、転送先アドレス(110)。ヒープ上のオブジェクトのword0にのみ現れる */
-#define TAG_FORWARD  0x6ULL
-/** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等)。fixnum/charと同様の即値として扱い、GCは素通しする(111) */
-#define TAG_RAW_POINTER 0x7ULL
+/** 即値のcharacter(0010)。コードポイントはbit32-63の32bit */
+#define TAG_CHAR     0x2ULL
+/** symbolへのアドレス(0011) */
+#define TAG_SYMBOL   0x3ULL
+/** 即値のsingle-float(0100)。**枠を予約しているだけで実装していない**。
+    <float>はIEEE754 binary64のままヒープ(MAGIC_FLOAT)に置く */
+#define TAG_SINGLE_FLOAT 0x4ULL
+/** stringへのアドレス(0101) */
+#define TAG_STRING   0x5ULL
+/** instance(function/process等)へのアドレス(0111) */
+#define TAG_INSTANCE 0x7ULL
+/** Lispヒープに属さない生の64bitアドレス(C構造体・MMIOレジスタ等、1001)。GCは素通しする */
+#define TAG_RAW_POINTER 0x9ULL
+/** GCが転送済みオブジェクトの新しい位置を指すために使う、転送先アドレス(1111)。
+    ヒープ上のオブジェクトのword0にのみ現れる。MAGIC_*の下位4bitは0xEなので、
+    **MAGIC値がこのタグと一致することは構造的にない**(PR #77) */
+#define TAG_FORWARD  0xFULL
+
+/** MAGIC_*の下位4bitに使う予約値(1110)。即値側なのでGCは追いかけない */
+#define TAG_MARKER   0xEULL
+
+/* --- タグ値の不変条件 ---------------------------------------------------
+   タグ幅を広げる改修(TAG_MASK を 0xF にする等)で最初に壊れるのがここ。
+   コンパイル時に落ちるようにしておき、実行時まで持ち越さない。
+   メッセージはASCIIで書く(GCCは非ASCIIを8進エスケープで出すため読めなくなる) */
+_Static_assert((TAG_MASK & (TAG_MASK + 1)) == 0,
+               "TAG_MASK must be a contiguous run of low bits (2^n - 1)");
+_Static_assert(TAG_FIXNUM      <= TAG_MASK, "TAG_FIXNUM does not fit in TAG_MASK");
+_Static_assert(TAG_CONS        <= TAG_MASK, "TAG_CONS does not fit in TAG_MASK");
+_Static_assert(TAG_SYMBOL      <= TAG_MASK, "TAG_SYMBOL does not fit in TAG_MASK");
+_Static_assert(TAG_CHAR        <= TAG_MASK, "TAG_CHAR does not fit in TAG_MASK");
+_Static_assert(TAG_STRING      <= TAG_MASK, "TAG_STRING does not fit in TAG_MASK");
+_Static_assert(TAG_INSTANCE    <= TAG_MASK, "TAG_INSTANCE does not fit in TAG_MASK");
+_Static_assert(TAG_FORWARD     <= TAG_MASK, "TAG_FORWARD does not fit in TAG_MASK");
+_Static_assert(TAG_RAW_POINTER <= TAG_MASK, "TAG_RAW_POINTER does not fit in TAG_MASK");
+_Static_assert(TAG_SINGLE_FLOAT <= TAG_MASK, "TAG_SINGLE_FLOAT does not fit in TAG_MASK");
+_Static_assert(TAG_MARKER       <= TAG_MASK, "TAG_MARKER does not fit in TAG_MASK");
+/* タグ値が互いに重複しないこと。ビット位置に1を立てて数を数える形で確かめる
+   (同じ値が2つあれば立つビットが10本に満たない) */
+_Static_assert(__builtin_popcountll((1ULL << TAG_FIXNUM) | (1ULL << TAG_CONS) |
+                                    (1ULL << TAG_SYMBOL) | (1ULL << TAG_CHAR) |
+                                    (1ULL << TAG_STRING) | (1ULL << TAG_INSTANCE) |
+                                    (1ULL << TAG_FORWARD) | (1ULL << TAG_RAW_POINTER) |
+                                    (1ULL << TAG_SINGLE_FLOAT) | (1ULL << TAG_MARKER)) == 10,
+               "TAG_* values are not all distinct");
+
+/* --- bit0 = 「アドレスを持つ」の割り当て ---------------------------------
+   この規約が崩れると os_tag_holds_address が嘘をつき、16byte境界の要求が
+   即値にまで及ぶ(または必要なポインタに及ばなくなる) */
+_Static_assert((TAG_FIXNUM       & TAG_IS_POINTER_BIT) == 0, "TAG_FIXNUM must be an immediate (bit0 = 0)");
+_Static_assert((TAG_CHAR         & TAG_IS_POINTER_BIT) == 0, "TAG_CHAR must be an immediate (bit0 = 0)");
+_Static_assert((TAG_SINGLE_FLOAT & TAG_IS_POINTER_BIT) == 0, "TAG_SINGLE_FLOAT must be an immediate (bit0 = 0)");
+_Static_assert((TAG_MARKER       & TAG_IS_POINTER_BIT) == 0, "TAG_MARKER must be an immediate (bit0 = 0)");
+_Static_assert((TAG_CONS        & TAG_IS_POINTER_BIT) != 0, "TAG_CONS must be a pointer (bit0 = 1)");
+_Static_assert((TAG_SYMBOL      & TAG_IS_POINTER_BIT) != 0, "TAG_SYMBOL must be a pointer (bit0 = 1)");
+_Static_assert((TAG_STRING      & TAG_IS_POINTER_BIT) != 0, "TAG_STRING must be a pointer (bit0 = 1)");
+_Static_assert((TAG_INSTANCE    & TAG_IS_POINTER_BIT) != 0, "TAG_INSTANCE must be a pointer (bit0 = 1)");
+_Static_assert((TAG_RAW_POINTER & TAG_IS_POINTER_BIT) != 0, "TAG_RAW_POINTER must be a pointer (bit0 = 1)");
+_Static_assert((TAG_FORWARD     & TAG_IS_POINTER_BIT) != 0, "TAG_FORWARD must be a pointer (bit0 = 1)");
+
+/* MAGIC_* の下位4bitが TAG_MARKER であることは MAGIC_LOW_NIBBLE 側で確かめる。
+   ここでは TAG_FORWARD と一致しないこと(= PR #77 の振り直しの目的)を固定する */
+_Static_assert(TAG_MARKER != TAG_FORWARD,
+               "MAGIC low nibble (TAG_MARKER) collides with TAG_FORWARD");
+
+/* ===== タグ別メモリ配置 =================================================
+ *
+ * 上の「タグ体系」がタグの値・幅・即値/アドレスの区別を決める。
+ * ここではタグごとの**ヒープ上のレイアウト**(何byte確保し、各wordに何が入るか)を書く。
+ *
+ * word番号はタグを外したアドレスからの8byte単位の添字である
+ * (word0 = ((UINT64 *)(v & ~TAG_MASK))[0])。
+ * 確保はすべて os_alloc_bytes を通り、要求サイズは OS_HEAP_ALIGN(16byte)へ
+ * 切り上げられる。したがって**実際に占める領域は下記サイズの16byte切り上げ**である。
+ *
+ * どのフィールドをGCが辿るかの正本は gc_scan_instance(runtime.c)であり、
+ * 下の表はその写しである。食い違ったらコードが正しい。
+ *
+ * ---- 即値(bit0 = 0) ----
+ *
+ * TAG_FIXNUM: ヒープなし。符号+マグニチュード(2の補数ではない)
+ *    bit63          符号(1:負)。0は常に非負へ正規化され、-0は存在しない
+ *    bit4-62        マグニチュード(FIXNUM_VALUE_SHIFT分ずらした FIXNUM_MAGNITUDE_MASK)
+ *    bit0-3         タグ
+ *    下端は上端の符号反転ちょうど。収まらない値は MAGIC_BIGNUM(TAG_INSTANCE)へ昇格する。
+ *
+ * TAG_CHAR: ヒープなし
+ *    bit32-63       Unicodeコードポイント(32bit、CHAR_VALUE_SHIFT分ずらす)
+ *    bit4-31        未使用(0)
+ *    bit0-3         タグ
+ *
+ * TAG_SINGLE_FLOAT / TAG_MARKER / 未割当の即値: 値を作る経路が無い(枠の予約のみ)。
+ *
+ * ---- アドレス(bit0 = 1) ----
+ *
+ * TAG_CONS: ヒープ16byte
+ *    word0: car
+ *    word1: cdr
+ *
+ * TAG_SYMBOL: ヒープ32byte
+ *    word0: 名前のstringへのポインタ(TAG_STRING)。
+ *           symbolの値や関数は環境(environment)側が持つ
+ *    word1: gensymフラグ。nilなら通常のinterned symbol(g_symbol_tableに登録済み)、
+ *           非nilなら os_make_uninterned_symbol が作ったgensym由来
+ *    word2, word3: 未使用(nilで予約)
+ *
+ * TAG_STRING: ヒープ可変長(8 + 長さbyte)
+ *    word0:       文字列長さ(**タグなしの生の整数**)
+ *    byte[8...]:  文字のデータ本体(バイト列)
+ *    word0が生の整数なので、長さの下位4bitが TAG_FORWARD と一致する文字列は
+ *    必ず存在する。転送済み判定が範囲検査を必要とする理由がこれである
+ *    (documents/tag4-design.md 5.4)。
+ *
+ * TAG_INSTANCE: ヒープ32byte。word0のMAGICで種別を区別する
+ *    word0 = MAGIC_FUNCTION_NATIVE
+ *      word1: za_fn_meta_t(ABI-M4、Immobilized Space上)への**生ポインタ**。
+ *             meta->cons_entry が fn(evaluated_args, env) の実体を指す。
+ *             metaもコード領域も動かないのでGCは辿らない
+ *      word2: fixnum 1(za.cがJITコンパイルした関数) / fixnum 2(トランスパイラが
+ *             リフトしたlambdaのクロージャ) / NIL(組み込みprimitive)
+ *      word3: 定義時の環境または捕捉した環境。**word2の種別によらず、
+ *             非nilならGCが辿る**(fixnum 1 のJIT関数も定義時環境を持つ)
+ *    word0 = MAGIC_FUNCTION_INTERPRETED / MAGIC_MACRO
+ *      word1: 仮引数リスト  word2: 本体(未評価のフォーム列)  word3: 定義時の環境
+ *    word0 = MAGIC_PROCESS
+ *      word1: fixnum(プロセス番号)  word3: 状態symbol
+ *      word2: saved_rsp。process.cの静的スタック領域への生アドレス(GCは辿らない)
+ *    word0 = MAGIC_BLOCK_EXIT     word1: block名symbol  word2: 戻り値
+ *    word0 = MAGIC_CATCH_EXIT     word1: tag(評価済みの値)  word2: throwされた値
+ *    word0 = MAGIC_GO_EXIT        word1: tag symbol(未評価)
+ *    word0 = MAGIC_STREAM
+ *      word1: os_stream_t への生ポインタ。GCは構造体ごとコピーし、
+ *             文字列ストリームなら str_buf も別途コピーして張り替える
+ *    word0 = MAGIC_CLASS_INSTANCE word1: class  word2: slots-vector(MAGIC_VECTOR)
+ *    word0 = MAGIC_BUILTIN_CLASS / MAGIC_STANDARD_CLASS
+ *      word1: name symbol  word2: superclasses(list)  word3: slots(list、継承分含む)
+ *    word0 = MAGIC_BIGNUM
+ *      word1: sign(0:非負 / 1:負、生のint)  word2: limb数(生のint)
+ *      word3: limb配列(基数2^32、下位32bitのみ使用、limbs[0]が最下位)への生ポインタ。
+ *             GCは 8*limb数 byte をコピーして張り替える。
+ *             word2 == 0 は limb配列を確保する前の構築中の状態
+ *    word0 = MAGIC_VECTOR
+ *      word1: 多次元配列(general array)本体への生ポインタ。本体は可変長
+ *             8*(1+rank+total) byte:
+ *               word0:          次元数 rank(生の整数)
+ *               word[1..rank]:  各次元のサイズ(生の整数)
+ *               word[rank+1..]: 要素本体(タグ付き lisp_val_t、行優先(row-major)順)
+ *             word1 == 0 は本体を確保する前の構築中の状態
+ *    word0 = MAGIC_FLOAT
+ *      word1: double(IEEE754 binary64)のビットパターン(生の64bit値。GCは辿らない)
+ *
+ * TAG_RAW_POINTER: ヒープ外(GC管理外)
+ *    Lispから生の64bitアドレス(C構造体・MMIOレジスタ等)を持つためのタグ。
+ *    中身は「タグを外した生アドレス」そのもので、fixnumのようなシフトはしない。
+ *    アドレスを持つがGCは追いかけない(os_tag_is_heap_ref が偽)。
+ *    実際に流通するのはJITリテラルスロット・block_deviceハンドル・Function Cell・
+ *    環境ページの4種で、どれも16byte境界にある(documents/static-align16-survey.md)。
+ *
+ * TAG_FORWARD: GC中のみ、From空間のword0に現れる
+ *    From空間からTo空間へコピー済みのオブジェクトの印。
+ *    コピー元のword0を「移動先アドレス | TAG_FORWARD」で上書きする。
+ */
+
+/** [GCデバッグ] stale領域を塗るトラップパターンの、タグを除いた土台。
+ *
+ * 上位16bitが 0xDEAD で non-canonical なので、これをデリファレンスすると
+ * ページフォルトではなく **#GP** になる。例外時のレジスタにこの値が載っていれば
+ * staleポインタの参照そのものだと分かる(interrupt.c の例外ダンプが使う)。
+ *
+ * 塗り潰し本体(ISIKIOS_GC_PAINT)と例外ダンプの両方が参照するので、
+ * `#ifdef` の外に置く。タグ付きの実際の値は GC_DEBUG_TRAP_PATTERN_VALUE。
+ */
+#define GC_PAINT_TRAP_PATTERN_BASE 0xDEADDEADDEADDEA0ULL
+_Static_assert((GC_PAINT_TRAP_PATTERN_BASE & TAG_MASK) == 0,
+               "GC_PAINT_TRAP_PATTERN_BASE must have a zero tag field");
 
 /**
  * [単一の真実源] このタグの値はヒープオブジェクトへの参照か(=GCが追いかけるか)。
@@ -35,51 +230,205 @@
  * この関数だけを直せばよい。
  */
 static inline int os_tag_is_heap_ref(UINT64 tag) {
-    /* FIXNUM/CHARは即値、RAW_POINTERはGC管理外の生ポインタ。それ以外は
-       ヒープ上のオブジェクトを指す(FORWARDはGC内部の転送ポインタだが、
-       これが外に現れたらそれ自体がバグなので検出対象に含める) */
-    return tag != TAG_FIXNUM && tag != TAG_CHAR && tag != TAG_RAW_POINTER;
+    /* [4bit化] **除外リストではなく列挙にする。** 除外リストのままだと、
+       未割当の10値すべてが「GCが追いかける」側に落ちる。GCが即値をポインタと
+       して追いかけると、生のビットパターンをヒープオブジェクトとして複製し
+       word0へ転送先を書き込む(= 静かなヒープ破壊)。
+       未割当タグは「まだ誰も作らない」だけで「安全」ではないので、
+       明示的に偽を返す側へ置く。 */
+    switch (tag) {
+        case TAG_CONS:
+        case TAG_SYMBOL:
+        case TAG_STRING:
+        case TAG_INSTANCE:
+        /* FORWARDはGC内部の転送ポインタだが、これが外に現れたらそれ自体が
+           バグなので検出対象に含める(PR #72 でこの漏れを直した経緯がある) */
+        case TAG_FORWARD:
+            return 1;
+        /* 即値(bit0=0)はアドレスを持たない */
+        case TAG_FIXNUM:
+        case TAG_CHAR:
+        case TAG_SINGLE_FLOAT:   /* 予約。値は作られない */
+        case TAG_MARKER:         /* 予約。MAGIC_*の下位4bit */
+        case 0x6ULL:             /* 即値・未割当 */
+        case 0x8ULL:             /* 即値・未割当 */
+        case 0xAULL:             /* 即値・未割当 */
+        case 0xCULL:             /* 即値・未割当 */
+        /* アドレスを持つがGC管理外 */
+        case TAG_RAW_POINTER:
+        /* アドレス側の未割当。**将来ここに入る型はヒープ上に置かれる**
+           (double-float / ratio はどちらも即値にできない)ので、いずれ真へ
+           移る枠である。値が存在しない今は偽にしておく — GCが未定義の
+           ビットパターンを追いかけないことのほうが、先回りして真にしておく
+           ことより安全だからである */
+        case 0xBULL:
+        case 0xDULL:
+            return 0;
+        default:
+            return 0;   /* 到達しない(下の_Static_assertが16値を網羅している) */
+    }
+}
+
+/** [単一の真実源] このタグの値はアドレスを保持するか(= 16byte境界を要求してよいか)。
+ *  os_tag_is_heap_ref(GCが追いかけるか)とは**別の概念**である。
+ *  raw pointer と forward はアドレスを持つがGCは追いかけない。 */
+static inline int os_tag_holds_address(UINT64 tag) {
+    return (tag & TAG_IS_POINTER_BIT) != 0;
 }
 
 /** TAG_FIXNUMの値フィールド最上位bit(bit63)。1なら負数を表す(0は常に非負に正規化) */
 #define FIXNUM_SIGN_BIT       0x8000000000000000ULL
-/** TAG_FIXNUMの値フィールドのうちマグニチュードに使う60bit(bit3〜62)分のマスク */
-#define FIXNUM_MAGNITUDE_MASK ((1ULL << 60) - 1)
+/** TAG_FIXNUMの値フィールドのうちマグニチュードに使う59bit(bit4〜62)分のマスク */
+#define FIXNUM_MAGNITUDE_MASK ((1ULL << 59) - 1)
+
+/**
+ * [単一の真実源] FIXNUMの値をタグ付き表現へ入れるためのシフト量。
+ *
+ * **TAG_MASK のビット幅(現在3)と値が同じだが、別の概念である。**
+ * ポインタのタグ幅だけを広げて即値の表現は据え置く、という案がありうる
+ * (documents/alignment-survey-report.md 5.5)。両者を同じ定数にまとめると、
+ * 片方だけを動かしたい改修で必ず事故になる。値が一致しているのは今たまたまである。
+ */
+#define FIXNUM_VALUE_SHIFT 4
+
+/**
+ * [単一の真実源] CHARの文字コードをタグ付き表現へ入れるためのシフト量。
+ * FIXNUM_VALUE_SHIFT と同じ理由で、値が同じでも別の定数として扱う
+ * (CHARだけ表現を変える改修がありうる)。
+ */
+#define CHAR_VALUE_SHIFT 32
+
+/* --- fixnum / char の64bit語レイアウトの不変条件 -------------------------
+   1語を「符号bit + マグニチュード + タグ」で分け合っているので、シフト量と
+   マスクとタグ幅のどれか1つだけを動かすと静かに食い違う。隙間も重なりも
+   ないことをコンパイル時に確かめる */
+_Static_assert((1ULL << FIXNUM_VALUE_SHIFT) > TAG_MASK,
+               "FIXNUM_VALUE_SHIFT is too small: the value field would overlap the tag");
+_Static_assert((1ULL << CHAR_VALUE_SHIFT) > TAG_MASK,
+               "CHAR_VALUE_SHIFT is too small: the char code would overlap the tag");
+_Static_assert((FIXNUM_SIGN_BIT & (FIXNUM_SIGN_BIT - 1)) == 0 && FIXNUM_SIGN_BIT != 0,
+               "FIXNUM_SIGN_BIT must be exactly one bit");
+_Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) & FIXNUM_SIGN_BIT) == 0,
+               "fixnum magnitude field overlaps FIXNUM_SIGN_BIT");
+_Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) & TAG_MASK) == 0,
+               "fixnum magnitude field overlaps the tag");
+_Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) | FIXNUM_SIGN_BIT | TAG_MASK)
+                   == ~0ULL,
+               "sign bit + fixnum magnitude + tag do not cover all 64 bits (a gap would silently lose range)");
+
+/**
+ * [単一の真実源] タグ付きLisp値が指しうるメモリの配置境界。
+ *
+ * タグは値の**下位ビット**に入るので、「アドレスの下位何bitが常に0か」が
+ * 「タグに何bit使えるか」の上限を決める。現在のタグは3bit(TAG_MASK)なので
+ * 必要なのは8byte境界だけだが、16byteに揃えておくと下位4bit目まで空く。
+ *
+ * この定数を参照するのは、**タグ付きLisp値として外へ出るアドレスを返す
+ * アロケータ**である:
+ *   - os_alloc_bytes  (Lispヒープ From空間のバンプ確保)
+ *   - gc_to_alloc     (Lispヒープ To空間、GCのコピー先)
+ *   - os_heap_init    (From/To空間の先頭アドレスと半空間サイズ)
+ *   - os_imm_slot_alloc (Immobilized Spaceのスロット。TAG_RAW_POINTER化される)
+ *   - os_boot_alloc_finalize (Lispヒープの先頭になるアドレス)
+ *
+ * **切り上げ単位をここ以外に直書きしないこと。** 確保側とGCのコピー側で
+ * 単位がずれると、To空間が枯渇したりオブジェクトが重なったりする。
+ * documents/alignment-survey-report.md 7.1 に、~TAG_MASK を 0xF8 として
+ * 9箇所へ独立に直書きしていたために「TAG_MASKを変えても追随しない」状態に
+ * なっていた実例がある。同じ形を作らないための集約である。
+ *
+ * 適用**されない**もの(documents/heap-align16-report.md 6章):
+ *   - g_nil_cell 等の静的オブジェクト(aligned属性で別途指定する)
+ *   - os_boot_alloc(size, align) の align は呼び出し側指定のまま
+ *   - JITリテラルスロット(&g_za_*_slots[i]、8byte刻みの静的配列の要素)
+ *
+ * 既定は16。**コマンドラインから上書きできるのは計測のためだけ**である
+ * (-DOS_HEAP_ALIGN=8ULL で「8byte切り上げだった頃」の消費量・GC回数を、
+ * 同じバイナリ構成のまま測り直せる)。ALIGN_AUDITの報告に heap-align=N を
+ * 出しているので、どちらで測った結果かは出力自体に残る。
+ * **製品ビルドで下げてはならない。**
+ */
+#ifndef OS_HEAP_ALIGN
+#define OS_HEAP_ALIGN 16ULL
+#endif
+
+_Static_assert(OS_HEAP_ALIGN >= 8, "OS_HEAP_ALIGN must be at least sizeof(lisp_val_t) (8)");
+_Static_assert((OS_HEAP_ALIGN & (OS_HEAP_ALIGN - 1)) == 0,
+               "OS_HEAP_ALIGN must be a power of two (mask arithmetic below depends on it)");
+_Static_assert(OS_HEAP_ALIGN > TAG_MASK,
+               "OS_HEAP_ALIGN must exceed TAG_MASK, otherwise tag bits collide with the address");
+
+/**
+ * nをOS_HEAP_ALIGNの倍数へ切り上げる。
+ * @param n 切り上げる値(バイト数またはアドレス)
+ * @return n以上で最小のOS_HEAP_ALIGNの倍数
+ */
+static inline UINT64 os_heap_align_up(UINT64 n) {
+    return (n + (OS_HEAP_ALIGN - 1)) & ~(OS_HEAP_ALIGN - 1);
+}
+
+/**
+ * [境界] addrがOS_HEAP_ALIGN境界に乗っていなければ、nameとアドレスを添えてos_panicする。
+ *
+ * 「Lispの値として現れるポインタはすべて16byte境界」という不変条件を、
+ * **ブート時に実物のアドレスで**確かめるための検査。コンパイル時の
+ * _Static_assert は型のサイズとアラインしか見られず、リンカやローダが
+ * 実際にどこへ置いたかまでは保証しないので、両方要る。
+ *
+ * 既定ビルドでも常に有効。ブート中に数回比較するだけでコストは無視できる。
+ * @param name panicメッセージに出す対象の名前
+ * @param addr 検査するアドレス(タグを外したもの)
+ */
+void os_assert_lisp_aligned(const char *name, lisp_addr_t addr);
 
 
 /** TAG_INSTANCEのword0に入る、ネイティブ(C)関数であることを示すMAGIC NUMBER */
-#define MAGIC_FUNCTION_NATIVE      0x1ULL
+#define MAGIC_FUNCTION_NATIVE      0x0EULL
 /** TAG_INSTANCEのword0に入る、Lisp(defun)で定義された関数であることを示すMAGIC NUMBER */
-#define MAGIC_FUNCTION_INTERPRETED 0x2ULL
+#define MAGIC_FUNCTION_INTERPRETED 0x1EULL
 /** TAG_INSTANCEのword0に入る、プロセスのPCBであることを示すMAGIC NUMBER */
-#define MAGIC_PROCESS              0x3ULL
+#define MAGIC_PROCESS              0x2EULL
 /** TAG_INSTANCEのword0に入る、Lisp(defmacro)で定義されたマクロであることを示すMAGIC NUMBER */
-#define MAGIC_MACRO                0x4ULL
+#define MAGIC_MACRO                0x3EULL
 /** TAG_INSTANCEのword0に入る、block/return-from/unwind-protectの非局所脱出シグナルであることを示すMAGIC NUMBER */
-#define MAGIC_BLOCK_EXIT           0x5ULL
+#define MAGIC_BLOCK_EXIT           0x4EULL
 /** TAG_INSTANCEのword0に入る、streamオブジェクトであることを示すMAGIC NUMBER */
-#define MAGIC_STREAM               0x6ULL
+#define MAGIC_STREAM               0x5EULL
 /** TAG_INSTANCEのword0に入る、ILOSのクラスインスタンスであることを示すMAGIC NUMBER。word1=class、word2=slots-vector(MAGIC_VECTOR)、word3=未使用 */
-#define MAGIC_CLASS_INSTANCE       0x8ULL
+#define MAGIC_CLASS_INSTANCE       0x6EULL
 /** TAG_INSTANCEのword0に入る、catch/throwの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(evalされた値)、word2=throwされた値 */
-#define MAGIC_CATCH_EXIT           0x9ULL
+#define MAGIC_CATCH_EXIT           0x7EULL
 /** TAG_INSTANCEのword0に入る、tagbody/goの非局所脱出シグナルであることを示すMAGIC NUMBER。word1=tag(未評価のsymbol) */
-#define MAGIC_GO_EXIT              0xAULL
+#define MAGIC_GO_EXIT              0x8EULL
 /** TAG_INSTANCEのword0に入る、60bitを超える整数(bignum)であることを示すMAGIC NUMBER。word1=sign(0:非負/1:負)、word2=limb数、word3=limb配列(基数2^32、下位32bitのみ使用、limbs[0]が最下位)への生ポインタ */
-#define MAGIC_BIGNUM               0xBULL
+#define MAGIC_BIGNUM               0x9EULL
 /** TAG_INSTANCEのword0に入る、多次元配列(vector/general array)であることを示すMAGIC NUMBER。word1=配列本体(rank+各次元サイズ+要素データを格納した可変長ブロック)への生ポインタ、word2/word3=未使用 */
-#define MAGIC_VECTOR               0xCULL
+#define MAGIC_VECTOR               0xAEULL
 /** TAG_INSTANCEのword0に入る、ISLispのfloat(IEEE754 binary64)であることを示すMAGIC NUMBER。word1=doubleのビットパターン、word2/word3=未使用 */
-#define MAGIC_FLOAT                0xDULL
+#define MAGIC_FLOAT                0xBEULL
 /** TAG_INSTANCEのword0に入る、ILOSの組み込み(built-in)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<built-in-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
-#define MAGIC_BUILTIN_CLASS        0xEULL
+#define MAGIC_BUILTIN_CLASS        0xCEULL
 /** TAG_INSTANCEのword0に入る、ILOSの標準(standard)クラスオブジェクトであることを示すMAGIC NUMBER。メタクラスは`<standard-class>`。word1=name(symbol)、word2=superclasses(クラスオブジェクトのlist)、word3=slots(スロット記述子のlist、継承分含む) */
-#define MAGIC_STANDARD_CLASS       0xFULL
+#define MAGIC_STANDARD_CLASS       0xDEULL
+
+/* [MAGIC値の下位4bit] 全MAGICの下位4bitを 0xE でそろえてある。
+
+   4bitタグ体系(documents/tag4-design.md)では TAG_FORWARD が 0xF になる。
+   下位4bitを 0xE に固定しておけば、そのときMAGICがタグとして
+   TAG_FORWARD に一致することが**構造的に**なくなる。値そのものはどこにも
+   外から見えない(word0の内部識別子)ので、振り直しは挙動を変えない。
+
+   **移行中(タグ3bitのあいだ)の注意**: 0xE の下位3bitは 0x6 = TAG_FORWARD
+   なので、この期間は全14個のMAGICが下位3bitで TAG_FORWARD と衝突する
+   (振り直し前は MAGIC_STREAM と MAGIC_BUILTIN_CLASS の2個だけだった)。
+   衝突を実際に弾いているのは下の範囲検査であり、そちらの余裕は
+   MAGIC最大 0xDE(222) 対 ヒープ先頭 > 0x1000 と5桁近くある。
+   os_heap_init はヒープ先頭が 0x1000 以下ならpanicする。 */
 
 /* [転送済み判定の不変条件] gc_copy_valueは word0 の下位3bitが TAG_FORWARD(0x6)か
    どうかで「転送済みかもしれない」と疑い、指す先がTo空間の範囲にあるかどうかで
-   確定させる。MAGIC_STREAM(0x6)とMAGIC_BUILTIN_CLASS(0xE)は下位3bitが
-   **実際に衝突している**ので、これらを弾いているのは範囲検査の下限だけである。
+   確定させる。上記のとおり下位bitでの衝突は防げないので、これらを弾いているのは
+   範囲検査の下限だけである。
    (STRINGのword0=生の長さも同じ理由で下限に守られている)
 
    したがって「MAGIC値はヒープの先頭アドレスより遥かに小さい」ことが不変条件になる。
@@ -104,6 +453,40 @@ _Static_assert(MAGIC_VECTOR               < MAGIC_MUST_BE_BELOW, "MAGICが大き
 _Static_assert(MAGIC_FLOAT                < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
 _Static_assert(MAGIC_BUILTIN_CLASS        < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
 _Static_assert(MAGIC_STANDARD_CLASS       < MAGIC_MUST_BE_BELOW, "MAGICが大きすぎる: 転送ポインタと誤認されうる");
+/* 全MAGICの下位4bitが 0xE であること。4bitタグ化で TAG_FORWARD(0xF) と
+   構造的に衝突しないことの土台になる。メッセージはASCIIで書く */
+#define MAGIC_LOW_NIBBLE TAG_MARKER
+_Static_assert((MAGIC_FUNCTION_NATIVE & 0xFULL) == MAGIC_LOW_NIBBLE,      "MAGIC_FUNCTION_NATIVE low nibble is not 0xE");
+_Static_assert((MAGIC_FUNCTION_INTERPRETED & 0xFULL) == MAGIC_LOW_NIBBLE, "MAGIC_FUNCTION_INTERPRETED low nibble is not 0xE");
+_Static_assert((MAGIC_PROCESS & 0xFULL) == MAGIC_LOW_NIBBLE,              "MAGIC_PROCESS low nibble is not 0xE");
+_Static_assert((MAGIC_MACRO & 0xFULL) == MAGIC_LOW_NIBBLE,                "MAGIC_MACRO low nibble is not 0xE");
+_Static_assert((MAGIC_BLOCK_EXIT & 0xFULL) == MAGIC_LOW_NIBBLE,           "MAGIC_BLOCK_EXIT low nibble is not 0xE");
+_Static_assert((MAGIC_STREAM & 0xFULL) == MAGIC_LOW_NIBBLE,               "MAGIC_STREAM low nibble is not 0xE");
+_Static_assert((MAGIC_CLASS_INSTANCE & 0xFULL) == MAGIC_LOW_NIBBLE,       "MAGIC_CLASS_INSTANCE low nibble is not 0xE");
+_Static_assert((MAGIC_CATCH_EXIT & 0xFULL) == MAGIC_LOW_NIBBLE,           "MAGIC_CATCH_EXIT low nibble is not 0xE");
+_Static_assert((MAGIC_GO_EXIT & 0xFULL) == MAGIC_LOW_NIBBLE,              "MAGIC_GO_EXIT low nibble is not 0xE");
+_Static_assert((MAGIC_BIGNUM & 0xFULL) == MAGIC_LOW_NIBBLE,               "MAGIC_BIGNUM low nibble is not 0xE");
+_Static_assert((MAGIC_VECTOR & 0xFULL) == MAGIC_LOW_NIBBLE,               "MAGIC_VECTOR low nibble is not 0xE");
+_Static_assert((MAGIC_FLOAT & 0xFULL) == MAGIC_LOW_NIBBLE,                "MAGIC_FLOAT low nibble is not 0xE");
+_Static_assert((MAGIC_BUILTIN_CLASS & 0xFULL) == MAGIC_LOW_NIBBLE,        "MAGIC_BUILTIN_CLASS low nibble is not 0xE");
+_Static_assert((MAGIC_STANDARD_CLASS & 0xFULL) == MAGIC_LOW_NIBBLE,       "MAGIC_STANDARD_CLASS low nibble is not 0xE");
+/* MAGICどうしが重複しないこと(下位4bitをそろえた以上、区別は上位側だけが担う) */
+_Static_assert(__builtin_popcountll(
+                   (1ULL << (MAGIC_FUNCTION_NATIVE      >> 4)) |
+                   (1ULL << (MAGIC_FUNCTION_INTERPRETED >> 4)) |
+                   (1ULL << (MAGIC_PROCESS              >> 4)) |
+                   (1ULL << (MAGIC_MACRO                >> 4)) |
+                   (1ULL << (MAGIC_BLOCK_EXIT           >> 4)) |
+                   (1ULL << (MAGIC_STREAM               >> 4)) |
+                   (1ULL << (MAGIC_CLASS_INSTANCE       >> 4)) |
+                   (1ULL << (MAGIC_CATCH_EXIT           >> 4)) |
+                   (1ULL << (MAGIC_GO_EXIT              >> 4)) |
+                   (1ULL << (MAGIC_BIGNUM               >> 4)) |
+                   (1ULL << (MAGIC_VECTOR               >> 4)) |
+                   (1ULL << (MAGIC_FLOAT                >> 4)) |
+                   (1ULL << (MAGIC_BUILTIN_CLASS        >> 4)) |
+                   (1ULL << (MAGIC_STANDARD_CLASS       >> 4))) == 14,
+               "MAGIC_* values are not all distinct");
 
 /** NIL */
 extern lisp_val_t nil;
@@ -247,6 +630,12 @@ void os_bootstrap();
  */
 double os_heap_used_ratio(void);
 
+/**
+ * 組み込み関数%%FIXNUM-MAGNITUDE-MASK。fixnumのマグニチュード部の最大値を返す。
+ * Lisp側の *most-positive-fixnum* / *most-negative-fixnum* はこれを起点に作る。
+ */
+lisp_val_t primitive_fixnum_magnitude_mask(lisp_val_t args, lisp_val_t env);
+
 /** 組み込み関数%%HEAP-TOTAL-BYTES。From空間(ヒープ全体の半分)の総バイト数を返す */
 lisp_val_t primitive_heap_total_bytes(lisp_val_t args, lisp_val_t env);
 
@@ -322,6 +711,67 @@ void os_gc_collect(void);
  * @return os_gc_collectの呼び出し回数の累積
  */
 UINT64 os_gc_collect_count(void);
+
+/**
+ * From/To両空間の範囲を返す(テスト専用。os_gc_collect_countと同様、本体の
+ * ロジックでは使用しない)。半空間の先頭がOS_HEAP_ALIGN境界にあること、
+ * 2つの半空間が同サイズであることを、テストから直接確かめるために使う。
+ * @param out_from_start From空間の先頭(不要ならNULL可)
+ * @param out_from_end   From空間の終端(不要ならNULL可)
+ * @param out_to_start   To空間の先頭(不要ならNULL可)
+ * @param out_to_end     To空間の終端(不要ならNULL可)
+ */
+void os_heap_bounds_for_test(UINT64 *out_from_start, UINT64 *out_from_end,
+                             UINT64 *out_to_start, UINT64 *out_to_end);
+
+/* ============================== [調査] 16byte境界監査 ==============================
+ * documents/alignment-survey-report.md。タグを下位4bitへ拡張できるかの判定材料
+ * (「Lisp値として現れるポインタが16byte境界に揃っているか」)を集める計測専用の
+ * 仕組み。ALIGN_AUDIT=1 でビルドしたときだけ有効になり、既定ビルドでは
+ * マクロが空になって1命令も増えない。
+ *
+ * 観測点は2系統ある:
+ *   1. 確保サイト。各アロケータが返したアドレスの下位4bitを、サイト別に数える。
+ *   2. 流通している値。gc_copy_valueはGCのたびに**全ルートと全生存オブジェクトの
+ *      全フィールド**を通るので、ここで数えればLisp値として現れるポインタを
+ *      タグ別に網羅できる(ヒープを線形走査する方法は、可変長の生ブロック
+ *      (bignumのlimb配列・vector本体)がヘッダを持たないため成立しない)。
+ */
+#ifdef ISIKIOS_ALIGN_AUDIT
+
+/** 確保サイトの識別子。os_align_audit_reportの出力順と対応する */
+#define ALIGN_SITE_ALLOC_BYTES   0  /* os_alloc_bytes(From空間バンプ) */
+#define ALIGN_SITE_GC_TO_ALLOC   1  /* gc_to_alloc(To空間、GCコピー先) */
+#define ALIGN_SITE_IMM_SLOT      2  /* os_imm_slot_alloc(Function Cell / za_fn_meta_t) */
+#define ALIGN_SITE_IMM_PAGE      3  /* os_imm_page_alloc(JITコードページ等) */
+#define ALIGN_SITE_BOOT_ALLOC    4  /* os_boot_alloc(ヒープ初期化前) */
+#define ALIGN_SITE_STATIC_NIL    5  /* g_nil_cell(静的領域のnilセル) */
+#define ALIGN_SITE_IMM_PAGES_CONTIG 6  /* os_imm_pages_alloc_contiguous(JITコードページ) */
+#define ALIGN_SITE_LITERAL_SLOT  7  /* os_environment_register_literal_slotがTAG_RAW_POINTER化するアドレス */
+#define ALIGN_SITE_ENV_PAGE      8  /* os_environment_register_pagesがTAG_RAW_POINTER化するアドレス */
+#define ALIGN_SITE_DEVICE_HANDLE 9  /* %%IDE-DEVICE-ATが返すblock_device_t*(TAG_RAW_POINTER) */
+#define ALIGN_SITE_COUNT        10
+
+/** 確保サイトが返したアドレスを1件記録する */
+void os_align_audit_note_alloc(int site, UINT64 addr, UINT64 size);
+/** Lisp値を1件記録する(ポインタを持つタグのみ数える) */
+void os_align_audit_note_value(lisp_val_t v);
+/** GC1回分の生存バイト数(To空間へコピーし終えた量)を記録する */
+void os_align_audit_note_gc_live(UINT64 live_bytes);
+/** 集計結果をシリアル(カーネル)/標準出力(ユニットテスト)へ出す */
+void os_align_audit_report(void);
+
+#define ALIGN_AUDIT_NOTE_ALLOC(site, addr, size) os_align_audit_note_alloc((site), (UINT64)(addr), (UINT64)(size))
+#define ALIGN_AUDIT_NOTE_VALUE(v)                os_align_audit_note_value((v))
+#define ALIGN_AUDIT_NOTE_GC_LIVE(bytes)          os_align_audit_note_gc_live((UINT64)(bytes))
+
+#else
+
+#define ALIGN_AUDIT_NOTE_ALLOC(site, addr, size) ((void)0)
+#define ALIGN_AUDIT_NOTE_VALUE(v)                ((void)0)
+#define ALIGN_AUDIT_NOTE_GC_LIVE(bytes)          ((void)0)
+
+#endif /* ISIKIOS_ALIGN_AUDIT */
 
 /* ============================== Immobilized Space ==============================
  * GC(copy GC)が移動・破棄しない固定領域。JITコードやFunction Cellなど、Cのポインタとして
@@ -616,7 +1066,7 @@ static inline void gc_unprotect_node(gc_rootnode *node) {
    process.cのget_current_processと同様クロスTU呼び出しのままだと呼び出し
    オーバーヘッドが本体を上回る。ヘッダのstatic inlineへ移す */
 static inline lisp_val_t os_make_fixnum(const UINT64 fixnum) {
-    return (lisp_val_t)(fixnum << 3);
+    return (lisp_val_t)(fixnum << FIXNUM_VALUE_SHIFT);
 }
 
 /**
@@ -734,11 +1184,44 @@ int os_symbol_table_count(void);
 void os_reset_runtime_state_for_test(void);
 
 /**
- * charオブジェクトを作る(即値、ヒープ確保なし)。
- * @param c 表現する文字
- * @return タグ付けされたCHAR
+ * characterオブジェクトを作る(即値、ヒープ確保なし)。
+ * @param code Unicodeコードポイント(32bit、bit32-63に入る)
+ * @return タグ付けされたCHARACTER
+ *
+ * **直接呼ばず、下の os_make_char マクロを使うこと。**
+ * 引数は UINT32 なので、呼び出し側が signed char を渡すと暗黙変換で
+ * 符号拡張し、0x80以上の文字で上位ビットが1で埋まる。コンパイラは
+ * 既定では警告しないので、マクロ側で型を見て弾いている。
  */
-lisp_val_t os_make_char(const char c);
+lisp_val_t os_make_char_from_code(const UINT32 code);
+
+/**
+ * [誤用の検出用] 呼ばれることのないダミー宣言。
+ *
+ * os_make_char に signed char を渡すと _Generic がこちらを選び、
+ * GCC の attribute error でコンパイルが止まる。定義は無いが、
+ * attribute error のほうが先に効くのでリンクまで到達しない。
+ *
+ * メッセージはASCIIで書く(GCCは非ASCIIを8進エスケープで出して読めなくなる)。
+ */
+__attribute__((error("os_make_char: pass an unsigned code point, not a signed char. Cast via UINT8 (e.g. os_make_char((UINT8)ch)) or use UINT32.")))
+lisp_val_t os_make_char_rejects_signed_char(int);
+
+/**
+ * characterオブジェクトを作る。**signed char を渡すとコンパイルエラーになる。**
+ *
+ * `char` は処理系によって符号の有無が変わるが、環境で挙動が変わるほうが
+ * 厄介なので、符号の有無にかかわらず `char` と `signed char` の両方を弾く。
+ * 通したいときは `(UINT8)` を噛ませる。
+ *
+ * 文字リテラル(`'A'`)はCでは int なので通る。int を弾いていないのは、
+ * `getchar()` 系の戻り値をそのまま渡す既存の書き方を壊さないため
+ * (documents/make-char-typesafe.md 3章)。
+ */
+#define os_make_char(code) _Generic((code), \
+    char:        os_make_char_rejects_signed_char, \
+    signed char: os_make_char_rejects_signed_char, \
+    default:     os_make_char_from_code)(code)
 
 /**
  * sをコピーしてstringオブジェクトを作る。
@@ -1138,7 +1621,7 @@ void os_gc_debug_note_painted_field(void);
     一致したときだけ関数呼び出しに落とす。ここを無条件の関数呼び出しにしたところ、
     za.cのlabels+letのJITコンパイルが数分たっても終わらなくなった
     (documents/pitfalls.md 原則6「計器が対象の実行時間を変えていないか」) */
-#define GC_DEBUG_TRAP_PATTERN_VALUE 0xDEADDEADDEADDEA7ULL
+#define GC_DEBUG_TRAP_PATTERN_VALUE (GC_PAINT_TRAP_PATTERN_BASE | TAG_MARKER)
 void os_gc_debug_trap_result_hit(const char *where, void *site);
 #define GC_DEBUG_TRAP_RESULT(v, where) \
     do { \

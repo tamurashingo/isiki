@@ -594,22 +594,27 @@
 ;; ABI-M2: 未対応プリミティブへの固定引数ラッパー拡充(車輪の横展開)。
 ;; いずれも1引数の型述語がza_compile_unary経由の固定引数直接呼び出しへ乗る。
 
+;; fixnum/bignumの境界は *most-positive-fixnum* (C側 FIXNUM_MAGNITUDE_MASK 由来)
+;; から作る。10進で直書きすると、タグ幅やFIXNUM_VALUE_SHIFTを変えたときに
+;; テストだけが古い境界を見続けてしまう
+(defglobal za-fx-over (+ *most-positive-fixnum* 1)) ;; 境界の1つ外、bignum
+
 (defun isiki-za-test-numberp (x) (numberp x))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-numberp)))
 (assert-equal t (isiki-za-test-numberp 1))
-(assert-equal t (isiki-za-test-numberp 1152921504606846976)) ;; 2^60、bignum
+(assert-equal t (isiki-za-test-numberp za-fx-over)) ;; fixnum範囲の1つ外、bignum
 (assert-equal t (isiki-za-test-numberp 3.14))
 (assert-equal nil (isiki-za-test-numberp 'foo))
 
 (defun isiki-za-test-fixnump (x) (fixnump x))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-fixnump)))
 (assert-equal t (isiki-za-test-fixnump 1))
-(assert-equal nil (isiki-za-test-fixnump 1152921504606846976))
+(assert-equal nil (isiki-za-test-fixnump za-fx-over))
 (assert-equal nil (isiki-za-test-fixnump 3.14))
 
 (defun isiki-za-test-bignump (x) (bignump x))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-bignump)))
-(assert-equal t (isiki-za-test-bignump 1152921504606846976))
+(assert-equal t (isiki-za-test-bignump za-fx-over))
 (assert-equal nil (isiki-za-test-bignump 1))
 
 (defun isiki-za-test-floatp (x) (floatp x))
@@ -668,7 +673,7 @@
 ;; 状況でも正しい結果を返すことを確認する。stepを最初からbignum範囲の値にすることで、
 ;; 毎イテレーションで新規bignum確保(=GC発火機会)を強制する。期待値はmultiply(全く
 ;; 別のwrapper_fn/コード経路)で計算し、加算/減算ループの結果と独立にクロスチェックする。
-(defglobal za-gc-test-step 1152921504606846976) ;; 2^60、bignum
+(defglobal za-gc-test-step za-fx-over) ;; fixnum範囲の1つ外、bignum
 (defun isiki-za-test-bignum-add-loop (acc step n)
   (if (= n 0)
       acc
@@ -695,14 +700,14 @@
 ;; フローしない場合のインライン高速path(wrapper_fn呼び出しを一切伴わない)と、
 ;; それ以外(オーバーフロー・負数)のfallback(従来通りwrapper_fn呼び出し)の両方で、
 ;; 修正前と完全に同じ計算結果になることを確認する。
-(defglobal fixnum-max 1152921504606846975) ;; 2^60-1
+(defglobal fixnum-max *most-positive-fixnum*) ;; 現在は 2^60-1
 
 (defun isiki-za-test-inline-add (a b) (+ a b))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-inline-add)))
 (assert-equal 8 (isiki-za-test-inline-add 3 5))                             ;; 高速path
 (assert-equal fixnum-max (isiki-za-test-inline-add fixnum-max 0))           ;; 高速path、境界値ちょうど
 (assert-equal t (fixnump (isiki-za-test-inline-add fixnum-max 0)))
-(assert-equal 1152921504606846976 (isiki-za-test-inline-add fixnum-max 1)) ;; オーバーフロー→fallback、bignum昇格
+(assert-equal za-fx-over (isiki-za-test-inline-add fixnum-max 1)) ;; オーバーフロー→fallback、bignum昇格
 (assert-equal t (bignump (isiki-za-test-inline-add fixnum-max 1)))
 (assert-equal -2 (isiki-za-test-inline-add -5 3))                           ;; 負数→fallback
 (assert-equal -2 (isiki-za-test-inline-add 3 -5))                           ;; 負数→fallback
@@ -745,7 +750,7 @@
       (isiki-za-test-fncache-gc-stress (- n 1) (isiki-za-test-fncache-callee acc))))
 (assert-equal t (%%za-compiled-p (function isiki-za-test-fncache-gc-stress)))
 (defglobal fncache-gc-stress-n 2000)
-(defglobal fncache-gc-stress-start 1152921504606846976) ;; 2^60、bignum
+(defglobal fncache-gc-stress-start za-fx-over) ;; fixnum範囲の1つ外、bignum
 (assert-equal (+ fncache-gc-stress-start fncache-gc-stress-n)
               (isiki-za-test-fncache-gc-stress fncache-gc-stress-n fncache-gc-stress-start))
 (close (open-output-file "/9p/tmp/ckpt-33-fn-resolve-cache.txt"))
