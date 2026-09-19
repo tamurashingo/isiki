@@ -956,11 +956,18 @@
       (signal-condition
         (make-instance '<division-by-zero> ':operation 'quotient ':operands (list dividend divisor))
         nil)
+      ;; **float が絡むときは / にそのまま任せる。** (float x) は整数を
+      ;; *read-default-float-format* に従って変換するので、
+      ;; (quotient 1 2.0f0) のように片方だけが float のときに
+      ;; 整数側が double になって結果を double へ引きずってしまう
+      ;; (documents/float-math-contagion.md §3)。
+      ;; float への変換が要るのは「両方整数で割り切れない」ときだけである。
       (if (and (or (fixnump dividend) (bignump dividend))
-               (or (fixnump divisor) (bignump divisor))
-               (= (mod dividend divisor) 0))
-          (div dividend divisor)
-          (/ (float dividend) (float divisor)))))
+               (or (fixnump divisor) (bignump divisor)))
+          (if (= (mod dividend divisor) 0)
+              (div dividend divisor)
+              (/ (float dividend) (float divisor)))
+          (/ dividend divisor))))
 
 (defun quotient (dividend &rest divisors)
   (if divisors
@@ -969,13 +976,33 @@
 
 (defun reciprocal (x) (quotient 1 x))
 
+;;; --- float の単位元・零元をサンプルの型に合わせるヘルパー (c-2) ---
+;;; **接尾辞なしの float リテラルは double である**(*read-default-float-format*
+;;; の既定)。それを単位元・零元・種として使うと、型昇格が正しく働いていても
+;;; 結果が double に引きずられる。
+;;;
+;;; 実例: %expt-integer の単位元が 1.0(double)だったため、
+;;; (expt 1.5f0 2) が途中で (* 1.5f0 1.0d0) を通って double になっていた。
+;;; documents/float-math-contagion.md
+(defun %float-one-like (sample)
+  (if (%%single-float-p sample) 1.0f0 1.0d0))
+
+(defun %float-zero-like (sample)
+  (if (%%single-float-p sample) 0.0f0 0.0d0))
+
+;; x を sample と同じ(またはそれより広い)float形式へ寄せる。
+;; 1.0 倍は値を変えない(無限大・NaNも素通しする)ので、型だけを動かす手段として使える。
+;; x が double で sample が single なら、型昇格の規則どおり double のままになる。
+(defun %widen-float-like (x sample)
+  (* x (%float-one-like sample)))
+
 ;; x1^x2(x2が非負整数)を*による繰り返し二乗法で計算する。x1の型(整数/float)は
-;; そのまま結果の型に伝わる(floatp baseなら1.0、それ以外は1を基底値とする)。
+;; そのまま結果の型に伝わる(単位元を base と同じ形式にしてあるため)。
 ;; x1が負でもlogを経由しないため、負の底×整数指数(spec例: (expt -100 2) => 10000、
 ;; (expt -0.25 -1) => -4.0)を正しく扱える。
 (defun %expt-integer (base power)
   (if (= power 0)
-      (if (floatp base) 1.0 1)
+      (if (floatp base) (%float-one-like base) 1)
       (if (= (mod power 2) 0)
           (let ((half (%expt-integer base (quotient power 2))))
             (* half half))
@@ -990,14 +1017,17 @@
      (cond
        ((and (numberp x2) (< x2 0)) (error "expt: 0 to a negative power ~S" x2))
        ((and (floatp x2) (= x2 0.0)) (error "expt: 0 to a float power of 0.0"))
-       (t (if (floatp x2) 0.0 0))))
+       (t (if (floatp x2) (%float-zero-like x2) 0))))
     ((or (fixnump x2) (bignump x2))
      (if (>= x2 0)
          (%expt-integer x1 x2)
          (reciprocal (%expt-integer x1 (- x2)))))
     ((< x1 0)
      (error "expt: negative base ~S with non-integer power ~S" x1 x2))
-    (t (exp (* (float x2) (log (float x1)))))))
+    ;; 指数が非整数floatのケース。**log へ渡す前に x1 を x2 の型へ寄せる。**
+    ;; (float x1) だと整数の x1 が *read-default-float-format* に従ってしまい、
+    ;; 既定が double のとき (expt 2 0.5f0) が double になる
+    (t (exp (* x2 (log (%widen-float-like x1 x2)))))))
 
 (defun tan (x) (/ (sin x) (cos x)))
 
@@ -1022,7 +1052,9 @@
 
 ;; |x| >= 1のときlogの引数(1+x または 1-x)が0以下になり、logのdomain-errorが
 ;; そのまま伝播する(spec 4658-4669行が要求するatanhのdomain-errorを合成の副産物で満たす)
-(defun atanh (x) (* 0.5 (- (log (+ 1 x)) (log (- 1 x)))))
+;; 係数は 0.5 ではなく整数 2 での除算にする。0.5 は double リテラルなので、
+;; single を渡しても結果が double に引きずられてしまう(上の %float-one-like の注参照)
+(defun atanh (x) (/ (- (log (+ 1 x)) (log (- 1 x))) 2))
 
 ;; spec 4505行「*pi* → <float> named constant」の通り、通常の変数参照(*pi*)で
 ;; 読める必要があるためdefdynamicではなくdefconstantを使う(defdynamicの値は
