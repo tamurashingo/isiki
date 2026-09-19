@@ -306,6 +306,29 @@
 ;;; 埋め込まれ実行時に呼ばれる)は、M15(documents/fs.md)でdevice.lisp/
 ;;; fat16.lisp/fat32.lispをAOT化するため、ここへ移動する。
 
+;;; --- [probe] AOT と実行時で float の既定形式がずれていないかを見張る ---
+;;;
+;;; **これは消さないこと。使われていない定数に見えるが、検出器である。**
+;;;
+;;; *read-default-float-format* の既定は2箇所で決まる:
+;;;   - 実行時   : runtime.h の DEFAULT_FLOAT_FORMAT_IS_SINGLE
+;;;                (init.lisp が %%default-float-format 経由で読む)
+;;;   - AOT変換時: transpile.lisp の read-all-forms がホストCLの
+;;;                *read-default-float-format* を束縛する値
+;;;
+;;; **transpile.lisp はホストCL上で動くので runtime.h を読めない。手で合わせるしかない。**
+;;; 合っていないと、接尾辞なしの `1.5` が「AOTでは single、インタプリタでは double」
+;;; のように経路で別の型になる。
+;;;
+;;; ここまで踏まれていなかったのは、**AOT対象に裸のfloatリテラルが1つも
+;;; 無かったから**にすぎない(PR #81 §4-3)。そこで逆手に取って、
+;;; 裸のリテラルをわざと1つ置く。この関数はAOTコンパイルされるので、
+;;; 返る値の型が「transpile.lisp が何を既定だと思っているか」そのものになる。
+;;;
+;;; 実行時の既定と一致することを test/lisp/float_default_test.lisp が確かめる。
+;;; 片方だけ変えるとそこが落ちる。
+(defun %aot-float-format-probe () 1.5)
+
 ;; plistからkeyに対応する値を探す。見つからなければdefault
 (defun %plist-get (plist key default)
   (if (null plist)
