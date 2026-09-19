@@ -3257,6 +3257,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
         os_set_function(os_make_symbol("%%FIXNUM-MAGNITUDE-MASK"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnum_magnitude_mask), global_environment);
         os_set_function(os_make_symbol("%%SINGLE-FLOAT-P"), os_make_native_function((lisp_addr_t)(void *)primitive_single_float_p), global_environment);
+        os_set_function(os_make_symbol("%%NARROW-TO-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_narrow_to_single_float), global_environment);
         os_set_function(os_make_symbol("%%MOST-POSITIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_single_float), global_environment);
         os_set_function(os_make_symbol("%%MOST-NEGATIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_negative_single_float), global_environment);
         os_set_function(os_make_symbol("%%MOST-POSITIVE-DOUBLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_double_float), global_environment);
@@ -6959,6 +6960,81 @@ lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_floatp1(lisp_val_t val) {
     return is_float(val) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%NARROW-TO-SINGLE-FLOAT。数値をsingle-floatへ**狭める**。
+ *
+ * **型昇格(c-1)は広いほうへ寄せるので、Lispだけでは狭められない。**
+ * (* double 1.0f0) は double のままだし、(float x) は float をそのまま返す。
+ * convert が double → <single-float> を提供するにはこの経路が要る
+ * (documents/convert-float.md)。
+ *
+ * 範囲判定も**ここで行う**。理由は documents/convert-float.md §4-3:
+ * (float)(double) の結果が無限大になったかだけで判定すると、
+ * **入力が元々無限大だった場合と、変換であふれた場合を区別できない。**
+ * そこで「入力がfloatか整数か」で先に分けてから見る。
+ *
+ *   入力がfloatで NaN / ±無限大 → そのまま単精度のNaN / ±無限大にする
+ *                                   (singleでも表現できる値なのでエラーにしない)
+ *   入力がfloatで有限、|x| > FLT_MAX → **範囲外**
+ *   入力が整数で、doubleにした時点で無限大 → **範囲外**(元は有限なのであふれた)
+ *   入力が整数で |x| > FLT_MAX          → **範囲外**
+ *   それ以外 → 単精度へ丸める。FLT_MINより小さい値は0へ丸まるが、
+ *              **0は有限の表現可能な結果なのでエラーにしない**(アンダーフローは
+ *              正しく丸めた結果だが、オーバーフローには有限の答えが無い)
+ *
+ * 範囲外のときは**nilを返す**。domain-errorの送出はLisp側(%convert)に任せる
+ * — 期待クラスの指定や条件クラスの組み立てはそちらのほうが素直だからである。
+ * 戻り値がsingle-float(TAG_SINGLE_FLOAT)かnil(TAG_CONSのセンチネル)かは
+ * タグで区別できるので、正常値と混ざることはない。
+ *
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatへ丸めた値。数値でない、または範囲外ならnil
+ */
+lisp_val_t primitive_narrow_to_single_float(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t val = cc_car(args);
+
+    /* [境界] 数値をハードコードしない。PR #79 でC側に作った
+       SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS から導く */
+    union { float f; UINT32 u; } flt_max;
+    flt_max.u = (UINT32)SINGLE_FLOAT_MAX_BITS;
+    const double max_single = (double)flt_max.f;
+    union { double d; UINT64 u; } dbl_max;
+    dbl_max.u = DOUBLE_FLOAT_MAX_BITS;
+    const double max_double = dbl_max.d;
+
+    if (is_float(val)) {
+        double d = os_float_value(val);
+        /* NaN。自分自身と等しくないことで判定する */
+        if (d != d) {
+            return os_make_single_float((float)d);
+        }
+        /* ±無限大。doubleの最大有限値を超えていれば無限大である */
+        if (d > max_double || d < -max_double) {
+            return os_make_single_float((float)d);
+        }
+        if (d > max_single || d < -max_single) {
+            return nil;   /* 有限だがsingleでは表せない大きさ */
+        }
+        return os_make_single_float((float)d);
+    }
+
+    if ((val & TAG_MASK) == TAG_FIXNUM || is_bignum(val)) {
+        double d = to_double(val);
+        /* 整数は必ず有限なので、doubleにした時点で無限大ならそこであふれている */
+        if (d > max_double || d < -max_double) {
+            return nil;
+        }
+        if (d > max_single || d < -max_single) {
+            return nil;
+        }
+        return os_make_single_float((float)d);
+    }
+
+    return nil;   /* 数値ではない */
 }
 
 /**

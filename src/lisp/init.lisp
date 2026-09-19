@@ -664,11 +664,44 @@
     (format s "~A" obj)
     (get-output-stream-string s)))
 
+;; (convert obj <single-float>) / (convert obj <double-float>) の実体。
+;;
+;; **float の形式を変換する手段は convert だけである。** 型昇格(c-1)は広いほうへ
+;; 寄せるので演算では狭められず((* double 1.0f0) は double のまま)、
+;; (float x) は float をそのまま返す(型保存)。
+;; documents/convert-float.md
+;;
+;; 狭める側は C の %%narrow-to-single-float が丸めと範囲判定の両方を行い、
+;; 範囲外なら nil を返す。ここで domain-error に変える。
+;; **精度が落ちるのは変換の目的そのものなので黙って落とす。**
+;; 表現できない大きさだけをエラーにする(アンダーフローは 0 への正しい丸めなので
+;; エラーにしない)。
+(defun %convert-to-single-float (obj class-name)
+  (if (numberp obj)
+      (let ((v (%%narrow-to-single-float obj)))
+        (if (null v) (%convert-error obj class-name) v))
+    (%convert-error obj class-name)))
+
+;; 広げる側は Lisp で書ける。1.0d0 倍は値を変えない(無限大・NaN も素通しする)。
+;; 整数・single・double のどれを渡しても double になる。
+(defun %convert-to-double-float (obj class-name)
+  (if (numberp obj)
+      (* obj 1.0d0)
+    (%convert-error obj class-name)))
+
 ;; ISLisp仕様§17 convertの変換表(tmp/islisp-spec.txt 3888-3895行)を実装する。
 ;; 「=」(恒等)と「X」(必須)に加え、「I」(実装定義だが提供必須)は文字<->整数を
 ;; 文字コードで、文字/シンボル<->文字列を名前文字列で対応させる。「–」はdomain-error
+;;
+;; **ディスパッチはクラス名シンボルの case である**(クラスオブジェクトの同一性では
+;; ない)。したがって <short-float>/<long-float> のような別名は、*classes* 上で
+;; 同じクラスオブジェクトを指していても**自動では効かない**。case のキーに並べて
+;; 明示する必要がある(documents/convert-float.md §4-1)。
 (defun %convert (obj class-name)
   (case class-name
+    ;; float の形式指定。<short-float>/<long-float> は別名(PR #79)
+    ((<single-float> <short-float>) (%convert-to-single-float obj class-name))
+    ((<double-float> <long-float>)  (%convert-to-double-float obj class-name))
     ((<character>)
      (cond ((characterp obj) obj)
            ((integerp obj) (code-char obj))
@@ -735,8 +768,20 @@
   (apply #'make-instance class (%create-normalize-initargs initargs)))
 
 ;; (convert obj class-name) : class-nameは評価しない
+;;
+;; ISLisp仕様どおり (convert 3 <float>) と裸で書く形が本来である。
+;; **(convert 3 '<float>) とクオート付きで書かれた場合も同じ意味に取る。**
+;; 評価しない引数にクオートを付けたくなるのは自然な間違いで、そのまま渡すと
+;; class-name が (quote <float>) というリストになり、%convert の case が
+;; どの枝にも当たらず domain-error になる — 原因の分かりにくい失敗の仕方をする。
+;; 仕様準拠のプログラムがこの形に意味を持たせることはないので、受けてよい。
 (defmacro convert (obj class-name)
-  `(%convert ,obj ',class-name))
+  `(%convert ,obj ',(if (and (consp class-name)
+                             (eq (car class-name) 'quote)
+                             (consp (cdr class-name))
+                             (null (cdr (cdr class-name))))
+                        (car (cdr class-name))
+                      class-name)))
 
 ;;; --- symbol property list (§18.2): property / set-property / remove-property ---
 ;;;
