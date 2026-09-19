@@ -82,8 +82,13 @@
 (assert-equal 1    (+ 10 -20 30 -19))
 (assert-equal 1    (- 10 20 -30 19))
 
-;;; --- 6. 60bit 境界: 昇格 ---
-(defglobal *max-fix* (- (expt 2 60) 1))
+;;; --- 6. fixnum 境界: 昇格 ---
+;; 境界は *most-positive-fixnum* から取る。この定数はC側の FIXNUM_MAGNITUDE_MASK
+;; 由来なので(init.lisp)、タグ幅や FIXNUM_VALUE_SHIFT を変えても自動で追随する。
+;; (expt 2 60) を直書きしていたが、タグ4bit化で上限が 2^59-1 になり
+;; fixnump 系6件が落ちた。ここは「上限ちょうど」であることが試験の主旨なので、
+;; 値を書き換えるのではなく導出に変える。
+(defglobal *max-fix* *most-positive-fixnum*)
 (assert-equal t (fixnump *max-fix*))
 (assert-equal t (bignump (+ *max-fix* 1)))          ; 正側の昇格
 (assert-equal t (bignump (+ (- *max-fix*) -1)))     ; 負側の昇格
