@@ -187,15 +187,19 @@
 (assert-equal t  (bignump (* (expt 2 100) 2)))
 (assert-equal t  (fixnump (+ 1 2)))
 
-;;; --- 13. c-2 の現状(数学関数はまだ double を返す) ---
-;;; ここは**次の作業で変わる**。変わったらこのアサーションを更新する。
-(assert-equal '<double-float> (%%class-name (class-of (sqrt 2.0f0))))
-(assert-equal '<double-float> (%%class-name (class-of (exp 1.0f0))))
-(assert-equal '<double-float> (%%class-name (class-of (log 2.0f0))))
-(assert-equal '<double-float> (%%class-name (class-of (sin 1.0f0))))
-;;; expt は整数指数でも double になる。%expt-integer の単位元が double リテラル
-;;; (1.0)なので、そこで single が落ちる。これも c-2 で直す
-(assert-equal '<double-float> (%%class-name (class-of (expt 1.5f0 2))))
-;;; float(FLOAT関数)は整数を double にする。これも c-2 で決める
+;;; --- 13. 数学関数 (c-2) ---
+;;; c-1 の時点では数学関数はすべて double を返していた。
+;;; c-2(documents/float-math-contagion.md)で入力の型を保つようになったので
+;;; single を渡せば single が返る。詳しい表は
+;;; test/lisp/float_math_contagion_test.lisp にある。
+(assert-equal '<single-float> (%%class-name (class-of (sqrt 2.0f0))))
+(assert-equal '<single-float> (%%class-name (class-of (exp 1.0f0))))
+(assert-equal '<single-float> (%%class-name (class-of (log 2.0f0))))
+(assert-equal '<single-float> (%%class-name (class-of (sin 1.0f0))))
+;;; expt は %expt-integer の単位元が double リテラル(1.0)だったため
+;;; 整数指数でも double になっていた。c-2 で単位元を base の型に合わせた
+(assert-equal '<single-float> (%%class-name (class-of (expt 1.5f0 2))))
+;;; float(FLOAT関数)は整数を *read-default-float-format* に従って変換する。
+;;; 既定は <double-float> なので (float 2) は double
 (assert-equal '<double-float> (%%class-name (class-of (float 2))))
 (assert-equal '<single-float> (%%class-name (class-of (float 1.5f0))))
