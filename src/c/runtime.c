@@ -5191,6 +5191,30 @@ static int args_float_kind(lisp_val_t args) {
 }
 
 /**
+ * 数学関数(sqrt/log/exp/sin/cos/atan2 等)の結果の型を決める。
+ *
+ * **float が絡めば c-1 の型昇格規則そのまま**(args_float_kind = kind の最大値)。
+ * 二項の atan2 もこれで正しくなるので、新しい判定は書かない。
+ *
+ * **整数だけのときは *read-default-float-format* に従う。**
+ * CommonLisp は有理数入力に single を返すと定めているが、isiki-os では
+ * この変数を型の中心に据えているのでそちらへ揃える。こうすると
+ * リテラルと数学関数の結果が同じ型になり、
+ * (approx= 1.4142135623730951 (sqrt 2)) のような比較が既定をどちらにしても成立する。
+ *
+ * 変数が読めないとき(ブート初期・unbound・想定外の値)のフォールバックは
+ * os_read_default_float_format_is_single が持っている(documents/single-float.md)。
+ * ここで別に用意はしない。
+ */
+static int math_result_kind(lisp_val_t args) {
+    int kind = args_float_kind(args);
+    if (kind != FLOAT_KIND_NONE) {
+        return kind;
+    }
+    return os_read_default_float_format_is_single() ? FLOAT_KIND_SINGLE : FLOAT_KIND_DOUBLE;
+}
+
+/**
  * 数値(FIXNUM/bignum/float)をdoubleへ変換する。float同士の演算・比較の前に
  * オペランドをdoubleへ揃えるために使う。
  */
@@ -6431,7 +6455,7 @@ lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
         if (d < 0.0) {
             return signal_domain_error(val, env);
         }
-        return os_make_float(sqrt_fpu(d));
+        return os_make_float_of_kind(math_result_kind(args), sqrt_fpu(d));
     }
 
     GC_PROTECT(val);
@@ -6455,7 +6479,9 @@ lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
         return root;
     }
 
-    return os_make_float(sqrt_fpu(to_double(val)));
+    /* 完全平方でなければfloatにする。整数入力なので型は
+       *read-default-float-format* に従う(math_result_kind) */
+    return os_make_float_of_kind(math_result_kind(args), sqrt_fpu(to_double(val)));
 }
 
 /**
@@ -6494,7 +6520,7 @@ lisp_val_t primitive_log(lisp_val_t args, lisp_val_t env) {
     if (x <= 0.0) {
         return signal_domain_error(val, env);
     }
-    return os_make_float(log_fpu(x));
+    return os_make_float_of_kind(math_result_kind(args), log_fpu(x));
 }
 
 /**
@@ -6565,7 +6591,7 @@ static double exp_fpu(double x) {
  */
 lisp_val_t primitive_exp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    return os_make_float(exp_fpu(to_double(cc_car(args))));
+    return os_make_float_of_kind(math_result_kind(args), exp_fpu(to_double(cc_car(args))));
 }
 
 /**
@@ -6599,7 +6625,7 @@ static double sin_fpu(double x) {
  */
 lisp_val_t primitive_sin(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    return os_make_float(sin_fpu(to_double(cc_car(args))));
+    return os_make_float_of_kind(math_result_kind(args), sin_fpu(to_double(cc_car(args))));
 }
 
 /**
@@ -6632,7 +6658,7 @@ static double cos_fpu(double x) {
  */
 lisp_val_t primitive_cos(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    return os_make_float(cos_fpu(to_double(cc_car(args))));
+    return os_make_float_of_kind(math_result_kind(args), cos_fpu(to_double(cc_car(args))));
 }
 
 /**
@@ -6669,9 +6695,10 @@ static double atan2_fpu(double y, double x) {
  */
 lisp_val_t primitive_atan2(lisp_val_t args, lisp_val_t env) {
     (void)env;
+    /* 二項なのでc-1の型昇格規則がそのまま効く(引数リストを丸ごと見る) */
     double y = to_double(cc_car(args));
     double x = to_double(cc_car(cc_cdr(args)));
-    return os_make_float(atan2_fpu(y, x));
+    return os_make_float_of_kind(math_result_kind(args), atan2_fpu(y, x));
 }
 
 /**
@@ -7058,7 +7085,9 @@ lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
         return x;
     }
     if ((x & TAG_MASK) == TAG_FIXNUM || is_bignum(x)) {
-        return os_make_float(to_double(x));
+        /* 整数→floatの型は *read-default-float-format* に従う(sqrt等と同じ規則)。
+           第2引数で形式を指定する拡張は本作業では扱わない */
+        return os_make_float_of_kind(math_result_kind(args), to_double(x));
     }
     return g_sym_eval_error;
 }
