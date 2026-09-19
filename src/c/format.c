@@ -55,9 +55,11 @@ static void format_integer_write(os_char_sink_t *sink, lisp_val_t integer, int r
     }
 }
 
-/** floatをprint.cのos_print_double_to_sinkと同じロジックで10進表記にして出力する */
+/** floatをprint.cと同じロジックで10進表記にして出力する。
+ *  single/doubleのどちらも受け、*read-default-float-format* と型が一致しない場合は
+ *  接尾辞('f0'/'d0')が付く(printと同じ規則にして、表示経路で型が食い違わないようにする) */
 static void format_float_write(os_char_sink_t *sink, lisp_val_t obj) {
-    os_print_double_to_sink(sink, os_float_value(obj));
+    os_print_float_to_sink(sink, obj);
 }
 
 lisp_val_t cc_format_char(lisp_val_t args, lisp_val_t env) {

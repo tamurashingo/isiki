@@ -367,18 +367,61 @@ static lisp_val_t read_string(reader_source_t *src) {
 #define READER_INT_LIMBS 16
 
 /**
- * c が浮動小数点リテラルの構成要素として許される文字('0'-'9', '.', 'e'/'E', '+'/'-')かどうかを返す。
+ * c が指数マーカーなら、その種別を小文字1文字で返す。マーカーでなければ0。
+ *
+ * ISLisp仕様(§19.2)が定めるのは 'e'/'E' だけで、'f'/'F'・'d'/'D' は isiki の拡張である。
+ *   'e' : 型は *read-default-float-format* に従う
+ *   'f' : single-float
+ *   'd' : double-float
+ *
+ * **接尾辞ではなく指数マーカーとしてのみ許す。** つまり後ろに必ず指数の桁が要る。
+ * こうしておくと "3.14f" が float なのかシンボルなのかという曖昧さが生じない。
+ * @param c 判定する文字
+ * @return 'e' / 'f' / 'd' のいずれか。指数マーカーでなければ0
+ */
+static char float_exponent_marker_kind(char c) {
+    switch (c) {
+        case 'e': case 'E': return 'e';
+        case 'f': case 'F': return 'f';
+        case 'd': case 'D': return 'd';
+        default:            return 0;
+    }
+}
+
+/**
+ * c が浮動小数点リテラルの構成要素として許される文字('0'-'9', '.', 指数マーカー, '+'/'-')かどうかを返す。
  * read_atomがトークン全体を整数/float/symbolのいずれとして扱うか判定する粗いフィルタに使う。
  * @param c 判定する文字
  * @return floatリテラルの構成要素として許される文字なら非0、そうでなければ0
  */
 static int is_float_token_char(char c) {
-    return is_digit(c) || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-';
+    return is_digit(c) || c == '.' || float_exponent_marker_kind(c) != 0 || c == '+' || c == '-';
+}
+
+/**
+ * token[digit_start..len) に isiki 拡張の指数マーカー('f'/'F'/'d'/'D')が含まれるか。
+ *
+ * read_atomが「floatの構文から外れたトークンをシンボルへ戻すかどうか」の判断に使う。
+ * 'e'/'E' を含むトークンは従来どおりread-errorのままにする(既存の挙動を変えない)。
+ * @param token トークン全体
+ * @param len tokenの長さ
+ * @param digit_start 数字部の開始位置
+ * @return 'f'/'F'/'d'/'D' を1つでも含めば非0
+ */
+static int has_extended_float_marker(const char *token, UINT32 len, UINT32 digit_start) {
+    for (UINT32 i = digit_start; i < len; i++) {
+        char kind = float_exponent_marker_kind(token[i]);
+        if (kind == 'f' || kind == 'd') {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /**
  * token[digit_start..len)をISLisp §19.2のfloat構文([s]dd...d.dd...d、
- * [s]dd...d.dd...dE[s]dd...d、[s]dd...dE[s]dd...dのいずれか)として解析する。
+ * [s]dd...d.dd...dE[s]dd...d、[s]dd...dE[s]dd...dのいずれか。Eの位置には
+ * isiki拡張の 'f'/'F'/'d'/'D' も置ける)として解析する。
  * token[0..digit_start)の符号は解析済み(negativeへ反映済み)の前提。strtodが無い環境のため、
  * 桁を読みながらmantissaへ逐次累積し、小数部桁数と指数部を最後にまとめて10のべきとして
  * 掛け/割りする手書きの変換を行う。
@@ -386,7 +429,8 @@ static int is_float_token_char(char c) {
  * @param len tokenの長さ
  * @param digit_start 数字部の開始位置(符号が無ければ0、あれば1)
  * @param negative tokenの符号が'-'だったかどうか
- * @return 解析したfloat値。ISLisp §19.2の構文に一致しない場合はg_sym_read_error
+ * @return 解析したfloat値(single-floatの即値またはMAGIC_FLOATのINSTANCE)。
+ *         構文に一致しない場合はg_sym_read_error
  */
 static lisp_val_t parse_float_token(const char *token, UINT32 len, UINT32 digit_start, int negative) {
     UINT32 i = digit_start;
@@ -432,9 +476,11 @@ static lisp_val_t parse_float_token(const char *token, UINT32 len, UINT32 digit_
     int has_exp = 0;
     int exp_negative = 0;
     int exponent = 0;
+    char marker_kind = 0;
 
-    if (i < len && (token[i] == 'e' || token[i] == 'E')) {
+    if (i < len && float_exponent_marker_kind(token[i]) != 0) {
         has_exp = 1;
+        marker_kind = float_exponent_marker_kind(token[i]);
         i++;
         if (i < len && (token[i] == '+' || token[i] == '-')) {
             exp_negative = (token[i] == '-');
@@ -468,7 +514,21 @@ static lisp_val_t parse_float_token(const char *token, UINT32 len, UINT32 digit_
         }
     }
 
-    return os_make_float(negative ? -value : value);
+    if (negative) {
+        value = -value;
+    }
+
+    /* 'f'/'d' は型をその場で決め、'e' と「指数部無し」は *read-default-float-format* に従う。
+       読めない状況(ブート初期・unbound・想定外の値)はC側の既定値へ倒れる */
+    int want_single = (marker_kind == 'f') ? 1
+                    : (marker_kind == 'd') ? 0
+                    : os_read_default_float_format_is_single();
+
+    /* [精度] single-floatも**いったんdoubleへ組み立ててから**単精度へ落とす。
+       10進→singleの直接変換に比べると二重丸めが入るが、そもそもこの組み立て
+       (mantissa * 10^total_exp のループ)は正しい丸めをしていないので、
+       単精度に限った劣化ではない。documents/single-float.md に明記。 */
+    return want_single ? os_make_single_float((float)value) : os_make_float(value);
 }
 
 /**
@@ -532,7 +592,23 @@ static lisp_val_t read_atom(reader_source_t *src) {
         }
     }
     if (float_chars && has_digit) {
-        return parse_float_token(token, len, digit_start, negative);
+        lisp_val_t parsed = parse_float_token(token, len, digit_start, negative);
+        if (parsed != g_sym_read_error) {
+            return parsed;
+        }
+        /* [拡張マーカーの後始末] "3f" や "3.14f" のように、isiki拡張の 'f'/'d' を
+           含むが float の構文に一致しないトークンは**シンボルへ戻す**。
+           理由は2つある:
+             1. 仕様として "3.14f" / "3f" はシンボルと決めた(接尾辞ではないので、
+                指数部の桁が無ければ float ではない)
+             2. 'f'/'d' は元々シンボル名の構成文字として使えた。"f1" のような
+                既存のシンボルが読めなくなるのを避ける
+           'e'/'E' しか含まないトークン("3.14e" 等)は従来どおり read-error のまま
+           にする。こちらを変えると single-float とは無関係な既存挙動が動く。 */
+        if (has_extended_float_marker(token, len, digit_start)) {
+            return os_make_symbol(token);
+        }
+        return parsed;
     }
 
     return os_make_symbol(token);
@@ -891,6 +967,9 @@ int os_process_stdin_read_char(char *out_ch) {
  */
 static int is_number_result(lisp_val_t val) {
     if ((val & TAG_MASK) == TAG_FIXNUM) {
+        return 1;
+    }
+    if ((val & TAG_MASK) == TAG_SINGLE_FLOAT) {
         return 1;
     }
     if ((val & TAG_MASK) != TAG_INSTANCE) {

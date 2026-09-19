@@ -889,12 +889,49 @@
 ;;; --- miscellaneous (§30) ---
 (defun identity (obj) obj)
 
-;;; --- number class (§19) float ---
-;;; IEEE754 binary64のDBL_MAX/-DBL_MAX相当。reader.cのfloatリテラル構文(§19.2)を
-;;; そのまま使って表現する(quotient/exp/log等の未実装超越関数と違い、
-;;; 定数の束縛だけなのでCコードの追加は不要)。
-(defconstant *most-positive-float* 1.7976931348623157E308)
-(defconstant *most-negative-float* -1.7976931348623157E308)
+;;; --- number class (§19) リーダ/プリンタの既定float型 ---
+;;; 指数マーカーが e/E のとき、および指数部が無いときに、リーダがどちらの型で
+;;; floatを作るかを決める。プリンタも同じ変数を見て、一致する型は接尾辞なし、
+;;; 一致しない型は接尾辞付き("1.5d0")で出す。
+;;;
+;;; **このdefdynamicより前の行にfloatリテラルを置かないこと。** loadは
+;;; 「1フォーム読む→評価する」の繰り返しなので、この行を評価するまでの
+;;; floatリテラルはC側のフォールバック(double-float)で読まれる。
+;;;
+;;; 動的変数はg_dynamic_bindingsという単一のグローバルにあり、**プロセス間で
+;;; 共有される**(documents/type-system-survey.md §4)。あるプロセスで
+;;; setqすると別のプロセスの読み取り・印字も変わる。現状の仕組みのままとする。
+;;;
+;;; **初期値は <double-float>。** CommonLisp の既定(single-float)とは違う。
+;;; 演算の型昇格(single × single → single)がまだ入っていないため、
+;;; <single-float> を既定にすると「リテラルは single、計算結果は double」という
+;;; 食い違いが全体に出る。equal はタグ一致を要求するので
+;;; (assert-equal 15.0 (+ 12 3.0)) の類が軒並み落ちる。
+;;; さらに (sqrt 2) のような整数→float変換が double を返す以上、
+;;; (%approx= 1.4142135623730951 (sqrt 2)) は型昇格が入っても成り立たない
+;;; (リテラル側が単精度に丸められ、許容誤差 1e-9 を超える)。
+;;; **既定を <single-float> へ倒すのは、演算の型昇格と整数→float変換の型を
+;;; 決めてからにする。** 詳細と実測は documents/single-float.md。
+(defdynamic *read-default-float-format* '<double-float>)
+
+;;; --- number class (§19) float の境界 ---
+;;; 値は必ずC側(runtime.h の SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS)から
+;;; 導く。Lisp側に 1.7976931348623157E308 のような数値リテラルを直書きすると、
+;;; (1) リーダの組み立て(mantissa * 10^exp のループ)が正しい丸めをしないため
+;;;     そもそも DBL_MAX ちょうどにならない
+;;; (2) *read-default-float-format* の値しだいで型が変わってしまう
+;;; の2つでC側と黙ってずれる。負側も専用のプリミティブにするのは、
+;;; (- 0 x) と書くと演算の型昇格(未実装)を通ってsingleがdoubleへ落ちるため。
+(defconstant *most-positive-single-float* (%%most-positive-single-float))
+(defconstant *most-negative-single-float* (%%most-negative-single-float))
+(defconstant *most-positive-double-float* (%%most-positive-double-float))
+(defconstant *most-negative-double-float* (%%most-negative-double-float))
+
+;;; ISLisp仕様(§19)の *most-positive-float* / *most-negative-float*。
+;;; isikiでは <float> が single/double の両方を指すようになったが、この2つは
+;;; 従来どおり double 側の端を指す(値も型も single-float 導入前と同じ)。
+(defconstant *most-positive-float* *most-positive-double-float*)
+(defconstant *most-negative-float* *most-negative-double-float*)
 
 ;;; --- number class (§19) fixnum の境界 ---
 ;;; fixnumが表現できる範囲の両端。値は必ずC側の FIXNUM_MAGNITUDE_MASK
@@ -990,7 +1027,10 @@
 ;; spec 4505行「*pi* → <float> named constant」の通り、通常の変数参照(*pi*)で
 ;; 読める必要があるためdefdynamicではなくdefconstantを使う(defdynamicの値は
 ;; (dynamic name)経由でしか読めず、bareなシンボル参照は未定義変数アクセスになる)
-(defconstant *pi* 3.141592653589793)
+;; 'd' 接尾辞を付けて double-float であることを明示する。*read-default-float-format*
+;; の既定は今のところ <double-float> なので付けなくても同じ値になるが、
+;; 既定を切り替えたときに単精度(有効桁7)へ落ちないよう明示しておく
+(defconstant *pi* 3.141592653589793d0)
 
 ;;; Environment操作ユーティリティ(documents/environment.md Phase4)。Q4の決定に従い、
 ;;; make-environment等は特殊形式ではなく通常のLisp関数として実装する。名前(第一引数)は

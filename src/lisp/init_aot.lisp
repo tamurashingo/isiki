@@ -368,6 +368,18 @@
 (%register-builtin-class '<number> '(<object>))
 (%register-builtin-class '<integer> '(<number>))
 (%register-builtin-class '<float> '(<number>))
+;; 内部表現を型階層に出す拡張(ISLispには<fixnum>/<bignum>/<single-float>/
+;; <double-float>は無い。documents/type-system-survey.md §4-1)。
+;; class-ofは<integer>/<float>ではなくこの4つのどれかを返すようになる。
+(%register-builtin-class '<fixnum> '(<integer>))
+(%register-builtin-class '<bignum> '(<integer>))
+(%register-builtin-class '<single-float> '(<float>))
+(%register-builtin-class '<double-float> '(<float>))
+;; <short-float>/<long-float>は**別名**であってサブクラスではない。
+;; 同一のクラスオブジェクトを2つ目の名前で*classes*へ登録する。
+;; サブクラスにすると、class-ofが決して返さない到達不能クラスができてしまう。
+(%register-class '<short-float> (%find-class '<single-float>))
+(%register-class '<long-float> (%find-class '<double-float>))
 (%register-builtin-class '<standard-class> '(<object>))
 (%register-builtin-class '<standard-object> '(<object>))
 (%register-builtin-class '<stream> '(<object>))
@@ -465,8 +477,15 @@
     ((stringp obj) (%find-class '<string>))
     ((general-vector-p obj) (%find-class '<general-vector>))
     ((general-array*-p obj) (%find-class '<general-array*>))
-    ((floatp obj) (%find-class '<float>))
-    ((integerp obj) (%find-class '<integer>))
+    ;; floatとintegerは**既存の分岐位置を動かさず**、その内側で内部表現を分ける。
+    ;; 分岐順序を動かすと他の型への影響が読めない(documents/type-system-survey.md §3-2)。
+    ;; 判定の安い述語を先に置く(fixnumpはタグ検査4命令、bignumpは8命令)
+    ((floatp obj) (if (%%single-float-p obj)
+                      (%find-class '<single-float>)
+                    (%find-class '<double-float>)))
+    ((integerp obj) (if (fixnump obj)
+                        (%find-class '<fixnum>)
+                      (%find-class '<bignum>)))
     ((numberp obj) (%find-class '<number>))
     ((functionp obj) (%find-class '<function>))
     ((streamp obj) (%find-class '<stream>))

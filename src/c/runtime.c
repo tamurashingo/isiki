@@ -3256,6 +3256,11 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample_pub), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
         os_set_function(os_make_symbol("%%FIXNUM-MAGNITUDE-MASK"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnum_magnitude_mask), global_environment);
+        os_set_function(os_make_symbol("%%SINGLE-FLOAT-P"), os_make_native_function((lisp_addr_t)(void *)primitive_single_float_p), global_environment);
+        os_set_function(os_make_symbol("%%MOST-POSITIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_single_float), global_environment);
+        os_set_function(os_make_symbol("%%MOST-NEGATIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_negative_single_float), global_environment);
+        os_set_function(os_make_symbol("%%MOST-POSITIVE-DOUBLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_double_float), global_environment);
+        os_set_function(os_make_symbol("%%MOST-NEGATIVE-DOUBLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_negative_double_float), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
@@ -4876,6 +4881,9 @@ typedef struct {
  * FIXNUMまたはMAGIC_BIGNUMのINSTANCEを符号付きマグニチュードのビューに分解する。
  * bignumのlimb配列はコピーせずオブジェクト自身の配列を直接指す。
  */
+/* decomposeが整数以外を弾くために使う。定義は下(float/bignum判定の節)にある */
+static int is_bignum(lisp_val_t val);
+
 static void decompose(lisp_val_t v, signed_mag_t *out) {
     if ((v & TAG_MASK) == TAG_FIXNUM) {
         UINT64 magnitude = os_fixnum_magnitude(v);
@@ -4884,11 +4892,28 @@ static void decompose(lisp_val_t v, signed_mag_t *out) {
         out->fixnum_buf[1] = magnitude >> 32;
         out->limbs = out->fixnum_buf;
         out->count = mag_len(out->fixnum_buf, 2);
-    } else {
+    } else if (is_bignum(v)) {
         UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
         out->sign = (int)obj[1];
         out->limbs = (UINT64 *)obj[3];
         out->count = obj[2];
+    } else {
+        /* [single-float] 整数でない値は0として扱う。
+           以前はここも無条件に (v & ~TAG_MASK) をデリファレンスしていた。
+           doubleを渡すとMAGIC_FLOATのword1〜3をsign/count/limbsとして読むという
+           既に間違った動作だったが、アドレスは有効なヒープ内だったので落ちなかった。
+           **single-floatは即値なので、同じことをすると生のビットパターンを
+           アドレスとして読んで即座に落ちる。**
+           整数専用の関数(div/mod/gcd/lcm/isqrt等)にfloatを渡すのは元々
+           定義域エラーであり、ここで正しい答えを出すつもりはない。
+           「未定義の入力で segfault しない」ことだけを保証する。
+           floatを正しく扱う必要がある関数(abs等)は、decomposeへ来る前に
+           is_floatで分岐すること。 */
+        out->sign = 0;
+        out->fixnum_buf[0] = 0;
+        out->fixnum_buf[1] = 0;
+        out->limbs = out->fixnum_buf;
+        out->count = 0;
     }
 }
 
@@ -5046,8 +5071,16 @@ static int bignum_equal(const UINT64 *obj_a, const UINT64 *obj_b) {
     return 1;
 }
 
-/** valがfloat(MAGIC_FLOATのINSTANCE)かどうかを判定する */
+/** valがfloat(single/doubleのどちらか)かどうかを判定する。
+ *
+ * **single-floatもここで真になる。** 算術・比較・floatpはすべてこの述語を
+ * 通るので、ここ1箇所でsingleを受け入れれば「single-floatは数として普通に
+ * 使える」が成り立つ。演算結果の型昇格(single×single→single)は別作業なので、
+ * 結果は従来どおりdoubleになる。 */
 static int is_float(lisp_val_t val) {
+    if (os_is_single_float(val)) {
+        return 1;
+    }
     return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT;
 }
 
@@ -5063,9 +5096,26 @@ lisp_val_t os_make_float(double value) {
 }
 
 double os_float_value(lisp_val_t val) {
+    if (os_is_single_float(val)) {
+        return (double)os_single_float_value(val);
+    }
     union { double d; UINT64 u; } conv;
     conv.u = ((UINT64 *)(val & ~TAG_MASK))[1];
     return conv.d;
+}
+
+lisp_val_t os_make_single_float(float value) {
+    /* ビットパターンの移動はunion経由。*(UINT32 *)&value はstrict aliasing違反で、
+       最適化によって黙って別の値になりうる */
+    union { float f; UINT32 u; } conv;
+    conv.f = value;
+    return ((lisp_val_t)conv.u) << SINGLE_FLOAT_VALUE_SHIFT | TAG_SINGLE_FLOAT;
+}
+
+float os_single_float_value(lisp_val_t val) {
+    union { float f; UINT32 u; } conv;
+    conv.u = (UINT32)(val >> SINGLE_FLOAT_VALUE_SHIFT);
+    return conv.f;
 }
 
 double bignum_to_double(lisp_val_t val) {
@@ -6111,6 +6161,23 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
         return os_make_fixnum(os_fixnum_magnitude(val));
     }
 
+    /* [single-float] floatを明示的に分ける。**型は保存する**
+       (singleを渡したらsingleが返る。ここは演算の型昇格ではなく符号の除去なので、
+       (c) の対象ではない)。
+       以前はfloatもdecomposeへ落ちていた。doubleのビットパターンを
+       sign/count/limbsとして読むという既に間違った動作だったが、
+       2.0 や -0.0 では偶然 sign=0 になって val がそのまま返っていただけである。 */
+    if (is_float(val)) {
+        double d = os_float_value(val);
+        if (d < 0.0) {
+            d = -d;
+            return os_is_single_float(val) ? os_make_single_float((float)d) : os_make_float(d);
+        }
+        /* -0.0 は d < 0.0 に入らないのでそのまま返る(single-float導入前と同じ)。
+           equal は float を値で比べるので (abs -0.0) と 0.0 は等しい */
+        return val;
+    }
+
     signed_mag_t m;
     decompose(val, &m);
     if (!m.sign) {
@@ -6704,6 +6771,9 @@ lisp_val_t primitive_numberp1(lisp_val_t val) {
     if ((val & TAG_MASK) == TAG_FIXNUM) {
         return g_sym_t;
     }
+    if ((val & TAG_MASK) == TAG_SINGLE_FLOAT) {
+        return g_sym_t;
+    }
     if ((val & TAG_MASK) == TAG_INSTANCE) {
         UINT64 magic = ((UINT64 *)(val & ~TAG_MASK))[0];
         if (magic == MAGIC_BIGNUM || magic == MAGIC_FLOAT) {
@@ -6774,6 +6844,117 @@ lisp_val_t primitive_floatp(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_floatp1(lisp_val_t val) {
     return is_float(val) ? g_sym_t : nil;
+}
+
+/**
+ * 組み込み関数%%SINGLE-FLOAT-P。第一引数がsingle-float(TAG_SINGLE_FLOATの即値)か
+ * どうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return primitive_single_float_p1(cc_car(args));
+}
+
+/**
+ * primitive_single_float_pの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p1(lisp_val_t val) {
+    return os_is_single_float(val) ? g_sym_t : nil;
+}
+
+/* float境界の定数4つ。値はC側の SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS から
+   導く(Lisp側に数値リテラルを書かないための経路。init.lispのdefconstantが呼ぶ)。
+
+   負側も専用にするのは、Lispで (- 0 *most-positive-single-float*) と書くと
+   演算の型昇格が未実装のためsingleがdoubleへ落ちてしまうからである。
+   ビット単位では符号bitを立てるだけなので、値の丸めも起きない。 */
+
+/** 組み込み関数%%MOST-POSITIVE-SINGLE-FLOAT。単精度の最大有限値 */
+lisp_val_t primitive_most_positive_single_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { float f; UINT32 u; } conv;
+    conv.u = (UINT32)SINGLE_FLOAT_MAX_BITS;
+    return os_make_single_float(conv.f);
+}
+
+/** 組み込み関数%%MOST-NEGATIVE-SINGLE-FLOAT。単精度の最小有限値(最大有限値の符号反転) */
+lisp_val_t primitive_most_negative_single_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { float f; UINT32 u; } conv;
+    conv.u = (UINT32)SINGLE_FLOAT_MAX_BITS | 0x80000000UL;
+    return os_make_single_float(conv.f);
+}
+
+/** 組み込み関数%%MOST-POSITIVE-DOUBLE-FLOAT。倍精度の最大有限値 */
+lisp_val_t primitive_most_positive_double_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { double d; UINT64 u; } conv;
+    conv.u = DOUBLE_FLOAT_MAX_BITS;
+    return os_make_float(conv.d);
+}
+
+/** 組み込み関数%%MOST-NEGATIVE-DOUBLE-FLOAT。倍精度の最小有限値(最大有限値の符号反転) */
+lisp_val_t primitive_most_negative_double_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { double d; UINT64 u; } conv;
+    conv.u = DOUBLE_FLOAT_MAX_BITS | 0x8000000000000000ULL;
+    return os_make_float(conv.d);
+}
+
+/**
+ * リーダ・プリンタが参照する *read-default-float-format* の現在値を解決する。
+ *
+ * 動的変数は g_dynamic_bindings という**単一のグローバル**に入っているので、
+ * プロセスをまたいで共有される(documents/type-system-survey.md §4)。
+ * F1で変えるとF2の読み取りも変わる。これは現状の動的変数の仕組みそのままで、
+ * 本作業では変えない。
+ *
+ * **読めない状況で落ちないことを最優先にする。** ブート初期(init.lispの
+ * defdynamicより前)・unboundのとき・想定外のシンボルが入っているときは、
+ * どれもC側の既定値へ倒す。
+ * @return single-floatなら非0、double-floatなら0
+ */
+/**
+ * 既にinternされているsymbolだけを引く(**確保しない**)。未登録ならnil。
+ *
+ * os_make_symbol は見つからなければ新しく作るので `os_alloc_bytes` を通り、
+ * GCが走りうる。プリンタの内側(print_value)から呼ぶとGCが印字中の値を
+ * 動かしてしまい、Cのローカル変数はGCルートでないので参照が腐る。
+ * ここは**引くだけ**にして、その経路を断つ。
+ */
+static lisp_val_t find_interned_symbol(const char *name) {
+    int found = symbol_hash_lookup(name);
+    return (found >= 0) ? g_symbol_table[found] : nil;
+}
+
+int os_read_default_float_format_is_single(void) {
+    /* 動的変数がまだ1つも無い間(ブート最初期)は引くまでもない */
+    if (g_dynamic_bindings == nil) {
+        return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;
+    }
+    lisp_val_t name = find_interned_symbol("*READ-DEFAULT-FLOAT-FORMAT*");
+    if (name == nil) {
+        return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;   /* まだinternされていない */
+    }
+    lisp_val_t value = os_get_dynamic(name);
+    if (value == nil) {
+        return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;   /* 未定義 */
+    }
+    /* 比較相手もinterned symbolのはず。未登録なら nil になり、value(非nil)とは
+       一致しないので自然にフォールバックへ落ちる */
+    if (value == find_interned_symbol("<SINGLE-FLOAT>")) {
+        return 1;
+    }
+    if (value == find_interned_symbol("<DOUBLE-FLOAT>")) {
+        return 0;
+    }
+    /* 想定外の値。エラーにはせず既定へ倒す(リーダもプリンタも落ちてはいけない) */
+    return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;
 }
 
 /**
@@ -6925,6 +7106,12 @@ static int values_equal(lisp_val_t a, lisp_val_t b) {
     }
 
     switch (tag_a) {
+        case TAG_SINGLE_FLOAT:
+            /* 即値なのでビットパターンが同じなら上の a == b で既に真。ここへ来るのは
+               ビットパターンが違う場合だけで、+0.0 と -0.0 がそれにあたる。
+               数値はeql比較(ISLisp §13)なので値として比べる */
+            return os_single_float_value(a) == os_single_float_value(b);
+
         case TAG_CONS:
             return values_equal(cc_car(a), cc_car(b)) && values_equal(cc_cdr(a), cc_cdr(b));
 
@@ -8390,7 +8577,23 @@ lisp_val_t primitive_class_name(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    lisp_val_t cls = cc_car(args);
+    /* [防御] クラスオブジェクトでなければ「親なし」として空リストを返す。
+       subclasspは (eq c1 c2) が偽なら無条件に %%class-supers を呼ぶので、
+       class-of が **nil を返したとき**(そのクラス名が *classes* に未登録)に
+       ここへ nil が来る。以前は nil をそのままデリファレンスして
+       g_nil_cell の外(16byteしかない)を読んでいた。読めた値が偶然 nil なら
+       素通りし、そうでなければ落ちる — つまり**グローバルの並び順しだいで
+       壊れる**状態だった(single-float でグローバルが増えた結果、
+       lisp_compiled_test が実際に落ちて発覚した)。
+       空リストを返せば subclassp は正しく偽になる。 */
+    if ((cls & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(cls & ~TAG_MASK);
+    if (obj[0] != MAGIC_BUILTIN_CLASS && obj[0] != MAGIC_STANDARD_CLASS) {
+        return nil;
+    }
     return obj[2];
 }
 
