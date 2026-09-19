@@ -1977,6 +1977,133 @@ void test_single_floats_survive_gc_unchanged() {
     for (int i = 0; i < 8; i++) { os_gc_unregister_root(&kept[i]); }
 }
 
+/* --- float の型昇格 (c-1) ----------------------------------------------
+   規則: より広い形式へ寄せる。整数は float に従う。
+   documents/float-contagion.md */
+
+/** ヒープのバンプポインタが進んだ量(byte)。確保がゼロかどうかを直接見る */
+static UINT64 heap_used_now(void) {
+    return os_fixnum_magnitude(primitive_heap_used_bytes(nil, nil));
+}
+
+void test_float_contagion_two_arg_result_types() {
+    lisp_val_t sf = os_make_single_float(1.5f);
+    lisp_val_t df = os_make_float(1.5);
+    lisp_val_t fx = os_make_fixnum(2);
+
+    struct { lisp_val_t a, b; int expect_single; const char *what; } cases[] = {
+        { sf, sf, 1, "single + single -> single" },
+        { fx, sf, 1, "fixnum + single -> single" },
+        { sf, fx, 1, "single + fixnum -> single" },
+        { sf, df, 0, "single + double -> double" },
+        { df, sf, 0, "double + single -> double" },
+        { df, df, 0, "double + double -> double" },
+        { fx, df, 0, "fixnum + double -> double" },
+        { df, fx, 0, "double + fixnum -> double" },
+    };
+    int bad_add = 0, bad_sub = 0, bad_mul = 0;
+    for (UINT64 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (os_is_single_float(primitive_add2(cases[i].a, cases[i].b))      != cases[i].expect_single) { bad_add++; }
+        if (os_is_single_float(primitive_subtract2(cases[i].a, cases[i].b)) != cases[i].expect_single) { bad_sub++; }
+        if (os_is_single_float(primitive_multiply2(cases[i].a, cases[i].b)) != cases[i].expect_single) { bad_mul++; }
+    }
+    assert(bad_add == 0, "primitive_add2の結果の型が全8通りで型昇格の規則どおり");
+    assert(bad_sub == 0, "primitive_subtract2の結果の型が全8通りで型昇格の規則どおり");
+    assert(bad_mul == 0, "primitive_multiply2の結果の型が全8通りで型昇格の規則どおり");
+
+    /* 値も確かめる。fixnum同士は従来どおりfixnumのまま */
+    assert(primitive_add2(os_make_fixnum(1), os_make_fixnum(2)) == os_make_fixnum(3),
+           "fixnum同士の加算は従来どおりfixnum");
+    assert(os_single_float_value(primitive_add2(sf, sf)) == 3.0f, "1.5f + 1.5f = 3.0f");
+    assert(os_float_value(primitive_add2(sf, df)) == 3.0, "1.5f + 1.5d = 3.0d");
+    assert(os_single_float_value(primitive_multiply2(sf, fx)) == 3.0f, "1.5f * 2 = 3.0f");
+}
+
+void test_single_float_arithmetic_allocates_nothing() {
+    /* **c-1 の性能上の眼目。** single はタグ0x4の即値なので、結果を包むための
+       ヒープ確保が要らない。以前は primitive_add2 が cons を2個作って
+       primitive_add へ委譲していたため、型が正しくても確保が残る形だった
+       (改善Aで見つけた「32byte/回」の正体と同じ構図)。
+
+       バンプポインタ(g_from_ptr - g_from_start)を直接見て、1byteも
+       進んでいないことを確認する。 */
+    lisp_val_t a = os_make_single_float(1.5f);
+    lisp_val_t b = os_make_single_float(2.25f);
+
+    UINT64 before = heap_used_now();
+    lisp_val_t r = a;
+    for (int i = 0; i < 1000; i++) {
+        r = primitive_add2(r, b);
+        r = primitive_subtract2(r, b);
+        r = primitive_multiply2(a, b);
+    }
+    UINT64 after = heap_used_now();
+    assert(after == before, "single x single の + - * はヒープを1byteも確保しない");
+    assert(os_is_single_float(r), "3000回まわしても結果はsingle-floatの即値のまま");
+
+    /* 対照: double は MAGIC_FLOAT の instance なので必ず確保が起きる。
+       この差が single 即値化の効果そのものである */
+    lisp_val_t da = os_make_float(1.5);
+    lisp_val_t db = os_make_float(2.25);
+    UINT64 dbefore = heap_used_now();
+    lisp_val_t dr = da;
+    for (int i = 0; i < 1000; i++) {
+        dr = primitive_add2(dr, db);
+    }
+    UINT64 dafter = heap_used_now();
+    assert(dafter > dbefore, "double x double の加算はヒープを確保する(対照)");
+    assert(!os_is_single_float(dr), "double同士の結果はsingle-floatではない");
+
+    /* 整数 x single も確保ゼロ(整数側は float に従うだけなので) */
+    UINT64 mbefore = heap_used_now();
+    lisp_val_t mr = a;
+    for (int i = 0; i < 1000; i++) {
+        mr = primitive_add2(mr, os_make_fixnum(0));
+    }
+    UINT64 mafter = heap_used_now();
+    assert(mafter == mbefore, "fixnum x single の加算もヒープを確保しない");
+    assert(os_is_single_float(mr), "fixnum x single の結果はsingle-float");
+}
+
+void test_float_comparison_widens_to_double() {
+    /* **狭いほうへ落としてはいけない。** double を single へ丸めてから比べると
+       (= 0.1f0 0.1d0) が真になってしまう(精度を捨てている)。
+       single を double へ広げるのが正しい。 */
+    lisp_val_t sf_tenth = os_make_single_float(0.1f);
+    lisp_val_t df_tenth = os_make_float(0.1);
+
+    lisp_val_t pair = os_make_cons(sf_tenth, os_make_cons(df_tenth, nil));
+    assert(primitive_num_equal(pair, nil) == nil,
+           "(= 0.1f0 0.1d0) は偽。singleをdoubleへ広げて比較している");
+    assert(primitive_less_than(pair, nil) == nil,
+           "single の 0.1 を double へ広げた値は double の 0.1 より大きいので < は偽");
+    assert(primitive_greater_than(pair, nil) == g_sym_t,
+           "同じ理由で > は真");
+
+    /* 1.5 は両形式で正確に表せるので、実装が誤っていても通る。
+       テストに 0.1 系を必ず含めるのはこのため */
+    lisp_val_t exact = os_make_cons(os_make_single_float(1.5f),
+                                    os_make_cons(os_make_float(1.5), nil));
+    assert(primitive_num_equal(exact, nil) == g_sym_t, "(= 1.5f0 1.5d0) は真");
+
+    /* 整数と float も整数側を広げる */
+    lisp_val_t int_vs_single = os_make_cons(os_make_fixnum(1),
+                                            os_make_cons(os_make_single_float(1.0f), nil));
+    assert(primitive_num_equal(int_vs_single, nil) == g_sym_t, "(= 1 1.0f0) は真");
+}
+
+void test_equal_still_requires_matching_tags() {
+    /* equal はタグ一致を要求する。= とは別物で、本作業で変えていない */
+    lisp_val_t mixed = os_make_cons(os_make_single_float(1.5f),
+                                    os_make_cons(os_make_float(1.5), nil));
+    assert(primitive_equal(mixed, nil) == nil, "(equal 1.5f0 1.5d0) は偽(型が違う)");
+    assert(primitive_num_equal(mixed, nil) == g_sym_t, "(= 1.5f0 1.5d0) は真(値が同じ)");
+
+    lisp_val_t same = os_make_cons(os_make_single_float(1.5f),
+                                   os_make_cons(os_make_single_float(1.5f), nil));
+    assert(primitive_equal(same, nil) == g_sym_t, "(equal 1.5f0 1.5f0) は真");
+}
+
 void test_gc_string_with_forward_tag_colliding_length_is_not_misdetected() {
     /* STRINGのword0は**生の長さ**なので、長さの下位ビットがたまたま TAG_FORWARD と
        一致する文字列が必ず存在する。長さは Lisp プログラムが決めるので制御できない
@@ -2608,6 +2735,10 @@ int main(int argc, char** argv) {
    test_single_float_is_a_number_and_a_float();
    test_single_float_limits_come_from_c();
    test_single_floats_survive_gc_unchanged();
+   test_float_contagion_two_arg_result_types();
+   test_single_float_arithmetic_allocates_nothing();
+   test_float_comparison_widens_to_double();
+   test_equal_still_requires_matching_tags();
    test_gc_string_with_forward_tag_colliding_length_is_not_misdetected();
    test_gc_instance_survives();
    test_gc_circular_cons_list_does_not_hang();
