@@ -41,6 +41,7 @@
 (load "test/lisp/declaim_test.lisp")
 (load "test/lisp/inline_builtin_test.lisp")
 (load "test/lisp/fixnum_signed_arith_test.lisp")
+(load "test/lisp/single_float_test.lisp")
 (load "test/lisp/disassemble_test.lisp")
 
 (isiki-test-report)

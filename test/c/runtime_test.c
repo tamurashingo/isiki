@@ -1869,6 +1869,114 @@ void test_immediates_survive_gc_unchanged() {
     os_gc_unregister_root(&fix);
 }
 
+void test_single_float_bit_pattern_round_trip() {
+    /* float → 即値 → float でビットパターンが完全に戻ること。
+       union経由でしか触らないので、非正規化数・NaN・無限大も素通しできるはず */
+    union { float f; UINT32 u; } conv;
+    const UINT32 patterns[] = {
+        0x00000000UL,   /* +0.0 */
+        0x80000000UL,   /* -0.0 */
+        0x3F800000UL,   /* 1.0 */
+        0xBFC00000UL,   /* -1.5 */
+        0x00000001UL,   /* 最小の非正規化数 */
+        0x007FFFFFUL,   /* 最大の非正規化数 */
+        0x00800000UL,   /* 最小の正規化数 */
+        (UINT32)SINGLE_FLOAT_MAX_BITS,              /* FLT_MAX */
+        (UINT32)SINGLE_FLOAT_MAX_BITS | 0x80000000UL, /* -FLT_MAX */
+        0x7F800000UL,   /* +inf */
+        0xFF800000UL,   /* -inf */
+        0x7FC00000UL,   /* quiet NaN */
+    };
+    int bad_tag = 0, bad_bits = 0, bad_upper = 0;
+    for (UINT64 i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        conv.u = patterns[i];
+        lisp_val_t v = os_make_single_float(conv.f);
+        if ((v & TAG_MASK) != TAG_SINGLE_FLOAT) { bad_tag++; }
+        /* bit4-31 は未使用(0)でなければならない */
+        if ((v & ~(lisp_val_t)TAG_MASK & 0xFFFFFFFFULL) != 0) { bad_upper++; }
+        union { float f; UINT32 u; } back;
+        back.f = os_single_float_value(v);
+        if (back.u != patterns[i]) { bad_bits++; }
+    }
+    assert(bad_tag == 0, "single-floatのエンコードは全ケースでTAG_SINGLE_FLOATになる");
+    assert(bad_upper == 0, "single-floatの即値はbit4-31が0(タグとビットパターン以外を汚さない)");
+    assert(bad_bits == 0,
+           "single-floatはエンコード→デコードでビットパターンが完全に保たれる(0.0/-0.0/非正規化数/inf/NaNを含む)");
+
+    /* +0.0 と -0.0 は**別のビットパターン**なので即値としても別の値になる */
+    assert(os_make_single_float(0.0f) != os_make_single_float(-0.0f),
+           "+0.0と-0.0のsingle-floatは別のビットパターンになる");
+    /* ただし数としては等しい。equalは数値をeql比較する(ISLisp §13)。
+       引数はどちらも即値なので、consを組む間にGCが走っても壊れない */
+    lisp_val_t zero_args = os_make_cons(os_make_single_float(0.0f),
+                                        os_make_cons(os_make_single_float(-0.0f), nil));
+    assert(primitive_equal(zero_args, nil) == g_sym_t,
+           "+0.0と-0.0はequalで等しい(値として比較される)");
+}
+
+void test_single_float_is_a_number_and_a_float() {
+    lisp_val_t v = os_make_single_float(1.5f);
+    assert(primitive_floatp1(v) == g_sym_t, "single-floatはfloatpで真");
+    assert(primitive_numberp1(v) == g_sym_t, "single-floatはnumberpで真");
+    assert(primitive_single_float_p1(v) == g_sym_t, "single-floatは%%single-float-pで真");
+    assert(primitive_fixnump1(v) == nil, "single-floatはfixnumpで偽");
+
+    lisp_val_t d = os_make_float(1.5);
+    assert(primitive_floatp1(d) == g_sym_t, "double-floatもfloatpで真");
+    assert(primitive_single_float_p1(d) == nil, "double-floatは%%single-float-pで偽");
+
+    /* os_float_valueは両方を受ける。即値をアドレスとして読まないこと */
+    assert(os_float_value(v) == 1.5, "os_float_valueはsingle-floatも受ける");
+    assert(os_float_value(d) == 1.5, "os_float_valueはdouble-floatも受ける");
+}
+
+void test_single_float_limits_come_from_c() {
+    lisp_val_t pos = primitive_most_positive_single_float(nil, nil);
+    lisp_val_t neg = primitive_most_negative_single_float(nil, nil);
+    assert((pos & TAG_MASK) == TAG_SINGLE_FLOAT, "*most-positive-single-float*はsingle-float");
+    assert((neg & TAG_MASK) == TAG_SINGLE_FLOAT, "*most-negative-single-float*はsingle-float");
+    /* 有限であること: 10倍すると無限大になるが、自分自身は無限大ではない */
+    float p = os_single_float_value(pos);
+    assert(p == p && p * 10.0f != p, "*most-positive-single-float*は有限の最大値");
+    assert(os_single_float_value(neg) == -p, "負側は正側の符号反転ちょうど");
+
+    lisp_val_t dpos = primitive_most_positive_double_float(nil, nil);
+    lisp_val_t dneg = primitive_most_negative_double_float(nil, nil);
+    double dp = os_float_value(dpos);
+    assert(dp == dp && dp * 10.0 != dp, "*most-positive-double-float*は有限の最大値");
+    assert(os_float_value(dneg) == -dp, "double側も負は正の符号反転ちょうど");
+    /* singleの最大値はdoubleの最大値より小さい */
+    assert((double)p < dp, "単精度の最大値は倍精度の最大値より小さい");
+}
+
+void test_single_floats_survive_gc_unchanged() {
+    /* 即値なのでGCは追いかけない。大量に作ってGCを跨いでも値が壊れないこと */
+    lisp_val_t kept[8];
+    for (int i = 0; i < 8; i++) {
+        kept[i] = os_make_single_float((float)i + 0.5f);
+        os_gc_register_root(&kept[i]);
+    }
+    lisp_val_t before[8];
+    for (int i = 0; i < 8; i++) { before[i] = kept[i]; }
+
+    /* GCを確実に動かすため、間にヒープを使う値を挟んで2回回す */
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 64; i++) {
+            (void)os_make_cons(os_make_single_float((float)i), nil);
+        }
+        os_gc_collect();
+    }
+
+    int changed = 0;
+    for (int i = 0; i < 8; i++) {
+        if (kept[i] != before[i]) { changed++; }
+        if (os_single_float_value(kept[i]) != (float)i + 0.5f) { changed++; }
+    }
+    assert(changed == 0, "single-floatはGCを跨いでもビットパターンが変わらない");
+
+    for (int i = 0; i < 8; i++) { os_gc_unregister_root(&kept[i]); }
+}
+
 void test_gc_string_with_forward_tag_colliding_length_is_not_misdetected() {
     /* STRINGのword0は**生の長さ**なので、長さの下位ビットがたまたま TAG_FORWARD と
        一致する文字列が必ず存在する。長さは Lisp プログラムが決めるので制御できない
@@ -1993,12 +2101,23 @@ void test_gc_reclaims_unreferenced_garbage() {
 //
 // 掃引結果(マージ後のツリー、2026-09-18):
 //   80KB: ハング  — GC後も確保不能
-//   81KB: 5395 OK / 0 NG
-//   82KB: 5395 OK / 0 NG   ← 採用(窓の中央。ハング側へ2KB、GC未発火側へ3KBの余裕)
-//   83KB: 5395 OK / 0 NG
-//   84KB: 5395 OK / 0 NG
-//   85KB: isqrtテスト(runtime_test.c:2090)の「GCが発火する」アサーションがNG
-//   86KB: bignum加算テスト(同2029)のアサーションもNG
+//   81KB〜84KB: 5395 OK / 0 NG (82KBを採用していた)
+//   85KB: isqrtテストの「GCが発火する」アサーションがNG
+//   86KB: bignum加算テストのアサーションもNG
+//
+// [single-float] 2026-09-19: 組み込み関数を5個(%%SINGLE-FLOAT-P と
+// float境界の定数4つ)追加したため、os_bootstrap直後の生存量がまた増え、
+// 82KBはハングするようになった。**組み込みを1つ足すたびにここは動く**
+// (memory: builtin_count_small_heap_calibration)。
+//
+// 掃引結果(single-float導入後、2026-09-19):
+//   82KB: ハング — GC後も確保不能(4625件出たところで止まる)
+//   83KB: 5416 OK / 0 NG
+//   84KB: 5416 OK / 0 NG
+//   85KB: 5416 OK / 0 NG   ← 採用(窓83〜86の中央寄り。ハング側へ3KB、GC未発火側へ2KB)
+//   86KB: 5416 OK / 0 NG
+//   87KB: isqrtテストの「GCが発火する」アサーションがNG
+//   88KB: bignum加算テストのアサーションもNG
 //
 // 中央付近を採るのは、両端のどちらに寄っても壊れ方が違うためである。
 // 小さすぎるとGC後も確保不能でハングし(os_panicがユニットテストでは無限ループ)、
@@ -2011,7 +2130,7 @@ void test_gc_reclaims_unreferenced_garbage() {
 // `timeout N docker run ...` は docker クライアントしか殺さず、ハングした
 // コンテナが生き残って掃引が進まなくなる。
 #ifndef SMALL_HEAP_SIZE
-#define SMALL_HEAP_SIZE (82 * 1024)
+#define SMALL_HEAP_SIZE (85 * 1024)
 #endif
 
 static void setup_small_heap(void) {
@@ -2485,6 +2604,10 @@ int main(int argc, char** argv) {
    test_immediate_encode_decode_round_trip();
    test_char_high_code_points_do_not_corrupt_upper_bits();
    test_immediates_survive_gc_unchanged();
+   test_single_float_bit_pattern_round_trip();
+   test_single_float_is_a_number_and_a_float();
+   test_single_float_limits_come_from_c();
+   test_single_floats_survive_gc_unchanged();
    test_gc_string_with_forward_tag_colliding_length_is_not_misdetected();
    test_gc_instance_survives();
    test_gc_circular_cons_list_does_not_hang();

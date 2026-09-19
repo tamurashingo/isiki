@@ -12,7 +12,7 @@
  *   値   種別    型
  *   0x0  即値    fixnum
  *   0x2  即値    character
- *   0x4  即値    single-float (**予約のみ。実装していない**)
+ *   0x4  即値    single-float (IEEE754 binary32)
  *   0x6  即値    未割当
  *   0x8  即値    未割当
  *   0xA  即値    未割当
@@ -46,8 +46,8 @@
 #define TAG_CHAR     0x2ULL
 /** symbolへのアドレス(0011) */
 #define TAG_SYMBOL   0x3ULL
-/** 即値のsingle-float(0100)。**枠を予約しているだけで実装していない**。
-    <float>はIEEE754 binary64のままヒープ(MAGIC_FLOAT)に置く */
+/** 即値のsingle-float(0100)。IEEE754 binary32のビットパターンはbit32-63の32bit。
+    double-float(<double-float>)はIEEE754 binary64のままヒープ(MAGIC_FLOAT)に置く */
 #define TAG_SINGLE_FLOAT 0x4ULL
 /** stringへのアドレス(0101) */
 #define TAG_STRING   0x5ULL
@@ -133,7 +133,15 @@ _Static_assert(TAG_MARKER != TAG_FORWARD,
  *    bit4-31        未使用(0)
  *    bit0-3         タグ
  *
- * TAG_SINGLE_FLOAT / TAG_MARKER / 未割当の即値: 値を作る経路が無い(枠の予約のみ)。
+ * TAG_SINGLE_FLOAT: ヒープなし
+ *    bit32-63       IEEE754 単精度(binary32)のビットパターンをそのまま格納
+ *                   (SINGLE_FLOAT_VALUE_SHIFT分ずらす)
+ *    bit4-31        未使用(0)
+ *    bit0-3         タグ
+ *    double-floatは即値にできない(仮数だけで52bitある)ので、従来どおり
+ *    MAGIC_FLOAT(TAG_INSTANCE)のまま。タグ0xBは将来のdouble即値化用に空けてある。
+ *
+ * TAG_MARKER / 未割当の即値: 値を作る経路が無い(枠の予約のみ)。
  *
  * ---- アドレス(bit0 = 1) ----
  *
@@ -248,7 +256,7 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
         /* 即値(bit0=0)はアドレスを持たない */
         case TAG_FIXNUM:
         case TAG_CHAR:
-        case TAG_SINGLE_FLOAT:   /* 予約。値は作られない */
+        case TAG_SINGLE_FLOAT:   /* 即値。ビットパターンそのものなので追いかけない */
         case TAG_MARKER:         /* 予約。MAGIC_*の下位4bit */
         case 0x6ULL:             /* 即値・未割当 */
         case 0x8ULL:             /* 即値・未割当 */
@@ -298,6 +306,22 @@ static inline int os_tag_holds_address(UINT64 tag) {
  */
 #define CHAR_VALUE_SHIFT 32
 
+/**
+ * [単一の真実源] SINGLE-FLOATのビットパターンをタグ付き表現へ入れるためのシフト量。
+ * CHAR_VALUE_SHIFT と同じ32だが、**別の概念なので別の定数にする**
+ * (CHARのコードポイント幅とfloatの仮数幅は独立に動きうる)。
+ */
+#define SINGLE_FLOAT_VALUE_SHIFT 32
+
+/** IEEE754 binary32 の最大有限値(FLT_MAX)のビットパターン。
+ *  freestandingビルドで <float.h> を使わないため、ビット列から導出する。
+ *  符号0 / 指数0xFE / 仮数all-1 = 0x7F7FFFFF = 3.40282347E38 */
+#define SINGLE_FLOAT_MAX_BITS 0x7F7FFFFFUL
+
+/** IEEE754 binary64 の最大有限値(DBL_MAX)のビットパターン。
+ *  符号0 / 指数0x7FE / 仮数all-1 = 0x7FEFFFFFFFFFFFFF = 1.7976931348623157E308 */
+#define DOUBLE_FLOAT_MAX_BITS 0x7FEFFFFFFFFFFFFFULL
+
 /* --- fixnum / char の64bit語レイアウトの不変条件 -------------------------
    1語を「符号bit + マグニチュード + タグ」で分け合っているので、シフト量と
    マスクとタグ幅のどれか1つだけを動かすと静かに食い違う。隙間も重なりも
@@ -306,6 +330,11 @@ _Static_assert((1ULL << FIXNUM_VALUE_SHIFT) > TAG_MASK,
                "FIXNUM_VALUE_SHIFT is too small: the value field would overlap the tag");
 _Static_assert((1ULL << CHAR_VALUE_SHIFT) > TAG_MASK,
                "CHAR_VALUE_SHIFT is too small: the char code would overlap the tag");
+_Static_assert((1ULL << SINGLE_FLOAT_VALUE_SHIFT) > TAG_MASK,
+               "SINGLE_FLOAT_VALUE_SHIFT is too small: the float bits would overlap the tag");
+/* binary32は32bit。シフトした値が64bitからはみ出さないこと */
+_Static_assert(SINGLE_FLOAT_VALUE_SHIFT + 32 <= 64,
+               "SINGLE_FLOAT_VALUE_SHIFT is too large: the binary32 pattern would not fit in a word");
 _Static_assert((FIXNUM_SIGN_BIT & (FIXNUM_SIGN_BIT - 1)) == 0 && FIXNUM_SIGN_BIT != 0,
                "FIXNUM_SIGN_BIT must be exactly one bit");
 _Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) & FIXNUM_SIGN_BIT) == 0,
@@ -2053,11 +2082,84 @@ lisp_val_t primitive_bignump1(lisp_val_t val);
 lisp_val_t os_make_float(double value);
 
 /**
- * MAGIC_FLOATのINSTANCEからword1のビットパターンを読み出し、doubleへ戻す。
- * @param val MAGIC_FLOATのINSTANCE(タグ付きlisp_val_t)
- * @return 格納されているdouble値
+ * float(single/double)からdoubleの値を取り出す。
+ * MAGIC_FLOATのINSTANCEならword1のビットパターンを、TAG_SINGLE_FLOATの即値なら
+ * bit32-63のbinary32を、それぞれdoubleへ戻す。
+ *
+ * **この関数は両方を受ける。** single-floatを入れる前は「MAGIC_FLOATのword1を
+ * 読む」だけだったので、呼び出し側が先にis_floatで絞っていれば安全だったが、
+ * is_floatがsingleも真を返すようになった以上ここで分岐しないと即値をアドレスとして
+ * デリファレンスする。
+ * @param val floatの値(TAG_SINGLE_FLOATの即値、またはMAGIC_FLOATのINSTANCE)
+ * @return 格納されている値をdoubleにしたもの
  */
 double os_float_value(lisp_val_t val);
+
+/**
+ * float(IEEE754 binary32)の値をTAG_SINGLE_FLOATの即値にする。ヒープは使わない。
+ * ビットパターンの移動にはunionを使う(ポインタキャストはstrict aliasing違反)。
+ * @param value 格納するfloat値
+ * @return TAG_SINGLE_FLOATのタグ付き即値
+ */
+lisp_val_t os_make_single_float(float value);
+
+/**
+ * TAG_SINGLE_FLOATの即値からbit32-63のビットパターンを読み出し、floatへ戻す。
+ * @param val TAG_SINGLE_FLOATのタグ付き即値
+ * @return 格納されているfloat値
+ */
+float os_single_float_value(lisp_val_t val);
+
+/**
+ * valがsingle-float(TAG_SINGLE_FLOATの即値)かどうかを判定する。
+ * @param val 判定対象
+ * @return single-floatなら非0
+ */
+static inline int os_is_single_float(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_SINGLE_FLOAT;
+}
+
+/**
+ * 組み込み関数%%SINGLE-FLOAT-P。第一引数がsingle-float(TAG_SINGLE_FLOATの即値)か
+ * どうかを判定する。class-ofがfloatをsingle/doubleへ振り分けるのに使う。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_single_float_pの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p1(lisp_val_t val);
+
+/* 組み込み関数%%MOST-POSITIVE-SINGLE-FLOAT / %%MOST-NEGATIVE-SINGLE-FLOAT /
+   %%MOST-POSITIVE-DOUBLE-FLOAT / %%MOST-NEGATIVE-DOUBLE-FLOAT。
+   float境界の定数をC側(SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS)から導く。
+
+   **負側も専用のプリミティブにする。** Lisp側で (- 0 *most-positive-single-float*)
+   と書くと、演算の型昇格(未実装)を通ってsingleがdoubleへ落ちてしまう。 */
+lisp_val_t primitive_most_positive_single_float(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_most_negative_single_float(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_most_positive_double_float(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_most_negative_double_float(lisp_val_t args, lisp_val_t env);
+
+/**
+ * リーダ・プリンタが参照する *read-default-float-format* の現在値を解決する。
+ *
+ * 動的変数が未定義・unbound・想定外の値のときは**C側の既定値へフォールバックする**
+ * (起動時に落ちないことのほうが優先)。フォールバック先は
+ * READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE。
+ * @return single-floatなら非0、double-floatなら0
+ */
+int os_read_default_float_format_is_single(void);
+
+/** os_read_default_float_format_is_single のフォールバック値。
+ *  0 = double-float。**動的変数が読めない状況では従来どおりdoubleにする**
+ *  (single-float導入前の挙動と一致させ、ブート初期の読み取りで意味が変わらないようにする) */
+#define READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE 0
 
 /**
  * bignum(MAGIC_BIGNUMのINSTANCE)をdoubleへ変換する。limb配列を上位から
@@ -2069,7 +2171,8 @@ double os_float_value(lisp_val_t val);
 double bignum_to_double(lisp_val_t val);
 
 /**
- * 組み込み関数FLOATP。第一引数がfloat(MAGIC_FLOATのINSTANCE)かどうかを判定する。
+ * 組み込み関数FLOATP。第一引数がfloat(TAG_SINGLE_FLOATの即値、または
+ * MAGIC_FLOATのINSTANCE)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return floatならg_sym_t、そうでなければnil

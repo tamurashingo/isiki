@@ -192,6 +192,9 @@
     (fixnump . "primitive_fixnump")
     (bignump . "primitive_bignump")
     (floatp . "primitive_floatp")
+    ;; single-float導入: class-ofがfloatを<single-float>/<double-float>へ
+    ;; 振り分けるのに使う
+    (%%single-float-p . "primitive_single_float_p")
     (symbolp . "primitive_symbolp")
     (consp . "primitive_consp")
     (characterp . "primitive_characterp")
@@ -557,6 +560,7 @@
     (fixnump 1 . "primitive_fixnump1")
     (bignump 1 . "primitive_bignump1")
     (floatp 1 . "primitive_floatp1")
+    (%%single-float-p 1 . "primitive_single_float_p1")
     (symbolp 1 . "primitive_symbolp1")
     (consp 1 . "primitive_consp1")
     (characterp 1 . "primitive_characterp1")
