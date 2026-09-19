@@ -228,8 +228,10 @@
 (assert-equal t (eq (class-of (make-instance 'point)) (%find-class 'point)))
 (assert-equal t (eq (class-of (make-instance 'point3d)) (%find-class 'point3d)))
 
-;; class-of: 組み込み型の値からも対応するpredefinedクラスを返す
-(assert-equal t (eq (class-of 5) (%find-class '<integer>)))
+;; class-of: 組み込み型の値からも対応するpredefinedクラスを返す。
+;; 整数は内部表現(fixnum/bignum)まで返すようになった(single-float導入)
+(assert-equal t (eq (class-of 5) (%find-class '<fixnum>)))
+(assert-equal t (eq (class-of (expt 2 100)) (%find-class '<bignum>)))
 (assert-equal t (eq (class-of nil) (%find-class '<null>)))
 
 ;; defmethodのspecializerを組み込み型にした場合、非適合な引数には適用されない

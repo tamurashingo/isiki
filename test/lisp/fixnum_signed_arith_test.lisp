@@ -119,12 +119,18 @@
 (assert-equal 0 (- 0 *max-fix* *max-fix* (- *max-fix*) (- *max-fix*)))
 (assert-equal t (bignump (- 0 *max-fix* *max-fix*)))
 
-;;; --- 8. ユーザーから見える型名は境界の前後で変わらない ---
-(assert-equal '<integer> (%%class-name (class-of 1)))
-(assert-equal '<integer> (%%class-name (class-of -1)))
-(assert-equal '<integer> (%%class-name (class-of *max-fix*)))
-(assert-equal '<integer> (%%class-name (class-of (+ *max-fix* 1))))
-(assert-equal '<integer> (%%class-name (class-of (- (- *max-fix*) 1))))
+;;; --- 8. 内部表現は class-of から見える(single-float導入で仕様を変更) ---
+;;; 以前は境界の前後どちらも <INTEGER> だった(ISLisp準拠)。
+;;; 内部表現を型階層へ公開する方針に変えたため、fixnum/bignum が直接返る。
+;;; <integer> との関係は typep / subclassp 側で保たれている(下の2件)。
+(assert-equal '<fixnum> (%%class-name (class-of 1)))
+(assert-equal '<fixnum> (%%class-name (class-of -1)))
+(assert-equal '<fixnum> (%%class-name (class-of *max-fix*)))
+(assert-equal '<bignum> (%%class-name (class-of (+ *max-fix* 1))))
+(assert-equal '<bignum> (%%class-name (class-of (- (- *max-fix*) 1))))
+;;; 境界の前後で <integer> であることは変わらない
+(assert-equal t (typep *max-fix* '<integer>))
+(assert-equal t (typep (+ *max-fix* 1) '<integer>))
 
 ;;; --- 9. bignum が絡むケースは従来どおり ---
 (defglobal *big* (expt 2 100))

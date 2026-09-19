@@ -426,6 +426,118 @@ void test_os_read_float_literal_exponent_only() {
     assert(os_float_value(v) == 3e5, "読み取った値は3E5=300000.0");
 }
 
+/* --- single-float と指数マーカー f/F/d/D (Phase 4a) -------------------------
+   このテストバイナリでは g_dynamic_bindings が空なので
+   *read-default-float-format* は読めず、C側のフォールバック(double-float)が効く。
+   したがって接尾辞なしの "1.5" は従来どおり double になる。 */
+
+/** 読み取った1トークンを返す小さなヘルパー(この節のテスト専用) */
+static lisp_val_t read_one_token(const char *text) {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    proc->env = os_make_environment(os_make_symbol(proc->name), global_environment);
+    push_string(proc, text);
+    return os_read(proc);
+}
+
+void test_os_read_single_float_marker_lowercase() {
+    lisp_val_t v = read_one_token("1.5f0");
+    assert((v & TAG_MASK) == TAG_SINGLE_FLOAT, "\"1.5f0\"はsingle-floatの即値として読める");
+    assert(os_single_float_value(v) == 1.5f, "読み取った値は1.5");
+}
+
+void test_os_read_single_float_marker_uppercase() {
+    lisp_val_t v = read_one_token("1.5F0");
+    assert((v & TAG_MASK) == TAG_SINGLE_FLOAT, "\"1.5F0\"も大文字でsingle-floatとして読める");
+    assert(os_single_float_value(v) == 1.5f, "読み取った値は1.5");
+}
+
+void test_os_read_double_float_marker_lowercase() {
+    lisp_val_t v = read_one_token("1.5d0");
+    assert((v & TAG_MASK) == TAG_INSTANCE, "\"1.5d0\"はdouble-float(INSTANCE)として読める");
+    assert(((UINT64 *)(v & ~TAG_MASK))[0] == MAGIC_FLOAT, "word0はMAGIC_FLOAT");
+    assert(os_float_value(v) == 1.5, "読み取った値は1.5");
+}
+
+void test_os_read_double_float_marker_uppercase() {
+    lisp_val_t v = read_one_token("1.5D0");
+    assert((v & TAG_MASK) == TAG_INSTANCE, "\"1.5D0\"も大文字でdouble-floatとして読める");
+    assert(os_float_value(v) == 1.5, "読み取った値は1.5");
+}
+
+void test_os_read_single_float_without_decimal_point() {
+    /* 小数点が無くても指数部があればfloat。"3f10" = 3.0 * 10^10 */
+    lisp_val_t v = read_one_token("3f10");
+    assert((v & TAG_MASK) == TAG_SINGLE_FLOAT, "\"3f10\"は小数点無しでもsingle-floatとして読める");
+    assert(os_single_float_value(v) == 3.0e10f, "読み取った値は3.0E10");
+}
+
+void test_os_read_single_float_negative_exponent() {
+    lisp_val_t v = read_one_token("-1.25f-2");
+    assert((v & TAG_MASK) == TAG_SINGLE_FLOAT, "符号と負の指数を持つsingle-floatが読める");
+    assert(os_single_float_value(v) == -1.25e-2f, "読み取った値は-1.25E-2");
+}
+
+void test_os_read_float_marker_without_exponent_is_symbol() {
+    /* 'f'/'d' は**接尾辞ではなく指数マーカー**なので、桁が続かなければfloatでない。
+       read-errorではなくシンボルへ戻す(既存のシンボル名を読めなくしないため) */
+    lisp_val_t v = read_one_token("3.14f");
+    assert((v & TAG_MASK) == TAG_SYMBOL, "\"3.14f\"は指数部が無いのでシンボル");
+    assert(v == os_make_symbol("3.14F"), "シンボル名はトークンそのもの(大文字化される)");
+}
+
+void test_os_read_digit_then_marker_is_symbol() {
+    lisp_val_t v = read_one_token("3f");
+    assert((v & TAG_MASK) == TAG_SYMBOL, "\"3f\"もシンボル");
+}
+
+void test_os_read_marker_then_digit_is_symbol() {
+    /* 'f'/'d' を指数マーカーに加えたことで "f1" のような既存のシンボルが
+       読めなくなっていないことを固定する */
+    lisp_val_t v = read_one_token("f1");
+    assert((v & TAG_MASK) == TAG_SYMBOL, "\"f1\"はシンボルのまま読める");
+    lisp_val_t w = read_one_token("d2");
+    assert((w & TAG_MASK) == TAG_SYMBOL, "\"d2\"もシンボルのまま読める");
+}
+
+void test_os_read_bare_exponent_marker_e_stays_read_error() {
+    /* 'e'/'E' の挙動は変えない。"3.14e" は従来どおりread-error */
+    lisp_val_t v = read_one_token("3.14e");
+    assert(v == g_sym_read_error, "\"3.14e\"は従来どおりread errorのまま");
+}
+
+void test_os_read_default_float_format_switches_type() {
+    /* 動的変数を直接置いて両方向を確かめる。os_read_default_float_format_is_single
+       は g_dynamic_bindings を見るので、os_set_dynamic で足せば効く */
+    os_set_dynamic(os_make_symbol("*READ-DEFAULT-FLOAT-FORMAT*"), os_make_symbol("<SINGLE-FLOAT>"));
+    lisp_val_t single = read_one_token("1.5");
+    assert((single & TAG_MASK) == TAG_SINGLE_FLOAT,
+           "*read-default-float-format*が<single-float>なら\"1.5\"はsingle");
+
+    os_set_dynamic(os_make_symbol("*READ-DEFAULT-FLOAT-FORMAT*"), os_make_symbol("<DOUBLE-FLOAT>"));
+    lisp_val_t dbl = read_one_token("1.5");
+    assert((dbl & TAG_MASK) == TAG_INSTANCE,
+           "*read-default-float-format*が<double-float>なら\"1.5\"はdouble");
+
+    /* 'e' マーカーも同じ変数に従う */
+    os_set_dynamic(os_make_symbol("*READ-DEFAULT-FLOAT-FORMAT*"), os_make_symbol("<SINGLE-FLOAT>"));
+    lisp_val_t e_single = read_one_token("1.5e0");
+    assert((e_single & TAG_MASK) == TAG_SINGLE_FLOAT, "\"1.5e0\"も既定の型に従う");
+
+    /* 明示マーカーは既定より強い */
+    lisp_val_t forced = read_one_token("1.5d0");
+    assert((forced & TAG_MASK) == TAG_INSTANCE, "\"1.5d0\"は既定が<single-float>でもdouble");
+
+    /* 想定外の値はフォールバック(double)へ倒れ、落ちない */
+    os_set_dynamic(os_make_symbol("*READ-DEFAULT-FLOAT-FORMAT*"), os_make_symbol("<BOGUS>"));
+    lisp_val_t fallback = read_one_token("1.5");
+    assert((fallback & TAG_MASK) == TAG_INSTANCE,
+           "想定外の値ならC側のフォールバック(double)になり、読み取りは成功する");
+
+    /* 後続のテストに影響しないよう既定へ戻す */
+    os_set_dynamic(os_make_symbol("*READ-DEFAULT-FLOAT-FORMAT*"), os_make_symbol("<DOUBLE-FLOAT>"));
+}
+
 void test_os_read_float_literal_trailing_dot_is_read_error() {
     initialize_processes(g_buffers);
     process_t *proc = get_current_process();
@@ -897,9 +1009,20 @@ int main(int argc, char** argv) {
     test_os_read_float_literal_simple();
     test_os_read_float_literal_negative_with_exponent();
     test_os_read_float_literal_exponent_only();
+    test_os_read_single_float_marker_lowercase();
+    test_os_read_single_float_marker_uppercase();
+    test_os_read_double_float_marker_lowercase();
+    test_os_read_double_float_marker_uppercase();
+    test_os_read_single_float_without_decimal_point();
+    test_os_read_single_float_negative_exponent();
+    test_os_read_float_marker_without_exponent_is_symbol();
+    test_os_read_digit_then_marker_is_symbol();
+    test_os_read_marker_then_digit_is_symbol();
+    test_os_read_bare_exponent_marker_e_stays_read_error();
     test_os_read_float_literal_trailing_dot_is_read_error();
     test_os_read_float_literal_leading_dot_is_read_error();
     test_os_read_float_literal_bare_exponent_is_read_error();
+    test_os_read_default_float_format_switches_type();
     test_os_read_symbol();
     test_os_read_string();
     test_os_read_empty_list();
