@@ -232,6 +232,15 @@ extern lisp_val_t lisp_ll_transpile_fixture_generic_no_applicable_method(lisp_va
 extern lisp_val_t lisp_ll_transpile_fixture_call_next_method_no_next(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_make_instance(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_macro_gf(lisp_val_t evaluated_args, lisp_val_t env);
+/* c-2: float リテラルが AOT 経路を通ることの確認用。
+   **宣言を忘れると暗黙の int 宣言になり、戻り値の上位32bitが落ちる。**
+   タグ(下位4bit)だけは残るので「型は合っているのに値が0」という形で出る。 */
+extern lisp_val_t lisp_ll_transpile_fixture_single_float_literal(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_double_float_literal(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_bare_float_literal(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_single_float_arith(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_negative_float_literal(lisp_val_t evaluated_args, lisp_val_t env);
+extern lisp_val_t lisp_ll_transpile_fixture_exponent_float_literal(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_macro_gf_no_methods(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_register_macro_gf_methods(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_transpile_fixture_toynode_gf(lisp_val_t evaluated_args, lisp_val_t env);
@@ -943,6 +952,47 @@ static void test_transpile_fixture_make_instance(void) {
            "make-instance: %generic-call経由で呼ばれたinitialize-objectがinitargsの値をスロットへ書き込む");
 }
 
+/* --- c-2: float リテラルの AOT 経路 -------------------------------------
+   transpile-expr に floatp の分岐が無く、float リテラルを含むファイルは
+   AOT 化そのものが失敗していた(documents/float-math-contagion.md §4-3)。
+   src/lisp の AOT 対象に float リテラルが1つも無かったので踏まれていなかった。
+   **この経路が生きていることは、既定を <single-float> へ戻す判断(§8)の前提になる。** */
+static void test_transpile_fixture_float_literals(void) {
+    lisp_val_t sf = lisp_ll_transpile_fixture_single_float_literal(nil, 0);
+    assert(os_is_single_float(sf), "AOT: 1.5f0 は single-float の即値になる");
+    assert(os_single_float_value(sf) == 1.5f, "AOT: 1.5f0 の値が保たれる");
+
+    lisp_val_t df = lisp_ll_transpile_fixture_double_float_literal(nil, 0);
+    assert(!os_is_single_float(df) && primitive_floatp1(df) == g_sym_t,
+           "AOT: 1.5d0 は double-float になる");
+    assert(os_float_value(df) == 1.5, "AOT: 1.5d0 の値が保たれる");
+
+    /* ホストCLの既定は single-float、isiki-os の既定は double-float。
+       read-all-forms が束縛を合わせていないとここが single になって静かにずれる */
+    lisp_val_t bare = lisp_ll_transpile_fixture_bare_float_literal(nil, 0);
+    assert(!os_is_single_float(bare) && primitive_floatp1(bare) == g_sym_t,
+           "AOT: 接尾辞なしの 1.5 は double-float(ホストCLの既定 single に引きずられない)");
+    assert(os_float_value(bare) == 1.5, "AOT: 1.5 の値が保たれる");
+
+    /* 負の値と指数付き。10進の往復でビットパターンが変わっていないこと */
+    lisp_val_t neg = lisp_ll_transpile_fixture_negative_float_literal(nil, 0);
+    assert(os_is_single_float(neg) && os_single_float_value(neg) == -0.25f,
+           "AOT: 負の single-float リテラル -0.25f0");
+    lisp_val_t big = lisp_ll_transpile_fixture_exponent_float_literal(nil, 0);
+    assert(os_is_single_float(big) && os_single_float_value(big) == 1.5e10f,
+           "AOT: 指数付きの single-float リテラル 1.5f10");
+
+    /* c-1 の型昇格と組み合わせて、AOT コード中でも single が保たれること */
+    lisp_val_t sum = lisp_ll_transpile_fixture_single_float_arith(
+        os_make_cons(os_make_single_float(1.0f), nil), 0);
+    assert(os_is_single_float(sum), "AOT: single リテラルとの加算結果も single");
+    assert(os_single_float_value(sum) == 2.5f, "AOT: 1.0f + 1.5f = 2.5f");
+
+    lisp_val_t sum_int = lisp_ll_transpile_fixture_single_float_arith(
+        os_make_cons(os_make_fixnum(1), nil), 0);
+    assert(os_is_single_float(sum_int), "AOT: 整数 + single リテラルも single");
+}
+
 static void test_transpile_fixture_macro_gf(void) {
     /* M1([ファイルI/O]#44): defgeneric/defmethodのマクロ展開の検証。
        %register-method/%generic-call自体の正しさはM12 Phase5のテスト
@@ -1582,6 +1632,7 @@ int main(void) {
     test_transpile_fixture_generic_no_applicable_method();
     test_transpile_fixture_call_next_method_no_next();
     test_transpile_fixture_make_instance();
+    test_transpile_fixture_float_literals();
     test_transpile_fixture_macro_gf();
     test_transpile_fixture_macro_gf_no_methods();
     test_transpile_fixture_toynode_dispatch();

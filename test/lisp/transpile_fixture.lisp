@@ -894,3 +894,34 @@
       (while (< i n)
         (progn (setq last (cons pair i)) (setq i (+ i 1))))
       (car (car last)))))
+
+;; c-2: float リテラルが AOT 経路を通ることの確認
+;; (documents/float-math-contagion.md §4-3)。
+;;
+;; **この経路は c-2 まで一度も踏まれていなかった。** transpile-expr に floatp の
+;; 分岐が無く、float リテラルを含むファイルは「未対応の式です」で AOT 化そのものが
+;; 失敗していた。src/lisp の AOT 対象に float リテラルが1つも無かったので
+;; 表に出ていなかっただけである。
+;;
+;; 接尾辞なしの 1.5 は **double** になること(ホストCLの既定は single なので、
+;; read-all-forms が *read-default-float-format* を double へ束縛している)も
+;; ここで固定する。
+(defun %%transpile-fixture-single-float-literal ()
+  1.5f0)
+
+(defun %%transpile-fixture-double-float-literal ()
+  1.5d0)
+
+(defun %%transpile-fixture-bare-float-literal ()
+  1.5)
+
+;; リテラルが演算を通っても型が保たれること(c-1 の型昇格と組み合わせた確認)
+(defun %%transpile-fixture-single-float-arith (x)
+  (+ x 1.5f0))
+
+;; 負の float リテラルと指数付き
+(defun %%transpile-fixture-negative-float-literal ()
+  -0.25f0)
+
+(defun %%transpile-fixture-exponent-float-literal ()
+  1.5f10)

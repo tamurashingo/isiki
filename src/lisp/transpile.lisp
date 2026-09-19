@@ -357,6 +357,24 @@
              (write-char ch out))
     (write-char #\" out)))
 
+(defun c-float-literal (x)
+  "CL の float を、同じビットパターンになる C の式へ変換する。
+
+   **10進の往復で正確さを保つ。** CL のプリンタは「読み直すと同じ値になる
+   最短の10進表記」を出し、C コンパイラは10進リテラルを正しく丸めるので、
+   両者を通してもビットパターンは変わらない。
+   *read-default-float-format* をその値自身の型へ束縛して印字することで、
+   指数マーカー(1.5d0 の d0 等)が付かない素の10進表記が得られる。
+
+   single-float はタグ0x4の即値(os_make_single_float)、
+   double-float はヒープ上の MAGIC_FLOAT(os_make_float)で、生成する式が違う。"
+  (let* ((single-p (typep x 'single-float))
+         (*read-default-float-format* (if single-p 'single-float 'double-float))
+         (text (prin1-to-string x)))
+    (if single-p
+        (format nil "os_make_single_float(~Af)" text)
+        (format nil "os_make_float(~A)" text))))
+
 (defun c-char-literal (ch)
   "CommonLisp文字からCのchar literal(シングルクオート込み)を作る。\\と'の
    みエスケープする(M15: fat16.lisp/fat32.lisp/file-cmd.lispが使うのは
@@ -995,6 +1013,13 @@
      ;; リーダは既にTAG_CHARの値へパース済み(reader.c)なので、os_make_charで
      ;; そのままタグ付けするだけでよい
      (format nil "os_make_char(~A)" (c-char-literal expr)))
+    ((floatp expr)
+     ;; c-2: floatリテラル。**ここが無いと下の(t (error ...))へ落ちて、
+     ;; float リテラルを含むファイルはAOT化そのものが失敗する。**
+     ;; 現状 src/lisp のAOT対象にfloatリテラルは1つも無いので踏まれていなかった
+     ;; (documents/float-math-contagion.md §4-3)。
+     ;; single は即値、double はヒープなので生成するCの関数が違う。
+     (c-float-literal expr))
     ((and (symbolp expr) (assoc expr scope))
      (let ((binding (cdr (assoc expr scope))))
        (if (cdr binding)
@@ -2151,10 +2176,16 @@
           (format nil "~{~A~%~}~A" (reverse *lifted-lambda-decls*) fn-text))))))
 
 (defun read-all-forms (path)
-  (with-open-file (in path)
-    (loop for form = (read in nil :eof)
-          until (eq form :eof)
-          collect form)))
+  ;; **ホストCLの *read-default-float-format* を isiki-os の既定に合わせる。**
+  ;; CL の既定は single-float、isiki-os の既定は double-float(init.lisp、
+  ;; documents/single-float.md §2-3a)なので、揃えないと接尾辞なしの `1.5` が
+  ;; 「AOTでは single、インタプリタでは double」になって静かに食い違う。
+  ;; 接尾辞付き(1.5f0 / 1.5d0)はどちらの側でも同じ型に読まれるので影響しない。
+  (let ((*read-default-float-format* 'double-float))
+    (with-open-file (in path)
+      (loop for form = (read in nil :eof)
+            until (eq form :eof)
+            collect form))))
 
 (defun toplevel-defun-p (form)
   (and (consp form) (eq (car form) 'defun)))
