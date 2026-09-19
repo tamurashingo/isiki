@@ -2129,6 +2129,23 @@ static inline int os_is_single_float(lisp_val_t val) {
 lisp_val_t primitive_single_float_p(lisp_val_t args, lisp_val_t env);
 
 /**
+ * 組み込み関数%%NARROW-TO-SINGLE-FLOAT。数値をsingle-floatへ**狭める**。
+ *
+ * 型昇格(c-1)は広いほうへ寄せるので、Lispだけでは狭められない
+ * ((* double 1.0f0) は double のまま、(float x) は float をそのまま返す)。
+ * convert の double → <single-float> にはこの経路が要る。
+ *
+ * 範囲外(singleで表せない大きさ)と数値でない入力は**nilを返す**。
+ * domain-errorの送出は呼び出し側(%convert)に任せる。
+ * NaN・±無限大はsingleでも表現できるのでそのまま通す。
+ * FLT_MINより小さい値は0へ丸まるが、これは正しく丸めた結果なのでエラーにしない。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatへ丸めた値。数値でない、または範囲外ならnil
+ */
+lisp_val_t primitive_narrow_to_single_float(lisp_val_t args, lisp_val_t env);
+
+/**
  * primitive_single_float_pの非allocatingな核ロジック(za向け)。
  * @param val 判定対象
  * @return single-floatならg_sym_t、そうでなければnil
