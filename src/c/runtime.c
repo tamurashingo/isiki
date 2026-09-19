@@ -5071,17 +5071,62 @@ static int bignum_equal(const UINT64 *obj_a, const UINT64 *obj_b) {
     return 1;
 }
 
+/* ===== float の型昇格(float contagion) =================================
+ *
+ * 「より広い形式へ寄せる。整数は float に従う」。
+ * 値が大きいほど広い形式なので、**オペランドの kind の最大値がそのまま結果の型**に
+ * なる。整数は FLOAT_KIND_NONE なので何も要求せず、float 側の形式に合わせる。
+ *
+ *   fixnum/bignum × single → single
+ *   fixnum/bignum × double → double
+ *   single × single        → single
+ *   single × double        → double
+ *
+ * documents/float-contagion.md
+ */
+/** floatが1つも無い(= 整数だけ) */
+#define FLOAT_KIND_NONE   0
+/** 最も広いオペランドが single-float */
+#define FLOAT_KIND_SINGLE 1
+/** 最も広いオペランドが double-float */
+#define FLOAT_KIND_DOUBLE 2
+
+/** 値の float 種別を返す。整数(および数値でない値)は FLOAT_KIND_NONE */
+static int float_kind_of(lisp_val_t val) {
+    if (os_is_single_float(val)) {
+        return FLOAT_KIND_SINGLE;
+    }
+    if ((val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT) {
+        return FLOAT_KIND_DOUBLE;
+    }
+    return FLOAT_KIND_NONE;
+}
+
+/** 2つの kind のうち広いほう。**これが型昇格の規則そのもの** */
+static int float_kind_max(int a, int b) {
+    return a > b ? a : b;
+}
+
+/** doubleで持っている値を kind の形式へ丸める。
+ *  single のときだけ単精度へ落とす(NONE は整数だけなので丸めない)。 */
+static double float_round_to_kind(int kind, double value) {
+    return (kind == FLOAT_KIND_SINGLE) ? (double)(float)value : value;
+}
+
+/** doubleで計算した値を kind の Lisp 値にする。
+ *  **single はタグ0x4の即値なのでヒープを確保しない。** これが c-1 の性能上の眼目。 */
+static lisp_val_t os_make_float_of_kind(int kind, double value) {
+    return (kind == FLOAT_KIND_SINGLE) ? os_make_single_float((float)value)
+                                       : os_make_float(value);
+}
+
 /** valがfloat(single/doubleのどちらか)かどうかを判定する。
  *
  * **single-floatもここで真になる。** 算術・比較・floatpはすべてこの述語を
  * 通るので、ここ1箇所でsingleを受け入れれば「single-floatは数として普通に
- * 使える」が成り立つ。演算結果の型昇格(single×single→single)は別作業なので、
- * 結果は従来どおりdoubleになる。 */
+ * 使える」が成り立つ。 */
 static int is_float(lisp_val_t val) {
-    if (os_is_single_float(val)) {
-        return 1;
-    }
-    return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT;
+    return float_kind_of(val) != FLOAT_KIND_NONE;
 }
 
 /** valがbignum(MAGIC_BIGNUMのINSTANCE)かどうかを判定する */
@@ -5131,17 +5176,18 @@ double bignum_to_double(lisp_val_t val) {
 }
 
 /**
- * argsの中にfloat(MAGIC_FLOATのINSTANCE)が1つでも含まれるかどうかを判定する。
- * 四則演算プリミティブが整数専用の高速/一般パスとfloatパスのどちらを使うかを
- * 振り分けるために使う。
+ * argsの中で最も広いfloat種別を返す。floatが1つも無ければ FLOAT_KIND_NONE。
+ *
+ * 四則演算プリミティブが「整数専用の高速/一般パスとfloatパスのどちらを使うか」と
+ * 「floatパスの結果の型」を同時に決めるために使う。
+ * **戻り値がそのまま結果の型**になる(型昇格の規則 = kind の最大値)。
  */
-static int any_float(lisp_val_t args) {
+static int args_float_kind(lisp_val_t args) {
+    int kind = FLOAT_KIND_NONE;
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        if (is_float(cc_car(cur))) {
-            return 1;
-        }
+        kind = float_kind_max(kind, float_kind_of(cc_car(cur)));
     }
-    return 0;
+    return kind;
 }
 
 /**
@@ -5501,7 +5547,8 @@ static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
 
 /**
  * 組み込み関数+。argsの全数値(FIXNUM/bignum/float、負数も可)を合計する。
- * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して合計する。
+ * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (整数×single→single、single×double→double。documents/float-contagion.md)。
  * それ以外で全オペランドがFIXNUM(**符号は問わない**)かつ途中経過が60bitに
  * 収まる場合はヒープ確保なしの高速パスを使い、それ以外(bignumが絡む、
  * 桁あふれする)は符号付きマグニチュードによる一般パスにフォールバックする。
@@ -5511,12 +5558,20 @@ static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    if (any_float(args)) {
+    /* [型昇格] 結果の型は全オペランドの最も広い形式(args_float_kind)。
+       計算はdoubleで行い、**そこまでに見た形式へ毎回丸める**。こうすると
+       (+ a b c) と (+ (+ a b) c) が一致する(左畳み込みと同じ結果になる)。
+       丸めを最後の1回だけにすると精度は上がるが、n引数版と2引数版の合成で
+       答えが食い違うので採らない。 */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
         double sum = 0.0;
+        int kind = FLOAT_KIND_NONE;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-            sum += to_double(cc_car(cur));
+            lisp_val_t v = cc_car(cur);
+            kind = float_kind_max(kind, float_kind_of(v));
+            sum = float_round_to_kind(kind, sum + to_double(v));
         }
-        return os_make_float(sum);
+        return os_make_float_of_kind(kind, sum);
     }
 
     /* [改善A] 途中経過(sum_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない。
@@ -5596,6 +5651,14 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
     if (fixnum_add_signed(a, b, &sum)) {
         return sum;
     }
+    /* [型昇格] floatが絡むならconsを作らずここで計算する。
+       **singleどうしなら結果も即値なので、この経路はヒープを一切確保しない。**
+       consを2個作ってprimitive_addへ委譲していた頃は、型が正しくても
+       確保が残っていた(改善Aで見つけた「32byte/回」の正体と同じ構図)。 */
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        return os_make_float_of_kind(kind, to_double(a) + to_double(b));
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -5620,6 +5683,11 @@ lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
     if ((b & TAG_MASK) == TAG_FIXNUM && fixnum_add_signed(a, fixnum_negate(b), &diff)) {
         return diff;
     }
+    /* [型昇格] add2と同じ。singleどうしならヒープ確保ゼロ */
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        return os_make_float_of_kind(kind, to_double(a) - to_double(b));
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -5628,7 +5696,8 @@ lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
 
 /**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として
- * 符号を反転する。floatが1つでも含まれる場合は全オペランドをdoubleへ変換して減算する。
+ * 符号を反転する。floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (単項マイナスは第一引数の型をそのまま保つ。documents/float-contagion.md)。
  * それ以外で全オペランドがFIXNUM(**符号は問わない**)かつ途中経過が60bitに収まる
  * 場合はヒープ確保なしの高速パスを使い、それ以外は符号付きマグニチュードによる
  * 一般パスにフォールバックする。
@@ -5640,15 +5709,19 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t first = cc_car(args);
 
-    if (any_float(args)) {
+    /* [型昇格] +と同じ規則。単項マイナスは第一引数の型をそのまま保つ */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
+        int kind = float_kind_of(first);
         double result = to_double(first);
         if (cc_cdr(args) == nil) {
-            return os_make_float(-result);
+            return os_make_float_of_kind(kind, -result);
         }
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
-            result -= to_double(cc_car(rest));
+            lisp_val_t v = cc_car(rest);
+            kind = float_kind_max(kind, float_kind_of(v));
+            result = float_round_to_kind(kind, result - to_double(v));
         }
-        return os_make_float(result);
+        return os_make_float_of_kind(kind, result);
     }
 
     if (cc_cdr(args) == nil) {
@@ -5784,7 +5857,8 @@ lisp_val_t primitive_null1(lisp_val_t a) {
 
 /**
  * 組み込み関数*。argsの全数値(FIXNUM/bignum/float、負数も可)を乗算する。
- * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して乗算する。
+ * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (documents/float-contagion.md)。
  * それ以外で全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの高速パスを使い、
  * それ以外は符号付きマグニチュードによる一般パス(素朴なO(n*m)乗算)にフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
@@ -5793,12 +5867,16 @@ lisp_val_t primitive_null1(lisp_val_t a) {
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    if (any_float(args)) {
+    /* [型昇格] +と同じ規則 */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
         double product = 1.0;
+        int kind = FLOAT_KIND_NONE;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-            product *= to_double(cc_car(cur));
+            lisp_val_t v = cc_car(cur);
+            kind = float_kind_max(kind, float_kind_of(v));
+            product = float_round_to_kind(kind, product * to_double(v));
         }
-        return os_make_float(product);
+        return os_make_float_of_kind(kind, product);
     }
 
     int fast = 1;
@@ -5866,6 +5944,11 @@ lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
             return os_make_fixnum(mag_a * mag_b);
         }
     }
+    /* [型昇格] add2と同じ。singleどうしならヒープ確保ゼロ */
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        return os_make_float_of_kind(kind, to_double(a) * to_double(b));
+    }
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
@@ -5874,7 +5957,8 @@ lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
 
 /**
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
- * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して除算する
+ * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (documents/float-contagion.md)
  * (0除算はIEEE754の挙動どおり+inf/-inf/nanを返す。domain-error未実装のための簡略化)。
  * それ以外で全オペランドが非負FIXNUMの場合はヒープ確保なしの高速パスを使い、それ以外
  * (負数・bignumが絡む)は符号付きマグニチュードによる一般パス(1bitずつのシフト&サブトラクトに
@@ -5887,12 +5971,16 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t first = cc_car(args);
 
-    if (any_float(args)) {
+    /* [型昇格] +と同じ規則。0除算はIEEE754どおり inf/nan を返す(従来どおり) */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
+        int kind = float_kind_of(first);
         double result = to_double(first);
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
-            result /= to_double(cc_car(rest));
+            lisp_val_t v = cc_car(rest);
+            kind = float_kind_max(kind, float_kind_of(v));
+            result = float_round_to_kind(kind, result / to_double(v));
         }
-        return os_make_float(result);
+        return os_make_float_of_kind(kind, result);
     }
 
     int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
