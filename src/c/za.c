@@ -768,7 +768,8 @@ static int za_is_bignum_literal(lisp_val_t val) {
 }
 
 /**
- * is_literal: 0=paramsのidx番目を参照、1=fixnum即値(literalをそのままmovabs)、
+ * is_literal: 0=paramsのidx番目を参照、1=即値(fixnum/char/single-float。
+ *             literalをそのままmovabs)、
  * 2=quoteシンボル(literalは現在のタグ付きシンボル値だが、GCで移動しうるため
  * emit時はmovabsで直接埋め込まず名前から再解決する。za_emit_operand参照)、
  * 3=&restパラメータそのものへの参照(param_indexはcdrする回数=fixed_countを保持する。
@@ -892,7 +893,11 @@ static int za_classify_quoted_value(lisp_val_t quoted, za_operand_t *out) {
         out->literal = quoted;
         return 1;
     }
-    if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM || (quoted & TAG_MASK) == TAG_CHAR) {
+    /* [float契約] single-floatもタグ0x4の即値なので、fixnum/charと同じく
+       movabsで直接埋め込める。GCが動かさないのでスロットもルート登録も要らない
+       (os_tag_is_heap_refが偽なので、defun末尾の焼き込み監査も通る) */
+    if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM ||
+        (quoted & TAG_MASK) == TAG_CHAR || (quoted & TAG_MASK) == TAG_SINGLE_FLOAT) {
         out->is_literal = 1;
         out->literal = quoted;
         return 1;
@@ -1150,6 +1155,17 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
     // (quoteされたcharケースは既に上のquote分岐(is_literal=1、nil/fixnum/charの
     // 即値判定)で対応済み)。
     if ((form & TAG_MASK) == TAG_CHAR) {
+        out->is_literal = 1;
+        out->literal = form;
+        return 1;
+    }
+    // [float契約] 裸のsingle-floatリテラル。charと同じ理由でmovabsに埋め込める。
+    // **ここが無いとza_classify_operandが0を返し、single-floatリテラルを含む
+    // defunがまるごとJITコンパイルを諦める。** そうなるとインタプリタ経路
+    // (引数ごとにconsを作る)を通るので、single即値化の意味が無くなる
+    // (実測: JITに乗らないと128 byte/回、乗ると0 byte/回)。
+    // doubleはTAG_INSTANCEでGCが動かすので、下のスロット方式のままにする。
+    if ((form & TAG_MASK) == TAG_SINGLE_FLOAT) {
         out->is_literal = 1;
         out->literal = form;
         return 1;
@@ -2557,7 +2573,7 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * 呼ばずに(副作用、特にis_literal==7の新規リテラルスロット登録を二重に踏まないため)
  * 判定する。za_emit_operandの各分岐を確認した結果、以下の3パターンだけがCALL命令を
  * 一切発行しない(movabs/レジスタ・スタックのMOVのみ):
- *   - is_literal==1相当(TAG_FIXNUM/TAG_CHARの裸リテラル): jit_movabs_raxのみ
+ *   - is_literal==1相当(TAG_FIXNUM/TAG_CHAR/TAG_SINGLE_FLOATの裸リテラル): jit_movabs_raxのみ
  *   - is_literal==4相当(let-IIFEでbox化されていないローカル変数): za_load_slotのみ
  *   - is_literal==0かつg_za_use_param_slots(ABI-M5のパラメータスロット方式が有効な
  *     関数での固定引数params参照): za_load_slotのみ
@@ -2571,7 +2587,9 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  */
 static int za_operand_is_safe_leaf(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                                     const za_local_scope_t *locals) {
-    if ((form & TAG_MASK) == TAG_FIXNUM || (form & TAG_MASK) == TAG_CHAR) {
+    /* [float契約] single-floatもmovabs1命令だけで済むのでleafに含める */
+    if ((form & TAG_MASK) == TAG_FIXNUM || (form & TAG_MASK) == TAG_CHAR ||
+        (form & TAG_MASK) == TAG_SINGLE_FLOAT) {
         return 1;
     }
     if ((form & TAG_MASK) == TAG_SYMBOL) {
