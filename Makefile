@@ -909,6 +909,14 @@ test-qemu-for-expansion:
 test-qemu-bench-construct-check:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_construct.lisp
 
+# [性能測定] float の型昇格(c-1)の効果。documents/float-contagion.md 6章。
+# single-float はタグ0x4の即値なので結果を包むヒープ確保が要らない。
+# double は MAGIC_FLOAT の instance なので1演算ごとに確保する。その差を測る。
+# 同一ブート内で single/double/mixed/fixnum を2往復し、bytes/call と ticks を
+# test-results.txt へ出す(確保量だけは回帰アサーションにしてある)
+test-qemu-float-contagion-bench:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_float_contagion_bench.lisp
+
 # 使い方: make test-qemu-instcount MILESTONE=test/lisp/qemu_boot_xxx.lisp
 # [QEMU_DISK_IMG=...]。既存のtest-qemu-milestoneと同じ引数を受け付ける
 test-qemu-instcount: $(INSTCOUNT_PLUGIN)

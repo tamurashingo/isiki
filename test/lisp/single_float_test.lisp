@@ -231,12 +231,16 @@
 (assert-equal t (= 1.5f0 (abs 1.5f0)))
 (assert-equal t (= 0.0f0 (abs -0.0f0)))
 
-;;; --- 10. 既知の中間状態: 演算の型昇格はまだ入っていない ---
-;;; single 同士の演算結果は **double** になる。(c) が入ったら single へ変わる。
-;;; ここを直すのは次の作業であり、このアサーションはそのとき更新する。
-(assert-equal '<double-float> (%%class-name (class-of (+ 1.5f0 1.5f0))))
-(assert-equal '<double-float> (%%class-name (class-of (* 2.0f0 2.0f0))))
+;;; --- 10. 演算の型昇格 (c-1、PR後続) ---
+;;; PR #79 の時点では single 同士の演算結果も double になっていた。
+;;; c-1(documents/float-contagion.md)で入力の型から結果の型を決めるようにしたので、
+;;; single 同士なら single が返る。詳しい組み合わせ表は
+;;; test/lisp/float_contagion_test.lisp にある。
+(assert-equal '<single-float> (%%class-name (class-of (+ 1.5f0 1.5f0))))
+(assert-equal '<single-float> (%%class-name (class-of (* 2.0f0 2.0f0))))
+(assert-equal '<double-float> (%%class-name (class-of (+ 1.5f0 1.5d0))))
 (assert-equal t (= 3.0d0 (+ 1.5f0 1.5f0)))
+(assert-equal t (= 3.0f0 (+ 1.5f0 1.5f0)))
 ;;; 比較は型をまたいでも値で行われる
 (assert-equal t (= 1.5f0 1.5d0))
 (assert-equal t (< 1.0f0 1.5d0))
