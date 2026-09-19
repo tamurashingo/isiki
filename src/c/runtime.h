@@ -2168,15 +2168,52 @@ lisp_val_t primitive_most_negative_double_float(lisp_val_t args, lisp_val_t env)
  *
  * 動的変数が未定義・unbound・想定外の値のときは**C側の既定値へフォールバックする**
  * (起動時に落ちないことのほうが優先)。フォールバック先は
- * READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE。
+ * DEFAULT_FLOAT_FORMAT_IS_SINGLE(init.lisp の初期値と同じ定数)。
  * @return single-floatなら非0、double-floatなら0
  */
 int os_read_default_float_format_is_single(void);
 
-/** os_read_default_float_format_is_single のフォールバック値。
- *  0 = double-float。**動的変数が読めない状況では従来どおりdoubleにする**
- *  (single-float導入前の挙動と一致させ、ブート初期の読み取りで意味が変わらないようにする) */
-#define READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE 0
+/**
+ * 組み込み関数%%DEFAULT-FLOAT-FORMAT。C側の既定 DEFAULT_FLOAT_FORMAT_IS_SINGLE を
+ * クラス名シンボル(<SINGLE-FLOAT> / <DOUBLE-FLOAT>)として返す。
+ *
+ * init.lisp の (defdynamic *read-default-float-format* ...) がこれを使う。
+ * **Lisp側にクラス名を直接書かないための経路**で、*most-positive-fixnum* が
+ * %%FIXNUM-MAGNITUDE-MASK を通しているのと同じ形である。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return <SINGLE-FLOAT> または <DOUBLE-FLOAT> のシンボル
+ */
+lisp_val_t primitive_default_float_format(lisp_val_t args, lisp_val_t env);
+
+/**
+ * [単一の真実源] *read-default-float-format* の既定。
+ * 0 = <double-float> / 1 = <single-float>。
+ *
+ * **この1箇所が「isiki-os の既定の float 形式」を決める。**
+ * 次の2つを兼ねる:
+ *   1. init.lisp の (defdynamic *read-default-float-format* (%%default-float-format))
+ *      が読む初期値
+ *   2. 動的変数が読めないとき(ブート最初期・unbound・想定外の値・Cのユニット
+ *      テスト)に os_read_default_float_format_is_single が倒れる先
+ *
+ * 以前はこの2つが別の定数だった。**別々にすると、片方だけ動かしたときに
+ * 「init.lisp を評価するまでとそれ以降で既定が違う」という状態が作れてしまう。**
+ * 同じ値でなければならないものは同じ定数にする。
+ *
+ * **既定を <double-float> にしている理由**(documents/float-default.md):
+ *   - single 既定だと 1.5 の有効桁が約7桁になり、素朴に書いた数値計算が
+ *     黙って精度を失う(PR #79 で実際に14件落ちた)
+ *   - single 即値化の価値は既定とは独立に成立している。性能が要る場所で
+ *     1.5f0 と書けば、ヒープ確保ゼロの利益はすでに得られる(PR #80 の実測)
+ *   - 明示的に f0 を書いた人は精度を落とすことを承知している。既定を変えるのは
+ *     「明示せずに速い経路へ乗れる」利便性のために全体の精度を下げることになる
+ *
+ * **transpile.lisp(ホストCL上で動くのでこの定数を読めない)だけは手で合わせる。**
+ * ずれを検出するため、AOT対象に裸のfloatリテラルのprobeを置いてある
+ * (src/lisp/init_aot.lisp の %aot-float-format-probe)。
+ */
+#define DEFAULT_FLOAT_FORMAT_IS_SINGLE 0
 
 /**
  * bignum(MAGIC_BIGNUMのINSTANCE)をdoubleへ変換する。limb配列を上位から
