@@ -130,6 +130,29 @@
 (assert-equal t (= 1.0d0 1.0d0 1.0d0))
 (assert-equal t (< 1.0d0 2.0d0 3.0d0))
 
+;;; --- /= が比較の専用経路に乗ったこと(PR #86) ---
+;;; primitive_num_not_equal2 の追加で、/= も < と同じく cons を作らず直接 call
+;;; されるようになった。**経路が変わったので、上の NaN の結果が JIT 経由でも
+;;; 同じであることを確かめる**(C 側の num_ne とインライン側を一致させる前提)。
+(defun nan-ne-jit (a b) (/= a b))
+(defun nan-eq-jit (a b) (= a b))
+(defun nan-lt-jit (a b) (< a b))
+(assert-equal t (%%za-compiled-p (function nan-ne-jit)))
+(assert-equal t (%%za-compiled-p (function nan-eq-jit)))
+;; JIT 経由でも NaN の規則は同じ
+(assert-equal t (nan-ne-jit *nan-d* *nan-d*))
+(assert-equal t (nan-ne-jit *nan-s* *nan-s*))
+(assert-equal t (nan-ne-jit *nan-d* 1.0d0))
+(assert-equal nil (nan-eq-jit *nan-d* *nan-d*))
+(assert-equal nil (nan-lt-jit *nan-d* 1.0d0))
+;; 通常の値も JIT 経由で一致
+(assert-equal nil (nan-ne-jit 1 1))
+(assert-equal t (nan-ne-jit 1 2))
+(assert-equal nil (nan-ne-jit 1.0d0 1.0f0))   ; 数値として等しい
+(assert-equal t (nan-ne-jit 0.1f0 0.1d0))     ; 数値として異なる(PR #80)
+(assert-equal t (nan-ne-jit *inf-d* *ninf-d*))
+(assert-equal nil (nan-ne-jit *inf-d* *inf-d*))
+
 ;;; --- max / min は順序依存になった(§4-3、直さない。記録のみ) ---
 ;;; num_gt / num_lt が非順序で偽を返すため、**NaN は最良値を更新できない**。
 ;;; 結果として **引数の順序で答えが変わる**。
