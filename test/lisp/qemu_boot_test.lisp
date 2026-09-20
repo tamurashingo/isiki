@@ -45,6 +45,7 @@
 (load "test/lisp/float_contagion_test.lisp")
 (load "test/lisp/float_math_contagion_test.lisp")
 (load "test/lisp/convert_float_test.lisp")
+(load "test/lisp/float_default_test.lisp")
 (load "test/lisp/disassemble_test.lisp")
 
 (isiki-test-report)

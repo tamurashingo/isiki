@@ -947,17 +947,18 @@
 ;;; 共有される**(documents/type-system-survey.md §4)。あるプロセスで
 ;;; setqすると別のプロセスの読み取り・印字も変わる。現状の仕組みのままとする。
 ;;;
-;;; **初期値は <double-float>。** CommonLisp の既定(single-float)とは違う。
-;;; 演算の型昇格(single × single → single)がまだ入っていないため、
-;;; <single-float> を既定にすると「リテラルは single、計算結果は double」という
-;;; 食い違いが全体に出る。equal はタグ一致を要求するので
-;;; (assert-equal 15.0 (+ 12 3.0)) の類が軒並み落ちる。
-;;; さらに (sqrt 2) のような整数→float変換が double を返す以上、
-;;; (%approx= 1.4142135623730951 (sqrt 2)) は型昇格が入っても成り立たない
-;;; (リテラル側が単精度に丸められ、許容誤差 1e-9 を超える)。
-;;; **既定を <single-float> へ倒すのは、演算の型昇格と整数→float変換の型を
-;;; 決めてからにする。** 詳細と実測は documents/single-float.md。
-(defdynamic *read-default-float-format* '<double-float>)
+;;; **初期値は必ずC側の DEFAULT_FLOAT_FORMAT_IS_SINGLE(runtime.h)から導く。**
+;;; Lisp側に <double-float> と直接書かないこと。同じ既定を決めている場所が
+;;; 増えると、片方だけ動かしたときに静かにずれる
+;;; (documents/float-default.md)。
+;;;
+;;; **既定は <double-float>。CommonLisp の既定(single-float)とは違う。**
+;;; single 既定だと 1.5 の有効桁が約7桁になり、素朴に書いた数値計算が黙って
+;;; 精度を失う。single 即値化の価値は既定とは独立に成立していて、性能が要る
+;;; 場所で 1.5f0 と書けばヒープ確保ゼロの利益はすでに得られる。
+;;; 明示的に f0 を書いた人は精度を落とすことを承知している。
+;;; 判断の経緯は documents/float-default.md。
+(defdynamic *read-default-float-format* (%%default-float-format))
 
 ;;; --- number class (§19) float の境界 ---
 ;;; 値は必ずC側(runtime.h の SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS)から
