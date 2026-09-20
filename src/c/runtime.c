@@ -3327,6 +3327,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%FIXNUM-MAGNITUDE-MASK"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnum_magnitude_mask), global_environment);
         os_set_function(os_make_symbol("%%SINGLE-FLOAT-P"), os_make_native_function((lisp_addr_t)(void *)primitive_single_float_p), global_environment);
         os_set_function(os_make_symbol("%%NARROW-TO-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_narrow_to_single_float), global_environment);
+        os_set_function(os_make_symbol("%%DEFAULT-FLOAT-FORMAT"), os_make_native_function((lisp_addr_t)(void *)primitive_default_float_format), global_environment);
         os_set_function(os_make_symbol("%%MOST-POSITIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_single_float), global_environment);
         os_set_function(os_make_symbol("%%MOST-NEGATIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_negative_single_float), global_environment);
         os_set_function(os_make_symbol("%%MOST-POSITIVE-DOUBLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_double_float), global_environment);
@@ -7370,18 +7371,30 @@ static lisp_val_t find_interned_symbol(const char *name) {
     return (found >= 0) ? g_symbol_table[found] : nil;
 }
 
+/**
+ * 組み込み関数%%DEFAULT-FLOAT-FORMAT。C側の既定をクラス名シンボルとして返す。
+ * init.lisp の defdynamic がこれを使う(Lisp側にクラス名を直接書かないため)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return <SINGLE-FLOAT> または <DOUBLE-FLOAT> のシンボル
+ */
+lisp_val_t primitive_default_float_format(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_symbol(DEFAULT_FLOAT_FORMAT_IS_SINGLE ? "<SINGLE-FLOAT>" : "<DOUBLE-FLOAT>");
+}
+
 int os_read_default_float_format_is_single(void) {
     /* 動的変数がまだ1つも無い間(ブート最初期)は引くまでもない */
     if (g_dynamic_bindings == nil) {
-        return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;
+        return DEFAULT_FLOAT_FORMAT_IS_SINGLE;
     }
     lisp_val_t name = find_interned_symbol("*READ-DEFAULT-FLOAT-FORMAT*");
     if (name == nil) {
-        return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;   /* まだinternされていない */
+        return DEFAULT_FLOAT_FORMAT_IS_SINGLE;   /* まだinternされていない */
     }
     lisp_val_t value = os_get_dynamic(name);
     if (value == nil) {
-        return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;   /* 未定義 */
+        return DEFAULT_FLOAT_FORMAT_IS_SINGLE;   /* 未定義 */
     }
     /* 比較相手もinterned symbolのはず。未登録なら nil になり、value(非nil)とは
        一致しないので自然にフォールバックへ落ちる */
@@ -7392,7 +7405,7 @@ int os_read_default_float_format_is_single(void) {
         return 0;
     }
     /* 想定外の値。エラーにはせず既定へ倒す(リーダもプリンタも落ちてはいけない) */
-    return READ_DEFAULT_FLOAT_FORMAT_FALLBACK_IS_SINGLE;
+    return DEFAULT_FLOAT_FORMAT_IS_SINGLE;
 }
 
 /**
