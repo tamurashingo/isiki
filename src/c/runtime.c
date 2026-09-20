@@ -6457,6 +6457,25 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_num_not_equalを2引数固定で呼ぶためのラッパー。primitive_num_equal2と
+ * 同じ理由でnum_ne(=number_compare4)へ直接委譲する(consを一切構築しない)。
+ *
+ * **比較演算子で二項版が欠けていたのは/=だけだった**ため、za_compile_binaryの
+ * 専用経路に乗れず、n項版への一般呼び出しに落ちていた(引数のconsを2個作るので
+ * 1回あたり32byte確保し、生成コードも2倍。documents/binary-not-equal.md)。
+ *
+ * **num_neを使うこと。** /=は非順序(NaN)で**真**を返す唯一の比較である
+ * (documents/nan-comparison.md §3-1)。`num_lt(a,b) || num_gt(a,b)`と書くと
+ * 非順序がどちらにも該当せず偽になり、IEEE 754に反する。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a≠b(非順序を含む)ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b) {
+    return num_ne(a, b) ? g_sym_t : nil;
+}
+
+/**
  * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)

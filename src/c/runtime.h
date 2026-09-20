@@ -2044,6 +2044,15 @@ lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b);
 lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_num_not_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。**非順序(NaN)では真を返す**(/=は IEEE 754 でそうなる唯一の比較)。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a≠b(非順序を含む)ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
