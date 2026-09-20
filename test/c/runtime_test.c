@@ -2621,6 +2621,63 @@ void test_heap_init_aligns_both_half_spaces() {
     free(raw);
 }
 
+
+/* [Phase 4a-2] os_scan_declarations が nil 終端で止まること。
+ *
+ * **このテストが無かったために無限ループを実機まで持ち込んだ。**
+ * nil は g_nil_cell | TAG_CONS、つまり TAG_CONS タグを持つ Lisp 値なので、
+ * `(v & TAG_MASK) == TAG_CONS` をリストの終端判定に使うと
+ * cc_cdr(nil) == nil が返り続けて抜けられない。
+ * JIT はユニットテストのビルドでは常に断念するが、declare の走査は
+ * eval_defun 側(= インタプリタ経路)なのでここで踏める。 */
+void test_scan_declarations_terminates_on_nil() {
+    lisp_val_t x = os_make_symbol("DT-X");
+    lisp_val_t y = os_make_symbol("DT-Y");
+    lisp_val_t var_syms[2];
+    var_syms[0] = x;
+    var_syms[1] = y;
+
+    /* (declare (type <fixnum> x y)) を1つ持つ body。
+       <fixnum> は *classes* が未初期化(init_aot.lisp 未ロード)なので
+       解決できず OS_DECL_TYPE_UNKNOWN になるが、**終端判定の確認には十分**で、
+       むしろ「未知の型名でもエラーにせず抜ける」(§3-3)も同時に確認できる。 */
+    lisp_val_t cls = os_make_symbol("<FIXNUM>");
+    lisp_val_t vars = os_make_cons(x, os_make_cons(y, nil));
+    lisp_val_t spec = os_make_cons(os_make_symbol("TYPE"), os_make_cons(cls, vars));
+    lisp_val_t decl = os_make_cons(os_make_symbol("DECLARE"), os_make_cons(spec, nil));
+    lisp_val_t rest_form = os_make_cons(os_make_symbol("DT-BODY"), nil);
+    lisp_val_t body = os_make_cons(decl, os_make_cons(rest_form, nil));
+
+    os_decl_types_t types;
+    lisp_val_t after = os_scan_declarations(body, var_syms, 2, &types);
+
+    assert(after != nil, "declareを1つ剥がしても残りのbodyがある");
+    assert(cc_car(after) == rest_form, "剥がした後の先頭は declare の次のフォーム");
+    assert(cc_cdr(after) == nil, "bodyはそれで終わり");
+    assert(os_decl_types_get(types, 0) != OS_DECL_TYPE_NONE, "1つめの変数に符号が付く");
+    assert(os_decl_types_get(types, 1) != OS_DECL_TYPE_NONE, "2つめの変数にも符号が付く");
+
+    /* declare しか無い body は、剥がすと nil になる(ここも終端で止まること) */
+    lisp_val_t only = os_make_cons(decl, nil);
+    os_decl_types_t t2;
+    assert(os_scan_declarations(only, var_syms, 2, &t2) == nil,
+           "declareだけのbodyは剥がすとnilになる");
+
+    /* body が nil でも即座に戻ること */
+    os_decl_types_t t3;
+    assert(os_scan_declarations(nil, var_syms, 2, &t3) == nil, "nilのbodyはnilのまま戻る");
+    assert(os_decl_types_get(t3, 0) == OS_DECL_TYPE_NONE, "宣言が無ければ符号も付かない");
+
+    /* 宣言指定子が空の declare、変数の無い type: どちらも抜けること */
+    lisp_val_t empty_decl = os_make_cons(os_make_symbol("DECLARE"), nil);
+    lisp_val_t novars = os_make_cons(os_make_symbol("TYPE"), os_make_cons(cls, nil));
+    lisp_val_t decl2 = os_make_cons(os_make_symbol("DECLARE"), os_make_cons(novars, nil));
+    lisp_val_t body2 = os_make_cons(empty_decl, os_make_cons(decl2, os_make_cons(rest_form, nil)));
+    os_decl_types_t t4;
+    assert(os_scan_declarations(body2, var_syms, 2, &t4) == cc_cdr(cc_cdr(body2)),
+           "空のdeclareと変数無しのtypeも読み飛ばせる");
+}
+
 int main(int argc, char** argv) {
    (void)argc;
    (void)argv;
@@ -2742,6 +2799,7 @@ int main(int argc, char** argv) {
    test_gc_string_with_forward_tag_colliding_length_is_not_misdetected();
    test_gc_instance_survives();
    test_gc_circular_cons_list_does_not_hang();
+   test_scan_declarations_terminates_on_nil();
    test_gc_reclaims_unreferenced_garbage();
 
    test_gc_fires_during_bignum_addition_and_result_is_correct();

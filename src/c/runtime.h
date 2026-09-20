@@ -564,10 +564,14 @@ extern lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 extern lisp_val_t g_sym_flet;
 extern lisp_val_t g_sym_declaim;
+/** declare特殊形式を表すシンボル(Phase 4a-2。宣言は評価時にはno-opでnilを返す) */
+extern lisp_val_t g_sym_declare;
 extern lisp_val_t g_sym_null;
 extern lisp_val_t g_sym_eq;
 extern lisp_val_t g_sym_inline;
 extern lisp_val_t g_sym_notinline;
+/** declareの宣言指定子 (type <class> v...) のtypeを表すシンボル(Phase 4a-2) */
+extern lisp_val_t g_sym_type;
 extern lisp_val_t g_sym_optimize;
 extern lisp_val_t g_sym_speed;
 extern lisp_val_t g_sym_safety;
@@ -1507,6 +1511,108 @@ void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr)
  */
 void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp_val_t *slot_addr));
 
+/* ===== declare による型宣言(Phase 4a-2) ==============================
+ *
+ * `(declare (type <fixnum> x y))` で宣言された型を記録するための表現。
+ *
+ * [なぜクラスオブジェクトやシンボルを持たないか]
+ * 記録先は za_fn_meta_t(Immobilized Space)と za_local_scope_t(Cスタック上の
+ * コンパイル時構造)で、どちらも **GCのルート走査の対象外** である。
+ * クラスオブジェクトもシンボルもGCで動く(gc_copy_valueがTAG_SYMBOL/TAG_INSTANCEを
+ * 追いかける)ため、生の lisp_val_t を置くと最初のGCでstaleになる。
+ * そこで「解決済みクラスの**正準名**に対応する小さな整数」へ畳んでから持つ。
+ * 型情報がGCと無関係になるので、ルート登録も保護も要らない。
+ *
+ * [別名(<short-float> / <long-float>)の扱い]
+ * 符号化は **利用者が書いた名前ではなく、解決したクラスオブジェクトの正準名**
+ * を見る。<short-float> は <single-float> と同一のクラスオブジェクトに登録されて
+ * いる(init_aot.lisp)ので、正準名は <SINGLE-FLOAT> になり、別名は自動的に
+ * 同じ符号になる。%convert が利用者の書いた名前をcaseで突き合わせていたために
+ * 別名が効かなかった件(documents/float-default.md §4-2)と同じ轍を踏まないための
+ * 設計である。
+ */
+
+/** 宣言が無い(または宣言指定子として読めなかった) */
+#define OS_DECL_TYPE_NONE        0
+/** 実在するクラスだが、本実装が符号を持たない(ユーザ定義クラス等) */
+#define OS_DECL_TYPE_OTHER     254
+/** クラスとして解決できなかった(§3-3: エラーにせず無視する) */
+#define OS_DECL_TYPE_UNKNOWN   255
+
+/** 1つの関数/letで型を記録できる変数の個数。ZA_MAX_PARAMS(=16)と
+    ZA_MAX_LOCALS_PER_LET(=4)のどちらも覆う */
+#define OS_DECL_TYPES_MAX_VARS  16
+
+/**
+ * 変数位置ごとの型符号(1個1byte)を詰めた値。16変数×8bit = 128bit = UINT64 2個。
+ * lisp_val_tを1つも含まないのでGCと無関係であり、値渡しで持ち回れる。
+ */
+typedef struct {
+    UINT64 w[2];
+} os_decl_types_t;
+
+/** すべて OS_DECL_TYPE_NONE の os_decl_types_t */
+static inline os_decl_types_t os_decl_types_empty(void) {
+    os_decl_types_t t;
+    t.w[0] = 0;
+    t.w[1] = 0;
+    return t;
+}
+
+/** 変数位置iの型符号を読む(範囲外は OS_DECL_TYPE_NONE) */
+static inline UINT8 os_decl_types_get(os_decl_types_t t, UINT64 i) {
+    if (i >= OS_DECL_TYPES_MAX_VARS) {
+        return OS_DECL_TYPE_NONE;
+    }
+    return (UINT8)((t.w[i >> 3] >> ((i & 7) * 8)) & 0xFF);
+}
+
+/** 変数位置iへ型符号を書く(範囲外は無視) */
+static inline void os_decl_types_set(os_decl_types_t *t, UINT64 i, UINT8 code) {
+    if (i >= OS_DECL_TYPES_MAX_VARS) {
+        return;
+    }
+    UINT64 shift = (i & 7) * 8;
+    t->w[i >> 3] = (t->w[i >> 3] & ~(0xFFULL << shift)) | ((UINT64)code << shift);
+}
+
+/** 1つでも宣言が入っているか */
+static inline int os_decl_types_any(os_decl_types_t t) {
+    return (t.w[0] != 0 || t.w[1] != 0);
+}
+
+/**
+ * クラス名シンボルを型符号へ変換する。**%find-classと同じ *classes* を引く**
+ * (別の名前解決表を作らない)。確保を一切行わないため、コンパイル中に呼んでも
+ * GCが走らない。
+ * @param class_name_sym 利用者が (declare (type X v)) に書いた X
+ * @return 型符号。解決できなければ OS_DECL_TYPE_UNKNOWN、
+ *         実在するが符号を持たないクラスなら OS_DECL_TYPE_OTHER
+ */
+UINT8 os_decl_type_code_of(lisp_val_t class_name_sym);
+
+/**
+ * 型符号を表示用のシンボルへ戻す(%%DECLARED-TYPES-OF が使う)。
+ * @param code 型符号
+ * @return 正準クラス名のシンボル。NONEはnil、OTHERは<OTHER>、UNKNOWNは<UNKNOWN>
+ */
+lisp_val_t os_decl_type_name(UINT8 code);
+
+/**
+ * (declare ...) が先頭に連続しているぶんだけbodyを読み飛ばし、宣言から
+ * var_symsの各位置に対応する型符号を組み立てる。確保は行わない。
+ * @param body 走査対象のbody(フォームのリスト)
+ * @param var_syms 型を対応づける変数シンボルの配列
+ * @param var_count var_symsの要素数(OS_DECL_TYPES_MAX_VARS以下)
+ * @param out_types 組み立てた型符号(呼び出し前の内容は破棄される)
+ * @return 先頭のdeclareを取り除いた残りのbody
+ */
+lisp_val_t os_scan_declarations(lisp_val_t body, const lisp_val_t *var_syms, UINT64 var_count,
+                                os_decl_types_t *out_types);
+
+/** 関数オブジェクトのmetaへ、宣言された型を記録する */
+void os_fn_set_declared_types(lisp_val_t fn, os_decl_types_t types);
+
 /**
  * ABI-M4: MAGIC_FUNCTION_NATIVEのword1が指すメタデータ(dual-entry設計の土台)。
  * Immobilized Space上に確保する生データ構造体で、フィールドはいずれもコード
@@ -1538,6 +1644,15 @@ typedef struct {
        5フィールド40byteはもともと16byte境界へ丸められて48byte確保されていたため、
        6フィールド目を足しても実消費は変わらない(documents/declaim-design.md)。 */
     UINT64 optimize;
+    /* offset 48/56: (declare (type ...)) で宣言された仮引数の型(Phase 4a-2)。
+       %%DECLARED-TYPES-OF が事後確認のために読む。os_decl_types_t と同じ
+       「16変数×8bitの符号」で、lisp_val_tを含まないのでGCは辿らない
+       (metaはImmobilized Space上でルート走査の対象外。os_decl_types_t参照)。
+       6フィールド48byteは16byte境界へ丸めるとちょうど48byteだが、
+       7フィールド目(56byte)も8フィールド目(64byte)も丸め後は同じ64byteになるため、
+       2ワード使っても実消費の増分は1ワードのときと変わらない
+       (documents/declare-types.md の測定)。 */
+    UINT64 declared_types[2];
 } za_fn_meta_t;
 
 /**

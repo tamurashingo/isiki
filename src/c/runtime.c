@@ -59,6 +59,8 @@ lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 lisp_val_t g_sym_flet;
 lisp_val_t g_sym_declaim;
+lisp_val_t g_sym_declare;
+lisp_val_t g_sym_type;
 lisp_val_t g_sym_null;
 lisp_val_t g_sym_eq;
 lisp_val_t g_sym_inline;
@@ -1712,6 +1714,61 @@ lisp_val_t primitive_optimize_of(lisp_val_t args, lisp_val_t env) {
     return optimize_to_list(((za_fn_meta_t *)obj[1])->optimize);
 }
 
+/** 組み込み関数%%DECLARED-TYPES-OF。(declare (type ...)) で宣言された仮引数の型を
+ * **仮引数の位置順のリスト**で返す(Phase 4a-2)。
+ *
+ *   (defun add-integer (x y) (declare (type <fixnum> x y)) (+ x y))
+ *   (%%declared-types-of 'add-integer)   ; => (<FIXNUM> <FIXNUM>)
+ *
+ * 宣言の無い位置はnil、実在するが符号を持たないクラスは<OTHER>、クラスとして
+ * 解決できなかった名前は<UNKNOWN>になる(§3-3「無視されたことが分かる」)。
+ * 末尾の連続するnil(宣言の無い引数)は落とす。
+ *
+ * **変数名ではなく位置で返す。** 記録先のza_fn_meta_tはImmobilized Space上で
+ * GCのルート走査の対象外のため、シンボルを置けない(os_decl_types_t参照)。
+ * 名前が要る場合は仮引数リストと突き合わせる。
+ *
+ * インタプリタ実行の関数(metaを持たない)はnil。%%OPTIMIZE-OF/%%INLINE-OFと同じで、
+ * **ユニットテストのビルドではJITが常に断念する**ため、この関数の確認は
+ * make test-qemu 側で行う。 */
+lisp_val_t primitive_declared_types_of(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_SYMBOL) {
+        val = os_get_function(val, env);
+    }
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE || obj[1] == 0) {
+        return nil;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    os_decl_types_t types;
+    types.w[0] = meta->declared_types[0];
+    types.w[1] = meta->declared_types[1];
+
+    UINT64 last = 0;
+    int any = 0;
+    for (UINT64 i = 0; i < OS_DECL_TYPES_MAX_VARS; i++) {
+        if (os_decl_types_get(types, i) != OS_DECL_TYPE_NONE) {
+            last = i;
+            any = 1;
+        }
+    }
+    if (!any) {
+        return nil;
+    }
+    /* 後ろから積む。os_make_consは確保するのでresultをGC_PROTECTしておく */
+    lisp_val_t result = nil;
+    GC_PROTECT(result);
+    for (INT64 i = (INT64)last; i >= 0; i--) {
+        lisp_val_t name = os_decl_type_name(os_decl_types_get(types, (UINT64)i));
+        result = os_make_cons(name, result);
+    }
+    return result;
+}
+
 static imm_slot_cursor_t g_fn_meta_cursor;
 /** 直近にImmobilized Spaceへ要求された確保サイズ(枯渇時の診断表示用) */
 static UINT64 g_imm_last_request_bytes = 0;
@@ -2241,6 +2298,14 @@ za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
        「逆アセンブルできる機械語を持たない」(組み込みprimitive/AOT)を意味する */
     meta->code_base = 0;
     meta->code_len = 0;
+    /* [Phase 4a-2] Immobilized Spaceは**ゼロ初期化されない**
+       (os_imm_page_allocはbumpかフリーリストから切り出すだけで、再利用ページには
+       前の内容が残っている)。ここで潰さないと、組み込みprimitiveのように
+       za_try_compile_defunを通らずmetaだけ持つ関数に対して
+       %%OPTIMIZE-OF / %%DECLARED-TYPES-OF が前の内容を読んでしまう。 */
+    meta->optimize = OPTIMIZE_DEFAULT;
+    meta->declared_types[0] = 0;
+    meta->declared_types[1] = 0;
     return meta;
 }
 
@@ -2950,6 +3015,8 @@ static void os_gc_collect_body(void) {
     g_sym_function = gc_copy_value(g_sym_function);
     g_sym_flet = gc_copy_value(g_sym_flet);
     g_sym_declaim = gc_copy_value(g_sym_declaim);
+    g_sym_declare = gc_copy_value(g_sym_declare);
+    g_sym_type = gc_copy_value(g_sym_type);
     g_sym_null = gc_copy_value(g_sym_null);
     g_sym_eq = gc_copy_value(g_sym_eq);
     g_sym_inline = gc_copy_value(g_sym_inline);
@@ -3117,6 +3184,8 @@ void os_bootstrap() {
         g_sym_function = os_make_symbol("FUNCTION");
         g_sym_flet = os_make_symbol("FLET");
         g_sym_declaim = os_make_symbol("DECLAIM");
+        g_sym_declare = os_make_symbol("DECLARE");
+        g_sym_type = os_make_symbol("TYPE");
         g_sym_null = os_make_symbol("NULL");
         g_sym_eq = os_make_symbol("EQ");
         g_sym_inline = os_make_symbol("INLINE");
@@ -3273,6 +3342,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%OPTIMIZE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_optimize_of), global_environment);
         os_set_function(os_make_symbol("%%CURRENT-INLINE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_inline), global_environment);
         os_set_function(os_make_symbol("%%INLINE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_of), global_environment);
+        os_set_function(os_make_symbol("%%DECLARED-TYPES-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_declared_types_of), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
@@ -4171,6 +4241,183 @@ void os_fn_set_optimize(lisp_val_t fn, UINT64 packed) {
         return;
     }
     meta->optimize = packed;
+}
+
+/* ===== declare による型宣言(Phase 4a-2) ============================== */
+
+/**
+ * 型符号 → 正準クラス名 の対応表。**符号化と復号の両方がこの1つの表だけを見る**
+ * (符号 i の名前が g_decl_type_names[i - 1])。
+ *
+ * 並びはinit_aot.lispの%register-builtin-class呼び出しと同じにしてある。
+ * ここに無いクラス(ユーザ定義クラス等)は OS_DECL_TYPE_OTHER になる。
+ * **この表は名前解決の表ではない。** 名前からクラスを引くのは*classes*(=%find-class
+ * と同じ経路)で、この表が受け取るのは既に解決済みのクラスの**正準名**である
+ * (runtime.h の os_decl_types_t のコメント参照)。
+ */
+static const char *const g_decl_type_names[] = {
+    "<OBJECT>",
+    "<BASIC-ARRAY>",
+    "<BASIC-ARRAY*>",
+    "<GENERAL-ARRAY*>",
+    "<BASIC-VECTOR>",
+    "<GENERAL-VECTOR>",
+    "<STRING>",
+    "<BUILT-IN-CLASS>",
+    "<CHARACTER>",
+    "<FUNCTION>",
+    "<GENERIC-FUNCTION>",
+    "<STANDARD-GENERIC-FUNCTION>",
+    "<LIST>",
+    "<CONS>",
+    "<SYMBOL>",
+    "<NULL>",
+    "<NUMBER>",
+    "<INTEGER>",
+    "<FLOAT>",
+    "<FIXNUM>",
+    "<BIGNUM>",
+    "<SINGLE-FLOAT>",
+    "<DOUBLE-FLOAT>",
+    "<STANDARD-CLASS>",
+    "<STANDARD-OBJECT>",
+    "<STREAM>",
+};
+#define DECL_TYPE_NAME_COUNT ((UINT64)(sizeof(g_decl_type_names) / sizeof(g_decl_type_names[0])))
+
+/* 符号は1始まりで、254(OTHER)/255(UNKNOWN)とぶつかってはならない */
+_Static_assert(sizeof(g_decl_type_names) / sizeof(g_decl_type_names[0]) < 254,
+               "g_decl_type_names got too large: codes would collide with OS_DECL_TYPE_OTHER/UNKNOWN");
+
+static lisp_val_t find_interned_symbol(const char *name);
+
+/**
+ * nameで登録済みのクラスオブジェクトを引く。init_aot.lispの
+ * `(defun %find-class (name) (cdr (assoc name (dynamic *classes*))))` と
+ * **同じ *classes* を同じ順序で走査する**(別の表を作らない)。
+ *
+ * Lisp側の%find-classをosApplyFunctionで呼ぶ実装(os_resolve_class)にしないのは、
+ * あちらが確保を伴いGCを誘発するためである。この関数はコンパイル中
+ * (za_compile_let)からも呼ばれるので、確保してはいけない
+ * (documents/pitfalls.md 原則4: コンパイル中のGCは手元のASTをstaleにする)。
+ */
+static lisp_val_t decl_find_class(lisp_val_t class_name_sym) {
+    lisp_val_t classes_sym = find_interned_symbol("*CLASSES*");
+    if (classes_sym == nil) {
+        return nil;     /* init_aot.lispがまだ読まれていない */
+    }
+    lisp_val_t pair = cc_assoc_eq(class_name_sym, os_get_dynamic(classes_sym));
+    return (pair != nil) ? cc_cdr(pair) : nil;
+}
+
+UINT8 os_decl_type_code_of(lisp_val_t class_name_sym) {
+    if ((class_name_sym & TAG_MASK) != TAG_SYMBOL) {
+        return OS_DECL_TYPE_UNKNOWN;
+    }
+    lisp_val_t cls = decl_find_class(class_name_sym);
+    if (cls == nil || (cls & TAG_MASK) != TAG_INSTANCE) {
+        return OS_DECL_TYPE_UNKNOWN;    /* §3-3: エラーにせず無視する */
+    }
+    UINT64 *obj = (UINT64 *)(cls & ~TAG_MASK);
+    if (obj[0] != MAGIC_BUILTIN_CLASS && obj[0] != MAGIC_STANDARD_CLASS) {
+        return OS_DECL_TYPE_UNKNOWN;
+    }
+    /* [別名] 利用者が書いた class_name_sym ではなく、**解決したクラスの正準名**
+       (word1)で突き合わせる。<short-float>は<single-float>と同一のクラス
+       オブジェクトなので、ここでは<SINGLE-FLOAT>が出てきて同じ符号になる */
+    lisp_val_t canonical = obj[1];
+    for (UINT64 i = 0; i < DECL_TYPE_NAME_COUNT; i++) {
+        if (canonical == find_interned_symbol(g_decl_type_names[i])) {
+            return (UINT8)(i + 1);
+        }
+    }
+    return OS_DECL_TYPE_OTHER;          /* 実在するが符号を持たない */
+}
+
+lisp_val_t os_decl_type_name(UINT8 code) {
+    if (code == OS_DECL_TYPE_NONE) {
+        return nil;
+    }
+    if (code == OS_DECL_TYPE_OTHER) {
+        return os_make_symbol("<OTHER>");
+    }
+    if (code == OS_DECL_TYPE_UNKNOWN || (UINT64)code > DECL_TYPE_NAME_COUNT) {
+        return os_make_symbol("<UNKNOWN>");
+    }
+    return os_make_symbol(g_decl_type_names[code - 1]);
+}
+
+/**
+ * 1つの宣言指定子 (type <fixnum> x y) を読み、var_symsに現れる変数へ符号を配る。
+ * type以外の指定子(将来のinline等)は黙って読み飛ばす。
+ */
+static void decl_apply_spec(lisp_val_t spec, const lisp_val_t *var_syms, UINT64 var_count,
+                            os_decl_types_t *out) {
+    if ((spec & TAG_MASK) != TAG_CONS) {
+        return;
+    }
+    /* §3-1: (type <class> v...) の形のみ。(fixnum v) のような裸の型名は採らない */
+    if (cc_car(spec) != g_sym_type) {
+        return;
+    }
+    lisp_val_t rest = cc_cdr(spec);
+    if ((rest & TAG_MASK) != TAG_CONS) {
+        return;
+    }
+    UINT8 code = os_decl_type_code_of(cc_car(rest));
+    /* [重要] 終端は **nil との比較**で見ること。nil は g_nil_cell | TAG_CONS、
+       つまり **TAG_CONS タグを持つ Lisp 値**なので、`(v & TAG_MASK) == TAG_CONS`
+       だけでは終端を弾けず、cc_cdr(nil) == nil が返り続けて無限ループになる
+       (runtime.c 先頭の g_nil_cell のコメント参照)。 */
+    for (lisp_val_t vars = cc_cdr(rest); vars != nil && (vars & TAG_MASK) == TAG_CONS; vars = cc_cdr(vars)) {
+        lisp_val_t v = cc_car(vars);
+        for (UINT64 i = 0; i < var_count; i++) {
+            if (var_syms[i] == v) {
+                /* 同じ変数を2回宣言したら後勝ち(CommonLispは未定義。ここでは単純に上書き) */
+                os_decl_types_set(out, i, code);
+            }
+        }
+    }
+}
+
+lisp_val_t os_scan_declarations(lisp_val_t body, const lisp_val_t *var_syms, UINT64 var_count,
+                                os_decl_types_t *out_types) {
+    *out_types = os_decl_types_empty();
+    if (var_count > OS_DECL_TYPES_MAX_VARS) {
+        var_count = OS_DECL_TYPES_MAX_VARS;
+    }
+    /* §3-5: bodyの**先頭に連続する**declareだけを宣言として扱う。
+       途中に現れたものはここで止まるので通常の式のまま残り、
+       評価時/コンパイル時にno-op(nil)として扱われる */
+    /* [重要] nil は TAG_CONS タグを持つ(decl_apply_spec のコメント参照)。
+       終端は必ず nil との比較で見ること。 */
+    while (body != nil && (body & TAG_MASK) == TAG_CONS) {
+        lisp_val_t form = cc_car(body);
+        if (form == nil || (form & TAG_MASK) != TAG_CONS || cc_car(form) != g_sym_declare) {
+            break;
+        }
+        for (lisp_val_t specs = cc_cdr(form); specs != nil && (specs & TAG_MASK) == TAG_CONS; specs = cc_cdr(specs)) {
+            decl_apply_spec(cc_car(specs), var_syms, var_count, out_types);
+        }
+        body = cc_cdr(body);
+    }
+    return body;
+}
+
+void os_fn_set_declared_types(lisp_val_t fn, os_decl_types_t types) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE) {
+        return;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    if (meta == 0) {
+        return;
+    }
+    meta->declared_types[0] = types.w[0];
+    meta->declared_types[1] = types.w[1];
 }
 
 void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len) {

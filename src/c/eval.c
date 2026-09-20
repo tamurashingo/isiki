@@ -371,6 +371,25 @@ static lisp_val_t eval_dynamic(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * 仮引数リストから固定引数のシンボルを最大maxまで取り出す(&restは対象外。
+ * &rest変数はリストなので型宣言の意味が無い)。確保は行わない。
+ * @return 取り出した個数
+ */
+static UINT64 collect_fixed_param_syms(lisp_val_t params, lisp_val_t *out, UINT64 max) {
+    UINT64 n = 0;
+    /* [重要] nil は TAG_CONS タグを持つ(runtime.c の g_nil_cell 参照)ので、
+       終端は nil との比較で見る。 */
+    for (lisp_val_t cur = params; cur != nil && (cur & TAG_MASK) == TAG_CONS && n < max; cur = cc_cdr(cur)) {
+        lisp_val_t sym = cc_car(cur);
+        if ((sym & TAG_MASK) != TAG_SYMBOL || sym == g_sym_rest) {
+            break;
+        }
+        out[n++] = sym;
+    }
+    return n;
+}
+
+/**
  * defun特殊形式。(defun name (params...) body...)から関数オブジェクトを作り、
  * current environmentのfunctionsスロットに登録する。
  * @param args (name (params...) . body)
@@ -391,6 +410,21 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(params);
     GC_PROTECT(body);
 
+    /* [Phase 4a-2] bodyの先頭に連続する (declare ...) を剥がし、仮引数の型宣言を
+       符号化する。**剥がさずにza_try_compile_defunへ渡すとJITから外れる**
+       (declareはza_is_excluded_special_formの対象。
+       documents/type-system-survey.md §6-4)。インタプリタへ落ちた場合も
+       make_interpreted_functionへ渡るbodyから消えるので、両方をここ1箇所で覆える。
+
+       os_scan_declarationsは確保を行わない(%find-classと同じ*classes*をその場で
+       走査するだけ)ので、ここでGCが走ることはなく、上で保護したname/params/bodyが
+       staleにならない。bodyはGC_PROTECTで**アドレスを**繋いであるため、
+       代入し直しても追随する。 */
+    lisp_val_t fixed_syms[OS_DECL_TYPES_MAX_VARS];
+    UINT64 fixed_sym_count = collect_fixed_param_syms(params, fixed_syms, OS_DECL_TYPES_MAX_VARS);
+    os_decl_types_t declared_types;
+    body = os_scan_declarations(body, fixed_syms, fixed_sym_count, &declared_types);
+
     // [重要] envとownerは役割が違う。
     //   env   = 捕捉環境。関数オブジェクトのword3に入り、本体の自由変数を
     //           実行時にos_get_variableが辿る起点になる。**frameでよい**
@@ -404,7 +438,7 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
        本Phaseではza_try_compile_defunは受け取った値をmetaへ記録するだけで、
        コード生成には使わない(Phase3以降) */
     UINT64 optimize = os_env_optimize(owner);
-    lisp_val_t fn = za_try_compile_defun(params, body, env, owner, optimize);
+    lisp_val_t fn = za_try_compile_defun(params, body, env, owner, optimize, declared_types);
     if (fn == nil) {
         fn = make_interpreted_function(params, body, env);
     }
@@ -1128,6 +1162,16 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
         }
         if (op == g_sym_declaim) {
             return eval_declaim(args, env);
+        }
+        if (op == g_sym_declare) {
+            /* [Phase 4a-2] §3-4-2: declareはコンパイル時にしか効かない。
+               defunの先頭のものはeval_defunが既に剥がしているので、ここへ来るのは
+               「作用する対象が無い位置に書かれたdeclare」である。エラーにせず
+               nilを返す(トップレベルやlet本体に書いた人がエラーを踏まないように)。
+               za側もnilへ潰すのでJITも諦めない(za_is_excluded_special_formに
+               入れると、宣言を書いた関数がコンパイルされなくなり本末転倒になる) */
+            (void)args;
+            return nil;
         }
         if (op == g_sym_flet) {
             return eval_flet(args, env);

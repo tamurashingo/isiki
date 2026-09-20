@@ -13,6 +13,56 @@
 (defglobal *isiki-test-fail* 0)
 
 ;; ---------------------------------------------------------------------------
+;; 進捗マーカーと経過時間。
+;;
+;; **合計だけでは、ハングしたときに何も分からない。** test-results.txtは
+;; isiki-test-reportが最後に書くので、途中で止まると「空のファイル」しか残らず、
+;; どのファイルのどこまで進んだのかを外から知る手段が無い。
+;;
+;; そこでloadの単位で1行ずつ、開始からの経過時間つきで書き出す。
+;; **1ファイル1行**なので通常実行でも負担にならず、監査モード(*isiki-audit*、
+;; 全アサーションを1件ずつ出す)を有効にしなくても効く。
+;;
+;; 時間の単位はtick。get-internal-real-timeはPITの分周設定(約100Hz)の
+;; tick数をそのまま返すので、**100 tick = 1秒**(1 tick = 10ms)である
+;; (src/c/clock.c の TICKS_PER_SECOND)。
+;; **随時出力するか、結果だけにするかの切り替え。**
+;; #at の行は 9p 経由のファイルへ finish-output まで行うため、**1行あたりの
+;; コストが無視できない**(test-results.txt はホスト側の共有ディレクトリにあり、
+;; QEMU の 9p は msize <= 8192 で動いている)。
+;; ハングの切り分けをするときは t、時間を計測するときは nil にする。
+;; nil でも #elapsed(最後に1回)は出るので、総時間の比較はできる。
+(defglobal *isiki-test-progress* t)
+
+(defglobal *isiki-test-time-start* (get-internal-real-time))
+(defglobal *isiki-test-mark-prev* 0)   ; 直前のマーク時点の経過tick
+
+;; frameworkをloadしてからの経過tick
+(defun isiki-test-elapsed ()
+  (- (get-internal-real-time) *isiki-test-time-start*))
+
+;; 進捗を1行書いてフラッシュする。t=は開始からの経過tick、+=は直前のマークからの差分。
+;; **フラッシュまでやること。** バッファに溜めたままだとハング時に消える。
+(defun isiki-test-mark (label)
+  (if *isiki-test-progress*
+      (let ((now (isiki-test-elapsed)))
+        (format *isiki-test-stream* "#at ~A t=~D += ~D~%"
+                label now (- now *isiki-test-mark-prev*))
+        (setq *isiki-test-mark-prev* now)
+        (finish-output *isiki-test-stream*))
+    nil))
+
+;; 試験ファイルを進捗マーカーつきでloadする。boot-entryスクリプトは
+;; (load "test/lisp/xxx_test.lisp") の代わりにこれを使う。
+;; **loadの前に印をつける**ので、ハングしたときは最後に出ている行の
+;; ファイルが犯人になる(通り抜けていれば次の行が出る)。
+(defun isiki-test-load (path)
+  (isiki-test-mark path)
+  (isiki-audit-begin path)
+  (load path))
+;; ---------------------------------------------------------------------------
+
+;; ---------------------------------------------------------------------------
 ;; [GC監査] 塗り潰し(ISIKIOS_GC_PAINT)下で全試験を流すための逐次出力モード。
 ;; documents/pitfalls.md 原則6。
 ;;
@@ -79,11 +129,12 @@
         (if (and (not ok) (= *isiki-audit-first-ng* 0))
             (setq *isiki-audit-first-ng* *isiki-audit-index*)
           nil)
-        (format *isiki-test-stream* "#t ~D ~A ~A gc=~D tick=~D trap=~D stale=~D~%"
+        (format *isiki-test-stream* "#t ~D ~A ~A gc=~D tick=~D t=~D trap=~D stale=~D~%"
                 *isiki-audit-index* *isiki-audit-label*
                 (if ok "OK" "NG")
                 (- gc *isiki-audit-gc-prev*)
                 (- tm *isiki-audit-time-prev*)
+                (isiki-test-elapsed)
                 (isiki-audit-trap-hits)
                 (isiki-audit-stale-hits))
         (setq *isiki-audit-gc-prev* gc)
@@ -190,5 +241,8 @@
       (format *isiki-test-stream* "#audit total=~D first-ng=~D~%"
               *isiki-audit-index* *isiki-audit-first-ng*)
     nil)
+  ;; 総経過時間。100 tick = 1秒(src/c/clock.c の TICKS_PER_SECOND)
+  (let ((e (isiki-test-elapsed)))
+    (format *isiki-test-stream* "#elapsed ~D ticks = ~D sec~%" e (div e 100)))
   (format *isiki-test-stream* "~%==== isiki tests: ~D passed, ~D failed ====~%"
           *isiki-test-pass* *isiki-test-fail*))
