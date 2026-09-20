@@ -940,8 +940,21 @@ typedef enum za_var_kind {
 typedef struct za_local_var {
     lisp_val_t sym;
     UINT32 val_off;
-    za_var_kind_t kind;
+    /* [Phase 4a-2] kindはza_var_kind_t(値は0/1の2つだけ)だが、UINT16として持つ。
+       enumのまま4byte使うと、直後のdecl_typeを足した時点で構造体が16→24byteへ
+       太り、za_local_scope_tが1段あたり32byte増える(ZA_MAX_LET_DEPTH=16段で+512byte)。
+       UINT16へ落とせば型宣言を1byte足しても16byteのままで、**増加量は0**になる
+       (documents/declare-types.md §3の測定)。 */
+    UINT16 kind;
+    /** (declare (type ...)) で宣言された型の符号(os_decl_types_t参照)。
+        本Phaseではコード生成に使わず、記録するだけ */
+    UINT8 decl_type;
+    UINT8 _pad;
 } za_local_var_t;
+
+/* 型宣言のフィールドを足しても1変数16byteのままであること(上のコメントの前提) */
+_Static_assert(sizeof(za_local_var_t) == 16,
+               "za_local_var_t grew past 16 bytes: za_local_scope_t cost changed");
 
 /** let-IIFEインライン化(拡張B)のネスト深さ・1letあたりの変数数の上限
  * (ZA_MAX_NLX_DEPTH等と同じ考え方の実装上の固定上限)。za_local_scope_tが
@@ -1126,7 +1139,7 @@ static int za_local_lookup(const za_local_scope_t *locals, lisp_val_t sym, UINT3
         for (UINT64 i = 0; i < s->count; i++) {
             if (s->vars[i].sym == sym) {
                 *out_val_off = s->vars[i].val_off;
-                *out_kind = s->vars[i].kind;
+                *out_kind = (za_var_kind_t)s->vars[i].kind;
                 return 1;
             }
         }
@@ -2437,6 +2450,17 @@ static UINT64 g_za_compile_nest = 0;
  * (documents/inline-builtin.md)。 */
 static UINT64 g_za_declaim = OPTIMIZE_DEFAULT;
 
+/** [Phase 4a-2] このコンパイル試行で宣言された仮引数の型(位置順の符号)。
+ * g_za_declaimと同じ理由でグローバルに置く(引数で持ち回ると署名が
+ * za_compile_*の全域へ波及する)。本Phaseではコード生成に使わない。 */
+static os_decl_types_t g_za_param_decl_types;
+
+/** [Phase 4a-2][診断] 直近のコンパイル試行で、letの束縛変数に対して記録した
+ * 型宣言の個数。%%DIAG-ZA-LOCAL-DECLS が読む。let-localの型は関数オブジェクトに
+ * 残らない(za_local_scope_tはコンパイル時だけのCスタック上の構造)ため、
+ * 配管が通っていることを外から確かめる手段がこれしかない。 */
+static UINT64 g_za_local_decl_count = 0;
+
 /** nameのbuiltinがこのコンパイルでインライン展開対象か */
 static int za_inline_enabled(UINT64 bit) {
     return (DECLAIM_INLINE_BITS(g_za_declaim) & bit) != 0;
@@ -3388,6 +3412,21 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         return 0;
     }
 
+    /* [Phase 4a-2] let本体の先頭のdeclareを剥がし、束縛変数の型を記録する。
+       letは `((lambda (v...) . body) init...)` へマクロ展開されるが、letマクロは
+       bodyを `,@body` でそのまま通すので、**展開後もdeclareはlambda本体の先頭に
+       そのまま残っている**。したがって展開前に手を入れる必要はなく、ここで剥がせば
+       よい(documents/declare-types.md §2-1の調査結果)。
+
+       この代入より下でlambda_bodyを読むのは解析ループと本体コンパイルループだけ
+       なので、ここで差し替えれば両方が宣言を取り除いたbodyを見る。
+
+       os_scan_declarationsは確保を行わないため、**コンパイル中にGCを誘発しない**
+       (documents/pitfalls.md 原則4)。Lisp側の%find-classをosApplyFunctionで
+       呼ぶ実装にしなかったのはこのためである。 */
+    os_decl_types_t local_decl_types;
+    lambda_body = os_scan_declarations(lambda_body, var_syms, var_count, &local_decl_types);
+
     // SBCL方式のcell昇格(za_local_var_tのコメント参照): setqされ、かつエスケープする
     // lambdaに捕捉される変数だけをZA_VAR_BOXEDにする。bodyをコンパイルする前に
     // 静的解析しておく必要がある(box化するかどうかで初期値のstore方法自体が変わる)。
@@ -3556,7 +3595,14 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     for (UINT64 i = 0; i < var_count; i++) {
         new_scope.vars[i].sym = var_syms[i];
         new_scope.vars[i].val_off = za_local_val_off(depth, i);
-        new_scope.vars[i].kind = var_kind[i];
+        new_scope.vars[i].kind = (UINT16)var_kind[i];
+        /* [Phase 4a-2] 型はコンパイル時のこの構造にだけ置く。frameにも環境にも
+           残さない(letのhot pathを重くしないため。指示書 §1) */
+        new_scope.vars[i].decl_type = os_decl_types_get(local_decl_types, i);
+        new_scope.vars[i]._pad = 0;
+        if (new_scope.vars[i].decl_type != OS_DECL_TYPE_NONE) {
+            g_za_local_decl_count++;
+        }
         za_gc_protect_batch_push(&local_scope_nodes[i], &new_scope.vars[i].sym);
     }
 
@@ -3761,6 +3807,17 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
     if (head == g_sym_progn) {
         return za_compile_progn(form, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth,
                                  tb_ctx, call_depth, arith_depth);
+    }
+    /* [Phase 4a-2] 宣言として扱われなかった位置のdeclare(body途中、あるいは
+       対象にしていない束縛形式の中)をnilへ潰す。
+       **za_is_excluded_special_formへ入れてはいけない。** 入れると
+       「declareを書いた関数がコンパイルされなくなる」という本末転倒になる
+       (declaimがまさにその形。documents/type-system-survey.md §6-4)。
+       一般呼び出しとしてコンパイルするのも駄目で、実行時にDECLAREという関数が
+       見つからずEVAL-ERRORになる。インタプリタ側のeval_declareと同じくnilを返す */
+    if (head == g_sym_declare) {
+        jit_movabs_rax(nil);
+        return 1;
     }
     if (head == syms->plus) {
         if (cc_cdr(form) == nil) {
@@ -5308,6 +5365,30 @@ lisp_val_t cc_diag_za_bail_line(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum((UINT64)g_za_bail_line);
 }
 
+/** [Phase 4a-2][診断] 直近のコンパイル試行にコンパイラが受け取った仮引数の型宣言の
+ * 個数。%%DECLARED-TYPES-OF が読むのは**コンパイル後にmetaへ書き戻した結果**なので、
+ * 「コンパイラ本体へ届いていたか」はこちらでしか確かめられない
+ * (コンパイルに失敗した関数では両者が食い違う)。 */
+lisp_val_t cc_diag_za_param_decls(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    UINT64 n = 0;
+    for (UINT64 i = 0; i < OS_DECL_TYPES_MAX_VARS; i++) {
+        if (os_decl_types_get(g_za_param_decl_types, i) != OS_DECL_TYPE_NONE) {
+            n++;
+        }
+    }
+    return os_make_fixnum(n);
+}
+
+/** [Phase 4a-2][診断] 直近のコンパイル試行でletの束縛変数に記録した型宣言の個数。
+ * let-localの型はza_local_scope_t(Cスタック上のコンパイル時構造)にしか置かず
+ * 関数オブジェクトに残らないため、%%DECLARED-TYPES-OFのようには引けない。
+ * 配管が通っていることを外から確かめる唯一の手段。 */
+lisp_val_t cc_diag_za_local_decls(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_za_local_decl_count);
+}
+
 /** 記録された断念行の件数(先頭ほど内側 = 起点に近い) */
 /* [GC監査] 第0部: 直近に生成したコードの位置と長さ、およびそこへ焼き込まれた
    movabs即値の一覧。jit_movabs_regは REX.W(0x48|0x49) + (0xB8+reg) + imm64 を
@@ -6332,7 +6413,7 @@ UINT64 g_za_compile_calls = 0;
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
                                 lisp_val_t capture_env, lisp_val_t owner_env,
-                                UINT64 optimize) {
+                                UINT64 optimize, os_decl_types_t declared_types) {
     g_za_compile_calls++;
     g_za_analyze_steps = 0;
     g_za_analyze_over = 0;
@@ -6430,6 +6511,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     /* [declaim] このコンパイル試行に効くoptimize/inline指定。emitterはg_za_declaimを
        見る(引数で持ち回ると署名が広範囲に波及するため) */
     g_za_declaim = optimize;
+    /* [Phase 4a-2] このコンパイル試行に効く仮引数の型宣言 */
+    g_za_param_decl_types = declared_types;
+    g_za_local_decl_count = 0;
     /* 即値サイトの記録をこのコンパイル試行ぶんだけにする(原則8の監査用) */
     g_za_imm_site_count = 0;
     g_za_imm_site_overflow = 0;
@@ -6769,11 +6853,13 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         /* [declaim] このコンパイルに効いていたoptimizeを事後確認用に記録する
            (%%OPTIMIZE-OF)。本Phaseではコード生成に使っていない */
         os_fn_set_optimize(fn, optimize);
+        os_fn_set_declared_types(fn, declared_types);
         return fn;
     }
     lisp_val_t fn = os_make_jit_function(cons_entry_addr, capture_env);
     os_fn_set_code_range(fn, (UINT64)(lisp_addr_t)dest_bytes, code_len);
     os_fn_set_optimize(fn, optimize);
+    os_fn_set_declared_types(fn, declared_types);
     return fn;
 }
 
@@ -6815,6 +6901,8 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DIAG-ZA-MX-CALLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_mx_calls), global_environment);
         os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-LOCAL-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_local_decls), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-PARAM-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_param_decls), global_environment);
 }
 
 #else /* !defined(__x86_64__) */
@@ -6846,12 +6934,15 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DIAG-ZA-IMM-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_region), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-LOCAL-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_local_decls), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-PARAM-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_param_decls), global_environment);
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
                                 lisp_val_t capture_env, lisp_val_t owner_env,
-                                UINT64 optimize) {
+                                UINT64 optimize, os_decl_types_t declared_types) {
     (void)optimize;
+    (void)declared_types;
     (void)params;
     (void)body;
     (void)capture_env;

@@ -92,11 +92,15 @@
  * @param owner_env **定義の登録先**(os_definition_envが解決したenvironment)。
  *   確保したImmobilized Pageとリテラルスロットの所有者として登録する。
  *   frameを渡すとdestroy-environmentの回収対象にならず、ページが永久に残る
+ * @param declared_types [Phase 4a-2] (declare (type ...)) で宣言された仮引数の型
+ *   (位置順の符号。os_decl_types_t参照)。**bodyからdeclareを取り除くのは呼び出し元
+ *   (eval_defun)の役目**で、ここへ来る時点でbodyに宣言は残っていない。
+ *   本Phaseではコンパイル時構造へ記録しmetaへ書き戻すだけで、コード生成には使わない
  * @return コンパイル済み関数のMAGIC_FUNCTION_NATIVE INSTANCE、失敗時はnil
  */
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
                                 lisp_val_t capture_env, lisp_val_t owner_env,
-                                UINT64 optimize);
+                                UINT64 optimize, os_decl_types_t declared_types);
 
 /**
  * za.c実装のネイティブ関数(%%DESTROY-ENVIRONMENT-RECLAIM、documents/environment.md
