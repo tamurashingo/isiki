@@ -149,7 +149,14 @@ PR #81(c-2)で `float`(FLOAT関数)を既定に従わせたときに、この性
 
 一連の float 作業(PR #79〜#82)で判明した、**直していない**問題。
 
-### 4-1 `(= nan nan)` が真を返す
+### 4-1 `(= nan nan)` が真を返す(**解決済み**)
+
+> **【追記】`feature/nan-comparison` で解決した。** `number_compare` を三値から
+> 非順序を含む四値へ改め、呼び出し側を述語経由にした。`(= nan nan)` は偽、
+> `(/= nan nan)` は真になる。NaN 判定は `(/= x x)` で足りるため、
+> 下記が提案していた専用述語は不要になった。詳細は `documents/nan-comparison.md`。
+
+> 以下は当時の記録である。
 
 `number_compare`(runtime.c)が IEEE 754 の非順序性を扱っていない。
 

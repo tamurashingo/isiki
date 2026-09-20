@@ -5483,11 +5483,33 @@ static double to_double(lisp_val_t v) {
  * 高速パスを使う。いずれかがfloatの場合は両方をdoubleへ変換して比較する。
  * @return a<bなら負、a==bなら0、a>bなら正
  */
-static int number_compare(lisp_val_t a, lisp_val_t b) {
+/* [NaN] 数値比較の結果。**三値では NaN を扱えない。**
+   IEEE 754 では NaN が絡む比較は「小さい」「等しい」「大きい」のいずれでもない
+   **非順序(unordered)** になる。旧 number_compare は float 経路で
+   `da < db ? -1 : (da > db ? 1 : 0)` としていたため、NaN では < も > も偽になり
+   **0(等しい)へ落ちて `(= nan nan)` が真を返していた**
+   (documents/float-default.md §4-1 に既知の問題として記録されていたもの)。
+
+   第四の状態を足すだけでは足りない。旧関数の戻り値を呼び出し側で直接
+   `>= 0` のように比べる書き方が残っていると、UNORDERED が「大きい」として
+   通ってしまう。そこで**関数名を変え**、呼び出し側は必ず下の述語
+   (num_lt / num_gt / ...)を通す形にした。古い名前を消したので、
+   **扱い漏れがコンパイルエラーになる**。 */
+#define NUM_CMP_LESS      (-1)
+#define NUM_CMP_EQUAL     0
+#define NUM_CMP_GREATER   1
+#define NUM_CMP_UNORDERED 2
+
+static int number_compare4(lisp_val_t a, lisp_val_t b) {
     if (is_float(a) || is_float(b)) {
         double da = to_double(a);
         double db = to_double(b);
-        return da < db ? -1 : (da > db ? 1 : 0);
+        if (da < db) { return NUM_CMP_LESS; }
+        if (da > db) { return NUM_CMP_GREATER; }
+        if (da == db) { return NUM_CMP_EQUAL; }
+        /* <, >, == のいずれも偽になるのは NaN が絡むときだけである。
+           **無限大はここへ来ない**(順序づけられるため。§3-2)。 */
+        return NUM_CMP_UNORDERED;
     }
 
     if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM) {
@@ -5511,6 +5533,25 @@ static int number_compare(lisp_val_t a, lisp_val_t b) {
     int cmp = mag_compare(ma.limbs, ma.count, mb.limbs, mb.count);
     return ma.sign ? -cmp : cmp;
 }
+
+/* [NaN] 比較述語。**非順序の扱いはここに集約する。**
+   整数どうしは NUM_CMP_UNORDERED を返さないので、挙動は従来と完全に同じである
+   (documents/nan-comparison.md §3-4)。 */
+static int num_lt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_LESS; }
+static int num_gt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_GREATER; }
+static int num_eq(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_EQUAL; }
+static int num_le(lisp_val_t a, lisp_val_t b) {
+    int c = number_compare4(a, b);
+    return c == NUM_CMP_LESS || c == NUM_CMP_EQUAL;
+}
+static int num_ge(lisp_val_t a, lisp_val_t b) {
+    int c = number_compare4(a, b);
+    return c == NUM_CMP_GREATER || c == NUM_CMP_EQUAL;
+}
+/** /= 。**IEEE 754 で NaN に対して真を返す唯一の比較である。**
+    「等しくない」は非順序も含む。= の否定として書くこと自体が仕様であり、
+    独立に「小さいか大きい」と書くと NaN で偽になって誤る(§3-1)。 */
+static int num_ne(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) != NUM_CMP_EQUAL; }
 
 /**
  * 整数z1をz2で除した「floor除算」の商と余りを求める(ISLisp仕様のdiv/mod。素朴な
@@ -6321,7 +6362,7 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
+        if (!num_lt(cc_car(rest), cc_car(cc_cdr(rest)))) {
             return nil;
         }
     }
@@ -6340,7 +6381,7 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
  * @return a<bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) < 0 ? g_sym_t : nil;
+    return num_lt(a, b) ? g_sym_t : nil;
 }
 
 /**
@@ -6352,7 +6393,7 @@ lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
 lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
+        if (!num_gt(cc_car(rest), cc_car(cc_cdr(rest)))) {
             return nil;
         }
     }
@@ -6367,7 +6408,7 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
  * @return a>bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) > 0 ? g_sym_t : nil;
+    return num_gt(a, b) ? g_sym_t : nil;
 }
 
 /**
@@ -6379,7 +6420,7 @@ lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
 lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
+        if (!num_eq(cc_car(rest), cc_car(cc_cdr(rest)))) {
             return nil;
         }
     }
@@ -6394,7 +6435,7 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
  * @return a=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) == 0 ? g_sym_t : nil;
+    return num_eq(a, b) ? g_sym_t : nil;
 }
 
 /**
@@ -6408,7 +6449,7 @@ lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
 lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
+        if (!num_ne(cc_car(rest), cc_car(cc_cdr(rest)))) {
             return nil;
         }
     }
@@ -6424,7 +6465,7 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
+        if (!num_ge(cc_car(rest), cc_car(cc_cdr(rest)))) {
             return nil;
         }
     }
@@ -6439,7 +6480,7 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
  * @return a>=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) >= 0 ? g_sym_t : nil;
+    return num_ge(a, b) ? g_sym_t : nil;
 }
 
 /**
@@ -6451,7 +6492,7 @@ lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
 lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
+        if (!num_le(cc_car(rest), cc_car(cc_cdr(rest)))) {
             return nil;
         }
     }
@@ -6466,7 +6507,7 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
  * @return a<=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) <= 0 ? g_sym_t : nil;
+    return num_le(a, b) ? g_sym_t : nil;
 }
 
 /**
@@ -6480,7 +6521,7 @@ lisp_val_t primitive_max(lisp_val_t args, lisp_val_t env) {
     lisp_val_t best = cc_car(args);
     for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
         lisp_val_t v = cc_car(rest);
-        if (number_compare(v, best) > 0) {
+        if (num_gt(v, best)) {
             best = v;
         }
     }
@@ -6498,7 +6539,7 @@ lisp_val_t primitive_min(lisp_val_t args, lisp_val_t env) {
     lisp_val_t best = cc_car(args);
     for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
         lisp_val_t v = cc_car(rest);
-        if (number_compare(v, best) < 0) {
+        if (num_lt(v, best)) {
             best = v;
         }
     }
