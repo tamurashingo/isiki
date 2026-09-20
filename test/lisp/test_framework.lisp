@@ -26,6 +26,14 @@
 ;; 時間の単位はtick。get-internal-real-timeはPITの分周設定(約100Hz)の
 ;; tick数をそのまま返すので、**100 tick = 1秒**(1 tick = 10ms)である
 ;; (src/c/clock.c の TICKS_PER_SECOND)。
+;; **随時出力するか、結果だけにするかの切り替え。**
+;; #at の行は 9p 経由のファイルへ finish-output まで行うため、**1行あたりの
+;; コストが無視できない**(test-results.txt はホスト側の共有ディレクトリにあり、
+;; QEMU の 9p は msize <= 8192 で動いている)。
+;; ハングの切り分けをするときは t、時間を計測するときは nil にする。
+;; nil でも #elapsed(最後に1回)は出るので、総時間の比較はできる。
+(defglobal *isiki-test-progress* t)
+
 (defglobal *isiki-test-time-start* (get-internal-real-time))
 (defglobal *isiki-test-mark-prev* 0)   ; 直前のマーク時点の経過tick
 
@@ -36,11 +44,13 @@
 ;; 進捗を1行書いてフラッシュする。t=は開始からの経過tick、+=は直前のマークからの差分。
 ;; **フラッシュまでやること。** バッファに溜めたままだとハング時に消える。
 (defun isiki-test-mark (label)
-  (let ((now (isiki-test-elapsed)))
-    (format *isiki-test-stream* "#at ~A t=~D += ~D~%"
-            label now (- now *isiki-test-mark-prev*))
-    (setq *isiki-test-mark-prev* now)
-    (finish-output *isiki-test-stream*)))
+  (if *isiki-test-progress*
+      (let ((now (isiki-test-elapsed)))
+        (format *isiki-test-stream* "#at ~A t=~D += ~D~%"
+                label now (- now *isiki-test-mark-prev*))
+        (setq *isiki-test-mark-prev* now)
+        (finish-output *isiki-test-stream*))
+    nil))
 
 ;; 試験ファイルを進捗マーカーつきでloadする。boot-entryスクリプトは
 ;; (load "test/lisp/xxx_test.lisp") の代わりにこれを使う。
