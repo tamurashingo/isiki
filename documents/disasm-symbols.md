@@ -193,8 +193,11 @@ JIT 関数のアドレスが焼かれるのは主に**自己参照(末尾呼び�
 | 項目 | 結果 |
 |---|---|
 | `make test` | 8498 OK / 0 NG |
-| `make test-qemu` 256M | **4286 passed / 0 failed** |
-| `QEMU_MEM=96M` | **4286 passed / 0 failed** |
+| `make test-qemu` 256M | **4289 passed / 0 failed** |
+| `QEMU_MEM=96M` | **4289 passed / 0 failed** |
+
+(テスト数が 4286 → 4289 に増えているのは、下の「CI で落とした」で
+アサーションを 3 件足したため)
 
 ### ずれていないことの確認(§6-2)
 
@@ -221,6 +224,46 @@ QEMU_MEM=1024M  mov r11d, 0x3c75c5fd   ; primitive_add2_fixnum
 
 **「`<kernel>` が出ないこと」と「実際の関数名が出ること」の両方**を見る形にした。
 片方だけだと、解決が全滅しても気づけない。
+
+### CI で落とした(修正済み)
+
+`<kernel>` の側は直したが、**`<immobilized>` に同じ形のアサーションが
+もう 1 つあるのを見落とし、GitHub Actions で落ちた。**
+
+```
+[NG] (> (DISASM-COUNT-COMMENT (QUOTE DIS-CALLER) "<immobilized>") 0) => NIL (expected T)
+```
+
+**原因は、JIT 逆引き(§4-5)を入れたあとにフル回帰を回さず PR を作ったこと。**
+最後に通した `make test-qemu` は逆引きを入れる前のものだった。
+
+さらに、それを直すときに書いたアサーションもそのままでは通らなかった。
+
+```lisp
+(assert-equal t (> (disasm-count-comment 'dis-caller "DIS-CALLER") 0))
+```
+
+`disasm-count-comment` は `string=` の**完全一致**なので、**範囲マッチで付く
+`DIS-CALLER+0x27c` という注釈にはヒットしない。** 前方一致版
+`disasm-count-comment-prefix` を足して `"DIS-CALLER+0x"` で見る形にした。
+オフセット値を直書きしないのは、JIT のコード生成が少し変われば動く数字だから。
+
+実機での注釈の実測(`dis-caller` / `dis-rec`):
+
+| 注釈 | dis-caller | dis-rec |
+|---|---|---|
+| `za_gc_link` | 9 | 8 |
+| `za_gc_unlink` | 6 | 6 |
+| `os_is_control_transfer` | 2 | 6 |
+| `za_gc_current_head` | 3 | 3 |
+| `os_make_cons` | 2 | 1 |
+| `cc_car` / `cc_cdr` / `os_make_symbol` / `os_get_function_cell` | 各 1 | 各 1 |
+| **自己参照** | `DIS-CALLER+0x27c` (1) | `DIS-REC+0x3ad` (1) |
+| `<kernel>` / `<immobilized>` / `<gc-heap>` | **0** | **0** |
+
+`dis-rec` は自分を名前で呼ぶ再帰関数だが、**再帰呼び出しも Function Cell 経由**
+なので、`DIS-REC` の名前が出るのは末尾呼び出しトランポリンの自己参照 1 件だけ
+である(§5 と同じ話)。
 
 ---
 
