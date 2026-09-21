@@ -5839,10 +5839,15 @@ static lisp_val_t fixnum_negate(lisp_val_t val) {
  * ma==mb、の2通り。どちらもos_make_fixnum_signedがマグニチュード0のとき符号を
  * 落とすため、必ず正のゼロ(生値0)になる。
  */
-static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
-    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
-        return 0;
-    }
+/* [型特化] fixnum 加算のコア。**タグ検査をしない。**
+   両方が fixnum であることを呼び出し側が保証する。
+   0 を返すのは**桁溢れのときだけ**である(タグ検査をしないため、それ以外に
+   失敗する理由が無い)。
+
+   タグ検査つきの fixnum_add_signed と**コアを共有する**のが要点である。
+   別実装を書くと、桁溢れの境界や符号の扱いが GENERIC と乖離しうる
+   (documents/declare-typed-add.md §3-5 の「結果が GENERIC と一致する」が崩れる)。 */
+static int fixnum_add_signed_unchecked(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
     UINT64 mag_a = os_fixnum_magnitude(a);
     UINT64 mag_b = os_fixnum_magnitude(b);
     int neg_a = os_fixnum_is_negative(a);
@@ -5865,6 +5870,17 @@ static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
         *out = os_make_fixnum_signed(neg_b, mag_b - mag_a);
     }
     return 1;
+}
+
+/** fixnum 加算(タグ検査つき)。GENERIC(primitive_add2)が使う。
+ *  **0 を返すのは「どちらかが fixnum でない」か「桁溢れ」のどちらか**である。
+ *  呼び出し側はどちらも「この経路では扱えない」として次の経路へ落とすので、
+ *  区別する必要が無い。 */
+static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
+        return 0;
+    }
+    return fixnum_add_signed_unchecked(a, b, out);
 }
 
 /**
@@ -6006,9 +6022,14 @@ static void declare_audit_fail(const char *fn, const char *expected, lisp_val_t 
 /**
  * 型特化した + (fixnum × fixnum)。**タグを見ない。**
  *
- * 桁溢れは GENERIC と同じく bignum へ昇格させる必要があるため、
- * fixnum_add_signed をそのまま使う(あれが 0 を返すのは桁溢れのときだけである。
- * タグ検査は宣言で保証されているぶん無駄になるが、**結果の一致を優先する**)。
+ * 桁溢れは GENERIC と同じく bignum へ昇格させる必要があるため、コアを共有する
+ * fixnum_add_signed_unchecked を使う。**タグ検査だけを省く**ので、
+ * 桁溢れの境界や符号の扱いが GENERIC と乖離しない
+ * (別実装を書くとそこが乖離しうる)。
+ *
+ * **宣言が嘘なら壊れる。** unchecked はタグを見ずに os_fixnum_magnitude を
+ * 呼ぶため、fixnum でない値を渡すとマグニチュードとしてゴミを読む。
+ * これは意図した挙動である(documents/declare-typed-add.md §3-1)。
  * @param a 第一オペランド(<fixnum> と宣言されている)
  * @param b 第二オペランド(同上)
  * @return a+b
@@ -6017,7 +6038,7 @@ lisp_val_t primitive_add2_fixnum(lisp_val_t a, lisp_val_t b) {
     DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", a);
     DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", b);
     lisp_val_t sum;
-    if (fixnum_add_signed(a, b, &sum)) {
+    if (fixnum_add_signed_unchecked(a, b, &sum)) {
         return sum;
     }
     /* 桁溢れ。GENERIC と同じ経路で bignum へ昇格させる */
