@@ -185,7 +185,17 @@
     count))
 
 ;; 生Cのprimitiveを呼ぶ movabs は必ずある(za_gc_current_head/cc_car/primitive_add2 等)
-(assert-equal t (> (disasm-count-comment 'dis-add "<kernel>") 0))
+;; [シンボル解決] カーネル .text への呼び先は**関数名**で注釈される
+;; (documents/disasm-symbols.md)。以前は領域名 "<kernel>" だったが、
+;; 名前が引けるようになったのでそちらが優先される。
+;; **引けなかったときだけ "<kernel>" へ落ちる**ので、ここは 0 でよい。
+(assert-equal 0 (disasm-count-comment 'dis-add "<kernel>"))
+;; 代わりに、実際の関数名が出ていることを見る。(+ a b) は必ず GC ルートの
+;; link/unlink を呼ぶので、その名前が現れる
+(assert-equal t (> (disasm-count-comment 'dis-add "za_gc_link") 0))
+(assert-equal t (> (disasm-count-comment 'dis-add "za_gc_unlink") 0))
+;; 宣言の無い + は GENERIC を呼ぶ
+(assert-equal t (> (disasm-count-comment 'dis-add "primitive_add2") 0))
 ;; GCヒープを指す即値は1つもあってはならない
 (assert-equal 0 (disasm-count-comment 'dis-add "<gc-heap>"))
 (assert-equal 0 (disasm-count-comment 'dis-caller "<gc-heap>"))

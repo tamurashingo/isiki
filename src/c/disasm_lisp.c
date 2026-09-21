@@ -8,6 +8,7 @@
  */
 
 #include "disasm_lisp.h"
+#include "disasm_symtab.h"
 #include "disasm.h"
 #include "lisp.h"
 #include "runtime.h"
@@ -22,12 +23,148 @@
  * どの領域にも当たらない場合は空文字列のままにする — 「引けなかった」ことを
  * 示す表示は出さない(全行に無意味な注釈が付くだけになるため)。
  */
+/** comment へ 16 進を追記する(桁数ぶんだけ。0 は "0") */
+static UINT64 d_comment_hex(char *buf, UINT64 n, UINT64 cap, UINT64 v) {
+    char tmp[17];
+    UINT64 t = 0;
+    if (v == 0) {
+        tmp[t++] = '0';
+    }
+    while (v != 0 && t < 16) {
+        UINT64 nib = v & 0xF;
+        tmp[t++] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+        v >>= 4;
+    }
+    while (t > 0 && n + 1 < cap) {
+        buf[n++] = tmp[--t];
+    }
+    return n;
+}
+
+/* ===== JIT 関数のシンボル逆引き(documents/disasm-symbols.md §4-5)=====
+ *
+ * Immobilized Space 上のアドレスから、それを持つ関数の名前を引く。
+ * カーネル .text と違いビルド時には決まらないので、**実行時に環境を走査**する。
+ *
+ * **グローバル環境を起点にする。** 呼び出し文脈の環境から辿ると、同じコードを
+ * 逆アセンブルしても呼ぶ場所で結果が変わってしまう。
+ *
+ * **範囲マッチ**にする。code_base <= addr < code_base + code_len なら、
+ * その関数の内側を指しているので `NAME+0x1c` の形で出せる。
+ *
+ * [引けないのが正しい場合がある]
+ *  - **再定義された関数の古いコード。** Immobilized Space には残るが、
+ *    どの環境からも参照されないので引けない
+ *  - **別名**(同じ関数オブジェクトを 2 つの名前で登録した場合)。
+ *    最初に見つかったものを返す
+ */
+static lisp_val_t d_env_functions_alist(lisp_val_t env) {
+    /* 環境は (name . x) (variables . y) (functions . z) ... の alist。
+       3 番目が functions スロットである(os_make_environment_raw 参照)。
+       スロットの並びに依存せず、**シンボル名で引く**ほうが壊れにくい */
+    for (lisp_val_t cur = env; cur != nil && (cur & TAG_MASK) == TAG_CONS; cur = cc_cdr(cur)) {
+        lisp_val_t slot = cc_car(cur);
+        if ((slot & TAG_MASK) != TAG_CONS) {
+            continue;
+        }
+        if (cc_car(slot) == os_make_symbol("FUNCTIONS")) {
+            return cc_cdr(slot);
+        }
+    }
+    return nil;
+}
+
+/**
+ * JIT コンパイル済み関数のコード範囲に addr が入っていれば、その名前を返す。
+ * @param addr 実行時アドレス
+ * @param out_offset コード先頭からのバイト数(引けたときだけ書く)
+ * @return 名前のシンボル。引けなければ nil
+ */
+static lisp_val_t d_lookup_jit_symbol(UINT64 addr, UINT64 *out_offset) {
+    lisp_val_t fns = d_env_functions_alist(global_environment);
+    for (lisp_val_t cur = fns; cur != nil && (cur & TAG_MASK) == TAG_CONS; cur = cc_cdr(cur)) {
+        lisp_val_t pair = cc_car(cur);
+        if ((pair & TAG_MASK) != TAG_CONS) {
+            continue;
+        }
+        lisp_val_t fn = cc_cdr(pair);
+        if ((fn & TAG_MASK) != TAG_INSTANCE) {
+            continue;
+        }
+        UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+        if (obj[0] != MAGIC_FUNCTION_NATIVE || obj[1] == 0) {
+            continue;
+        }
+        za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+        if (meta->code_len == 0) {
+            continue;   /* 組み込み primitive / AOT は機械語ブロックを持たない */
+        }
+        if (addr >= meta->code_base && addr < meta->code_base + meta->code_len) {
+            if (out_offset != 0) {
+                *out_offset = addr - meta->code_base;
+            }
+            return cc_car(pair);
+        }
+    }
+    return nil;
+}
+
 static void d_fill_region_comment(os_disasm_insn_t *insn) {
     insn->comment[0] = 0;
     if (!insn->has_target_addr) {
         return;
     }
-    const char *name = os_addr_region_name(os_classify_addr((lisp_addr_t)insn->target_addr));
+    os_addr_region_t region = os_classify_addr((lisp_addr_t)insn->target_addr);
+
+    /* [シンボル解決] カーネル .text なら**名前**を出す。
+       領域名("<kernel>")より、どの関数を呼んでいるかのほうが役に立つ
+       (documents/disasm-symbols.md)。引けなければ領域名へ落ちる。 */
+    if (region == OS_ADDR_KERNEL_TEXT) {
+        UINT64 off = 0;
+        const char *sym = os_disasm_lookup_kernel_symbol(insn->target_addr, &off);
+        if (sym != 0) {
+            UINT64 n = 0;
+            while (*sym != 0 && n + 1 < sizeof(insn->comment)) {
+                insn->comment[n++] = *sym++;
+            }
+            if (off != 0 && n + 3 < sizeof(insn->comment)) {
+                insn->comment[n++] = '+';
+                insn->comment[n++] = '0';
+                insn->comment[n++] = 'x';
+                n = d_comment_hex(insn->comment, n, sizeof(insn->comment), off);
+            }
+            insn->comment[n] = 0;
+            return;
+        }
+    }
+
+    /* [シンボル解決] Immobilized Space なら JIT 関数の名前を環境から引く */
+    if (region == OS_ADDR_IMMOBILIZED) {
+        UINT64 off = 0;
+        lisp_val_t sym = d_lookup_jit_symbol(insn->target_addr, &off);
+        if (sym != nil && (sym & TAG_MASK) == TAG_SYMBOL) {
+            lisp_val_t str = ((lisp_val_t *)(sym & ~TAG_MASK))[0];
+            if ((str & TAG_MASK) == TAG_STRING) {
+                lisp_addr_t sa = str & ~TAG_MASK;
+                UINT64 slen = ((UINT64 *)sa)[0];
+                const char *sp = (const char *)(sa + 8);
+                UINT64 n = 0;
+                for (UINT64 i = 0; i < slen && n + 1 < sizeof(insn->comment); i++) {
+                    insn->comment[n++] = sp[i];
+                }
+                if (off != 0 && n + 3 < sizeof(insn->comment)) {
+                    insn->comment[n++] = '+';
+                    insn->comment[n++] = '0';
+                    insn->comment[n++] = 'x';
+                    n = d_comment_hex(insn->comment, n, sizeof(insn->comment), off);
+                }
+                insn->comment[n] = 0;
+                return;
+            }
+        }
+    }
+
+    const char *name = os_addr_region_name(region);
     if (name == 0) {
         return;
     }
