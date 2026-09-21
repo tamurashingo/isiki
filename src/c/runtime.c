@@ -6098,6 +6098,54 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
  * @param b 第二オペランド
  * @return primitive_subtractと同じ規則で計算したa-b
  */
+/**
+ * 型特化した - (fixnum × fixnum)。**タグを見ない。**
+ *
+ * GENERIC(primitive_subtract2)と同じく a-b を a+(-b) に帰着させ、
+ * fixnum_add_signed_unchecked を共有する。**タグ検査だけを省く**ので、
+ * 桁溢れの境界や符号の扱いが GENERIC と乖離しない。
+ *
+ * GENERIC 側の `(b & TAG_MASK) == TAG_FIXNUM` は fixnum_negate が
+ * os_fixnum_magnitude を読むための前提確認なので、両方 fixnum と分かっている
+ * ここでは省ける。**- 用に新しいコアを書き足してはいない。**
+ *
+ * **宣言が嘘なら壊れる**(documents/declare-typed-add.md §3-1)。
+ * @param a 被減数(<fixnum> と宣言されている)
+ * @param b 減数(同上)
+ * @return a-b
+ */
+lisp_val_t primitive_subtract2_fixnum(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_subtract2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_subtract2_fixnum", b);
+    lisp_val_t diff;
+    if (fixnum_add_signed_unchecked(a, fixnum_negate(b), &diff)) {
+        return diff;
+    }
+    /* 桁溢れ。GENERIC と同じ経路で bignum へ昇格させる */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_subtract(args, global_environment);
+}
+
+/**
+ * 型特化した - (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。** single どうしの差は正確な結果が
+ * double で表現できるため、double で引いてから single へ丸めても
+ * single で直接引いた結果と一致する(+ と同じ理由。除算だけは二重丸めになるので
+ * 別扱い。documents/single-float-arith.md §5)。
+ * @param a 被減数(<single-float> と宣言されている)
+ * @param b 減数(同上)
+ * @return a-b
+ */
+lisp_val_t primitive_subtract2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_subtract2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_subtract2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) -
+                                        (double)os_single_float_value(b)));
+}
+
 lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
     lisp_val_t diff;
     if ((b & TAG_MASK) == TAG_FIXNUM && fixnum_add_signed(a, fixnum_negate(b), &diff)) {

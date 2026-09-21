@@ -2788,16 +2788,30 @@ static UINT8 za_operand_decl_type(lisp_val_t form, lisp_val_t params, UINT64 fix
 
    **混在(fixnum × single)は本作業では扱わない。** 変換のコストと、
    2^24 を超える fixnum で桁が落ちる問題があるため、GENERIC へ落とす
-   (documents/declare-typed-add.md §3-3)。 */
+   (documents/declare-typed-add.md §3-3)。
+
+   対象は `+` と `-`(PR #89 / 本 PR)。`*` `/` は未対応で、ここに足していく
+   (documents/declare-typed-arith.md)。
+   **単項の `-`(符号反転)は対象外。** za_compile_fold は引数 2 つ未満で
+   そもそも呼ばれない。 */
 static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
-    if (generic_fn != (void *)primitive_add2) {
-        return 0;                   /* 本作業は + だけ */
-    }
     if (ta == OS_DECL_TYPE_FIXNUM && tb == OS_DECL_TYPE_FIXNUM) {
-        return (void *)primitive_add2_fixnum;
+        if (generic_fn == (void *)primitive_add2) {
+            return (void *)primitive_add2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_subtract2) {
+            return (void *)primitive_subtract2_fixnum;
+        }
+        return 0;
     }
     if (ta == OS_DECL_TYPE_SINGLE_FLOAT && tb == OS_DECL_TYPE_SINGLE_FLOAT) {
-        return (void *)primitive_add2_single;
+        if (generic_fn == (void *)primitive_add2) {
+            return (void *)primitive_add2_single;
+        }
+        if (generic_fn == (void *)primitive_subtract2) {
+            return (void *)primitive_subtract2_single;
+        }
+        return 0;
     }
     return 0;
 }
