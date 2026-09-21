@@ -6354,6 +6354,34 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_divideを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定で、**floatが絡むならconsを一切構築しない**
+ * (primitive_add2と同じ形。PR #80)。
+ *
+ * **ISLispに / は無い。** これは quotient の実装(init.lisp の %quotient2)が
+ * 内部で使う経路である。ゼロ除算はIEEE754どおり inf/nan を返し、
+ * <division-by-zero> を出すのは quotient 側の責務である
+ * (%quotient2 がここへ来る前に除数0を弾く)。
+ *
+ * **整数どうしはn項版へ委譲する。** bignum除算の経路が長く、二項版へ展開すると
+ * 重複が大きい。そのぶんcons 2個(32byte)が残る
+ * (documents/divide-direct-call.md §4-2)。
+ * @param a 被除数
+ * @param b 除数
+ * @return a/b
+ */
+lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b) {
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        return os_make_float_of_kind(kind, to_double(a) / to_double(b));
+    }
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_divide(args, global_environment);
+}
+
+/**
  * 組み込み関数<。argsが単調増加(a<b<c<...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
