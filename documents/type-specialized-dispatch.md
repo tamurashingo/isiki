@@ -115,7 +115,22 @@ call primitive_add2_fixnum      ← 何が起きているか一目で分かる
 
 全部をインラインにすると、命令の羅列から意図を復元することになる。
 
-> **【重要】理由 2 は現時点では成立していない。**
+> **【更新 / disasm-symbols】理由 2 は成立するようになった。**
+>
+> シンボル名解決を実装したので、いまは呼び先が名前で出る。
+>
+> ```
+> mov r11d, 0x275c5fd    ; primitive_add2_fixnum
+> call r11
+> ```
+>
+> **PR #89 の検証は code-len でしか確認できず**、`primitive_add2_fixnum` と
+> `primitive_add2_single` を取り違えても気づけなかった。いまは名前で直接
+> 確認できる。詳細は `documents/disasm-symbols.md`。
+>
+> 以下は実装前の記録である。
+>
+> **【当時】理由 2 は現時点では成立していない。**
 >
 > disassembler はまだ **call 先の関数名を出せない**。`disasm_lisp.c` が付ける
 > 注釈は `os_addr_region_name(os_classify_addr(...))` による**領域分類のみ**で、

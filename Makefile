@@ -41,7 +41,10 @@ SRCDIR = src/c
 TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/file-node.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp src/lisp/bench_aot.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_symtab.c $(SRCDIR)/disasm_symtab_lookup.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
+# $(TARGET) の依存には生成物(disasm_symtab.c)を含めない。含めると自分が作る
+# ファイルに依存して毎回作り直しになる
+SRC_NO_SYMTAB = $(filter-out $(SRCDIR)/disasm_symtab.c,$(SRC))
 HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/za_jit_tags.h $(SRCDIR)/disasm.h $(SRCDIR)/disasm_lisp.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/bench_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -124,7 +127,7 @@ TEST_BIN_REPL = $(BUILD_TMPDIR)/repl_test
 TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/subprimitive.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(TESTDIR)/subprimitive_test.c
 TEST_BIN_SUBPRIMITIVE = $(BUILD_TMPDIR)/subprimitive_test
 
-TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
+TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_symtab_lookup.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
 TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
@@ -211,9 +214,20 @@ transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 # 「実際にソース/ヘッダが変更された時だけ」再生成されるようにする土台になる
 # (buildをphonyのままにしていると、buildを経由するあらゆる後続ターゲットが
 # 常に再実行されてしまう)。
-$(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
-	mkdir -p esp_dir/EFI/BOOT
-	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
+# [シンボル解決] 逆アセンブル用のシンボル表は**2 パス**で作る
+# (documents/disasm-symbols.md §3)。
+#
+#   1. 空のテーブルでリンク      → アドレスが確定する
+#   2. nm で抽出してテーブル生成
+#   3. テーブルを含めて再リンク
+#   4. **再抽出して 1 と照合**   → ずれていたらビルドを止める
+#
+# 実測では .rdata が 80KB 増えても .text のシンボルは 1 つも動かなかった
+# (.text が最初のセクションで、テーブルは .rdata へ載るため)。
+# それでも 4 を入れてあるのは、**将来リンカの挙動が変わったときに、
+# 黙って古いテーブルを積んだイメージができるのを防ぐ**ためである。
+DISASM_SYMTAB = $(SRCDIR)/disasm_symtab.c
+KERNEL_LINK = docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
 		-nostdlib -mno-red-zone -O1 -shared \
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
@@ -222,6 +236,22 @@ $(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
+NM_IN_DOCKER = docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-nm -v "$(PWD)":/workspace isiki-builder
+OBJDUMP_IN_DOCKER = docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-objdump -v "$(PWD)":/workspace isiki-builder
+
+$(TARGET): $(SRC_NO_SYMTAB) $(HDR) $(GC_DEBUG_STAMP)
+	mkdir -p esp_dir/EFI/BOOT $(BUILD_TMPDIR)
+	@echo '/* placeholder */' > $(DISASM_SYMTAB)
+	@printf '#include "runtime.h"\n#include "disasm_symtab.h"\n' >> $(DISASM_SYMTAB)
+	@printf 'const UINT64 g_disasm_link_image_base = 0;\nconst UINT64 g_disasm_sym_count = 0;\n' >> $(DISASM_SYMTAB)
+	@printf 'const UINT64 g_disasm_sym_addr[1] = {0};\nconst UINT32 g_disasm_sym_name_off[1] = {0};\nconst char g_disasm_sym_names[1] = {0};\n' >> $(DISASM_SYMTAB)
+	$(KERNEL_LINK)
+	@$(NM_IN_DOCKER) $(TARGET) > $(BUILD_TMPDIR)/nm_pass1.txt
+	@$(OBJDUMP_IN_DOCKER) -p $(TARGET) | awk '/^ImageBase/ { print $$2 }' > $(BUILD_TMPDIR)/imagebase.txt
+	@sh tools/gen_disasm_symtab.sh $(BUILD_TMPDIR)/nm_pass1.txt "$$(cat $(BUILD_TMPDIR)/imagebase.txt)" > $(DISASM_SYMTAB)
+	$(KERNEL_LINK)
+	@$(NM_IN_DOCKER) $(TARGET) > $(BUILD_TMPDIR)/nm_pass2.txt
+	@sh tools/check_disasm_symtab.sh $(BUILD_TMPDIR)/nm_pass1.txt $(BUILD_TMPDIR)/nm_pass2.txt
 
 # [測定の落とし穴] `build`は以前 $(TARGET)(= esp_dir/.../BOOTX64.EFI)だけを作って
 # いた。QEMUが実際に起動するのは $(BOOT_FAT32_IMG) の中にコピーされたEFIなので、

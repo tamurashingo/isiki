@@ -184,13 +184,57 @@
       (setq items (cdr items)))
     count))
 
+;; 名前 + オフセット("DIS-CALLER+0x27c" のような形)で解決された注釈を数えるため、
+;; 前方一致版も用意する。上の disasm-count-comment は string= の完全一致なので、
+;; オフセットが付く自己参照には使えない(オフセット値を直書きすると、JIT の
+;; コード生成が少し変わるだけで落ちる脆いテストになる)
+(defun disasm-count-comment-prefix (name prefix)
+  (let ((items (disasm-items (%%disasm-code-base name) (%%disasm-code-len name)))
+        (plen (length prefix))
+        (count 0))
+    (while (not (null items))
+      (let ((c (disasm-item-comment (cdr (car items)))))
+        (if (and (stringp c)
+                 (>= (length c) plen)
+                 (string= prefix (subseq c 0 plen)))
+            (setq count (+ count 1))
+          nil))
+      (setq items (cdr items)))
+    count))
+
 ;; 生Cのprimitiveを呼ぶ movabs は必ずある(za_gc_current_head/cc_car/primitive_add2 等)
-(assert-equal t (> (disasm-count-comment 'dis-add "<kernel>") 0))
+;; [シンボル解決] カーネル .text への呼び先は**関数名**で注釈される
+;; (documents/disasm-symbols.md)。以前は領域名 "<kernel>" だったが、
+;; 名前が引けるようになったのでそちらが優先される。
+;; **引けなかったときだけ "<kernel>" へ落ちる**ので、ここは 0 でよい。
+(assert-equal 0 (disasm-count-comment 'dis-add "<kernel>"))
+;; 代わりに、実際の関数名が出ていることを見る。(+ a b) は必ず GC ルートの
+;; link/unlink を呼ぶので、その名前が現れる
+(assert-equal t (> (disasm-count-comment 'dis-add "za_gc_link") 0))
+(assert-equal t (> (disasm-count-comment 'dis-add "za_gc_unlink") 0))
+;; 宣言の無い + は GENERIC を呼ぶ
+(assert-equal t (> (disasm-count-comment 'dis-add "primitive_add2") 0))
 ;; GCヒープを指す即値は1つもあってはならない
 (assert-equal 0 (disasm-count-comment 'dis-add "<gc-heap>"))
 (assert-equal 0 (disasm-count-comment 'dis-caller "<gc-heap>"))
-;; 他の関数を名前で呼ぶ側には Function Cell(Immobilized Space)への参照が出る
-(assert-equal t (> (disasm-count-comment 'dis-caller "<immobilized>") 0))
+;; [シンボル解決] Immobilized Space への参照も**名前**で注釈されるようになった
+;; (documents/disasm-symbols.md)。dis-caller の生成コードに現れる
+;; Immobilized のアドレスは**自分自身への参照**(末尾呼び出しのトランポリン)で、
+;; 範囲マッチにより "DIS-CALLER+0x27c" の形で解決される。
+;;
+;; **他の関数を名前で呼ぶ側に、その関数のアドレスは焼かれていない。**
+;; JIT は Function Cell 経由で間接的に呼ぶ(再定義に追随するため)ので、
+;; 焼かれるのは Cell のアドレスであり、呼び先のコード先頭ではない
+;; (documents/disasm-symbols.md §5)。その Cell も環境からは引けないため、
+;; 名前が付くのは自己参照だけになる。
+(assert-equal 0 (disasm-count-comment 'dis-caller "<immobilized>"))
+;; 自己参照が名前 + オフセットで解決されること。注釈は "DIS-CALLER+0x27c" の
+;; ような形になるので、完全一致ではなく前方一致で見る
+(assert-equal t (> (disasm-count-comment-prefix 'dis-caller "DIS-CALLER+0x") 0))
+;; 前方一致そのものが常に真を返しているのではないこと
+(assert-equal 0 (disasm-count-comment-prefix 'dis-caller "DIS-ADD"))
+;; Function Cell を引く呼び出し自体は残っている(カーネル側の名前で確認)
+(assert-equal t (> (disasm-count-comment 'dis-caller "os_get_function_cell") 0))
 
 ;;; --- 出力(Phase 1.3 / 1.4) ---
 
