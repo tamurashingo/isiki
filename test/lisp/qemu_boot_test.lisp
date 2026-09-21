@@ -47,6 +47,7 @@
 (isiki-test-load "test/lisp/convert_float_test.lisp")
 (isiki-test-load "test/lisp/float_default_test.lisp")
 (isiki-test-load "test/lisp/nan_comparison_test.lisp")
+(isiki-test-load "test/lisp/divide_direct_call_test.lisp")
 (isiki-test-load "test/lisp/declare_types_test.lisp")
 (isiki-test-load "test/lisp/disassemble_test.lisp")
 
