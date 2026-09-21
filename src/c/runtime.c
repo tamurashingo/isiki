@@ -6292,7 +6292,17 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
             lisp_val_t v = cc_car(rest);
             kind = float_kind_max(kind, float_kind_of(v));
-            result = float_round_to_kind(kind, result / to_double(v));
+            /* [二重丸め] **除算だけは single で割らないと結果が変わる。**
+               double で割ってから single へ丸めると 2 回丸めることになり、
+               single で直接割った結果(= JIT の divss)と食い違いうる。
+               +/-/* は正確な結果が double で表現できるので double 経由でも
+               一致するが、除算の正確な商は無限桁になりうる
+               (documents/single-float-arith.md §5)。 */
+            if (kind == FLOAT_KIND_SINGLE) {
+                result = (double)((float)result / (float)to_double(v));
+            } else {
+                result = float_round_to_kind(kind, result / to_double(v));
+            }
         }
         return os_make_float_of_kind(kind, result);
     }
@@ -6351,6 +6361,39 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
     }
 
     return acc_val;
+}
+
+/**
+ * primitive_divideを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定で、**floatが絡むならconsを一切構築しない**
+ * (primitive_add2と同じ理由。PR #80)。
+ *
+ * ISLispに / は無く、これは quotient の実装が内部で使う経路である
+ * (init.lisp の %quotient2)。**ゼロ除算はIEEE754どおり inf/nan を返す**
+ * (<division-by-zero> を出すのは quotient 側の責務で、%quotient2 が
+ * ここへ来る前に除数0を弾いている)。
+ *
+ * **singleどうしはsingleで割る。** double経由だと二重丸めになり、
+ * JITのdivssと結果が食い違う(documents/single-float-arith.md §5)。
+ * @param a 被除数
+ * @param b 除数
+ * @return a/b
+ */
+lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b) {
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind == FLOAT_KIND_SINGLE) {
+        /* 片方が整数でもここへ来る(float_kind_maxがSINGLEを返す)ので、
+           os_single_float_valueではなくto_double経由でfloatへ落とす */
+        return os_make_single_float((float)to_double(a) / (float)to_double(b));
+    }
+    if (kind == FLOAT_KIND_DOUBLE) {
+        return os_make_float(to_double(a) / to_double(b));
+    }
+    /* 整数はbignum除算の経路が長いのでn項版へ委譲する(consは2個) */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_divide(args, global_environment);
 }
 
 /**

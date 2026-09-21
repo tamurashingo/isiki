@@ -22,11 +22,14 @@ single-float はタグ 0x4 の即値で**ヒープ確保がゼロ**なのに、J
 
 | 対象 | 内容 |
 |---|---|
-| 算術 | `+` `-` `*`(**single どうしのみ**) |
+| 算術 | `+` `-` `*` `/`(**single どうしのみ**) |
 | 比較 | `<` `>` `<=` `>=` `=` `/=`(同上) |
 
-**`/` は対象外。** za に `/` の算術経路そのものが無い(`za_syms_t` に居らず、
-一般呼び出しに落ちる)。経路の新設は「既存の形に乗せる」という方針から外れる。
+**`/` は二項のみ。** `(/ a b c)` は一般呼び出しのままで、n 項の型昇格規則は
+C 側が持つ。
+
+**ISLisp に `/` は無い。** `/` は `quotient` の実装(`init.lisp` の `%quotient2`)が
+内部で使う経路である。`quotient` を速くする道はこれしかない(§3-4)。
 
 **double-float と混在(single × double)も対象外。** 従来どおり C へ落ちる。
 型昇格の規則は C 側が持っているので二重実装しない(PR #80)。
@@ -108,6 +111,46 @@ mov  rax, r10
 `g_sym_t` は GC ヒープ上にあり移動するので、**アドレスを movabs して deref する**
 (`za_emit_inline_bool_from_flags` と同じ理由)。`movabs` も `mov r64,[r64]` も
 フラグを変えないので `ucomiss` の結果は保たれる。
+
+### 3-4 `/` と `quotient` / `reciprocal` の関係
+
+**ISLisp に `/` は無い。** `quotient` が正式で、`reciprocal` はその 1 引数版である。
+isiki-os では両方 Lisp 側(`init.lisp`)で実装され、**内部で `/` を呼んでいる**。
+
+```lisp
+(defun %quotient2 (dividend divisor)
+  (if (= divisor 0)
+      (signal-condition (make-instance '<division-by-zero> ...) nil)
+      (if (両方整数)
+          (if (割り切れる) (div ...) (/ (float d) (float v)))
+          (/ dividend divisor))))      ; ← float が絡むとここ
+
+(defun reciprocal (x) (quotient 1 x))
+```
+
+`%quotient2` は `defun` なので **JIT 対象**である。その中の `(/ dividend divisor)` が
+二項として `primitive_divide2` にコンパイルされ、実行時に両方 single なら
+`divss` に入る。**`quotient` を速くする道はこれしかない。**
+
+#### ゼロ除算は二系統のまま
+
+| | ゼロ除算 |
+|---|---|
+| `/` | IEEE どおり `inf` / `nan`(`divss` と一致) |
+| `quotient` | **`<division-by-zero>` をシグナル** |
+
+`%quotient2` が `/` を呼ぶ**前に**除数 0 を弾くので、**`quotient` 経由で `divss` に
+0 が届くことはない**。`/` を直接呼んだ場合は `divss` と C が同じ inf を返すので、
+インライン化しても挙動は変わらない。
+
+#### `reciprocal` は single どうしにならない
+
+`(reciprocal x)` は `(quotient 1 x)` なので **整数 1 と single の混在**になり、
+JIT の single 経路(両方 single が条件)には入らない。C 側の型昇格で結果は
+single になるが、計算は一般経路を通る。
+
+インライン化するには「片方が整数即値なら single に変換してから `divss`」という
+別の最適化が要る。**本作業の範囲外**とし、正しさだけテストで固定した。
 
 ### 3-3 逆アセンブラへの追加(必須だった)
 
@@ -239,16 +282,29 @@ C 側のディスパッチが丸ごと消えたためで、実機でも同じ方
 
 ---
 
-## 5. 副次的に回避されたこと
+## 5. 除算の二重丸めを直した
 
-C 側は single どうしでも `to_double(a) + to_double(b)` と **double で計算してから
-single に丸めている**。`+` `-` `*` は正確な結果が double で表現できるので
-`addss` / `subss` / `mulss` と一致するが、**除算だけは二重丸めで結果が変わりうる**
-(正確な商を double に丸め、さらに single に丸めるため)。
+C 側は single どうしでも `to_double(a) / to_double(b)` と **double で計算してから
+single に丸めていた**。
 
-**`/` が対象外なので、この問題は起きない。** 将来 `/` をインライン化するなら、
-`divss` のほうが IEEE 754 的に正しい一方で**現在の C 実装と結果が変わる**ことを
-先に確かめる必要がある。
+`+` `-` `*` は正確な結果が double で表現できるので double 経由でも
+`addss` / `subss` / `mulss` と一致する。**除算だけが違う。** 正確な商は無限桁に
+なりうるので、double へ丸め(1 回目)、さらに single へ丸める(2 回目)と、
+**single で直接割った結果(`divss`)と食い違いうる。**
+
+そこで C 側を single 演算に直した。
+
+```c
+if (kind == FLOAT_KIND_SINGLE) {
+    return os_make_single_float((float)to_double(a) / (float)to_double(b));
+}
+```
+
+n 項版の `primitive_divide` も同じ理由で single のステップを single 演算にした。
+
+**これは実質的にバグ修正でもある。** double 経由は IEEE 754 的に不正確で、
+`divss` のほうが正しい。インライン経路を入れたことで、C 側の不正確さが
+表に出る形になった。
 
 ---
 
@@ -263,5 +319,5 @@ NaN boxing などの別の手を検討することになり、規模が大きい
 対照の `car` が 487 byte で、算術の 818 byte との差は 331 byte しかない。
 **算術そのものより関数の入口のほうが大きい。** 次に大きな効果を狙うならそちらである。
 
-`/` の算術経路を作ることと、fixnum の比較のインライン化(`<` は fixnum でも
-call のまま)も残っている。
+`reciprocal` のインライン化(整数即値を single へ畳む)と、fixnum の比較の
+インライン化(`<` は fixnum でも call のまま)が残っている。

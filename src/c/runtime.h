@@ -2053,6 +2053,16 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b);
 
 /**
+ * primitive_divideを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。**singleどうしはsingleで割る**(double経由だと二重丸めで
+ * JITのdivssと食い違う)。ゼロ除算はIEEE754どおり inf/nan。
+ * @param a 被除数
+ * @param b 除数
+ * @return a/b
+ */
+lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)

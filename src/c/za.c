@@ -1414,6 +1414,7 @@ typedef struct {
     lisp_val_t le;      /* "<=" */
     lisp_val_t ge;      /* ">=" */
     lisp_val_t ne;      /* "/=" (二項版はPR #86で追加。それ以前は一般呼び出しへ落ちていた) */
+    lisp_val_t slash;   /* "/" (quotient の実装が内部で使う経路。ISLispに / は無い) */
     lisp_val_t eqp;     /* "EQ" (ポインタ同一性比較) */
     lisp_val_t nullsym; /* "NULL" */
     lisp_val_t atom;    /* "ATOM" */
@@ -1445,7 +1446,7 @@ typedef struct {
    ではないので、stale領域を読まないからである。
    配列とみなして一括linkするため、平坦であることを機械的に保証しておく。 */
 #define ZA_SYMS_FIELD_COUNT (sizeof(za_syms_t) / sizeof(lisp_val_t))
-_Static_assert(sizeof(za_syms_t) == 26 * sizeof(lisp_val_t),
+_Static_assert(sizeof(za_syms_t) == 27 * sizeof(lisp_val_t),
                "za_syms_tはlisp_val_tだけの平坦な構造体でなければならない"
                "(フィールドを増減したらこの数も更新すること)");
 
@@ -2928,6 +2929,7 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
     if (wrapper_fn == (void *)primitive_add2)           { ss_op = JIT_SS_ADD; }
     else if (wrapper_fn == (void *)primitive_subtract2) { ss_op = JIT_SS_SUB; }
     else if (wrapper_fn == (void *)primitive_multiply2) { ss_op = JIT_SS_MUL; }
+    else if (wrapper_fn == (void *)primitive_divide2)   { ss_op = JIT_SS_DIV; }
 
     if (ss_op == 0) {
         jit_movabs_r11((UINT64)wrapper_fn);
@@ -3373,6 +3375,10 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
            rcx=第一オペランド、rdx=第二オペランドが揃っているのでそのまま比較する */
         jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
         za_emit_inline_bool_from_flags();
+    } else if (wrapper_fn == (void *)primitive_divide2) {
+        /* [single-float] 除算も single どうしなら divss でインライン化する。
+           fixnum の高速路は持たないので single 判定から始まる */
+        za_emit_arith_call_or_inline(wrapper_fn);
     } else if (za_emit_single_float_compare(wrapper_fn)) {
         /* [single-float] 両方 single なら ucomiss でインライン化し、
            外れたら wrapper_fn へ落ちる(関数側で両方出している) */
@@ -4123,6 +4129,12 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
     if (head == syms->ne) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                                   call_depth, arith_depth, (void *)primitive_num_not_equal2, 0);
+    }
+    if (head == syms->slash) {
+        /* **二項のみ対象。** (/ a b c) は一般呼び出しへ落ちる(n項の型昇格規則は
+           C 側が持つ)。ISLisp に / は無く、quotient の実装が内部で使う経路である */
+        return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                  call_depth, arith_depth, (void *)primitive_divide2, 0);
     }
     if (head == g_sym_car) {
         // consでない引数はdomain-error(ISLisp仕様§21.2、primitive_carと同じ)。envが要るので
@@ -6755,6 +6767,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     syms.le = os_make_symbol("<=");
     syms.ge = os_make_symbol(">=");
     syms.ne = os_make_symbol("/=");
+    syms.slash = os_make_symbol("/");
     syms.eqp = os_make_symbol("EQ");
     syms.nullsym = os_make_symbol("NULL");
     syms.atom = os_make_symbol("ATOM");

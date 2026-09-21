@@ -107,3 +107,54 @@
 (assert-equal (< *denorm* (* *denorm* 2.0f0)) (c-lt *denorm* (* *denorm* 2.0f0)))
 (assert-equal t (c-lt *denorm* (sf-mul2 *denorm* 2.0f0)))
 
+
+;;; --- 除算 / quotient / reciprocal(PR #87 追補) ---
+;;; ISLisp に / は無く、quotient の実装(init.lisp の %quotient2)が内部で使う経路。
+;;; **二項の / だけが専用経路に乗る。** (/ a b c) は一般呼び出しのまま。
+(defun d-div (a b) (/ a b))
+(defun d-quo (a b) (quotient a b))
+(defun d-rec (x) (reciprocal x))
+(assert-equal t (%%za-compiled-p (function d-div)))
+
+;; C 経由と JIT 経由がビット単位で一致すること
+(assert-equal (pr (/ 1.0f0 3.0f0)) (pr (d-div 1.0f0 3.0f0)))
+(assert-equal (pr (/ 1.5f0 2.5f0)) (pr (d-div 1.5f0 2.5f0)))
+(assert-equal (pr (/ 7.0f0 3.0f0)) (pr (d-div 7.0f0 3.0f0)))
+(assert-equal (pr (/ -1.0f0 3.0f0)) (pr (d-div -1.0f0 3.0f0)))
+;; 型が保たれること
+(assert-equal '<single-float> (%%class-name (class-of (d-div 1.0f0 3.0f0))))
+(assert-equal '<double-float> (%%class-name (class-of (d-div 1.0f0 3.0d0))))  ; 混在は C 経由
+(assert-equal '<single-float> (%%class-name (class-of (d-div 1 3.0f0))))      ; 整数混在も single
+;; ゼロ除算は IEEE どおり inf/nan(/ の側。quotient とは別)
+(assert-equal (pr (/ 1.0f0 0.0f0)) (pr (d-div 1.0f0 0.0f0)))
+(assert-equal (pr (/ 0.0f0 0.0f0)) (pr (d-div 0.0f0 0.0f0)))
+;; 整数どうしは従来どおり(single 経路に入らない)
+(assert-equal 2 (d-div 4 2))
+
+;;; quotient: 両方整数で割り切れれば整数、でなければ float
+(assert-equal 2 (d-quo 4 2))
+(assert-equal t (floatp (d-quo 1 2)))
+(assert-equal '<single-float> (%%class-name (class-of (d-quo 1.0f0 3.0f0))))
+(assert-equal (pr (quotient 1.0f0 3.0f0)) (pr (d-quo 1.0f0 3.0f0)))
+(assert-equal (pr (quotient 1.5f0 2.5f0)) (pr (d-quo 1.5f0 2.5f0)))
+;; quotient のゼロ除算は <division-by-zero>(/ の inf とは異なる)
+(assert-error (quotient 1.0f0 0.0f0))
+(assert-error (quotient 1 0))
+
+;;; reciprocal: (quotient 1 x) なので整数 1 と x の混在になる
+(assert-equal '<single-float> (%%class-name (class-of (d-rec 2.0f0))))
+(assert-equal (pr (reciprocal 2.0f0)) (pr (d-rec 2.0f0)))
+(assert-equal (pr (reciprocal 3.0f0)) (pr (d-rec 3.0f0)))
+(assert-equal 0.5f0 (d-rec 2.0f0))   ; **接尾辞を落とすと double で読まれて不一致になる**
+(assert-error (reciprocal 0))
+
+;;; --- 二重丸めの確認 ---
+;;; **single どうしの除算は single で割る。** double で割ってから single へ丸めると
+;;; 2 回丸めることになり、divss と食い違いうる(documents/single-float-arith.md §5)。
+;;; 下は「C 経由(primitive_divide2)と JIT 経由(divss)が一致する」ことの確認。
+(defun dd (a b) (/ a b))
+(assert-equal (pr (/ 1.0f0 49.0f0)) (pr (dd 1.0f0 49.0f0)))
+(assert-equal (pr (/ 1.0f0 7.0f0)) (pr (dd 1.0f0 7.0f0)))
+(assert-equal (pr (/ 16777215.0f0 16777213.0f0)) (pr (dd 16777215.0f0 16777213.0f0)))
+(format *isiki-test-stream* "[SFA] 1/3=~A 1/49=~A~%" (pr (dd 1.0f0 3.0f0)) (pr (dd 1.0f0 49.0f0)))
+(finish-output *isiki-test-stream*)
