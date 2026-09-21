@@ -4285,6 +4285,14 @@ static const char *const g_decl_type_names[] = {
 };
 #define DECL_TYPE_NAME_COUNT ((UINT64)(sizeof(g_decl_type_names) / sizeof(g_decl_type_names[0])))
 
+/* [型特化] 個別の型符号(runtime.h)が表の並びと一致していることを、
+   **文字列比較ではなくビルド時に**確かめる。表へ要素を挿入すると符号がずれ、
+   「fixnum と宣言したのに single 用の呼び先を呼ぶ」という静かな誤りになる。 */
+_Static_assert(OS_DECL_TYPE_FIXNUM >= 1 && OS_DECL_TYPE_FIXNUM <= 26,
+               "OS_DECL_TYPE_FIXNUM が g_decl_type_names の範囲外");
+_Static_assert(OS_DECL_TYPE_SINGLE_FLOAT >= 1 && OS_DECL_TYPE_SINGLE_FLOAT <= 26,
+               "OS_DECL_TYPE_SINGLE_FLOAT が g_decl_type_names の範囲外");
+
 /* 符号は1始まりで、254(OTHER)/255(UNKNOWN)とぶつかってはならない */
 _Static_assert(sizeof(g_decl_type_names) / sizeof(g_decl_type_names[0]) < 254,
                "g_decl_type_names got too large: codes would collide with OS_DECL_TYPE_OTHER/UNKNOWN");
@@ -5960,6 +5968,83 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return primitive_addと同じ規則で計算した合計値
  */
+/* ===== 型特化した + (documents/type-specialized-dispatch.md) ==========
+ *
+ * **宣言された型を無検査で信じる。** タグを一切見ない。
+ * 宣言が嘘なら壊れるが、それが仕様である(CommonLisp の (safety 0) と同じ立場。
+ * documents/declare-typed-add.md §3-1)。
+ *
+ * 監査ビルド(ISIKIOS_DECLARE_AUDIT)でだけ、渡された値が宣言どおりかを確認して
+ * 合わなければ os_panic で止める。**通常ビルドの実行時コストはゼロ**である。
+ */
+#ifdef ISIKIOS_DECLARE_AUDIT
+static void declare_audit_fail(const char *fn, const char *expected, lisp_val_t got) {
+    os_diag_serial_write("\nPANIC: declare が嘘をついている\n  関数: ");
+    os_diag_serial_write(fn);
+    os_diag_serial_write("\n  宣言された型: ");
+    os_diag_serial_write(expected);
+    os_diag_serial_write("\n  実際のタグ: 0x");
+    {
+        UINT64 t = got & TAG_MASK;
+        char hex[2];
+        hex[0] = (char)(t < 10 ? ('0' + t) : ('A' + t - 10));
+        hex[1] = '\0';
+        os_diag_serial_write(hex);
+    }
+    os_diag_serial_write(" (0=fixnum 4=single-float 7=instance)\n");
+    os_panic("declare audit: 宣言と実際の型が一致しない");
+}
+#define DECLARE_AUDIT_FIXNUM(fn, v) \
+    do { if (((v) & TAG_MASK) != TAG_FIXNUM) { declare_audit_fail((fn), "<fixnum>", (v)); } } while (0)
+#define DECLARE_AUDIT_SINGLE(fn, v) \
+    do { if (!os_is_single_float(v)) { declare_audit_fail((fn), "<single-float>", (v)); } } while (0)
+#else
+#define DECLARE_AUDIT_FIXNUM(fn, v) ((void)0)
+#define DECLARE_AUDIT_SINGLE(fn, v) ((void)0)
+#endif
+
+/**
+ * 型特化した + (fixnum × fixnum)。**タグを見ない。**
+ *
+ * 桁溢れは GENERIC と同じく bignum へ昇格させる必要があるため、
+ * fixnum_add_signed をそのまま使う(あれが 0 を返すのは桁溢れのときだけである。
+ * タグ検査は宣言で保証されているぶん無駄になるが、**結果の一致を優先する**)。
+ * @param a 第一オペランド(<fixnum> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a+b
+ */
+lisp_val_t primitive_add2_fixnum(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", b);
+    lisp_val_t sum;
+    if (fixnum_add_signed(a, b, &sum)) {
+        return sum;
+    }
+    /* 桁溢れ。GENERIC と同じ経路で bignum へ昇格させる */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_add(args, global_environment);
+}
+
+/**
+ * 型特化した + (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。** single どうしの和は正確な結果が
+ * double で表現できるため、double で足してから single へ丸めても
+ * single で直接足した結果と一致する(除算だけは二重丸めになるので別扱い。
+ * documents/single-float-arith.md §5)。
+ * @param a 第一オペランド(<single-float> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a+b
+ */
+lisp_val_t primitive_add2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_add2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_add2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) +
+                                        (double)os_single_float_value(b)));
+}
+
 lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
     lisp_val_t sum;
     if (fixnum_add_signed(a, b, &sum)) {
