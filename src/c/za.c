@@ -2790,7 +2790,7 @@ static UINT8 za_operand_decl_type(lisp_val_t form, lisp_val_t params, UINT64 fix
    2^24 を超える fixnum で桁が落ちる問題があるため、GENERIC へ落とす
    (documents/declare-typed-add.md §3-3)。
 
-   対象は `+` と `-`(PR #89 / 本 PR)。`*` `/` は未対応で、ここに足していく
+   対象は `+` `-` `*`(PR #89 / #91 / 本 PR)。`/` は未対応で、ここに足していく
    (documents/declare-typed-arith.md)。
    **単項の `-`(符号反転)は対象外。** za_compile_fold は引数 2 つ未満で
    そもそも呼ばれない。 */
@@ -2802,6 +2802,9 @@ static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
         if (generic_fn == (void *)primitive_subtract2) {
             return (void *)primitive_subtract2_fixnum;
         }
+        if (generic_fn == (void *)primitive_multiply2) {
+            return (void *)primitive_multiply2_fixnum;
+        }
         return 0;
     }
     if (ta == OS_DECL_TYPE_SINGLE_FLOAT && tb == OS_DECL_TYPE_SINGLE_FLOAT) {
@@ -2810,6 +2813,9 @@ static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
         }
         if (generic_fn == (void *)primitive_subtract2) {
             return (void *)primitive_subtract2_single;
+        }
+        if (generic_fn == (void *)primitive_multiply2) {
+            return (void *)primitive_multiply2_single;
         }
         return 0;
     }

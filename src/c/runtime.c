@@ -5883,6 +5883,49 @@ static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
     return fixnum_add_signed_unchecked(a, b, out);
 }
 
+/* [改善B] fixnum 乗算のコア。**タグ検査をしない。**
+   両方が fixnum であることを呼び出し側が保証する。
+   0 を返すのは**桁溢れのときだけ**である。
+
+   **`+` `-` より単純である。** 符号は `neg_a ^ neg_b` で決まり、マグニチュードの
+   計算に符号が影響しない。`+` のような「同符号なら加算、異符号ならマグニチュードを
+   比較して減算」の場合分けが要らない
+   (documents/fixnum-signed-fastpath.md §5-1 の予告どおり)。
+
+   [桁溢れ判定に除算を使わない] マグニチュードは高々 2^60-1 なので積は高々 2^120。
+   **128bit で受ければ `prod > FIXNUM_MAGNITUDE_MASK` の比較 1 回で済む。**
+   以前は `mag_b <= FIXNUM_MAGNITUDE_MASK / mag_a` と 64bit 除算で判定しており、
+   `mag_a == 0` の場合分けも要った(0 除算を避けるため)。
+
+   [__int128 を選んだ理由] __builtin_mul_overflow は「64bit に収まるか」しか
+   見ないので、そのあとさらに FIXNUM_MAGNITUDE_MASK との比較が要り、判定が
+   2 段になる。__int128 なら上の 1 行が**そのまま桁溢れの定義**になる。
+   x86-64 では u64 × u64 → u128 は `mul` 1 命令で、libgcc の呼び出しは出ない
+   (libgcc が要るのは 128bit の除算・剰余である)。
+
+   [-0 を作らない] os_make_fixnum_signed がマグニチュード 0 の符号を落とすので、
+   `(* 0 -1)` は正のゼロになる。 */
+static int fixnum_multiply_signed_unchecked(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    unsigned __int128 prod =
+        (unsigned __int128)os_fixnum_magnitude(a) * (unsigned __int128)os_fixnum_magnitude(b);
+    if (prod > (unsigned __int128)FIXNUM_MAGNITUDE_MASK) {
+        return 0;
+    }
+    *out = os_make_fixnum_signed(os_fixnum_is_negative(a) != os_fixnum_is_negative(b),
+                                 (UINT64)prod);
+    return 1;
+}
+
+/** fixnum 乗算(タグ検査つき)。GENERIC(primitive_multiply / primitive_multiply2)が使う。
+ *  **0 を返すのは「どちらかが fixnum でない」か「桁溢れ」のどちらか**である。
+ *  fixnum_add_signed と同じ立場で、呼び出し側はどちらも次の経路へ落とす。 */
+static int fixnum_multiply_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
+        return 0;
+    }
+    return fixnum_multiply_signed_unchecked(a, b, out);
+}
+
 /**
  * 組み込み関数+。argsの全数値(FIXNUM/bignum/float、負数も可)を合計する。
  * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
@@ -6347,23 +6390,21 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
         return os_make_float_of_kind(kind, product);
     }
 
+    /* [改善B] 途中経過(prod_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない。
+       以前は「全オペランドが**非負**」を要求していたため、`(* -2 3)` のように
+       結果がFIXNUMに収まる式でもbignum機構(decompose→limb_alloc→mag_mul→
+       os_make_integer)を丸ごと通っていた。改善Aが `+`/`-` で直したのと同じ構図で、
+       fixnum_multiply_signed へ寄せて符号つきのまま計算する */
     int fast = 1;
-    UINT64 product = 1;
+    lisp_val_t prod_val = os_make_fixnum(1);
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        lisp_val_t v = cc_car(cur);
-        if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+        if (!fixnum_multiply_signed(prod_val, cc_car(cur), &prod_val)) {
             fast = 0;
             break;
         }
-        UINT64 mag = os_fixnum_magnitude(v);
-        if (mag != 0 && product > FIXNUM_MAGNITUDE_MASK / mag) {
-            fast = 0;
-            break;
-        }
-        product *= mag;
     }
     if (fast) {
-        return os_make_fixnum(product);
+        return prod_val;
     }
 
     // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -6403,14 +6444,56 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return primitive_multiplyと同じ規則で計算したa*b
  */
+/**
+ * 型特化した * (fixnum × fixnum)。**タグを見ない。**
+ *
+ * 桁溢れは GENERIC と同じく bignum へ昇格させる必要があるため、コアを共有する
+ * fixnum_multiply_signed_unchecked を使う。**タグ検査だけを省く。**
+ *
+ * **宣言が嘘なら壊れる**(documents/declare-typed-add.md §3-1)。
+ * @param a 第一オペランド(<fixnum> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a*b
+ */
+lisp_val_t primitive_multiply2_fixnum(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_multiply2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_multiply2_fixnum", b);
+    lisp_val_t prod;
+    if (fixnum_multiply_signed_unchecked(a, b, &prod)) {
+        return prod;
+    }
+    /* 桁溢れ。GENERIC と同じ経路で bignum へ昇格させる */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_multiply(args, global_environment);
+}
+
+/**
+ * 型特化した * (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。** single どうしの積は正確な結果が
+ * double で表現できる(仮数 24bit × 24bit = 48bit ≦ 53bit、指数も double の
+ * 範囲に収まる)ため、double で掛けてから single へ丸めても single で直接
+ * 掛けた結果と一致する(除算だけは二重丸めになるので別扱い。
+ * documents/single-float-arith.md §5)。
+ * @param a 第一オペランド(<single-float> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a*b
+ */
+lisp_val_t primitive_multiply2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_multiply2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_multiply2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) *
+                                        (double)os_single_float_value(b)));
+}
+
 lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
-    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
-        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
-        UINT64 mag_a = os_fixnum_magnitude(a);
-        UINT64 mag_b = os_fixnum_magnitude(b);
-        if (mag_a == 0 || mag_b <= FIXNUM_MAGNITUDE_MASK / mag_a) {
-            return os_make_fixnum(mag_a * mag_b);
-        }
+    /* [改善B] 符号つきのまま計算し、桁溢れ判定に除算を使わない。
+       以前は「両方とも非負」に限られていたため `(* -2 3)` が bignum 機構を通った */
+    lisp_val_t prod;
+    if (fixnum_multiply_signed(a, b, &prod)) {
+        return prod;
     }
     /* [型昇格] add2と同じ。singleどうしならヒープ確保ゼロ */
     int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
