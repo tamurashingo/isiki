@@ -1940,6 +1940,19 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b);
 
 /**
+ * 型特化した - (fixnum × fixnum)。**宣言された型を無検査で信じ、タグを見ない。**
+ * 宣言が嘘なら壊れる(documents/declare-typed-add.md §3-1)。
+ * GENERIC と同じく a-b を a+(-b) に帰着させ、桁溢れは bignum へ昇格する。
+ */
+lisp_val_t primitive_subtract2_fixnum(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した - (single-float × single-float)。**同上、タグを見ない。**
+ * GENERIC と同じく double を経由するので結果はビット単位で一致する。
+ */
+lisp_val_t primitive_subtract2_single(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数CONS。第一引数をcar、第二引数をcdrとするconsを返す。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
