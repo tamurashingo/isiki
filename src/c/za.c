@@ -342,6 +342,22 @@ static void jit_test_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x85, d
  * jit_emit_reg_reg_opが使っている0x89系は reg=src / rm=dst だが、cmovccは
  * **reg=dst / rm=src で向きが逆**なので個別に組む。
  * 分岐を出さずに真偽値を選ぶために使う(documents/inline-builtin.md)。 */
+/* cmovcc の条件コード(0F 4x /r の下位ニブル) */
+#define JIT_CC_AE 0x43   /* CF=0            : above or equal */
+#define JIT_CC_E  0x44   /* ZF=1            : equal */
+#define JIT_CC_A  0x47   /* CF=0 かつ ZF=0  : above */
+#define JIT_CC_P  0x4A   /* PF=1            : parity(ucomiss の非順序) */
+
+/** cmovcc dst, src (REX.W + 0F cc /r)。jit_cmove_reg_reg の条件可変版。
+ *  **フラグを変えない**ので、ucomiss の直後に何段でも積める。 */
+static void jit_cmovcc_reg_reg(UINT8 cc, UINT8 dst, UINT8 src) {
+    UINT8 rex = (UINT8)(0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x0F);
+    jit_emit8(cc);
+    jit_emit8((UINT8)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
 static void jit_cmove_reg_reg(UINT8 dst, UINT8 src) {
     UINT8 rex = (UINT8)(0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
     jit_emit8(rex);
@@ -490,6 +506,95 @@ static void jit_cmp_reg_imm8(UINT8 reg, UINT8 imm8) {
     jit_emit8(0x83);
     jit_emit8((UINT8)(0xC0 | (7 << 3) | (reg & 7)));
     jit_emit8(imm8);
+}
+
+/* ===== SSE(single-float 算術のインライン化) =============================
+ *
+ * **JIT がこれまで出していたのは整数命令だけだった。** single-float は
+ * タグ 0x4 の即値でヒープ確保がゼロなのに、算術のインライン経路が fixnum 専用の
+ * ため毎回 C を呼んでいた(documents/single-float-arith.md)。
+ *
+ * [XMM を使ってよい根拠]
+ * - 割り込み/タイマは FXSAVE/FXRSTOR で x87/xmm0-15/MXCSR をすべて保存する
+ *   (interrupt.c)。spawn の偽フレームにも FXSAVE 領域があり init_fpu の
+ *   既定状態で初期化される(process.c)
+ * - MXCSR は 0x1F80(全 SIMD 例外マスク、round-to-nearest、FTZ/DAZ なし)。
+ *   **C 経由の結果と食い違わない**
+ * - ここで使うのは**揮発 xmm0/xmm1 だけ**で、**call をまたがない**。
+ *   したがってプロローグ/エピローグに保存・復元を足す必要が無い
+ * - **タグ付きの Lisp 値を XMM に置かない。** 置くと GC から見えなくなる。
+ *   XMM に入るのは float のビット列だけである
+ */
+
+/** shr reg, imm8 (REX.W + C1 /5 ib) */
+static void jit_shr_reg_imm8(UINT8 reg, UINT8 imm8) {
+    jit_emit8((UINT8)(0x48 | ((reg >> 3) & 1)));
+    jit_emit8(0xC1);
+    jit_emit8((UINT8)(0xC0 | (5 << 3) | (reg & 7)));
+    jit_emit8(imm8);
+}
+
+/** shl reg, imm8 (REX.W + C1 /4 ib) */
+static void jit_shl_reg_imm8(UINT8 reg, UINT8 imm8) {
+    jit_emit8((UINT8)(0x48 | ((reg >> 3) & 1)));
+    jit_emit8(0xC1);
+    jit_emit8((UINT8)(0xC0 | (4 << 3) | (reg & 7)));
+    jit_emit8(imm8);
+}
+
+/** or reg, imm8 (REX.W + 83 /1 ib)。タグを付け直すのに使う */
+static void jit_or_reg_imm8(UINT8 reg, UINT8 imm8) {
+    jit_emit8((UINT8)(0x48 | ((reg >> 3) & 1)));
+    jit_emit8(0x83);
+    jit_emit8((UINT8)(0xC0 | (1 << 3) | (reg & 7)));
+    jit_emit8(imm8);
+}
+
+/** movd xmm, r32 (66 [REX] 0F 6E /r)。**REX.W を付けてはいけない**
+ *  (付けると movq になり上位 32bit まで運んでしまう)。 */
+static void jit_movd_xmm_from_reg32(UINT8 xmm, UINT8 reg) {
+    jit_emit8(0x66);
+    UINT8 rex = (UINT8)((((xmm >> 3) & 1) << 2) | ((reg >> 3) & 1));
+    if (rex != 0) { jit_emit8((UINT8)(0x40 | rex)); }
+    jit_emit8(0x0F);
+    jit_emit8(0x6E);
+    jit_emit8((UINT8)(0xC0 | ((xmm & 7) << 3) | (reg & 7)));
+}
+
+/** movd r32, xmm (66 [REX] 0F 7E /r)。上位 32bit はゼロ拡張される */
+static void jit_movd_reg32_from_xmm(UINT8 reg, UINT8 xmm) {
+    jit_emit8(0x66);
+    UINT8 rex = (UINT8)((((xmm >> 3) & 1) << 2) | ((reg >> 3) & 1));
+    if (rex != 0) { jit_emit8((UINT8)(0x40 | rex)); }
+    jit_emit8(0x0F);
+    jit_emit8(0x7E);
+    jit_emit8((UINT8)(0xC0 | ((xmm & 7) << 3) | (reg & 7)));
+}
+
+/* scalar single-float 演算のオペコード(F3 0F xx /r) */
+#define JIT_SS_ADD 0x58
+#define JIT_SS_MUL 0x59
+#define JIT_SS_SUB 0x5C
+#define JIT_SS_DIV 0x5E
+
+/** addss/subss/mulss/divss dst_xmm, src_xmm (F3 [REX] 0F op /r) */
+static void jit_ss_op_xmm(UINT8 op, UINT8 dst_xmm, UINT8 src_xmm) {
+    jit_emit8(0xF3);
+    UINT8 rex = (UINT8)((((dst_xmm >> 3) & 1) << 2) | ((src_xmm >> 3) & 1));
+    if (rex != 0) { jit_emit8((UINT8)(0x40 | rex)); }
+    jit_emit8(0x0F);
+    jit_emit8(op);
+    jit_emit8((UINT8)(0xC0 | ((dst_xmm & 7) << 3) | (src_xmm & 7)));
+}
+
+/** ucomiss a_xmm, b_xmm ([REX] 0F 2E /r)。**非順序で ZF=PF=CF=1 になる**ので、
+ *  PF を見れば NaN を区別できる(comiss と違い quiet NaN で例外を出さない)。 */
+static void jit_ucomiss_xmm(UINT8 a_xmm, UINT8 b_xmm) {
+    UINT8 rex = (UINT8)((((a_xmm >> 3) & 1) << 2) | ((b_xmm >> 3) & 1));
+    if (rex != 0) { jit_emit8((UINT8)(0x40 | rex)); }
+    jit_emit8(0x0F);
+    jit_emit8(0x2E);
+    jit_emit8((UINT8)(0xC0 | ((a_xmm & 7) << 3) | (b_xmm & 7)));
 }
 
 /** jmp reg (レジスタ間接ジャンプ、"jmp r/m64"opcode0xFF /4でエンコード) */
@@ -2698,11 +2803,149 @@ static int za_compile_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
  * 使う必要があるため、インライン試行部分は破壊せずr10を計算用スコッチとして使う
  * (add/subの結果をr10で計算してからraxへ移す。rcx/rdx自体は最後まで不変)。
  */
+/* [single-float] rcx=a, rdx=b が**両方 single-float かどうか**を検査し、
+   外れる場合の patch を積む。タグを見るだけなので宣言(declare)は要らない。
+   **混在(single × double)も外れる側へ落とす。** 型昇格の規則は C 側が持って
+   いるので二重実装しない(PR #80)。 */
+static void za_emit_single_float_guard(UINT64 *patches, UINT64 *count) {
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
+    jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
+    jit_cmp_reg_imm8(ZA_REG_R10, (UINT8)TAG_SINGLE_FLOAT);
+    patches[(*count)++] = jit_emit_jne_rel32_placeholder();
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RDX);
+    jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
+    jit_cmp_reg_imm8(ZA_REG_R10, (UINT8)TAG_SINGLE_FLOAT);
+    patches[(*count)++] = jit_emit_jne_rel32_placeholder();
+}
+
+/* [single-float] 両方が single-float と分かった後の本体。
+   bits 32-63 を取り出して XMM で演算し、タグを付け直して rax へ置く。
+
+   **fixnum のインライン経路より単純である。** float は範囲を超えても別表現へ
+   昇格せず無限大になるだけなので、fixnum の `js`(オーバーフロー検出)に
+   相当する検査が要らない。
+
+   rcx/rdx は壊さない(フォールバック call がそのまま使う)。 */
+static void za_emit_single_float_binop(UINT8 ss_op) {
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
+    jit_shr_reg_imm8(ZA_REG_R10, SINGLE_FLOAT_VALUE_SHIFT);
+    jit_movd_xmm_from_reg32(0, ZA_REG_R10);
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RDX);
+    jit_shr_reg_imm8(ZA_REG_R10, SINGLE_FLOAT_VALUE_SHIFT);
+    jit_movd_xmm_from_reg32(1, ZA_REG_R10);
+    jit_ss_op_xmm(ss_op, 0, 1);
+    jit_movd_reg32_from_xmm(ZA_REG_R10, 0);
+    jit_shl_reg_imm8(ZA_REG_R10, SINGLE_FLOAT_VALUE_SHIFT);
+    jit_or_reg_imm8(ZA_REG_R10, (UINT8)TAG_SINGLE_FLOAT);
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R10);
+}
+
+/* [single-float] 比較 6 種を ucomiss でインライン化する。
+   対応する wrapper_fn なら 1 を返し、**single 経路とフォールバック call の
+   両方を出力済み**の状態にする。対応しないなら 0(呼び出し元が call を出す)。
+
+   **ucomiss は非順序(NaN)で ZF=PF=CF=1 になる。** これは「より小」「等しい」と
+   フラグで区別できないため、素朴に jb / je を使うと NaN で誤る
+   (documents/nan-comparison.md §7)。
+
+   | 演算子 | ucomiss の順序 | 主 cmov | 補正 |
+   |---|---|---|---|
+   | >  | a, b | cmova  | 不要(非順序は CF=1 で偽) |
+   | >= | a, b | cmovae | 不要(同上) |
+   | <  | **b, a** | cmova  | 不要(入れ替えで PF を見ずに済む) |
+   | <= | **b, a** | cmovae | 不要(同上) |
+   | =  | a, b | cmove  | **cmovp で nil へ戻す**(ZF=1 に吸われるのを防ぐ) |
+   | /= | a, b | cmove で nil | **cmovp で t へ戻す**(向きが他と逆) |
+
+   非順序が真になるのは /= だけである(IEEE 754。C 側の num_ne と一致させる)。
+
+   分岐ではなく cmov で組むのは、TCG では分岐の追加が重いためである
+   (documents/inline-builtin.md の実測で、分岐版は呼び出しより 11% 遅かった)。 */
+static int za_emit_single_float_compare(void *wrapper_fn) {
+    UINT8 cc = 0;       /* 主 cmov の条件。0 なら = // = 系 */
+    int swap = 0;       /* ucomiss のオペランドを入れ替えるか */
+    int eq_kind = 0;    /* 1: = 、2: /= */
+    if (wrapper_fn == (void *)primitive_greater_than2)       { cc = JIT_CC_A; }
+    else if (wrapper_fn == (void *)primitive_greater_equal2) { cc = JIT_CC_AE; }
+    else if (wrapper_fn == (void *)primitive_less_than2)     { cc = JIT_CC_A;  swap = 1; }
+    else if (wrapper_fn == (void *)primitive_less_equal2)    { cc = JIT_CC_AE; swap = 1; }
+    else if (wrapper_fn == (void *)primitive_num_equal2)     { eq_kind = 1; }
+    else if (wrapper_fn == (void *)primitive_num_not_equal2) { eq_kind = 2; }
+    else { return 0; }
+
+    UINT64 fallback_patches[2];
+    UINT64 fallback_count = 0;
+    za_emit_single_float_guard(fallback_patches, &fallback_count);
+
+    /* bits 32-63 を xmm へ。**タグ付きの値は XMM に置かない** */
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
+    jit_shr_reg_imm8(ZA_REG_R10, SINGLE_FLOAT_VALUE_SHIFT);
+    jit_movd_xmm_from_reg32(0, ZA_REG_R10);
+    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RDX);
+    jit_shr_reg_imm8(ZA_REG_R10, SINGLE_FLOAT_VALUE_SHIFT);
+    jit_movd_xmm_from_reg32(1, ZA_REG_R10);
+    if (swap) {
+        jit_ucomiss_xmm(1, 0);   /* (< a b) は ucomiss b, a + above とする */
+    } else {
+        jit_ucomiss_xmm(0, 1);
+    }
+
+    /* [原則8] g_sym_t は GC ヒープ上にあり移動する。**アドレスを movabs して
+       deref する**こと(za_emit_inline_bool_from_flags と同じ理由)。
+       movabs も mov r64,[r64] もフラグを変えないので ucomiss の結果は保たれる。 */
+    jit_movabs_reg(ZA_REG_R10, (UINT64)(void *)&g_sym_t);
+    jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);
+    jit_movabs_reg(ZA_REG_R9, nil);
+
+    if (eq_kind == 0) {
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R9);            /* 既定 nil */
+        jit_cmovcc_reg_reg(cc, ZA_REG_RAX, ZA_REG_R10);    /* 条件成立なら t */
+    } else if (eq_kind == 1) {
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R9);            /* 既定 nil */
+        jit_cmovcc_reg_reg(JIT_CC_E, ZA_REG_RAX, ZA_REG_R10);  /* ZF=1 なら t */
+        jit_cmovcc_reg_reg(JIT_CC_P, ZA_REG_RAX, ZA_REG_R9);   /* 非順序なら nil へ戻す */
+    } else {
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R10);           /* 既定 t */
+        jit_cmovcc_reg_reg(JIT_CC_E, ZA_REG_RAX, ZA_REG_R9);   /* 等しければ nil */
+        jit_cmovcc_reg_reg(JIT_CC_P, ZA_REG_RAX, ZA_REG_R10);  /* 非順序なら t へ戻す */
+    }
+    UINT64 done_patch = jit_emit_jmp_rel32_placeholder();
+
+    UINT64 slow_offset = g_jit_used;
+    for (UINT64 k = 0; k < fallback_count; k++) {
+        jit_patch_rel32_target(fallback_patches[k], slow_offset);
+    }
+    jit_movabs_r11((UINT64)wrapper_fn);
+    jit_call_r11();
+    jit_patch_rel32(done_patch);
+    return 1;
+}
+
 static void za_emit_arith_call_or_inline(void *wrapper_fn) {
-    if (wrapper_fn != (void *)primitive_add2 && wrapper_fn != (void *)primitive_subtract2) {
+    /* [single-float] この演算に対応する scalar single 命令。0 なら single の
+       インライン化対象外(/ は za の算術経路そのものが無い。§4-1)。 */
+    UINT8 ss_op = 0;
+    if (wrapper_fn == (void *)primitive_add2)           { ss_op = JIT_SS_ADD; }
+    else if (wrapper_fn == (void *)primitive_subtract2) { ss_op = JIT_SS_SUB; }
+    else if (wrapper_fn == (void *)primitive_multiply2) { ss_op = JIT_SS_MUL; }
+
+    if (ss_op == 0) {
         jit_movabs_r11((UINT64)wrapper_fn);
         jit_call_r11();
         return;
+    }
+
+    /* fixnum のインライン経路は + と - だけが持つ(* は従来どおり call)。
+       single の経路はそのあとに続けるので、* はここを素通りして single 判定へ進む。 */
+    int has_fixnum_fast = (wrapper_fn == (void *)primitive_add2 ||
+                           wrapper_fn == (void *)primitive_subtract2);
+    UINT64 fallback_patches[8];
+    UINT64 fallback_count = 0;
+    UINT64 done_patches[2];
+    UINT64 done_count = 0;
+
+    if (!has_fixnum_fast) {
+        goto single_path;
     }
 
     // 両方非負fixnum(タグ3bit=000かつ符号bit63=0)かどうかを、a|bへ
@@ -2712,8 +2955,6 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
     jit_or_reg_reg(ZA_REG_R10, ZA_REG_RDX);
     jit_movabs_reg(ZA_REG_R9, TAG_MASK | FIXNUM_SIGN_BIT);
     jit_test_reg_reg(ZA_REG_R10, ZA_REG_R9);
-    UINT64 fallback_patches[2];
-    UINT64 fallback_count = 0;
     fallback_patches[fallback_count++] = jit_emit_jne_rel32_placeholder();
 
     if (wrapper_fn == (void *)primitive_add2) {
@@ -2736,7 +2977,21 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
         jit_sub_reg_reg(ZA_REG_R10, ZA_REG_RDX);
     }
     jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R10);
-    UINT64 fast_done_patch = jit_emit_jmp_rel32_placeholder();
+    done_patches[done_count++] = jit_emit_jmp_rel32_placeholder();
+
+single_path:
+    /* [single-float] fixnum で外れた分はここへ合流する。**両方 single なら
+       C を一切呼ばずに XMM で計算する。** 外れたら下の call へ落ちる。 */
+    {
+        UINT64 slow_offset_fixnum = g_jit_used;
+        for (UINT64 k = 0; k < fallback_count; k++) {
+            jit_patch_rel32_target(fallback_patches[k], slow_offset_fixnum);
+        }
+        fallback_count = 0;
+        za_emit_single_float_guard(fallback_patches, &fallback_count);
+        za_emit_single_float_binop(ss_op);
+        done_patches[done_count++] = jit_emit_jmp_rel32_placeholder();
+    }
 
     // フォールバック: rcx=a, rdx=bは上記のいずれの分岐でも変更していないため、
     // 従来通りwrapper_fn(a, b)をそのまま間接callできる。
@@ -2747,7 +3002,9 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
     jit_movabs_r11((UINT64)wrapper_fn);
     jit_call_r11();
 
-    jit_patch_rel32(fast_done_patch);
+    for (UINT64 k = 0; k < done_count; k++) {
+        jit_patch_rel32(done_patches[k]);
+    }
 }
 static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
@@ -3116,6 +3373,9 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
            rcx=第一オペランド、rdx=第二オペランドが揃っているのでそのまま比較する */
         jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
         za_emit_inline_bool_from_flags();
+    } else if (za_emit_single_float_compare(wrapper_fn)) {
+        /* [single-float] 両方 single なら ucomiss でインライン化し、
+           外れたら wrapper_fn へ落ちる(関数側で両方出している) */
     } else {
         jit_movabs_r11((UINT64)wrapper_fn);
         jit_call_r11();

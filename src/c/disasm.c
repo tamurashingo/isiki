@@ -136,6 +136,15 @@ static const char *d_regname(UINT8 reg, int wide) {
 /** 0x83/0x81のグループ1(/digitでニモニックが決まる) */
 static const char *const g_group1[8] = { "add", "or", "adc", "sbb", "and", "sub", "xor", "cmp" };
 
+/** 0xC1/0xD1/0xD3のグループ2(シフト。/digitでニモニックが決まる) */
+static const char *const g_group2[8] = { "rol", "ror", "rcl", "rcr", "shl", "shr", "shl", "sar" };
+
+/** SSEレジスタ名。za.cがsingle-floatの算術で使う(documents/single-float-arith.md) */
+static const char *const g_xmm[16] = {
+    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+    "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"
+};
+
 /** 0x70-0x7F(rel8)および0x0F 0x80-0x8F(rel32)の条件付きジャンプ */
 static const char *const g_jcc[16] = {
     "jo", "jno", "jb", "jae", "je", "jne", "jbe", "ja",
@@ -411,6 +420,14 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
     c.rip_relative = 0;
     c.rip_disp = 0;
 
+    /* [SSE] 0x66(オペランドサイズ)と0xF3(REP)は、SSEでは**オペコードの一部**として
+       働く(66 0F 6E = movd、F3 0F 58 = addss)。REXより前に来るので先に読む。 */
+    UINT8 pfx66 = 0;
+    UINT8 pfxF3 = 0;
+    while (c.pos < code_len && (code[c.pos] == 0x66 || code[c.pos] == 0xF3)) {
+        if (code[c.pos] == 0x66) { pfx66 = 1; } else { pfxF3 = 1; }
+        c.pos++;
+    }
     UINT8 rex = 0;
     while (c.pos < code_len && code[c.pos] >= 0x40 && code[c.pos] <= 0x4F) {
         rex = code[c.pos++];
@@ -488,6 +505,17 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
             } else {
                 sb_shex(&ops, (INT64)(INT32)d_u32(&c));
             }
+            break;
+        }
+
+        /* ---- group2 シフト r/m64, imm8 ---- */
+        case 0xC1: {
+            UINT8 modrm_peek = (c.pos < code_len) ? code[c.pos] : 0;
+            d_decode_modrm(&c, rex, wide, rm_text, sizeof(rm_text), &reg);
+            d_strcpy(mnemonic, sizeof(mnemonic), g_group2[(modrm_peek >> 3) & 7]);
+            sb_str(&ops, rm_text);
+            sb_str(&ops, ", ");
+            sb_shex(&ops, (INT64)d_u8(&c));
             break;
         }
 
@@ -642,6 +670,45 @@ UINT64 os_disasm_item(const UINT8 *code, UINT64 code_len, UINT64 offset, os_disa
                 sb_str(&ops, d_regname(reg, wide));
                 sb_str(&ops, ", ");
                 sb_str(&ops, rm_text);
+            } else if (op2 >= 0x40 && op2 <= 0x4F) {
+                /* cmovcc: "cmov" + jccニモニックの条件部分(setccと同じ作り) */
+                d_decode_modrm(&c, rex, wide, rm_text, sizeof(rm_text), &reg);
+                d_sb_t mn;
+                sb_init(&mn, mnemonic, sizeof(mnemonic));
+                sb_str(&mn, "cmov");
+                sb_str(&mn, g_jcc[op2 - 0x40] + 1);
+                sb_str(&ops, d_regname(reg, wide));
+                sb_str(&ops, ", ");
+                sb_str(&ops, rm_text);
+            } else if (op2 == 0x2E || op2 == 0x2F) {
+                /* [SSE] ucomiss / comiss xmm, xmm。za.cが出すのはレジスタ間のみ */
+                UINT8 modrm = d_u8(&c);
+                d_strcpy(mnemonic, sizeof(mnemonic), (op2 == 0x2E) ? "ucomiss" : "comiss");
+                sb_str(&ops, g_xmm[((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3)]);
+                sb_str(&ops, ", ");
+                sb_str(&ops, g_xmm[(modrm & 7) | ((rex & 1) << 3)]);
+            } else if (pfx66 && (op2 == 0x6E || op2 == 0x7E)) {
+                /* [SSE] movd xmm, r32 (6E) / movd r32, xmm (7E)。
+                   **ModRMのregは常にxmm側**で、向きだけがオペコードで決まる */
+                UINT8 modrm = d_u8(&c);
+                const char *x = g_xmm[((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3)];
+                const char *r = d_regname((UINT8)((modrm & 7) | ((rex & 1) << 3)), wide);
+                d_strcpy(mnemonic, sizeof(mnemonic), wide ? "movq" : "movd");
+                if (op2 == 0x6E) {
+                    sb_str(&ops, x); sb_str(&ops, ", "); sb_str(&ops, r);
+                } else {
+                    sb_str(&ops, r); sb_str(&ops, ", "); sb_str(&ops, x);
+                }
+            } else if (pfxF3 && (op2 == 0x58 || op2 == 0x59 || op2 == 0x5C || op2 == 0x5E)) {
+                /* [SSE] scalar single の算術 */
+                UINT8 modrm = d_u8(&c);
+                const char *mn_ss = (op2 == 0x58) ? "addss" :
+                                    (op2 == 0x59) ? "mulss" :
+                                    (op2 == 0x5C) ? "subss" : "divss";
+                d_strcpy(mnemonic, sizeof(mnemonic), mn_ss);
+                sb_str(&ops, g_xmm[((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3)]);
+                sb_str(&ops, ", ");
+                sb_str(&ops, g_xmm[(modrm & 7) | ((rex & 1) << 3)]);
             } else {
                 ok = 0;
             }
