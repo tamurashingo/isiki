@@ -1539,6 +1539,14 @@ void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp
 /** クラスとして解決できなかった(§3-3: エラーにせず無視する) */
 #define OS_DECL_TYPE_UNKNOWN   255
 
+/* [型特化] 個別の型符号。**g_decl_type_names の並びと一致していなければならない**
+   (符号 i の名前が g_decl_type_names[i - 1])。runtime.c 側に
+   _Static_assert 相当の実行時検査は置けないため、表を変えたらここも直すこと。
+   型特化ディスパッチが「この符号なら fixnum 用の呼び先」と判断するのに使う
+   (documents/type-specialized-dispatch.md)。 */
+#define OS_DECL_TYPE_FIXNUM        20
+#define OS_DECL_TYPE_SINGLE_FLOAT  22
+
 /** 1つの関数/letで型を記録できる変数の個数。ZA_MAX_PARAMS(=16)と
     ZA_MAX_LOCALS_PER_LET(=4)のどちらも覆う */
 #define OS_DECL_TYPES_MAX_VARS  16
@@ -1900,6 +1908,19 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env);
  * @return 合計値の整数(60bit以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した + (fixnum × fixnum)。**宣言された型を無検査で信じ、タグを見ない。**
+ * 宣言が嘘なら壊れる(documents/declare-typed-add.md §3-1)。
+ * 桁溢れは GENERIC と同じく bignum へ昇格する。
+ */
+lisp_val_t primitive_add2_fixnum(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した + (single-float × single-float)。**同上、タグを見ない。**
+ * GENERIC と同じく double を経由するので結果はビット単位で一致する。
+ */
+lisp_val_t primitive_add2_single(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として符号を反転する。

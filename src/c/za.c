@@ -1147,6 +1147,19 @@ static int za_local_lookup(const za_local_scope_t *locals, lisp_val_t sym, UINT3
     return 0;
 }
 
+/** let 束縛変数に (declare (type ...)) で宣言された型の符号を引く。
+ *  見つからなければ OS_DECL_TYPE_NONE。 */
+static UINT8 za_local_decl_type(const za_local_scope_t *locals, lisp_val_t sym) {
+    for (const za_local_scope_t *s = locals; s != 0; s = s->parent) {
+        for (UINT64 i = 0; i < s->count; i++) {
+            if (s->vars[i].sym == sym) {
+                return s->vars[i].decl_type;
+            }
+        }
+    }
+    return OS_DECL_TYPE_NONE;
+}
+
 /**
  * +のオペランド1個を分類する。let-IIFEインライン化のローカル変数、paramsの
  * 固定引数部分に含まれるシンボル参照、即値fixnumリテラル、または(quote X)形式の
@@ -2750,6 +2763,45 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
 
     jit_patch_rel32(fast_done_patch);
 }
+/* [型特化] オペランドの宣言型を引く。**declare からのみ。**
+   リテラルや式からの推論はしない(documents/declare-typed-add.md §3-4)。
+   `(+ x (f y))` のように片方が式なら、その型は不明として GENERIC へ落ちる。 */
+static UINT8 za_operand_decl_type(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                   const za_local_scope_t *locals) {
+    if ((form & TAG_MASK) != TAG_SYMBOL) {
+        return OS_DECL_TYPE_NONE;   /* 式・リテラルは不明 */
+    }
+    UINT8 t = za_local_decl_type(locals, form);
+    if (t != OS_DECL_TYPE_NONE) {
+        return t;                   /* let 束縛変数の宣言(内側が優先) */
+    }
+    UINT64 idx;
+    if (za_param_index(params, form, fixed_count, &idx)) {
+        return os_decl_types_get(g_za_param_decl_types, idx);
+    }
+    return OS_DECL_TYPE_NONE;
+}
+
+/* [型特化] 宣言された型の組から呼び先を選ぶ。**引数 2 つのときだけ**呼ばれる。
+   選べなければ 0 を返し、呼び出し元は GENERIC のままにする
+   (documents/type-specialized-dispatch.md §4)。
+
+   **混在(fixnum × single)は本作業では扱わない。** 変換のコストと、
+   2^24 を超える fixnum で桁が落ちる問題があるため、GENERIC へ落とす
+   (documents/declare-typed-add.md §3-3)。 */
+static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
+    if (generic_fn != (void *)primitive_add2) {
+        return 0;                   /* 本作業は + だけ */
+    }
+    if (ta == OS_DECL_TYPE_FIXNUM && tb == OS_DECL_TYPE_FIXNUM) {
+        return (void *)primitive_add2_fixnum;
+    }
+    if (ta == OS_DECL_TYPE_SINGLE_FLOAT && tb == OS_DECL_TYPE_SINGLE_FLOAT) {
+        return (void *)primitive_add2_single;
+    }
+    return 0;
+}
+
 static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
@@ -2796,6 +2848,20 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         if (!za_operand_is_safe_leaf(operand_forms[i], params, fixed_count, locals)) {
             skip_protect = 0;
             break;
+        }
+    }
+
+    /* [型特化] **引数がちょうど 2 つで、両方の型が宣言されているときだけ**
+       呼び先を専用関数へ差し替える。3 つ以上は型が分かっていても GENERIC のまま
+       (documents/type-specialized-dispatch.md §4)。
+       宣言は無検査で信じる。タグ検査は出さない(§3-1)。 */
+    if (count == 2) {
+        void *specialized = za_specialized_wrapper(
+            wrapper_fn,
+            za_operand_decl_type(operand_forms[0], params, fixed_count, locals),
+            za_operand_decl_type(operand_forms[1], params, fixed_count, locals));
+        if (specialized != 0) {
+            wrapper_fn = specialized;
         }
     }
 
