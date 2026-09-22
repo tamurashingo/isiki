@@ -3710,6 +3710,50 @@ make test-qemu-instcount-gate MILESTONE=test/lisp/qemu_boot_instcount_gate_check
 > **空ゲートが 0 と出たのを見て気づいた**(規則 2: 完全一致は疑え)。
 > `BEGIN { k=0; j=0 }` で直してある。
 
+### 計測手順: **ゲートに入る前に GC を起こす**
+
+**区間の中で GC が走ると、その命令数が乗る。**
+
+Phase 0 の 26 区間を測ったとき、`gc=1` だった 3 区間だけ他と違う端数を持っていた。
+
+| 区間 | gc | 端数 |
+|---|---:|---:|
+| `/fix-decl` | 1 | +528,013 |
+| `+dbl-nodecl` | 1 | +156,098 |
+| `*dbl-decl` | 1 | +2,128,866 |
+| 他の 23 区間 | 0 | 無し |
+
+**gc=1 の区間と端数の出た区間が完全に一致していた**ので原因が特定できた
+(GC 1 回のコストは生きているオブジェクトの量で変わるため、端数の大きさは
+区間ごとに違う)。
+
+#### 手順
+
+1. **ゲートに入る前に GC を起こして半空間を空ける**
+2. 区間ごとに `gc=` を出し、**0 であることを確認してから数字を読む**
+
+```lisp
+(defun force-gc ()
+  (let ((c (%%gc-collect-count)))
+    (while (= (%%gc-collect-count) c) (cons 1 2))
+    (%%gc-collect-count)))
+
+(defun seg (label f a b)
+  (force-gc)                       ; ← ゲートの外で
+  (let ((g0 (%%gc-collect-count)) (t0 (get-internal-real-time)))
+    (%%gate-open) (loop f a b n) (%%gate-close)
+    (format s "#seg ~A gc=~D ticks=~D~%" label (- (%%gc-collect-count) g0) ...)))
+```
+
+1 区間ぶんの確保(最大 16MB 程度)は半空間(約 42MB)に収まるので、
+空けてから入れば区間内で GC は起きない。**26 区間すべてが gc=0 になり、
+2 ブートで 1 命令も違わなくなった。**
+
+**ウォームアップもゲートの外で行うこと。** JIT コンパイルとコードページの
+確保が区間に入ると、それも命令数に乗る。
+
+---
+
 ### 合格判定 — **2 つの対照とも合格した**
 
 計器を作り直したら、**それが使い物になることを先に示す**
