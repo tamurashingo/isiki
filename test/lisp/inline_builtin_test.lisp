@@ -91,8 +91,16 @@
 
 ;;; --- 未知の名前はエラーにならない(6-4) ---
 (assert-equal nil (declaim (inline nonexistent-fn)))
-(assert-equal nil (declaim (inline +)))
+;; [変更 (inline-arith)] ここは以前 `+` を「未実装の builtin」の例として使っていたが、
+;; **`+` は対象になった**(documents/inline-arith.md §7)。対象外の例は、
+;; 展開の対象でない builtin へ差し替える。`cons` は確保を伴うので対象にならない
+(assert-equal nil (declaim (inline cons)))
 (assert-equal nil (declaim (notinline nonexistent-fn)))
+(assert-equal nil (%%current-inline))
+;; 算術が対象になったことの確認(打ち消しまでがここの責務)
+(declaim (inline +))
+(assert-equal '(+) (%%current-inline))
+(declaim (notinline +))
 (assert-equal nil (%%current-inline))
 ;; 有効な名前と混ざっていても、有効な分だけ効く
 (declaim (inline nonexistent-fn car))

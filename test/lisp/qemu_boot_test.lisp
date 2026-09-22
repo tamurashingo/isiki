@@ -40,6 +40,7 @@
 (isiki-test-load "test/lisp/jit_code_packing_test.lisp")
 (isiki-test-load "test/lisp/declaim_test.lisp")
 (isiki-test-load "test/lisp/inline_builtin_test.lisp")
+(isiki-test-load "test/lisp/inline_decl_test.lisp")
 (isiki-test-load "test/lisp/fixnum_signed_arith_test.lisp")
 (isiki-test-load "test/lisp/single_float_test.lisp")
 (isiki-test-load "test/lisp/float_contagion_test.lisp")

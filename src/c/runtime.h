@@ -878,10 +878,32 @@ void os_imm_page_free(void *page);
 #define INLINE_BIT_CDR  (1ULL << 1)
 #define INLINE_BIT_NULL (1ULL << 2)
 #define INLINE_BIT_EQ   (1ULL << 3)
+/* 算術(documents/inline-arith.md)。**ビットを足しただけでは展開されない。**
+   za.c 側が za_inline_enabled で門番するところまでが対になる */
+#define INLINE_BIT_ADD  (1ULL << 4)
+#define INLINE_BIT_SUB  (1ULL << 5)
+#define INLINE_BIT_MUL  (1ULL << 6)
+#define INLINE_BIT_DIV  (1ULL << 7)
 
 /** インライン展開の対象名に対応するビットを返す。対象外の名前は0
  * (declaimが未知の名前を黙って無視するための判定に使う) */
 UINT64 os_inline_bit_of(lisp_val_t sym);
+
+/**
+ * bodyの先頭に連続する (declare ...) から (inline f...) / (notinline f...) を読み、
+ * inheritedへ重ねた結果のビット集合を返す。**bodyは変更しない**(剥がすのは
+ * os_scan_declarations の仕事で、こちらは剥がす前に呼ぶ)。確保は行わない。
+ *
+ * 合成の規則(documents/inline-arith.md §7):
+ *   - **内側が優先**。inherited に外側の値を渡し、内側の declare がそれを上書きする
+ *   - **同じ深さなら後から来たものが優先**。宣言指定子を現れた順に適用する
+ *   - 未知の名前は黙って無視する(declaim と同じ方針)
+ *
+ * @param body 走査対象のbody(フォームのリスト)
+ * @param inherited 外側のスコープで効いているビット集合
+ * @return 重ねた結果のビット集合
+ */
+UINT64 os_scan_declaration_inline(lisp_val_t body, UINT64 inherited);
 /** envが属するenvironmentのoptimize指定を読む(frameはos_definition_envで読み飛ばす) */
 UINT64 os_env_optimize(lisp_val_t env);
 /** envが属するenvironmentのoptimize指定を書き換える。書けたら1 */

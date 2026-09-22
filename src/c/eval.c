@@ -422,8 +422,6 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
        代入し直しても追随する。 */
     lisp_val_t fixed_syms[OS_DECL_TYPES_MAX_VARS];
     UINT64 fixed_sym_count = collect_fixed_param_syms(params, fixed_syms, OS_DECL_TYPES_MAX_VARS);
-    os_decl_types_t declared_types;
-    body = os_scan_declarations(body, fixed_syms, fixed_sym_count, &declared_types);
 
     // [重要] envとownerは役割が違う。
     //   env   = 捕捉環境。関数オブジェクトのword3に入り、本体の自由変数を
@@ -438,6 +436,19 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
        本Phaseではza_try_compile_defunは受け取った値をmetaへ記録するだけで、
        コード生成には使わない(Phase3以降) */
     UINT64 optimize = os_env_optimize(owner);
+
+    /* [inline] **declare (inline/notinline ...) は declaim の上に重ねる。**
+       宣言を剥がす前に読むこと(os_scan_declarations が剥がしてしまう)。
+       optimize と同じ fixnum の bit8〜 へ畳み込むので、za_try_compile_defun の
+       署名は変えなくてよく、%%INLINE-OF がそのまま「この関数に効いた指定」を
+       返すようになる(documents/inline-arith.md §7)。 */
+    optimize = DECLAIM_WITH_INLINE_BITS(
+        optimize, os_scan_declaration_inline(body, DECLAIM_INLINE_BITS(optimize)));
+
+    /* 宣言を剥がすのはここ。**上の inline 走査より後**でなければならない */
+    os_decl_types_t declared_types;
+    body = os_scan_declarations(body, fixed_syms, fixed_sym_count, &declared_types);
+
     lisp_val_t fn = za_try_compile_defun(params, body, env, owner, optimize, declared_types);
     if (fn == nil) {
         fn = make_interpreted_function(params, body, env);

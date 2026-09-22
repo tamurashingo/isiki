@@ -1323,6 +1323,11 @@ typedef struct {
     lisp_val_t ge;      /* ">=" */
     lisp_val_t ne;      /* "/=" (二項版はPR #86で追加。それ以前は一般呼び出しへ落ちていた) */
     lisp_val_t slash;   /* "/" (ISLispに / は無く、quotient の実装が内部で使う経路) */
+    /* [inline] (%%inline-here) はコンパイル時に畳む組み込み。**そのフォームが
+       置かれたレキシカルスコープで効いている inline ビット**を fixnum の即値として
+       返す。let の内側の declare が届いているかをテストから読むために置いた
+       (%%INLINE-OF は関数単位までしか見えない。documents/inline-arith.md §7-3) */
+    lisp_val_t inline_here;
     lisp_val_t eqp;     /* "EQ" (ポインタ同一性比較) */
     lisp_val_t nullsym; /* "NULL" */
     lisp_val_t atom;    /* "ATOM" */
@@ -1354,7 +1359,7 @@ typedef struct {
    ではないので、stale領域を読まないからである。
    配列とみなして一括linkするため、平坦であることを機械的に保証しておく。 */
 #define ZA_SYMS_FIELD_COUNT (sizeof(za_syms_t) / sizeof(lisp_val_t))
-_Static_assert(sizeof(za_syms_t) == 27 * sizeof(lisp_val_t),
+_Static_assert(sizeof(za_syms_t) == 28 * sizeof(lisp_val_t),
                "za_syms_tはlisp_val_tだけの平坦な構造体でなければならない"
                "(フィールドを増減したらこの数も更新すること)");
 
@@ -2477,8 +2482,22 @@ static os_decl_types_t g_za_param_decl_types;
 static UINT64 g_za_local_decl_count = 0;
 
 /** nameのbuiltinがこのコンパイルでインライン展開対象か */
+/** [inline] **いまコンパイルしているレキシカルスコープで効いている**ビット集合。
+ *
+ * g_za_declaim は environment 単位の declaim(+ defun 本体の declare を畳み込んだもの)で、
+ * こちらは **let の内側などフォーム単位の declare** まで反映した現在値である。
+ * g_za_fn_scope と同じ「グローバルを save/restore する」方式を採る
+ * (C の再帰がレキシカルネストと 1 対 1 に対応するので、
+ *  パラメータで持ち回るのと意味的に等価。za_fn_scope のコメント参照)。 */
+static UINT64 g_za_inline_scope = 0;
+
+/** cleanup 属性で使う復元。body のコンパイルが途中で失敗して return しても戻る */
+static void za_inline_scope_restore(UINT64 *saved) {
+    g_za_inline_scope = *saved;
+}
+
 static int za_inline_enabled(UINT64 bit) {
-    return (DECLAIM_INLINE_BITS(g_za_declaim) & bit) != 0;
+    return (g_za_inline_scope & bit) != 0;
 }
 
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
@@ -3533,6 +3552,14 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
        os_scan_declarationsは確保を行わないため、**コンパイル中にGCを誘発しない**
        (documents/pitfalls.md 原則4)。Lisp側の%find-classをosApplyFunctionで
        呼ぶ実装にしなかったのはこのためである。 */
+    /* [inline] **剥がす前に**読む。適用するのは body のコンパイルの直前だけで、
+       ここではまだ g_za_inline_scope を触らない。
+       let は `((lambda (v...) . body) init...)` なので、**init 式はこの下で
+       body より先にコンパイルされる。** 適用位置を body ループの直前にすることで、
+       「let の初期化式には効かない」が自然に成り立つ(CommonLisp と同じ。
+       documents/inline-arith.md §7-2) */
+    UINT64 body_inline_bits = os_scan_declaration_inline(lambda_body, g_za_inline_scope);
+
     os_decl_types_t local_decl_types;
     lambda_body = os_scan_declarations(lambda_body, var_syms, var_count, &local_decl_types);
 
@@ -3714,6 +3741,11 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         }
         za_gc_protect_batch_push(&local_scope_nodes[i], &new_scope.vars[i].sym);
     }
+
+    /* [inline] ここから body。**init 式のコンパイルは既に終わっている。**
+       cleanup 属性にしてあるので、body の途中で return 0 しても復元される */
+    UINT64 saved_inline_scope __attribute__((cleanup(za_inline_scope_restore))) = g_za_inline_scope;
+    g_za_inline_scope = body_inline_bits;
 
     UINT64 body_end_patches[ZA_MAX_OPERANDS];
     UINT64 body_end_patch_count = 0;
@@ -3971,6 +4003,12 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
     if (head == syms->ne) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
                                   call_depth, arith_depth, (void *)primitive_num_not_equal2, 0);
+    }
+    if (head == syms->inline_here && cc_cdr(form) == nil) {
+        /* [inline] コンパイル時に畳む。**実行時には何も起きない。**
+           いまのレキシカルスコープのビット集合をそのまま即値で返す */
+        jit_movabs_rax(os_make_fixnum(g_za_inline_scope));
+        return 1;
     }
     if (head == syms->slash) {
         /* **二項のみ。** (/ a b c) は一般呼び出しへ落ちる(n項の型昇格規則は C 側が持つ)。
@@ -6612,6 +6650,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     syms.ge = os_make_symbol(">=");
     syms.ne = os_make_symbol("/=");
     syms.slash = os_make_symbol("/");
+    syms.inline_here = os_make_symbol("%%INLINE-HERE");
     syms.eqp = os_make_symbol("EQ");
     syms.nullsym = os_make_symbol("NULL");
     syms.atom = os_make_symbol("ATOM");
@@ -6634,6 +6673,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     /* [declaim] このコンパイル試行に効くoptimize/inline指定。emitterはg_za_declaimを
        見る(引数で持ち回ると署名が広範囲に波及するため) */
     g_za_declaim = optimize;
+    /* [inline] レキシカルスコープの現在値を、この関数に効く指定で初期化する。
+       let の内側の declare はここから重ねていく(za_compile_let) */
+    g_za_inline_scope = DECLAIM_INLINE_BITS(optimize);
     /* [Phase 4a-2] このコンパイル試行に効く仮引数の型宣言 */
     g_za_param_decl_types = declared_types;
     g_za_local_decl_count = 0;
