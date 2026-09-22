@@ -398,6 +398,94 @@ static lisp_val_t cc_diag_imm_burn(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum(os_imm_space_used_bytes());
 }
 
+/* --- 命令数ゲートのマーカー(documents/performance-measurement.md「手法1の改良案」) ---
+
+   TCGプラグイン(tools/plugins/isiki_instcount.c)の gate_start=/gate_end= に
+   渡すための、**アドレスが既知で一意な2つの関数**。この2つのTBが実行された
+   時点でプラグインが計数を開始/停止する。
+
+   [なぜ必要か] プラグインの start=/end= はTBの開始アドレスで選別する
+   「アドレスのフィルタ」なので、「呼び出し元 + 呼び先 + JIT生成コード」を
+   1つの連続した範囲では囲えない(JITはヒープ上の動的アドレスに居る)。
+   インライン化で消えるのは**呼び出し側のcall**であって呼び先の中身ではないため、
+   呼び先の範囲だけを数えるとインライン化した瞬間に0になり、コストが呼び出し元へ
+   移っただけなのに「全部消えた」と読めてしまう。時間で区切るしかない。
+
+   [インライン化されてはならない] マーカーが展開されると、そのアドレスのTBが
+   存在しなくなってゲートが永久に開かない(または閉じない)。**noinline を
+   構造的に保証する。** 将来 declaim inline をファイル全体にかけても、これは
+   C側の関数なのでLisp側の宣言の影響を受けない。
+
+   [同一コードの畳み込み(ICF)も避ける] 2つの関数の本体が同じだとリンカが
+   1つにまとめてアドレスが一致しうる。**別々のvolatileカウンタを別の値で
+   更新する**ことで、本体が必ず異なるようにしてある。カウンタは
+   %%GATE-HITS から読めるので、ゲートを通った回数をゲスト側からも確認できる。 */
+static volatile UINT64 g_gate_open_hits = 0;
+static volatile UINT64 g_gate_close_hits = 0;
+
+__attribute__((noinline, noclone, used))
+void os_bench_gate_open(void) {
+    g_gate_open_hits += 1;
+    __asm__ __volatile__("" ::: "memory");
+}
+
+__attribute__((noinline, noclone, used))
+void os_bench_gate_close(void) {
+    g_gate_close_hits += 3;
+    __asm__ __volatile__("" ::: "memory");
+}
+
+static lisp_val_t cc_gate_open(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    os_bench_gate_open();
+    return nil;
+}
+
+static lisp_val_t cc_gate_close(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    os_bench_gate_close();
+    return nil;
+}
+
+/** ゲートを通った回数。(open-hits . close-hits/3) を返す。
+    **ゲートが実際に呼ばれたかをゲスト側で確認するためのもの**で、
+    プラグインの gate_opens/gate_closes と突き合わせる */
+static lisp_val_t cc_gate_hits(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_cons(os_make_fixnum(g_gate_open_hits),
+                         os_make_fixnum(g_gate_close_hits / 3));
+}
+
+/** 16進1桁 */
+static char gate_hex_digit(UINT64 v) {
+    return (char)(v < 10 ? ('0' + v) : ('a' + (v - 10)));
+}
+
+/** "gate_start=0x...,gate_end=0x..." をそのまま文字列で返す。
+    プラグインへ渡す形そのものにしてあるので、呼び出し側で組み立て直さなくてよい
+    (組み立て直すところで桁を落とす事故を防ぐ) */
+static lisp_val_t cc_gate_plugin_args(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    char buf[80];
+    UINT64 addrs[2];
+    addrs[0] = (UINT64)(lisp_addr_t)(void *)os_bench_gate_open;
+    addrs[1] = (UINT64)(lisp_addr_t)(void *)os_bench_gate_close;
+    const char *labels[2] = { "gate_start=0x", "gate_end=0x" };
+    UINT64 pos = 0;
+    for (int k = 0; k < 2; k++) {
+        if (k == 1) { buf[pos++] = ','; }
+        for (const char *p = labels[k]; *p != '\0'; p++) { buf[pos++] = *p; }
+        /* 上位の0は落とす。0 は起きないが念のため1桁は出す */
+        int started = 0;
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            UINT64 d = (addrs[k] >> shift) & 0xF;
+            if (d != 0 || started || shift == 0) { buf[pos++] = gate_hex_digit(d); started = 1; }
+        }
+    }
+    buf[pos] = '\0';
+    return os_make_string(buf);
+}
+
 /** 第一引数のFIXNUMをUINT64として取り出す(全ベンチマーク共通の引数取り出し) */
 static UINT64 bench_arg_n(lisp_val_t args) {
     return os_fixnum_magnitude(cc_car(args));
@@ -423,6 +511,14 @@ BENCH_DEFINE_PRIMITIVE(cc_diag_closure_call, bench_closure_call)
 BENCH_DEFINE_PRIMITIVE(cc_diag_ct_check, bench_ct_check)
 
 void os_register_bench_subprimitives(void) {
+    os_set_function(os_make_symbol("%%GATE-OPEN"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_gate_open), global_environment);
+    os_set_function(os_make_symbol("%%GATE-CLOSE"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_gate_close), global_environment);
+    os_set_function(os_make_symbol("%%GATE-HITS"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_gate_hits), global_environment);
+    os_set_function(os_make_symbol("%%GATE-PLUGIN-ARGS"),
+                     os_make_native_function((lisp_addr_t)(void *)cc_gate_plugin_args), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-LOOP"),
                      os_make_native_function((lisp_addr_t)(void *)cc_bench_c_loop), global_environment);
     os_set_function(os_make_symbol("%%BENCH-C-ARITH"),
