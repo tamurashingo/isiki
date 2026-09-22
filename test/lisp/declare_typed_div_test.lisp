@@ -164,13 +164,39 @@
 (assert-equal 'eval-error (/ -100 5 0))
 
 ;;; --- quotient は変わらないこと(**/ を経由していない**)---
-;; %quotient2 は整数どうしなら mod / div(floor 除算)を使う。/ ではない
+;; %quotient2 は整数どうしなら mod / div(**床除算**)を使う。/ ではない。
+;;
+;; **この処理系には切り捨て方向の違う除算が 2 つある。**
+;;   / と primitive_divide2_fixnum : ゼロ方向   (/ -7 2)   = -3
+;;   div / mod (floor_divmod)      : 床方向     (div -7 2) = -4
+;;
+;; それでも quotient が壊れないのは、**%quotient2 が div を使うのが
+;; 「(mod dividend divisor) が 0 のとき」に限られる**からである。
+;; 割り切れる領域では床と切り捨てが一致するので、方向の違いが表に出ない。
+;; 割り切れないときは float を返す(ISLisp §19 の quotient の規定どおり)。
+;;
+;; **この mod = 0 のガードが正しさを支えている。** ここを「最適化」で
+;; 外すと負数で -4 と -3 が食い違う。以下はそれを固定するテストである。
 (assert-equal 2 (quotient 6 3))
 (assert-equal -2 (quotient -6 3))
 (assert-equal -2 (quotient 6 -3))
 (assert-equal 2 (quotient -6 -3))
-;; 割り切れないときは float になる(これも / ではなく (float x) 経由)
+;; 割り切れる領域では / と quotient が一致すること
+(assert-equal (/ -6 3) (quotient -6 3))
+(assert-equal (/ 6 -3) (quotient 6 -3))
+(assert-equal (/ -6 -3) (quotient -6 -3))
+;; **床除算そのものは確かに方向が違う。**(この 2 行が食い違いの存在を記録する)
+(assert-equal -3 (/ -7 2))
+(assert-equal -4 (div -7 2))
+(assert-equal 1 (mod -7 2))
+(assert-equal -4 (div 7 -2))
+;; 割り切れないときは float になる(これも / ではなく (float x) 経由)。
+;; **-4 ではなく -3.5 が返る**ので、床除算が表に出ていないことが分かる
 (assert-equal (dtd-pr (quotient 7 2)) (dtd-pr (/ (float 7) (float 2))))
+(assert-equal (dtd-pr (quotient -7 2)) (dtd-pr (/ (float -7) (float 2))))
+(assert-equal (dtd-pr -3.5) (dtd-pr (quotient -7 2)))
+(assert-equal (dtd-pr -3.5) (dtd-pr (quotient 7 -2)))
+(assert-equal (dtd-pr 3.5) (dtd-pr (quotient -7 -2)))
 (assert-equal 1 (reciprocal 1))
 (assert-equal -1 (reciprocal -1))
 

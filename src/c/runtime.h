@@ -1109,12 +1109,18 @@ static inline lisp_val_t os_make_fixnum(const UINT64 fixnum) {
  * @param magnitude 絶対値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-/* [性能] os_make_fixnum と同じ理由でヘッダの static inline へ移した。
-   中身はシフトと OR だけなのに、クロスTU呼び出しのままだと呼び出しの
-   オーバーヘッドが本体を上回る。改善A以降、符号つきの fixnum を作る経路
-   (+ - * / の fixnum 高速路すべて)がここを通るようになったため、
-   os_make_fixnum が 1,513 箇所で inline 化されているのと同じ扱いにする
-   (documents/declare-typed-arith.md §9-6)。 */
+/* [API の形を揃えるため] os_make_fixnum は static inline、符号つき版は
+   クロスTU呼び出し、という非対称に理由が無いので揃えた。改善A以降、
+   `+` `-` `*` `/` の fixnum 高速路はすべてここを通る。
+
+   **速度目的ではない。実測でも差は出なかった**(PR #93)。
+   「os_make_fixnum_signed が static inline でないことが、PR #92 で
+   『* の桁溢れ判定から除算を消しても速くならなかった』原因ではないか」
+   という仮説を立てて inline 化の有無で測ったが、`+` `-` `*` の差は
+   すべて雑音の幅の中だった。**仮説は外れである。**
+   PR #92 の件の原因は別にある(documents/declare-typed-arith.md §10)。
+
+   この否定の結果を消さないこと。同じ仮説を二度検証しないために書いてある。 */
 static inline lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
     lisp_val_t val = (lisp_val_t)(magnitude << FIXNUM_VALUE_SHIFT);
     if (negative && magnitude != 0) {
