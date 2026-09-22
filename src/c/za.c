@@ -2790,7 +2790,7 @@ static UINT8 za_operand_decl_type(lisp_val_t form, lisp_val_t params, UINT64 fix
    2^24 を超える fixnum で桁が落ちる問題があるため、GENERIC へ落とす
    (documents/declare-typed-add.md §3-3)。
 
-   対象は `+` `-` `*`(PR #89 / #91 / 本 PR)。`/` は未対応で、ここに足していく
+   対象は `+` `-` `*` `/`(PR #89 / #91 / #92 / 本 PR)。四則が揃った
    (documents/declare-typed-arith.md)。
    **単項の `-`(符号反転)は対象外。** za_compile_fold は引数 2 つ未満で
    そもそも呼ばれない。 */
@@ -2805,6 +2805,9 @@ static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
         if (generic_fn == (void *)primitive_multiply2) {
             return (void *)primitive_multiply2_fixnum;
         }
+        if (generic_fn == (void *)primitive_divide2) {
+            return (void *)primitive_divide2_fixnum;
+        }
         return 0;
     }
     if (ta == OS_DECL_TYPE_SINGLE_FLOAT && tb == OS_DECL_TYPE_SINGLE_FLOAT) {
@@ -2816,6 +2819,9 @@ static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
         }
         if (generic_fn == (void *)primitive_multiply2) {
             return (void *)primitive_multiply2_single;
+        }
+        if (generic_fn == (void *)primitive_divide2) {
+            return (void *)primitive_divide2_single;
         }
         return 0;
     }
@@ -3170,6 +3176,21 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     }
     lisp_val_t op1_form = cc_car(rest2);
     GC_PROTECT(op1_form);
+
+    /* [型特化] **両方の型が宣言されているときだけ**呼び先を専用関数へ差し替える。
+       za_compile_fold と同じ仕組みだが、`/` はこちらを通る
+       (documents/divide-direct-call.md §3-1)。za_specialized_wrapper は
+       GENERIC の関数ポインタで振り分けるので、比較演算子が誤って
+       差し替わることはない(表に載っていないので 0 が返る)。 */
+    {
+        void *specialized = za_specialized_wrapper(
+            wrapper_fn,
+            za_operand_decl_type(op0_form, params, fixed_count, locals),
+            za_operand_decl_type(op1_form, params, fixed_count, locals));
+        if (specialized != 0) {
+            wrapper_fn = specialized;
+        }
+    }
 
     // JIT GC保護コスト削減(Phase1): za_compile_foldと同じ理由・同じ判定基準
     // (za_operand_is_safe_leaf参照)で、op1がGCを誘発しうる呼び出しを一切含まない

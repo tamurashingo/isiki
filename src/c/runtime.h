@@ -1109,7 +1109,19 @@ static inline lisp_val_t os_make_fixnum(const UINT64 fixnum) {
  * @param magnitude 絶対値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude);
+/* [性能] os_make_fixnum と同じ理由でヘッダの static inline へ移した。
+   中身はシフトと OR だけなのに、クロスTU呼び出しのままだと呼び出しの
+   オーバーヘッドが本体を上回る。改善A以降、符号つきの fixnum を作る経路
+   (+ - * / の fixnum 高速路すべて)がここを通るようになったため、
+   os_make_fixnum が 1,513 箇所で inline 化されているのと同じ扱いにする
+   (documents/declare-typed-arith.md §9-6)。 */
+static inline lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
+    lisp_val_t val = (lisp_val_t)(magnitude << FIXNUM_VALUE_SHIFT);
+    if (negative && magnitude != 0) {
+        val |= FIXNUM_SIGN_BIT;
+    }
+    return val;
+}
 
 /**
  * FIXNUMのマグニチュード(絶対値)を取り出す。
@@ -2107,6 +2119,20 @@ lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b);
  * @return a/b
  */
 lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した / (fixnum × fixnum)。**型のタグは見ないが、ゼロ検査はする。**
+ * 宣言が嘘なら壊れる(documents/declare-typed-add.md §3-1)が、
+ * **除数 0 で #DE を出して止まることはない**(documents/declare-typed-arith.md §9)。
+ * 商はゼロ方向に切り捨て。除数が0ならEVAL-ERROR。
+ */
+lisp_val_t primitive_divide2_fixnum(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した / (single-float × single-float)。**同上、タグを見ない。**
+ * GENERIC と同じく double を経由する(二重丸めごと一致させる)。
+ */
+lisp_val_t primitive_divide2_single(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。

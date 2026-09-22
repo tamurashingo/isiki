@@ -3553,14 +3553,6 @@ lisp_val_t primitive_fixnum_magnitude_mask(lisp_val_t args, lisp_val_t env) {
  * @param magnitude 絶対値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
-    lisp_val_t val = (lisp_val_t)(magnitude << FIXNUM_VALUE_SHIFT);
-    if (negative && magnitude != 0) {
-        val |= FIXNUM_SIGN_BIT;
-    }
-    return val;
-}
-
 /**
  * FIXNUMのマグニチュード(絶対値)を取り出す。
  * @param val タグ付けされたFIXNUM
@@ -5926,6 +5918,49 @@ static int fixnum_multiply_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
     return fixnum_multiply_signed_unchecked(a, b, out);
 }
 
+/* [改善C] fixnum 除算のコア。
+
+   **`_unchecked` が外しているのは「タグ検査」だけである。ゼロ検査は外していない。**
+   宣言が正しくても除数は 0 になりうる(`<fixnum>` の 0 は正しい fixnum である)。
+   x86-64 の `div` は除数 0 で #DE を出し、**freestanding の UEFI 環境では
+   ハンドラが無いので機械が止まる。** `+` `*` の嘘の宣言は「ゴミの値」で済んだが、
+   除算は質が違う。**ここのゼロ検査は性能のためではなく、落とさないためにある。**
+
+   [桁溢れしない] マグニチュードの商は必ず被除数のマグニチュード以下なので、
+   fixnum ÷ fixnum が bignum へ昇格することはない。`+` `*` が持っていた
+   「桁溢れしたら GENERIC へ」という分岐は要らない。0 を返す理由は
+   **除数が 0 のときだけ**である。
+
+   [ゼロ方向の切り捨てが自動で得られる] 符号なし除算は必ず切り捨てなので、
+   マグニチュードどうしを割って符号を後から付ければ、そのままゼロ方向になる。
+   `(/ -7 2)` = -3(床方向なら -4)。**本作業で切り捨て方向は変えていない。**
+
+   [(/ *most-negative-fixnum* -1) が安全] 2 の補数なら INT64_MIN / -1 は
+   商が表現できず #DE になるが、符号マグニチュードでは
+   マグニチュード 2^59-1 を 1 で割るだけなので何も起きない。
+
+   [-0 を作らない] os_make_fixnum_signed がマグニチュード 0 の符号を落とす。 */
+static int fixnum_divide_signed_unchecked(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    UINT64 mag_b = os_fixnum_magnitude(b);
+    if (mag_b == 0) {
+        return 0;               /* ゼロ除算。**div を実行する前に必ず弾く** */
+    }
+    /* 符号は neg_a ^ neg_b。* と同じで、マグニチュードの計算に符号が影響しない */
+    *out = os_make_fixnum_signed(os_fixnum_is_negative(a) != os_fixnum_is_negative(b),
+                                 os_fixnum_magnitude(a) / mag_b);
+    return 1;
+}
+
+/** fixnum 除算(タグ検査つき)。GENERIC(primitive_divide / primitive_divide2)が使う。
+ *  **0 を返すのは「どちらかが fixnum でない」か「除数が 0」のどちらか**である。
+ *  呼び出し側はどちらも次の経路へ落とし、そこで EVAL-ERROR になる。 */
+static int fixnum_divide_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
+        return 0;
+    }
+    return fixnum_divide_signed_unchecked(a, b, out);
+}
+
 /**
  * 組み込み関数+。argsの全数値(FIXNUM/bignum/float、負数も可)を合計する。
  * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
@@ -6097,7 +6132,7 @@ lisp_val_t primitive_add2_fixnum(lisp_val_t a, lisp_val_t b) {
  * **GENERIC と同じく double を経由する。** single どうしの和は正確な結果が
  * double で表現できるため、double で足してから single へ丸めても
  * single で直接足した結果と一致する(除算だけは二重丸めになるので別扱い。
- * documents/single-float-arith.md §5)。
+ * documents/single-float.md)。
  * @param a 第一オペランド(<single-float> と宣言されている)
  * @param b 第二オペランド(同上)
  * @return a+b
@@ -6177,7 +6212,7 @@ lisp_val_t primitive_subtract2_fixnum(lisp_val_t a, lisp_val_t b) {
  * **GENERIC と同じく double を経由する。** single どうしの差は正確な結果が
  * double で表現できるため、double で引いてから single へ丸めても
  * single で直接引いた結果と一致する(+ と同じ理由。除算だけは二重丸めになるので
- * 別扱い。documents/single-float-arith.md §5)。
+ * 別扱い。documents/single-float.md)。
  * @param a 被減数(<single-float> と宣言されている)
  * @param b 減数(同上)
  * @return a-b
@@ -6476,7 +6511,7 @@ lisp_val_t primitive_multiply2_fixnum(lisp_val_t a, lisp_val_t b) {
  * double で表現できる(仮数 24bit × 24bit = 48bit ≦ 53bit、指数も double の
  * 範囲に収まる)ため、double で掛けてから single へ丸めても single で直接
  * 掛けた結果と一致する(除算だけは二重丸めになるので別扱い。
- * documents/single-float-arith.md §5)。
+ * documents/single-float.md)。
  * @param a 第一オペランド(<single-float> と宣言されている)
  * @param b 第二オペランド(同上)
  * @return a*b
@@ -6534,24 +6569,28 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
         return os_make_float_of_kind(kind, result);
     }
 
-    int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
-    UINT64 result = fast ? os_fixnum_magnitude(first) : 0;
+    /* [改善C] 途中経過(quot_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない。
+       以前は「全オペランドが**非負**」を要求していたため、`(/ -6 3)` のように
+       結果がFIXNUMに収まる式でもbignum機構(decompose→limb_alloc→mag_divmod→
+       os_make_integer)を丸ごと通っていた。改善Aが `+`/`-` で、PR #92 が `*` で
+       直したのと**同じ構図の 3 例目**である。
+       ゼロ除算は従来どおり、割る前にg_sym_eval_errorで返す */
+    int fast = (first & TAG_MASK) == TAG_FIXNUM;
+    lisp_val_t quot_val = first;
     if (fast) {
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
             lisp_val_t v = cc_car(rest);
-            if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+            if ((v & TAG_MASK) != TAG_FIXNUM) {
                 fast = 0;
                 break;
             }
-            UINT64 divisor = os_fixnum_magnitude(v);
-            if (divisor == 0) {
-                return g_sym_eval_error;
+            if (!fixnum_divide_signed_unchecked(quot_val, v, &quot_val)) {
+                return g_sym_eval_error;   /* 除数が0。桁溢れはありえない */
             }
-            result /= divisor;
         }
     }
     if (fast) {
-        return os_make_fixnum(result);
+        return quot_val;
     }
 
     // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -6607,11 +6646,74 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
  * @param b 除数
  * @return a/b
  */
+/**
+ * 型特化した / (fixnum × fixnum)。**型のタグを見ない。ゼロ検査はする。**
+ *
+ * コアを共有する fixnum_divide_signed_unchecked を使う。
+ * **外れるのは除数が 0 のときだけ**なので、そこだけ GENERIC へ落として
+ * EVAL-ERROR を返す(値の作り方を二重に書かないため)。
+ *
+ * **宣言が嘘なら壊れる**(documents/declare-typed-add.md §3-1)。
+ * ただし**ゼロ除算で機械が止まることはない**。
+ * @param a 被除数(<fixnum> と宣言されている)
+ * @param b 除数(同上)
+ * @return a/b(ゼロ方向に切り捨て)。除数が0ならEVAL-ERROR
+ */
+lisp_val_t primitive_divide2_fixnum(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_divide2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_divide2_fixnum", b);
+    lisp_val_t quot;
+    if (fixnum_divide_signed_unchecked(a, b, &quot)) {
+        return quot;
+    }
+    /* 除数が 0。GENERIC と同じ経路で EVAL-ERROR を返す */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_divide(args, global_environment);
+}
+
+/**
+ * 型特化した / (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。**
+ * `+` `-` `*` では「single どうしの結果が double で正確に表せるから一致する」
+ * という理由だったが、**除算はその理由が成り立たない**(商は無限小数になりうる)。
+ * double で割ってから single へ丸めると**二重丸め**になり、single で直接割った
+ * 結果と食い違う場合がある。
+ *
+ * **それでも double を経由するのは、GENERIC と一致させるためである。**
+ * 直接 single で割るほうが正確だが、そうすると宣言の有無で答えが変わる。
+ * 二重丸めは GENERIC が元から持っている性質で、**本作業では変えない**
+ * (直すなら GENERIC 側の別作業。documents/single-float.md)。
+ *
+ * ゼロ除算は divss がマスクされた MXCSR(0x1F80)の下で inf/nan を返すだけで、
+ * 例外は出ない(interrupt.c の init_fpu と process.c の FXSAVE 既定状態)。
+ * @param a 被除数(<single-float> と宣言されている)
+ * @param b 除数(同上)
+ * @return a/b
+ */
+lisp_val_t primitive_divide2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_divide2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_divide2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) /
+                                        (double)os_single_float_value(b)));
+}
+
 lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b) {
+    /* [改善C] **内側の cons が消える。** 以前は整数どうしのとき無条件に
+       cons を 2 個作って n 項版 primitive_divide へ委譲していた
+       (documents/divide-direct-call.md §4-2)。PR #88 が消したのは
+       **呼び出し側(外側)**の cons で、これは別物である */
+    lisp_val_t quot;
+    if (fixnum_divide_signed(a, b, &quot)) {
+        return quot;
+    }
     int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
     if (kind != FLOAT_KIND_NONE) {
         return os_make_float_of_kind(kind, to_double(a) / to_double(b));
     }
+    /* 整数だが fixnum でない(bignum)か、除数が 0。どちらも n 項版へ */
     GC_PROTECT(a);
     GC_PROTECT(b);
     lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));

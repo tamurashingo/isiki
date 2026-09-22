@@ -51,6 +51,7 @@
 (isiki-test-load "test/lisp/declare_typed_add_test.lisp")
 (isiki-test-load "test/lisp/declare_typed_sub_test.lisp")
 (isiki-test-load "test/lisp/declare_typed_mul_test.lisp")
+(isiki-test-load "test/lisp/declare_typed_div_test.lisp")
 (isiki-test-load "test/lisp/declare_types_test.lisp")
 (isiki-test-load "test/lisp/disassemble_test.lisp")
 
