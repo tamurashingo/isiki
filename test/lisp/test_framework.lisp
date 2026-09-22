@@ -56,10 +56,30 @@
 ;; (load "test/lisp/xxx_test.lisp") の代わりにこれを使う。
 ;; **loadの前に印をつける**ので、ハングしたときは最後に出ている行の
 ;; ファイルが犯人になる(通り抜けていれば次の行が出る)。
+;; [declaim 漏れの検出] declaim は environment 単位で、**ファイルをまたいで残る。**
+;; テストファイルが打ち消し忘れると、後続の無関係なファイルが連鎖で落ちる。
+;; 実際に踏んだ: inline_builtin_test.lisp の 1 行の declaim が、同じファイルの
+;; 後続 assert を 10 件まとめて落とした(documents/inline-arith.md §7-4)。
+;;
+;; **落ちた場所と原因の場所が離れるのが、この事故のいちばん悪いところ。**
+;; ファイルの出口で見れば、両者が一致する。
+;;
+;; 宣言を試すファイルも、**最後に打ち消せば除外は要らない。** 除外リストを
+;; 作らなかったのは、リストに足すことで漏れを恒久化できてしまうからである。
 (defun isiki-test-load (path)
   (isiki-test-mark path)
   (isiki-audit-begin path)
-  (load path))
+  (let* ((before (%%current-inline))
+         (r (load path)))
+    ;; **検査本体は別関数にしてある。** assert-equal は**マクロ**で、この defun より
+    ;; 後ろで定義されている。ここへ直接書くとマクロ展開されず、ただの関数呼び出しと
+    ;; して解釈される。assert-equal は関数としては存在しないので EVAL-ERROR が
+    ;; 値として返り、**検査は黙って一度も走らない。**
+    ;; 実際に踏んだ: 陽性対照(わざと declaim を漏らす)が反応しなくて気づいた。
+    ;; **新しく置いた検出器は、それ自体が検証対象である**(規則 8)。
+    ;; 関数呼び出しなら実行時解決なので、定義が後ろでも問題ない。
+    (isiki-declaim-check path before)
+    r))
 ;; ---------------------------------------------------------------------------
 
 ;; ---------------------------------------------------------------------------
@@ -193,6 +213,12 @@
            (isiki-audit-record nil)
            (format *isiki-test-stream* "[NG] ~S => ~S (expected ~~ ~S)~%"
                    ',form %isiki-actual %isiki-expected)))))
+
+;; isiki-test-load から呼ぶ declaim 漏れの検査。**assert-equal より後に置くこと**
+;; (ここでマクロ展開される)。path を混ぜてあるのは NG の行にファイル名を出すため
+(defun isiki-declaim-check (path before)
+  (assert-equal (list path before) (list path (%%current-inline))))
+
 
 ;; (assert-error form) : formの評価が何らかのconditionをsignalすること
 ;; (仕様の "an error shall be signaled" の例)を検証する。handlerは

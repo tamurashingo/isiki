@@ -64,6 +64,11 @@
 (assert-equal 7 (idt-decl-merged 3 4))
 
 ;;; --- 4. declare は declaim の上に重なる。内側が優先 ---
+;; **「落とす方向」がここで実際に走る。** 合成規則の半分(内側が外側を打ち消す /
+;; 後の宣言が前を取り消す)が一度も実行されないと、壊れていても分からない。
+;;   idt-override  … 内側の notinline が外側の declaim を打ち消す
+;;   idt-last-wins … 同じ深さで後の notinline が前の inline を取り消す
+;;   idt-here-nest … let の内側の notinline を %%inline-here で読む(§5)
 (declaim (inline + -))
 (defun idt-inherit (x y) (+ x y))
 (assert-equal '(+ -) (%%inline-of 'idt-inherit))
@@ -116,7 +121,13 @@
 
 ;;; --- 6. **let の初期化式には効かない**(CommonLisp と同じ)---
 ;; 初期化式は `((lambda (v) . body) init)` の init 側で、body より先にコンパイルされる。
-;; 宣言を適用するのは body の直前だけなので、初期化式は外側のスコープのまま
+;; 宣言を適用するのは body の直前だけなので、初期化式は外側のスコープのまま。
+;;
+;; **この節はコンパイル順序の番人である。**
+;; 正しさが「init 式が body より先にコンパイルされる」という**別の場所の性質**に
+;; 依存している。将来 let の展開や引数の評価順を触ると、**明示的な処理が無いぶん
+;; 静かに壊れる。** ここが落ちたら、まず za_compile_let の中での
+;; 「init のコンパイル」と「g_za_inline_scope の適用」の前後関係を見ること。
 (defun idt-init-form (n)
   (let ((outer (%%inline-here)))          ; ← 宣言の外(この let の body ではない)
     outer))

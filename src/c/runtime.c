@@ -97,6 +97,10 @@ lisp_val_t g_sym_car;
 lisp_val_t g_sym_cdr;
 /** cons関数を表すシンボル */
 lisp_val_t g_sym_cons;
+lisp_val_t g_sym_plus;
+lisp_val_t g_sym_minus;
+lisp_val_t g_sym_asterisk;
+lisp_val_t g_sym_slash;
 
 /** 構文エラーを表すシンボル */
 lisp_val_t g_sym_read_error;
@@ -1663,26 +1667,47 @@ lisp_val_t primitive_current_optimize(lisp_val_t args, lisp_val_t env) {
 
 /** インラインビットを、指定されている名前のリストへ展開する。
  * 順序は INLINE_BIT_* の並びに合わせる(car cdr null eq) */
+/** インライン展開の対象の名前表。**ビットと名前の対応はここ 1 箇所だけにある。**
+ *
+ * 以前は「名前 → ビット」(os_inline_bit_of)と「ビット → 名前」(inline_to_list)が
+ * 別々に並んでいて、**片方だけに足すと %%CURRENT-INLINE が黙って nil を返した**
+ * (実際に踏んだ。documents/inline-arith.md §7-4)。表を 1 つにして両方をそこから
+ * 導き、要素数を _Static_assert で INLINE_BIT_COUNT と突き合わせる。
+ * **ビットを足して表に足し忘れると、ビルドが落ちる。**
+ *
+ * シンボルは g_sym_* への**ポインタ**で持つ。値をコピーで持つと GC の移動に
+ * 追随できない(g_sym_* 自身は gc_copy_value で更新される)。
+ * 並びは %%CURRENT-INLINE の出力順である。 */
+static const struct {
+    UINT64 bit;
+    lisp_val_t *sym;
+} g_inline_names[] = {
+    { INLINE_BIT_CAR,  &g_sym_car },
+    { INLINE_BIT_CDR,  &g_sym_cdr },
+    { INLINE_BIT_NULL, &g_sym_null },
+    { INLINE_BIT_EQ,   &g_sym_eq },
+    { INLINE_BIT_ADD,  &g_sym_plus },
+    { INLINE_BIT_SUB,  &g_sym_minus },
+    { INLINE_BIT_MUL,  &g_sym_asterisk },
+    { INLINE_BIT_DIV,  &g_sym_slash },
+};
+_Static_assert(sizeof(g_inline_names) / sizeof(g_inline_names[0]) == INLINE_BIT_COUNT,
+               "インライン対象のビットを増減したら g_inline_names と "
+               "INLINE_BIT_COUNT の両方を更新すること");
+
 static lisp_val_t inline_to_list(UINT64 packed) {
     UINT64 bits = DECLAIM_INLINE_BITS(packed);
     lisp_val_t r = nil;
-    /* [原則4] **os_make_symbol は確保しうる。** 算術の名前は g_sym_* を持たないので
-       ここで intern することになり、途中で GC が走ると積み上げ中の r が stale になる。
-       既存の car/cdr/null/eq だけだった頃は全部グローバルで確保が無かったため
-       保護が要らなかった。**ビットを足したときに一緒に持ち込んだ危険である。** */
-    GC_PROTECT(r);
-    /* 末尾から積んで (car cdr null eq + - * /) の順にする。
-       **ビットを足したらここにも足すこと。** 足し忘れると %%CURRENT-INLINE と
-       %%INLINE-OF が黙って nil を返し、「宣言が効いていない」ように見える
-       (実際に踏んだ。documents/inline-arith.md §7-4) */
-    if (bits & INLINE_BIT_DIV)  { r = os_make_cons(os_make_symbol("/"), r); }
-    if (bits & INLINE_BIT_MUL)  { r = os_make_cons(os_make_symbol("*"), r); }
-    if (bits & INLINE_BIT_SUB)  { r = os_make_cons(os_make_symbol("-"), r); }
-    if (bits & INLINE_BIT_ADD)  { r = os_make_cons(os_make_symbol("+"), r); }
-    if (bits & INLINE_BIT_EQ)   { r = os_make_cons(g_sym_eq, r); }
-    if (bits & INLINE_BIT_NULL) { r = os_make_cons(g_sym_null, r); }
-    if (bits & INLINE_BIT_CDR)  { r = os_make_cons(g_sym_cdr, r); }
-    if (bits & INLINE_BIT_CAR)  { r = os_make_cons(g_sym_car, r); }
+    /* 表の末尾から積むと表の順(= %%CURRENT-INLINE の出力順)になる。
+       **os_make_cons は引数を GC_PROTECT するので、ここでの確保は安全である**
+       (シンボルはすべて g_sym_* なので、cons の前に確保が走ることも無い)。
+       一時期ここで os_make_symbol("+") を呼んでいたが、それは cons へ入る前に
+       確保が走る形で原則4に触れていた(documents/inline-arith.md §8-2) */
+    for (UINT64 i = INLINE_BIT_COUNT; i > 0; i--) {
+        if (bits & g_inline_names[i - 1].bit) {
+            r = os_make_cons(*g_inline_names[i - 1].sym, r);
+        }
+    }
     return r;
 }
 
@@ -2137,28 +2162,13 @@ static lisp_val_t declaim_slot_of(lisp_val_t env) {
  * @param sym 関数名のシンボル
  * @return INLINE_BIT_*、対象外なら0
  */
-static lisp_val_t find_interned_symbol(const char *name);
 
-/** 算術演算子のシンボルは g_sym_* を持たないので、**その都度 intern 表から引く。**
- * lisp_val_t を static へキャッシュしてはいけない(シンボルは GC で動く。
- * ルートに繋がない生の保持は原則8違反になる)。宣言の解釈はコンパイル時にしか
- * 走らないので、引き直しのコストは問題にならない。 */
-static UINT64 inline_bit_of_arith(lisp_val_t sym) {
-    if (sym == find_interned_symbol("+")) { return INLINE_BIT_ADD; }
-    if (sym == find_interned_symbol("-")) { return INLINE_BIT_SUB; }
-    if (sym == find_interned_symbol("*")) { return INLINE_BIT_MUL; }
-    if (sym == find_interned_symbol("/")) { return INLINE_BIT_DIV; }
-    return 0;
-}
 
 UINT64 os_inline_bit_of(lisp_val_t sym) {
-    if (sym == g_sym_car)  { return INLINE_BIT_CAR; }
-    if (sym == g_sym_cdr)  { return INLINE_BIT_CDR; }
-    if (sym == g_sym_null) { return INLINE_BIT_NULL; }
-    if (sym == g_sym_eq)   { return INLINE_BIT_EQ; }
-    if ((sym & TAG_MASK) == TAG_SYMBOL) {
-        UINT64 b = inline_bit_of_arith(sym);
-        if (b != 0) { return b; }
+    for (UINT64 i = 0; i < INLINE_BIT_COUNT; i++) {
+        if (sym == *g_inline_names[i].sym) {
+            return g_inline_names[i].bit;
+        }
     }
     return 0;
 }
@@ -3131,6 +3141,10 @@ static void os_gc_collect_body(void) {
     g_sym_car = gc_copy_value(g_sym_car);
     g_sym_cdr = gc_copy_value(g_sym_cdr);
     g_sym_cons = gc_copy_value(g_sym_cons);
+    g_sym_plus = gc_copy_value(g_sym_plus);
+    g_sym_minus = gc_copy_value(g_sym_minus);
+    g_sym_asterisk = gc_copy_value(g_sym_asterisk);
+    g_sym_slash = gc_copy_value(g_sym_slash);
     g_sym_read_error = gc_copy_value(g_sym_read_error);
     g_sym_eval_error = gc_copy_value(g_sym_eval_error);
     g_sym_top_level_block = gc_copy_value(g_sym_top_level_block);
@@ -3300,6 +3314,10 @@ void os_bootstrap() {
         g_sym_car = os_make_symbol("CAR");
         g_sym_cdr = os_make_symbol("CDR");
         g_sym_cons = os_make_symbol("CONS");
+        g_sym_plus = os_make_symbol("+");
+        g_sym_minus = os_make_symbol("-");
+        g_sym_asterisk = os_make_symbol("*");
+        g_sym_slash = os_make_symbol("/");
 
         g_sym_read_error = os_make_symbol("READ-ERROR");
         g_sym_eval_error = os_make_symbol("EVAL-ERROR");
