@@ -10,6 +10,8 @@
 ;; [P3] with-handler の脱出先(ハンドラが正常 return したらその with-handler まで戻る)。
 ;; インタプリタ版と JIT 版の両方を見る
 (isiki-test-load "test/lisp/handler_exit_test.lisp")
+;; [P4-1] 算術の EVAL-ERROR 返しを signal へ移した分(クラス・スロット・打ち切り)
+(isiki-test-load "test/lisp/arith_signal_test.lisp")
 (isiki-test-load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例は別ファイル。構文エラーでloadが中断した場合に検出できるよう
 ;; 戻り値(成功ならt)を確認する。loadの中でも assert-* が走るので、assert-equal の

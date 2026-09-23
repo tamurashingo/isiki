@@ -918,8 +918,12 @@
 (assert-equal 1 (mod -14 3))
 (assert-equal 4 (div -14 -3))
 (assert-equal -2 (mod -14 -3))
-(assert-equal 'eval-error (div 5 0))
-(assert-equal 'eval-error (mod 5 0))
+;; [P4-1] 0除算は <division-by-zero> を signal する(spec:4889)。
+;; **このファイルは test/c/script_test.c からも読まれる**(test_framework.lisp を
+;; load しない harness)ので、assert-error-class ではなく ignore-errors を使う。
+;; クラスまで固定するのは test/lisp/arith_signal_test.lisp(QEMU 専用)
+(assert-equal nil (ignore-errors (div 5 0)))
+(assert-equal nil (ignore-errors (mod 5 0)))
 
 ;; gcd/lcm
 (assert-equal 4 (gcd 0 -4))
@@ -934,7 +938,8 @@
 (assert-equal 0 (isqrt 0))
 (assert-equal 1 (isqrt 1))
 (assert-equal 1 (isqrt 2))
-(assert-equal 'eval-error (isqrt -1))
+;; [P4-1] 負の整数は <domain-error> を signal する(spec:4984)
+(assert-equal nil (ignore-errors (isqrt -1)))
 ;; bignum境界: fixnumの上限(*most-positive-fixnum*)の2乗の平方根が元に戻る
 (assert-equal t (= fx-max (isqrt (* fx-max fx-max))))
 (assert-equal t (= fx-max (isqrt (+ 1 (* fx-max fx-max)))))

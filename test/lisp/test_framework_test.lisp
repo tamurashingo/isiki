@@ -123,14 +123,20 @@
 (assert-equal '(0 1 1) (list (tf-dpass *tf-ec-none*) (tf-dfail *tf-ec-none*) (tf-dattempt *tf-ec-none*)))
 (assert-equal (tf-ng-not-signaled-text 42 42 '<simple-error>) (tf-out *tf-ec-none*))
 
-;; **現時点の 0 除算は signal しない**(シンボル EVAL-ERROR を値として返す)。
-;; documents/error-unwind-survey.md §A-4 のパターン1。P4 でここが signal に変わったら、
-;; この陰性対照は陽性対照(assert-error-class '<division-by-zero> が通る)へ書き換える。
-;; **書き換え忘れると必ず落ちる**ので、移行の取りこぼしがそのまま検出できる
+;; **P4-1 で 0 除算が signal に変わった**(<division-by-zero>、spec:4889)。
+;; ここは以前「signal されないこと」の陰性対照だった(documents/error-unwind-survey.md
+;; §A-4 のパターン1)。**書き換え忘れると必ず落ちる**形にしてあったので、
+;; 移行の取りこぼしがそのまま検出できた
 (defglobal *tf-ec-div* (tf-capture (lambda () (assert-error-class '<division-by-zero> (div 1 0)))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ec-div*) (tf-dfail *tf-ec-div*)))
-(assert-equal (tf-ng-not-signaled-text '(div 1 0) 'eval-error '<division-by-zero>)
-              (tf-out *tf-ec-div*))
+(assert-equal '(1 0) (list (tf-dpass *tf-ec-div*) (tf-dfail *tf-ec-div*)))
+(assert-equal "" (tf-out *tf-ec-div*))
+
+;; **まだ signal しない経路**での陰性対照。(length 5) は EVAL-ERROR を値として返す
+;; (P4-2「添字・範囲」の対象)。上と同じく、そこが signal に変わったらここが落ちる
+(defglobal *tf-ec-len* (tf-capture (lambda () (assert-error-class '<domain-error> (length 5)))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ec-len*) (tf-dfail *tf-ec-len*)))
+(assert-equal (tf-ng-not-signaled-text '(length 5) 'eval-error '<domain-error>)
+              (tf-out *tf-ec-len*))
 
 ;;; ---------------------------------------------------------------------------
 ;;; assert-error との住み分け
@@ -140,6 +146,11 @@
 (defglobal *tf-ae-any* (tf-capture (lambda () (assert-error (error "tf boom")))))
 (assert-equal '(1 0) (list (tf-dpass *tf-ae-any*) (tf-dfail *tf-ae-any*)))
 
-;; assert-error も EVAL-ERROR 返しは捕まえられない(signal されていないため)
+;; assert-error は「何かが signal された」ので 0 除算も通るようになった(P4-1)
 (defglobal *tf-ae-div* (tf-capture (lambda () (assert-error (div 1 0)))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ae-div*) (tf-dfail *tf-ae-div*)))
+(assert-equal '(1 0) (list (tf-dpass *tf-ae-div*) (tf-dfail *tf-ae-div*)))
+
+;; assert-error も EVAL-ERROR 返しは捕まえられない(signal されていないため)。
+;; まだ signal しない (length 5) で確かめる
+(defglobal *tf-ae-len* (tf-capture (lambda () (assert-error (length 5)))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ae-len*) (tf-dfail *tf-ae-len*)))

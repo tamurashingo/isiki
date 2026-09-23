@@ -10,6 +10,8 @@
 ;; [P3] with-handler の脱出先(ハンドラが正常 return したらその with-handler まで戻る)。
 ;; インタプリタ版と JIT 版の両方を見る
 (load "test/lisp/handler_exit_test.lisp")
+;; [P4-1] 算術の EVAL-ERROR 返しを signal へ移した分(クラス・スロット・打ち切り)
+(load "test/lisp/arith_signal_test.lisp")
 (load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例(#nA 等)は別ファイル。load の戻り値(成功なら t)で構文エラーによる
 ;; 中断を検出する(qemu_boot_test.lisp と同じ。assert-equal の中に load を直接書かない)

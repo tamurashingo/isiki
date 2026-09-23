@@ -2043,7 +2043,7 @@ lisp_val_t primitive_multiply2_single(lisp_val_t a, lisp_val_t b);
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果の整数。0除算の場合はg_sym_eval_error
+ * @return 除算結果の整数。0除算の場合は<division-by-zero>をsignalする
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env);
 
@@ -2203,7 +2203,7 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env);
  * 商は-∞方向へ切り捨てる)。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の商。z2が0の場合はg_sym_eval_error
+ * @return floor除算の商。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env);
 
@@ -2212,7 +2212,7 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env);
  * 一致する)。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の余り。z2が0の場合はg_sym_eval_error
+ * @return floor除算の余り。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env);
 
@@ -2236,7 +2236,7 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env);
  * 組み込み関数ISQRT。第一引数の整数平方根floor(sqrt(z))を返す。zが負の場合は定義域エラー。
  * @param args 評価済みの引数リスト(非負整数1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
+ * @return floor(sqrt(z))。zが負の場合は<domain-error>をsignalする(spec:4984)
  */
 lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env);
 
@@ -2456,7 +2456,7 @@ lisp_val_t primitive_floatp1(lisp_val_t val);
  * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
  * @param args 評価済みの引数リスト(数値1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
+ * @return floatに変換した値。数値以外が渡された場合は<domain-error>をsignalする(spec:4734)
  */
 lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env);
 
