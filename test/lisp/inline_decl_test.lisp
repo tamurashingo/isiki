@@ -145,15 +145,14 @@
 (assert-equal t   (idt-has (car (cdr *idt-pair*)) '-))
 (declaim (notinline -))
 
-;;; --- 7. **このフェーズでは展開しない。生成コードが変わらないこと** ---
-;; 宣言を付けても code-len が変わらない = まだ門番が効いていない(次のフェーズで変わる)
-(defun idt-len-plain (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (+ x y))
-(defun idt-len-inline (x y)
-  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline +))
-  (+ x y))
-(assert-equal (%%disasm-code-len 'idt-len-plain) (%%disasm-code-len 'idt-len-inline))
-(assert-equal (idt-len-plain 3 4) (idt-len-inline 3 4))
-;; * / も同じ
+;;; --- 7. **まだ展開しない演算**(`*` `/`)---
+;;
+;; Phase 2 ではここに `+` も並んでいて「宣言を付けても code-len が変わらない」
+;; ことを固定していた。**Phase 3 で `+` `-` が展開されるようになったので、
+;; この assert がその変更を正しく検出して落ちた。** 期待値を更新した。
+;; `+` `-` の展開は §9 で見る。
+;;
+;; `*` `/` は展開命令列をまだ書いていないので、宣言しても call のままである。
 (defun idt-len-mul (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (* x y))
 (defun idt-len-mul-i (x y)
   (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline *))
@@ -181,3 +180,96 @@
 (assert-equal 1 (idt-car-on '(1 2)))
 (assert-equal 1 (idt-car-off '(1 2)))
 (assert-equal 1 (idt-car-declare '(1 2)))
+
+;;; --- 9. **展開が効く(Phase 3)。予測をテストで固定する** ---
+;;
+;; 【規則 11】実装前に PR へこう書いた:
+;;   「展開される命令列は型宣言なしの経路と**同一**(違うのは通らない
+;;    フォールバックの呼び先だけ)。だから完全一致が正常である」
+;; **予測が確定しているなら検出器にできる。** 観測して満足するのではなく、
+;; 一致をここで固定する。将来どちらかの経路だけが変わった日に落ちる。
+
+(defun idt-mnemonics (name)
+  (let ((items (disasm-items (%%disasm-code-base name) (%%disasm-code-len name)))
+        (acc nil))
+    (while (not (null items))
+      (setq acc (cons (disasm-item-mnemonic (cdr (car items))) acc))
+      (setq items (cdr items)))
+    acc))
+(defun idt-callee-p (name callee)
+  (let ((items (disasm-items (%%disasm-code-base name) (%%disasm-code-len name)))
+        (found nil))
+    (while (not (null items))
+      (if (string= callee (disasm-item-comment (cdr (car items)))) (setq found t) nil)
+      (setq items (cdr items)))
+    found))
+
+(defun idt-add-nodecl (x y) (+ x y))
+(defun idt-add-decl (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (+ x y))
+(defun idt-add-decl-inline (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline +))
+  (+ x y))
+(defun idt-sub-nodecl (x y) (- x y))
+(defun idt-sub-decl (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (- x y))
+(defun idt-sub-decl-inline (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline -))
+  (- x y))
+
+;; **加算的であること**: inline 宣言が無い経路は一切変わらない
+(assert-equal 690 (%%disasm-code-len 'idt-add-decl))       ; call だけ(従来どおり)
+(assert-equal 735 (%%disasm-code-len 'idt-add-nodecl))     ; 展開あり(従来どおり)
+(assert-equal 690 (%%disasm-code-len 'idt-sub-decl))
+(assert-equal 738 (%%disasm-code-len 'idt-sub-nodecl))
+;; **宣言すると展開される**
+(assert-equal 735 (%%disasm-code-len 'idt-add-decl-inline))
+(assert-equal 738 (%%disasm-code-len 'idt-sub-decl-inline))
+
+;; **命令列が同一であること**(予測の固定)
+(assert-equal (idt-mnemonics 'idt-add-nodecl) (idt-mnemonics 'idt-add-decl-inline))
+(assert-equal (idt-mnemonics 'idt-sub-nodecl) (idt-mnemonics 'idt-sub-decl-inline))
+
+;; **違うのはフォールバックの呼び先だけ**。GENERIC に戻っていたら別の事故
+(assert-equal t   (idt-callee-p 'idt-add-nodecl "primitive_add2"))
+(assert-equal nil (idt-callee-p 'idt-add-nodecl "primitive_add2_fixnum"))
+(assert-equal t   (idt-callee-p 'idt-add-decl-inline "primitive_add2_fixnum"))
+(assert-equal nil (idt-callee-p 'idt-add-decl-inline "primitive_add2"))
+(assert-equal t   (idt-callee-p 'idt-sub-decl-inline "primitive_subtract2_fixnum"))
+(assert-equal nil (idt-callee-p 'idt-sub-decl-inline "primitive_subtract2"))
+
+;; **結果は展開の有無で変わらない**(桁溢れと負数まで見る)
+(defglobal *idt-max* *most-positive-fixnum*)
+(assert-equal 7 (idt-add-decl-inline 3 4))
+(assert-equal (idt-add-nodecl 3 4) (idt-add-decl-inline 3 4))
+(assert-equal (idt-add-nodecl -3 4) (idt-add-decl-inline -3 4))
+(assert-equal (idt-add-nodecl 3 -4) (idt-add-decl-inline 3 -4))
+(assert-equal (idt-add-nodecl -3 -4) (idt-add-decl-inline -3 -4))
+(assert-equal (idt-add-nodecl *idt-max* 1) (idt-add-decl-inline *idt-max* 1))
+(assert-equal t (bignump (idt-add-decl-inline *idt-max* 1)))
+(assert-equal (idt-sub-nodecl 3 4) (idt-sub-decl-inline 3 4))
+(assert-equal (idt-sub-nodecl 4 3) (idt-sub-decl-inline 4 3))
+(assert-equal (idt-sub-nodecl -3 4) (idt-sub-decl-inline -3 4))
+(assert-equal (idt-sub-nodecl -3 -4) (idt-sub-decl-inline -3 -4))
+(assert-equal 0 (idt-sub-decl-inline 5 5))
+(assert-equal (idt-sub-nodecl *most-negative-fixnum* 1)
+              (idt-sub-decl-inline *most-negative-fixnum* 1))
+
+;; **notinline で戻る**
+(declaim (inline + -))
+(defun idt-add-declaim (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (+ x y))
+(defun idt-add-off (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (notinline +))
+  (+ x y))
+(assert-equal 735 (%%disasm-code-len 'idt-add-declaim))
+(assert-equal 690 (%%disasm-code-len 'idt-add-off))
+(assert-equal 7 (idt-add-declaim 3 4))
+(assert-equal 7 (idt-add-off 3 4))
+(declaim (notinline + -))
+
+;; single / double は展開の対象外(この PR では fixnum だけ)
+(defun idt-add-sgl-inline (x y)
+  (declare (type <single-float> x)) (declare (type <single-float> y)) (declare (inline +))
+  (+ x y))
+(assert-equal 690 (%%disasm-code-len 'idt-add-sgl-inline))
+(assert-equal t (idt-callee-p 'idt-add-sgl-inline "primitive_add2_single"))

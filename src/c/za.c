@@ -2732,11 +2732,30 @@ static int za_compile_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
  * (add/subの結果をr10で計算してからraxへ移す。rcx/rdx自体は最後まで不変)。
  */
 static void za_emit_arith_call_or_inline(void *wrapper_fn) {
-    if (wrapper_fn != (void *)primitive_add2 && wrapper_fn != (void *)primitive_subtract2) {
+    int is_add = (wrapper_fn == (void *)primitive_add2);
+    int is_sub = (wrapper_fn == (void *)primitive_subtract2);
+    /* [inline] **型宣言つきの特化版でも、inline 宣言があれば同じ高速路を出す。**
+       出る命令列は宣言なしの経路と同一で、違うのは**通らないフォールバックの
+       呼び先**だけ(GENERIC ではなく特化版になる)。
+
+       **加算的な変更である。** inline 宣言が無ければ従来どおり call だけで、
+       宣言なしの経路(is_add / is_sub がそのまま真になる側)は一切触らない。
+       「inline 宣言が無ければ展開しない」という方針へ寄せるのは、
+       宣言なしの経路が遅くなる変更なので**別の PR**で行う
+       (documents/inline-arith.md §1-3)。 */
+    if (!is_add && !is_sub) {
+        if (wrapper_fn == (void *)primitive_add2_fixnum && za_inline_enabled(INLINE_BIT_ADD)) {
+            is_add = 1;
+        } else if (wrapper_fn == (void *)primitive_subtract2_fixnum && za_inline_enabled(INLINE_BIT_SUB)) {
+            is_sub = 1;
+        }
+    }
+    if (!is_add && !is_sub) {
         jit_movabs_r11((UINT64)wrapper_fn);
         jit_call_r11();
         return;
     }
+    (void)is_sub;
 
     // 両方非負fixnum(タグ3bit=000かつ符号bit63=0)かどうかを、a|bへ
     // (TAG_MASK|FIXNUM_SIGN_BIT)を掛けた結果が0かどうかで一括判定する
@@ -2749,7 +2768,7 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
     UINT64 fallback_count = 0;
     fallback_patches[fallback_count++] = jit_emit_jne_rel32_placeholder();
 
-    if (wrapper_fn == (void *)primitive_add2) {
+    if (is_add) {
         // 生のタグ付き値同士をそのまま加算するだけでよい(下位3bitは両方0のまま、
         // マグニチュード和が60bitを超えるとbit63(符号bit)が1になるので、
         // それをオーバーフロー検出に使う。fixnum_add_signedの同符号側の

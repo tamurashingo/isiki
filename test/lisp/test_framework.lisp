@@ -70,6 +70,7 @@
   (isiki-test-mark path)
   (isiki-audit-begin path)
   (let* ((before (%%current-inline))
+         (before-count (+ *isiki-test-pass* *isiki-test-fail*))
          (r (load path)))
     ;; **検査本体は別関数にしてある。** assert-equal は**マクロ**で、この defun より
     ;; 後ろで定義されている。ここへ直接書くとマクロ展開されず、ただの関数呼び出しと
@@ -78,7 +79,7 @@
     ;; 実際に踏んだ: 陽性対照(わざと declaim を漏らす)が反応しなくて気づいた。
     ;; **新しく置いた検出器は、それ自体が検証対象である**(規則 8)。
     ;; 関数呼び出しなら実行時解決なので、定義が後ろでも問題ない。
-    (isiki-declaim-check path before)
+    (isiki-file-end-check path before before-count)
     r))
 ;; ---------------------------------------------------------------------------
 
@@ -214,10 +215,29 @@
            (format *isiki-test-stream* "[NG] ~S => ~S (expected ~~ ~S)~%"
                    ',form %isiki-actual %isiki-expected)))))
 
-;; isiki-test-load から呼ぶ declaim 漏れの検査。**assert-equal より後に置くこと**
-;; (ここでマクロ展開される)。path を混ぜてあるのは NG の行にファイル名を出すため
-(defun isiki-declaim-check (path before)
-  (assert-equal (list path before) (list path (%%current-inline))))
+;; isiki-test-load から呼ぶファイル出口の検査。**assert-equal より後に置くこと**
+;; (ここでマクロ展開される)。path を混ぜてあるのは NG の行にファイル名を出すため。
+;;
+;; 2 つ見る。
+;;
+;; 1. **declaim 漏れ。** declaim は environment 単位でファイルをまたいで残るので、
+;;    打ち消し忘れると後続の無関係なファイルが連鎖で落ちる。出口で見れば
+;;    落ちた場所と原因の場所が一致する。
+;;
+;; 2. **そのファイルが実際に何件走ったか。** 中断検出(*isiki-test-attempt*)は
+;;    assert-* の中の中断しか見ない。**assert でないトップレベル式が落ちて
+;;    以降が走らなかった場合、件数が静かに減るだけで誰も気づかない。**
+;;    実際、検出器が一度も走っていなかったことに気づけたのは合計件数が
+;;    増えなかったからで、**件数が唯一の証人だった**
+;;    (documents/inline-arith.md §8-1)。証人を制度にする。
+;;
+;;    #count 行を出すので、CI の出力差分に「どのファイルが何件減ったか」が出る。
+;;    0 件のファイルは「走らなかった」疑いとして NG にする。
+(defun isiki-file-end-check (path before before-count)
+  (let ((n (- (+ *isiki-test-pass* *isiki-test-fail*) before-count)))
+    (format *isiki-test-stream* "#count ~A ~D~%" path n)
+    (assert-equal (list path before) (list path (%%current-inline)))
+    (assert-equal (list path t) (list path (> n 0)))))
 
 
 ;; (assert-error form) : formの評価が何らかのconditionをsignalすること
