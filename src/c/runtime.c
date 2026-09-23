@@ -4571,6 +4571,47 @@ static lisp_val_t signal_domain_error_for_class(lisp_val_t offending_object, con
     return os_signal_condition(g_sym_class_domain_error, initargs, env);
 }
 
+/**
+ * [P4] 0除算を<division-by-zero>としてsignalする。
+ * 仕様の error-id: div/mod は spec:4889、quotient/reciprocal は spec:4347/4365。
+ *
+ * spec §29.3.1 の <arithmetic-error> は operation / operands のデータを持つ。
+ * **operation にはシンボルを入れる。** 仕様の型は <function> だが、このコードベースは
+ * 既に %quotient2(init.lisp)と init_test.lisp がシンボルを入れる形で揃っており、
+ * report-condition の ~A も関数オブジェクトでは #<FUNCTION-BUILTIN> としか出ない。
+ * 既存の形に合わせる(PR に仕様との差として記録した)。
+ *
+ * キーワードとクラス名は os_make_symbol でその場で引く。エラー経路なのでキャッシュの
+ * 必要が無く、**グローバルを増やすと gc_copy_value の追加を忘れる余地が増える**
+ * ([ファイルI/O]#49 と同じ落とし方)ため。symbol は intern 済みなので table は増えない。
+ *
+ * @param operation_name 演算の名前(例 "/")
+ * @param operands 受け取った引数のリスト
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ */
+static lisp_val_t signal_division_by_zero(const char *operation_name, lisp_val_t operands, lisp_val_t env) {
+    GC_PROTECT(operands);
+    GC_PROTECT(env);
+    lisp_val_t operation = os_make_symbol(operation_name);
+    GC_PROTECT(operation);
+    lisp_val_t kw_operands = os_make_symbol(":OPERANDS");
+    GC_PROTECT(kw_operands);
+    lisp_val_t kw_operation = os_make_symbol(":OPERATION");
+    GC_PROTECT(kw_operation);
+    lisp_val_t class_sym = os_make_symbol("<DIVISION-BY-ZERO>");
+    GC_PROTECT(class_sym);
+
+    /* 確保を1つずつ行い、それぞれの結果を次の確保を跨いで保護する
+       (C言語の引数評価順に依存したネストは避ける。documents/pitfalls.md 原則4) */
+    lisp_val_t initargs = os_make_cons(operands, nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(kw_operands, initargs);
+    initargs = os_make_cons(operation, initargs);
+    initargs = os_make_cons(kw_operation, initargs);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
 static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t env) {
     GC_PROTECT(offending_object);
     GC_PROTECT(env);
@@ -6559,10 +6600,10 @@ lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
  * よる長除算)にフォールバックする。商の符号は絶対値の商にオペランドの符号のXORを付与して決める。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果の数値。floatが絡まず0除算の場合はg_sym_eval_error
+ * @return 除算結果の数値。floatが絡まず0除算の場合は<division-by-zero>をsignalする
+ *         ([P4] 以前はg_sym_eval_errorを値として返していた)
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t first = cc_car(args);
 
     /* [型昇格] +と同じ規則。0除算はIEEE754どおり inf/nan を返す(従来どおり) */
@@ -6593,7 +6634,8 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
                 break;
             }
             if (!fixnum_divide_signed_unchecked(quot_val, v, &quot_val)) {
-                return g_sym_eval_error;   /* 除数が0。桁溢れはありえない */
+                /* 除数が0。桁溢れはありえない */
+                return signal_division_by_zero("/", args, env);
             }
         }
     }
@@ -6618,7 +6660,7 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
         decompose(cc_car(rest), &operand);
 
         if (operand.count == 1 && operand.limbs[0] == 0) {
-            return g_sym_eval_error;
+            return signal_division_by_zero("/", args, env);
         }
 
         decompose(acc_val, &acc);
@@ -6987,10 +7029,9 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
  * 商は-∞方向へ切り捨てる)。floor_divmodを参照。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の商。z2が0の場合はg_sym_eval_error
+ * @return floor除算の商。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
 
@@ -6998,7 +7039,7 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
     int div_by_zero;
     floor_divmod(z1, z2, &div_out, &mod_out, &div_by_zero);
     if (div_by_zero) {
-        return g_sym_eval_error;
+        return signal_division_by_zero("DIV", args, env);
     }
     return div_out;
 }
@@ -7008,10 +7049,9 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
  * 一致する)。floor_divmodを参照。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の余り。z2が0の場合はg_sym_eval_error
+ * @return floor除算の余り。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
 
@@ -7019,7 +7059,7 @@ lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
     int div_by_zero;
     floor_divmod(z1, z2, &div_out, &mod_out, &div_by_zero);
     if (div_by_zero) {
-        return g_sym_eval_error;
+        return signal_division_by_zero("MOD", args, env);
     }
     return mod_out;
 }
@@ -7090,15 +7130,15 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
  * mag_isqrtを参照)。zが負の場合は定義域エラー。
  * @param args 評価済みの引数リスト(非負整数1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
+ * @return floor(sqrt(z))。zが負の場合は<domain-error>をsignalする(spec:4984)
  */
 lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t val = cc_car(args);
     signed_mag_t m;
     decompose(val, &m);
     if (m.sign) {
-        return g_sym_eval_error;
+        /* spec:4984 「z が非負整数でなければ error-id. domain-error」 */
+        return signal_domain_error_for_class(val, "<INTEGER>", env);
     }
 
     return mag_isqrt(val);
@@ -7847,10 +7887,9 @@ int os_read_default_float_format_is_single(void) {
  * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
  * @param args 評価済みの引数リスト(数値1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
+ * @return floatに変換した値。数値以外が渡された場合は<domain-error>をsignalする(spec:4734)
  */
 lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t x = cc_car(args);
     if (is_float(x)) {
         return x;
@@ -7860,7 +7899,8 @@ lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
            第2引数で形式を指定する拡張は本作業では扱わない */
         return os_make_float_of_kind(math_result_kind(args), to_double(x));
     }
-    return g_sym_eval_error;
+    /* spec:4734 「x が数でなければ error-id. domain-error」 */
+    return signal_domain_error(x, env);
 }
 
 /**
