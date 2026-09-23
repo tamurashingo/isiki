@@ -97,6 +97,10 @@ lisp_val_t g_sym_car;
 lisp_val_t g_sym_cdr;
 /** cons関数を表すシンボル */
 lisp_val_t g_sym_cons;
+lisp_val_t g_sym_plus;
+lisp_val_t g_sym_minus;
+lisp_val_t g_sym_asterisk;
+lisp_val_t g_sym_slash;
 
 /** 構文エラーを表すシンボル */
 lisp_val_t g_sym_read_error;
@@ -1663,14 +1667,47 @@ lisp_val_t primitive_current_optimize(lisp_val_t args, lisp_val_t env) {
 
 /** インラインビットを、指定されている名前のリストへ展開する。
  * 順序は INLINE_BIT_* の並びに合わせる(car cdr null eq) */
+/** インライン展開の対象の名前表。**ビットと名前の対応はここ 1 箇所だけにある。**
+ *
+ * 以前は「名前 → ビット」(os_inline_bit_of)と「ビット → 名前」(inline_to_list)が
+ * 別々に並んでいて、**片方だけに足すと %%CURRENT-INLINE が黙って nil を返した**
+ * (実際に踏んだ。documents/inline-arith.md §7-4)。表を 1 つにして両方をそこから
+ * 導き、要素数を _Static_assert で INLINE_BIT_COUNT と突き合わせる。
+ * **ビットを足して表に足し忘れると、ビルドが落ちる。**
+ *
+ * シンボルは g_sym_* への**ポインタ**で持つ。値をコピーで持つと GC の移動に
+ * 追随できない(g_sym_* 自身は gc_copy_value で更新される)。
+ * 並びは %%CURRENT-INLINE の出力順である。 */
+static const struct {
+    UINT64 bit;
+    lisp_val_t *sym;
+} g_inline_names[] = {
+    { INLINE_BIT_CAR,  &g_sym_car },
+    { INLINE_BIT_CDR,  &g_sym_cdr },
+    { INLINE_BIT_NULL, &g_sym_null },
+    { INLINE_BIT_EQ,   &g_sym_eq },
+    { INLINE_BIT_ADD,  &g_sym_plus },
+    { INLINE_BIT_SUB,  &g_sym_minus },
+    { INLINE_BIT_MUL,  &g_sym_asterisk },
+    { INLINE_BIT_DIV,  &g_sym_slash },
+};
+_Static_assert(sizeof(g_inline_names) / sizeof(g_inline_names[0]) == INLINE_BIT_COUNT,
+               "インライン対象のビットを増減したら g_inline_names と "
+               "INLINE_BIT_COUNT の両方を更新すること");
+
 static lisp_val_t inline_to_list(UINT64 packed) {
     UINT64 bits = DECLAIM_INLINE_BITS(packed);
     lisp_val_t r = nil;
-    /* 末尾から積んで (car cdr null eq) の順にする */
-    if (bits & INLINE_BIT_EQ)   { r = os_make_cons(g_sym_eq, r); }
-    if (bits & INLINE_BIT_NULL) { r = os_make_cons(g_sym_null, r); }
-    if (bits & INLINE_BIT_CDR)  { r = os_make_cons(g_sym_cdr, r); }
-    if (bits & INLINE_BIT_CAR)  { r = os_make_cons(g_sym_car, r); }
+    /* 表の末尾から積むと表の順(= %%CURRENT-INLINE の出力順)になる。
+       **os_make_cons は引数を GC_PROTECT するので、ここでの確保は安全である**
+       (シンボルはすべて g_sym_* なので、cons の前に確保が走ることも無い)。
+       一時期ここで os_make_symbol("+") を呼んでいたが、それは cons へ入る前に
+       確保が走る形で原則4に触れていた(documents/inline-arith.md §8-2) */
+    for (UINT64 i = INLINE_BIT_COUNT; i > 0; i--) {
+        if (bits & g_inline_names[i - 1].bit) {
+            r = os_make_cons(*g_inline_names[i - 1].sym, r);
+        }
+    }
     return r;
 }
 
@@ -1678,6 +1715,26 @@ static lisp_val_t inline_to_list(UINT64 packed) {
 lisp_val_t primitive_current_inline(lisp_val_t args, lisp_val_t env) {
     (void)args;
     return inline_to_list(os_env_optimize(env));
+}
+
+/** 組み込み関数%%INLINE-HERE。**いまのレキシカルスコープで効いている inline 指定**を
+ * ビット集合(fixnum)で返す。
+ *
+ * **JIT ではコンパイル時に即値へ畳まれる**(za.c)。この C 実装が走るのは
+ * インタプリタ実行のときだけで、そちらは declare のレキシカルスコープを持たないので
+ * **environment の declaim をそのまま返す**(documents/inline-arith.md §7-3)。
+ * 両者が食い違うのは「JIT 済み関数の let の内側」だけで、そこを見るのが
+ * この関数の用途である。 */
+lisp_val_t primitive_inline_here(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    return os_make_fixnum(DECLAIM_INLINE_BITS(os_env_optimize(env)));
+}
+
+/** 組み込み関数%%INLINE-BIT-OF。名前に対応するビットを fixnum で返す。対象外は0。
+ * %%INLINE-HERE の戻り値を読むために要る(ビット位置は C 側にしか無い) */
+lisp_val_t primitive_inline_bit_of(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_inline_bit_of(cc_car(args)));
 }
 
 /** 組み込み関数%%INLINE-OF。関数がコンパイルされたときのinline指定。
@@ -2105,12 +2162,57 @@ static lisp_val_t declaim_slot_of(lisp_val_t env) {
  * @param sym 関数名のシンボル
  * @return INLINE_BIT_*、対象外なら0
  */
+
+
 UINT64 os_inline_bit_of(lisp_val_t sym) {
-    if (sym == g_sym_car)  { return INLINE_BIT_CAR; }
-    if (sym == g_sym_cdr)  { return INLINE_BIT_CDR; }
-    if (sym == g_sym_null) { return INLINE_BIT_NULL; }
-    if (sym == g_sym_eq)   { return INLINE_BIT_EQ; }
+    for (UINT64 i = 0; i < INLINE_BIT_COUNT; i++) {
+        if (sym == *g_inline_names[i].sym) {
+            return g_inline_names[i].bit;
+        }
+    }
     return 0;
+}
+
+/** os_scan_declaration_inline の 1 指定子ぶん。(inline f...) / (notinline f...) 以外は無視 */
+static UINT64 decl_apply_inline_spec(lisp_val_t spec, UINT64 bits) {
+    if ((spec & TAG_MASK) != TAG_CONS) {
+        return bits;
+    }
+    lisp_val_t kind = cc_car(spec);
+    if (kind != g_sym_inline && kind != g_sym_notinline) {
+        return bits;
+    }
+    /* [重要] 終端は nil との比較で見ること(nil は TAG_CONS タグを持つ)。
+       decl_apply_spec と同じ理由。 */
+    for (lisp_val_t names = cc_cdr(spec); names != nil && (names & TAG_MASK) == TAG_CONS;
+         names = cc_cdr(names)) {
+        UINT64 bit = os_inline_bit_of(cc_car(names));
+        if (bit == 0) {
+            continue;               /* 未知の名前は黙って無視(declaim と同じ) */
+        }
+        if (kind == g_sym_inline) {
+            bits |= bit;
+        } else {
+            bits &= ~bit;
+        }
+    }
+    return bits;
+}
+
+UINT64 os_scan_declaration_inline(lisp_val_t body, UINT64 inherited) {
+    UINT64 bits = inherited & DECLAIM_INLINE_MASK;
+    /* os_scan_declarations と同じ「先頭に連続する declare だけ」の規則 */
+    for (lisp_val_t rest = body; rest != nil && (rest & TAG_MASK) == TAG_CONS; rest = cc_cdr(rest)) {
+        lisp_val_t form = cc_car(rest);
+        if ((form & TAG_MASK) != TAG_CONS || cc_car(form) != g_sym_declare) {
+            break;
+        }
+        for (lisp_val_t specs = cc_cdr(form); specs != nil && (specs & TAG_MASK) == TAG_CONS;
+             specs = cc_cdr(specs)) {
+            bits = decl_apply_inline_spec(cc_car(specs), bits);
+        }
+    }
+    return bits;
 }
 
 UINT64 os_env_optimize(lisp_val_t env) {
@@ -3039,6 +3141,10 @@ static void os_gc_collect_body(void) {
     g_sym_car = gc_copy_value(g_sym_car);
     g_sym_cdr = gc_copy_value(g_sym_cdr);
     g_sym_cons = gc_copy_value(g_sym_cons);
+    g_sym_plus = gc_copy_value(g_sym_plus);
+    g_sym_minus = gc_copy_value(g_sym_minus);
+    g_sym_asterisk = gc_copy_value(g_sym_asterisk);
+    g_sym_slash = gc_copy_value(g_sym_slash);
     g_sym_read_error = gc_copy_value(g_sym_read_error);
     g_sym_eval_error = gc_copy_value(g_sym_eval_error);
     g_sym_top_level_block = gc_copy_value(g_sym_top_level_block);
@@ -3208,6 +3314,10 @@ void os_bootstrap() {
         g_sym_car = os_make_symbol("CAR");
         g_sym_cdr = os_make_symbol("CDR");
         g_sym_cons = os_make_symbol("CONS");
+        g_sym_plus = os_make_symbol("+");
+        g_sym_minus = os_make_symbol("-");
+        g_sym_asterisk = os_make_symbol("*");
+        g_sym_slash = os_make_symbol("/");
 
         g_sym_read_error = os_make_symbol("READ-ERROR");
         g_sym_eval_error = os_make_symbol("EVAL-ERROR");
@@ -3341,6 +3451,8 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%CURRENT-OPTIMIZE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_optimize), global_environment);
         os_set_function(os_make_symbol("%%OPTIMIZE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_optimize_of), global_environment);
         os_set_function(os_make_symbol("%%CURRENT-INLINE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_inline), global_environment);
+        os_set_function(os_make_symbol("%%INLINE-HERE"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_here), global_environment);
+        os_set_function(os_make_symbol("%%INLINE-BIT-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_bit_of), global_environment);
         os_set_function(os_make_symbol("%%INLINE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_of), global_environment);
         os_set_function(os_make_symbol("%%DECLARED-TYPES-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_declared_types_of), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);

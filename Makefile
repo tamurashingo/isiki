@@ -280,7 +280,18 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-o $@ $<
 
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+# マクロの前方参照検査(tools/check_macro_forward_refs.py)。
+# **マクロ定義より前で使われたマクロは展開されず、関数呼び出しになる。**
+# その名前の関数は存在しないので EVAL-ERROR が**値として**返り、制御転送では
+# ないので黙って流れて捨てられる。エラーにならないので気づけない。
+# とくに defun は JIT が定義時にコンパイルするので call が焼き込まれる。
+# 静的検査で一瞬で終わるので make test の先頭に置く
+# (実際に踏んだ: documents/inline-arith.md §8-1)
+.PHONY: check-macro-order
+check-macro-order:
+	@python3 tools/check_macro_forward_refs.py
+
+test: check-macro-order $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
@@ -899,6 +910,12 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # (ソースからの再ビルドを前提とし、.soはgit管理対象外)。stderrへ
 # `[isiki_instcount] total_insns=<N>` の形式で報告する。
 INSTCOUNT_PLUGIN = tools/plugins/isiki_instcount.so
+# タイマー割り込み1回あたりの命令数。ゲート区間の中で割り込みが入ると、その
+# ハンドラの命令も数えてしまうので差し引く。**実測で求めた値**で、同じ区間を
+# 違う tick 数で 4 回測って傾きを取ったところ 4 回とも 914.0 だった
+# (documents/performance-measurement.md「手法1の改良案」)。ハンドラを
+# 変更したら測り直すこと
+ISR_INSNS_PER_TICK ?= 914
 
 $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 	docker run --rm --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder -c '\
@@ -951,6 +968,40 @@ test-qemu-float-contagion-bench:
 # [QEMU_DISK_IMG=...]。既存のtest-qemu-milestoneと同じ引数を受け付ける
 test-qemu-instcount: $(INSTCOUNT_PLUGIN)
 	$(MAKE) test-qemu-milestone QEMU_EXTRA_FLAGS="-plugin file=$(INSTCOUNT_PLUGIN)"
+
+# ゲート版(documents/performance-measurement.md「手法1の改良案」)。
+# **2パスで走る。** ロード先のアドレスはディスク構成でも変わるので、
+# 同じQEMUコマンドラインでまず実行時アドレスを取り(パス1)、それを
+# gate_start=/gate_end= に渡して測る(パス2)。
+#
+# MILESTONE の Lisp は、どこかで
+#   (format *isiki-test-stream* "#gate ~A~%" (%%gate-plugin-args))
+# を出力すること。パス1はその1行だけを取りに行く。
+#
+# 使い方: make test-qemu-instcount-gate MILESTONE=test/lisp/qemu_boot_xxx.lisp
+test-qemu-instcount-gate: $(INSTCOUNT_PLUGIN)
+	@test -n "$(MILESTONE)" || { echo "ERROR: MILESTONE= を指定すること"; exit 1; }
+	@echo "=== パス1: ゲートの実行時アドレスを取る(プラグイン無し) ==="
+	$(MAKE) test-qemu-milestone MILESTONE=$(MILESTONE)
+	@GATE_ARGS=$$(sed -n 's/^#gate //p' test-results.txt | head -1); \
+	 test -n "$$GATE_ARGS" || { echo "ERROR: test-results.txt に #gate 行が無い"; exit 1; }; \
+	 echo "=== パス2: gate=$$GATE_ARGS ==="; \
+	 $(MAKE) test-qemu-milestone MILESTONE=$(MILESTONE) \
+	   QEMU_EXTRA_FLAGS="-plugin file=$(INSTCOUNT_PLUGIN),$$GATE_ARGS" 2>&1 | tee tmp/instcount-gate.out
+	@echo ""
+	@echo "=== 区間ごとの命令数(割り込み補正つき) ==="
+	@echo "補正後 = insns - $(ISR_INSNS_PER_TICK) * ticks"
+	@echo "  ISR_INSNS_PER_TICK はタイマー割り込み1回あたりの命令数。区間の中で"
+	@echo "  割り込みが入るとそのハンドラの命令も数えてしまうので差し引く"
+	@echo "  (documents/performance-measurement.md「手法1の改良案」§割り込みの補正)"
+	@awk -v isr=$(ISR_INSNS_PER_TICK) '\
+	  BEGIN { k=0; j=0 }   # **未初期化のまま添字に使うと ins[""] を引く**(awk の添字は文字列) \
+	  FNR==NR { if ($$0 ~ /^\[isiki_instcount\] SEG [0-9]+ insns=/) { v=$$0; sub(/.*insns=/,"",v); ins[k++]=v } next } \
+	  /^#seg / { label=$$2; ticks=0; \
+	             for (i=1;i<=NF;i++) { if ($$i ~ /^ticks=/) { t=$$i; sub(/^ticks=/,"",t); ticks=t } } \
+	             if (hdr==0) { printf "%-18s %14s %6s %14s\n","label","insns","ticks","corrected"; hdr=1 } \
+	             printf "%-18s %14d %6d %14d\n", label, ins[j], ticks, ins[j]-isr*ticks; j++ }' \
+	  tmp/instcount-gate.out test-results.txt
 
 # 決定論的実行モード(-icount)での計測(documents/performance-measurement.md
 # 参照)。1命令ごとに仮想時間を進めるため、ホストの実行速度と無関係に常に
