@@ -1,5 +1,8 @@
 (load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
+;; テストフレームワーク自身の検証。**道具が壊れていると全部の期待値が黙って無効になる**ので、
+;; 何より先に走らせる(assert-error-class の陽性/陰性対照を含む)
+(isiki-test-load "test/lisp/test_framework_test.lisp")
 (isiki-test-load "test/lisp/init_test.lisp")
 (isiki-test-load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例は別ファイル。構文エラーでloadが中断した場合に検出できるよう

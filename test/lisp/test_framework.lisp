@@ -214,6 +214,56 @@
            (format *isiki-test-stream* "[NG] ~S => ~S (expected an error to be signaled)~%"
                    ',form (car (cdr %isiki-actual)))))))
 
+;; (assert-error-class class-designator form) : formの評価が
+;; class-designator(またはそのサブクラス)のコンディションをsignalすることを
+;; 検証する。assert-errorが「何かがsignalされた」までしか見ないのに対し、
+;; こちらは**どのクラスか**まで固定する。
+;;
+;; EVAL-ERROR返しをsignalへ寄せていく作業(documents/error-unwind-survey.md
+;; §A-4 / §6-3 B)では、「エラーになること」だけでなく「仕様のerror-idどおりの
+;; クラスであること」までが検証対象になる。assert-errorで通してしまうと、
+;; 0除算が<simple-error>でsignalされても誰も気づかない。
+;;
+;; class-designatorは**評価する**(typepと同じクラスdesignator: クラス名symbolでも
+;; クラスオブジェクトでもよい)。呼び出し側はquoteして渡す:
+;;   (assert-error-class '<division-by-zero> (div 1 0))
+;;
+;; ハンドラは仕様どおり必ず制御を転送する(spec:6927-6930)。continuableかどうかは
+;; 問わない。assert-errorと同じくisiki-test-beginを先に呼ぶので、中断検出
+;; (*isiki-test-attempt*)にも正しく乗る。
+;;
+;; 結果は3通りに分けてNGメッセージに出す:
+;;   signalされてクラスも一致     -> pass
+;;   signalされたがクラスが違う   -> NG(実際のクラス名を出す)
+;;   signalされず値を返した       -> NG(その値を出す。EVAL-ERRORもここに落ちる)
+(defmacro assert-error-class (class-designator form)
+  `(let ((%isiki-class ,class-designator))
+     (let ((%isiki-actual
+            (block %isiki-assert-error-class
+              (isiki-test-begin ',form)
+              (with-handler
+                  (lambda (%isiki-c)
+                    (return-from %isiki-assert-error-class
+                      (list '%isiki-signaled
+                            (typep %isiki-c %isiki-class)
+                            (%%class-name (class-of %isiki-c)))))
+                (list '%isiki-no-error ,form)))))
+       (if (eq (car %isiki-actual) '%isiki-signaled)
+           (if (car (cdr %isiki-actual))
+               (progn
+                 (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
+                 (isiki-audit-record t))
+             (progn
+               (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+               (isiki-audit-record nil)
+               (format *isiki-test-stream* "[NG] ~S => signaled ~S (expected ~S)~%"
+                       ',form (car (cdr (cdr %isiki-actual))) %isiki-class)))
+         (progn
+           (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+           (isiki-audit-record nil)
+           (format *isiki-test-stream* "[NG] ~S => ~S (expected ~S to be signaled)~%"
+                   ',form (car (cdr %isiki-actual)) %isiki-class))))))
+
 ;; (assert-output (result-var output-var) form body...) : formを
 ;; *standard-output*が文字列出力ストリーム(create-string-output-stream)に
 ;; 束縛された状態で評価し、その戻り値をresult-var、出力された文字列を
