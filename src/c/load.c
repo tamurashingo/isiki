@@ -54,7 +54,25 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
             break;
         }
 
-        os_eval_top_level(form, env);
+        // [P2] REPLと同じく、エラーで打ち切られたフォームの中での
+        // switch-environment(proc->envの恒久的な書き換え)は無かったことにする。
+        // cc_load自身はenv引数のもとで評価するのでproc->envを読まないが、
+        // proc->envはload後のREPLに残るため、やりかけの切り替えを残さない。
+        // 正常終了したフォームのswitch-environmentは従来どおり有効なままにする
+        process_t *proc = get_current_process();
+        lisp_val_t saved_proc_env = proc->env;
+        GC_PROTECT(saved_proc_env);
+
+        int aborted = 0;
+        os_eval_top_level_ex(form, env, &aborted);
+        // saved_proc_envが0のときは「まだ遅延生成されていなかった」ので戻さない。
+        // 0へ書き戻すと、フォームの中で生成されたprocess environmentが捨てられ、
+        // 次の%%current-environmentが同名の環境をもう1つ*environments*へ足してしまう
+        if (aborted && saved_proc_env != 0) {
+            // procはGCで動かないが、os_eval_top_level_exの中でGCが走っていれば
+            // proc->envは書き換わっている。取り直してから戻す
+            get_current_process()->env = saved_proc_env;
+        }
     }
 
     os_stream_close(&stream);

@@ -8557,15 +8557,25 @@ lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env) {
  * そのまま(レキシカルに)子フォームへ伝播するだけで、%%set-current-environmentによる
  * proc->envの書き換えを一切参照しないため、単にbodyを(progn ...)へまとめて
  * %%set-current-environmentするだけでは対象環境で評価したことにならない。
+ * [P2] **os_eval_top_levelではなくos_evalを使う。** 以前はここでも
+ * os_eval_top_levelを呼んでいたため、**内側にもう1つ block %TOP-LEVEL が張られ、
+ * %abort-top-levelがそこで止まってしまっていた。** その結果、
+ * (progn (with-environment e (error "x")) (note 'after)) の 'after まで評価が
+ * 進み、conditionがwith-environment式の値になっていた(調査文書 §3-3、
+ * 「<error>オブジェクトが値として返る」唯一の実測ケース)。
+ * ここをos_evalにすると、脱出は呼び出し元へそのまま伝播し、本物のトップレベルの
+ * %TOP-LEVELまで届く。with-environment(init.lisp)のunwind-protectは
+ * 脱出経路でも走るので、environmentの復元は従来どおり保証される。
+ *
  * @param args (form env) formは未評価のS式(呼び出し側でquote済み)
  * @param env 呼び出し時の環境(未使用、formの評価にはargsのenvを使う)
- * @return formをargsのenvのもとで評価した結果
+ * @return formをargsのenvのもとで評価した結果。非局所脱出はそのまま伝播する
  */
 lisp_val_t primitive_eval_in_environment(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t form = cc_car(args);
     lisp_val_t target_env = cc_car(cc_cdr(args));
-    return os_eval_top_level(form, target_env);
+    return os_eval(form, target_env);
 }
 
 /**

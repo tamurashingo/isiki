@@ -26,6 +26,27 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env);
 lisp_val_t os_eval_top_level(lisp_val_t form, lisp_val_t env);
 
 /**
+ * os_eval_top_levelの、「打ち切られたかどうか」を呼び出し元へ返す版。
+ *
+ * **戻り値だけでは区別が付かない。** `(error "x")` が打ち切られた場合も、
+ * フォームがたまたまconditionオブジェクトを値として返した場合も、
+ * os_eval_top_levelの戻り値はどちらも<error>のインスタンスになる。
+ * environmentの巻き戻し(打ち切られたときだけ戻す)と表示の切り替え
+ * (report-conditionを使うかどうか)は、この区別が要る。
+ *
+ * 打ち切りとみなすのは**%abort-top-levelによる脱出だけ**である。すなわち
+ * MAGIC_BLOCK_EXIT かつ宛先が %TOP-LEVEL のもの。eval_blockと同じく
+ * 宛先名だけを見る経路(throw/goのタグがたまたま%TOP-LEVELだった場合)は
+ * 値としては従来どおり捕捉するが、打ち切りとしては数えない。
+ *
+ * @param form 評価対象のトップレベルフォーム
+ * @param env 評価に使う環境
+ * @param out_aborted %abort-top-levelで打ち切られた場合に1を格納する先(NULL可)
+ * @return formの評価結果。abortされた場合はabortに渡されたcondition
+ */
+lisp_val_t os_eval_top_level_ex(lisp_val_t form, lisp_val_t env, int *out_aborted);
+
+/**
  * 組み込み関数MACROEXPAND-1。formの先頭がマクロとして定義されたsymbolなら1段だけ展開して返し、
  * そうでなければformをそのまま返す。
  * @param args 評価済みの引数リスト(第一引数がform)
