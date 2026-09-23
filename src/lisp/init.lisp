@@ -607,6 +607,27 @@
   (format stream "undefined ~A: ~A" (slot-value condition 'namespace) (slot-value condition 'name))
   condition)
 
+;; [P2] トップレベルが打ち切られたときの表示に使う。conditionのreport-conditionを
+;; 文字列にして返す。C側(repl.c)がos_get_function+os_apply_functionで呼ぶ。
+;;
+;; **表示の途中でさらにエラーが起きても、そこで巻き添えにしない。** report-condition
+;; はユーザが特殊化できる総称関数なので、中でエラーをsignalしうる。その場合はnilを
+;; 返し、C側は従来どおり #<INSTANCE-OF ...> の表示へ落とす。
+;;
+;; **ここでハンドラを張らないと無限再帰になる。** この関数はos_eval_top_levelを
+;; 抜けた後に呼ばれるので、block %TOP-LEVEL はもう生きていない。その状態で
+;; signal-conditionが%abort-top-levelへ落ちると、return-fromの宛先が生きていない
+;; ため<control-error>がsignalされ、それがまた%abort-top-levelへ……と回り続ける。
+;;
+;; 戻り値の文字列は呼び出し側(C)が固定長バッファへ取り出すので、長すぎる場合は
+;; 途中で切れる(create-string-output-streamの容量1024も同様の上限)。
+(defun %report-condition-string (condition)
+  (block %report-condition-string
+    (with-handler (lambda (c) (return-from %report-condition-string nil))
+      (let ((s (create-string-output-stream)))
+        (report-condition condition s)
+        (get-output-stream-string s)))))
+
 ;;; --- ignore-errors ---
 
 ;; bodyの評価中に<error>系のconditionが発生したらそこで中断してnilを返す。

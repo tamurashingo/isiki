@@ -26,6 +26,50 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env);
 lisp_val_t os_eval_top_level(lisp_val_t form, lisp_val_t env);
 
 /**
+ * os_eval_top_levelの、「打ち切られたかどうか」を呼び出し元へ返す版。
+ *
+ * **戻り値だけでは区別が付かない。** `(error "x")` が打ち切られた場合も、
+ * フォームがたまたまconditionオブジェクトを値として返した場合も、
+ * os_eval_top_levelの戻り値はどちらも<error>のインスタンスになる。
+ * environmentの巻き戻し(打ち切られたときだけ戻す)と表示の切り替え
+ * (report-conditionを使うかどうか)は、この区別が要る。
+ *
+ * 打ち切りとみなすのは**%abort-top-levelによる脱出だけ**である。すなわち
+ * MAGIC_BLOCK_EXIT かつ宛先が %TOP-LEVEL のもの。eval_blockと同じく
+ * 宛先名だけを見る経路(throw/goのタグがたまたま%TOP-LEVELだった場合)は
+ * 値としては従来どおり捕捉するが、打ち切りとしては数えない。
+ *
+ * @param form 評価対象のトップレベルフォーム
+ * @param env 評価に使う環境
+ * @param out_aborted %abort-top-levelで打ち切られた場合に1を格納する先(NULL可)
+ * @return formの評価結果。abortされた場合はabortに渡されたcondition
+ */
+lisp_val_t os_eval_top_level_ex(lisp_val_t form, lisp_val_t env, int *out_aborted);
+
+/**
+ * conditionを、init.lispの%report-condition-string経由で自然言語のメッセージにし、
+ * outへNUL終端の文字列として格納する。
+ *
+ * トップレベルのドライバ(repl.c / load.c)が、打ち切られたフォームの理由を出すために
+ * 使う。**中で任意のLispコード(report-conditionの特殊化メソッド)が走る**ので、
+ * 次のどれかに当たったら0を返す。呼び出し元はそのとき生の値の印字へ落とすこと。
+ *   - init.lisp未ロード等で%report-condition-stringが未定義
+ *   - 表示の途中でさらに脱出が起きた(Lisp側もハンドラを張っているので通常は
+ *     nilが返るが、念のためここでも制御転送を見る)
+ *   - 戻り値が文字列でない
+ *
+ * メッセージがout_capを超える場合は途中で切れる(Lisp側の
+ * create-string-output-streamの容量1024も同じく上限として効く)。
+ *
+ * @param condition メッセージにするcondition
+ * @param env %report-condition-stringを解決する環境
+ * @param out 格納先
+ * @param out_cap outの容量(NUL終端込み)
+ * @return メッセージを得られたら1、得られなければ0(outは未変更)
+ */
+int os_condition_report_cstr(lisp_val_t condition, lisp_val_t env, char *out, UINT32 out_cap);
+
+/**
  * 組み込み関数MACROEXPAND-1。formの先頭がマクロとして定義されたsymbolなら1段だけ展開して返し、
  * そうでなければformをそのまま返す。
  * @param args 評価済みの引数リスト(第一引数がform)

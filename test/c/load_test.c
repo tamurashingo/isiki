@@ -168,6 +168,12 @@ static void reset_capture(void) {
     g_capture_len = 0;
 }
 
+/** キャプチャした出力をNUL終端の文字列として取り出す */
+static const char *captured(void) {
+    g_capture_buf[g_capture_len] = '\0';
+    return g_capture_buf;
+}
+
 #define HEAP_SIZE (1024 * 1024)
 
 static void setup_heap(void) {
@@ -238,6 +244,84 @@ static void test_load_open_failure_returns_eval_error(void) {
     assert(result == g_sym_eval_error, "openに失敗した場合はg_sym_eval_errorを返す");
 }
 
+// ---------------------------------------------------------------------------
+// [P2] ロード中にフォームが打ち切られたときの扱い
+//
+// init.lispをロードしないテストなので、errorやreport-conditionは使えない。
+// %abort-top-levelが実際に出すのと同じ脱出((return-from %top-level ...))を
+// フォームとして直接書き、%REPORT-CONDITION-STRINGはフェイクを登録して、
+// C側の配線だけを検証する。
+// ---------------------------------------------------------------------------
+
+static int g_fake_report_calls = 0;
+
+static lisp_val_t fake_report_condition_string(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    g_fake_report_calls++;
+    return os_make_string("p2 load reported");
+}
+
+static void install_fake_report(void) {
+    os_set_function(os_make_symbol("%REPORT-CONDITION-STRING"),
+                     os_make_native_function((lisp_addr_t)(void *)fake_report_condition_string),
+                     global_environment);
+}
+
+static void uninstall_fake_report(void) {
+    os_set_function(os_make_symbol("%REPORT-CONDITION-STRING"), nil, global_environment);
+}
+
+static void test_load_aborted_form_reports_and_continues(void) {
+    reset_fake_state();
+    reset_capture();
+    install_fake_report();
+    g_fake_report_calls = 0;
+    // 2番目のフォームが打ち切られる。**3番目は評価されなければならない**
+    set_fake_data("(setq p2-a 1)\n(return-from %top-level 9)\n(setq p2-b 2)\n");
+
+    lisp_val_t result = call_load("fake/abort.lisp");
+
+    assert(result == g_sym_t, "打ち切られたフォームがあってもloadはg_sym_tを返す(ロードは続行する)");
+    assert(g_fake_report_calls == 1, "打ち切られたフォーム1つにつき1回report-conditionを呼ぶ");
+    assert(strcmp(captured(), "load: fake/abort.lisp: p2 load reported\n") == 0,
+        "打ち切りはパス付きでreport-conditionのメッセージとして表示される");
+
+    lisp_val_t a = os_get_variable(os_make_symbol("p2-a"), global_environment);
+    assert(a == os_make_fixnum(1), "打ち切りより前のフォームは評価されている");
+    lisp_val_t b = os_get_variable(os_make_symbol("p2-b"), global_environment);
+    assert(b == os_make_fixnum(2), "打ち切られたフォームの**次**のフォームも評価される");
+    uninstall_fake_report();
+}
+
+static void test_load_normal_form_does_not_report(void) {
+    reset_fake_state();
+    reset_capture();
+    install_fake_report();
+    g_fake_report_calls = 0;
+    set_fake_data("(setq p2-c 3)\n");
+
+    lisp_val_t result = call_load("fake/normal.lisp");
+
+    assert(result == g_sym_t, "正常なファイルのloadはg_sym_tを返す");
+    assert(g_fake_report_calls == 0, "打ち切りが無ければreport-conditionを呼ばない");
+    assert(strcmp(captured(), "") == 0, "打ち切りが無ければ何も表示しない(従来どおり結果は捨てる)");
+    uninstall_fake_report();
+}
+
+static void test_load_aborted_form_falls_back_when_report_missing(void) {
+    reset_fake_state();
+    reset_capture();
+    uninstall_fake_report();
+    set_fake_data("(return-from %top-level 9)\n");
+
+    lisp_val_t result = call_load("fake/abort2.lisp");
+
+    assert(result == g_sym_t, "report-conditionが無くてもloadは続行してg_sym_tを返す");
+    assert(strcmp(captured(), "load: fake/abort2.lisp: 9\n") == 0,
+        "%REPORT-CONDITION-STRINGが未定義なら生の値の印字へ落とす");
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -248,6 +332,9 @@ int main(int argc, char **argv) {
     test_load_evaluates_multiple_forms();
     test_load_syntax_error_returns_eval_error();
     test_load_empty_file_returns_t();
+    test_load_aborted_form_reports_and_continues();
+    test_load_normal_form_does_not_report();
+    test_load_aborted_form_falls_back_when_report_missing();
     test_load_open_failure_returns_eval_error();
 
     return g_test_failed ? 1 : 0;

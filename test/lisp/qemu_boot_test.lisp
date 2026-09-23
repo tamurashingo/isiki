@@ -4,6 +4,9 @@
 ;; 何より先に走らせる(assert-error-class の陽性/陰性対照を含む)
 (isiki-test-load "test/lisp/test_framework_test.lisp")
 (isiki-test-load "test/lisp/init_test.lisp")
+;; [P2] トップレベルの打ち切り(environment の巻き戻し / with-environment の
+;; 握り潰し解消 / report-condition の文字列)。init.lisp と条件システムが要る
+(isiki-test-load "test/lisp/toplevel_abort_test.lisp")
 (isiki-test-load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例は別ファイル。構文エラーでloadが中断した場合に検出できるよう
 ;; 戻り値(成功ならt)を確認する。loadの中でも assert-* が走るので、assert-equal の

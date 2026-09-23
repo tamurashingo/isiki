@@ -1229,16 +1229,67 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
  * @return formの評価結果。abortされた場合はabortに渡されたcondition
  */
 lisp_val_t os_eval_top_level(lisp_val_t form, lisp_val_t env) {
-    // envはos_make_consの引数ではないため、os_make_consの内部保護の対象外である。
-    // wrappedを組み立てる3回の確保はいずれもGCを誘発しうるので、envはここで
-    // 自分で保護しなければならない。保護していないと、GCを跨いだ時点でenvが
-    // 旧From空間を指したままos_evalへ渡り、os_eval側のGC_PROTECT(env)は
-    // 「すでに古い値」を追跡するだけになって救えない
-    // (documents/pitfalls.md 原則4。formは各os_make_consの引数なので内部保護される)
+    return os_eval_top_level_ex(form, env, 0);
+}
+
+lisp_val_t os_eval_top_level_ex(lisp_val_t form, lisp_val_t env, int *out_aborted) {
+    if (out_aborted != 0) {
+        *out_aborted = 0;
+    }
+    // (block %TOP-LEVEL form) を**consで組み立てずに**、eval_blockと同じことを
+    // その場で行う。組み立てていた頃は、脱出が%TOP-LEVEL宛のblock-exitだったのか
+    // フォームがconditionを値として返しただけなのかを呼び出し元が区別できなかった
+    // (eval_blockが包みを外して値だけ返すため)。ついでにフォーム1個につき
+    // 3回あったos_make_consも無くなる。
+    //
+    // formとenvは、os_live_block_push(os_make_consを伴う)とos_evalを跨いで
+    // 生存する必要がある(documents/pitfalls.md 原則4)
+    GC_PROTECT(form);
     GC_PROTECT(env);
-    lisp_val_t wrapped = os_make_cons(g_sym_block,
-        os_make_cons(g_sym_top_level_block, os_make_cons(form, nil)));
-    return os_eval(wrapped, env);
+
+    // ISLisp仕様§14.7: blockの動的extentの間だけ名前を積む。eval_blockと同じ
+    lisp_val_t saved = os_live_block_push(g_sym_top_level_block);
+    GC_PROTECT(saved);
+    lisp_val_t result = os_eval(form, env);
+    os_live_block_restore(saved);
+
+    if (is_control_transfer(result)) {
+        UINT64 *obj = (UINT64 *)(result & ~TAG_MASK);
+        // 捕捉の条件はeval_blockと同じ「宛先名の一致」だけにして、従来の意味論を
+        // 変えない(magicは見ない)。**打ち切りの判定だけ**はMAGIC_BLOCK_EXITに
+        // 限る = %abort-top-levelが作るものだけを打ち切りとみなす
+        if (obj[1] == g_sym_top_level_block) {
+            if (out_aborted != 0 && obj[0] == MAGIC_BLOCK_EXIT) {
+                *out_aborted = 1;
+            }
+            return obj[2];
+        }
+    }
+    return result;
+}
+
+int os_condition_report_cstr(lisp_val_t condition, lisp_val_t env, char *out, UINT32 out_cap) {
+    if (out_cap == 0) {
+        return 0;
+    }
+    GC_PROTECT(condition);
+    GC_PROTECT(env);
+    lisp_val_t sym = os_make_symbol("%REPORT-CONDITION-STRING");
+    GC_PROTECT(sym);
+    lisp_val_t fn = os_get_function(sym, env);
+    if (fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(fn);
+    lisp_val_t args = os_make_cons(condition, nil);
+    GC_PROTECT(args);
+    lisp_val_t str = apply_function(fn, args, env);
+    if (is_control_transfer(str) || (str & TAG_MASK) != TAG_STRING) {
+        return 0;
+    }
+    GC_PROTECT(str);
+    os_string_to_cstr(str, out, out_cap);
+    return 1;
 }
 
 /**

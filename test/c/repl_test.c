@@ -237,6 +237,131 @@ void test_os_repl_step_multiline_string_shows_prompt_once() {
         "複数行にわたる文字列の入力では継続行に'環境名> 'が表示されない");
 }
 
+// ---------------------------------------------------------------------------
+// [P2] トップレベルの打ち切り(%abort-top-level相当)の扱い
+//
+// init.lispをロードしないテストなので、errorやwith-environmentは使えない。
+// 代わりに、%abort-top-levelが実際に出すのと同じ脱出
+// ((return-from %top-level ...) = MAGIC_BLOCK_EXIT 宛先%TOP-LEVEL)を
+// フォームとして直接書いて、C側の配線だけを検証する。
+// 実際のconditionを使ったend-to-endの確認はQEMU側
+// (test/lisp/toplevel_abort_test.lisp)で行う。
+// ---------------------------------------------------------------------------
+
+/** [P2] %REPORT-CONDITION-STRINGのフェイク。init.lispの代わりに、
+    「呼ばれたら固定の文字列を返す」だけの実装をglobal_environmentへ登録する。
+    repl.cがこの関数を実際に呼んで、その戻り値を表示に使っているかを見る */
+static int g_fake_report_calls = 0;
+
+static lisp_val_t fake_report_condition_string(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    g_fake_report_calls++;
+    return os_make_string("p2 reported message");
+}
+
+/** フェイクの%REPORT-CONDITION-STRINGを登録する(登録しない版の挙動も見たいので関数にする) */
+static void install_fake_report(void) {
+    os_set_function(os_make_symbol("%REPORT-CONDITION-STRING"),
+                     os_make_native_function((lisp_addr_t)(void *)fake_report_condition_string),
+                     global_environment);
+}
+
+/** フェイクを外す(未定義に戻す)。os_set_functionでnilを入れるとos_get_functionがnilを返す */
+static void uninstall_fake_report(void) {
+    os_set_function(os_make_symbol("%REPORT-CONDITION-STRING"), nil, global_environment);
+}
+
+void test_os_repl_step_normal_form_does_not_use_report() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    install_fake_report();
+    g_fake_report_calls = 0;
+    reset_capture();
+    push_string(proc, "(+ 1 2)\n");
+
+    os_repl_step(proc);
+
+    assert(strcmp(captured(), "3\n") == 0, "正常終了したフォームは従来どおりos_printで表示される");
+    assert(g_fake_report_calls == 0, "正常終了したフォームではreport-conditionを呼ばない");
+    uninstall_fake_report();
+}
+
+void test_os_repl_step_aborted_form_uses_report() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    install_fake_report();
+    g_fake_report_calls = 0;
+    reset_capture();
+    // %abort-top-levelが出すのと同じ脱出。42が「abortに渡されたcondition」に当たる
+    push_string(proc, "(return-from %top-level 42)\n");
+
+    os_repl_step(proc);
+
+    assert(g_fake_report_calls == 1, "打ち切られたフォームでは%REPORT-CONDITION-STRINGを1回呼ぶ");
+    assert(strcmp(captured(), "p2 reported message\n") == 0,
+        "打ち切りの表示はreport-conditionの文字列になる(生の値の印字ではない)");
+    uninstall_fake_report();
+}
+
+void test_os_repl_step_aborted_form_falls_back_when_report_missing() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    uninstall_fake_report();
+    reset_capture();
+    push_string(proc, "(return-from %top-level 42)\n");
+
+    os_repl_step(proc);
+
+    assert(strcmp(captured(), "42\n") == 0,
+        "%REPORT-CONDITION-STRINGが未定義なら従来どおりの印字へ落とす");
+}
+
+void test_os_repl_step_aborted_form_restores_environment() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    uninstall_fake_report();
+
+    // まず1回評価してproc->envを遅延生成させる
+    reset_capture();
+    push_string(proc, "1\n");
+    os_repl_step(proc);
+    lisp_val_t original_env = proc->env;
+    assert(original_env != 0, "envが遅延生成されている");
+
+    // 打ち切られるフォームの**中で**環境を切り替える。
+    // %%set-current-environmentはproc->envを恒久的に書き換えるプリミティブで、
+    // switch-environment(init.lisp)の実体でもある
+    reset_capture();
+    push_string(proc,
+        "(progn (%%set-current-environment (%%make-environment (quote P2ENV) (%%global-environment)))"
+        " (return-from %top-level 7))\n");
+    os_repl_step(proc);
+
+    assert(proc->env == original_env,
+        "打ち切られたフォームの中のswitch-environmentは巻き戻る");
+}
+
+void test_os_repl_step_normal_form_keeps_environment_switch() {
+    initialize_processes(g_buffers);
+    process_t *proc = get_current_process();
+    uninstall_fake_report();
+
+    reset_capture();
+    push_string(proc, "1\n");
+    os_repl_step(proc);
+    lisp_val_t original_env = proc->env;
+
+    // 正常終了するフォームの中での切り替えは**残す**(switch-environmentの仕様)
+    reset_capture();
+    push_string(proc,
+        "(%%set-current-environment (%%make-environment (quote P2ENV2) (%%global-environment)))\n");
+    os_repl_step(proc);
+
+    assert(proc->env != original_env,
+        "正常終了したフォームのswitch-environmentは次のフォームにも効く");
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -249,6 +374,11 @@ int main(int argc, char** argv) {
     test_os_repl_step_lazily_initializes_env();
     test_os_repl_step_reuses_env_across_calls();
     test_os_repl_step_multiline_string_shows_prompt_once();
+    test_os_repl_step_normal_form_does_not_use_report();
+    test_os_repl_step_aborted_form_uses_report();
+    test_os_repl_step_aborted_form_falls_back_when_report_missing();
+    test_os_repl_step_aborted_form_restores_environment();
+    test_os_repl_step_normal_form_keeps_environment_switch();
 
     return g_test_failed ? 1 : 0;
 }
