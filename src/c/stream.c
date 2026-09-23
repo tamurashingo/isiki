@@ -44,6 +44,7 @@ static void stream_init_common(os_stream_t *stream, stream_kind_t kind) {
     stream->closed = 0;
     stream->mount_file_node = nil;
     stream->self_handle = nil;
+    stream->pending_transfer = nil;
 }
 
 /** write_bufに溜まっている内容をTwriteで送出し、成功したらnext_offsetを進める */
@@ -138,11 +139,26 @@ static os_stream_t *flush_write_buf_fat(os_stream_t *stream) {
                        os_make_cons(os_make_fixnum(len), nil)))));
     GC_PROTECT(args);
     lisp_val_t result = os_apply_function(write_fn, args, global_environment);
+    GC_PROTECT(result);
 
     // ここまでのいずれかのアロケーションでstreamが再配置されている可能性があるため、
     // GC_PROTECT済みのself_handle経由で必ず生ポインタを取り直す
     if (self_handle != nil) {
         stream = stream_from_handle(self_handle);
+    }
+
+    // write-from!がエラーをsignalする等で非局所脱出した場合。**ここを見ないと、
+    // 脱出シグナル(TAG_INSTANCE)がnilでないというだけで「書き込み成功」と
+    // 判定され、next_offsetがlenぶん進んでしまう**
+    // (documents/error-unwind-survey.md §F-6)。
+    // 書きかけのバッファは捨て、next_offsetは進めない(どこまで書けたか分からない
+    // ため、進めるよりも「書けていない」側に倒す)。errorを立てるのは既存の失敗
+    // 経路と同じで、os_stream_read_char等の呼び出し元はそのまま抜けられる
+    if (os_is_control_transfer(result)) {
+        stream->error = 1;
+        stream->write_buf_len = 0;
+        stream->pending_transfer = result;
+        return stream;
     }
 
     if (result == nil) {
@@ -193,6 +209,24 @@ static os_stream_t *refill_read_buf_fat(os_stream_t *stream) {
                        os_make_cons(os_make_fixnum(STREAM_READ_CHUNK), nil)))));
     GC_PROTECT(args);
     lisp_val_t result = os_apply_function(read_fn, args, global_environment);
+    GC_PROTECT(result);
+
+    // read-into!が非局所脱出した場合。**os_fixnum_magnitudeへ通す前に見ること。**
+    // 脱出シグナルはTAG_INSTANCEなので、そのまま通すとヒープアドレスを
+    // 「読めたバイト数」として解釈し、buf_data[]へ無関係なメモリをコピーする
+    // (documents/error-unwind-survey.md §A-3 / §F-6)。
+    // ここで返せば、下の cli 区間(buf_dataへのコピー)にも入らない
+    if (os_is_control_transfer(result)) {
+        if (self_handle != nil) {
+            stream = stream_from_handle(self_handle);
+        }
+        // buf_count/buf_pos/next_offsetは触らない(何も読めていないので、
+        // 呼び出し前の状態のまま据え置く)。eofも立てない
+        stream->error = 1;
+        stream->pending_transfer = result;
+        return stream;
+    }
+
     UINT64 got = (result == nil) ? 0 : os_fixnum_magnitude(result);
     if (got > STREAM_READ_CHUNK) {
         got = STREAM_READ_CHUNK;
@@ -221,6 +255,26 @@ static os_stream_t *refill_read_buf_fat(os_stream_t *stream) {
         stream->eof = 1;
     }
     return stream;
+}
+
+lisp_val_t os_stream_take_transfer(lisp_val_t stream_handle) {
+    if (stream_handle == nil || (stream_handle & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(lisp_addr_t)(stream_handle & ~TAG_MASK);
+    if (obj[0] != MAGIC_STREAM) {
+        return nil;
+    }
+    // **必ずハンドルから取り直す。** flush/refillはos_stream_tを再配置しうるので、
+    // 呼び出し元が持っている生ポインタは古い実体を指している可能性がある
+    os_stream_t *raw = stream_from_handle(stream_handle);
+    lisp_val_t transfer = raw->pending_transfer;
+    if (!os_is_control_transfer(transfer)) {
+        return nil;
+    }
+    // 同じ脱出を二度返さないようクリアする。errorフラグは残す(stream.hのコメント参照)
+    raw->pending_transfer = nil;
+    return transfer;
 }
 
 int os_stream_open_9p_file(os_stream_t *stream, const char *path, char *err_msg, UINT32 err_msg_cap) {

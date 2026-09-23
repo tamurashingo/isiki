@@ -4,6 +4,15 @@
 #include "process.h"
 #include "reader.h"
 #include "mount.h"
+#include "eval.h"
+
+/* [P1] **C→Lispの呼び戻しは、Cの境界で脱出を値に化けさせる。**
+   FAT系ストリームのflush/refillはwrite-from!/read-into!をos_apply_functionで
+   呼び戻すが、stream.cの公開APIはintしか返せないので、脱出値は
+   stream->pending_transferへ預けられる(stream.hのコメント参照)。
+   **ストリームを触るcc_*は、Lispへ戻る前に必ずos_stream_take_transferで拾うこと。**
+   1箇所でも漏らすと、そのAPI経由のエラーだけが静かに消える
+   (documents/pitfalls.mdのomission list、documents/error-unwind-survey.md §F-6)。 */
 
 /** stream(TAG_INSTANCE, MAGIC_STREAM)のword1に埋め込んだ生ポインタを取り出す */
 static os_stream_t *stream_raw(lisp_val_t stream) {
@@ -158,7 +167,15 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
         UINT8 *data;
         UINT32 len;
-        if (!os_mount_fat_read_file(kind, device, relative, &data, &len)) {
+        // FATドライバ(Lisp)が非局所脱出したらそれをそのまま返す。**GC_PROTECTは
+        // 呼び出しより前に置くこと**(mount.c側が書き込んだ値が、以後のアロケーションで
+        // 再配置されても追随するように)
+        lisp_val_t transfer = nil;
+        GC_PROTECT(transfer);
+        if (!os_mount_fat_read_file(kind, device, relative, &data, &len, &transfer)) {
+            if (transfer != nil) {
+                return transfer;
+            }
             return g_sym_eval_error;
         }
         // dataはos_mount_fat_read_file内でos_alloc_raw済みの専有バッファ(コピー元の
@@ -187,7 +204,15 @@ lisp_val_t cc_open_output_stream(lisp_val_t args, lisp_val_t env) {
 
 lisp_val_t cc_close(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_close(stream_raw(cc_car(args)));
+    // FAT系のcloseは最後のflush(write-from!の呼び戻し)を行うため、ハンドルは
+    // 呼び出しを跨いで保護し、呼び出し後はハンドル経由で脱出を拾う
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
+    os_stream_close(stream_raw(stream));
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return nil;
 }
 
@@ -196,9 +221,17 @@ lisp_val_t cc_read_char(lisp_val_t args, lisp_val_t env) {
     int eos_error_p;
     lisp_val_t eos_value;
     resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    // FAT系のreadはread-into!を呼び戻すのでGCが走りうる。streamハンドルを保護
+    // しないと、以後のhandle_end_of_stream/os_stream_take_transferが古い実体を指す
+    GC_PROTECT(stream);
+    GC_PROTECT(eos_value);
     os_stream_t *raw = stream_raw(stream);
     char ch;
     if (!os_stream_read_char(raw, &ch)) {
+        lisp_val_t transfer = os_stream_take_transfer(stream);
+        if (transfer != nil) {
+            return transfer;
+        }
         return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
     /* [4bit化] chはsigned char。UINT8を経由しないと0x80以上で符号拡張する */
@@ -208,8 +241,15 @@ lisp_val_t cc_read_char(lisp_val_t args, lisp_val_t env) {
 lisp_val_t cc_write_char(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t ch = cc_car(args);
-    os_stream_t *raw = stream_raw(cc_car(cc_cdr(args)));
-    os_stream_write_char(raw, (char)(ch >> CHAR_VALUE_SHIFT));
+    // FAT系の書き込みはバッファが満杯になるとwrite-from!を呼び戻す
+    lisp_val_t stream = cc_car(cc_cdr(args));
+    GC_PROTECT(stream);
+    GC_PROTECT(ch);
+    os_stream_write_char(stream_raw(stream), (char)(ch >> CHAR_VALUE_SHIFT));
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return ch;
 }
 
@@ -226,6 +266,10 @@ lisp_val_t cc_read(lisp_val_t args, lisp_val_t env) {
     char pending;
     lisp_val_t result = os_read_stream_ex(raw, &eof, &has_pending, &pending);
     GC_PROTECT(result);
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     if (eof) {
         return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
@@ -304,7 +348,13 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
 
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
         lisp_val_t node;
-        if (!os_mount_fat_resolve_file_node(kind, device, relative, 1 /* truncate */, 1 /* create_if_missing */, &node)) {
+        lisp_val_t transfer = nil;
+        GC_PROTECT(transfer);
+        if (!os_mount_fat_resolve_file_node(kind, device, relative, 1 /* truncate */, 1 /* create_if_missing */,
+                                             &node, &transfer)) {
+            if (transfer != nil) {
+                return transfer;
+            }
             return g_sym_eval_error;
         }
         // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
@@ -341,7 +391,13 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
 
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
         lisp_val_t node;
-        if (!os_mount_fat_resolve_file_node(kind, device, relative, 0 /* truncate */, 1 /* create_if_missing */, &node)) {
+        lisp_val_t transfer = nil;
+        GC_PROTECT(transfer);
+        if (!os_mount_fat_resolve_file_node(kind, device, relative, 0 /* truncate */, 1 /* create_if_missing */,
+                                             &node, &transfer)) {
+            if (transfer != nil) {
+                return transfer;
+            }
             return g_sym_eval_error;
         }
         // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
@@ -357,7 +413,14 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
 
 lisp_val_t cc_finish_output(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_finish_output(stream_raw(cc_car(args)));
+    // FAT系のfinish-outputはwrite-from!を呼び戻す
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
+    os_stream_finish_output(stream_raw(stream));
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return nil;
 }
 
@@ -402,9 +465,15 @@ lisp_val_t cc_preview_char(lisp_val_t args, lisp_val_t env) {
     int eos_error_p;
     lisp_val_t eos_value;
     resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    GC_PROTECT(stream);
+    GC_PROTECT(eos_value);
     os_stream_t *raw = stream_raw(stream);
     char ch;
     if (!os_stream_preview_char(raw, &ch)) {
+        lisp_val_t transfer = os_stream_take_transfer(stream);
+        if (transfer != nil) {
+            return transfer;
+        }
         return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
     /* [4bit化] chはsigned char。UINT8を経由しないと0x80以上で符号拡張する */
@@ -416,14 +485,17 @@ lisp_val_t cc_read_line(lisp_val_t args, lisp_val_t env) {
     int eos_error_p;
     lisp_val_t eos_value;
     resolve_input_args(args, &stream, &eos_error_p, &eos_value);
-    os_stream_t *raw = stream_raw(stream);
+    GC_PROTECT(stream);
+    GC_PROTECT(eos_value);
 
     #define READ_LINE_MAX 512
     char buf[READ_LINE_MAX];
     UINT32 n = 0;
     int got_any = 0;
     char ch;
-    while (os_stream_read_char(raw, &ch)) {
+    // **ループのたびにハンドルから取り直す。** FAT系のrefillはos_stream_tを
+    // 再配置しうるので、ループの外で1回取った生ポインタは途中で古くなる
+    while (os_stream_read_char(stream_raw(stream), &ch)) {
         got_any = 1;
         if (ch == '\n') {
             break;
@@ -431,6 +503,10 @@ lisp_val_t cc_read_line(lisp_val_t args, lisp_val_t env) {
         if (n < READ_LINE_MAX - 1) {
             buf[n++] = ch;
         }
+    }
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
     }
     if (!got_any) {
         return handle_end_of_stream(stream, eos_error_p, eos_value, env);
@@ -450,9 +526,16 @@ lisp_val_t cc_stream_ready_p(lisp_val_t args, lisp_val_t env) {
  * 1byteごとにconsリストを構築するコストを避けるため、consチェーンを経由せず
  * 直接呼べるようにする)。意味論はcc_read_byteと完全に同じ。 */
 lisp_val_t cc_read_byte1(lisp_val_t stream) {
-    os_stream_t *raw = stream_raw(stream);
+    // **ここは AOT 生成コードから直接呼ばれる**(file-cmd.lisp の
+    // read-file-into-vector のループ)。生成側は戻り値を os_is_control_transfer で
+    // 検査しているので、脱出値をそのまま返せば正しく伝播する
+    GC_PROTECT(stream);
     char ch;
-    if (!os_stream_read_char(raw, &ch)) {
+    if (!os_stream_read_char(stream_raw(stream), &ch)) {
+        lisp_val_t transfer = os_stream_take_transfer(stream);
+        if (transfer != nil) {
+            return transfer;
+        }
         return nil;
     }
     return os_make_fixnum((UINT64)(UINT8)ch);
@@ -463,7 +546,14 @@ lisp_val_t cc_read_byte(lisp_val_t args, lisp_val_t env) {
     int eos_error_p;
     lisp_val_t eos_value;
     resolve_input_args(args, &stream, &eos_error_p, &eos_value);
+    GC_PROTECT(stream);
+    GC_PROTECT(eos_value);
     lisp_val_t result = cc_read_byte1(stream);
+    GC_PROTECT(result);
+    // cc_read_byte1が脱出値を拾って返してくる(ここで二重に取りに行かない)
+    if (os_is_control_transfer(result)) {
+        return result;
+    }
     if (result == nil) {
         return handle_end_of_stream(stream, eos_error_p, eos_value, env);
     }
@@ -473,8 +563,14 @@ lisp_val_t cc_read_byte(lisp_val_t args, lisp_val_t env) {
 lisp_val_t cc_write_byte(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t z = cc_car(args);
-    os_stream_t *raw = stream_raw(cc_car(cc_cdr(args)));
-    os_stream_write_char(raw, (char)(UINT8)os_fixnum_magnitude(z));
+    lisp_val_t stream = cc_car(cc_cdr(args));
+    GC_PROTECT(stream);
+    GC_PROTECT(z);
+    os_stream_write_char(stream_raw(stream), (char)(UINT8)os_fixnum_magnitude(z));
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return z;
 }
 
@@ -502,7 +598,13 @@ lisp_val_t cc_probe_file(lisp_val_t args, lisp_val_t env) {
         // 中身が空の既存ファイルは無しと誤判定される既知の制約がある
         UINT8 *data;
         UINT32 len;
-        return os_mount_fat_read_file(kind, device, relative, &data, &len) ? g_sym_t : nil;
+        lisp_val_t transfer = nil;
+        GC_PROTECT(transfer);
+        int ok = os_mount_fat_read_file(kind, device, relative, &data, &len, &transfer);
+        if (transfer != nil) {
+            return transfer;
+        }
+        return ok ? g_sym_t : nil;
     }
 
     return nil;
@@ -584,7 +686,12 @@ lisp_val_t cc_file_length(lisp_val_t args, lisp_val_t env) {
         // サイズだけを得ようとすると#41と同じ性能問題を抱えるため、
         // ディレクトリエントリの解決だけで済む軽量パスを使う
         UINT32 len;
-        if (!os_mount_fat_file_size(kind, device, relative, &len)) {
+        lisp_val_t transfer = nil;
+        GC_PROTECT(transfer);
+        if (!os_mount_fat_file_size(kind, device, relative, &len, &transfer)) {
+            if (transfer != nil) {
+                return transfer;
+            }
             return g_sym_eval_error;
         }
         return os_make_fixnum(len);
