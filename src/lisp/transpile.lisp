@@ -2269,6 +2269,27 @@
       (format out "~A~%" b))
     (format out "~%~A" tail-text)))
 
+;; [P3] **トランスパイラが落ちても make が緑のまま通ってしまう**問題への対処。
+;;
+;; ros/SBCL は未処理のエラーでデバッガへ入り、--quit がそれを**終了コード 0**で
+;; 抜ける。make は成功と判断し、**古い lisp_compiled.c のままビルドを続ける。**
+;; emit-c-file の :supersede は書き込み完了時に差し替わるので、生成物は
+;; 壊れずに「前回のまま」残る。つまり
+;;   - ビルドは通る
+;;   - テストも通る(前回の生成物で動くため)
+;;   - 生成物が入力より古い、という形でしか気づけない
+;; 実際に踏んだ: init_aot.lisp の括弧を 1 つ壊しただけで END-OF-FILE になり、
+;; make transpile が exit 0、生成物の mtime は据え置き、テストは全部通った。
+;;
+;; エラーを掴んで非ゼロで落とす。Makefile はこちらを呼ぶ。
+(defun main-or-die ()
+  (handler-case (main)
+    (error (e)
+      (format *error-output* "~&[transpile] ERROR: ~A~%" e)
+      (finish-output *error-output*)
+      #+sbcl (sb-ext:exit :code 1 :abort t)
+      #-sbcl (error e))))
+
 (defun main ()
   (let* ((fixture-defuns (remove-if-not #'toplevel-defun-p
                             (%%expand-defgenerics-in-forms (read-all-forms *runtime-lisp-path*))))

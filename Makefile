@@ -196,7 +196,7 @@ image:
 # BOOT_FAT32_IMGが常に再ビルドされてしまっていた)。
 $(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
-		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main-or-die)" --quit'
 
 # (main)は$(LISP_COMPILED)と$(LISP_COMPILED_FIXTURE)を1回の実行で両方生成するが、
 # 独立したルールにしているため、両方が古い状態から`make test`のように両方を
@@ -206,7 +206,7 @@ $(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 # 互換性を優先しここでは使わない
 $(LISP_COMPILED_FIXTURE): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
-		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main-or-die)" --quit'
 
 transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 
