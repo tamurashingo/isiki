@@ -1268,6 +1268,30 @@ lisp_val_t os_eval_top_level_ex(lisp_val_t form, lisp_val_t env, int *out_aborte
     return result;
 }
 
+int os_condition_report_cstr(lisp_val_t condition, lisp_val_t env, char *out, UINT32 out_cap) {
+    if (out_cap == 0) {
+        return 0;
+    }
+    GC_PROTECT(condition);
+    GC_PROTECT(env);
+    lisp_val_t sym = os_make_symbol("%REPORT-CONDITION-STRING");
+    GC_PROTECT(sym);
+    lisp_val_t fn = os_get_function(sym, env);
+    if (fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(fn);
+    lisp_val_t args = os_make_cons(condition, nil);
+    GC_PROTECT(args);
+    lisp_val_t str = apply_function(fn, args, env);
+    if (is_control_transfer(str) || (str & TAG_MASK) != TAG_STRING) {
+        return 0;
+    }
+    GC_PROTECT(str);
+    os_string_to_cstr(str, out, out_cap);
+    return 1;
+}
+
 /**
  * apply_functionをruntime.c/reader.cのCプリミティブから呼べるように公開するラッパー。
  * @param fn 呼び出す関数オブジェクト

@@ -15,34 +15,14 @@
 
 /**
  * [P2] 打ち切られたフォームのconditionを、report-condition経由の自然言語メッセージで
- * 表示する。表示できたら1を返す。
- *
- * init.lispの%report-condition-stringをos_apply_functionで呼ぶ。次のどれかに
- * 当たったら0を返し、呼び出し元は従来どおりos_printへ落とす:
- *   - init.lisp未ロード等で%report-condition-stringが未定義
- *   - 表示の途中でさらに脱出が起きた(Lisp側もハンドラを張っているので通常は
- *     nilが返るが、念のためC側でも制御転送を見る)
- *   - 戻り値が文字列でない
+ * 表示する。表示できたら1を返す。0のときは呼び出し元が従来どおりos_printへ落とす
+ * (判定の中身はos_condition_report_cstr(eval.c)のコメント参照。load.cと共用する)。
  */
 static int print_condition_report(process_t *proc, lisp_val_t condition) {
-    GC_PROTECT(condition);
-    lisp_val_t sym = os_make_symbol("%REPORT-CONDITION-STRING");
-    GC_PROTECT(sym);
-    lisp_val_t fn = os_get_function(sym, proc->env);
-    if (fn == nil) {
-        return 0;
-    }
-    GC_PROTECT(fn);
-    lisp_val_t args = os_make_cons(condition, nil);
-    GC_PROTECT(args);
-    lisp_val_t str = os_apply_function(fn, args, proc->env);
-    if (os_is_control_transfer(str) || (str & TAG_MASK) != TAG_STRING) {
-        return 0;
-    }
-    GC_PROTECT(str);
-
     char msg[REPL_REPORT_MAX];
-    os_string_to_cstr(str, msg, sizeof(msg));
+    if (!os_condition_report_cstr(condition, proc->env, msg, sizeof(msg))) {
+        return 0;
+    }
     proc->stdout_buffer->write_string(proc->stdout_buffer, msg);
     return 1;
 }
