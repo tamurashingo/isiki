@@ -2754,6 +2754,14 @@ static void gc_relocate_stream(UINT64 *words) {
     // 表面化しにくかった一方、write-from!経由の書き込みで顕在化した。
     new_stream->self_handle = gc_copy_value(new_stream->self_handle);
 
+    // write-from!/read-into!が非局所脱出したときに預かる制御転送値
+    // (stream.hのpending_transfer参照)。mount_file_node/self_handleと全く同じ理由で
+    // コピー後にgc_copy_valueし直す。**ここを落とすと、脱出値を預けてから
+    // Lispへ返すまでの間にGCが1回走っただけで、古いFrom空間のアドレスを
+    // 「制御転送値」として返すことになる**([ファイルI/O]#49のself_handleと同じ
+    // 落とし方。documents/pitfalls.md 原則8: 構造体フィールドはGC_PROTECTでは守れない)
+    new_stream->pending_transfer = gc_copy_value(new_stream->pending_transfer);
+
     words[1] = (UINT64)new_stream;
 }
 
