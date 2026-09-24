@@ -131,12 +131,19 @@
 (assert-equal '(1 0) (list (tf-dpass *tf-ec-div*) (tf-dfail *tf-ec-div*)))
 (assert-equal "" (tf-out *tf-ec-div*))
 
-;; **まだ signal しない経路**での陰性対照。(length 5) は EVAL-ERROR を値として返す
-;; (P4-2「添字・範囲」の対象)。上と同じく、そこが signal に変わったらここが落ちる
+;; **P4-2 で (length 5) も signal に変わった**(<domain-error>、spec:5290)。
+;; ここも陰性対照から陽性対照へ書き換わった2例目
 (defglobal *tf-ec-len* (tf-capture (lambda () (assert-error-class '<domain-error> (length 5)))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ec-len*) (tf-dfail *tf-ec-len*)))
-(assert-equal (tf-ng-not-signaled-text '(length 5) 'eval-error '<domain-error>)
-              (tf-out *tf-ec-len*))
+(assert-equal '(1 0) (list (tf-dpass *tf-ec-len*) (tf-dfail *tf-ec-len*)))
+(assert-equal "" (tf-out *tf-ec-len*))
+
+;; **まだ signal しない経路**での陰性対照。未定義関数の呼び出しは EVAL-ERROR を
+;; 値として返す(eval.c、P4-3 の対象)。そこが signal に変わったらここが落ちる
+(defglobal *tf-ec-undef*
+  (tf-capture (lambda () (assert-error-class '<undefined-function> (tf-no-such-function-p4)))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ec-undef*) (tf-dfail *tf-ec-undef*)))
+(assert-equal (tf-ng-not-signaled-text '(tf-no-such-function-p4) 'eval-error '<undefined-function>)
+              (tf-out *tf-ec-undef*))
 
 ;;; ---------------------------------------------------------------------------
 ;;; assert-error との住み分け
@@ -151,6 +158,6 @@
 (assert-equal '(1 0) (list (tf-dpass *tf-ae-div*) (tf-dfail *tf-ae-div*)))
 
 ;; assert-error も EVAL-ERROR 返しは捕まえられない(signal されていないため)。
-;; まだ signal しない (length 5) で確かめる
-(defglobal *tf-ae-len* (tf-capture (lambda () (assert-error (length 5)))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ae-len*) (tf-dfail *tf-ae-len*)))
+;; まだ signal しない未定義関数呼び出しで確かめる
+(defglobal *tf-ae-undef* (tf-capture (lambda () (assert-error (tf-no-such-function-p4)))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ae-undef*) (tf-dfail *tf-ae-undef*)))
