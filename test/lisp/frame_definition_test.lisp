@@ -61,12 +61,12 @@
 
 (flet ((fd-must-not-leak () 99))
   (assert-equal 99 (fd-must-not-leak)))
-;; 外からは見えない(未定義の関数呼び出しはシンボル EVAL-ERROR を値として返す)
-(assert-equal 'eval-error (fd-must-not-leak))
+;; 外からは見えない([P4-3] 未定義の関数呼び出しは <undefined-function> を signal する)
+(assert-error-class '<undefined-function> (fd-must-not-leak))
 
 (labels ((fd-must-not-leak2 () 98))
   (assert-equal 98 (fd-must-not-leak2)))
-(assert-equal 'eval-error (fd-must-not-leak2))
+(assert-error-class '<undefined-function> (fd-must-not-leak2))
 
 ;; flet の束縛が外側の同名定義を一時的に隠し、抜けたら戻ること
 (defun fd-shadowed () 'outer)
@@ -92,8 +92,8 @@
 (assert-equal 'fd-in-env (with-environment *fd-env* (defun fd-in-env () 7)))
 ;; 対象環境では呼べる
 (assert-equal 7 (%%eval-in-environment '(fd-in-env) *fd-env*))
-;; グローバルからは見えない
-(assert-equal 'eval-error (fd-in-env))
+;; グローバルからは見えない([P4-3] <undefined-function>)
+(assert-error-class '<undefined-function> (fd-in-env))
 
 ;; 同名関数を環境ごとに別定義できる
 (defun fd-per-env () 'global)

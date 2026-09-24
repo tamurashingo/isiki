@@ -54,8 +54,18 @@ import sys
 # **条件システム自体が使えない状態のフォールバック**(既存の
 # 「init.lisp 未ロード時」と同じ位置づけ)である。詳細は
 # test/lisp/qemu_boot_no_init_signal.lisp の冒頭を見ること。
+#
+# [P4-3] 27 -> 21。未定義関数 / immutable-binding / 「関数でないものの呼び出し」の
+# 6 箇所を signal へ移した。
+#
+# **runtime.c の os_make_array_from_nested_list の 3 箇所はこのまま残す。**
+# あそこの EVAL-ERROR は評価器へ漏れる戻り値ではなく、唯一の呼び出し元である
+# reader.c が直後に g_sym_read_error へ翻訳するための内部ステータスである
+# (reader.c の「array == g_sym_eval_error」の分岐)。リーダーの構文エラーは
+# 条件ではなく読み取りエラーの経路で報告するのが現在の設計なので、
+# 数だけを合わせるために signal へ変えるのは筋が悪い。
 BUDGETS = {
-    "c_return": 27,
+    "c_return": 21,
     "lisp_quote": 5,
 }
 # --------------------------------------------------------------------------

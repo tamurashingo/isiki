@@ -80,14 +80,16 @@
 ;; トップレベルの裸シンボル読み込みでも同じenvを見るため99が見える
 (assert-equal 99 *iz19-unbound-2*)
 
-;;; --- 4. defconstant変数へのsetq(g_sym_eval_error相当、defconstant保護) ---
+;;; --- 4. defconstant変数へのsetq([P4-3] <program-error> を signal、defconstant保護) ---
 
 (defconstant *iz19-const* 123)
 
 (defun iz19-set-const (v)
   (setq *iz19-const* v))
 (assert-equal t (%%za-compiled-p (function iz19-set-const)))
-(assert-equal 'eval-error (iz19-set-const 456))
+;; [P4-3] EVAL-ERROR 返しから signal へ。error-id. immutable-binding(spec:435-437)、
+;; クラスは <program-error>(spec:7239-7241)
+(assert-error-class '<program-error> (iz19-set-const 456))
 ;; 保護されているため値自体は変わっていない
 (defun iz19-read-const ()
   *iz19-const*)
