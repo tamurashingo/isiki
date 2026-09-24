@@ -733,12 +733,17 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
 # (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする。
 #
+# [P4] qemu_boot_no_init_signal.lispは**init.lispを読まない**唯一のboot-entryで、
+# 条件クラスが1つも無い状態でsignalしても戻ってくることを見る。他のmilestoneは
+# すべて先頭で(load "src/lisp/init.lisp")するため、この状態はここでしか通らない。
+#
 # [P1] qemu_boot_fat_callback_transfer.lispは**必ずqemu_boot_m6_fat16.lispより後**に
 # 置くこと。FAT16イメージのルートへP1BASE.TXT等を作るので、先に走らせると
 # fat16_test.lispのルートディレクトリ一覧のアサーションが落ちる
 test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_no_init_signal.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat_callback_transfer.lisp QEMU_DISK_IMG=tmp/fat16_test.img

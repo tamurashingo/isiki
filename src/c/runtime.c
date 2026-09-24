@@ -3132,6 +3132,8 @@ static void os_gc_collect_body(void) {
 }
 
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
+lisp_val_t cc_diag_signal_overflows(lisp_val_t args, lisp_val_t env);
+
 void os_bootstrap() {
     // NIL の作成。From/To空間どちらにも属さない専用の固定領域(g_nil_cell)を使う
     {
@@ -3330,6 +3332,7 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-LIFO-VIOLATIONS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_lifo_violations), global_environment);
 
         #endif
+        os_set_function(os_make_symbol("%%DIAG-SIGNAL-OVERFLOWS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_signal_overflows), global_environment);
         os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample_pub), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
         os_set_function(os_make_symbol("%%FIXNUM-MAGNITUDE-MASK"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnum_magnitude_mask), global_environment);
@@ -4471,22 +4474,100 @@ lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnpt
     return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(2), captured_env);
 }
 
+/* [P4] **conditionの構築そのものが失敗する状態では、signalは再帰する。**
+ *
+ * os_signal_conditionは「init.lisp未ロード」をmake-instance/signal-conditionが
+ * 未定義かどうかで判定しているが、**この2つはinit_aot.lisp側にある**。つまり
+ * AOTフォームだけ実行してinit.lispを読んでいない状態(素のカーネル起動、
+ * boot-entryスクリプトが(load "src/lisp/init.lisp")を持たない場合)では、
+ * 関数はあるのに**条件クラスが1つも登録されていない**という食い違いが起きる。
+ *
+ * そこでmake-instanceは (%find-class '<DOMAIN-ERROR>) にnilを得て、
+ * (%%class-slots nil) が型検査の無いまま生の値を読み、その値をlengthに渡す。
+ * P4でlengthが非シーケンスをsignalするようになったため、ここから
+ *   length -> signal -> make-instance -> %%class-slots -> length -> ...
+ * という無限再帰になり、スタックガードページに当たって停止していた
+ * (QEMU上で #PF: CR2 = RSP-8、gdbスタブで確認)。P4以前はlengthが
+ * EVAL-ERRORを「値として」返していたため再帰にならず、黙って壊れた値が
+ * 流れるだけだった。
+ *
+ * 深さで打ち切り、未ロード時と同じフォールバック(EVAL-ERROR)へ落とす。
+ * 正常系(init.lispロード済み)ではハンドラの入れ子がこの深さに達することは
+ * 無い(signal-conditionはハンドラを呼ぶ前に*handlers*をcdrへ進めるため、
+ * 入れ子の深さはハンドラの数で頭打ちになる)。
+ */
+#define SIGNAL_MAX_DEPTH 16
+static UINT64 g_signal_depth = 0;
+static UINT64 g_signal_overflow_count = 0;
+
+/** (%%diag-signal-overflows) → 上の打ち切りが起きた延べ回数。0が正常。 */
+lisp_val_t cc_diag_signal_overflows(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_signal_overflow_count);
+}
+
+/* 非局所脱出は戻り値(control transfer)で伝わるのでlongjmpは無いが、returnが
+   複数あるのでGC_PROTECTと同じくcleanup属性で確実に戻す */
+static void signal_depth_pop(UINT64 *saved) { g_signal_depth = *saved; }
+
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
     GC_PROTECT(env);
+    if (g_signal_depth >= SIGNAL_MAX_DEPTH) {
+        g_signal_overflow_count++;
+        return g_sym_eval_error;
+    }
+    UINT64 _signal_depth_saved __attribute__((cleanup(signal_depth_pop))) = g_signal_depth;
+    g_signal_depth++;
+    GC_PROTECT(class_sym);
+    GC_PROTECT(initargs);
     lisp_val_t make_instance_fn = os_get_function(g_sym_make_instance, env);
+    /* [GC安全性] **make_instance_fnはここで守らなければならない。**
+       下のos_make_consはヒープを確保するのでGCが走りうる。GCはコピー方式なので、
+       守られていないローカルは転送先へ追随せず、os_apply_functionへ**旧番地**が
+       渡る。GC_DEBUGビルドでこれを踏むと、make-instanceが壊れたclassを受け取り、
+       (%%class-slots class)がEVAL-ERRORを返し、それをlengthがsignalし、signalが
+       また make-instance を呼ぶ……という無限再帰でスタックを食い潰していた
+       (documents/pitfalls.md 原則4) */
+    GC_PROTECT(make_instance_fn);
     lisp_val_t signal_condition_fn = os_get_function(g_sym_signal_condition, env);
     GC_PROTECT(signal_condition_fn);
-    if (make_instance_fn == nil || signal_condition_fn == nil) {
-        // init.lisp未ロード(make-instance/signal-conditionが未定義)時のフォールバック
+    /* [P4] **関数の有無だけでは「条件システムが使えるか」を判定できない。**
+       make-instance / signal-condition / %find-class はどれもinit_aot.lisp側に
+       あるので、init.lispを読んでいない起動(boot-entryスクリプトが
+       (load "src/lisp/init.lisp")を持たない場合)でも**存在する**。一方で
+       条件クラス(<simple-error>や<domain-error>)はinit.lispのdefclassで
+       登録されるため、そちらは1つも無い。
+       その食い違いのままmake-instanceへ進むと、classにnilが渡り、
+       (%%class-slots nil)の生の読み出しを経てlengthがsignalし、signalがまた
+       make-instanceを呼ぶ無限再帰になる。クラスが引けるかどうかも併せて見て、
+       関数が無い場合と**同じ1つのフォールバック**へ落とす。 */
+    lisp_val_t resolved_class = nil;
+    if (make_instance_fn != nil && signal_condition_fn != nil &&
+        (class_sym & TAG_MASK) == TAG_SYMBOL) {
+        resolved_class = os_resolve_class(class_sym, env);
+        if (os_is_control_transfer(resolved_class)) {
+            return resolved_class;
+        }
+        if (resolved_class == g_sym_eval_error) {
+            resolved_class = nil;
+        }
+    }
+    if (make_instance_fn == nil || signal_condition_fn == nil ||
+        ((class_sym & TAG_MASK) == TAG_SYMBOL && resolved_class == nil)) {
+        // 条件システムが使えない(init.lisp未ロード等)ときのフォールバック
         return g_sym_eval_error;
     }
 
-    lisp_val_t condition = os_apply_function(make_instance_fn, os_make_cons(class_sym, initargs), env);
+    lisp_val_t make_args = os_make_cons(class_sym, initargs);
+    GC_PROTECT(make_args);
+    lisp_val_t condition = os_apply_function(make_instance_fn, make_args, env);
     if (os_is_control_transfer(condition)) {
         return condition;
     }
+    GC_PROTECT(condition);
 
     lisp_val_t signal_args = os_make_cons(condition, os_make_cons(nil, nil));
+    GC_PROTECT(signal_args);
     return os_apply_function(signal_condition_fn, signal_args, env);
 }
 
@@ -4610,6 +4691,36 @@ static lisp_val_t signal_division_by_zero(const char *operation_name, lisp_val_t
     initargs = os_make_cons(operation, initargs);
     initargs = os_make_cons(kw_operation, initargs);
     return os_signal_condition(class_sym, initargs, env);
+}
+
+/**
+ * [P4] 添字が範囲外のときの<program-error>をsignalする。
+ *
+ * 仕様の error-id は index-out-of-range(elt/set-elt/subseq。spec:5320 等)で、
+ * §29.4 の対応表(spec:7249-7252)が **「conditions of class <program-error>」**と
+ * 定めている。専用クラスは仕様のクラス階層(spec:994-1010)に存在しない。
+ *
+ * **<program-error> はスロットを持たないので、どのシーケンスのどの添字だったかは
+ * 運べない。** report-condition も既定メソッドでクラス名だけを出す。
+ * 情報を足すには <index-out-of-range> のような部分クラスを増やすことになるが、
+ * それは仕様に無いクラスの追加なので別途の判断とする(PRに記録した)。
+ *
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ */
+/* [P4-2] **signal には global_environment を渡す。** os_signal_conditionがenvを使うのは
+   MAKE-INSTANCE / SIGNAL-CONDITION の解決だけで、どちらも global_environment にしか
+   登録されない(どのenvの親鎖もそこへ行き着く)。呼び出し元のenvをエラー分岐まで
+   生かすと、**成功経路の側**でcallee-savedレジスタへの退避(push/pop)が増える。
+   実測(objdump): elt を env 引きまわしにすると primitive_elt2 が 5->6 命令、
+   primitive_elt_impl のプロローグが +2 命令になった。エラー分岐は稀なので、
+   その場で global_environment を読むほうが安い。primitive_divide2_fixnum が
+   0除算時に primitive_divide(args, global_environment) へ委譲しているのと同じ考え方。 */
+static lisp_val_t signal_index_out_of_range(lisp_val_t env) {
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol("<PROGRAM-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, nil, env);
 }
 
 static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t env) {
@@ -9029,8 +9140,8 @@ static UINT64 array_offset(lisp_val_t *header, UINT64 rank, lisp_val_t cur, int 
 /**
  * 組み込み関数AREF。第一引数の配列から、残りの引数(各次元の添字)が指す要素を返す。
  * @param args 評価済みの引数リスト(第一引数はVECTOR、残りはFIXNUM)
- * @param env 呼び出し時の環境(未使用)
- * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ * @param env 呼び出し時の環境
+ * @return 添字が指す要素。範囲外の添字が指定された場合は<program-error>をsignalする
  */
 lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -9041,7 +9152,12 @@ lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
     int out_of_bounds;
     UINT64 offset = array_offset(header, rank, cc_cdr(args), &out_of_bounds);
     if (out_of_bounds) {
-        return g_sym_eval_error;
+        /* [P4] **仕様未確認。** aref の誤り条件として仕様が挙げているのは
+           「basic-array でない」「添字が非負整数でない」の2つだけで、
+           「非負整数だが次元より大きい」は明示されていない(spec:5049-5056)。
+           同じ添字アクセスである elt の index-out-of-range(§29.4 -> <program-error>)に
+           揃えた */
+        return signal_index_out_of_range(global_environment);
     }
 
     lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
@@ -9069,7 +9185,8 @@ lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
     }
 
     if (!is_vector(array)) {
-        return g_sym_eval_error;
+        /* spec:5077「basic-array でなければ error-id. domain-error」 */
+        return signal_domain_error_for_class(array, "<BASIC-ARRAY>", global_environment);
     }
 
     lisp_val_t *header = vector_header(array);
@@ -9138,7 +9255,7 @@ lisp_val_t primitive_set_cdr2(lisp_val_t target, lisp_val_t val) {
  * 組み込み関数SET-AREF。第一引数の配列の、続く添字が指す要素を最後の引数で破壊的に書き換える。
  * @param args 評価済みの引数リスト(array idx1 idx2 ... value の並び)
  * @param env 呼び出し時の環境(未使用)
- * @return 書き込んだ値(最後の引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 書き込んだ値(最後の引数)。範囲外の添字が指定された場合は<program-error>をsignalする
  */
 lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -9152,7 +9269,8 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     lisp_val_t idx_cur = cc_cdr(cc_cdr(args));
     UINT64 offset = array_offset(header, rank, idx_cur, &out_of_bounds);
     if (out_of_bounds) {
-        return g_sym_eval_error;
+        /* aref と同じ扱い(spec:5085「制約は aref と同じ」) */
+        return signal_index_out_of_range(global_environment);
     }
 
     lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
@@ -9190,7 +9308,7 @@ lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
  * 組み込み関数STRING-ELT。第一引数のSTRINGの第二引数(0起算)番目の文字を返す。
  * @param args 評価済みの引数リスト(第一引数はSTRING、第二引数はFIXNUM)
  * @param env 呼び出し時の環境(未使用)
- * @return 添字が指す文字(CHAR)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 添字が指す文字(CHAR)。範囲外の添字が指定された場合は<program-error>をsignalする
  */
 lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -9200,7 +9318,9 @@ lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
     lisp_addr_t addr = str & ~TAG_MASK;
     UINT64 len = ((lisp_val_t *)addr)[0];
     if (idx >= len) {
-        return g_sym_eval_error;
+        /* [P4] **仕様未確認。** string-elt は ISLisp 仕様に無い実装独自の関数。
+           文字列に対する elt と同じ index-out-of-range に揃えた */
+        return signal_index_out_of_range(global_environment);
     }
     UINT8 *bytes = (UINT8 *)(addr + 8);
     return os_make_char(bytes[idx])  /* [4bit化] bytesはUINT8*。charへ落とすと符号拡張する */;
@@ -9234,7 +9354,7 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
         }
         case TAG_INSTANCE: {
             if (!is_vector(seq)) {
-                return g_sym_eval_error;
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
             }
             lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
@@ -9245,7 +9365,11 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
             return os_make_fixnum(total);
         }
         default:
-            return g_sym_eval_error;
+            /* spec:5290「basic-vector でも list でもなければ error-id. domain-error」。
+               **仕様の「basic-vector または list」を1つのクラスでは表せない**
+               (ISLisp に <sequence> は無い)ので、expected-class には受け付ける
+               クラスの一方を入れる。以下の elt/set-elt/subseq も同じ扱い */
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -9256,7 +9380,8 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
  * どちらからも呼ばれる。
  * @param seq LIST/STRING/VECTOR
  * @param idx 0起算の添字(タグを外した生の値)
- * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 添字が指す要素。範囲外なら<program-error>、型違いなら<domain-error>をsignalする
+ *         (signalに使うenvはglobal_environment。signal_index_out_of_rangeのコメント参照)
  */
 static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
@@ -9266,7 +9391,8 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
                 cur = cc_cdr(cur);
             }
             if (cur == nil) {
-                return g_sym_eval_error;
+                /* spec:5316「z が範囲外の整数なら error-id. index-out-of-range」 */
+                return signal_index_out_of_range(global_environment);
             }
             return cc_car(cur);
         }
@@ -9274,14 +9400,15 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
             lisp_addr_t addr = seq & ~TAG_MASK;
             UINT64 len = ((lisp_val_t *)addr)[0];
             if (idx >= len) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             UINT8 *bytes = (UINT8 *)(addr + 8);
             return os_make_char(bytes[idx])  /* [4bit化] bytesはUINT8*。charへ落とすと符号拡張する */;
         }
         case TAG_INSTANCE: {
             if (!is_vector(seq)) {
-                return g_sym_eval_error;
+                /* spec:5319「basic-vector でも list でもなければ error-id. domain-error」 */
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
             }
             lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
@@ -9290,13 +9417,13 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
                 total *= header[1 + i];
             }
             if (idx >= total) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
             return data[idx];
         }
         default:
-            return g_sym_eval_error;
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -9325,7 +9452,8 @@ lisp_val_t primitive_elt2(lisp_val_t seq, lisp_val_t idx) {
  * @param obj 新しい値
  * @param seq LIST/STRING/VECTOR
  * @param idx 0起算の添字(タグを外した生の値)
- * @return 書き込んだ値(obj)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 書き込んだ値(obj)。範囲外なら<program-error>、型違いなら<domain-error>をsignalする
+ *         (signalに使うenvはglobal_environment。signal_index_out_of_rangeのコメント参照)
  */
 static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
@@ -9335,7 +9463,8 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
                 cur = cc_cdr(cur);
             }
             if (cur == nil) {
-                return g_sym_eval_error;
+                /* spec:5347「z が有効な添字の範囲外なら error-id. index-out-of-range」 */
+                return signal_index_out_of_range(global_environment);
             }
             cc_set_car(cur, obj);
             return obj;
@@ -9344,7 +9473,7 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
             lisp_addr_t addr = seq & ~TAG_MASK;
             UINT64 len = ((lisp_val_t *)addr)[0];
             if (idx >= len) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             UINT8 *bytes = (UINT8 *)(addr + 8);
             bytes[idx] = (UINT8)(obj >> CHAR_VALUE_SHIFT);
@@ -9352,7 +9481,7 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
         }
         case TAG_INSTANCE: {
             if (!is_vector(seq)) {
-                return g_sym_eval_error;
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
             }
             lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
@@ -9361,14 +9490,14 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
                 total *= header[1 + i];
             }
             if (idx >= total) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
             data[idx] = obj;
             return obj;
         }
         default:
-            return g_sym_eval_error;
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -9397,14 +9526,56 @@ lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx) {
  * 範囲を要素とする、同じクラスの新規シーケンスを返す。
  * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二・第三引数は
  *             FIXNUM(z1, z2))
- * @param env 呼び出し時の環境(未使用)
- * @return 新規に確保したシーケンス(元と同じクラス)
+ * @param env 呼び出し時の環境
+ * @return 新規に確保したシーケンス(元と同じクラス)。範囲外なら<program-error>、
+ *         型違いなら<domain-error>をsignalする
  */
 lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t seq = cc_car(args);
     UINT64 z1 = cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT;
     UINT64 z2 = cc_car(cc_cdr(cc_cdr(args))) >> FIXNUM_VALUE_SHIFT;
+
+    /* [P4] **範囲検査がそもそも無かった。** 仕様は 0 <= z1 <= z2 <= (length seq) を
+       要求し、外れたら index-out-of-range(spec:5374-5376)としているが、
+       検査が無いため (subseq "abc" 1 99) が確保済み領域の外を読んでいた
+       (list なら nil の cdr が自分自身なので nil を out_len 個並べて返していた)。
+       EVAL-ERROR 返しの置き換えに合わせて、この抜けもここで塞ぐ。
+       lengthの計算は既存のprimitive_lengthに委ねず、各分岐の前に1回だけ行う */
+    UINT64 seq_len;
+    switch (seq & TAG_MASK) {
+        case TAG_CONS: {
+            seq_len = 0;
+            for (lisp_val_t cur = seq; cur != nil; cur = cc_cdr(cur)) {
+                seq_len++;
+            }
+            break;
+        }
+        case TAG_STRING:
+            seq_len = ((lisp_val_t *)(seq & ~TAG_MASK))[0];
+            break;
+        case TAG_INSTANCE: {
+            if (!is_vector(seq)) {
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
+            }
+            lisp_val_t *header = vector_header(seq);
+            UINT64 rank = header[0];
+            seq_len = 1;
+            for (UINT64 i = 0; i < rank; i++) {
+                seq_len *= header[1 + i];
+            }
+            break;
+        }
+        default:
+            /* nilはTAG_CONS付きのLisp値(os_bootstrap)なので、空リストは上のTAG_CONSへ行く。
+               ここへ来るのはfixnum/char/symbol等 */
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
+    }
+    /* z1/z2はタグを外した非負の生値なので、負数は表現されない。
+       0 <= z1 <= z2 <= seq_len の残りを見る */
+    if (z1 > z2 || z2 > seq_len) {
+        return signal_index_out_of_range(global_environment);
+    }
     UINT64 out_len = z2 - z1;
 
     switch (seq & TAG_MASK) {
@@ -9443,9 +9614,6 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
             return (lisp_val_t)(out_addr | TAG_STRING);
         }
         case TAG_INSTANCE: {
-            if (!is_vector(seq)) {
-                return g_sym_eval_error;
-            }
             GC_PROTECT(seq);
             lisp_val_t out_vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
             GC_PROTECT(out_vec);
@@ -9462,7 +9630,9 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
             return out_vec;
         }
         default:
-            return g_sym_eval_error;
+            /* 上の長さ計算で型は検査済みなので**到達しない**。同じ判定を2回書くより、
+               万一到達したときに黙って値を返さないほうがよいのでsignalしておく */
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -9542,8 +9712,19 @@ lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env) {
  * @return slots(スロット記述子のlist)
  */
 lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    lisp_val_t cls = cc_car(args);
+    /* [P4] **型検査が無く、任意の値のword3を生で読んでいた。**
+       nilを渡すとg_nil_cell(2語しかない)の外を読み、生のワードがそのまま
+       Lisp値として流れる。実際に (%%class-slots nil) が 6931512 を返し、
+       make-instanceがそれを(make-array 6931512)に使ってヒープを使い切っていた。
+       クラス以外を渡すのは呼び出し側の誤りなのでdomain-errorにする。 */
+    if ((cls & TAG_MASK) != TAG_INSTANCE) {
+        return signal_domain_error_for_class(cls, "<STANDARD-CLASS>", env);
+    }
+    UINT64 *obj = (UINT64 *)(cls & ~TAG_MASK);
+    if (obj[0] != MAGIC_BUILTIN_CLASS && obj[0] != MAGIC_STANDARD_CLASS) {
+        return signal_domain_error_for_class(cls, "<STANDARD-CLASS>", env);
+    }
     return obj[3];
 }
 
