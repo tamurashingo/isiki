@@ -1144,7 +1144,7 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
     }
     UINT64 tag = exp & TAG_MASK;
     if (tag == TAG_SYMBOL) {
-        return os_get_variable(exp, env);
+        return os_get_variable_checked(exp, env);
     }
     if (tag == TAG_CONS) {
         lisp_val_t op = cc_car(exp);

@@ -18,6 +18,8 @@
 (isiki-test-load "test/lisp/undefined_signal_test.lisp")
 ;; [P4-4] load / open-*-file / file-length
 (isiki-test-load "test/lisp/io_signal_test.lisp")
+;; [P5] 算術の型違い / 未束縛変数(正常系のコストがゼロの検出)
+(isiki-test-load "test/lisp/type_unbound_test.lisp")
 (isiki-test-load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例は別ファイル。構文エラーでloadが中断した場合に検出できるよう
 ;; 戻り値(成功ならt)を確認する。loadの中でも assert-* が走るので、assert-equal の

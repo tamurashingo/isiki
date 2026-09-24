@@ -3421,6 +3421,17 @@ void os_bootstrap() {
  * @param env 検索を開始する環境
  * @return 見つかった値。未定義の場合はnil
  */
+/**
+ * envおよびその親を順に辿り、symの変数の値を取得する。**未束縛でも signal しない。**
+ *
+ * process.c / interrupt.c が *RUN-QUEUE* / *CURRENT-PROCESS* の「まだ束縛されて
+ * いない」を nil で判定しているため、この入口は従来どおり nil を返す。
+ * **interrupt.c の呼び出しは割り込みハンドラの中**なので、ここから Lisp の
+ * make-instance を呼ぶわけにはいかない。
+ * @param sym 検索するsymbol
+ * @param env 検索を開始する環境
+ * @return 見つかった値。未束縛の場合はnil
+ */
 lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env) {
     GC_DEBUG_ASSERT_LIVE(env, "os_get_variable");
     lisp_val_t current_env = env;
@@ -3468,10 +3479,77 @@ lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env) {
 
         current_env = cc_cdr(par_slot); // parent の値
     }
-
-
     // TODO: UNBOUND VARIABLE 等を返し、評価のタイミングでエラーとする
+    //       (ISLisp の変数参照は os_get_variable_checked を使うこと)
     return nil;
+}
+
+/**
+ * [P5] os_get_variable と同じ探索を行い、**未束縛なら <unbound-variable> を signal する。**
+ * ISLisp の変数参照(eval.c のシンボル評価、za.c が生成するグローバル変数読み出し)
+ * が使う入口。nil が束縛されている場合とは区別される(alist に pair があるため、
+ * 値が nil でも上の分岐で返る)。
+ *
+ * **探索ループを os_get_variable と共有せず写しているのは計測の結果である。**
+ * 共通の static 関数へ括り出して2つの薄い入口から呼ぶ形にすると、-O1 の gcc は
+ * インライン展開せず os_get_variable が「呼ぶだけの5命令の踏み台」になった
+ * (39 -> 5 命令)。always_inline を付けると展開はされるが、レジスタ割付が変わって
+ * **親環境をたどるループが1命令増えた**(39 -> 40)。P5 の完了条件は
+ * 「正常系の経路に命令が増えていないこと」なので、写して両方を据え置く形にした。
+ * **片方を直したらもう片方も直すこと。**
+ * @param sym 検索するsymbol
+ * @param env 検索を開始する環境
+ * @return 見つかった値。未束縛なら signal-condition の戻り値
+ */
+lisp_val_t os_get_variable_checked(lisp_val_t sym, lisp_val_t env) {
+    GC_DEBUG_ASSERT_LIVE(env, "os_get_variable_checked");
+    lisp_val_t current_env = env;
+
+    /*
+     * env の構造
+     * '((name . env-name)
+     *   (variables . ((sym2 . val1)
+     *                 (sym2 . val2)
+     *                 (sym3 . val3)))
+     *   (functions . ((sym1 . fn1)
+     *                 (sym2 . fn2)
+     *                 (sym3 . fn3)))
+     *   (parent . ((name . parent-env-name)
+     *              (variables . ((p-sym1 . p-val1)
+     *                            (p-sym2 . p-val2)
+     *                            (p-sym3 . p-val3)))
+     *              (functions . ((p-sym1 . p-fn1)
+     *                            (p-sym2 . p-fn2)
+     *                            (p-sym3 . p-fn3)))
+     *              (parent . ()))))
+     */
+
+    while (current_env != nil) {
+        // 現在の環境から variables slot (cadr) を取得
+        lisp_val_t va_slot = cc_car(cc_cdr(current_env));
+
+        // variables slot の cdr にある alist を取得
+        lisp_val_t alist = cc_cdr(va_slot);
+
+        // alist に対して assoc
+        lisp_val_t pair = cc_assoc_eq(sym, alist);
+
+        if (pair != nil) {
+            // みつかった pair の cdr を返す
+            return cc_cdr(pair);
+        }
+
+
+        // 現在の環境で見つからなければ parent の環境で探す
+        lisp_val_t cell1 = cc_cdr(current_env); // cdr
+        lisp_val_t cell2 = cc_cdr(cell1); // cddr
+        lisp_val_t cell3 = cc_cdr(cell2); // cdddr
+        lisp_val_t par_slot = cc_car(cell3); // cadddr (parent . env)
+
+        current_env = cc_cdr(par_slot); // parent の値
+    }
+    /* [P5] ISLisp の変数参照。spec:899-902 / spec:7255-7257 */
+    return os_signal_unbound_variable(sym, global_environment);
 }
 
 
@@ -4753,6 +4831,35 @@ lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env) {
 }
 
 /**
+ * [P5] 未束縛の変数を <unbound-variable> として signal する。
+ *
+ * 仕様は「識別子が表す実体が存在しなければ error を signal する
+ * (error-id. undefined-entity)」とし、その代表例として unbound-variable を挙げている
+ * (spec:899-902)。§29.4 の対応表(spec:7255-7257)がそのクラスを
+ * <unbound-variable> と定めている。
+ *
+ * <undefined-entity> のスロットは name と namespace で、namespace は
+ * variable / dynamic-variable / function / class のいずれか(spec:7160-7163、
+ * spec:7181-7182)。ここは変数名前空間なので variable を入れる。
+ *
+ * @param name_sym 未束縛だった変数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_unbound_variable(lisp_val_t name_sym, lisp_val_t env) {
+    GC_PROTECT(name_sym);
+    GC_PROTECT(env);
+    lisp_val_t initargs = os_make_cons(os_make_symbol("VARIABLE"), nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(os_make_symbol(":NAMESPACE"), initargs);
+    initargs = os_make_cons(name_sym, initargs);
+    initargs = os_make_cons(os_make_symbol(":NAME"), initargs);
+    lisp_val_t class_sym = os_make_symbol("<UNBOUND-VARIABLE>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
+/**
  * [P4-3] 変更できない束縛への代入を <program-error> として signal する。
  *
  * defconstant の束縛は immutable(spec:1699-1700)で、immutable binding を
@@ -5718,6 +5825,25 @@ double bignum_to_double(lisp_val_t val) {
     return sign ? -result : result;
 }
 
+/* [P5] 数値(fixnum / bignum / float)かどうか。既存の判定を組み合わせるだけで、
+   新しい型情報は持たない。
+   **この判定は「正常系の速い経路」からは呼ばない。** decompose が非数値を 0 として
+   扱ってしまう経路(= もう遅い経路に入っている場所)でだけ使う。 */
+static int is_number_val(lisp_val_t v) {
+    return (v & TAG_MASK) == TAG_FIXNUM || is_float(v) || is_bignum(v);
+}
+
+/* [P5] args の中で最初に現れる非数値を返す。すべて数値なら 0 を返す
+   (0 は lisp_val_t として有効な値ではないので番人に使える)。 */
+static lisp_val_t first_non_number(lisp_val_t args) {
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        if (!is_number_val(cc_car(cur))) {
+            return cc_car(cur);
+        }
+    }
+    return 0;
+}
+
 /**
  * argsの中で最も広いfloat種別を返す。floatが1つも無ければ FLOAT_KIND_NONE。
  *
@@ -5793,9 +5919,18 @@ static double to_double(lisp_val_t v) {
 #define NUM_CMP_EQUAL     0
 #define NUM_CMP_GREATER   1
 #define NUM_CMP_UNORDERED 2
+/* [P5] どちらかが数値でない。spec:4204-4205(=)、spec:4250-4251(< > <= >=)の
+   「An error shall be signaled if either x1 or x2 is not a number
+   (error-id. domain-error)」に対応する。**この値は fixnum どうしの高速経路からは
+   決して返らない**ので、整数どうしの比較(正常系)には命令が増えない。 */
+#define NUM_CMP_NOT_NUMBER 3
 
 static int number_compare4(lisp_val_t a, lisp_val_t b) {
     if (is_float(a) || is_float(b)) {
+        /* [P5] 片方が float でも、もう片方が数値とは限らない */
+        if (!is_number_val(a) || !is_number_val(b)) {
+            return NUM_CMP_NOT_NUMBER;
+        }
         double da = to_double(a);
         double db = to_double(b);
         if (da < db) { return NUM_CMP_LESS; }
@@ -5818,6 +5953,11 @@ static int number_compare4(lisp_val_t a, lisp_val_t b) {
         return neg_a ? -cmp : cmp;
     }
 
+    /* [P5] float でもなく、両方 fixnum でもない。ここまで来たら bignum か非数値。
+       **fixnum どうしは上で返っているので、正常系にはこの判定が乗らない** */
+    if (!is_number_val(a) || !is_number_val(b)) {
+        return NUM_CMP_NOT_NUMBER;
+    }
     signed_mag_t ma, mb;
     decompose(a, &ma);
     decompose(b, &mb);
@@ -5831,6 +5971,13 @@ static int number_compare4(lisp_val_t a, lisp_val_t b) {
 /* [NaN] 比較述語。**非順序の扱いはここに集約する。**
    整数どうしは NUM_CMP_UNORDERED を返さないので、挙動は従来と完全に同じである
    (documents/nan-comparison.md §3-4)。 */
+/* [P5] number_compare4 が NUM_CMP_NOT_NUMBER を返したときに呼ぶ。
+   **比較が偽になった分岐の内側からしか呼ばない**ので、真の側には命令が増えない。 */
+static lisp_val_t compare_pair_domain_error(lisp_val_t a, lisp_val_t b) {
+    lisp_val_t bad = is_number_val(a) ? b : a;
+    return signal_domain_error_for_class(bad, "<NUMBER>", global_environment);
+}
+
 static int num_lt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_LESS; }
 static int num_gt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_GREATER; }
 static int num_eq(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_EQUAL; }
@@ -5842,10 +5989,6 @@ static int num_ge(lisp_val_t a, lisp_val_t b) {
     int c = number_compare4(a, b);
     return c == NUM_CMP_GREATER || c == NUM_CMP_EQUAL;
 }
-/** /= 。**IEEE 754 で NaN に対して真を返す唯一の比較である。**
-    「等しくない」は非順序も含む。= の否定として書くこと自体が仕様であり、
-    独立に「小さいか大きい」と書くと NaN で偽になって誤る(§3-1)。 */
-static int num_ne(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) != NUM_CMP_EQUAL; }
 
 /**
  * 整数z1をz2で除した「floor除算」の商と余りを求める(ISLisp仕様のdiv/mod。素朴な
@@ -6278,6 +6421,9 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
         int kind = FLOAT_KIND_NONE;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
             lisp_val_t v = cc_car(cur);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
             kind = float_kind_max(kind, float_kind_of(v));
             sum = float_round_to_kind(kind, sum + to_double(v));
         }
@@ -6296,6 +6442,18 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
     }
     if (fast) {
         return sum_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -6449,6 +6607,14 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
        確保が残っていた(改善Aで見つけた「32byte/回」の正体と同じ構図)。 */
     int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
     if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
         return os_make_float_of_kind(kind, to_double(a) + to_double(b));
     }
     GC_PROTECT(a);
@@ -6526,6 +6692,14 @@ lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
     /* [型昇格] add2と同じ。singleどうしならヒープ確保ゼロ */
     int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
     if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
         return os_make_float_of_kind(kind, to_double(a) - to_double(b));
     }
     GC_PROTECT(a);
@@ -6551,6 +6725,9 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
 
     /* [型昇格] +と同じ規則。単項マイナスは第一引数の型をそのまま保つ */
     if (args_float_kind(args) != FLOAT_KIND_NONE) {
+        if (!is_number_val(first)) {
+            return signal_domain_error_for_class(first, "<NUMBER>", global_environment);
+        }
         int kind = float_kind_of(first);
         double result = to_double(first);
         if (cc_cdr(args) == nil) {
@@ -6558,6 +6735,9 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
         }
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
             lisp_val_t v = cc_car(rest);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
             kind = float_kind_max(kind, float_kind_of(v));
             result = float_round_to_kind(kind, result - to_double(v));
         }
@@ -6568,6 +6748,10 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
         // 単項マイナス: 0 - x
         if ((first & TAG_MASK) == TAG_FIXNUM) {
             return fixnum_negate(first);   /* [改善A] 同じ式が2箇所にあったので寄せた */
+        }
+        /* [P5] fixnum でない単項マイナス。bignum でなければ数値ではない */
+        if (!is_number_val(first)) {
+            return signal_domain_error_for_class(first, "<NUMBER>", global_environment);
         }
         signed_mag_t operand;
         decompose(first, &operand);
@@ -6593,6 +6777,18 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     }
     if (fast) {
         return result_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -6713,6 +6909,9 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
         int kind = FLOAT_KIND_NONE;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
             lisp_val_t v = cc_car(cur);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
             kind = float_kind_max(kind, float_kind_of(v));
             product = float_round_to_kind(kind, product * to_double(v));
         }
@@ -6734,6 +6933,18 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
     }
     if (fast) {
         return prod_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -6827,6 +7038,14 @@ lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
     /* [型昇格] add2と同じ。singleどうしならヒープ確保ゼロ */
     int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
     if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
         return os_make_float_of_kind(kind, to_double(a) * to_double(b));
     }
     GC_PROTECT(a);
@@ -6853,10 +7072,16 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
 
     /* [型昇格] +と同じ規則。0除算はIEEE754どおり inf/nan を返す(従来どおり) */
     if (args_float_kind(args) != FLOAT_KIND_NONE) {
+        if (!is_number_val(first)) {
+            return signal_domain_error_for_class(first, "<NUMBER>", global_environment);
+        }
         int kind = float_kind_of(first);
         double result = to_double(first);
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
             lisp_val_t v = cc_car(rest);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
             kind = float_kind_max(kind, float_kind_of(v));
             result = float_round_to_kind(kind, result / to_double(v));
         }
@@ -6886,6 +7111,18 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
     }
     if (fast) {
         return quot_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -7006,6 +7243,14 @@ lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b) {
     }
     int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
     if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
         return os_make_float_of_kind(kind, to_double(a) / to_double(b));
     }
     /* 整数だが fixnum でない(bignum)か、除数が 0。どちらも n 項版へ */
@@ -7025,6 +7270,11 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (!num_lt(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -7043,7 +7293,14 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
  * @return a<bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
-    return num_lt(a, b) ? g_sym_t : nil;
+    if (num_lt(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -7056,6 +7313,11 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (!num_gt(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -7070,7 +7332,14 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
  * @return a>bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
-    return num_gt(a, b) ? g_sym_t : nil;
+    if (num_gt(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -7083,6 +7352,11 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (!num_eq(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -7097,7 +7371,14 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
  * @return a=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
-    return num_eq(a, b) ? g_sym_t : nil;
+    if (num_eq(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -7108,10 +7389,23 @@ lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
  * @param env 呼び出し時の環境(未使用)
  * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
  */
+/* **`/=` は IEEE 754 で NaN に対して真を返す唯一の比較である。**
+   「等しくない」は非順序も含む。= の否定として書くこと自体が仕様であり、
+   独立に「小さいか大きい」と書くと NaN で偽になって誤る(§3-1)。
+   [P5] 述語 num_ne は使わなくなった(下のコメント参照)ので消してある。 */
 lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (!num_ne(cc_car(rest), cc_car(cc_cdr(rest)))) {
+        /* [P5] **`/=` だけは「偽の側で判定する」手が使えない。**
+           num_ne は「等しくない」なので、数値でない相手に対して**真**を返してしまう
+           (NUM_CMP_NOT_NUMBER != NUM_CMP_EQUAL)。他の比較と違い、ここは
+           比較結果そのものを見て分岐する。**`/=` の正常系には cmp が1つ増える。**
+           spec:4204-4205 */
+        int c = number_compare4(cc_car(rest), cc_car(cc_cdr(rest)));
+        if (c == NUM_CMP_NOT_NUMBER) {
+            return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+        }
+        if (c == NUM_CMP_EQUAL) {
             return nil;
         }
     }
@@ -7134,7 +7428,12 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
  * @return a≠b(非順序を含む)ならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b) {
-    return num_ne(a, b) ? g_sym_t : nil;
+    /* [P5] n項版と同じ理由で、比較結果そのものを見る(上のコメント参照) */
+    int c = number_compare4(a, b);
+    if (c == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return (c == NUM_CMP_EQUAL) ? nil : g_sym_t;
 }
 
 /**
@@ -7147,6 +7446,11 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (!num_ge(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -7161,7 +7465,14 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
  * @return a>=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
-    return num_ge(a, b) ? g_sym_t : nil;
+    if (num_ge(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -7174,6 +7485,11 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
         if (!num_le(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -7188,7 +7504,14 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
  * @return a<=bならg_sym_t、そうでなければnil
  */
 lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
-    return num_le(a, b) ? g_sym_t : nil;
+    if (num_le(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -7204,7 +7527,15 @@ lisp_val_t primitive_max(lisp_val_t args, lisp_val_t env) {
         lisp_val_t v = cc_car(rest);
         if (num_gt(v, best)) {
             best = v;
+        } else if (number_compare4(v, best) == NUM_CMP_NOT_NUMBER) {
+            /* [P5] 偽の側でだけ判定する。spec:4390「An error shall be signaled
+               if any x is not a number (error-id. domain-error)」 */
+            return compare_pair_domain_error(v, best);
         }
+    }
+    /* [P5] 引数が1つだけ(ループを回らない)のときも第一引数を検査する */
+    if (!is_number_val(best)) {
+        return signal_domain_error_for_class(best, "<NUMBER>", global_environment);
     }
     return best;
 }
@@ -7222,7 +7553,15 @@ lisp_val_t primitive_min(lisp_val_t args, lisp_val_t env) {
         lisp_val_t v = cc_car(rest);
         if (num_lt(v, best)) {
             best = v;
+        } else if (number_compare4(v, best) == NUM_CMP_NOT_NUMBER) {
+            /* [P5] 偽の側でだけ判定する。spec:4390「An error shall be signaled
+               if any x is not a number (error-id. domain-error)」 */
+            return compare_pair_domain_error(v, best);
         }
+    }
+    /* [P5] 引数が1つだけ(ループを回らない)のときも第一引数を検査する */
+    if (!is_number_val(best)) {
+        return signal_domain_error_for_class(best, "<NUMBER>", global_environment);
     }
     return best;
 }
@@ -7261,6 +7600,13 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
         return val;
     }
 
+    /* [P5] fixnum でも float でもない。bignum でなければ数値ではない。
+       **fixnum / float の経路は上で返っているので正常系には効かない。**
+       spec:4414「An error shall be signaled if x is not a number
+       (error-id. domain-error)」 */
+    if (!is_number_val(val)) {
+        return signal_domain_error_for_class(val, "<NUMBER>", global_environment);
+    }
     signed_mag_t m;
     decompose(val, &m);
     if (!m.sign) {

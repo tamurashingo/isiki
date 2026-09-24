@@ -1855,7 +1855,7 @@ static void za_emit_operand(const za_operand_t *op) {
         jit_call_r11();
         jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_variable);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_variable_checked);
         jit_call_r11();
         return;
     }
