@@ -15,13 +15,6 @@
 /** report-conditionの出力を受ける固定長バッファ。これを超えるメッセージは途中で切れる */
 #define LOAD_REPORT_MAX 256
 
-/** msgを現在実行中プロセスのstdout_bufferへ改行付きで表示する */
-static void print_load_error(const char *msg) {
-    process_t *proc = get_current_process();
-    proc->stdout_buffer->write_string(proc->stdout_buffer, msg);
-    proc->stdout_buffer->write_char(proc->stdout_buffer, '\n');
-}
-
 /**
  * [P2] エラーで打ち切られたフォームの理由を表示する。
  *
@@ -53,8 +46,13 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
     char err_msg[LOAD_ERR_MSG_MAX];
     os_stream_t stream;
     if (!os_stream_open_9p_file(&stream, path, err_msg, sizeof(err_msg))) {
-        print_load_error(err_msg);
-        return g_sym_eval_error;
+        /* [P4-4] **load は ISLisp 仕様に無い**(実装独自)ので error-id の指定も無い。
+           open-input-file に揃えて <simple-error> を signal する
+           (クラスの選択理由は os_signal_io_error のコメント参照)。
+           以前はここで自前に1行表示してから EVAL-ERROR を返していたが、
+           condition のメッセージが同じ内容を運ぶので表示はやめる。
+           握り潰されずトップレベルまで上がれば repl.c / cc_load が報告する */
+        return os_signal_io_error("load", path, err_msg, env);
     }
 
     // envはループの複数回のイテレーションを跨いで再利用される。os_eval_top_level経由で
@@ -68,16 +66,14 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
         lisp_val_t form = os_read_stream(&stream);
 
         if (form == g_sym_read_error) {
-            print_load_error("load: syntax error");
             os_stream_close(&stream);
-            return g_sym_eval_error;
+            return os_signal_io_error("load", path, "syntax error", env);
         }
 
         if (form == nil) {
             if (stream.error) {
-                print_load_error("load: I/O error");
                 os_stream_close(&stream);
-                return g_sym_eval_error;
+                return os_signal_io_error("load", path, "I/O error", env);
             }
             break;
         }

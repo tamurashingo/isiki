@@ -64,9 +64,22 @@ import sys
 # (reader.c の「array == g_sym_eval_error」の分岐)。リーダーの構文エラーは
 # 条件ではなく読み取りエラーの経路で報告するのが現在の設計なので、
 # 数だけを合わせるために signal へ変えるのは筋が悪い。
+#
+# [P4-4] 21 -> 6。load.c 3 + stream_lisp.c 12 を片付けた。
+# 残る 6 箇所はいずれも**意図して残すもの**:
+#   runtime.c 3  条件システムが使えないときのフォールバック(深さ打ち切り/
+#                make-instance 等が無い/クラスが引けない)
+#   runtime.c 3  os_make_array_from_nested_list。reader.c が直後に
+#                g_sym_read_error へ翻訳する内部ステータスで、評価器へは漏れない
+# **したがってこの予算はもう下がらない。** 下げようとする変更があれば、
+# それは上のどちらかの性質を変えているということなので、先に設計を見直すこと。
 BUDGETS = {
-    "c_return": 21,
-    "lisp_quote": 5,
+    "c_return": 6,
+    # [P4-4] 5 -> 2。file-cmd.lisp の read-file-into-vector / write-vector-to-file が
+    # 見ていた EVAL-ERROR 返しは、open-input-stream / open-output-file / file-length が
+    # signal(または仕様どおりの nil)へ変わったことで**起きなくなった**ため落とした。
+    # 残る 2 箇所は init_aot.lisp の slot-value / set-slot-value のエラー分岐。
+    "lisp_quote": 2,
 }
 # --------------------------------------------------------------------------
 

@@ -708,10 +708,16 @@
 
 ;;; --- open-input-file ---
 
-;; open-input-streamの別名であることをmacroexpand-1相当(defunなのでここでは
-;; funcallの展開結果ではなく、実際に9Pが失敗する環境でも同じ結果(g_sym_eval_error
-;; 相当のシンボル)を返すことで確認する。
-(assert-equal (open-input-stream "foo.lsp") (open-input-file "foo.lsp"))
+;; open-input-streamの別名であることを、実際に9Pが失敗する環境で
+;; **同じように失敗すること**で確認する。
+;;
+;; [P4-4] 以前は両方とも EVAL-ERROR を値として返していたので戻り値同士を
+;; assert-equal で比べられたが、いまは両方とも <simple-error> を signal する。
+;; **このファイルは test/c/script_test.c からも読まれる**(test_framework.lisp を
+;; 読まない)ので assert-error-class は使えず、ignore-errors で「signal された」
+;; ことだけを見る。
+(assert-equal nil (ignore-errors (open-input-stream "foo.lsp")))
+(assert-equal nil (ignore-errors (open-input-file "foo.lsp")))
 
 ;;; --- with-open-output-stream / with-open-output-file ---
 

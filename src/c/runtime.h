@@ -1868,6 +1868,19 @@ lisp_val_t os_signal_immutable_binding(lisp_val_t env);
 lisp_val_t os_signal_not_a_function(lisp_val_t obj, lisp_val_t env);
 
 /**
+ * [P4-4] 入出力の失敗(ファイルを開けない、マウントが解決できない等)を
+ * <simple-error> としてsignalする。メッセージは "what: path[: detail]" になる。
+ * **クラスの選択は仕様未確認**(open-*-file は「開き方は implementation-defined」
+ * spec:6266-6268 としか書かれておらず、load は仕様に無い)。理由は実装側のコメント参照。
+ * @param what 失敗した操作(例 "open-input-file")
+ * @param path 対象のパス
+ * @param detail 下位層のメッセージ。不要なら0
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_io_error(const char *what, const char *path, const char *detail, lisp_val_t env);
+
+/**
  * <control-error>をsignalする(ISLisp仕様§14.7: 既に抜けたblockへのreturn-from、
  * unwind-protectのcleanup中の別の非局所脱出など)。eval.cとza.c(JIT生成コード)の両方から呼ぶ。
  * @param env 呼び出し時の環境

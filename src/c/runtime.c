@@ -4770,6 +4770,70 @@ lisp_val_t os_signal_immutable_binding(lisp_val_t env) {
     return os_signal_condition(class_sym, nil, env);
 }
 
+/* [P4-4] os_signal_io_error がメッセージを組み立てるための切り詰め付き連結。
+   nostdlib のため strcat/snprintf は使えない */
+#define IO_ERROR_MSG_MAX 256
+static void io_error_append(char *out, UINT64 cap, UINT64 *pos, const char *src) {
+    if (src == 0) {
+        return;
+    }
+    while (*src != '\0' && *pos + 1 < cap) {
+        out[(*pos)++] = *src++;
+    }
+}
+
+/**
+ * [P4-4] 入出力の失敗を <simple-error> として signal する。
+ *
+ * **クラスの選択は仕様未確認。** open-input-file / open-output-file / open-io-file に
+ * ついて仕様が定めている誤りは「filename が文字列でないこと」だけで、開く操作自体は
+ * "The corresponding file is opened in an implementation-defined way"(spec:6266-6268)と
+ * されている。**開けなかった場合の error-id は挙げられていない。** load は
+ * そもそも ISLisp 仕様に無い(実装独自)。
+ *
+ * <stream-error> を使わないのは、そのスロットが stream ただ1つで、仕様が
+ * 「the stream on which the error occurred」(spec:7146-7147)と定めているためである。
+ * ここで失敗しているのは**ストリームを開く操作そのもの**で、載せられるストリームが
+ * 存在しない。nil を入れるとクラスの定義と食い違う上、report-condition も
+ * 「stream error on NIL」としか出せず、どのファイルで失敗したのか分からない。
+ * <simple-error> なら失敗したパスと下位層のメッセージをそのまま運べる。
+ *
+ * format-string は "~A" 固定にして、本文は format-arguments 側へ渡す。
+ * **パスに ~ が含まれていても format の指示子として解釈されないようにするため。**
+ *
+ * @param what 失敗した操作(例 "open-input-file")
+ * @param path 対象のパス
+ * @param detail 下位層のメッセージ。不要なら0
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_io_error(const char *what, const char *path, const char *detail, lisp_val_t env) {
+    GC_PROTECT(env);
+    char msg[IO_ERROR_MSG_MAX];
+    UINT64 pos = 0;
+    io_error_append(msg, sizeof(msg), &pos, what);
+    io_error_append(msg, sizeof(msg), &pos, ": ");
+    io_error_append(msg, sizeof(msg), &pos, path);
+    if (detail != 0 && detail[0] != '\0') {
+        io_error_append(msg, sizeof(msg), &pos, ": ");
+        io_error_append(msg, sizeof(msg), &pos, detail);
+    }
+    msg[pos] = '\0';
+
+    lisp_val_t body = os_make_string(msg);
+    GC_PROTECT(body);
+    lisp_val_t fmt_args = os_make_cons(body, nil);
+    GC_PROTECT(fmt_args);
+    lisp_val_t initargs = os_make_cons(fmt_args, nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(os_make_symbol(":FORMAT-ARGUMENTS"), initargs);
+    initargs = os_make_cons(os_make_string("~A"), initargs);
+    initargs = os_make_cons(os_make_symbol(":FORMAT-STRING"), initargs);
+    lisp_val_t class_sym = os_make_symbol("<SIMPLE-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
 /**
  * [P4-3] 関数でないものを関数として呼ぼうとした場合を <domain-error> として signal する。
  *

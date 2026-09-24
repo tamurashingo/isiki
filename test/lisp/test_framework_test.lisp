@@ -144,14 +144,23 @@
 (assert-equal '(1 0) (list (tf-dpass *tf-ec-undef*) (tf-dfail *tf-ec-undef*)))
 (assert-equal "" (tf-out *tf-ec-undef*))
 
-;; **まだ signal しない経路**での陰性対照。stream_lisp.c の入出力系は EVAL-ERROR を
-;; 値として返す(P4-4 の対象)。そこが signal に変わったらここが落ちる。
-;; 存在しないファイルの open-input-file がその1つ(stream_lisp.c)
+;; **P4-4 で入出力の失敗も signal に変わった**(<simple-error>)。
+;; ここも陰性対照から陽性対照へ書き換わった4例目
 (defglobal *tf-ec-io*
-  (tf-capture (lambda () (assert-error-class '<stream-error> (open-input-file "/9p/tf-no-such-file-p44.txt")))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ec-io*) (tf-dfail *tf-ec-io*)))
-(assert-equal (tf-ng-not-signaled-text '(open-input-file "/9p/tf-no-such-file-p44.txt") 'eval-error '<stream-error>)
-              (tf-out *tf-ec-io*))
+  (tf-capture (lambda () (assert-error-class '<simple-error> (open-input-file "/9p/tf-no-such-file-p44.txt")))))
+(assert-equal '(1 0) (list (tf-dpass *tf-ec-io*) (tf-dfail *tf-ec-io*)))
+(assert-equal "" (tf-out *tf-ec-io*))
+
+;; **P4 が終わり、EVAL-ERROR を値として返す経路は Lisp から到達できなくなった。**
+;; 残る 6 箇所はいずれも C の内部だけで消費される(条件システムが使えないときの
+;; フォールバックと、reader.c が読み取りエラーへ翻訳する配列リテラルの状態)。
+;; そのため**この陰性対照はリテラルで作る**。assert-error-class が
+;; 「EVAL-ERROR が値として返ってきた形」を見逃さないことを、以後も固定しておく
+(defglobal *tf-ec-literal*
+  (tf-capture (lambda () (assert-error-class '<simple-error> 'eval-error))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ec-literal*) (tf-dfail *tf-ec-literal*)))
+(assert-equal (tf-ng-not-signaled-text ''eval-error 'eval-error '<simple-error>)
+              (tf-out *tf-ec-literal*))
 
 ;;; ---------------------------------------------------------------------------
 ;;; assert-error との住み分け
@@ -165,7 +174,11 @@
 (defglobal *tf-ae-div* (tf-capture (lambda () (assert-error (div 1 0)))))
 (assert-equal '(1 0) (list (tf-dpass *tf-ae-div*) (tf-dfail *tf-ae-div*)))
 
-;; assert-error も EVAL-ERROR 返しは捕まえられない(signal されていないため)。
-;; まだ signal しない入出力系で確かめる
+;; assert-error は「何かが signal された」ので入出力の失敗も通るようになった(P4-4)
 (defglobal *tf-ae-io* (tf-capture (lambda () (assert-error (open-input-file "/9p/tf-no-such-file-p44.txt")))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ae-io*) (tf-dfail *tf-ae-io*)))
+(assert-equal '(1 0) (list (tf-dpass *tf-ae-io*) (tf-dfail *tf-ae-io*)))
+
+;; assert-error も EVAL-ERROR 返しは捕まえられない(signal されていないため)。
+;; 上と同じ理由でリテラルで確かめる
+(defglobal *tf-ae-literal* (tf-capture (lambda () (assert-error 'eval-error))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ae-literal*) (tf-dfail *tf-ae-literal*)))

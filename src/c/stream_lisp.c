@@ -159,7 +159,14 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
         os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
         char err_msg[128];
         if (!os_stream_open_9p_file(raw, relative, err_msg, sizeof(err_msg))) {
-            return g_sym_eval_error;
+            /* [P4-4] 下位層のメッセージをそのまま condition へ載せる。
+               **signal には global_environment を渡す(P4-2 と同じ理由)。**
+               呼び出し元の env をエラー分岐まで生かすと、成功経路の側で
+               callee-saved レジスタへの退避が増える(実測: この3関数の
+               プロローグが +2 命令になった)。os_signal_condition が env を
+               使うのは MAKE-INSTANCE / SIGNAL-CONDITION / %FIND-CLASS の
+               解決だけで、どれも global_environment にしか登録されない */
+            return os_signal_io_error("open-input-file", path, err_msg, global_environment);
         }
         return os_make_stream(raw);
     }
@@ -176,7 +183,7 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
             if (transfer != nil) {
                 return transfer;
             }
-            return g_sym_eval_error;
+            return os_signal_io_error("open-input-file", path, "cannot read file", global_environment);
         }
         // dataはos_mount_fat_read_file内でos_alloc_raw済みの専有バッファ(コピー元の
         // Lisp vectorから既に切り離されている)なので、そのままstr_bufとして渡せる
@@ -185,7 +192,8 @@ lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env) {
         return os_make_stream(raw);
     }
 
-    return g_sym_eval_error;
+    /* どのマウントにも解決できなかった(*mounts* に無いパス) */
+    return os_signal_io_error("open-input-file", path, "no such mount", global_environment);
 }
 
 lisp_val_t cc_open_output_stream(lisp_val_t args, lisp_val_t env) {
@@ -341,7 +349,8 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
         os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
         char err_msg[128];
         if (!os_stream_open_9p_file_write(raw, relative, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
-            return g_sym_eval_error;
+            /* [P4-4] 下位層のメッセージをそのまま condition へ載せる */
+            return os_signal_io_error("open-output-file", path, err_msg, global_environment);
         }
         return os_make_stream(raw);
     }
@@ -355,7 +364,7 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
             if (transfer != nil) {
                 return transfer;
             }
-            return g_sym_eval_error;
+            return os_signal_io_error("open-output-file", path, "cannot resolve file", global_environment);
         }
         // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
         // ため、書き込み先(os_stream_open_fat_file_write)に渡すまでGC_PROTECTする
@@ -365,7 +374,8 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
         return os_make_stream(raw);
     }
 
-    return g_sym_eval_error;
+    /* どのマウントにも解決できなかった(*mounts* に無いパス) */
+    return os_signal_io_error("open-output-file", path, "no such mount", global_environment);
 }
 
 lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
@@ -384,7 +394,8 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
         os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
         char err_msg[128];
         if (!os_stream_open_9p_file_io(raw, relative, 1 /* create_if_missing */, err_msg, sizeof(err_msg))) {
-            return g_sym_eval_error;
+            /* [P4-4] 下位層のメッセージをそのまま condition へ載せる */
+            return os_signal_io_error("open-io-file", path, err_msg, global_environment);
         }
         return os_make_stream(raw);
     }
@@ -398,7 +409,7 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
             if (transfer != nil) {
                 return transfer;
             }
-            return g_sym_eval_error;
+            return os_signal_io_error("open-io-file", path, "cannot resolve file", global_environment);
         }
         // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
         // ため、書き込み先(os_stream_open_fat_file_io)に渡すまでGC_PROTECTする
@@ -408,7 +419,8 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
         return os_make_stream(raw);
     }
 
-    return g_sym_eval_error;
+    /* どのマウントにも解決できなかった(*mounts* に無いパス) */
+    return os_signal_io_error("open-io-file", path, "no such mount", global_environment);
 }
 
 lisp_val_t cc_finish_output(lisp_val_t args, lisp_val_t env) {
@@ -657,6 +669,14 @@ lisp_val_t cc_set_file_position(lisp_val_t args, lisp_val_t env) {
     return z;
 }
 
+/*
+ * [P4-4] **file-length は失敗しても signal しない。**
+ * spec:6858-6859「Returns the length of the file named by filename, or **returns nil
+ * if the length cannot be determined**」。signal すべきと仕様が定めているのは
+ * filename が文字列でない場合(error-id. domain-error、spec:6860)だけである。
+ * したがってここは EVAL-ERROR 返しを signal ではなく **nil 返し**へ直す
+ * (元の EVAL-ERROR は「長さが決められなかった」の実装内部の表現でしかなかった)。
+ */
 lisp_val_t cc_file_length(lisp_val_t args, lisp_val_t env) {
     (void)env;
     char path[STREAM_PATH_MAX];
@@ -670,7 +690,7 @@ lisp_val_t cc_file_length(lisp_val_t args, lisp_val_t env) {
         os_stream_t tmp;
         char err_msg[128];
         if (!os_stream_open_9p_file(&tmp, relative, err_msg, sizeof(err_msg))) {
-            return g_sym_eval_error;
+            return nil;     /* 長さを決められなかった(spec:6858-6859) */
         }
         UINT64 count = 0;
         char ch;
@@ -692,12 +712,12 @@ lisp_val_t cc_file_length(lisp_val_t args, lisp_val_t env) {
             if (transfer != nil) {
                 return transfer;
             }
-            return g_sym_eval_error;
+            return nil;     /* 長さを決められなかった(spec:6858-6859) */
         }
         return os_make_fixnum(len);
     }
 
-    return g_sym_eval_error;
+    return nil;             /* どのマウントにも解決できなかった(spec:6858-6859) */
 }
 
 void os_register_streams(void) {
