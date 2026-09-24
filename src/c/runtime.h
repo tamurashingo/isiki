@@ -1839,6 +1839,35 @@ void os_set_panic_hook(void (*hook)(void));
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env);
 
 /**
+ * [P4-3] 未定義の関数を<undefined-function>としてsignalする(error-id. undefined-function。
+ * spec:1455-1457 / spec:1461 / spec:1512-1513、クラスはspec:7261-7263)。
+ * nameとnamespace(=function)のスロットを載せる(spec:7160-7163)。
+ * eval.c(eval_form / eval_function)とruntime.c(primitive_funcall_by_name)から呼ぶ。
+ * @param name_sym 未定義だった関数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env);
+
+/**
+ * [P4-3] 変更できない束縛(defconstant)への代入を<program-error>としてsignalする
+ * (error-id. immutable-binding。spec:435-437、クラスはspec:7239-7241)。
+ * eval.c(eval_setq)とruntime.c(os_setq_variable_checked。za.cのJIT生成コードが呼ぶ)から使う。
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_immutable_binding(lisp_val_t env);
+
+/**
+ * [P4-3] 関数でないものを関数として呼ぼうとした場合を<domain-error>としてsignalする
+ * (error-id. domain-error。spec:1667)。expected-classは<FUNCTION>。
+ * @param obj 関数ではなかった値
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_not_a_function(lisp_val_t obj, lisp_val_t env);
+
+/**
  * <control-error>をsignalする(ISLisp仕様§14.7: 既に抜けたblockへのreturn-from、
  * unwind-protectのcleanup中の別の非局所脱出など)。eval.cとza.c(JIT生成コード)の両方から呼ぶ。
  * @param env 呼び出し時の環境

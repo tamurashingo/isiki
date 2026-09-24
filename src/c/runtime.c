@@ -4723,6 +4723,67 @@ static lisp_val_t signal_index_out_of_range(lisp_val_t env) {
     return os_signal_condition(class_sym, nil, env);
 }
 
+/**
+ * [P4-3] 未定義の関数を <undefined-function> として signal する。
+ *
+ * 仕様は「関数名前空間に束縛が無ければ error を signal する(error-id.
+ * undefined-function)」と定めている(関数適用: spec:1455-1457 / spec:1461、
+ * function 特殊形式: spec:1512-1513)。§29.4 の対応表(spec:7261-7263)が
+ * そのクラスを <undefined-function> と定めている。
+ *
+ * <undefined-entity> のスロットは name と namespace の2つで、namespace は
+ * variable / dynamic-variable / function / class のいずれかのシンボル
+ * (spec:7160-7163、spec:7181-7182)。ここは関数名前空間なので function を入れる。
+ *
+ * @param name_sym 未定義だった関数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env) {
+    GC_PROTECT(name_sym);
+    GC_PROTECT(env);
+    lisp_val_t initargs = os_make_cons(os_make_symbol("FUNCTION"), nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(os_make_symbol(":NAMESPACE"), initargs);
+    initargs = os_make_cons(name_sym, initargs);
+    initargs = os_make_cons(os_make_symbol(":NAME"), initargs);
+    lisp_val_t class_sym = os_make_symbol("<UNDEFINED-FUNCTION>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
+/**
+ * [P4-3] 変更できない束縛への代入を <program-error> として signal する。
+ *
+ * defconstant の束縛は immutable(spec:1699-1700)で、immutable binding を
+ * 変更しようとするのは error-id. immutable-binding(spec:435-437)。
+ * §29.4 の対応表(spec:7239-7241)がそのクラスを <program-error> と定めている。
+ * **<program-error> はスロットを持たないので、どのシンボルだったかは運べない。**
+ *
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_immutable_binding(lisp_val_t env) {
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol("<PROGRAM-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, nil, env);
+}
+
+/**
+ * [P4-3] 関数でないものを関数として呼ぼうとした場合を <domain-error> として signal する。
+ *
+ * spec:1667「An error shall be signaled if function is not a function
+ * (error-id. domain-error)」(funcall)。
+ *
+ * @param obj 関数ではなかった値
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_not_a_function(lisp_val_t obj, lisp_val_t env) {
+    return signal_domain_error_for_class(obj, "<FUNCTION>", env);
+}
+
 static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t env) {
     GC_PROTECT(offending_object);
     GC_PROTECT(env);
@@ -4819,11 +4880,13 @@ lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
  * @param sym 設定するsymbol
  * @param val 設定する値
  * @param env 探索を開始する環境
- * @return val、またはsymが定数の場合はg_sym_eval_error
+ * @return val、またはsymが定数の場合は<program-error>をsignalした結果
  */
 lisp_val_t os_setq_variable_checked(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
     if (os_is_constant(sym, env)) {
-        return g_sym_eval_error;
+        /* [P4-3] eval_setqと同じくerror-id. immutable-binding(spec:435-437)。
+           クラスは<program-error>(spec:7239-7241) */
+        return os_signal_immutable_binding(global_environment);
     }
     return os_setq_variable(sym, val, env);
 }
@@ -5022,7 +5085,14 @@ lisp_val_t os_get_function_cell(lisp_val_t sym, lisp_val_t env) {
  */
 lisp_val_t os_apply_via_cell(lisp_val_t cell, lisp_val_t evaluated_args, lisp_val_t env) {
     if (cell == nil) {
-        return os_apply_function(nil, evaluated_args, env);
+        /* [P4-3] **cellがnilは「その名前に関数束縛が無い」ことそのもの**である
+           (os_get_function_cellが未定義の名前に対してnilを返す)。
+           インタプリタ側(eval_form)と同じ<undefined-function>にする。
+           os_apply_functionへ回すと「nilは関数ではない」=<domain-error>になり、
+           同じソースがJITコンパイルされたかどうかでクラスが変わってしまう。
+           **名前はここまで運ばれてこない**ので name スロットは nil になる
+           (JIT側で名前を渡すのはABI変更を伴うため P6 の範囲) */
+        return os_signal_undefined_function(nil, global_environment);
     }
     lisp_addr_t cell_addr = (lisp_addr_t)(cell & ~TAG_MASK);
     lisp_val_t fn_obj = *(lisp_val_t *)cell_addr;
@@ -9859,14 +9929,19 @@ lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env) {
  * @param args (sym . rest) 評価済みの引数リスト。symは呼び出したい関数名のシンボル、
  *             restはsymへ渡す評価済み引数のリスト
  * @param env rest内の関数呼び出しに使う環境(sym解決には使わない)
- * @return symの呼び出し結果。symがglobal_environment上で未定義の場合はg_sym_eval_error
+ * @return symの呼び出し結果。symがglobal_environment上で未定義の場合は
+ *         <undefined-function>をsignalする
  */
 lisp_val_t primitive_funcall_by_name(lisp_val_t args, lisp_val_t env) {
     lisp_val_t sym = cc_car(args);
     lisp_val_t rest = cc_cdr(args);
     lisp_val_t fn = os_get_function(sym, global_environment);
     if (fn == nil) {
-        return g_sym_eval_error;
+        /* [P4-3] error-id. undefined-function(spec:1461)。クラスはspec:7261-7263。
+           **envではなくglobal_environmentを渡す。** この関数のenvはrest内の
+           関数呼び出し用で、sym解決には元々使っていない(上のos_get_function参照)。
+           AOT生成コードからは0が渡ることもあり、os_get_functionへ回すと落ちる */
+        return os_signal_undefined_function(sym, global_environment);
     }
     return os_apply_function(fn, rest, env);
 }

@@ -14,6 +14,8 @@
 (isiki-test-load "test/lisp/arith_signal_test.lisp")
 ;; [P4-2] 添字・範囲の EVAL-ERROR 返しを signal へ移した分
 (isiki-test-load "test/lisp/index_signal_test.lisp")
+;; [P4-3] 未定義関数 / immutable-binding / 非関数の呼び出し
+(isiki-test-load "test/lisp/undefined_signal_test.lisp")
 (isiki-test-load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例は別ファイル。構文エラーでloadが中断した場合に検出できるよう
 ;; 戻り値(成功ならt)を確認する。loadの中でも assert-* が走るので、assert-equal の

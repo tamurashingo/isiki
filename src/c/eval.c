@@ -122,9 +122,22 @@ static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t
  * @param fn 呼び出す関数オブジェクト
  * @param evaluated_args 評価済みの引数リスト
  * @param env 呼び出し時の環境
- * @return 関数呼び出しの結果。関数オブジェクトでない場合はg_sym_eval_error
+ * @return 関数呼び出しの結果。関数オブジェクトでない場合は<domain-error>をsignalする
  */
 static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_t env) {
+    /* [P4-3] **タグを見ずに word0 を読んでいた。** fn は eval_form で
+       (op がシンボルでなければ)os_eval の結果がそのまま来るので、
+       ((car '(1 2)) 3) のように関数でない値が渡りうる。fixnum の 5 なら
+       5 & ~TAG_MASK = 0 で**アドレス0を読む**。タグを先に見る。
+       spec:1667「An error shall be signaled if function is not a function
+       (error-id. domain-error)」
+
+       **signal には global_environment を渡す(P4-2 と同じ理由)。** 加えて、
+       apply_function の env は AOT 生成コードから 0 が渡ることがあり
+       (lisp_ll_* の第2引数)、それを os_get_function へ渡すと cc_cdr(0) で落ちる。 */
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return os_signal_not_a_function(fn, global_environment);
+    }
     lisp_addr_t addr = fn & ~TAG_MASK;
     UINT64 *obj = (UINT64 *)addr;
     if (obj[0] == MAGIC_FUNCTION_NATIVE) {
@@ -157,7 +170,8 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         bind_params(params, evaluated_args, call_env);
         return eval_progn(body, call_env);
     }
-    return g_sym_eval_error; // 関数オブジェクトではない
+    // TAG_INSTANCEではあるが関数オブジェクトではない(vectorやILOSインスタンス等)
+    return os_signal_not_a_function(fn, global_environment);
 }
 
 /**
@@ -167,7 +181,7 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
  * @param op 関数を表すシンボル、または関数オブジェクトへ評価される式
  * @param args 未評価の引数リスト
  * @param env 評価に使う環境
- * @return 関数呼び出しの結果。opが未定義の場合はg_sym_eval_error
+ * @return 関数呼び出しの結果。opが未定義の場合は<undefined-function>をsignalする
  */
 static lisp_val_t eval_form(lisp_val_t op, lisp_val_t args, lisp_val_t env) {
     // [原則4の系] opの解決(os_get_functionの確保、opが(lambda ...)等ならos_evalの
@@ -185,7 +199,14 @@ static lisp_val_t eval_form(lisp_val_t op, lisp_val_t args, lisp_val_t env) {
     lisp_val_t fn = ((op & TAG_MASK) == TAG_SYMBOL) ? os_get_function(op, env) : os_eval(op, env);
     GC_PROTECT(fn);
     if (fn == nil) {
-        return g_sym_eval_error; // 未定義の関数
+        /* [P4-3] opがシンボルなら関数名前空間に束縛が無い = undefined-function
+           (spec:1455-1457 / spec:1461)。シンボルでない場合はopを評価した結果が
+           nilだったということなので、「nilは関数ではない」= domain-error
+           (spec:1667)にする */
+        if ((op & TAG_MASK) == TAG_SYMBOL) {
+            return os_signal_undefined_function(op, global_environment);
+        }
+        return os_signal_not_a_function(fn, global_environment);
     }
     lisp_val_t evaluated_args = eval_args(args, env);
     if (is_control_transfer(evaluated_args)) {
@@ -247,7 +268,10 @@ static lisp_val_t eval_setq(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(sym);
     GC_PROTECT(env);
     if (os_is_constant(sym, env)) {
-        return g_sym_eval_error; // defconstantで定義された定数はsetqで上書きできない
+        /* [P4-3] defconstantの束縛はimmutable(spec:1699-1700)。変更しようとするのは
+           error-id. immutable-binding(spec:435-437)で、クラスは<program-error>
+           (spec:7239-7241) */
+        return os_signal_immutable_binding(global_environment);
     }
     lisp_val_t val_form = cc_car(cc_cdr(args));
     lisp_val_t val = os_eval(val_form, env);
@@ -463,14 +487,17 @@ static lisp_val_t eval_lambda(lisp_val_t args, lisp_val_t env) {
  * (function (lambda ...))のような式ならその式自体をos_evalして得た関数オブジェクトを返す。
  * @param args (name-or-lambda-expr)
  * @param env 解決・評価に使う環境
- * @return 関数オブジェクト。nameが未定義の場合はg_sym_eval_error
+ * @return 関数オブジェクト。nameが未定義の場合は<undefined-function>をsignalする
  */
 static lisp_val_t eval_function(lisp_val_t args, lisp_val_t env) {
     lisp_val_t form = cc_car(args);
     if ((form & TAG_MASK) == TAG_SYMBOL) {
         lisp_val_t fn = os_get_function(form, env);
         if (fn == nil) {
-            return g_sym_eval_error; // 未定義の関数
+            /* spec:1512-1513「An error shall be signaled if no binding has been
+               established for the identifier in the function namespace
+               (error-id. undefined-function)」 */
+            return os_signal_undefined_function(form, global_environment);
         }
         return fn;
     }

@@ -14,6 +14,8 @@
 (load "test/lisp/arith_signal_test.lisp")
 ;; [P4-2] 添字・範囲の EVAL-ERROR 返しを signal へ移した分
 (load "test/lisp/index_signal_test.lisp")
+;; [P4-3] 未定義関数 / immutable-binding / 非関数の呼び出し
+(load "test/lisp/undefined_signal_test.lisp")
 (load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例(#nA 等)は別ファイル。load の戻り値(成功なら t)で構文エラーによる
 ;; 中断を検出する(qemu_boot_test.lisp と同じ。assert-equal の中に load を直接書かない)

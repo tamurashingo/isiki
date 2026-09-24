@@ -1922,6 +1922,15 @@ static UINT64 za_ensure_trampoline(void) {
     // r8はFunction Cell(TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)。
     // 中身(現在のfn、TAG_INSTANCE)を読み出してr8を差し替えてから、以降は従来通り
     // fn自体に対する分岐を行う(拡張: 間接呼び出し化)。
+    //
+    // [P4-3] **cellをr9へ退避しておく。** 下のfallbackでos_apply_functionではなく
+    // os_apply_via_cellを呼ぶために要る。cellがnilは「その名前に関数束縛が無い」
+    // ことそのもので、os_apply_via_cellはそれを<undefined-function>にする。
+    // fn(=nil)だけを渡すos_apply_functionでは「nilは関数ではない」=<domain-error>に
+    // なり、**同じソースが末尾呼び出しかどうかでクラスが変わってしまう**。
+    // 追加は高速path側でこのmov 1命令だけで、fallback側は従来の4回のローテートが
+    // 3回に減る(計測: 下記PR)。r9はこのスタブ内でfallbackでしか使っていない。
+    jit_mov_reg_reg(ZA_REG_R9, ZA_REG_R8);
     jit_mov_reg_reg(ZA_REG_R10, ZA_REG_R8);
     jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK); // タグを落として実アドレスにする
     jit_mov_reg_from_mem_disp8(ZA_REG_R8, ZA_REG_R10, 0); // r8 = *cell (fn, タグ付き)
@@ -1956,13 +1965,15 @@ static UINT64 za_ensure_trampoline(void) {
     jit_jmp_reg(ZA_REG_R11);
 
     jit_patch_rel32(jne_patch);
-    // fallback: os_apply_function(fn, evaluated_args, env)はrcx=fn,rdx=args,r8=envの
-    // 順。入ってきた時点でrcx=args,rdx=env,r8=fnなので3点をローテートする。
-    jit_mov_reg_reg(ZA_REG_R9, ZA_REG_RCX);
-    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R8);
+    // fallback: os_apply_via_cell(cell, evaluated_args, env)はrcx=cell,rdx=args,r8=env
+    // の順。この時点でrcx=args,rdx=env,r9=cell(冒頭で退避)なので、
+    // r8 <- rdx, rdx <- rcx, rcx <- r9 の順に詰め替える(この順ならrcxを潰す前に
+    // 読み終わっている)。os_apply_via_cellはcellの中身を読んでos_apply_functionへ
+    // 委譲するので、ここまでの分岐の意味は変わらない。
     jit_mov_reg_reg(ZA_REG_R8, ZA_REG_RDX);
-    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_R9);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_function);
+    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RCX);
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R9);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_via_cell);
     jit_jmp_reg(ZA_REG_R11);
 
     if (g_jit_overflow) {

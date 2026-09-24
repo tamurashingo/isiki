@@ -137,13 +137,21 @@
 (assert-equal '(1 0) (list (tf-dpass *tf-ec-len*) (tf-dfail *tf-ec-len*)))
 (assert-equal "" (tf-out *tf-ec-len*))
 
-;; **まだ signal しない経路**での陰性対照。未定義関数の呼び出しは EVAL-ERROR を
-;; 値として返す(eval.c、P4-3 の対象)。そこが signal に変わったらここが落ちる
+;; **P4-3 で未定義関数の呼び出しも signal に変わった**(<undefined-function>、
+;; spec:7261-7263)。ここも陰性対照から陽性対照へ書き換わった3例目
 (defglobal *tf-ec-undef*
   (tf-capture (lambda () (assert-error-class '<undefined-function> (tf-no-such-function-p4)))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ec-undef*) (tf-dfail *tf-ec-undef*)))
-(assert-equal (tf-ng-not-signaled-text '(tf-no-such-function-p4) 'eval-error '<undefined-function>)
-              (tf-out *tf-ec-undef*))
+(assert-equal '(1 0) (list (tf-dpass *tf-ec-undef*) (tf-dfail *tf-ec-undef*)))
+(assert-equal "" (tf-out *tf-ec-undef*))
+
+;; **まだ signal しない経路**での陰性対照。stream_lisp.c の入出力系は EVAL-ERROR を
+;; 値として返す(P4-4 の対象)。そこが signal に変わったらここが落ちる。
+;; 存在しないファイルの open-input-file がその1つ(stream_lisp.c)
+(defglobal *tf-ec-io*
+  (tf-capture (lambda () (assert-error-class '<stream-error> (open-input-file "/9p/tf-no-such-file-p44.txt")))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ec-io*) (tf-dfail *tf-ec-io*)))
+(assert-equal (tf-ng-not-signaled-text '(open-input-file "/9p/tf-no-such-file-p44.txt") 'eval-error '<stream-error>)
+              (tf-out *tf-ec-io*))
 
 ;;; ---------------------------------------------------------------------------
 ;;; assert-error との住み分け
@@ -158,6 +166,6 @@
 (assert-equal '(1 0) (list (tf-dpass *tf-ae-div*) (tf-dfail *tf-ae-div*)))
 
 ;; assert-error も EVAL-ERROR 返しは捕まえられない(signal されていないため)。
-;; まだ signal しない未定義関数呼び出しで確かめる
-(defglobal *tf-ae-undef* (tf-capture (lambda () (assert-error (tf-no-such-function-p4)))))
-(assert-equal '(0 1) (list (tf-dpass *tf-ae-undef*) (tf-dfail *tf-ae-undef*)))
+;; まだ signal しない入出力系で確かめる
+(defglobal *tf-ae-io* (tf-capture (lambda () (assert-error (open-input-file "/9p/tf-no-such-file-p44.txt")))))
+(assert-equal '(0 1) (list (tf-dpass *tf-ae-io*) (tf-dfail *tf-ae-io*)))
