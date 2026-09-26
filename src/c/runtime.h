@@ -1379,6 +1379,14 @@ lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val);
 lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env);
 
 /**
+ * [P5] os_get_variableと同じ探索を行い、**未束縛なら<unbound-variable>をsignalする。**
+ * ISLispの変数参照(eval.cのシンボル評価、za.cが生成するグローバル変数読み出し)が使う。
+ * process.c/interrupt.cのようにnilで「未束縛」を判定している内部の呼び出しは
+ * 従来どおりos_get_variableを使うこと。
+ */
+lisp_val_t os_get_variable_checked(lisp_val_t sym, lisp_val_t env);
+
+/**
  * envの変数slotにsymの値としてvalを設定する(既存なら破壊的に上書き、無ければ新規追加)。
  * @param sym 設定するsymbol
  * @param val 設定する値
@@ -1848,6 +1856,16 @@ lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_v
  * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
  */
 lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env);
+
+/**
+ * [P5] 未束縛の変数を<unbound-variable>としてsignalする(error-id. undefined-entity /
+ * unbound-variable。spec:899-902、クラスはspec:7255-7257)。
+ * nameとnamespace(=variable)のスロットを載せる(spec:7160-7163)。
+ * @param name_sym 未束縛だった変数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_unbound_variable(lisp_val_t name_sym, lisp_val_t env);
 
 /**
  * [P4-3] 変更できない束縛(defconstant)への代入を<program-error>としてsignalする
