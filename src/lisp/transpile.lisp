@@ -1526,18 +1526,22 @@
    1つのdefunを処理する間だけletで新しい束縛を張る")
 (defparameter *closure-temp-counter* 0)
 
-(defun emit-param-binding-stmt (c-var boxed-p)
+(defun emit-param-binding-stmt (c-var boxed-p &optional check-p)
   "step関数の先頭で、パラメータ1つをevaluated_argsから読み出しCローカル変数
    c-varへ束縛するC文を作る。boxed-pがnon-nilの場合(za.cの拡張4と同じ基準で
    setqされエスケープするlambdaに捕捉されるパラメータ)は、値そのものではなく
    (捨て値 . 実値)のconsをc-varへ束縛する。このconsが以後の全参照(このパラメータ
    自身への読み書きと、ネストしたlambdaが捕捉する際に共有するオブジェクト)で
-   共有される「box」そのものになる"
-  (if boxed-p
-      (format nil "lisp_val_t ~A = os_make_cons(nil, cc_car(evaluated_args)); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
-              c-var c-var)
-      (format nil "lisp_val_t ~A = cc_car(evaluated_args); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
-              c-var c-var)))
+   共有される「box」そのものになる。
+
+   [P6] CHECK-Pがnon-nilなら、読み出しの前に「実引数が尽きていないか」の検査を
+   前置する。**最後の固定パラメータにだけ付ける**(param-scope-and-preamble参照)"
+  (let ((guard (if check-p "if (evaluated_args == nil) { return os_tco_arity_error(); } " "")))
+    (if boxed-p
+        (format nil "~Alisp_val_t ~A = os_make_cons(nil, cc_car(evaluated_args)); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
+                guard c-var c-var)
+        (format nil "~Alisp_val_t ~A = cc_car(evaluated_args); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
+                guard c-var c-var))))
 
 ;;; M14 基盤B: &restパラメータ。list/append/create-list/apply/mapcar/map-into等が
 ;;; 使う。呼び出し側(transpile-call/transpile-tail-call)はパラメータの個数に
@@ -1600,10 +1604,29 @@
        (mapcar (lambda (p) (cons p (cons (param-symbol-to-c-name p) (and (member p boxed) t))))
                all-params)
        (append
-        (mapcar (lambda (p) (emit-param-binding-stmt (param-symbol-to-c-name p) (and (member p boxed) t)))
-                fixed-params)
+        ;; [P6] arity 検査は**2回だけ**で、仮引数の個数に比例しない。
+        ;; cc_car(nil) / cc_cdr(nil) がどちらも nil なので、途中で実引数が
+        ;; 尽きていれば最後の固定パラメータの時点でも必ず nil になっている。
+        ;; よって「足りない」は最後の1回で全部捕まえられる。
+        ;;   - 足りない: 最後の固定パラメータを読む直前(check-p)
+        ;;   - 多すぎ  : 全部読み終えたあとの残り(&rest があれば起きないので不要)
+        ;; **この検査は cons リストエントリ(__step)にしか乗らない。**
+        ;; 固定引数エントリ(__step_fixed)は引数をCの仮引数で受けるので
+        ;; arity は呼び出し側の fixed_argc 照合で既に保証されている
+        ;; (documents/unbound-arity-survey.md §3-3)。
+        (let ((n (length fixed-params))
+              (i 0))
+          (mapcar (lambda (p)
+                    (setq i (+ i 1))
+                    (emit-param-binding-stmt (param-symbol-to-c-name p)
+                                             (and (member p boxed) t)
+                                             (= i n)))
+                  fixed-params))
         (when rest-param
-          (list (emit-rest-param-binding-stmt (param-symbol-to-c-name rest-param) (and (member rest-param boxed) t)))))))))
+          (list (emit-rest-param-binding-stmt (param-symbol-to-c-name rest-param) (and (member rest-param boxed) t))))
+        ;; 固定パラメータが0個でもここは要る(引数を取らない関数に渡した場合)
+        (unless rest-param
+          (list "if (evaluated_args != nil) { return os_tco_arity_error(); }")))))))
 
 (defun emit-direct-preamble-stmts (params scope arg-c-names)
   "ABI-M6: PARAMS(&restを持たない固定パラメータのみ。呼び出し元がarityの
@@ -2262,6 +2285,10 @@
     (format out "typedef struct tco_result tco_result_t;~%")
     (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
     (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%    void *fixed_fn;~%    UINT64 fixed_argc;~%    lisp_val_t arg0;~%    lisp_val_t arg1;~%    lisp_val_t arg2;~%};~%~%")
+    ;; [P6] arity 不一致の cold 側。**noinline で out-of-line に固定する。**
+    ;; インライン展開されると tco_result_t のゼロ初期化(pxor+movups×4)が
+    ;; 検査地点ごとに展開され、生成コードが 4.93% 膨らんだ(3.65% まで下がる)。
+    (format out "static __attribute__((noinline)) __attribute__((unused)) tco_result_t os_tco_arity_error(void) {~%    return (tco_result_t){.is_tail_call = 0, .value = os_signal_arity_error(global_environment)};~%}~%~%")
     (dolist (p prototypes)
       (format out "~A~%" p))
     (format out "~%")
