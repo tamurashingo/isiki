@@ -7292,11 +7292,39 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a<bならg_sym_t、そうでなければnil
  */
+/* [P5] **2 引数版の比較 6 個は「安全側」に倒してある。**
+ *
+ * これらは za.c が (< a b) 等に対して直接呼ぶ入口(za.c の
+ * za_compile_call 付近を参照)なので、コンパイル済みループの 1 反復ごとに
+ * この検査が乗る。逆アセンブルで成功経路が **+5 命令**になることを確認している
+ * (変更前は分岐が無く cmov 1 個で済んでいた。内訳は cmp+jcc が約 2 と、
+ *  「どちらの引数が数値でなかったか」を報告するために a/b を
+ *  number_compare4 の call を跨いで生かすための退避が 4)。
+ *
+ * **それでも検査を入れる側へ倒した。** 黙って壊れた値を返すより遅いほうがよい
+ * (pitfalls 原則5)。仕様も無条件に signal を要求している(spec:4250-4251)。
+ *
+ * **安くする道は 2 本あり、どちらも別作業である。**
+ *
+ *   1. declaim の safety で入口を分ける。受け皿は既にある
+ *      (runtime.h の OPTIMIZE_SAFETY / za.c の g_za_declaim。
+ *       documents/declaim-design.md)。safety 0 のときだけ
+ *      「検査しない双子の入口」を呼ぶ形にすれば、cmov の 8 命令へ完全に戻せる。
+ *      **既定は検査する**(OPTIMIZE_DEFAULT は safety=1)。
+ *      既存の primitive_add2_fixnum 等が declare で入口を切り替えているのと同じ仕組み。
+ *   2. 両方 fixnum の比較をこの入口へインライン展開する。成功経路から
+ *      number_compare4 の call が消えるので上記の退避 4 命令も要らなくなり、
+ *      **現状より速くなる**(いまは fixnum どうしでも必ず call している)。
+ *      documents/type-system-survey.md の「< / > / = に fixnum インライン化が無い」と同じ項目。
+ *
+ * どちらも optimize 側の作業と重なるため、この PR では踏み込まない。
+ */
 lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
     if (num_lt(a, b)) {
         return g_sym_t;
     }
-    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない)。
+       安全側へ倒した判断と、安くする道は上のコメントを見ること */
     if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
         return compare_pair_domain_error(a, b);
     }
@@ -7335,7 +7363,8 @@ lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
     if (num_gt(a, b)) {
         return g_sym_t;
     }
-    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
     if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
         return compare_pair_domain_error(a, b);
     }
@@ -7374,7 +7403,8 @@ lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
     if (num_eq(a, b)) {
         return g_sym_t;
     }
-    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
     if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
         return compare_pair_domain_error(a, b);
     }
@@ -7468,7 +7498,8 @@ lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
     if (num_ge(a, b)) {
         return g_sym_t;
     }
-    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
     if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
         return compare_pair_domain_error(a, b);
     }
@@ -7507,7 +7538,8 @@ lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
     if (num_le(a, b)) {
         return g_sym_t;
     }
-    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない) */
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
     if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
         return compare_pair_domain_error(a, b);
     }
