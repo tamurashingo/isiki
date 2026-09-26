@@ -102,7 +102,37 @@
 (assert-error-class '<program-error> (funcall (function ar2-jit-two) 1))
 
 ;;; ---------------------------------------------------------------------------
-;;; 5. 正常系(変えていないこと)
+;;; 5. AOT 済み関数(事前コンパイル済み)
+;;; ---------------------------------------------------------------------------
+;;
+;; **AOT 済み関数も cons リストエントリに検査を持つ。** member / assoc / reverse は
+;; src/lisp/init_aot.lisp 由来で、トランスパイラが生成した C 関数になっている。
+;; ここも固定引数エントリは無検査で、個数が合わない呼び出しだけが
+;; cons エントリ(lisp_ll_xxx__step)へ落ちて検査に当たる。
+;;
+;; 入れる前は黙って通っていた(実機で確認した値):
+;;   (member 1)        => NIL
+;;   (member 1 '(1 2) 'extra) => (1 2)
+;;   (assoc 1)         => NIL
+;;   (reverse)         => NIL
+
+(assert-error-class '<program-error> (member 1))
+(assert-error-class '<program-error> (member 1 '(1 2) 'extra))
+(assert-error-class '<program-error> (assoc 1))
+(assert-error-class '<program-error> (reverse))
+(assert-error-class '<program-error> (reverse '(1 2) 'extra))
+
+;; 正しい個数なら従来どおり
+(assert-equal '(1 2) (member 1 '(1 2)))
+(assert-equal nil (member 9 '(1 2)))
+(assert-equal '(1 . 2) (assoc 1 '((1 . 2))))
+(assert-equal '(3 2 1) (reverse '(1 2 3)))
+
+;; &rest を持つ AOT 関数(apply)は「足りない」だけが起きる
+(assert-error-class '<program-error> (apply))
+
+;;; ---------------------------------------------------------------------------
+;;; 6. 正常系(変えていないこと)
 ;;; ---------------------------------------------------------------------------
 
 (assert-equal '(1 2) (ar2-two 1 2))
