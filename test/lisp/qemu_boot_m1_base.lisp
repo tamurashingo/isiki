@@ -20,6 +20,8 @@
 (load "test/lisp/io_signal_test.lisp")
 ;; [P5] 算術の型違い / 未束縛変数(正常系のコストがゼロの検出)
 (load "test/lisp/type_unbound_test.lisp")
+;; [P6] arity 不一致(固定引数エントリは無検査、cons エントリで検出)
+(load "test/lisp/arity_signal_test.lisp")
 (load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例(#nA 等)は別ファイル。load の戻り値(成功なら t)で構文エラーによる
 ;; 中断を検出する(qemu_boot_test.lisp と同じ。assert-equal の中に load を直接書かない)
