@@ -765,6 +765,17 @@ raw どうしを add → 和が 2^60 を超えると bit63 へ桁上がりする
 
 ### 9-5 宣言が嘘だったときの挙動
 
+> **[2026-09-29 追記] この「例外機構が無い」という見送り理由はもう成り立たない。**
+> `feature/error-unwind` の P0〜P6 で、コンディションを signal してトップレベル
+> または最も近い `with-handler` まで脱出する機構を作った
+> (`documents/error-unwind-survey.md` と `documents/islisp-implementation-defined.md`)。
+> `safety` を入れる前提は揃っている。
+>
+> なお下の「**`(optimize (safety 3))` のときだけガードを残す**」という案は、
+> **既定値と噛み合っていない。** `OPTIMIZE_DEFAULT` は `speed`/`safety`/`space` すべて 1
+> (`src/c/runtime.h`)なので、safety 3 だけ残す形にすると**既定で検査が消える**。
+> 既定で検査する方針なら閾値は「**`safety == 0` のときだけ外す**」になる。
+
 Phase 3 で `safety` を見送った理由(例外機構が無い)はここにも効く。
 現在の JIT は `(car 1)` のような型エラーを `os_car_checked` 経由で
 `signal_domain_error_for_class` に落としているので**機構自体はある**が、

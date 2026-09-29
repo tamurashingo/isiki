@@ -733,6 +733,10 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
 # (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする。
 #
+# [P0〜P6] test-qemu-error-escape-gcはGC_DEBUGビルドでエラー脱出を流し、
+# g_gc_lifo_violations == 0 を確認する。通常ビルドではこのカウンタが存在しないため
+# test-qemuには含められず、ここで別ビルドとして回す。
+#
 # [P4] qemu_boot_no_init_signal.lispは**init.lispを読まない**唯一のboot-entryで、
 # 条件クラスが1つも無い状態でsignalしても戻ってくることを見る。他のmilestoneは
 # すべて先頭で(load "src/lisp/init.lisp")するため、この状態はここでしか通らない。
@@ -744,6 +748,7 @@ test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_no_init_signal.lisp
+	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat_callback_transfer.lisp QEMU_DISK_IMG=tmp/fat16_test.img
@@ -870,6 +875,16 @@ AUDIT_TIMEOUT ?= 1800
 # 生成コードを直接見るテストとして常時回す
 test-inline-expansion: $(LISP_COMPILED)
 	tools/bench/check_inline_expansion.sh
+
+# [P0〜P6 の回帰] エラー脱出を GC_DEBUG ビルドで流し、shadow stack の LIFO 規律が
+# 破れていないこと(g_gc_lifo_violations == 0)を確認する。
+#
+# **フェーズごとに手で確認していただけだと、将来の変更で静かに破れる。**
+# g_gc_lifo_violations は GC_DEBUG ビルドにしか無いカウンタで、破れても
+# エラーにならず数が増えるだけ(pitfalls 原則6)なので、常設のテストで見張る。
+# GC_DEBUG は通常ビルドと別のビルドスタンプになるため、test-qemu とは別ターゲットにする。
+test-qemu-error-escape-gc:
+	$(MAKE) GC_DEBUG=1 test-qemu-milestone MILESTONE=test/lisp/qemu_boot_error_escape_gc.lisp
 
 test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
