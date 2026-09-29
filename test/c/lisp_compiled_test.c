@@ -263,6 +263,12 @@ extern lisp_val_t lisp_ll_mapcan(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_mapcon(lisp_val_t evaluated_args, lisp_val_t env);
 extern lisp_val_t lisp_ll_map_into(lisp_val_t evaluated_args, lisp_val_t env);
 
+// [P6] 引数を取らないAOT関数の呼び出しは evaluated_args に **nil** を渡す。
+// 以前は 0 を渡していたが、0 は空リストではない(nilはg_nil_cellへのTAG_CONS付き
+// ポインタ)。0引数の関数は evaluated_args を触らないので偶然通っていただけで、
+// arity 検査(「残りが nil でなければ引数が多すぎ」)を入れると全部落ちる。
+// カーネル本体は 0 を渡している箇所が1つも無い(os_apply_function経由で必ずnil)。
+//
 // os_make_string/os_make_symbolはヒープ確保とnilの初期化が前提なので、
 // それらを呼ぶ生成物のテストの前にheap_initとbootを済ませておく
 #define HEAP_SIZE (1024 * 1024)
@@ -276,13 +282,13 @@ static void setup_heap(void) {
 }
 
 static void test_transpile_fixture_answer(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_answer(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_answer(nil, 0);
     assert((result & TAG_MASK) == TAG_FIXNUM, "transpiled function returns a fixnum");
     assert((result >> FIXNUM_VALUE_SHIFT) == 42, "transpiled function returns 42");
 }
 
 static void test_transpile_fixture_string(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_string(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_string(nil, 0);
     assert((result & TAG_MASK) == TAG_STRING, "transpiled function returns a string");
 
     lisp_addr_t addr = result & ~TAG_MASK;
@@ -293,23 +299,23 @@ static void test_transpile_fixture_string(void) {
 }
 
 static void test_transpile_fixture_symbol(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_symbol(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_symbol(nil, 0);
     assert((result & TAG_MASK) == TAG_SYMBOL, "transpiled function returns a symbol");
     assert(result == os_make_symbol("FOO"), "transpiled symbol is interned as FOO");
 }
 
 static void test_transpile_fixture_nil(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_nil(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_nil(nil, 0);
     assert(result == nil, "transpiled function returns nil");
 }
 
 static void test_transpile_fixture_t(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_t(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_t(nil, 0);
     assert(result == g_sym_t, "transpiled function returns the T symbol");
 }
 
 static void test_transpile_fixture_quoted_fixnum(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_quoted_fixnum(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_quoted_fixnum(nil, 0);
     assert((result & TAG_MASK) == TAG_FIXNUM, "quoted fixnum is still a fixnum");
     assert((result >> FIXNUM_VALUE_SHIFT) == 99, "quoted fixnum keeps its value");
 }
@@ -366,7 +372,7 @@ static void test_transpile_fixture_and(void) {
 }
 
 static void test_transpile_fixture_and_empty(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_and_empty(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_and_empty(nil, 0);
     assert(result == g_sym_t, "and(引数無し): tを返す");
 }
 
@@ -390,7 +396,7 @@ static void test_transpile_fixture_or(void) {
 }
 
 static void test_transpile_fixture_or_empty(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_or_empty(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_or_empty(nil, 0);
     assert(result == nil, "or(引数無し): nilを返す");
 }
 
@@ -682,7 +688,7 @@ static void test_transpile_fixture_unwind_protect_normal(void) {
 }
 
 static void test_transpile_fixture_unwind_protect_non_local_exit(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_unwind_protect_non_local_exit(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_unwind_protect_non_local_exit(nil, 0);
     lisp_val_t exit_value = cc_car(result);
     lisp_val_t count = cc_cdr(result);
     assert(exit_value == os_make_fixnum(42),
@@ -692,19 +698,19 @@ static void test_transpile_fixture_unwind_protect_non_local_exit(void) {
 }
 
 static void test_transpile_fixture_unwind_protect_cleanup_exit_ignored(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_unwind_protect_cleanup_exit_ignored(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_unwind_protect_cleanup_exit_ignored(nil, 0);
     assert(result == os_make_fixnum(7),
            "unwind-protect: cleanup-form自身のreturn-fromは無視され、protected-formの結果(7)が式全体の値になる");
 }
 
 static void test_transpile_fixture_with_open_input_stream(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_stream(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_stream(nil, 0);
     assert(result == nil,
            "with-open-input-stream: body正常終了後、unwind-protect経由でstreamが必ずcloseされる(open-stream-pがnil)");
 }
 
 static void test_transpile_fixture_with_open_input_stream_early_exit(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_stream_early_exit(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_stream_early_exit(nil, 0);
     lisp_val_t exit_value = cc_car(result);
     lisp_val_t still_open = cc_cdr(result);
     assert(exit_value == os_make_fixnum(42),
@@ -714,13 +720,13 @@ static void test_transpile_fixture_with_open_input_stream_early_exit(void) {
 }
 
 static void test_transpile_fixture_with_open_input_file(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_file(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_input_file(nil, 0);
     assert(result == nil,
            "with-open-input-file: with-open-input-stream経由でも同様にcloseが保証される(open-stream-pがnil)");
 }
 
 static void test_transpile_fixture_with_open_output_stream_early_exit(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_with_open_output_stream_early_exit(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_output_stream_early_exit(nil, 0);
     lisp_val_t exit_value = cc_car(result);
     lisp_val_t still_open = cc_cdr(result);
     assert(exit_value == os_make_fixnum(42),
@@ -730,25 +736,25 @@ static void test_transpile_fixture_with_open_output_stream_early_exit(void) {
 }
 
 static void test_transpile_fixture_with_open_output_file(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_with_open_output_file(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_with_open_output_file(nil, 0);
     assert(result == nil,
            "with-open-output-file: open-output-fileで開いたstreamもwith-open-output-stream経由でcloseが保証される(open-stream-pがnil)");
 }
 
 static void test_transpile_fixture_catch_throw_basic(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_catch_throw_basic(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_throw_basic(nil, 0);
     assert(result == os_make_fixnum(42),
            "catch/throw: throwされた値(42)がcatch式全体の値になる");
 }
 
 static void test_transpile_fixture_catch_no_throw(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_catch_no_throw(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_no_throw(nil, 0);
     assert(result == os_make_fixnum(3),
            "catch: throwが起きない場合はprognと同じくbody最後のformの値を返す");
 }
 
 static void test_transpile_fixture_catch_mismatched_tag(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_catch_mismatched_tag(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_mismatched_tag(nil, 0);
     assert(result == os_make_fixnum(99),
            "catch/throw: タグが一致しない内側のcatchは素通りし、一致する外側のcatchで捕捉される");
 }
@@ -763,7 +769,7 @@ static void test_transpile_fixture_catch_throw_runtime_tag(void) {
 }
 
 static void test_transpile_fixture_catch_with_cleanup(void) {
-    lisp_val_t result = lisp_ll_transpile_fixture_catch_with_cleanup(0, 0);
+    lisp_val_t result = lisp_ll_transpile_fixture_catch_with_cleanup(nil, 0);
     lisp_val_t exit_value = cc_car(result);
     lisp_val_t count = cc_cdr(result);
     assert(exit_value == os_make_fixnum(7),

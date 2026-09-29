@@ -4831,6 +4831,29 @@ lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env) {
 }
 
 /**
+ * [P6] arity 不一致(仮引数の個数と実引数の個数が合わない)を signal する。
+ *
+ * spec:896-898(§9.2 (2))「an error shall be signaled if a function is activated
+ * with a number of arguments which is different than the number of parameters as
+ * required in the function definition (error-id. arity-error)」、
+ * spec:1549-1550(lambda)も同じことを定めている。
+ * §29.4 の対応表(spec:7191-7194)がそのクラスを **<program-error>** と定める。
+ *
+ * **<program-error> はスロットを持たないので、期待した個数と実際の個数は
+ * condition に載せられない。** 専用クラスは仕様のクラス階層(spec:994-1010)に無く、
+ * 仕様に無いクラスを増やさない方針(P4-2 の index-out-of-range と同じ)で通している。
+ *
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_arity_error(lisp_val_t env) {
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol("<PROGRAM-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, nil, env);
+}
+
+/**
  * [P5] 未束縛の変数を <unbound-variable> として signal する。
  *
  * 仕様は「識別子が表す実体が存在しなければ error を signal する

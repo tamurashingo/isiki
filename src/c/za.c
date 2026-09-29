@@ -6543,6 +6543,26 @@ lisp_val_t cc_diag_jit_used(lisp_val_t args, lisp_val_t env) {
     「何度も呼ばれている」かを切り分けるため、タイマーサンプラから読む */
 UINT64 g_za_compile_calls = 0;
 
+/* [P6] エピローグ(gc_rootsの巻き戻し・退避レジスタの復元・ret)を出す。
+   通常の出口と、arity エラー側の出口の2箇所で使う。
+   **arity エラー側はここへ jmp で戻らず写す。** jmp で戻すと関数の最後の命令が
+   jmp になり、「コードブロックの末尾は ret」という不変条件
+   (test/lisp/disassemble_test.lisp)が崩れるため。
+   za_gc_unlinkの呼び出し自体がrcxを使うため、本体の結果(rax)は先にr13へ退避してから
+   呼び、戻ってから復元する。 */
+static void za_emit_epilogue(void) {
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
+    jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+    jit_pop_r13();
+    jit_pop_rbx();
+    jit_ret();
+}
+
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
                                 lisp_val_t capture_env, lisp_val_t owner_env,
                                 UINT64 optimize, os_decl_types_t declared_types) {
@@ -6737,11 +6757,36 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     za_emit_gc_link_slot(ZA_OFF_ENV_VAL, ZA_OFF_ENV_NODE);
     za_emit_gc_link_slot(ZA_OFF_ARGS_VAL, ZA_OFF_ARGS_NODE);
 
+    /* [P6] arity 検査(consリストエントリだけに置く)。
+     *
+     * **固定引数エントリには置かない。** 呼び出し側が meta->arity と argc を
+     * 照合してから入る入口なので、合わない呼び出しは必ずこちらへ落ちてくる
+     * (za_compile_call の高速path判定を参照)。したがって速い経路には1命令も増えない。
+     *
+     * 検査は**2回だけ**で、仮引数の個数に比例しない。cc_car(nil)/cc_cdr(nil) が
+     * どちらも nil なので、途中で実引数が尽きていれば最後の仮引数の時点でも
+     * 必ず nil になっている(documents/unbound-arity-survey.md §5)。
+     *   - 足りない: 最後の固定引数を読む直前に ARGS_VAL が nil かどうか
+     *   - 多すぎ  : 全部読み終えたあとの残りが nil でないかどうか(&rest があれば不要)
+     *
+     * エラー側の機械語は**エピローグの後ろ**(retの先)へ置き、そこからエピローグへ
+     * jmpで戻る。本体の通常経路には jmp すら増えない。 */
+    UINT64 arity_patches[2];
+    UINT64 arity_patch_count = 0;
+    lisp_val_t arity_rest_sym;
+    int has_rest = za_rest_param_symbol(params, fixed_count, &arity_rest_sym) != 0;
+
     if (use_param_slots) {
         // ABI-M5: consリストエントリポイント側も、都度cc_car/cc_cdrで辿る代わりに
         // 一度だけARGS_VALをfixed_count回分だけ展開してza_param_val_off(i)へ
         // 書き込む(za_emit_operandがis_literal==0参照でここを直接読むようになる)。
         for (UINT64 i = 0; i < fixed_count; i++) {
+            if (i + 1 == fixed_count) {
+                /* [P6] 最後の固定引数の直前。ここが nil なら実引数が足りない */
+                za_load_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
+                za_emit_cmp_rax_nil();
+                arity_patches[arity_patch_count++] = jit_emit_je_rel32_placeholder();
+            }
             za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
             jit_movabs_r11((UINT64)(void *)cc_car);
             jit_call_r11();
@@ -6752,7 +6797,42 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
             jit_call_r11();
             za_store_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
         }
+        /* [P6] 残りが nil でなければ実引数が多すぎる。use_param_slots は
+           &rest なしが条件(上の判定参照)なので、無条件に検査してよい。
+           **jmp_to_body のパッチより前に置く**ので固定引数エントリは通らない */
+        za_load_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
+        za_emit_cmp_rax_nil();
+        arity_patches[arity_patch_count++] = jit_emit_jne_rel32_placeholder();
         jit_patch_rel32(jmp_to_body_patch);
+    } else {
+        /* [P6] パラメータスロットを使わない関数(&rest つき / 引数が
+           ZA_MAX_FIXED_ENTRY_PARAMS より多い / lambda・flet・labels を含む)。
+           **こちらには固定引数エントリが無い**ので、全ての呼び出しがここを通る。
+           展開ループが無いため、最後の固定引数のセルまで自分で cdr を辿る。
+           cc_cdr の回数は固定引数1個を参照するのと同じ(この経路は元から
+           参照ごとに辿っている)。 */
+        if (fixed_count > 0) {
+            za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
+            for (UINT64 i = 0; i + 1 < fixed_count; i++) {
+                jit_movabs_r11((UINT64)(void *)cc_cdr);
+                jit_call_r11();
+                jit_mov_rcx_rax();
+            }
+            jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_RCX);
+            za_emit_cmp_rax_nil();
+            arity_patches[arity_patch_count++] = jit_emit_je_rel32_placeholder();
+            if (!has_rest) {
+                jit_movabs_r11((UINT64)(void *)cc_cdr);
+                jit_call_r11();
+                za_emit_cmp_rax_nil();
+                arity_patches[arity_patch_count++] = jit_emit_jne_rel32_placeholder();
+            }
+        } else if (!has_rest) {
+            /* 引数を取らない関数。渡されていたら多すぎ */
+            za_load_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
+            za_emit_cmp_rax_nil();
+            arity_patches[arity_patch_count++] = jit_emit_jne_rel32_placeholder();
+        }
     }
 
     if (!za_compile_expr(form, params, fixed_count, 0, &syms, capture_env, 1, trampoline_offset, 0, 0, 0, 0)) {
@@ -6768,16 +6848,28 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     // エピローグ(末尾呼び出しでトランポリンへjmpせずここへ流れ落ちた場合のみ通る経路)。
     // za_gc_unlinkの呼び出し自体がrcxを使うため、本体の結果(rax)は先にr13へ退避してから
     // 呼び、戻ってから復元する。
-    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
-    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
-    jit_call_r11();
-    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
-    za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
-        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
-    jit_pop_r13();
-    jit_pop_rbx();
-    jit_ret();
+    za_emit_epilogue();
+
+    /* [P6] arity エラー側。**retの後ろ**に置くので、本体の通常経路には
+       1命令も増えない(条件分岐の not-taken 側を通るだけ)。
+       rax に signal の戻り値を入れてから**エピローグを写す**。
+       エピローグへ jmp で戻る形にすると関数の最後の命令が jmp になり、
+       「コードブロックの末尾は ret」という不変条件
+       (test/lisp/disassemble_test.lisp)が崩れるため、写す側を選んだ。
+       写しても実行されるのは arity が合わなかった呼び出しのときだけで、
+       増えるのは静的なサイズだけである。
+       エピローグの za_gc_unlink(ENV_SAVED_HEAD) が、ここまでにリンクした
+       env/args/パラメータスロットをまとめて外す。 */
+    if (arity_patch_count > 0) {
+        for (UINT64 i = 0; i < arity_patch_count; i++) {
+            jit_patch_rel32(arity_patches[i]);
+        }
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&global_environment);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RCX, ZA_REG_R11, 0);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_signal_arity_error);
+        jit_call_r11();
+        za_emit_epilogue();
+    }
 
     // setqとエスケープするlambdaが同一let-local変数に対して両方起きるケースは、
     // 変数単位のcell昇格(ZA_VAR_BOXED、za_analyze_var_usage/za_compile_let参照)で

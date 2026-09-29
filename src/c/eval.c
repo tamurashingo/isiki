@@ -93,7 +93,11 @@ static lisp_val_t make_interpreted_function(lisp_val_t params, lisp_val_t body, 
  * @param evaluated_args 評価済みの実引数リスト
  * @param call_env 束縛先の環境
  */
-static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t call_env) {
+/* [P6] 戻り値は 0 = 正常、1 = arity 不一致。
+   **out パラメータにしないのは計測の結果である。** ポインタで返す形にすると
+   それを保持するために callee-saved レジスタが1本増え、push/pop が 4 命令乗った
+   (bind_params 101 -> 108)。戻り値なら rax で返るだけで済む。 */
+static int bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t call_env) {
     lisp_val_t p = params;
     lisp_val_t a = evaluated_args;
     // os_set_variableはcall_envへの新規束縛時にos_make_consで確保を行いGCを誘発しうる。
@@ -108,13 +112,23 @@ static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t
         if (param == g_sym_rest) {
             lisp_val_t rest_param = cc_car(cc_cdr(p));
             os_set_variable(rest_param, a, call_env);
-            return;
+            return 0;
         }
-        lisp_val_t val = (a != nil) ? cc_car(a) : nil;
-        os_set_variable(param, val, call_env);
+        /* [P6] 実引数が足りない。**正常系に命令は増えない**(元から
+           `(a != nil) ? ... : nil` で a を見ていたので、nil 側の枝を
+           「nil を束縛する」から「arity error にする」へ差し替えただけ。
+           むしろ下の cc_cdr から三項演算子が1つ消えている)。
+           spec:896-898 / spec:1549-1550 */
+        if (a == nil) {
+            return 1;
+        }
+        os_set_variable(param, cc_car(a), call_env);
         p = cc_cdr(p);
-        a = (a != nil) ? cc_cdr(a) : nil;
+        a = cc_cdr(a);
     }
+    /* [P6] 実引数が多い。**ループを抜けたあとの1回だけ**なので、
+       仮引数の個数に比例しない */
+    return (a != nil) ? 1 : 0;
 }
 
 /**
@@ -167,7 +181,11 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         // ここ(呼び出し元)のcall_envローカルは別のスタックスロットなので追随しない。
         // bind_params完了後もcall_envをeval_prognに渡すため、ここでも保護する
         GC_PROTECT(call_env);
-        bind_params(params, evaluated_args, call_env);
+        if (bind_params(params, evaluated_args, call_env)) {
+            /* [P6] **signal には global_environment を渡す**(P4-2 以降と同じ理由)。
+               call_env はここで捨てる束縛用の frame なので渡す意味も無い */
+            return os_signal_arity_error(global_environment);
+        }
         return eval_progn(body, call_env);
     }
     // TAG_INSTANCEではあるが関数オブジェクトではない(vectorやILOSインスタンス等)
@@ -749,7 +767,11 @@ static lisp_val_t apply_macro(lisp_val_t macro, lisp_val_t args) {
     GC_PROTECT(body);
     lisp_val_t call_env = os_make_frame(os_make_symbol("MACRO-ENV"), closure_env);
     GC_PROTECT(call_env);
-    bind_params(params, args, call_env);
+    /* [P6] **マクロ展開の arity はここでは signal しない。** 展開は評価より前の
+       段階で、ここで signal するとマクロを含むフォームの評価が「展開中の
+       エラー」で止まることになる。行き先の設計が評価中の arity error とは
+       別なので、documents/unbound-arity-survey.md §7 のとおり別途の判断とする */
+    (void)bind_params(params, args, call_env);
     return eval_progn(body, call_env);
 }
 

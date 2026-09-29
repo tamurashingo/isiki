@@ -1868,6 +1868,15 @@ lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env);
 lisp_val_t os_signal_unbound_variable(lisp_val_t name_sym, lisp_val_t env);
 
 /**
+ * [P6] arity 不一致を<program-error>としてsignalする(error-id. arity-error。
+ * spec:896-898 / spec:1549-1550、クラスはspec:7191-7194)。
+ * eval.cのbind_paramsと、za.cが生成するconsリストエントリのプロローグから呼ぶ。
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_arity_error(lisp_val_t env);
+
+/**
  * [P4-3] 変更できない束縛(defconstant)への代入を<program-error>としてsignalする
  * (error-id. immutable-binding。spec:435-437、クラスはspec:7239-7241)。
  * eval.c(eval_setq)とruntime.c(os_setq_variable_checked。za.cのJIT生成コードが呼ぶ)から使う。
