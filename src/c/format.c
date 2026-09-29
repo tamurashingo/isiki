@@ -4,6 +4,13 @@
 #include "stream.h"
 #include "stream_lisp.h"
 #include "print.h"
+#include "eval.h"
+
+/* [P1] FAT系ストリームへの書き込みは、バッファが満杯になるとwrite-from!を
+   Lispへ呼び戻す(stream.cのflush_write_buf_fat)。そこで非局所脱出が起きると
+   制御転送値がstream->pending_transferへ預けられるので、**Lispへ戻るcc_*は
+   os_stream_take_transferで必ず拾うこと**
+   (documents/error-unwind-survey.md §F-6、stream.hのpending_transfer参照)。 */
 
 /** STRINGオブジェクトのレイアウト([len(8byte)][chars...])からデータ先頭とバイト数を取り出す */
 static void format_string_bytes(lisp_val_t str, const UINT8 **out_data, UINT32 *out_len) {
@@ -64,26 +71,42 @@ static void format_float_write(os_char_sink_t *sink, lisp_val_t obj) {
 
 lisp_val_t cc_format_char(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_t *raw = os_stream_from_lisp(cc_car(args));
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
     lisp_val_t ch = cc_car(cc_cdr(args));
-    os_stream_write_char(raw, (char)(ch >> CHAR_VALUE_SHIFT));
+    os_stream_write_char(os_stream_from_lisp(stream), (char)(ch >> CHAR_VALUE_SHIFT));
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return nil;
 }
 
 lisp_val_t cc_format_float(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_t *raw = os_stream_from_lisp(cc_car(args));
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
     lisp_val_t obj = cc_car(cc_cdr(args));
-    os_char_sink_t sink = make_stream_sink(raw);
+    os_char_sink_t sink = make_stream_sink(os_stream_from_lisp(stream));
     format_float_write(&sink, obj);
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return nil;
 }
 
 lisp_val_t cc_format_fresh_line(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_t *raw = os_stream_from_lisp(cc_car(args));
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
+    os_stream_t *raw = os_stream_from_lisp(stream);
     if (raw->column != 0) {
         os_stream_write_char(raw, '\n');
+    }
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
     }
     return nil;
 }
@@ -101,29 +124,48 @@ lisp_val_t cc_format_integer(lisp_val_t args, lisp_val_t env) {
 
 lisp_val_t cc_format_object(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_t *raw = os_stream_from_lisp(cc_car(args));
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
     lisp_val_t obj = cc_car(cc_cdr(args));
     lisp_val_t escape_p = cc_car(cc_cdr(cc_cdr(args)));
-    os_char_sink_t sink = make_stream_sink(raw);
+    os_char_sink_t sink = make_stream_sink(os_stream_from_lisp(stream));
     os_print_to_sink(obj, &sink, escape_p != nil);
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return nil;
 }
 
 lisp_val_t cc_format_tab(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_t *raw = os_stream_from_lisp(cc_car(args));
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
+    os_stream_t *raw = os_stream_from_lisp(stream);
     UINT32 target = (UINT32)os_fixnum_magnitude(cc_car(cc_cdr(args)));
     UINT32 current = raw->column;
     UINT32 spaces = (target > current) ? (target - current) : 1;
     for (UINT32 i = 0; i < spaces; i++) {
         os_stream_write_char(raw, ' ');
     }
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
+    }
     return nil;
 }
 
+/* [既知の未修正バグ] cc_formatは、書き込みがアロケーションを伴うストリーム
+   (= FAT系。flush時にwrite-from!をLispへ呼び戻す)に対してGC安全ではない。
+   rawもdata(fmt_strの生データ先頭)もobjsも、書き込みを跨いでGCが走ると
+   古くなる。画面/文字列ストリームは書き込みでアロケーションしないため
+   顕在化してこなかった。**P1の範囲外**(制御転送の検査だけを入れる)。
+   詳細と修正案は本フェーズのPR本文を参照。 */
 lisp_val_t cc_format(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    os_stream_t *raw = os_stream_from_lisp(cc_car(args));
+    lisp_val_t stream = cc_car(args);
+    GC_PROTECT(stream);
+    os_stream_t *raw = os_stream_from_lisp(stream);
     lisp_val_t fmt_str = cc_car(cc_cdr(args));
     lisp_val_t objs = cc_cdr(cc_cdr(args));
 
@@ -237,6 +279,10 @@ lisp_val_t cc_format(lisp_val_t args, lisp_val_t env) {
                 // 仕様に無い未知の指示子は無視する(既存コードの簡略化方針に合わせる)
                 break;
         }
+    }
+    lisp_val_t transfer = os_stream_take_transfer(stream);
+    if (transfer != nil) {
+        return transfer;
     }
     return nil;
 }

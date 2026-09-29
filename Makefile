@@ -133,7 +133,7 @@ TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
 TEST_BIN_STREAM = $(BUILD_TMPDIR)/stream_test
 
-TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
+TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/print.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
 TEST_BIN_LOAD = $(BUILD_TMPDIR)/load_test
 
 TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(TESTDIR)/stream_lisp_test.c
@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget
 
 all: build
 
@@ -196,7 +196,7 @@ image:
 # BOOT_FAT32_IMGが常に再ビルドされてしまっていた)。
 $(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
-		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main-or-die)" --quit'
 
 # (main)は$(LISP_COMPILED)と$(LISP_COMPILED_FIXTURE)を1回の実行で両方生成するが、
 # 独立したルールにしているため、両方が古い状態から`make test`のように両方を
@@ -206,7 +206,7 @@ $(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 # 互換性を優先しここでは使わない
 $(LISP_COMPILED_FIXTURE): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
-		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main-or-die)" --quit'
 
 transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 
@@ -279,8 +279,16 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
 		-o $@ $<
 
+# EVAL-ERROR を「値として返す」箇所の残数を予算と突き合わせる(計器)。
+# 上限を超えても下回っても落ちる ratchet。詳しくは tools/check_eval_error_budget.py
+# と documents/error-unwind-survey.md §A-4 / §7-5。
+# **潰し漏れは静かに残る**(戻り値の形が変わるだけでテストの無い経路は誰も気づかない)ので、
+# 減らす作業を始める前に数える仕掛けを置く
+check-eval-error-budget:
+	@python3 tools/check_eval_error_budget.py
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-eval-error-budget $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
@@ -723,12 +731,22 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # 順に実行してまとめて検証する(いずれかが失敗すればmakeはそこで停止する)。
 # fat16_test.lispはディスク上にファイルを作成・書き込みする破壊的なテストのため、
 # 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
-# (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする
+# (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする。
+#
+# [P4] qemu_boot_no_init_signal.lispは**init.lispを読まない**唯一のboot-entryで、
+# 条件クラスが1つも無い状態でsignalしても戻ってくることを見る。他のmilestoneは
+# すべて先頭で(load "src/lisp/init.lisp")するため、この状態はここでしか通らない。
+#
+# [P1] qemu_boot_fat_callback_transfer.lispは**必ずqemu_boot_m6_fat16.lispより後**に
+# 置くこと。FAT16イメージのルートへP1BASE.TXT等を作るので、先に走らせると
+# fat16_test.lispのルートディレクトリ一覧のアサーションが落ちる
 test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_no_init_signal.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat_callback_transfer.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img

@@ -590,10 +590,17 @@
                        0)))
       (block %%fixture-error-result
         (progn
+          ;; [P3] *handlers*の要素は (handler-function . 脱出タグ) のペア
+          ;; (init.lispのwith-handler / init_aot.lispのsignal-condition 参照)。
+          ;; ここは with-handler マクロを使わず直接積むので、形も自分で合わせる。
+          ;; このハンドラは return-from で脱出するのでタグは実際には使われないが、
+          ;; **形を合わせないと signal-condition の (car entry) が cons でない値に
+          ;; 当たって domain-error になる**
           (%%set-dynamic '*handlers*
-            (cons (lambda (c)
-                    (return-from %%fixture-error-result
-                      (cons (slot-value c 'format-string) (slot-value c 'format-arguments))))
+            (cons (cons (lambda (c)
+                          (return-from %%fixture-error-result
+                            (cons (slot-value c 'format-string) (slot-value c 'format-arguments))))
+                        (gensym))
                   nil))
           (error format-string format-argument))))))
 
@@ -640,8 +647,11 @@
           (%fill-slots (%%instance-slots instance)
                        (%slot-initial-values (%%class-slots (%%instance-class instance)) initargs)
                        0)))
+      ;; [P3] 要素は (handler-function . 脱出タグ) のペア。continuable が真
+      ;; (format した文字列)なので signal-condition はハンドラの戻り値を
+      ;; そのまま返し、脱出タグは使われない
       (%%set-dynamic '*handlers*
-        (cons (lambda (c) (cons 'handled (slot-value c 'format-string))) nil))
+        (cons (cons (lambda (c) (cons 'handled (slot-value c 'format-string))) (gensym)) nil))
       (cerror continue-string error-string obj))))
 
 ;; M15回帰テスト: 負の整数リテラル(例: (ash n -8)の-8)は、transpile-exprが

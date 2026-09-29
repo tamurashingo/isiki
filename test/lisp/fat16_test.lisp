@@ -513,7 +513,9 @@
 (defglobal fat16-test-rfitv-readback (read-file-into-vector "/mnt/RFITV.BIN"))
 (assert-equal t (if fat16-test-rfitv-readback t nil))
 (assert-equal fat16-test-rfitv-vec fat16-test-rfitv-readback)
-(assert-equal nil (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
+;; [P4-4] open-input-stream が開けないと <simple-error> を signal するようになり、
+;; read-file-into-vector はそれを握り潰さずそのまま通す(nil 返しではなくなった)
+(assert-error-class '<simple-error> (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
 
 ;;; --- [ファイルI/O]#51(M8): cat ---
 

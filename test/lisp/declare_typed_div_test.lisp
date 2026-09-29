@@ -96,15 +96,22 @@
 (assert-equal 1 (quotient 1 (+ (div-fixnum 0 -5) 1)))
 
 ;;; --- 6-3. ゼロ除算 ---
-;; 整数: EVAL-ERROR を**値として**返す(condition は signal しない)。
-;; <division-by-zero> を出すのは quotient 側の責務
-(assert-equal 'eval-error (/ 1 0))
-(assert-equal 'eval-error (/ -1 0))
-(assert-equal 'eval-error (div-generic 1 0))
-;; **宣言ありでも止まらないこと。** ここが止まればゼロ検査が入っていない
-(assert-equal 'eval-error (div-fixnum 1 0))
-(assert-equal 'eval-error (div-fixnum -1 0))
-(assert-equal 'eval-error (div-fixnum 0 0))
+;; [P4-1] 整数のゼロ除算は <division-by-zero> を signal するようになった。
+;; 以前は EVAL-ERROR を**値として**返しており、<division-by-zero> を出すのは
+;; quotient 側だけの責務だった。**/ は ISLisp 仕様に無い実装独自の名前**なので
+;; error-id の指定は無いが、同じ演算である quotient(spec:4365)と div(spec:4889)に
+;; 揃えた(documents/error-unwind-survey.md §A-4)。
+;;
+;; **宣言あり/なし・特化の有無で挙動が変わらないことが要点。** 型宣言つきの
+;; 高速路(div-fixnum)も、汎用路と同じく signal しなければならない
+;; (特化版 primitive_divide2_fixnum は 0 のとき n 項版 primitive_divide へ
+;;  委譲しているので、経路は 1 つに合流する)
+(assert-error-class '<division-by-zero> (/ 1 0))
+(assert-error-class '<division-by-zero> (/ -1 0))
+(assert-error-class '<division-by-zero> (div-generic 1 0))
+(assert-error-class '<division-by-zero> (div-fixnum 1 0))
+(assert-error-class '<division-by-zero> (div-fixnum -1 0))
+(assert-error-class '<division-by-zero> (div-fixnum 0 0))
 ;; float は IEEE 754 どおり(MXCSR=0x1F80 で例外はマスクされている)
 (assert-equal (dtd-pr (div-generic 1.0f0 0.0f0)) (dtd-pr (div-single 1.0f0 0.0f0)))
 (assert-equal (dtd-pr (div-generic -1.0f0 0.0f0)) (dtd-pr (div-single -1.0f0 0.0f0)))
@@ -159,9 +166,10 @@
 (assert-equal -10 (/ 100 -5 2))
 (assert-equal 0 (/ 0 -5 2))
 (assert-equal (dtd-pr 0) (dtd-pr (/ 0 -5 2)))
-(assert-equal 'eval-error (/ 100 0 2))
-(assert-equal 'eval-error (/ -100 0 2))
-(assert-equal 'eval-error (/ -100 5 0))
+;; [P4-1] n 項版も同じく <division-by-zero>(高速路・bignum 路の両方)
+(assert-error-class '<division-by-zero> (/ 100 0 2))
+(assert-error-class '<division-by-zero> (/ -100 0 2))
+(assert-error-class '<division-by-zero> (/ -100 5 0))
 
 ;;; --- quotient は変わらないこと(**/ を経由していない**)---
 ;; %quotient2 は整数どうしなら mod / div(**床除算**)を使う。/ ではない。

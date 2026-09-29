@@ -542,20 +542,35 @@
 (defclass <end-of-stream> (<stream-error>) ())
 (defclass <storage-exhausted> (<serious-condition>) ())
 
-;; *handlers*はwith-handlerの動的スコープの間だけpush/popする、有効なhandler-functionの
+;; *handlers*はwith-handlerの動的スコープの間だけpush/popする、有効なハンドラの
 ;; リスト(内側が先頭)。*classes*と同じ理由でdefdynamic+%%set-dynamicを使う(冒頭の
 ;; 既知の制約: defvar+setqでは関数呼び出しの内側からのpush/popが呼び出し元に見えない)。
+;;
+;; **要素は (handler-function . 脱出タグ) のペアである。**
+;; 脱出タグは、そのwith-handlerが張っているcatchのタグ(実行時のgensym)。
+;; ハンドラが非継続コンディションで正常returnしたとき、signal-conditionは
+;; このタグへthrowして「そのwith-handlerまで」戻る(init_aot.lispのsignal-condition)。
+;; *handlers*へ直接pushするコードは、この形に合わせること。
 (defdynamic *handlers* nil)
 
 ;; handler-formを1度だけ評価し、bodyの動的スコープの間だけ*handlers*の先頭に積む。
 ;; unwind-protectでbodyがどう脱出しても(非局所脱出でも)必ずpopする。
+;;
+;; **catchのタグは実行時のgensymでなければならない。** マクロ展開時に1つ作って
+;; 焼き込むと、同じwith-handlerフォームが再帰的に入れ子になったときに内側と外側が
+;; 同じタグになり、「内側ハンドラがsignal-conditionで外側へ譲り、外側ハンドラが
+;; 正常returnした」場合のthrowが**内側のcatch**に捕まってしまう(catchは最も内側の
+;; 一致を拾うため)。動的な出現ごとに別のタグが要る。
 (defmacro with-handler (handler-form &rest body)
-  (let ((saved (gensym)))
-    `(let ((,saved (dynamic *handlers*)))
-       (%%set-dynamic '*handlers* (cons ,handler-form ,saved))
-       (unwind-protect
-           (progn ,@body)
-         (%%set-dynamic '*handlers* ,saved)))))
+  (let ((saved (gensym)) (tag (gensym)))
+    `(let ((,saved (dynamic *handlers*))
+           (,tag (gensym)))
+       (catch ,tag
+         (progn
+           (%%set-dynamic '*handlers* (cons (cons ,handler-form ,tag) ,saved))
+           (unwind-protect
+               (progn ,@body)
+             (%%set-dynamic '*handlers* ,saved)))))))
 
 ;; %abort-top-levelはsrc/lisp/init_aot.lispへ移動した(M12 Phase 7、#27)。
 
@@ -606,6 +621,27 @@
 (defmethod report-condition ((condition <undefined-entity>) stream)
   (format stream "undefined ~A: ~A" (slot-value condition 'namespace) (slot-value condition 'name))
   condition)
+
+;; [P2] トップレベルが打ち切られたときの表示に使う。conditionのreport-conditionを
+;; 文字列にして返す。C側(repl.c)がos_get_function+os_apply_functionで呼ぶ。
+;;
+;; **表示の途中でさらにエラーが起きても、そこで巻き添えにしない。** report-condition
+;; はユーザが特殊化できる総称関数なので、中でエラーをsignalしうる。その場合はnilを
+;; 返し、C側は従来どおり #<INSTANCE-OF ...> の表示へ落とす。
+;;
+;; **ここでハンドラを張らないと無限再帰になる。** この関数はos_eval_top_levelを
+;; 抜けた後に呼ばれるので、block %TOP-LEVEL はもう生きていない。その状態で
+;; signal-conditionが%abort-top-levelへ落ちると、return-fromの宛先が生きていない
+;; ため<control-error>がsignalされ、それがまた%abort-top-levelへ……と回り続ける。
+;;
+;; 戻り値の文字列は呼び出し側(C)が固定長バッファへ取り出すので、長すぎる場合は
+;; 途中で切れる(create-string-output-streamの容量1024も同様の上限)。
+(defun %report-condition-string (condition)
+  (block %report-condition-string
+    (with-handler (lambda (c) (return-from %report-condition-string nil))
+      (let ((s (create-string-output-stream)))
+        (report-condition condition s)
+        (get-output-stream-string s)))))
 
 ;;; --- ignore-errors ---
 

@@ -725,27 +725,35 @@
 ;;; init.lispからの移動。*handlers*のdefdynamic自体とwith-handlerマクロは
 ;;; init.lisp常駐のまま変更不要(Phase7と同じ理由)。
 
-;; *handlers*の先頭(最も内側)のhandler-functionを、一時的に自分自身を取り除いた状態で
+;; *handlers*の先頭(最も内側)のエントリを、一時的に自分自身を取り除いた状態で
 ;; 呼び出す(ハンドラ内でのsignal-conditionが次の外側のハンドラに渡るようにするため)。
 ;; 呼び出し後は*handlers*を元に戻す(unwind-protectでどの脱出経路でも保証する)。
+;; エントリは (handler-function . 脱出タグ) のペア(init.lispのwith-handler参照)。
+;;
 ;; continuableな呼び出しはconditionに%continuable/%continue-tagを記録した上でcatchで
 ;; 包み、continue-conditionからのthrowで指定した値を返して呼び出し元(signal-conditionの
-;; 呼び出し元)へ復帰できるようにする。continuableでないconditionでハンドラが
-;; (非局所脱出せず)普通に返ってきた場合は、仕様上はエラーだがトップレベルへのabortに
-;; フォールバックする。
+;; 呼び出し元)へ復帰できるようにする。
+;;
+;; **非継続コンディションでハンドラが(非局所脱出せず)正常returnした場合は、
+;; そのハンドラを張ったwith-handlerの脱出タグへthrowし、ハンドラの戻り値を
+;; with-handler式の値にする。** 以前はトップレベルへabortしていたが、それだと
+;; 外側のwith-handlerもblockも飛び越えてしまい、利用者から見て驚きが大きかった
+;; (spec:6929 は「consequences are undefined」なのでどちらも仕様違反ではない)。
+;; 外側へ譲りたいハンドラは、spec:6932 のとおり自分でsignal-conditionを呼ぶ。
 (defun signal-condition (condition continuable)
   (let ((handlers (dynamic *handlers*)))
     (if (null handlers)
         (if continuable nil (%abort-top-level condition))
-        (let ((tag (gensym)))
+        (let ((entry (car handlers))
+              (tag (gensym)))
           (set-slot-value condition '%continuable continuable)
           (set-slot-value condition '%continue-tag tag)
           (catch tag
             (unwind-protect
                 (progn
                   (%%set-dynamic '*handlers* (cdr handlers))
-                  (let ((result (funcall (car handlers) condition)))
-                    (if continuable result (%abort-top-level condition))))
+                  (let ((result (funcall (car entry) condition)))
+                    (if continuable result (throw (cdr entry) result))))
               (%%set-dynamic '*handlers* handlers)))))))
 
 ;; (condition-continuable condition) → <object> : signal-conditionが記録した

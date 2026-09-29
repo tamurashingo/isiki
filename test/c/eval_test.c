@@ -155,8 +155,14 @@ void test_os_eval_symbol_looks_up_variable() {
     lisp_val_t v = os_eval(os_make_symbol("x"), env);
     assert(v == os_make_fixnum(10), "symbolはenvから変数の値をlookupして返す");
 
+    /* [P5] 未束縛の変数は<unbound-variable>をsignalするようになった
+       (spec:899-902 / spec:7255-7257)。このテストはinit.lispもAOTフォームも
+       走らせないので、os_signal_conditionが「条件システムが使えない」側の
+       フォールバックへ落ちてg_sym_eval_errorを返す。
+       **nilが返らなくなったことがここで固定される**(nilは「nilが束縛されている」
+       場合の正しい戻り値であり、未束縛と区別が付かないのが元の問題だった) */
     lisp_val_t undefined = os_eval(os_make_symbol("undefined-var"), env);
-    assert(undefined == nil, "未定義のsymbolはnilが返る");
+    assert(undefined == g_sym_eval_error, "未束縛のsymbolはsignalする(条件システムが無ければEVAL-ERROR)");
 }
 
 void test_os_eval_add() {

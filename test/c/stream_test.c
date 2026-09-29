@@ -197,12 +197,13 @@ int os_virtio9p_close(UINT32 fid, char *err_msg, UINT32 err_msg_cap) {
 // os_mount_fat_write_fileをフェイクに差し替える(このテストはFAT系streamを
 // 開かないため呼ばれることはないが、リンクを通すために必要)
 int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                             const UINT8 *data, UINT32 len) {
+                             const UINT8 *data, UINT32 len, lisp_val_t *out_transfer) {
     (void)kind;
     (void)device;
     (void)relative_path;
     (void)data;
     (void)len;
+    (void)out_transfer;
     return 1;
 }
 

@@ -1379,6 +1379,14 @@ lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val);
 lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env);
 
 /**
+ * [P5] os_get_variableと同じ探索を行い、**未束縛なら<unbound-variable>をsignalする。**
+ * ISLispの変数参照(eval.cのシンボル評価、za.cが生成するグローバル変数読み出し)が使う。
+ * process.c/interrupt.cのようにnilで「未束縛」を判定している内部の呼び出しは
+ * 従来どおりos_get_variableを使うこと。
+ */
+lisp_val_t os_get_variable_checked(lisp_val_t sym, lisp_val_t env);
+
+/**
  * envの変数slotにsymの値としてvalを設定する(既存なら破壊的に上書き、無ければ新規追加)。
  * @param sym 設定するsymbol
  * @param val 設定する値
@@ -1839,6 +1847,67 @@ void os_set_panic_hook(void (*hook)(void));
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env);
 
 /**
+ * [P4-3] 未定義の関数を<undefined-function>としてsignalする(error-id. undefined-function。
+ * spec:1455-1457 / spec:1461 / spec:1512-1513、クラスはspec:7261-7263)。
+ * nameとnamespace(=function)のスロットを載せる(spec:7160-7163)。
+ * eval.c(eval_form / eval_function)とruntime.c(primitive_funcall_by_name)から呼ぶ。
+ * @param name_sym 未定義だった関数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env);
+
+/**
+ * [P5] 未束縛の変数を<unbound-variable>としてsignalする(error-id. undefined-entity /
+ * unbound-variable。spec:899-902、クラスはspec:7255-7257)。
+ * nameとnamespace(=variable)のスロットを載せる(spec:7160-7163)。
+ * @param name_sym 未束縛だった変数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_unbound_variable(lisp_val_t name_sym, lisp_val_t env);
+
+/**
+ * [P6] arity 不一致を<program-error>としてsignalする(error-id. arity-error。
+ * spec:896-898 / spec:1549-1550、クラスはspec:7191-7194)。
+ * eval.cのbind_paramsと、za.cが生成するconsリストエントリのプロローグから呼ぶ。
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_arity_error(lisp_val_t env);
+
+/**
+ * [P4-3] 変更できない束縛(defconstant)への代入を<program-error>としてsignalする
+ * (error-id. immutable-binding。spec:435-437、クラスはspec:7239-7241)。
+ * eval.c(eval_setq)とruntime.c(os_setq_variable_checked。za.cのJIT生成コードが呼ぶ)から使う。
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_immutable_binding(lisp_val_t env);
+
+/**
+ * [P4-3] 関数でないものを関数として呼ぼうとした場合を<domain-error>としてsignalする
+ * (error-id. domain-error。spec:1667)。expected-classは<FUNCTION>。
+ * @param obj 関数ではなかった値
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_not_a_function(lisp_val_t obj, lisp_val_t env);
+
+/**
+ * [P4-4] 入出力の失敗(ファイルを開けない、マウントが解決できない等)を
+ * <simple-error> としてsignalする。メッセージは "what: path[: detail]" になる。
+ * **クラスの選択は仕様未確認**(open-*-file は「開き方は implementation-defined」
+ * spec:6266-6268 としか書かれておらず、load は仕様に無い)。理由は実装側のコメント参照。
+ * @param what 失敗した操作(例 "open-input-file")
+ * @param path 対象のパス
+ * @param detail 下位層のメッセージ。不要なら0
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_io_error(const char *what, const char *path, const char *detail, lisp_val_t env);
+
+/**
  * <control-error>をsignalする(ISLisp仕様§14.7: 既に抜けたblockへのreturn-from、
  * unwind-protectのcleanup中の別の非局所脱出など)。eval.cとza.c(JIT生成コード)の両方から呼ぶ。
  * @param env 呼び出し時の環境
@@ -2043,7 +2112,7 @@ lisp_val_t primitive_multiply2_single(lisp_val_t a, lisp_val_t b);
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果の整数。0除算の場合はg_sym_eval_error
+ * @return 除算結果の整数。0除算の場合は<division-by-zero>をsignalする
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env);
 
@@ -2203,7 +2272,7 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env);
  * 商は-∞方向へ切り捨てる)。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の商。z2が0の場合はg_sym_eval_error
+ * @return floor除算の商。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env);
 
@@ -2212,7 +2281,7 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env);
  * 一致する)。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の余り。z2が0の場合はg_sym_eval_error
+ * @return floor除算の余り。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env);
 
@@ -2236,7 +2305,7 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env);
  * 組み込み関数ISQRT。第一引数の整数平方根floor(sqrt(z))を返す。zが負の場合は定義域エラー。
  * @param args 評価済みの引数リスト(非負整数1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
+ * @return floor(sqrt(z))。zが負の場合は<domain-error>をsignalする(spec:4984)
  */
 lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env);
 
@@ -2456,7 +2525,7 @@ lisp_val_t primitive_floatp1(lisp_val_t val);
  * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
  * @param args 評価済みの引数リスト(数値1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
+ * @return floatに変換した値。数値以外が渡された場合は<domain-error>をsignalする(spec:4734)
  */
 lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env);
 

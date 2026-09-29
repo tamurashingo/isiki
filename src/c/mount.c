@@ -110,8 +110,31 @@ mount_kind_t os_mount_resolve(const char *path, char *out_relative, UINT32 relat
     return best_kind;
 }
 
+/**
+ * [P1] FATドライバ(Lisp)の呼び戻し結果が非局所脱出シグナルなら、out_transferへ
+ * 預けて1を返す。
+ *
+ * **C→Lispの呼び戻しは、Cの境界で脱出を値に化けさせる。** 例えば
+ * os_mount_fat_file_sizeは戻り値をos_fixnum_magnitudeへ通すので、脱出シグナルの
+ * ヒープアドレスを「ファイルサイズ」として返してしまっていた
+ * (documents/error-unwind-survey.md §A-3 / §F-6。このファイルには
+ * os_apply_functionが14箇所あり、検査は1つも無かった)。
+ *
+ * 脱出は「失敗(戻り値0)」として扱う。呼び出し元は0が返ったときにout_transferを
+ * 見て、非nilならそれをそのままLispへ返す。
+ */
+static int mount_transfer_escaped(lisp_val_t result, lisp_val_t *out_transfer) {
+    if (!os_is_control_transfer(result)) {
+        return 0;
+    }
+    if (out_transfer != 0) {
+        *out_transfer = result;
+    }
+    return 1;
+}
+
 int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                            UINT8 **out_data, UINT32 *out_len) {
+                            UINT8 **out_data, UINT32 *out_len, lisp_val_t *out_transfer) {
     GC_PROTECT(device);
 
     lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
@@ -121,6 +144,9 @@ int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *rel
     GC_PROTECT(handle_fn);
     lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
     GC_PROTECT(handle);
+    if (mount_transfer_escaped(handle, out_transfer)) {
+        return 0;
+    }
 
     const char *read_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-READ-FILE" : "FAT16-READ-FILE";
     lisp_val_t read_fn = os_get_function(os_make_symbol(read_name), global_environment);
@@ -135,6 +161,11 @@ int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *rel
     GC_PROTECT(read_args);
     lisp_val_t result = os_apply_function(read_fn, read_args, global_environment);
     GC_PROTECT(result);
+    // **os_vector_headerへ通す前に見ること。** 脱出シグナルはTAG_INSTANCEなので、
+    // そのまま通すと無関係なワードを「要素数」として読み、そのぶんループする
+    if (mount_transfer_escaped(result, out_transfer)) {
+        return 0;
+    }
 
     if (result == nil) {
         // FAT32/FAT16のread-fileはファイル無し・空ファイルのいずれもnilを返すため
@@ -162,7 +193,7 @@ int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *rel
 }
 
 int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                             const UINT8 *data, UINT32 len) {
+                             const UINT8 *data, UINT32 len, lisp_val_t *out_transfer) {
     GC_PROTECT(device);
 
     lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
@@ -172,6 +203,9 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
     GC_PROTECT(handle_fn);
     lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
     GC_PROTECT(handle);
+    if (mount_transfer_escaped(handle, out_transfer)) {
+        return 0;
+    }
 
     // [ファイルI/O]#46(M3): FAT32-WRITE-FILE/FAT16-WRITE-FILE/*-CREATE-FILEが
     // 受け取るbytesの契約がconsリストからgeneral-vectorへ変更されたため、
@@ -196,6 +230,11 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
         lisp_val_t write_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(bytes, nil)));
         GC_PROTECT(write_args);
         lisp_val_t result = os_apply_function(write_fn, write_args, global_environment);
+        GC_PROTECT(result);
+        // **脱出は「非nil」なので、検査しないと「書き込み成功」と誤判定する**
+        if (mount_transfer_escaped(result, out_transfer)) {
+            return 0;
+        }
         if (result != nil) {
             return 1;
         }
@@ -209,11 +248,16 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
     lisp_val_t create_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(bytes, nil)));
     GC_PROTECT(create_args);
     lisp_val_t result2 = os_apply_function(create_fn, create_args, global_environment);
+    GC_PROTECT(result2);
+    if (mount_transfer_escaped(result2, out_transfer)) {
+        return 0;
+    }
     return result2 != nil;
 }
 
 int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                                    int truncate, int create_if_missing, lisp_val_t *out_node) {
+                                    int truncate, int create_if_missing, lisp_val_t *out_node,
+                                    lisp_val_t *out_transfer) {
     GC_PROTECT(device);
 
     lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
@@ -223,6 +267,9 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
     GC_PROTECT(handle_fn);
     lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
     GC_PROTECT(handle);
+    if (mount_transfer_escaped(handle, out_transfer)) {
+        return 0;
+    }
 
     const char *resolve_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-RESOLVE-NODE" : "FAT16-RESOLVE-NODE";
     lisp_val_t resolve_fn = os_get_function(os_make_symbol(resolve_name), global_environment);
@@ -238,6 +285,11 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
 
     lisp_val_t node = os_apply_function(resolve_fn, resolve_args, global_environment);
     GC_PROTECT(node);
+    // **脱出は非nilなので、検査しないと「解決できた」と誤判定して
+    // out_nodeへ脱出シグナルを入れ、以後ストリームのmount_file_nodeになる**
+    if (mount_transfer_escaped(node, out_transfer)) {
+        return 0;
+    }
 
     if (node != nil && truncate) {
         const char *write_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-WRITE-FILE" : "FAT16-WRITE-FILE";
@@ -250,12 +302,20 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
         GC_PROTECT(empty_vec);
         lisp_val_t write_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(empty_vec, nil)));
         GC_PROTECT(write_args);
-        if (os_apply_function(write_fn, write_args, global_environment) == nil) {
+        lisp_val_t truncated = os_apply_function(write_fn, write_args, global_environment);
+        GC_PROTECT(truncated);
+        if (mount_transfer_escaped(truncated, out_transfer)) {
+            return 0;
+        }
+        if (truncated == nil) {
             return 0;
         }
         // 切り詰め後はdir-lba/start-cluster等が変わりうるため、nodeを解決し直す
         node = os_apply_function(resolve_fn, resolve_args, global_environment);
         GC_PROTECT(node);
+        if (mount_transfer_escaped(node, out_transfer)) {
+            return 0;
+        }
     }
 
     if (node == nil && create_if_missing) {
@@ -269,11 +329,19 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
         GC_PROTECT(empty_vec);
         lisp_val_t create_args = os_make_cons(handle, os_make_cons(path_str, os_make_cons(empty_vec, nil)));
         GC_PROTECT(create_args);
-        if (os_apply_function(create_fn, create_args, global_environment) == nil) {
+        lisp_val_t created = os_apply_function(create_fn, create_args, global_environment);
+        GC_PROTECT(created);
+        if (mount_transfer_escaped(created, out_transfer)) {
+            return 0;
+        }
+        if (created == nil) {
             return 0;
         }
         node = os_apply_function(resolve_fn, resolve_args, global_environment);
         GC_PROTECT(node);
+        if (mount_transfer_escaped(node, out_transfer)) {
+            return 0;
+        }
     }
 
     if (node == nil) {
@@ -284,7 +352,7 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
 }
 
 int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                            UINT32 *out_len) {
+                            UINT32 *out_len, lisp_val_t *out_transfer) {
     GC_PROTECT(device);
 
     lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
@@ -294,6 +362,9 @@ int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *rel
     GC_PROTECT(handle_fn);
     lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device, nil), global_environment);
     GC_PROTECT(handle);
+    if (mount_transfer_escaped(handle, out_transfer)) {
+        return 0;
+    }
 
     const char *size_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-FILE-SIZE" : "FAT16-FILE-SIZE";
     lisp_val_t size_fn = os_get_function(os_make_symbol(size_name), global_environment);
@@ -307,6 +378,12 @@ int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *rel
     lisp_val_t size_args = os_make_cons(handle, os_make_cons(path_str, nil));
     GC_PROTECT(size_args);
     lisp_val_t result = os_apply_function(size_fn, size_args, global_environment);
+    GC_PROTECT(result);
+    // **os_fixnum_magnitudeへ通す前に見ること。** 脱出シグナルのヒープアドレスを
+    // ファイルサイズとして返してしまう
+    if (mount_transfer_escaped(result, out_transfer)) {
+        return 0;
+    }
 
     if (result == nil) {
         return 0;
@@ -547,6 +624,11 @@ lisp_val_t cc_read_file_into_vector_native(lisp_val_t args, lisp_val_t env) {
     }
     GC_PROTECT(handle_fn);
     lisp_val_t handle = os_apply_function(handle_fn, os_make_cons(device_sym, nil), global_environment);
+    // %DEVICE-HANDLEが非局所脱出した場合はそのまま返す(この関数はlisp_val_tを
+    // 返すので、預ける先は要らない)
+    if (os_is_control_transfer(handle)) {
+        return handle;
+    }
     // [性能測定] handle自体はGCに再配置されうるが、ここから先(fat16n_*)は
     // 生のblock_device_t*しか使わない(handleを再度参照しない)ため、
     // これ以降GC_PROTECTは不要

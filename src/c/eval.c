@@ -93,7 +93,11 @@ static lisp_val_t make_interpreted_function(lisp_val_t params, lisp_val_t body, 
  * @param evaluated_args 評価済みの実引数リスト
  * @param call_env 束縛先の環境
  */
-static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t call_env) {
+/* [P6] 戻り値は 0 = 正常、1 = arity 不一致。
+   **out パラメータにしないのは計測の結果である。** ポインタで返す形にすると
+   それを保持するために callee-saved レジスタが1本増え、push/pop が 4 命令乗った
+   (bind_params 101 -> 108)。戻り値なら rax で返るだけで済む。 */
+static int bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t call_env) {
     lisp_val_t p = params;
     lisp_val_t a = evaluated_args;
     // os_set_variableはcall_envへの新規束縛時にos_make_consで確保を行いGCを誘発しうる。
@@ -108,13 +112,23 @@ static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t
         if (param == g_sym_rest) {
             lisp_val_t rest_param = cc_car(cc_cdr(p));
             os_set_variable(rest_param, a, call_env);
-            return;
+            return 0;
         }
-        lisp_val_t val = (a != nil) ? cc_car(a) : nil;
-        os_set_variable(param, val, call_env);
+        /* [P6] 実引数が足りない。**正常系に命令は増えない**(元から
+           `(a != nil) ? ... : nil` で a を見ていたので、nil 側の枝を
+           「nil を束縛する」から「arity error にする」へ差し替えただけ。
+           むしろ下の cc_cdr から三項演算子が1つ消えている)。
+           spec:896-898 / spec:1549-1550 */
+        if (a == nil) {
+            return 1;
+        }
+        os_set_variable(param, cc_car(a), call_env);
         p = cc_cdr(p);
-        a = (a != nil) ? cc_cdr(a) : nil;
+        a = cc_cdr(a);
     }
+    /* [P6] 実引数が多い。**ループを抜けたあとの1回だけ**なので、
+       仮引数の個数に比例しない */
+    return (a != nil) ? 1 : 0;
 }
 
 /**
@@ -122,9 +136,22 @@ static void bind_params(lisp_val_t params, lisp_val_t evaluated_args, lisp_val_t
  * @param fn 呼び出す関数オブジェクト
  * @param evaluated_args 評価済みの引数リスト
  * @param env 呼び出し時の環境
- * @return 関数呼び出しの結果。関数オブジェクトでない場合はg_sym_eval_error
+ * @return 関数呼び出しの結果。関数オブジェクトでない場合は<domain-error>をsignalする
  */
 static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_val_t env) {
+    /* [P4-3] **タグを見ずに word0 を読んでいた。** fn は eval_form で
+       (op がシンボルでなければ)os_eval の結果がそのまま来るので、
+       ((car '(1 2)) 3) のように関数でない値が渡りうる。fixnum の 5 なら
+       5 & ~TAG_MASK = 0 で**アドレス0を読む**。タグを先に見る。
+       spec:1667「An error shall be signaled if function is not a function
+       (error-id. domain-error)」
+
+       **signal には global_environment を渡す(P4-2 と同じ理由)。** 加えて、
+       apply_function の env は AOT 生成コードから 0 が渡ることがあり
+       (lisp_ll_* の第2引数)、それを os_get_function へ渡すと cc_cdr(0) で落ちる。 */
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return os_signal_not_a_function(fn, global_environment);
+    }
     lisp_addr_t addr = fn & ~TAG_MASK;
     UINT64 *obj = (UINT64 *)addr;
     if (obj[0] == MAGIC_FUNCTION_NATIVE) {
@@ -154,10 +181,15 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
         // ここ(呼び出し元)のcall_envローカルは別のスタックスロットなので追随しない。
         // bind_params完了後もcall_envをeval_prognに渡すため、ここでも保護する
         GC_PROTECT(call_env);
-        bind_params(params, evaluated_args, call_env);
+        if (bind_params(params, evaluated_args, call_env)) {
+            /* [P6] **signal には global_environment を渡す**(P4-2 以降と同じ理由)。
+               call_env はここで捨てる束縛用の frame なので渡す意味も無い */
+            return os_signal_arity_error(global_environment);
+        }
         return eval_progn(body, call_env);
     }
-    return g_sym_eval_error; // 関数オブジェクトではない
+    // TAG_INSTANCEではあるが関数オブジェクトではない(vectorやILOSインスタンス等)
+    return os_signal_not_a_function(fn, global_environment);
 }
 
 /**
@@ -167,7 +199,7 @@ static lisp_val_t apply_function(lisp_val_t fn, lisp_val_t evaluated_args, lisp_
  * @param op 関数を表すシンボル、または関数オブジェクトへ評価される式
  * @param args 未評価の引数リスト
  * @param env 評価に使う環境
- * @return 関数呼び出しの結果。opが未定義の場合はg_sym_eval_error
+ * @return 関数呼び出しの結果。opが未定義の場合は<undefined-function>をsignalする
  */
 static lisp_val_t eval_form(lisp_val_t op, lisp_val_t args, lisp_val_t env) {
     // [原則4の系] opの解決(os_get_functionの確保、opが(lambda ...)等ならos_evalの
@@ -185,7 +217,14 @@ static lisp_val_t eval_form(lisp_val_t op, lisp_val_t args, lisp_val_t env) {
     lisp_val_t fn = ((op & TAG_MASK) == TAG_SYMBOL) ? os_get_function(op, env) : os_eval(op, env);
     GC_PROTECT(fn);
     if (fn == nil) {
-        return g_sym_eval_error; // 未定義の関数
+        /* [P4-3] opがシンボルなら関数名前空間に束縛が無い = undefined-function
+           (spec:1455-1457 / spec:1461)。シンボルでない場合はopを評価した結果が
+           nilだったということなので、「nilは関数ではない」= domain-error
+           (spec:1667)にする */
+        if ((op & TAG_MASK) == TAG_SYMBOL) {
+            return os_signal_undefined_function(op, global_environment);
+        }
+        return os_signal_not_a_function(fn, global_environment);
     }
     lisp_val_t evaluated_args = eval_args(args, env);
     if (is_control_transfer(evaluated_args)) {
@@ -247,7 +286,10 @@ static lisp_val_t eval_setq(lisp_val_t args, lisp_val_t env) {
     GC_PROTECT(sym);
     GC_PROTECT(env);
     if (os_is_constant(sym, env)) {
-        return g_sym_eval_error; // defconstantで定義された定数はsetqで上書きできない
+        /* [P4-3] defconstantの束縛はimmutable(spec:1699-1700)。変更しようとするのは
+           error-id. immutable-binding(spec:435-437)で、クラスは<program-error>
+           (spec:7239-7241) */
+        return os_signal_immutable_binding(global_environment);
     }
     lisp_val_t val_form = cc_car(cc_cdr(args));
     lisp_val_t val = os_eval(val_form, env);
@@ -463,14 +505,17 @@ static lisp_val_t eval_lambda(lisp_val_t args, lisp_val_t env) {
  * (function (lambda ...))のような式ならその式自体をos_evalして得た関数オブジェクトを返す。
  * @param args (name-or-lambda-expr)
  * @param env 解決・評価に使う環境
- * @return 関数オブジェクト。nameが未定義の場合はg_sym_eval_error
+ * @return 関数オブジェクト。nameが未定義の場合は<undefined-function>をsignalする
  */
 static lisp_val_t eval_function(lisp_val_t args, lisp_val_t env) {
     lisp_val_t form = cc_car(args);
     if ((form & TAG_MASK) == TAG_SYMBOL) {
         lisp_val_t fn = os_get_function(form, env);
         if (fn == nil) {
-            return g_sym_eval_error; // 未定義の関数
+            /* spec:1512-1513「An error shall be signaled if no binding has been
+               established for the identifier in the function namespace
+               (error-id. undefined-function)」 */
+            return os_signal_undefined_function(form, global_environment);
         }
         return fn;
     }
@@ -722,7 +767,11 @@ static lisp_val_t apply_macro(lisp_val_t macro, lisp_val_t args) {
     GC_PROTECT(body);
     lisp_val_t call_env = os_make_frame(os_make_symbol("MACRO-ENV"), closure_env);
     GC_PROTECT(call_env);
-    bind_params(params, args, call_env);
+    /* [P6] **マクロ展開の arity はここでは signal しない。** 展開は評価より前の
+       段階で、ここで signal するとマクロを含むフォームの評価が「展開中の
+       エラー」で止まることになる。行き先の設計が評価中の arity error とは
+       別なので、documents/unbound-arity-survey.md §7 のとおり別途の判断とする */
+    (void)bind_params(params, args, call_env);
     return eval_progn(body, call_env);
 }
 
@@ -1117,7 +1166,7 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
     }
     UINT64 tag = exp & TAG_MASK;
     if (tag == TAG_SYMBOL) {
-        return os_get_variable(exp, env);
+        return os_get_variable_checked(exp, env);
     }
     if (tag == TAG_CONS) {
         lisp_val_t op = cc_car(exp);
@@ -1229,16 +1278,67 @@ lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
  * @return formの評価結果。abortされた場合はabortに渡されたcondition
  */
 lisp_val_t os_eval_top_level(lisp_val_t form, lisp_val_t env) {
-    // envはos_make_consの引数ではないため、os_make_consの内部保護の対象外である。
-    // wrappedを組み立てる3回の確保はいずれもGCを誘発しうるので、envはここで
-    // 自分で保護しなければならない。保護していないと、GCを跨いだ時点でenvが
-    // 旧From空間を指したままos_evalへ渡り、os_eval側のGC_PROTECT(env)は
-    // 「すでに古い値」を追跡するだけになって救えない
-    // (documents/pitfalls.md 原則4。formは各os_make_consの引数なので内部保護される)
+    return os_eval_top_level_ex(form, env, 0);
+}
+
+lisp_val_t os_eval_top_level_ex(lisp_val_t form, lisp_val_t env, int *out_aborted) {
+    if (out_aborted != 0) {
+        *out_aborted = 0;
+    }
+    // (block %TOP-LEVEL form) を**consで組み立てずに**、eval_blockと同じことを
+    // その場で行う。組み立てていた頃は、脱出が%TOP-LEVEL宛のblock-exitだったのか
+    // フォームがconditionを値として返しただけなのかを呼び出し元が区別できなかった
+    // (eval_blockが包みを外して値だけ返すため)。ついでにフォーム1個につき
+    // 3回あったos_make_consも無くなる。
+    //
+    // formとenvは、os_live_block_push(os_make_consを伴う)とos_evalを跨いで
+    // 生存する必要がある(documents/pitfalls.md 原則4)
+    GC_PROTECT(form);
     GC_PROTECT(env);
-    lisp_val_t wrapped = os_make_cons(g_sym_block,
-        os_make_cons(g_sym_top_level_block, os_make_cons(form, nil)));
-    return os_eval(wrapped, env);
+
+    // ISLisp仕様§14.7: blockの動的extentの間だけ名前を積む。eval_blockと同じ
+    lisp_val_t saved = os_live_block_push(g_sym_top_level_block);
+    GC_PROTECT(saved);
+    lisp_val_t result = os_eval(form, env);
+    os_live_block_restore(saved);
+
+    if (is_control_transfer(result)) {
+        UINT64 *obj = (UINT64 *)(result & ~TAG_MASK);
+        // 捕捉の条件はeval_blockと同じ「宛先名の一致」だけにして、従来の意味論を
+        // 変えない(magicは見ない)。**打ち切りの判定だけ**はMAGIC_BLOCK_EXITに
+        // 限る = %abort-top-levelが作るものだけを打ち切りとみなす
+        if (obj[1] == g_sym_top_level_block) {
+            if (out_aborted != 0 && obj[0] == MAGIC_BLOCK_EXIT) {
+                *out_aborted = 1;
+            }
+            return obj[2];
+        }
+    }
+    return result;
+}
+
+int os_condition_report_cstr(lisp_val_t condition, lisp_val_t env, char *out, UINT32 out_cap) {
+    if (out_cap == 0) {
+        return 0;
+    }
+    GC_PROTECT(condition);
+    GC_PROTECT(env);
+    lisp_val_t sym = os_make_symbol("%REPORT-CONDITION-STRING");
+    GC_PROTECT(sym);
+    lisp_val_t fn = os_get_function(sym, env);
+    if (fn == nil) {
+        return 0;
+    }
+    GC_PROTECT(fn);
+    lisp_val_t args = os_make_cons(condition, nil);
+    GC_PROTECT(args);
+    lisp_val_t str = apply_function(fn, args, env);
+    if (is_control_transfer(str) || (str & TAG_MASK) != TAG_STRING) {
+        return 0;
+    }
+    GC_PROTECT(str);
+    os_string_to_cstr(str, out, out_cap);
+    return 1;
 }
 
 /**

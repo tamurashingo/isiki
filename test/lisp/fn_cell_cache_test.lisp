@@ -18,7 +18,8 @@
 ;; 未定義のまま呼ぶ(ここでキャッシュスロットが埋まりうる)。
 ;; 未定義の関数呼び出しはconditionをsignalせず、シンボルEVAL-ERRORを値として返す
 ;; (apply_functionがg_sym_eval_errorを返す。runtime.c/eval.c)
-(assert-equal 'eval-error (fcc-early-caller))
+;; [P4-3] 未定義関数は <undefined-function> を signal する(spec:1461 / spec:7261-7263)
+(assert-error-class '<undefined-function> (fcc-early-caller))
 
 ;; あとから定義すれば解決されなければならない
 (defun fcc-not-yet-defined () 99)
@@ -40,8 +41,10 @@
 
 ;; 未定義のまま複数回呼んでも、あとから定義すれば解決されること
 (defun fcc-early2 () (fcc-later2))
-(assert-equal 'eval-error (fcc-early2))
-(assert-equal 'eval-error (fcc-early2))
-(assert-equal 'eval-error (fcc-early2))
+;; [P4-3] 同上。**3回とも同じクラスになること**(未定義の Function Cell を
+;; キャッシュしてしまうと2回目以降の挙動が変わるので、回数ぶん見る)
+(assert-error-class '<undefined-function> (fcc-early2))
+(assert-error-class '<undefined-function> (fcc-early2))
+(assert-error-class '<undefined-function> (fcc-early2))
 (defun fcc-later2 () 7)
 (assert-equal 7 (fcc-early2))
