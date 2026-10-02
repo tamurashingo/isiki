@@ -91,6 +91,75 @@ def read_baseline(path):
     return base
 
 
+def read_calibration(path):
+    """**真の値が分かっている行**(校正点)を読む。
+
+    documents/performance-measurement.md「推定量を校正点で決めた」節。
+    **これはコードを検査するテストではなく、計器を検査するテストである。**
+    推定量を変えたとき・N を変えたとき・プラグインを触ったときに、
+    真の値から外れたら計器が壊れている。
+    """
+    cal = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) != 5:
+                sys.exit(f"ERROR: {path}: 列が 5 つではありません: {line!r}")
+            p, case, true_value, tol, basis = cols
+            cal[(p, case)] = {"true": float(true_value), "tol": float(tol),
+                              "basis": basis}
+    return cal
+
+
+def check_calibration(g, cal, estimator):
+    """校正点に当てる。**選んだ推定量が外れたら落ちる。**"""
+    rows = [(k, v) for k, v in cal.items() if k in g]
+    if not rows:
+        return 0
+    print()
+    print("=== 校正点(真の値が分かっている行)===")
+    ng = []
+    for (p, case), c in sorted(rows):
+        e = estimates(g[(p, case)])
+        print(f"  {p}/{case}: 真値 {c['true']:.3f}  許容 ±{c['tol']:.3f}  "
+              f"N={e['n']}  回数={e['trials']}")
+        print(f"      根拠: {c['basis']}")
+        for name in ESTIMATOR_NAMES:
+            d = e[name] - c["true"]
+            mark = "  <= 選択中" if name == estimator else ""
+            ok = "OK " if abs(d) <= c["tol"] else "**外れ**"
+            print(f"      {ok} {name:18s} {e[name]:8.3f}  差 {d:+7.3f}{mark}")
+        if abs(e[estimator] - c["true"]) > c["tol"]:
+            ng.append((p, case, estimator, e[estimator], c))
+    if ng:
+        print()
+        print("=== 校正点を外しました — **計器が壊れています** ===")
+        for p, case, est, got, c in ng:
+            print(f"[NG] {p}/{case}: 推定量 {est} が {got:.3f}。"
+                  f"真値 {c['true']:.3f} ±{c['tol']:.3f} から外れている")
+        print("""
+**これは測定対象の退行ではない。計器の故障である。**
+記録値を更新しても直らない。見るところ:
+
+  1. **推定量を変えたのではないか。** 上の表で真値に入っている推定量がある。
+     --estimator / BENCH_ESTIMATOR でそれを選び、記録を取り直すこと
+  2. **N が小さすぎないか。** 1 ブートの異常(実測で約 31M 命令)を 2N で
+     割った値が誤差になる。真値 4 に対して N=10,000,000 では
+     31M/2e7 = 1.56 命令/単位、つまり 39% の誤差になりうる
+  3. **プラグインを触ったのではないか。** total_insns の数え方が変わると
+     全部ずれる
+  4. **ベンチの C 実装を変えたのではないか。** その場合は逆アセンブルし直して
+     tools/bench/bench_calibration.tsv の真値と根拠を更新すること
+""")
+        return 1
+    print()
+    print("校正点: すべて真の値の許容範囲に入っています。")
+    return 0
+
+
 def group(rows):
     g = {}
     for r in rows:
@@ -98,42 +167,62 @@ def group(rows):
     return g
 
 
-def estimates(rows):
-    """3 つの推定量を同じデータから出す。
+ESTIMATOR_NAMES = ["slope-of-medians", "median", "min-slope",
+                   "slope-of-mins", "slope-of-maxes"]
 
-    **min3(繰り返しの最小値)には落とし穴がある。** 傾きは 2 つの測定値の
-    「差」なので、妨害が lo 側に乗ると傾きは**下がる**。つまり
-    「実行命令数は決定的で妨害は増やす方向にしか働かない」から
-    「最小値が真の値に最も近い」は、**直接測った量には成り立つが差には
-    成り立たない。** 検算の結果は documents/performance-measurement.md
-    「推定量の検算」にある。どれを記録するかは --estimator で選び、
-    **記録の estimator 列に残す。**
+# **試行回数を増やすと系統的にずれる推定量。** 3 回の最小値と 10 回の最小値は
+# 別の量である。中央値はこの性質を持たない
+TRIALS_DEPENDENT = {"min-slope", "slope-of-mins", "slope-of-maxes"}
+
+
+def estimates(rows):
+    """同じデータから推定量を 5 通り出す。**どれを選んでも 5 つとも出力に出る。**
+
+    `lo` は N 回、`hi` は 3N 回のブート全体の総命令数。傾きは (hi-lo)/(2N)。
+
+    **「妨害は増やす方向にしか働かない」はこの計器では成り立たない。**
+    校正点(`c/for` は逆アセンブルで 4 命令)に当てると、
+    **1 ブートだけ約 31M 命令**少ない値が出ることがあり、それが `hi` 側に
+    当たると最小値ベースの推定量はその外れ値を**選んで**拾う。
+    実測(2026-10-02、N=10,000,000、真値 4.000):
+
+        hi1 -0.08 / hi2 +0.08 / **hi3 -1.56**(= -31,176,758 命令)
+        min-slope 2.44 / slope-of-mins 2.44 / median 3.92 / slope-of-maxes 4.07
+
+    導出は documents/performance-measurement.md「推定量を校正点で決めた」節。
     """
     n = rows[0]["n"]
     sl = [r["slope"] for r in rows]
     los = [r["lo"] for r in rows]
     his = [r["hi"] for r in rows]
-    return {
-        "median3": statistics.median(sl),
-        "min3": min(sl),
-        # 端点ごとに最小を採ってから差を取る版(「妨害は増やす方向にしか
-        # 働かない」を**生の総命令数**に当てた形)
-        "minend3": (min(his) - min(los)) / (2 * n),
-        "slopes": sorted(sl),
-        "n": n,
-        "trials": len(rows),
+    e = {
+        # 傾きを 1 回ずつ求めてから中央値。**既定。**1 本の外れたブートに強い
+        "median": statistics.median(sl),
+        # 端点ごとに中央値を採ってから差を取る
+        "slope-of-medians": (statistics.median(his) - statistics.median(los)) / (2 * n),
+        # 傾きの最小値。**低い側の外れ値を選んで拾う。**校正点を外す
+        "min-slope": min(sl),
+        # 端点ごとに最小値を採ってから差を取る(「妨害は増やす方向にしか
+        # 働かない」をそのまま適用した形)。**校正点を外す**
+        "slope-of-mins": (min(his) - min(los)) / (2 * n),
+        # 端点ごとに最大値を採ってから差を取る。校正点には近いが、
+        # **本物の妨害(ISR)は増やす方向なので、原理的にはそれを拾う**
+        "slope-of-maxes": (max(his) - max(los)) / (2 * n),
     }
+    e.update({"slopes": sorted(sl), "n": n, "trials": len(rows)})
+    return e
 
 
 def print_measured(g, estimator):
-    print(f"| 経路 | カテゴリ | N | 回数 | **{estimator}** | median3 | min3 | minend3 | 最小 | 最大 | 幅 |")
-    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    heads = " | ".join(ESTIMATOR_NAMES)
+    print(f"| 経路 | カテゴリ | N | 回数 | **{estimator}** | {heads} | 最小 | 最大 |")
+    print("|---|---|---:|---:|---:|" + "---:|" * len(ESTIMATOR_NAMES) + "---:|---:|")
     for (p, case) in sorted(g):
         e = estimates(g[(p, case)])
         s = e["slopes"]
+        cells = " | ".join(f"{e[k]:.2f}" for k in ESTIMATOR_NAMES)
         print(f"| {p} | {case} | {e['n']} | {e['trials']} | "
-              f"**{e[estimator]:.2f}** | {e['median3']:.2f} | {e['min3']:.2f} | "
-              f"{e['minend3']:.2f} | {s[0]:.2f} | {s[-1]:.2f} | {s[-1] - s[0]:.2f} |")
+              f"**{e[estimator]:.2f}** | {cells} | {s[0]:.2f} | {s[-1]:.2f} |")
 
 
 def print_eval(g, tol):
@@ -217,14 +306,29 @@ def check(g, base, estimator, tight_band, verdict):
             print(f"[保留] {p}/{case}: 測定値 {med:.2f}(記録 {b['value']:.2f})。"
                   f"**この行は調査中で、基準値として使わない。**照合しない")
             continue
-        if b["estimator"] != estimator or b["trials"] != e["trials"]:
+        if b["estimator"] != estimator:
             ng.append((p, case,
-                       f"推定量か試行回数が記録と違う"
-                       f"(記録 {b['estimator']}/{b['trials']} 回 / "
-                       f"今回 {estimator}/{e['trials']} 回)。"
-                       f"**最小値は試行回数を増やすと系統的に下がるので、"
+                       f"推定量が記録と違う(記録 {b['estimator']} / "
+                       f"今回 {estimator})。**推定量が違う値は比較できない。**"
+                       f"校正点を外す推定量もある"
+                       f"(tools/bench/bench_calibration.tsv)"))
+            continue
+        # **試行回数に系統的に依存する推定量だけ、回数の一致も要求する。**
+        # 最小値・最大値は回数を増やすと系統的に下がる/上がるので、
+        # 3 回の最小値と 10 回の最小値は別の量である。
+        # 中央値は回数に系統的に依存しないので、回数が違っても比較できる
+        if estimator in TRIALS_DEPENDENT and b["trials"] != e["trials"]:
+            ng.append((p, case,
+                       f"試行回数が記録と違う(記録 {b['trials']} 回 / "
+                       f"今回 {e['trials']} 回)。**推定量 {estimator} は"
+                       f"試行回数を増やすと系統的にずれるので、"
                        f"回数が違う値は比較できない**"))
             continue
+        if b["trials"] != e["trials"]:
+            warn.append((p, case,
+                         f"試行回数が記録と違う(記録 {b['trials']} 回 / "
+                         f"今回 {e['trials']} 回)。{estimator} は回数に系統的には"
+                         f"依存しないので比較はしたが、ばらつきの幅は変わる"))
         if b["n"] != e["n"]:
             ng.append((p, case,
                        f"N が記録と違う(記録 {b['n']} / 今回 {e['n']})。"
@@ -234,7 +338,10 @@ def check(g, base, estimator, tight_band, verdict):
         if abs(diff) <= b["band"]:
             print(f"[OK] {p}/{case}: {med:.2f} (記録 {b['value']:.2f} "
                   f"±{b['band']:.2f}, 差 {diff:+.2f})")
-            if e["trials"] >= 3 and abs(diff) > tight_band:
+            # 細い帯は、その行の帯より細いときだけ意味がある
+            # (C 行は帯 0.50 なので 7.00 の細い帯は発火しない)
+            if (e["trials"] >= 3 and tight_band < b["band"]
+                    and abs(diff) > tight_band):
                 warn.append((p, case,
                              f"{med:.2f} (記録 {b['value']:.2f}, 差 {diff:+.2f})"
                              f" -- 既定の帯 ±{b['band']:.2f} には収まるが、"
@@ -292,10 +399,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True)
     ap.add_argument("--baseline")
-    ap.add_argument("--estimator", default="min3",
-                    choices=["min3", "median3", "minend3"],
-                    help="記録・照合に使う推定量(既定 min3)。"
-                         "**どれを選んでも 3 つとも出力に出る**")
+    ap.add_argument("--estimator", default="median",
+                    choices=ESTIMATOR_NAMES,
+                    help="記録・照合に使う推定量(既定 median)。"
+                         "**どれを選んでも 5 つとも出力に出る。**"
+                         "校正点(c/for の真値 4.000)を外す推定量を選ぶと落ちる")
     ap.add_argument("--no-check", action="store_true",
                     help="集計だけして記録値との照合をしない(基準値を取り直すとき)")
     ap.add_argument("--tight-band", type=float, default=7.0,
@@ -308,6 +416,10 @@ def main():
                          "本来ちょうど 0 になる")
     ap.add_argument("--no-eval-gate", action="store_true",
                     help="os_eval のゲートを外す(**陽性対照専用**)")
+    ap.add_argument("--calibration", default="tools/bench/bench_calibration.tsv",
+                    help="真の値が分かっている行(校正点)の表")
+    ap.add_argument("--no-calibration", action="store_true",
+                    help="校正点の検査を省く(**推定量の比較実験専用**)")
     args = ap.parse_args()
 
     rows = read_results(args.results)
@@ -316,6 +428,17 @@ def main():
     g = group(rows)
 
     print_measured(g, args.estimator)
+
+    cal_rc = 0
+    if not args.no_calibration:
+        try:
+            cal = read_calibration(args.calibration)
+        except FileNotFoundError:
+            print()
+            print(f"(校正点の表 {args.calibration} が無い)")
+            cal = {}
+        cal_rc = check_calibration(g, cal, args.estimator)
+
     verdict = print_eval(g, args.eval_tol)
     if args.no_eval_gate:
         print()
@@ -335,9 +458,9 @@ def main():
                 print(f"[NG] {p}/{case}: 反復ごとに os_eval へ落ちている"
                       f"(傾き {verdict[(p, case)][1]:+.3f} 命令/反復)")
             return 1
-        return 0
+        return cal_rc
     return check(g, read_baseline(args.baseline), args.estimator,
-                 args.tight_band, verdict)
+                 args.tight_band, verdict) or cal_rc
 
 
 if __name__ == "__main__":

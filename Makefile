@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync test-qemu-bench-jit test-qemu-jit-bench
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator test-qemu-bench-jit test-qemu-jit-bench
 
 all: build
 
@@ -294,8 +294,16 @@ check-eval-error-budget:
 check-bench-jit-sync:
 	@tools/bench/check_bench_jit_sync.sh
 
+# [性能測定] **推定量の検査。**QEMU を起動しないので make test の前提に入れてある。
+# 真の値が分かっている行(c/for = 4.000。逆アセンブルで確定)を 5 回測った
+# 固定資料に対して、既定の推定量が真値に入ること(陰性対照)と、
+# **min 系の推定量が落ちること**(陽性対照)を見る。
+# documents/performance-measurement.md「推定量を校正点で決めた」節
+check-estimator:
+	@tools/bench/check_estimator.sh
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: check-eval-error-budget check-bench-jit-sync $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-eval-error-budget check-bench-jit-sync check-estimator $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
@@ -940,7 +948,8 @@ $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 # src/lisp/bench_aot.lispの同等Lispコード(AOTトランスパイル済み)を、構文
 # カテゴリごとに1対1で命令数比較する。ケースごとに別々のQEMU起動が必要
 # (total_insnsはブート全体の合計しか得られないため)なので起動を分ける。
-# **既定で 3 回繰り返す**(BENCH_REPEAT=3)ので 121 回起動する。
+# **既定で 3 回繰り返す**(BENCH_REPEAT=3)ので 121 回起動し、
+# **実測 約 50 分**(2026-10-02。C 版の N を 200,000,000 にしたぶん伸びた)。
 # test-qemu-perf等と同じくローカル専用でCIには含めない。
 # **AOT経路とC実装しか測らない。**JIT経路は test-qemu-jit-bench。
 #
@@ -949,11 +958,19 @@ $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 #   ゲート2 **os_eval 区間の命令数の N に対する傾きが 0 であること**
 #           (反復ごとにインタプリタへ落ちていたら、その数字は AOT でも C でもない)
 # transpile.lisp/生成コードを変更した後に再実行して、構文単位の改善/退行を追う
-BENCH_N_C ?= 10000000
+# [性能測定] **C 版の N は 10,000,000 では足りなかった。**
+# 1 ブートあたり 11〜31M 命令のぶれ(ホスト時間に依存するポーリング回数の差)を
+# 2N で割った 1.4〜2.6 命令/単位が、C の値そのもの(4〜17)と同じ桁になり、
+# 校正点 c/for(真値 4.000。逆アセンブルで確定)が 2.44 と出ていた。
+# 200,000,000 なら 0.03〜0.08 まで下がり、実測で median が 3.9996 になる。
+# cons だけは N に比例して cons を確保するので上げられない(GC が支配的になる)。
+# documents/performance-measurement.md「推定量を校正点で決めた」節
+BENCH_N_C ?= 200000000
+BENCH_N_C_CONS ?= 10000000
 BENCH_N_AOT ?= 1000000
 
 test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
-	BENCH_N_C=$(BENCH_N_C) BENCH_N_AOT=$(BENCH_N_AOT) tools/bench/run_construct_bench.sh
+	BENCH_N_C=$(BENCH_N_C) BENCH_N_C_CONS=$(BENCH_N_C_CONS) BENCH_N_AOT=$(BENCH_N_AOT) tools/bench/run_construct_bench.sh
 
 # [性能測定] JIT 経路の構文別ベンチマーク(documents/performance-measurement.md
 # 「JIT 経路の基準値」節)。**test-qemu-construct-bench は AOT 経路と C 実装しか

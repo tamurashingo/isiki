@@ -35,11 +35,24 @@
 
 set -eu
 
-N_C="${BENCH_N_C:-10000000}"
+# [性能測定] **C 版の N は 10,000,000 では足りなかった。**
+# 1 ブートあたり 11〜31M 命令のぶれ(ホスト時間に依存するポーリング回数の差。
+# ゲストの状態はビット単位で同一)を 2N で割った 1.4〜2.6 命令/単位が、
+# **C の値そのもの(4〜17)と同じ桁**になる。校正点 c/for(真値 4.000)が
+# 2.44 と出ていたのはこれが原因である。
+# N=200,000,000 なら 0.03〜0.08 まで下がり、実測で median が 3.9996 になる。
+# documents/performance-measurement.md「推定量を校正点で決めた」節。
+N_C="${BENCH_N_C:-200000000}"
+# cons だけは N に比例して cons を確保するので上げられない(GC が支配的になる)
+N_C_CONS="${BENCH_N_C_CONS:-10000000}"
 N_AOT="${BENCH_N_AOT:-1000000}"
+
+c_n_for() {
+    if [ "$1" = "cons" ]; then echo "$N_C_CONS"; else echo "$N_C"; fi
+}
 CASES="${BENCH_CASES:-loop arith tailrec nontailrec branch let cons for vector funcall}"
 REPEAT="${BENCH_REPEAT:-3}"
-ESTIMATOR="${BENCH_ESTIMATOR:-min3}"
+ESTIMATOR="${BENCH_ESTIMATOR:-median}"
 EVAL_TOL="${BENCH_EVAL_TOL:-0.5}"
 BASELINE="${BENCH_BASELINE:-tools/bench/bench_baseline.tsv}"
 
@@ -93,28 +106,29 @@ write_milestone() {
 write_milestone ""
 bench_init_eval_range "$NM_FILE" "$MILESTONE"
 
-echo "=== 構文別ベンチマーク(傾き法): N(C版)=$N_C/${N_C}x3  N(AOT版)=$N_AOT/${N_AOT}x3  繰り返し=$REPEAT ==="
+echo "=== 構文別ベンチマーク(傾き法): N(C版)=$N_C(cons は $N_C_CONS)  N(AOT版)=$N_AOT  繰り返し=$REPEAT  推定量=$ESTIMATOR ==="
 
 : > "$RESULT_TSV"
 r=1
 while [ "$r" -le "$REPEAT" ]; do
     for c in $CASES; do
         n_aot_c=$(aot_n_for "$c")
+        n_c_c=$(c_n_for "$c")
         echo "--- [$r] $c ---"
         # [性能測定] 1 行 1 測定の統一形式
         # (経路 カテゴリ 繰り返し N lo hi lo_eval hi_eval)で書く。
         # 集計と記録値との照合は tools/bench/check_bench_baseline.py が JIT 側の
         # ドライバと共通で行う。**数字に経路を持たせること**が issue #114 の
         # 再発防止の要点なので、形式を分けない
-        write_milestone "(%%bench-c-$c $N_C)"
-        set -- $(bench_run "$MILESTONE" "path=c case=$c n=$N_C");           c_lo=$1; c_lo_ev=$2
-        write_milestone "(%%bench-c-$c $((N_C * 3)))"
-        set -- $(bench_run "$MILESTONE" "path=c case=$c n=$((N_C * 3))");   c_hi=$1; c_hi_ev=$2
+        write_milestone "(%%bench-c-$c $n_c_c)"
+        set -- $(bench_run "$MILESTONE" "path=c case=$c n=$n_c_c");           c_lo=$1; c_lo_ev=$2
+        write_milestone "(%%bench-c-$c $((n_c_c * 3)))"
+        set -- $(bench_run "$MILESTONE" "path=c case=$c n=$((n_c_c * 3))");   c_hi=$1; c_hi_ev=$2
         write_milestone "(%%bench-aot-$c $n_aot_c)"
         set -- $(bench_run "$MILESTONE" "path=aot case=$c n=$n_aot_c");     a_lo=$1; a_lo_ev=$2
         write_milestone "(%%bench-aot-$c $((n_aot_c * 3)))"
         set -- $(bench_run "$MILESTONE" "path=aot case=$c n=$((n_aot_c * 3))"); a_hi=$1; a_hi_ev=$2
-        printf 'c\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n'   "$c" "$r" "$N_C"     "$c_lo" "$c_hi" "$c_lo_ev" "$c_hi_ev" >> "$RESULT_TSV"
+        printf 'c\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n'   "$c" "$r" "$n_c_c"     "$c_lo" "$c_hi" "$c_lo_ev" "$c_hi_ev" >> "$RESULT_TSV"
         printf 'aot\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$r" "$n_aot_c" "$a_lo" "$a_hi" "$a_lo_ev" "$a_hi_ev" >> "$RESULT_TSV"
         echo "[$r] $c: C $c_lo -> $c_hi / AOT $a_lo -> $a_hi   os_eval C $c_lo_ev->$c_hi_ev AOT $a_lo_ev->$a_hi_ev"
     done
