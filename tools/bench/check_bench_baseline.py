@@ -132,10 +132,11 @@ def print_cross(g):
         print(f"| {case} | {cs} | {as_} | {js} | {ac} | {jd} | {ja} |")
 
 
-def check(g, base):
+def check(g, base, tight_band):
     print()
     print("=== 記録値との照合(検出器、双方向) ===")
     ng = []
+    warn = []
     for (p, case) in sorted(g):
         b = base.get((p, case))
         s = [x["slope"] for x in g[(p, case)]]
@@ -154,6 +155,15 @@ def check(g, base):
         if abs(diff) <= b["band"]:
             print(f"[OK] {p}/{case}: {med:.2f} (記録 {b['value']:.2f} "
                   f"±{b['band']:.2f}, 差 {diff:+.2f})")
+            # 繰り返しが 3 回以上あるときは中央値が 1 発の外れ値に強いので、
+            # **もっと細い帯でも見る。落とさずに警告する**(規則 6/8)。
+            # 既定の帯(1 回測定でも誤報しない幅)では、+2.6% のような
+            # 小さな退行(PR #113 が報告した tailrec/for の悪化)が通ってしまう
+            if len(s) >= 3 and abs(diff) > tight_band:
+                warn.append((p, case,
+                             f"{med:.2f} (記録 {b['value']:.2f}, 差 {diff:+.2f})"
+                             f" -- 既定の帯 ±{b['band']:.2f} には収まるが、"
+                             f"3 回測定の分解能 ±{tight_band:.2f} を超えている"))
         else:
             direction = "遅くなった" if diff > 0 else "**速くなった**"
             ng.append((p, case,
@@ -166,9 +176,16 @@ def check(g, base):
             print(f"[未測定] {key[0]}/{key[1]}: 記録 {base[key]['value']:.2f} "
                   f"(この実行では測っていない)")
 
+    if warn:
+        print()
+        print("--- 注意(落としはしない) ---")
+        for p, case, msg in warn:
+            print(f"[注意] {p}/{case}: {msg}")
+        print("もう一度測って再現するなら、記録を見直すこと(規則 4)。")
+
     if not ng:
         print()
-        print("検出器: 記録値からのずれはありません。")
+        print("検出器: 既定の帯を超えたずれはありません。")
         return 0
 
     print()
@@ -199,6 +216,9 @@ def main():
     ap.add_argument("--baseline")
     ap.add_argument("--no-check", action="store_true",
                     help="集計だけして記録値との照合をしない(基準値を取り直すとき)")
+    ap.add_argument("--tight-band", type=float, default=3.0,
+                    help="繰り返しが 3 回以上あるときに追加で見る細い帯"
+                         "(既定 3.0 命令/単位)。超えても落とさず警告する")
     args = ap.parse_args()
 
     rows = read_results(args.results)
@@ -214,7 +234,7 @@ def main():
         print()
         print("(--no-check: 記録値との照合をしていません)")
         return 0
-    return check(g, read_baseline(args.baseline))
+    return check(g, read_baseline(args.baseline), args.tight_band)
 
 
 if __name__ == "__main__":

@@ -67,6 +67,18 @@ guard_fns_for() {
     esac
 }
 
+# ゲストが起動に失敗した回数。**隠さず数えて最後に出す。**
+# 2026-10-02 の測定中に 1 回だけ、aot/let の N=3,000,000 が
+# total_insns=1,104,582,976(素のブートより少ない)で終わり test-results.txt を
+# 1 行も作らずに落ちた。同じケースを単独で測り直したら 804 tick で正常に完走し、
+# 再現しなかった。**ブートの途中で落ちているので、これは測定値ではない。**
+# ここで黙って再試行すると「たまに落ちる」という事実が消えるので、
+# 落ちたことを出力に残したうえで 1 回だけやり直す
+# run_case は $(...) の中で呼ばれるのでサブシェルになる。シェル変数では
+# 親に数が戻らないため、ファイルへ 1 行ずつ追記して数える
+FLAKE_LOG="tmp/bench_jit_flakes.txt"
+: > "$FLAKE_LOG"
+
 # $1: 経路(aot|jit)  $2: カテゴリ  $3: N  -> total_insns を標準出力へ
 run_case() {
     local p="$1" c="$2" n="$3"
@@ -92,20 +104,28 @@ run_case() {
         echo '(close *isiki-test-stream*)'
     } > "$MILESTONE"
 
-    local out insns
-    # make 側が " 0 failed" を grep するので、guard が落ちればここで失敗する
-    if ! out=$(make test-qemu-instcount MILESTONE="$MILESTONE" 2>&1); then
-        echo "ERROR: 測定が失敗しました (path=$p case=$c n=$n)" >&2
-        echo "$out" | tail -25 >&2
-        exit 1
-    fi
-    insns=$(echo "$out" | sed -n 's/.*\[isiki_instcount\] total_insns=\([0-9]*\).*/\1/p' | tail -1)
-    if [ -z "$insns" ]; then
-        echo "ERROR: total_insns を取得できませんでした (path=$p case=$c n=$n)" >&2
-        echo "$out" | tail -25 >&2
-        exit 1
-    fi
-    echo "$insns"
+    local out insns attempt
+    attempt=1
+    while : ; do
+        # make 側が " 0 failed" を grep するので、**guard が落ちればここで失敗する**
+        # (JIT に乗っていないカテゴリの数字は 1 つも出ない)
+        if out=$(make test-qemu-instcount MILESTONE="$MILESTONE" 2>&1); then
+            insns=$(echo "$out" | sed -n 's/.*\[isiki_instcount\] total_insns=\([0-9]*\).*/\1/p' | tail -1)
+            if [ -n "$insns" ]; then
+                echo "$insns"
+                return 0
+            fi
+        fi
+        if [ "$attempt" -ge 2 ]; then
+            echo "ERROR: 測定が 2 回失敗しました (path=$p case=$c n=$n)。測定を中止します" >&2
+            echo "$out" | tail -25 >&2
+            exit 1
+        fi
+        echo "path=$p case=$c n=$n" >> "$FLAKE_LOG"
+        echo "[FLAKE] path=$p case=$c n=$n: 1 回目が失敗したのでやり直します" >&2
+        echo "$out" | sed -n 's/.*\(total_insns=[0-9]*\).*/        \1/p' | tail -1 >&2
+        attempt=$((attempt + 1))
+    done
 }
 
 # [性能測定] **ビルド直後の初回実行は命令数が約 118M(≒10%)多い。**
@@ -131,6 +151,14 @@ while [ "$r" -le "$REPEAT" ]; do
 done
 
 echo
+flakes=$(wc -l < "$FLAKE_LOG")
+if [ "$flakes" -gt 0 ]; then
+    echo "*** 注意: ゲストの起動が $flakes 回失敗し、やり直しています:"
+    sed 's/^/***   /' "$FLAKE_LOG"
+    echo "***       測定条件ではなく処理系側の問題の可能性がある。"
+    echo
+fi
+
 if [ "${BENCH_NO_CHECK:-0}" = "1" ]; then
     python3 tools/bench/check_bench_baseline.py --results "$RESULT_TSV" --no-check
 else
