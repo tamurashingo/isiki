@@ -59,3 +59,29 @@
         (finish-output *isiki-test-stream*)
         nil)
     t))
+
+;; ---------------------------------------------------------------------------
+;; [性能測定] 1 反復あたりの確保量(byte)。
+;;
+;; **同じ S 式でも、経路によって展開形が違うことがある。**
+;; その差は命令数より確保量にきれいに出る(確保量はこの環境でぶれない計器。規則 9)。
+;; documents/performance-measurement.md「for の 2.6 倍の切り分け」A-4。
+;;
+;; N1 回と N2 回を続けて実行し、確保量の差を (N2 - N1) で割る。
+;; 固定費は両方に等しく乗るので引き算で消える(命令数の傾き法と同じ考え方)。
+;;
+;; **GC が走ったら無効。** GC は確保量を減らすので、傾きが負や 0 に化ける。
+;; 走ったら -1 を返す(呼び出し側のアサーションが落ちる)ので、
+;; **黙って嘘の 0 を返すことはない。** N は GC が走らない範囲で選ぶこと
+;; (実測: %%bench-jit-for は 60,000 反復で約 1.9MB、GC 0 回)
+(defun bench-jit-alloc-per-iter (f n1 n2)
+  (let ((g0 (%%gc-collect-count)) (a0 (%%heap-used-bytes)))
+    (progn
+      (funcall f n1)
+      (let ((a1 (%%heap-used-bytes)))
+        (progn
+          (funcall f n2)
+          (let ((a2 (%%heap-used-bytes)) (g1 (%%gc-collect-count)))
+            (if (= g0 g1)
+                (div (- (- a2 a1) (- a1 a0)) (- n2 n1))
+              -1)))))))
