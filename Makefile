@@ -939,8 +939,9 @@ $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 # 「構文別ベンチマークスイート」節)。src/c/bench_subprimitive.cの素のC実装と
 # src/lisp/bench_aot.lispの同等Lispコード(AOTトランスパイル済み)を、構文
 # カテゴリごとに1対1で命令数比較する。ケースごとに別々のQEMU起動が必要
-# (total_insnsはブート全体の合計しか得られないため)なので21回起動し、
-# 10〜20分程度かかる。test-qemu-perf等と同じくローカル専用でCIには含めない。
+# (total_insnsはブート全体の合計しか得られないため)なので41回起動し、
+# **実測 約 7 分**(2026-10-02)。test-qemu-perf等と同じくローカル専用でCIには含めない。
+# **AOT経路とC実装しか測らない。**JIT経路は test-qemu-jit-bench。
 # transpile.lisp/生成コードを変更した後に再実行して、構文単位の改善/退行を追う
 BENCH_N_C ?= 10000000
 BENCH_N_AOT ?= 1000000
@@ -953,11 +954,15 @@ test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
 # 測っていない。** defun した関数(型特化・インライン・declaim が効く経路)は
 # こちらで測る。同じ N・同じ傾き法で AOT 版も測るので、AOT と JIT の差が
 # そのまま出る。6 カテゴリ x 2 経路 x 2 点 + ウォームアップで 25 起動、
-# 1 起動が約 7 秒なので 3 分程度。test-qemu-perf 等と同じくローカル専用。
+# **実測 約 5 分**(BENCH_REPEAT=3 なら 73 起動で **約 14 分**。
+# 2026-10-02、KVM 無しの TCG)。test-qemu-perf 等と同じくローカル専用。
 #
 # **測定の前に %%za-compiled-p が T であることを assert する。**T でなければ
 # そのカテゴリを測定せずに落ちる(test/lisp/bench_jit_guard.lisp)。
-# 1 回あたりの分解能を測り直すときは BENCH_REPEAT=3 を付ける
+#
+# **1 回測定の分解能は ±15 命令/単位しかない**(3 回測定の中央値なら ±2)。
+# +2.6% 程度の小さな差を見たいときは BENCH_REPEAT=3 を付けること
+# (documents/performance-measurement.md「1 回あたりの分解能」)
 BENCH_N_JIT ?= 1000000
 
 test-qemu-jit-bench: $(INSTCOUNT_PLUGIN) build
