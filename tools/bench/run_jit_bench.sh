@@ -53,7 +53,7 @@ N="${BENCH_N:-1000000}"
 CASES="${BENCH_CASES:-loop arith tailrec let for funcall}"
 PATHS="${BENCH_PATHS:-aot jit}"
 REPEAT="${BENCH_REPEAT:-3}"
-ESTIMATOR="${BENCH_ESTIMATOR:-min3}"
+ESTIMATOR="${BENCH_ESTIMATOR:-median}"
 EVAL_TOL="${BENCH_EVAL_TOL:-0.5}"
 BASELINE="${BENCH_BASELINE:-tools/bench/bench_baseline.tsv}"
 
