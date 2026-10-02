@@ -939,9 +939,15 @@ $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 # 「構文別ベンチマークスイート」節)。src/c/bench_subprimitive.cの素のC実装と
 # src/lisp/bench_aot.lispの同等Lispコード(AOTトランスパイル済み)を、構文
 # カテゴリごとに1対1で命令数比較する。ケースごとに別々のQEMU起動が必要
-# (total_insnsはブート全体の合計しか得られないため)なので41回起動し、
-# **実測 約 7 分**(2026-10-02)。test-qemu-perf等と同じくローカル専用でCIには含めない。
+# (total_insnsはブート全体の合計しか得られないため)なので起動を分ける。
+# **既定で 3 回繰り返す**(BENCH_REPEAT=3)ので 121 回起動する。
+# test-qemu-perf等と同じくローカル専用でCIには含めない。
 # **AOT経路とC実装しか測らない。**JIT経路は test-qemu-jit-bench。
+#
+# **測定前に 2 つのゲートを通す。**どちらが落ちても測定値を 1 つも出さない:
+#   ゲート1 Lisp 側のアサーション(" 0 failed" の grep で落ちる)
+#   ゲート2 **os_eval 区間の命令数の N に対する傾きが 0 であること**
+#           (反復ごとにインタプリタへ落ちていたら、その数字は AOT でも C でもない)
 # transpile.lisp/生成コードを変更した後に再実行して、構文単位の改善/退行を追う
 BENCH_N_C ?= 10000000
 BENCH_N_AOT ?= 1000000
@@ -953,16 +959,21 @@ test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
 # 「JIT 経路の基準値」節)。**test-qemu-construct-bench は AOT 経路と C 実装しか
 # 測っていない。** defun した関数(型特化・インライン・declaim が効く経路)は
 # こちらで測る。同じ N・同じ傾き法で AOT 版も測るので、AOT と JIT の差が
-# そのまま出る。6 カテゴリ x 2 経路 x 2 点 + ウォームアップで 25 起動、
-# **実測 約 5 分**(BENCH_REPEAT=3 なら 73 起動で **約 14 分**。
-# 2026-10-02、KVM 無しの TCG)。test-qemu-perf 等と同じくローカル専用。
+# そのまま出る。6 カテゴリ x 2 経路 x 2 点 x **3 回**(BENCH_REPEAT の既定)
+# + ウォームアップで 73 起動、**実測 約 14 分**(2026-10-02、KVM 無しの TCG)。
+# test-qemu-perf 等と同じくローカル専用。
 #
-# **測定の前に %%za-compiled-p が T であることを assert する。**T でなければ
-# そのカテゴリを測定せずに落ちる(test/lisp/bench_jit_guard.lisp)。
+# **測定の前に 2 つのゲートを通す。**どちらが落ちても測定値を 1 つも出さない:
+#   ゲート1 %%za-compiled-p が T であること(test/lisp/bench_jit_guard.lisp)
+#   ゲート2 **os_eval 区間の命令数の N に対する傾きが 0 であること**
+#           (%%za-compiled-p が T でも、本体が全部ネイティブで走るとは限らない)
+# ゲート2 の陽性対照:
+#   BENCH_PATHS=jit BENCH_CASES=evalfall BENCH_REPEAT=1 BENCH_NO_CHECK=1 \
+#     make test-qemu-jit-bench        -> ゲート2 が落ちる
 #
-# **1 回測定の分解能は ±15 命令/単位しかない**(3 回測定の中央値なら ±2)。
-# +2.6% 程度の小さな差を見たいときは BENCH_REPEAT=3 を付けること
-# (documents/performance-measurement.md「1 回あたりの分解能」)
+# **記録する推定量は 3 回の最小値(min3)。試行回数を変えたら記録値は全部無効に
+# なる**(最小値は回数を増やすと系統的に下がる)。推定量は出力に 3 つとも出る
+# (documents/performance-measurement.md「推定量を『3 回の最小値』にした」)
 BENCH_N_JIT ?= 1000000
 
 test-qemu-jit-bench: $(INSTCOUNT_PLUGIN) build

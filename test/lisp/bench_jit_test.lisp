@@ -96,6 +96,36 @@
 ;; 余裕のある 20 段で「JIT の非末尾再帰が動くこと」だけを固定する
 (assert-equal 210 (%%bench-jit-nontailrec-step 20))
 
+
+;;; --- 2c. for は AOT と JIT で展開形が違う(記録として固定する) ---
+;; [性能測定] documents/performance-measurement.md「for の 2.6 倍の切り分け」。
+;;
+;; init.lisp の for は毎反復 (list step1 step2) を作る**旧展開形**のままで、
+;; transpile.lisp の expand-for は一時変数+素の setq の**新展開形**である。
+;; したがって %%bench-jit-for と %%bench-aot-for は**同じ S 式だが別のコード**で、
+;; 命令数を比べても意味が無い(bench_baseline.tsv では for の帯を "-" にして
+;; 検出器の対象から外してある)。
+;;
+;; 差は確保量にそのまま出る。確保量はこの環境で**ぶれない計器**である(規則 9)。
+;;
+;; **この 2 行は「直ったら落ちる」テストである。**
+;; init.lisp の for を expand-for と同じ形へ移植したら 32 が 0 になって落ちる。
+;; そのときは:
+;;   1. ここの期待値を 0 にする
+;;   2. tools/bench/bench_baseline.tsv の for 2 行の帯を "-" から戻し、測り直す
+;;   3. documents/jit-unsupported-syntax.md の for の行を「乗るもの」へ移す
+;;   4. transpile.lisp:721 の「init.lisp の defmacro for/while と同じ展開規則」が
+;;      **そこで初めて本当になる**
+;;
+;; ついでに ide.lisp:40-45 が記録している「for マクロは GC が特定のタイミングで
+;; 走ると以後永久に結果が壊れる」既知のバグも、原因(ループ本体に毎回新規生成
+;; される let)が同じなので、インタプリタと JIT の経路には**まだ残っている**
+(assert-equal 32 (bench-jit-alloc-per-iter (function %%bench-jit-for) 20000 60000))
+(assert-equal 0  (bench-jit-alloc-per-iter (function %%bench-aot-for) 20000 60000))
+;; 対照: 確保しない構文では両経路とも 0(計器が「0 以外」を出す側に偏っていない)
+(assert-equal 0  (bench-jit-alloc-per-iter (function %%bench-jit-loop) 20000 60000))
+(assert-equal 0  (bench-jit-alloc-per-iter (function %%bench-aot-loop) 20000 60000))
+
 ;;; --- 3. Immobilized Space の消費 ---
 ;; [性能測定] defun ごとの Immobilized Space 消費は既知の未解決課題
 ;; (documents/investigation-defun-page-cost.md)。bench_jit.lisp の 20 個の

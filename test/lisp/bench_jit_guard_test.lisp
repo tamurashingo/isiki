@@ -58,3 +58,21 @@
 (assert-equal 1 bench-jit-fail-delta)
 ;; 後始末が効いていること
 (assert-equal t (bench-jit-guard-gate))
+
+;;; --- ゲート2(os_eval へ落ちていないこと)の陽性対照 ---
+;; [性能測定] documents/performance-measurement.md「インタプリタ落ちの検出器」。
+;;
+;; **ゲート1 とゲート2 は別物なので、対照も別に要る。**
+;; 上の bench-jit-not-compiled-loop は**ゲート1 で落ちる**ので、
+;; 「%%za-compiled-p が T なのに本体がインタプリタへ落ちる」ことの対照にならない。
+;;
+;; test/lisp/bench_jit_eval_control.lisp が、**ゲート1 を通ってゲート2 で落ちる**
+;; 形を持っている。ここではその形が意図どおりであることだけを固定する
+;; (ゲート2 自体はホスト側で os_eval 区間の傾きを見るので、落ちるところは
+;;  ドライバで確認する。実測 +533.000 命令/反復)。
+(assert-equal t   (%%za-compiled-p (function %%bench-jit-evalfall)))
+(assert-equal nil (%%za-compiled-p (function %%bench-eval-callee)))
+;; 対照群は嘘をついていてはならない(規則 5)。
+;; 計算は %%bench-jit-funcall と同じ(acc を n 回 1 増やす)である
+(assert-equal 2000 (%%bench-jit-evalfall 2000))
+(assert-equal (%%bench-jit-funcall 2000) (%%bench-jit-evalfall 2000))
