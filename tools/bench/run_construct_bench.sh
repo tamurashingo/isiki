@@ -4,8 +4,13 @@
 #
 # src/c/bench_subprimitive.c の %%BENCH-C-* と src/lisp/bench_aot.lisp の
 # %%bench-aot-* を、同じ命令数計測基盤(TCGプラグイン)で1ケースずつ別々に
-# QEMU起動して測り、boot-onlyベースラインとの差分から「仕事1単位あたりの
-# 命令数」を求めて比(AOT版 ÷ C版)を出す。
+# QEMU起動して測り、傾き法で「仕事1単位あたりの命令数」を求めて
+# 比(AOT版 ÷ C版)を出す。
+#
+# **このスクリプトは AOT 経路と C 実装しか測らない。**
+# defun した関数(型特化・インライン・declaim が効く経路)は JIT 経路で、
+# tools/bench/run_jit_bench.sh が測る。経路を混同すると issue #114 と同じ
+# 事故になる(名前にしか書かれていない事実は、記録されていない)。
 #
 # 1回のQEMU起動で得られるのはtotal_insns(ブート全体の合計)だけなので、
 # ケースごとに起動を分ける。
@@ -18,6 +23,11 @@
 # 「consが半減した」という誤った結論を出したりしていた。
 # この方法なら「適正Nをカテゴリごとに決める」問題自体が消える(固定コストは
 # 切片に入り傾きには乗らない)。
+#
+# [性能測定] 集計と**記録値からのずれの検出**は tools/bench/
+# check_bench_baseline.py が行う(JIT 側のドライバと共通)。
+# 記録値は tools/bench/bench_baseline.tsv。帯を超えたら上下どちらでも落ちる。
+# BENCH_NO_CHECK=1 で照合を省ける(基準値を取り直すときだけ)。
 
 set -eu
 
@@ -84,22 +94,19 @@ for c in $CASES; do
     c_hi=$(run_case "(%%bench-c-$c $((N_C * 3)))")
     a_lo=$(run_case "(%%bench-aot-$c $n_aot_c)")
     a_hi=$(run_case "(%%bench-aot-$c $((n_aot_c * 3)))")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$c_lo" "$c_hi" "$a_lo" "$a_hi" "$N_C" "$n_aot_c" >> "$RESULT_TSV"
+    # [性能測定] 1 行 1 測定の統一形式(経路 カテゴリ 繰り返し N lo hi)で書く。
+    # 集計と記録値との照合は tools/bench/check_bench_baseline.py が JIT 側の
+    # ドライバ(run_jit_bench.sh)と共通で行う。**数字に経路を持たせること**が
+    # issue #114 の再発防止の要点なので、形式を分けない
+    printf 'c\t%s\t1\t%s\t%s\t%s\n' "$c" "$N_C" "$c_lo" "$c_hi" >> "$RESULT_TSV"
+    printf 'aot\t%s\t1\t%s\t%s\t%s\n' "$c" "$n_aot_c" "$a_lo" "$a_hi" >> "$RESULT_TSV"
     echo "$c: C $c_lo -> $c_hi / AOT $a_lo -> $a_hi"
 done
 
-python3 - "$RESULT_TSV" << 'PYEOF2'
-import sys
-rows = []
-for line in open(sys.argv[1]):
-    name, c_lo, c_hi, a_lo, a_hi, n_c, n_aot = line.split()
-    per_c = (int(c_hi) - int(c_lo)) / (2 * int(n_c))
-    per_aot = (int(a_hi) - int(a_lo)) / (2 * int(n_aot))
-    rows.append((name, per_c, per_aot, per_aot / per_c if per_c > 0 else float('inf')))
-rows.sort(key=lambda r: -r[2])
-print()
-print("| カテゴリ | C版(命令/単位) | AOT版(命令/単位) | 比(AOT/C) |")
-print("|---|---|---|---|")
-for name, pc, pa, ratio in rows:
-    print(f"| {name} | {pc:.2f} | {pa:.2f} | {ratio:.1f}x |")
-PYEOF2
+echo
+if [ "${BENCH_NO_CHECK:-0}" = "1" ]; then
+    python3 tools/bench/check_bench_baseline.py --results "$RESULT_TSV" --no-check
+else
+    python3 tools/bench/check_bench_baseline.py --results "$RESULT_TSV" \
+        --baseline "${BENCH_BASELINE:-tools/bench/bench_baseline.tsv}"
+fi

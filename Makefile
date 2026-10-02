@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync test-qemu-bench-jit test-qemu-jit-bench
 
 all: build
 
@@ -287,8 +287,15 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 check-eval-error-budget:
 	@python3 tools/check_eval_error_budget.py
 
+# [性能測定] src/lisp/bench_jit.lisp が真実源(src/lisp/bench_aot.lisp)から
+# 生成したものと一致していることを固定する。ベンチ本体の S 式が AOT 版と
+# JIT 版で食い違うと、2 つの経路の命令数を比べた数字に意味が無くなる。
+# 数秒で終わるホスト側の検査なので make test の前提に入れてある
+check-bench-jit-sync:
+	@tools/bench/check_bench_jit_sync.sh
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: check-eval-error-budget $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-eval-error-budget check-bench-jit-sync $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
@@ -751,6 +758,7 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
+	$(MAKE) test-qemu-bench-jit
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
@@ -939,6 +947,29 @@ BENCH_N_AOT ?= 1000000
 
 test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
 	BENCH_N_C=$(BENCH_N_C) BENCH_N_AOT=$(BENCH_N_AOT) tools/bench/run_construct_bench.sh
+
+# [性能測定] JIT 経路の構文別ベンチマーク(documents/performance-measurement.md
+# 「JIT 経路の基準値」節)。**test-qemu-construct-bench は AOT 経路と C 実装しか
+# 測っていない。** defun した関数(型特化・インライン・declaim が効く経路)は
+# こちらで測る。同じ N・同じ傾き法で AOT 版も測るので、AOT と JIT の差が
+# そのまま出る。6 カテゴリ x 2 経路 x 2 点 + ウォームアップで 25 起動、
+# 1 起動が約 7 秒なので 3 分程度。test-qemu-perf 等と同じくローカル専用。
+#
+# **測定の前に %%za-compiled-p が T であることを assert する。**T でなければ
+# そのカテゴリを測定せずに落ちる(test/lisp/bench_jit_guard.lisp)。
+# 1 回あたりの分解能を測り直すときは BENCH_REPEAT=3 を付ける
+BENCH_N_JIT ?= 1000000
+
+test-qemu-jit-bench: $(INSTCOUNT_PLUGIN) build
+	BENCH_N=$(BENCH_N_JIT) tools/bench/run_jit_bench.sh
+
+# [性能測定] JIT 経路のベンチの正当性テスト(数秒)。
+#   - 測定対象が JIT に乗っていること(%%za-compiled-p)
+#   - AOT 版と同じ計算をしていること
+#   - JIT 化を確認するゲートの**陰性対照と陽性対照**(規則 8)
+# 計測と違い短時間で終わるので test-qemu-all に入れてある
+test-qemu-bench-jit:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_jit.lisp
 
 # [性能測定] Phase1の受け入れ条件(documents/performance-measurement.md
 # 「letのImmobilized Spaceリーク」節)。クロージャ生成が実行回数に比例して

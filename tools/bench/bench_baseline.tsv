@@ -1,0 +1,27 @@
+# [性能測定] 構文別ベンチマークの記録値。tools/bench/check_bench_baseline.py が読む。
+#
+# **数字に出自を持たせること。** 2026-09-29 に見つかった issue #114(AOT 経路が
+# 165 コミットのあいだに 1.5〜1.7 倍悪化していた)の原因は、記録された数字に
+# 「どの経路の値なのか」が書かれていなかったことである。名前(%%bench-aot-*)に
+# しか書かれていない事実は、記録されていない。
+#
+# 列:
+#   path      aot = カーネル埋め込みの %%bench-aot-*(AOT トランスパイル)
+#             jit = 実行時 load + defun された %%bench-jit-*(za_try_compile_defun)
+#             c   = src/c/bench_subprimitive.c の素の C 実装
+#   case      カテゴリ名
+#   unit      単位。insns-per-unit = 仕事 1 単位あたりの**実行命令数**
+#             (傾き法: N と 3N のブート全体の総命令数の差を 2N で割る)
+#   value     記録値
+#   band      許容する帯(絶対値、命令/単位)。**上下どちらに外れても落ちる。**
+#             由来はファイル末尾の「帯の根拠」を参照
+#   n         測定時の N。**N が違う傾きは比較できない**ので検出器が照合する
+#   revision  測定した時の HEAD
+#   date      測定日
+#
+# 取り直し方:
+#   make test-qemu-jit-bench       (jit と aot、6 カテゴリ)
+#   make test-qemu-construct-bench (c と aot、10 カテゴリ)
+#   基準値を取り直すときは BENCH_NO_CHECK=1 を付けて照合を外す。
+#
+# path	case	unit	value	band	n	revision	date
