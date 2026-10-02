@@ -26,13 +26,24 @@
 #
 # path	case	unit	value	band	n	revision	date
 aot	arith	insns-per-unit	239.17	20.0	1000000	5a27346	2026-10-02
-aot	for	insns-per-unit	257.43	20.0	1000000	5a27346	2026-10-02
+# **for の 2 行は帯を "-" にしてある = 照合しない。調査中で、基準値として使わない。**
+# 理由: AOT 257.43 と JIT 642.00 が**比較してよい数字か決まっていない。**
+#   候補A 展開形が AOT と JIT で違う(別のコードを測っている)
+#   候補B どちらかが反復ごとに os_eval へ落ちている
+# **速い AOT 側のほうが怪しい可能性がある。** transpile.lisp の macroexpand-all は
+# 入力中の defmacro を展開しないので、for の展開を実行時に委ねているなら
+# AOT が毎反復 os_eval を通っていることになる。速いほうが正しいとは限らない。
+# 切り分けは feature/bench-jit-fallback で行う。結論が出るまで帯を戻さないこと
+# (帯を広げてごまかすのではなく、対象から外してある)。
+# c/for(素の C 実装)はマクロ展開を通らないのでそのまま照合する。ただし
+# **for の AOT/C 比も同じ理由で保留**である。
+aot	for	insns-per-unit	257.43	-	1000000	5a27346	2026-10-02
 aot	funcall	insns-per-unit	297.74	20.0	1000000	5a27346	2026-10-02
 aot	let	insns-per-unit	605.90	20.0	1000000	5a27346	2026-10-02
 aot	loop	insns-per-unit	183.11	20.0	1000000	5a27346	2026-10-02
 aot	tailrec	insns-per-unit	365.99	20.0	1000000	5a27346	2026-10-02
 jit	arith	insns-per-unit	175.65	20.0	1000000	5a27346	2026-10-02
-jit	for	insns-per-unit	642.00	20.0	1000000	5a27346	2026-10-02
+jit	for	insns-per-unit	642.00	-	1000000	5a27346	2026-10-02
 jit	funcall	insns-per-unit	363.99	20.0	1000000	5a27346	2026-10-02
 jit	let	insns-per-unit	560.45	20.0	1000000	5a27346	2026-10-02
 jit	loop	insns-per-unit	145.51	20.0	1000000	5a27346	2026-10-02

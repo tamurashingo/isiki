@@ -56,9 +56,13 @@ def read_baseline(path):
             if len(cols) != 8:
                 sys.exit(f"ERROR: {path}: 列が 8 つではありません: {line!r}")
             p, case, unit, value, band, n, rev, date = cols
+            # band が "-" の行は**照合しない**。「この数字が何を測っているのか
+            # まだ分からない」ものを検出器に載せると、調査の結論が出る前に
+            # 誰かがその数字を根拠に何かを言えてしまう。
+            # **帯を広げてごまかすのではなく、対象から外す。**
             base[(p, case)] = {"unit": unit, "value": float(value),
-                               "band": float(band), "n": int(n),
-                               "revision": rev, "date": date}
+                               "band": None if band == "-" else float(band),
+                               "n": int(n), "revision": rev, "date": date}
     return base
 
 
@@ -145,6 +149,10 @@ def check(g, base, tight_band):
         if b is None:
             print(f"[未記録] {p}/{case}: 測定値 {med:.2f} 命令/単位。"
                   f"bench_baseline.tsv に記録が無い")
+            continue
+        if b["band"] is None:
+            print(f"[保留] {p}/{case}: 測定値 {med:.2f}(記録 {b['value']:.2f})。"
+                  f"**この行は調査中で、基準値として使わない。**照合しない")
             continue
         if b["n"] != n:
             ng.append((p, case,
