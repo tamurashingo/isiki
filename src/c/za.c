@@ -110,6 +110,46 @@ lisp_val_t primitive_za_heap_imm_count(lisp_val_t args, lisp_val_t env) {
 /** サポートする+のオペランドの最大個数(同上) */
 #define ZA_MAX_OPERANDS 16
 
+/* [診断] 断念箇所の記録の機構は、**使用箇所より前に置く必要がある**ため
+   フレームレイアウト定数群より前のここに置く。2026-10-04 に容量上限の検査へ
+   計器を広げたとき、za_validate_params(za.c 前方)の検査から呼べずリンクに
+   失敗した。マクロなので前方宣言できない。 */
+/* [性能測定] Phase5 第2部 2-3: JITがコンパイルを断念した位置を観測可能にする。
+   断念は*ok=0を書くだけで黙って進むため、外からは「なぜJIT化されなかったか」が
+   一切分からず切り分けに時間がかかっていた(cc_car/cc_cdrのinline化回帰の調査で
+   実際に問題になった)。直近の断念箇所の行番号を記録し、%%DIAG-ZA-BAIL-LINEで読む */
+static int g_za_bail_line = 0;
+
+/* [GC監査] 断念行を1つしか持たないと、記録されるのは**伝播点**であって起点ではない。
+   実測でza.c:4711(za_compile_body_formsが0を返したときの伝播)しか出なかった。
+   最初のN件を順に残せば、先頭が最も内側 = 起点に近いものになる。
+   なお、計器の追加先は慎重に選ぶこと。za_compile_fold/binary/unaryの`return 0;`は
+   「この特化経路は当てはまらない」という**正常な否定**であって断念ではない。
+   ここへ一括で計器を入れると正常経路を断念として拾う(documents/pitfalls.md 原則6の
+   実例そのもの)。計器を入れてあるのは失敗パスであることを確認済みのものだけである。
+
+   **2026-10-04: 容量上限の検査 30 箇所すべてに広げた**(既存 9 + 追加 21)。
+   なお ZA_MAX_COMPILE_NEST の検査(za_compile_expr 冒頭)には「ZA_BAIL_LINE は
+   この位置ではまだ未定義なので使えない」というコメントが付いていた。この定義を
+   ここ(ファイル先頭)へ移したことでその制約が消え、計器を入れられるようになった。
+   容量上限(`if (x >= ZA_MAX_...) return 0;`)は上の「正常な否定」とは性質が違い、
+   **常に失敗である**(呼び出し元はいずれも `return za_compile_X(...)` で
+   そのまま伝播させており、フォールバックしない — 実際に確認した)。
+   広げる前は 3 つの違う原因(letの幅・letの深さ・3引数比較)がすべて
+   唯一の伝播点(za_try_compile_defunの中の1行)を返していた。
+   documents/jit-frame-survey.md §5。
+   **行番号は1行足すたびに動く。**上限の名前はこのファイルのコメントにあるが、
+   診断が返すのは行番号だけである。対応表は
+   test/lisp/jit_limits_test.lisp が境界テストとして維持する。 */
+#define ZA_BAIL_MAX 24
+static int g_za_bail_lines[ZA_BAIL_MAX];
+static int g_za_bail_count = 0;
+
+#define ZA_BAIL_LINE() do { \
+        if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } \
+        if (g_za_bail_count < ZA_BAIL_MAX) { g_za_bail_lines[g_za_bail_count++] = __LINE__; } \
+    } while (0)
+
 static UINT8 g_jit_code[JIT_CODE_SIZE] __attribute__((aligned(16)));
 static UINT64 g_jit_used = 0;
 /** jit_emit8がg_jit_codeの残り容量を使い切ったことを示すフラグ。立った場合は
@@ -1101,6 +1141,7 @@ static int za_validate_params(lisp_val_t params, UINT64 *out_fixed_count) {
         }
         count++;
         if (count > ZA_MAX_PARAMS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_PARAMS */
             return 0;
         }
     }
@@ -2846,6 +2887,7 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     GC_PROTECT(params);
     GC_PROTECT(env);
     if (arith_depth >= ZA_MAX_ARITH_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_ARITH_DEPTH */
         return 0;
     }
     lisp_val_t operand_forms[ZA_MAX_OPERANDS];
@@ -2855,6 +2897,7 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
             return 0;
         }
         if (count >= ZA_MAX_OPERANDS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
             return 0;
         }
         operand_forms[count++] = cc_car(rest);
@@ -3173,6 +3216,7 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     GC_PROTECT(params);
     GC_PROTECT(env);
     if (arith_depth >= ZA_MAX_ARITH_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_ARITH_DEPTH */
         return 0;
     }
     lisp_val_t rest = cc_cdr(form);
@@ -3479,6 +3523,7 @@ static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out
             }
         }
         if (count >= ZA_MAX_LOCALS_PER_LET) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_LOCALS_PER_LET */
             return 0;
         }
         out_syms[count++] = sym;
@@ -3614,6 +3659,7 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         depth++;
     }
     if (depth >= ZA_MAX_LET_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_LET_DEPTH */
         return 0;
     }
 
@@ -3624,6 +3670,7 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
             return 0;
         }
         if (init_count >= ZA_MAX_LOCALS_PER_LET) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_LOCALS_PER_LET */
             return 0;
         }
         init_forms[init_count++] = cc_car(rest);
@@ -3748,6 +3795,7 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
             }
             if (!is_last) {
                 if (body_end_patch_count >= ZA_MAX_OPERANDS) {
+                    ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
                     return 0;
                 }
                 body_end_patches[body_end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -3800,6 +3848,7 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
             }
             if (!is_last) {
                 if (body_end_patch_count >= ZA_MAX_OPERANDS) {
+                    ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
                     return 0;
                 }
                 body_end_patches[body_end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -3849,9 +3898,13 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
        二度と評価されないので、外からは「固まった」ようにしか見えない。
        断念すれば遅くなるだけで正しく動く。 */
     if (g_za_compile_nest >= ZA_MAX_COMPILE_NEST) {
-        /* ZA_MAX_JIT_RELOCS等の固定上限と同じ形で知らせる(ZA_BAIL_LINEはこの位置では
-           まだ未定義なので使えない)。g_jit_overflowが立つとza_try_compile_defunは
-           コード生成を捨ててnilを返し、呼び出し元はインタプリタへ落ちる */
+        /* ZA_MAX_JIT_RELOCS等の固定上限と同じ形で知らせる。g_jit_overflowが立つと
+           za_try_compile_defunはコード生成を捨ててnilを返し、呼び出し元はインタプリタ
+           へ落ちる。
+           2026-10-04: 以前ここには「ZA_BAIL_LINEはこの位置ではまだ未定義なので使えない」
+           と書いてあった。ZA_BAIL_LINEの定義をファイル先頭(ZA_MAX_OPERANDSの直後)へ
+           移したので、その制約は無くなった。他の容量上限と同じく行番号を記録する */
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_COMPILE_NEST */
         g_jit_overflow = 1;
         return 0;
     }
@@ -4357,6 +4410,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
                             UINT64 call_depth, UINT64 arith_depth) {
     GC_PROTECT(env);
     if (call_depth >= ZA_MAX_CALL_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_CALL_DEPTH */
         return 0;
     }
     // fn_symがflet/labels束縛関数を指す場合、名前再解決ではなくgensymスロット経由で
@@ -4382,6 +4436,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             return 0;
         }
         if (argc >= ZA_MAX_OPERANDS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
             return 0;
         }
         arg_forms[argc++] = cc_car(rest);
@@ -4764,6 +4819,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
         }
     }
     if (qq_depth >= ZA_MAX_QQ_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_DEPTH */
         return 0;
     }
 
@@ -4796,6 +4852,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
         if (elem == g_sym_quasiquote ||
             ((elem == g_sym_unquote || elem == g_sym_unquote_splicing) && level > 0)) {
             if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+                ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_ELEMENTS */
                 return 0;
             }
             items[item_count].data = elem;
@@ -4821,6 +4878,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
                 return 0;
             }
             if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+                ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_ELEMENTS */
                 return 0;
             }
             items[item_count].data = cc_car(splice_rest);
@@ -4831,6 +4889,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
             continue;
         }
         if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_ELEMENTS */
             return 0;
         }
         items[item_count].data = elem;
@@ -4969,6 +5028,7 @@ static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fix
         }
         if (!is_last) {
             if (end_patch_count >= ZA_MAX_OPERANDS) {
+                ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
                 return 0;
             }
             end_patches[end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -5086,6 +5146,7 @@ static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fix
         return 0;
     }
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -5187,6 +5248,7 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
         return 0;
     }
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -5343,6 +5405,7 @@ static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     lisp_val_t body = cc_cdr(rest);
     GC_PROTECT(body);
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -5423,6 +5486,7 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     lisp_val_t result_form = cc_car(rest2);
     GC_PROTECT(result_form);
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -5465,27 +5529,6 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     return 1;
 }
 
-/* [性能測定] Phase5 第2部 2-3: JITがコンパイルを断念した位置を観測可能にする。
-   断念は*ok=0を書くだけで黙って進むため、外からは「なぜJIT化されなかったか」が
-   一切分からず切り分けに時間がかかっていた(cc_car/cc_cdrのinline化回帰の調査で
-   実際に問題になった)。直近の断念箇所の行番号を記録し、%%DIAG-ZA-BAIL-LINEで読む */
-static int g_za_bail_line = 0;
-
-/* [GC監査] 断念行を1つしか持たないと、記録されるのは**伝播点**であって起点ではない。
-   実測でza.c:4711(za_compile_body_formsが0を返したときの伝播)しか出なかった。
-   最初のN件を順に残せば、先頭が最も内側 = 起点に近いものになる。
-   なお、計器の追加先は慎重に選ぶこと。za_compile_fold/binary/unaryの`return 0;`は
-   「この特化経路は当てはまらない」という**正常な否定**であって断念ではない。
-   ここへ一括で計器を入れると正常経路を断念として拾う(documents/pitfalls.md 原則6の
-   実例そのもの)。現状の44箇所は失敗パスであることを確認済みのものだけである。 */
-#define ZA_BAIL_MAX 24
-static int g_za_bail_lines[ZA_BAIL_MAX];
-static int g_za_bail_count = 0;
-
-#define ZA_BAIL_LINE() do { \
-        if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } \
-        if (g_za_bail_count < ZA_BAIL_MAX) { g_za_bail_lines[g_za_bail_count++] = __LINE__; } \
-    } while (0)
 /* [性能測定] 計器を入れる対象は「失敗を表す返却」だけにすること。以前
    `return nil;`へ一括で入れたところ、za_rewrite_body_listのリスト終端(正常終了)
    まで拾って誤った箇所を指した。逆にreturn 0だけに絞ると、za_try_compile_defunが
@@ -5850,7 +5893,7 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
             }
             lisp_val_t name = cc_car(binding);
             if (inner_scope.count >= ZA_MAX_FLET_BINDINGS) {
-                *ok = 0; ZA_BAIL_LINE();
+                *ok = 0; ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_FLET_BINDINGS */
                 return form;
             }
             inner_scope.bindings[inner_scope.count].orig_name = name;
@@ -5954,7 +5997,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
     GC_PROTECT(body);
 
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
-        { ZA_BAIL_LINE(); return 0; }
+        { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
     }
 
     // bindings検証: 「(name params . body)」の形を持つ、重複を許す平坦なリスト
@@ -5981,7 +6024,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
             { ZA_BAIL_LINE(); return 0; }
         }
         if (binding_count >= ZA_MAX_FLET_BINDINGS) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_FLET_BINDINGS */
         }
         name_syms[binding_count] = name;
         binding_params[binding_count] = cc_car(brest);
@@ -6079,7 +6122,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
         } else if (g_za_lambda_slot_count < ZA_MAX_LAMBDA_SLOTS) {
             lambda_slot_idx = g_za_lambda_slot_count++;
         } else {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_LAMBDA_SLOTS */
         }
         g_za_lambda_slots[lambda_slot_idx].v = os_make_cons(binding_params[i], binding_bodies[i]);
         os_gc_register_root(&g_za_lambda_slots[lambda_slot_idx].v);
@@ -6252,7 +6295,7 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
     lisp_val_t cleanup_forms = cc_cdr(rest);
     GC_PROTECT(cleanup_forms);
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
-        { ZA_BAIL_LINE(); return 0; }
+        { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
     }
 
     // protected-formの評価結果は制御転送かどうかに関わらずcleanupへ進む
@@ -6386,7 +6429,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
             }
             if (idx < 0) {
                 if (new_ctx.tag_count >= ZA_MAX_TAGBODY_TAGS) {
-                    { ZA_BAIL_LINE(); return 0; }
+                    { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_TAGS */
                 }
                 idx = new_ctx.tag_count++;
                 new_ctx.tags[idx].tag = elem;
@@ -6403,7 +6446,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
         }
 
         if (end_patch_count >= ZA_MAX_TAGBODY_FORMS) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_FORMS */
         }
         if (!za_compile_expr(elem, params, fixed_count, locals, syms, env, 0, trampoline_offset, nlx_depth, &new_ctx,
                               call_depth, arith_depth)) {
@@ -6504,7 +6547,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
     }
     if (idx < 0) {
         if (tb_ctx->tag_count >= ZA_MAX_TAGBODY_TAGS) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_TAGS */
         }
         idx = tb_ctx->tag_count++;
         tb_ctx->tags[idx].tag = tag;
@@ -6522,7 +6565,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
         jit_emit_jmp_to(tb_ctx->tags[idx].offset);
     } else {
         if (tb_ctx->tags[idx].pending_count >= ZA_MAX_TAGBODY_GOTOS_PER_TAG) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_GOTOS_PER_TAG */
         }
         tb_ctx->tags[idx].pending[tb_ctx->tags[idx].pending_count++] = jit_emit_jmp_rel32_placeholder();
     }
