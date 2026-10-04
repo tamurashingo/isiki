@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress jit-frame-breakdown let-histogram
 
 all: build
 
@@ -768,6 +768,7 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
 	$(MAKE) test-qemu-bench-jit
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_semantics.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
@@ -1016,6 +1017,23 @@ test-qemu-bench-jit:
 # documents/for-expansion.md §3
 test-qemu-macro-parity:
 	tools/check_macro_parity.sh
+
+# [調査] JIT 生成コードのスタックフレーム(ZA_FRAME_TOTAL)の内訳。
+# **ZA_FRAME_TOTAL は JIT 関数すべてのフレームで、再帰深さの上限をそのまま決める**
+# (256KB / 7480 = 35 段)。za.c からフレームレイアウトの #define を切り出して
+# プリプロセッサに計算させる(手計算しない)。QEMU もビルドも要らない。
+# 定数を上書きした試算もできる: python3 tools/jit_frame_breakdown.py DEPTH=8 LOCALS=8
+# documents/jit-frame-survey.md §2
+jit-frame-breakdown:
+	@python3 tools/jit_frame_breakdown.py
+
+# [調査] let / let* の束縛数(幅)と入れ子段数(深さ)のヒストグラム。
+# **ソース上の let ではなくマクロ展開後の IIFE 形を数える**(JIT が判定する対象)。
+# host 側(roswell)で全 Lisp ソースを macroexpand-all する。QEMU は要らない。
+# documents/jit-frame-survey.md §3
+let-histogram:
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
+		-c 'ros run --load tools/let_histogram.lisp --quit' 2>&1 | grep -E '^(IIFE|SKIP|FILE)'
 
 # [GCデバッグ] GC を強制しても for の結果が壊れないことを確かめる
 # (documents/for-expansion.md §1)。**GC_DEBUG=1 を自分で渡す。**
