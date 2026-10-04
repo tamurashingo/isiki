@@ -718,9 +718,22 @@
           ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
           ((eq (car place) 'property) `(set-property ,value ,@(cdr place))))))
 
-;;; for/while: init.lispのdefmacro for/while(%for-vars/%for-inits/%for-next/
-;;; %for-nexts/%for-let-bindings/%for-setqs)と同じ展開規則。init.lisp側の同名
+;;; for/while: init.lispのdefmacro for/whileからポートしたもの。init.lisp側の同名
 ;;; ヘルパーと衝突しないよう%%接頭辞でポートする(%%let-vars等と同じ命名規則)。
+;;;
+;;; **whileは同じ展開規則だが、forは違う。**
+;;; expand-forは「ループ本体のlet廃止」(下のdocstring参照)で作り直してあるが、
+;;; init.lispのforは旧展開形(毎反復 (list step1 step2 ...) を作る)のままである。
+;;; 以前ここには「init.lispのdefmacro for/whileと**同じ展開規則**」と書いてあったが、
+;;; **それは嘘になっていた**(2026-10-04に発覚。片方だけ直され、コメントが
+;;; 古くなったことを誰も見ていなかった)。
+;;;
+;;; 実測の差: 同じS式でもJIT/インタプリタ側だけ32.00 byte/反復 確保する
+;;; (documents/for-expansion.md)。意味論(並列代入)は3経路で一致している。
+;;;
+;;; **二重定義されたマクロの照合は `make test-qemu-macro-parity` が行う**
+;;; (tools/check_macro_parity.sh。判定は tools/macro_parity_expected.tsv)。
+;;; ここのコメントを信じる代わりに、そちらを回すこと。
 ;;; 展開結果はlet(基盤A)・if/progn/setqと、本コミットで追加するblock/
 ;;; return-from/tagbody/go(基盤D)のみに帰着する。tagbody/goのタグ
 ;;; (%for-loop/%while-loop)はこのform内だけで解決される局所的な識別子であり、
