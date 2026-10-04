@@ -37,12 +37,14 @@
 
 ;; (%ide-bytes-from-addr addr offset count) : addr+offsetを先頭にcount byte分を
 ;; %%peekで読み、0番目が先頭になるfixnum(0-255)のリストを返す。
-;; whileで実装する理由: forマクロ((let ((%for-next-values ...)) ...)を
-;; tagbody/goのループ本体に毎回新規生成する展開形)はGCが特定のタイミングで
-;; 走ると、以後永久に(そのループ内での)結果が壊れる既知のバグがある
-;; (documents/partition.md PART-M4調査で発覚。1回でも発生すると回復しない)。
-;; whileはループ本体に追加のletを挟まないため、この問題を回避できる
-;; (300,000回の(setq junk (cons i junk))連続実行では再現しないことを確認済み)。
+;; whileで実装する理由: **forマクロのGC下永続破損バグの主張があった。
+;; 調査結果は issue #119(再現せず。根拠として挙げられていた
+;; documents/partition.md は一度も存在しない)。** whileはループ本体に
+;; 追加のletを挟まないため、その主張が正しかった場合にも当たらない。
+;;
+;; **forへ戻すのは issue #119 を閉じてから。** いまのforは(新展開形になっても)
+;; インタプリタ経路では毎反復96byte確保する一方、whileは0なので、
+;; 性能の面でもwhileのままで損は無い(documents/for-expansion.md §3)。
 ;;
 ;; [ファイルI/O]#50付随の性能修正: 以前はconsリストを構築して返していたが、
 ;; read-sectorの戻り値(=このセクタバイト列)がconsリストのままだと、

@@ -202,3 +202,24 @@
   (if (= n 0)
       0
       (+ n (%%bench-jit-deep-recursion (- n 1)))))
+
+;;; --- 11. for の並列代入の確認(ベンチではなく意味論の probe) ---
+;; [性能測定/意味論] ISLisp の for は step 式を**並列に評価して並列に代入する**。
+;; init.lisp の for は毎反復 (list step1 step2 ...) を作ってからまとめて代入し、
+;; transpile.lisp の expand-for は一時変数へ全部評価してからまとめて書き戻す。
+;; **形が違うので、同じ意味論になっているかを実測で確かめる必要がある**
+;; (documents/for-expansion.md)。
+;;
+;; i と j を互いの旧値で更新する。並列なら 1 反復ごとに入れ替わり、
+;; 逐次(i を先に書き換えてから j がその新値を読む)なら両方 1 になる。
+;;
+;;   n=1 -> 並列 (1 0) / 逐次 (1 1)
+;;   n=2 -> 並列 (0 1) / 逐次 (1 1)
+;;
+;; AOT・JIT・インタプリタの 3 経路で同じ答えになることを
+;; test/lisp/for_semantics_test.lisp が固定する。
+;; 戻り値はリストではなく (+ (* i 10) j) の fixnum にする
+;; (AOT のトランスパイラに list を使わせないため。値で区別できれば十分)
+(defun %%bench-jit-for-swap (n)
+  (for ((i 0 j) (j 1 i) (k 0 (+ k 1)))
+       ((>= k n) (+ (* i 10) j))))

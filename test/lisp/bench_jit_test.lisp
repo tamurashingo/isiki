@@ -51,6 +51,10 @@
 ;; (bench_aot.lisp の %%bench-aot-let5par)。原因は調べていない。
 ;; 本作業は計器を作るだけなので直さない(作業指示書 §9)。
 ;; **この行が T で落ちたら、それは退行ではなく改善である。** 期待値を T に直すこと
+;; **原因が分かった(2026-10-04)**: JIT の単一 let の束縛数の上限
+;; ZA_MAX_LOCALS_PER_LET=4(src/c/za.c:963)。let5par は 5 束縛なので超えている。
+;; 束縛 4 個までは T、5 個以上は NIL(並列 let でも let* でも同じ)。
+;; documents/jit-unsupported-syntax.md
 (assert-equal nil (%%za-compiled-p (function %%bench-jit-let5par)))
 
 ;;; --- 2. AOT 版と同じ計算をしていること ---
@@ -97,7 +101,7 @@
 (assert-equal 210 (%%bench-jit-nontailrec-step 20))
 
 
-;;; --- 2c. for は AOT と JIT で展開形が違う(記録として固定する) ---
+;;; --- 2c. for の 1 反復あたりの確保量(両経路とも 0) ---
 ;; [性能測定] documents/performance-measurement.md「for の 2.6 倍の切り分け」。
 ;;
 ;; init.lisp の for は毎反復 (list step1 step2) を作る**旧展開形**のままで、
@@ -120,8 +124,10 @@
 ;; ついでに ide.lisp:40-45 が記録している「for マクロは GC が特定のタイミングで
 ;; 走ると以後永久に結果が壊れる」既知のバグも、原因(ループ本体に毎回新規生成
 ;; される let)が同じなので、インタプリタと JIT の経路には**まだ残っている**
-(assert-equal 32 (bench-jit-alloc-per-iter (function %%bench-jit-for) 20000 60000))
-(assert-equal 0  (bench-jit-alloc-per-iter (function %%bench-aot-for) 20000 60000))
+;; **2026-10-04 に移植して 32 -> 0 になった。**以前は 32(cons 2 個)で、
+;; この行はその記録だった。0 以外へ戻ったら旧展開形へ戻ったということである
+(assert-equal 0 (bench-jit-alloc-per-iter (function %%bench-jit-for) 20000 60000))
+(assert-equal 0 (bench-jit-alloc-per-iter (function %%bench-aot-for) 20000 60000))
 ;; 対照: 確保しない構文では両経路とも 0(計器が「0 以外」を出す側に偏っていない)
 (assert-equal 0  (bench-jit-alloc-per-iter (function %%bench-jit-loop) 20000 60000))
 (assert-equal 0  (bench-jit-alloc-per-iter (function %%bench-aot-loop) 20000 60000))

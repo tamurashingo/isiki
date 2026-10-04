@@ -50,15 +50,16 @@
 # そのためで、+2.6% 程度の小さな退行は通ってしまう。やっていない理由は測定時間
 # (aot/branch は 713 命令/単位なので N=3,000,000 で 1 ブート約 100 秒)。
 #
-# **aot/for と jit/for の 2 行は帯を "-" にしてある = 照合しない。**
-# 理由(2026-10-02 に切り分け済み。documents/performance-measurement.md
-# 「for の 2.6 倍の切り分け」節):
-#   **init.lisp の for と transpile.lisp の expand-for は別の展開形だった。**
-#   AOT 側だけが「ループ本体の let 廃止」で作り直されており、JIT 側は毎反復
-#   (list step1 step2) を作る旧展開形のままである(実測で JIT 側だけ
-#   32.00 byte/反復 確保する)。**したがって 2 つの数字は比較できない。**
-#   init.lisp 側を expand-for と同じ形へ移植したら、両方測り直して帯を戻すこと。
-#   **c/for は素の C 実装で、しかも校正点なので有効のまま**である。
+# **for の 2 行は 2026-10-04 に有効へ戻した。**
+# 2026-10-02 の時点では帯を "-" にして照合から外していた。理由は
+# **init.lisp の for と transpile.lisp の expand-for が別の展開形で、
+# 2 つの数字が比較できなかった**こと(JIT 側だけ毎反復 32 byte 確保していた)。
+# init.lisp 側を一時変数方式へ移植して解消した(documents/for-expansion.md §5)。
+#   jit/for  643.41 -> 199.08(-444.33)。**いまは AOT より 25% 速い**
+#   aot/for  270.51 のまま。init.lisp は AOT の入力ではないので移植で変わらない
+#            (今回の jit ドライバでの実測は 264.32。差 -6.19 は帯 20.0 の中で、
+#             aot/for の跨セッションの幅 16 と同じ桁。**「1 命令も動かなかった」
+#             とは言えない。この N では分解能が足りない**)
 #
 # ---------------------------------------------------------------------------
 # 帯の根拠(2026-10-02。規則 9)
@@ -114,12 +115,12 @@ aot	nontailrec	insns-per-unit	median	3	368.33	20.00	1000000	bbd6915	2026-10-02
 aot	branch	insns-per-unit	median	3	717.00	20.00	1000000	bbd6915	2026-10-02
 aot	let	insns-per-unit	median	3	605.16	20.00	1000000	bbd6915	2026-10-02
 aot	cons	insns-per-unit	median	3	389.89	20.00	1000000	bbd6915	2026-10-02
-aot	for	insns-per-unit	median	3	270.51	-	1000000	bbd6915	2026-10-02
+aot	for	insns-per-unit	median	3	270.51	20.00	1000000	bbd6915	2026-10-02
 aot	vector	insns-per-unit	median	3	662.40	20.00	1000000	bbd6915	2026-10-02
 aot	funcall	insns-per-unit	median	3	295.41	20.00	1000000	bbd6915	2026-10-02
-jit	loop	insns-per-unit	median	3	148.73	20.00	1000000	bbd6915	2026-10-02
-jit	arith	insns-per-unit	median	3	174.43	20.00	1000000	bbd6915	2026-10-02
-jit	tailrec	insns-per-unit	median	3	396.07	20.00	1000000	bbd6915	2026-10-02
-jit	let	insns-per-unit	median	3	560.80	20.00	1000000	bbd6915	2026-10-02
-jit	for	insns-per-unit	median	3	643.41	-	1000000	bbd6915	2026-10-02
-jit	funcall	insns-per-unit	median	3	365.89	20.00	1000000	bbd6915	2026-10-02
+jit	loop	insns-per-unit	median	3	146.87	20.00	1000000	85c4e72+for移植	2026-10-04
+jit	arith	insns-per-unit	median	3	175.37	20.00	1000000	85c4e72+for移植	2026-10-04
+jit	tailrec	insns-per-unit	median	3	396.09	20.00	1000000	85c4e72+for移植	2026-10-04
+jit	let	insns-per-unit	median	3	557.74	20.00	1000000	85c4e72+for移植	2026-10-04
+jit	for	insns-per-unit	median	3	199.08	20.00	1000000	85c4e72+for移植	2026-10-04
+jit	funcall	insns-per-unit	median	3	364.10	20.00	1000000	85c4e72+for移植	2026-10-04

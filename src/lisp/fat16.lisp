@@ -92,7 +92,7 @@
 ;; 文字を1文字ずつ持つLisp文字列を組み立てる(FAT16-M0(1)で確認したcode-char+
 ;; create-string+set-eltの手順)。
 ;; whileで実装する理由: ide.lispの%ide-bytes-from-addrのコメント参照
-;; (PART-M4調査で発覚したforマクロのGC下永続破損バグの回避)。
+;; (issue #119 で調査した(再現せず)forマクロのGC下永続破損バグの回避)。
 (defun %fat16-bytes-to-string (bytes)
   (let ((s (create-string (length bytes))) (b bytes) (i 0))
     (progn

@@ -1,0 +1,28 @@
+# [二重定義マクロの照合] 期待する判定。tools/check_macro_parity.sh が読む。
+#
+# **「2 つの実装が同じである」と主張して、照合するものが何も無かった。**
+# transpile.lisp:721 のコメントは for/while について「init.lisp の defmacro と
+# 同じ展開規則」と書いていて、**それが嘘になっていた**(for だけ片方が
+# 作り直されていた)。片方を直すともう片方のコメントが静かに嘘になる形である。
+#
+# 判定:
+#   same      gensym 名を除いて展開形が完全に一致すること。**違ったら落ちる**
+#   cosmetic  違うが意味は同じ。**同じになったら落ちる**(理由が消えたので行を直す)
+#   DIVERGENT **意味が違う。** 既知の不一致。**同じになったら落ちる**
+#             (直したのなら same へ変え、記録と文書を更新すること)
+#
+# 確認したリビジョン: f19b434 + for の移植(2026-10-04)
+#
+# macro	判定	説明
+LET	cosmetic	host は body を (progn ...) で包む。AOT の「lambda の body は単一式」制約のため。意味は同じ
+LET*	same
+COND	same
+CASE	same
+CASE-USING	same
+SETF	same
+FOR	cosmetic	**2026-10-04 に guest を新展開形へ移植した。**残る差は一時変数を置く場所だけで、host は 1 つの let に append、guest は入れ子の let。理由は JIT の ZA_MAX_LOCALS_PER_LET=4(za.c:963): 1 つの let に 2N 束縛入れると束縛 3 個の for が JIT に乗らなくなる。AOT 側にこの上限は無い。意味は同じ(documents/for-expansion.md §4)
+WHILE	same
+WITH-OPEN-INPUT-STREAM	same
+WITH-OPEN-INPUT-FILE	same
+WITH-OPEN-OUTPUT-STREAM	same
+WITH-OPEN-OUTPUT-FILE	same

@@ -718,9 +718,26 @@
           ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
           ((eq (car place) 'property) `(set-property ,value ,@(cdr place))))))
 
-;;; for/while: init.lispのdefmacro for/while(%for-vars/%for-inits/%for-next/
-;;; %for-nexts/%for-let-bindings/%for-setqs)と同じ展開規則。init.lisp側の同名
+;;; for/while: init.lispのdefmacro for/whileからポートしたもの。init.lisp側の同名
 ;;; ヘルパーと衝突しないよう%%接頭辞でポートする(%%let-vars等と同じ命名規則)。
+;;;
+;;; **whileは同じ展開規則。forは「一時変数方式」という点では同じだが、
+;;; 一時変数を置く場所だけ違う。**
+;;; 以前ここには「init.lispのdefmacro for/whileと**同じ展開規則**」と書いてあったが、
+;;; **それは嘘になっていた**(2026-10-04に発覚。expand-forだけ「ループ本体のlet廃止」で
+;;; 作り直され、init.lispは旧展開形のまま。コメントが古くなったことを誰も見ていなかった)。
+;;; 2026-10-04にinit.lisp側も一時変数方式へ移植した。
+;;;
+;;; 残る差: こちらは1つのletにappendし、init.lisp側は入れ子のletにする。
+;;; 理由はJITの単一letの束縛数の上限ZA_MAX_LOCALS_PER_LET=4(src/c/za.c:963)で、
+;;; 1つのletに2N個入れると**束縛3個のforがJITに乗らなくなる**。
+;;; AOT側にこの上限は無いのでこちらは1つのままでよい。意味は同じ。
+;;; 実測: 移植で確保量が JIT 32→0 byte/反復、インタプリタ 928→96 になった
+;;; (documents/for-expansion.md)。意味論(並列代入ほか)は3経路で一致している。
+;;;
+;;; **二重定義されたマクロの照合は `make test-qemu-macro-parity` が行う**
+;;; (tools/check_macro_parity.sh。判定は tools/macro_parity_expected.tsv)。
+;;; ここのコメントを信じる代わりに、そちらを回すこと。
 ;;; 展開結果はlet(基盤A)・if/progn/setqと、本コミットで追加するblock/
 ;;; return-from/tagbody/go(基盤D)のみに帰着する。tagbody/goのタグ
 ;;; (%for-loop/%while-loop)はこのform内だけで解決される局所的な識別子であり、
