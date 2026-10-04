@@ -97,8 +97,14 @@ def check(za_path, lisp_files, fix=False, quiet=False):
                 if len(cands) == 1:
                     newline = cands[0]
                 else:
-                    # 複数ある場合は、ずれる前に一番近かったものへ寄せる
+                    # 複数ある場合は、ずれる前に一番近かったものへ寄せる。
+                    # **これは当て推量である** — 同じ定数の別の検査箇所へ寄せて
+                    # しまうと、照合器は通るのに QEMU のテストが落ちる(実際に
+                    # ZA_MAX_QQ_ELEMENTS の 3 箇所で踏んだ)。警告を出す。
                     newline = min(cands, key=lambda c: abs(c - want_line))
+                    print("    警告: %s の断念箇所は %d 箇所ある。--fix は推量なので、"
+                          "QEMU のテストで実測値を確かめること"
+                          % (const, len(cands)), file=sys.stderr)
                 lines[ln] = text.replace(m.group(0),
                                          m.group(0).replace(m.group(1), str(newline), 1), 1)
                 print("    --fix: %d -> %d" % (want_line, newline), file=sys.stderr)

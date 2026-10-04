@@ -145,9 +145,16 @@ static int g_za_bail_line = 0;
 static int g_za_bail_lines[ZA_BAIL_MAX];
 static int g_za_bail_count = 0;
 
+/* g_za_bail_countは**打ち切らずに数える**。枠(ZA_BAIL_MAX)を超えた分は保存しないが、
+   countが枠より大きいこと自体が「切り詰めた」印になる。打ち切って数えると
+   count==ZA_BAIL_MAX が「ちょうど24件」と「24件以上」のどちらなのか外から
+   区別できない(実測: 入れ子tagbody 24段/26段/30段がすべて count=24 を返した)。
+   読み出し側(cc_diag_za_bail_at)はZA_BAIL_MAXでも頭打ちにすること — countだけで
+   境界検査すると配列の外を読む。 */
 #define ZA_BAIL_LINE() do { \
         if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } \
-        if (g_za_bail_count < ZA_BAIL_MAX) { g_za_bail_lines[g_za_bail_count++] = __LINE__; } \
+        if (g_za_bail_count < ZA_BAIL_MAX) { g_za_bail_lines[g_za_bail_count] = __LINE__; } \
+        g_za_bail_count++; \
     } while (0)
 
 static UINT8 g_jit_code[JIT_CODE_SIZE] __attribute__((aligned(16)));
@@ -5645,11 +5652,13 @@ lisp_val_t cc_diag_za_bail_count(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum((UINT64)g_za_bail_count);
 }
 
-/** i番目の断念行 */
+/** i番目の断念行。保存できたのは先頭ZA_BAIL_MAX件だけなので、
+ *  g_za_bail_countが枠を超えていてもそこで頭打ちにする(配列の外を読まないため)。
+ *  **countが枠より大きければ切り詰めている** — 呼び出し側はそれで判断できる。 */
 lisp_val_t cc_diag_za_bail_at(lisp_val_t args, lisp_val_t env) {
     (void)env;
     UINT64 i = os_fixnum_magnitude(cc_car(args));
-    if ((int)i >= g_za_bail_count) { return os_make_fixnum(0); }
+    if ((int)i >= g_za_bail_count || i >= (UINT64)ZA_BAIL_MAX) { return os_make_fixnum(0); }
     return os_make_fixnum((UINT64)g_za_bail_lines[i]);
 }
 
