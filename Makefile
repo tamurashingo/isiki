@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress jit-frame-breakdown let-histogram
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress jit-frame-breakdown let-histogram
 
 all: build
 
@@ -302,8 +302,18 @@ check-bench-jit-sync:
 check-estimator:
 	@tools/bench/check_estimator.sh
 
+# [診断] JIT が容量上限でコンパイルを断念した「行番号」の期待値を、za.c の
+# 注記(`ZA_BAIL_LINE(); /* [診断] 容量上限 <定数> */`)と照合する。
+# 診断は __LINE__ を記録するので、za.c に 1 行入れただけで境界テストの
+# 期待値が全部ずれる。QEMU を回さないと分からないのでは遅い(1 回 8 分)ので、
+# ホスト側・1 秒で落ちるようにして make test の前提に入れてある。
+# --self-test は規則 8 の陽性対照(za.c を 1 行ずらして検出器が落ちることを見る)
+check-jit-bail-lines:
+	@python3 tools/check_jit_bail_lines.py
+	@python3 tools/check_jit_bail_lines.py --self-test
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: check-eval-error-budget check-bench-jit-sync check-estimator $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
@@ -769,6 +779,7 @@ test-qemu-all:
 	$(MAKE) test-qemu-bench-jit
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_semantics.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_limits.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
