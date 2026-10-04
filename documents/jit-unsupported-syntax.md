@@ -23,15 +23,15 @@ JIT(`za_try_compile_defun`)が**ある構文を受け取ったときに何が起
 
 ## 一覧
 
-確認したカーネルのリビジョンは **`8a92737`**(`feature/compiler-optimization`。
-PR #115 も本作業もカーネルに入るソースを変えていない)、確認日は
-いずれも **2026-10-02**。
+確認したカーネルのリビジョンは **`8a92737`**(2026-10-02 の行)および
+**`f19b434` + `for` の移植**(2026-10-04 の行)。
 
 | 構文 | 症状 | 詳細 | 確認方法 |
 |---|---|---|---|
 | **パラメータへの `setq`**<br>`(defun f (n) ... (setq n ...))` | **①乗らない** | `%%za-compiled-p` = `NIL`。インタプリタでは正しい答えを返す | `test/lisp/bench_jit_guard_test.lisp`(常時テスト)。`documents/control-transfer-survey.md:485` |
-| **並列束縛 `let` で 5 つの init が同じローカル変数を参照**<br>`(let ((a i) (b i) (c i) (d i) (e i)) e)` | **①乗らない** | `%%bench-jit-let5par` が `NIL`。**原因は未調査。** 束縛数を減らした形・`let*` 版(`let1` / `let` / `let10` / `let5const`)はいずれも T | `test/lisp/bench_jit_test.lisp`(常時テスト。期待値を `nil` で固定してある。**T になったら退行ではなく改善**) |
-| **`for`** | **③展開形が食い違う** | `%%za-compiled-p` は T、`os_eval` の傾きも 0。**だが `init.lisp` の `for` は毎反復 `(list step1 step2)` を作る旧展開形**で、`transpile.lisp` の `expand-for` は一時変数+素の `setq` の新展開形。実測で **JIT 側だけ 32 byte/反復(cons 2 個)**確保する。命令数は JIT 635.29 対 AOT 244.57(2.6 倍) | `documents/performance-measurement.md`「`for` の 2.6 倍の切り分け」節 |
+| **1 つの `let` の束縛が 5 個以上**<br>`(let ((a 1) (b 2) (c 3) (d 4) (e 5)) ...)` | **①乗らない** | **原因は `ZA_MAX_LOCALS_PER_LET = 4`**(`src/c/za.c:963`)。**束縛 4 個までは T、5 個以上は NIL。** 並列 `let` でも `let*` でも同じ。`let*` 版が T に見えていたのは、`let*` が 1 束縛ずつ `let` へ入れ子展開されるため(`%%bench-aot-let10` は 10 束縛でも T)。**`ZA_MAX_LET_DEPTH` は 16** なので、入れ子にすれば 4×16 まで使える | `test/lisp/bench_jit_test.lisp`(`%%bench-jit-let5par` を `nil` で固定。**T になったら上限が上がったということ**)。実測 2026-10-04: 4 束縛=T / 5,6,8 束縛=NIL |
+| **`for`**(2026-10-04 に解消) | ~~③展開形が食い違う~~ | **`init.lisp` 側を一時変数方式へ移植して解消した。** 確保量は JIT 32→**0**、インタプリタ 928→**96**(`while` と同値)。残る差は一時変数を置く場所だけ(host は 1 つの `let`、guest は入れ子。理由は上の `ZA_MAX_LOCALS_PER_LET`)。`documents/for-expansion.md` |
+| **`for` の束縛が 5 個以上** | **①乗らない** | 上の `let` の上限から来る。入れ子方式なので外側 N 個・内側 N 個となり、**4 変数までは JIT に乗る**(移植前と同じ)。5 変数以上は NIL | 実測 2026-10-04: 1〜4 変数=T |
 | **非末尾再帰(深さ 34 以上)** | **④止まる** | 深さ 33 までは返る。34 で C スタック(`STACK_SIZE` = 256KB)を使い切りガードページを踏む。**報告は `-serial stdio` にしか出ない**ので、外からは QEMU の無反応と区別がつかない。AOT 版は同じ S 式で深さ 100 が通る(1 段 330 byte に対し JIT は約 7.5KB) | `documents/performance-measurement.md`、`documents/known-issue-deep-if-nesting-jit.md` の「残っているタスク」 |
 
 ## 乗ると確認したもの(否定の結果。規則 6)

@@ -144,14 +144,45 @@
       (cons (list (car (car bindings)) (car (cdr (car bindings))))
             (%for-let-bindings (cdr bindings)))))
 
-;; list-exprが指す一時リストからvar群へ順にcar/cdrで取り出してsetqする式を作る。
-;; nextの式群は先に(list ...)としてまとめて評価されるため、do構文同様、
-;; 各step式は「更新前」の値を参照でき、複数変数の同時更新が成立する。
-(defun %for-setqs (bindings list-expr)
+;; 一時変数の名前は**固定のシンボルを使い回す。gensymを使ってはいけない。**
+;; マクロは評価されるたびに展開され直すので、gensymだと多重ループで
+;; シンボルテーブルが枯渇する(下のforのコメントにある旧実装の失敗がそれ)。
+;; 名前はtranspile.lisp側の%%for-temp-namesと同じ%FOR-TMP-nに揃えてある。
+;; internが無く名前を作れないため、プールから必要な数だけ取る形にする。
+(defun %for-temp-name-pool ()
+  '(%for-tmp-1 %for-tmp-2 %for-tmp-3 %for-tmp-4 %for-tmp-5 %for-tmp-6
+    %for-tmp-7 %for-tmp-8 %for-tmp-9 %for-tmp-10 %for-tmp-11 %for-tmp-12
+    %for-tmp-13 %for-tmp-14 %for-tmp-15 %for-tmp-16))
+
+(defun %for-take (n lst)
+  (if (= n 0) nil (cons (car lst) (%for-take (- n 1) (cdr lst)))))
+
+;; 束縛の個数ぶんの一時変数名を返す。**プールを超えたら黙って壊れた展開形を
+;; 作るのではなくエラーにする**((car nil)がnilを返すので、黙ると
+;; (setq nil ...)という形になって原因が分からなくなる)
+(defun %for-temp-names (bindings)
+  (if (> (length bindings) (length (%for-temp-name-pool)))
+      (error "for: 束縛が多すぎます(上限は%for-temp-name-poolの長さ)")
+    (%for-take (length bindings) (%for-temp-name-pool))))
+
+(defun %for-temp-let-bindings (temps)
+  (if (null temps)
+      nil
+      (cons (list (car temps) nil) (%for-temp-let-bindings (cdr temps)))))
+
+;; 全step式を一時変数へ評価する。束縛変数はまだ書き換えない(並列束縛の意味論)
+(defun %for-step-setqs (bindings temps)
   (if (null bindings)
       nil
-      (cons `(setq ,(car (car bindings)) (car ,list-expr))
-            (%for-setqs (cdr bindings) `(cdr ,list-expr)))))
+      (cons `(setq ,(car temps) ,(%for-next (car bindings)))
+            (%for-step-setqs (cdr bindings) (cdr temps)))))
+
+;; 全step式の評価が終わってから、一時変数の値を各束縛変数へ書き戻す
+(defun %for-commit-setqs (bindings temps)
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car (car bindings)) ,(car temps))
+            (%for-commit-setqs (cdr bindings) (cdr temps)))))
 
 ;; (for ((var1 init1 [step1]) ...) (test result...) body...) を、
 ;; varをletで束縛したのちtagbody/goによる繰り返しとsetqによる更新に展開する。
@@ -164,18 +195,49 @@
 ;; tagbodyは自身の最後の式の値を返さず常にnilを返すため、testが成立したときの
 ;; result部の値は(return-from nil ...)で明示的にblockの脱出値として返す必要がある。
 ;; block nilで囲むことで、body中の(return-from nil 値)による早期脱出もできる。
+;;
+;; [性能測定] **2026-10-04: 一時変数方式へ移植した。**transpile.lisp側の
+;; expand-forと同じ展開形である(documents/for-expansion.md)。
+;; 旧展開形はループ本体で毎反復
+;;     (let ((%for-next-values (list step1 step2 ...))) (setq v1 (car ...)) ...)
+;; を評価しており、**1反復あたり16byte×束縛数を確保していた**
+;; (実測: 2束縛のJIT経路で32.00byte/反復、インタプリタ経路で928byte/反復)。
+;; AOT側は「ループ本体のlet廃止」で既に作り直されていたため、**同じS式なのに
+;; 経路によって展開形が違い、命令数も2.6倍違う**という状態が続いていた
+;; (transpile.lisp:721のコメントが「同じ展開規則」と書いていて嘘になっていた)。
+;;
+;; 一時変数をループの外側のletで一度だけ束縛し、ループ本体では素のsetqだけを
+;; 使う。**全step式を一時変数へ評価しきってから各束縛変数へ書き戻すため、
+;; 並列束縛の意味論は保たれる**((for ((a 0 b) (b 1 (+ a b))) ...)のように
+;; 互いの旧値を参照するstepでも正しい)。3経路での確認は
+;; test/lisp/for_semantics_test.lisp と test/lisp/for_expansion_test.lisp。
+;;
+;; **一時変数は入れ子のletで束縛する。transpile.lisp側は1つのletにappendして
+;; いるが、こちらは同じにできない。** JITの単一letの束縛数の上限が
+;; ZA_MAX_LOCALS_PER_LET=4(src/c/za.c:963)で、1つのletに2N個入れると
+;; **束縛3個のforがJITに乗らなくなる**(実測: 4束縛までT、5束縛以上はNIL。
+;; PR #115で未調査だった%%bench-aot-let5parがJITに乗らないのも同じ上限)。
+;; 入れ子なら外側N個・内側N個でどちらも4以下に収まり、**移植前と同じ
+;; 「4変数までJIT」を保てる**(ZA_MAX_LET_DEPTHは16なので深さは問題ない)。
+;; AOT側にこの上限は無いので、transpile.lisp側を変える必要はない。
+;; 入れ子にしても意味は同じ(一時変数は新しい名前で、外側の束縛を隠さない)。
+;; この差は tools/macro_parity_expected.tsv で cosmetic として記録してある。
+;;
+;; 二重定義マクロの照合は `make test-qemu-macro-parity` が行う。
 (defmacro for (bindings test-and-result &rest body)
-  `(let ,(%for-let-bindings bindings)
-     (block nil
-       (tagbody
-        %for-loop
-        (if ,(car test-and-result)
-            (return-from nil (progn ,@(cdr test-and-result)))
-            (progn
-              ,@body
-              (let ((%for-next-values (list ,@(%for-nexts bindings))))
-                ,@(%for-setqs bindings '%for-next-values))
-              (go %for-loop)))))))
+  (let ((temps (%for-temp-names bindings)))
+    `(let ,(%for-let-bindings bindings)
+       (let ,(%for-temp-let-bindings temps)
+         (block nil
+           (tagbody
+            %for-loop
+            (if ,(car test-and-result)
+                (return-from nil (progn ,@(cdr test-and-result)))
+                (progn
+                  ,@body
+                  ,@(%for-step-setqs bindings temps)
+                  ,@(%for-commit-setqs bindings temps)
+                  (go %for-loop)))))))))
 
 ;; while同様にtagbody/goで展開する。ループを終わらせるにはtestがnilになるか、
 ;; body中でreturn-fromを使う。

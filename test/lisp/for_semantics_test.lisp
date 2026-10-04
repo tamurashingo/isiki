@@ -86,11 +86,15 @@
 (assert-equal '(2 1 0) for-sem-acc)
 (assert-equal 2 for-sem-seen)
 
-;;; --- 5. 1 反復あたりの確保量(展開形の違いがここに出る) ---
+;;; --- 5. 1 反復あたりの確保量 ---
 ;; [性能測定] documents/for-expansion.md §1。
-;; init.lisp の for は毎反復 (list step1 step2) を作るので 32 byte/反復(cons 2 個)、
-;; transpile.lisp の expand-for は作らないので 0。
-;; **init.lisp 側を移植したら JIT 側が 0 になってここが落ちる。**
-;; そのときは 0 に直し、bench_baseline.tsv の for の帯を "-" から戻して測り直すこと。
-(assert-equal 32 (bench-jit-alloc-per-iter (function %%bench-jit-for) 20000 60000))
-(assert-equal 0  (bench-jit-alloc-per-iter (function %%bench-aot-for) 20000 60000))
+;;
+;; **経緯:** 以前は jit 側が 32(cons 2 個)だった。init.lisp の for が毎反復
+;; (list step1 step2) を作る旧展開形だったためで、PR #116 でその 32 を記録に固定し、
+;; **2026-10-04 の移植(一時変数方式)で 0 になった。**
+;; AOT 側は「ループ本体の let 廃止」で先に作り直されていたので最初から 0 である。
+;;
+;; **数字だけ書き換えると、なぜこのテストがあるのか分からなくなる。**
+;; ここが 0 以外に戻ったら、init.lisp の for が旧展開形へ戻ったということである。
+(assert-equal 0 (bench-jit-alloc-per-iter (function %%bench-jit-for) 20000 60000))
+(assert-equal 0 (bench-jit-alloc-per-iter (function %%bench-aot-for) 20000 60000))

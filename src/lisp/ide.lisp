@@ -37,28 +37,14 @@
 
 ;; (%ide-bytes-from-addr addr offset count) : addr+offsetを先頭にcount byte分を
 ;; %%peekで読み、0番目が先頭になるfixnum(0-255)のリストを返す。
-;; whileで実装する理由: forマクロ((let ((%for-next-values ...)) ...)を
-;; tagbody/goのループ本体に毎回新規生成する展開形)はGCが特定のタイミングで
-;; 走ると、以後永久に(そのループ内での)結果が壊れる既知のバグがある
-;; (PART-M4調査で発覚。1回でも発生すると回復しない)。
-;; whileはループ本体に追加のletを挟まないため、この問題を回避できる
-;; (300,000回の(setq junk (cons i junk))連続実行では再現しないことを確認済み)。
+;; whileで実装する理由: **forマクロのGC下永続破損バグの主張があった。
+;; 調査結果は issue #119(再現せず。根拠として挙げられていた
+;; documents/partition.md は一度も存在しない)。** whileはループ本体に
+;; 追加のletを挟まないため、その主張が正しかった場合にも当たらない。
 ;;
-;; **【2026-10-04 追記】この記述の根拠は確認できていない。**
-;;   - 根拠として挙げられていた documents/partition.md は**どのブランチにも
-;;     1度も存在しない**(git log --all --diff-filter=A で確認)。
-;;     再現手順はどこにも残っていない
-;;   - 再現を試みたが**再現しなかった**: GC_DEBUGビルドで%%DIAG-GC-STRESS=1
-;;     (確保ごとにGC、約9,000回)、累算がfixnum/consリスト/文字列/3変数、
-;;     インタプリタ/JIT/AOTの3経路、いずれも正しい値を返す。
-;;     塗り潰し(GC_PAINT)でのstale読みも0件
-;;   - ただし%%DIAG-GC-STRESSはos_alloc_bytesの中でしかGCを起こさないので、
-;;     **確保を含まない窓にはGCを置けない**(%for-next-valuesを作ってからcarで
-;;     読むまでの区間がそれ)。再現しないことの証明にはなっていない
-;;   詳細は documents/for-expansion.md §1。
-;;   **したがってこのwhileでの実装はそのまま残す。** forへ戻すのは、
-;;   init.lispのforが新展開形(毎反復のlistを作らない形)になり、かつ
-;;   バグの有無が決着してからにすること。
+;; **forへ戻すのは issue #119 を閉じてから。** いまのforは(新展開形になっても)
+;; インタプリタ経路では毎反復96byte確保する一方、whileは0なので、
+;; 性能の面でもwhileのままで損は無い(documents/for-expansion.md §3)。
 ;;
 ;; [ファイルI/O]#50付随の性能修正: 以前はconsリストを構築して返していたが、
 ;; read-sectorの戻り値(=このセクタバイト列)がconsリストのままだと、

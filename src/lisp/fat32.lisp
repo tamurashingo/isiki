@@ -143,7 +143,7 @@
 ;; 上限は%fat32-total-cluster-count+2(クラスタ番号は2始まり)とし、FATが破損して
 ;; 自己参照/循環したチェインになっていても無限ループせず打ち切る。
 ;; whileループ本体で毎回新規のletを生成しない理由: %ide-bytes-from-addrと同じ
-;; (ide.lispのコメント参照、PART-M4調査で発覚したとされる(根拠未確認。ide.lispの2026-10-04追記参照)GC下永続破損バグの回避。forマクロに
+;; (ide.lispのコメント参照、issue #119 で調査した(再現せず)GC下永続破損バグの回避。forマクロに
 ;; 限らず、tagbody/goのループ本体内で毎回新規に評価・確保されるletバインディングは
 ;; 同種のリスクを持つため、entry等をループ外のletへ引き上げてsetqで更新する)。
 (defun fat32-cluster-chain (device bpb start-cluster)
@@ -260,7 +260,7 @@
 ;; (%fat32-bytes-to-string bytes) : ASCIIコードのfixnumリストbytesから対応する
 ;; 文字を1文字ずつ持つLisp文字列を組み立てる。
 ;; whileで実装する理由: %ide-bytes-from-addrと同じ(ide.lispのコメント参照、
-;; PART-M4調査で発覚したとされる(根拠未確認。ide.lispの2026-10-04追記参照)forマクロのGC下永続破損バグの回避)。
+;; issue #119 で調査した(再現せず)forマクロのGC下永続破損バグの回避)。
 (defun %fat32-bytes-to-string (bytes)
   (let ((s (create-string (length bytes))) (b bytes) (i 0))
     (progn

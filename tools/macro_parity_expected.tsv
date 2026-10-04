@@ -11,7 +11,7 @@
 #   DIVERGENT **意味が違う。** 既知の不一致。**同じになったら落ちる**
 #             (直したのなら same へ変え、記録と文書を更新すること)
 #
-# 確認したリビジョン: f19b434(2026-10-04)
+# 確認したリビジョン: f19b434 + for の移植(2026-10-04)
 #
 # macro	判定	説明
 LET	cosmetic	host は body を (progn ...) で包む。AOT の「lambda の body は単一式」制約のため。意味は同じ
@@ -20,7 +20,7 @@ COND	same
 CASE	same
 CASE-USING	same
 SETF	same
-FOR	DIVERGENT	**host は一時変数へ全部評価してから書き戻す新展開形。guest は毎反復 (list step...) を作る旧展開形。** 実測で guest 側だけ 32.00 byte/反復 確保する(documents/for-expansion.md)
+FOR	cosmetic	**2026-10-04 に guest を新展開形へ移植した。**残る差は一時変数を置く場所だけで、host は 1 つの let に append、guest は入れ子の let。理由は JIT の ZA_MAX_LOCALS_PER_LET=4(za.c:963): 1 つの let に 2N 束縛入れると束縛 3 個の for が JIT に乗らなくなる。AOT 側にこの上限は無い。意味は同じ(documents/for-expansion.md §4)
 WHILE	same
 WITH-OPEN-INPUT-STREAM	same
 WITH-OPEN-INPUT-FILE	same

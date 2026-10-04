@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress
 
 all: build
 
@@ -1016,6 +1016,15 @@ test-qemu-bench-jit:
 # documents/for-expansion.md §3
 test-qemu-macro-parity:
 	tools/check_macro_parity.sh
+
+# [GCデバッグ] GC を強制しても for の結果が壊れないことを確かめる
+# (documents/for-expansion.md §1)。**GC_DEBUG=1 を自分で渡す。**
+# 渡し忘れると %%DIAG-GC-STRESS が無く「GC を強制したつもりで強制していない」
+# まま全部通るので、test/lisp/gc_debug_guard.lisp が通常ビルドで落とす。
+# %%DIAG-GC-STRESS=1(確保ごとに GC)を含むので **約 8 分**かかる。
+# test-qemu-all には入れない(通常ビルドでは意味を持たない)
+test-qemu-for-gc-stress:
+	$(MAKE) test-qemu-milestone GC_DEBUG=1 MILESTONE=test/lisp/qemu_boot_for_gc_stress.lisp
 
 # [性能測定] Phase1の受け入れ条件(documents/performance-measurement.md
 # 「letのImmobilized Spaceリーク」節)。クロージャ生成が実行回数に比例して
