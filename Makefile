@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress jit-frame-breakdown let-histogram
 
 all: build
 
@@ -302,8 +302,18 @@ check-bench-jit-sync:
 check-estimator:
 	@tools/bench/check_estimator.sh
 
+# [診断] JIT が容量上限でコンパイルを断念した「行番号」の期待値を、za.c の
+# 注記(`ZA_BAIL_LINE(); /* [診断] 容量上限 <定数> */`)と照合する。
+# 診断は __LINE__ を記録するので、za.c に 1 行入れただけで境界テストの
+# 期待値が全部ずれる。QEMU を回さないと分からないのでは遅い(1 回 8 分)ので、
+# ホスト側・1 秒で落ちるようにして make test の前提に入れてある。
+# --self-test は規則 8 の陽性対照(za.c を 1 行ずらして検出器が落ちることを見る)
+check-jit-bail-lines:
+	@python3 tools/check_jit_bail_lines.py
+	@python3 tools/check_jit_bail_lines.py --self-test
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: check-eval-error-budget check-bench-jit-sync check-estimator $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
@@ -768,6 +778,8 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
 	$(MAKE) test-qemu-bench-jit
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_semantics.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_limits.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
@@ -1016,6 +1028,23 @@ test-qemu-bench-jit:
 # documents/for-expansion.md §3
 test-qemu-macro-parity:
 	tools/check_macro_parity.sh
+
+# [調査] JIT 生成コードのスタックフレーム(ZA_FRAME_TOTAL)の内訳。
+# **ZA_FRAME_TOTAL は JIT 関数すべてのフレームで、再帰深さの上限をそのまま決める**
+# (256KB / 7480 = 35 段)。za.c からフレームレイアウトの #define を切り出して
+# プリプロセッサに計算させる(手計算しない)。QEMU もビルドも要らない。
+# 定数を上書きした試算もできる: python3 tools/jit_frame_breakdown.py DEPTH=8 LOCALS=8
+# documents/jit-frame-survey.md §2
+jit-frame-breakdown:
+	@python3 tools/jit_frame_breakdown.py
+
+# [調査] let / let* の束縛数(幅)と入れ子段数(深さ)のヒストグラム。
+# **ソース上の let ではなくマクロ展開後の IIFE 形を数える**(JIT が判定する対象)。
+# host 側(roswell)で全 Lisp ソースを macroexpand-all する。QEMU は要らない。
+# documents/jit-frame-survey.md §3
+let-histogram:
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
+		-c 'ros run --load tools/let_histogram.lisp --quit' 2>&1 | grep -E '^(IIFE|SKIP|FILE)'
 
 # [GCデバッグ] GC を強制しても for の結果が壊れないことを確かめる
 # (documents/for-expansion.md §1)。**GC_DEBUG=1 を自分で渡す。**
