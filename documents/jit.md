@@ -398,6 +398,15 @@ JIT対象です。1つの`flet`/`labels`で同時に束縛できるのは`ZA_MAX
   **実測は「深さ 33 までは返る、34 で STACK OVERFLOW」**
   (`documents/for-expansion.md`、`documents/jit-unsupported-syntax.md`)で、
   計算と一致する(差はベースの C スタック消費)
+- **1 段あたりの実測は 7,536 byte**(2026-10-07。塗って最高水位を読む方法。
+  `ZA_FRAME_TOTAL` 7,480 + `push rbx`/`push r13` 16 + 戻り番地 8 +
+  **呼び出し側のシャドウスペース 32**)。`documents/stack-guard.md` §5-2
+- **2026-10-07 以降、溢れる前に `<storage-exhausted>` を signal する**
+  (issue #110、`documents/stack-guard.md`)。予備領域 24,576 byte を取るので
+  **使える深さは 33 → 27 に減った。** 代わりに**ハングしなくなった**ので
+  **深さを直接探るテストが書ける**(`test/lisp/stack_guard_test.lisp`)。
+  **守られているのは JIT 経路だけである** — インタプリタ(実測 3,072 byte/段、
+  約 66 段)と AOT(実測 320 byte/段、約 782 段)には検査が無い
 - 1 束縛増やすと **16 × 24 = 384 byte** フレームが太り、再帰深さが減る
 - **16 byte 境界はどの値でも保たれる**(16 × 24 = 384 が 16 の倍数なので)。
   `ZA_MAX_CALL_DEPTH` のような「偶数を保つ」配慮は不要
