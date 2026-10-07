@@ -101,11 +101,33 @@
       (setq items (cdr items)))
     found))
 
-;; プロローグの先頭は push rbx(jit_push_rbx)
-(assert-equal "push" (disasm-mnemonic-at 'dis-add 0))
-(assert-equal "rbx" (disasm-item-operands
-                     (cdr (car (disasm-items (%%disasm-code-base 'dis-add)
-                                             (%%disasm-code-len 'dis-add))))))
+;; プロローグの先頭は**スタック残量の検査**(issue #110、2026-10-07 に入った)。
+;; それまでは push rbx(jit_push_rbx)が先頭だった。
+;;   mov r11d, &g_za_stack_limit / cmp rsp, [r11] / jae ...
+;; **オペランドは期待値にできない** — &g_za_stack_limit は実行時のアドレスで
+;; ビルドごとに変わる。だから 0 番目はニモニックだけを見る。
+(assert-equal "mov" (disasm-mnemonic-at 'dis-add 0))
+;; 1 番目は cmp rsp, [r11]。**ここは即値を含まないので固定できる**
+(assert-equal "cmp" (disasm-mnemonic-at 'dis-add 1))
+(assert-equal "rsp, [r11]" (disasm-item-operands
+                            (cdr (car (cdr (disasm-items (%%disasm-code-base 'dis-add)
+                                                         (%%disasm-code-len 'dis-add)))))))
+;; **push rbx は消えていない。** 検査の後ろ(断念経路を飛ばした先)に残っている。
+;; 先頭 12 項目のどこかに push rbx があること(位置を固定すると検査の形を
+;; 変えるたびに落ちるので、存在だけを見る)
+(defun disasm-has-push-rbx (name n)
+  (let ((items (disasm-items (%%disasm-code-base name) (%%disasm-code-len name)))
+        (i 0) (found nil))
+    (progn
+      (while (and (not found) (< i n) (not (null items)))
+        (progn
+          (if (and (equal "push" (disasm-item-mnemonic (cdr (car items))))
+                   (equal "rbx" (disasm-item-operands (cdr (car items)))))
+              (setq found t) nil)
+          (setq i (+ i 1))
+          (setq items (cdr items))))
+      found)))
+(assert-equal t (disasm-has-push-rbx 'dis-add 12))
 
 ;; エピローグの最後は ret(jit_ret)。末尾呼び出しでトランポリンへ抜ける関数でも、
 ;; フォールスルー経路のエピローグがコードブロックの末尾に残る
@@ -262,10 +284,13 @@
 ;; 先頭項目のオフセットは0、アドレスはコード先頭
 (assert-equal 0 (elt (car *disasm-list*) 1))
 (assert-equal (%%disasm-code-base 'dis-add) (elt (car *disasm-list*) 0))
-(assert-equal "push" (elt (car *disasm-list*) 2))
-(assert-equal "53" (elt (car *disasm-list*) 4))
-;; push rbx は絶対アドレスを持たないので注釈は空文字列
-(assert-equal "" (elt (car *disasm-list*) 5))
+;; 先頭はスタック残量の検査の mov(issue #110)。**即値はビルドごとに変わる**ので
+;; バイト列と注釈は 2 番目の cmp rsp,[r11] で見る(即値を含まないので固定できる)
+(assert-equal "mov" (elt (car *disasm-list*) 2))
+(assert-equal "cmp" (elt (car (cdr *disasm-list*)) 2))
+(assert-equal "49 3b 23" (elt (car (cdr *disasm-list*)) 4))
+;; cmp rsp,[r11] は絶対アドレスを持たないので注釈は空文字列
+(assert-equal "" (elt (car (cdr *disasm-list*)) 5))
 
 ;; disassemble自体は標準出力へ出してnilを返す
 (assert-output (disasm-result disasm-output) (disassemble 'dis-add)

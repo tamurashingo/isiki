@@ -86,6 +86,20 @@ int os_process_guard_is_upper(UINT64 va, UINT64 rsp);
 UINT64 os_process_stack_base(UINT32 i);
 int os_process_stack_contains(UINT64 rsp);
 
+/**
+ * @brief rspが属するプロセススタックの「実際に使える下端」を返す(issue #110)
+ *
+ * JIT のプロローグが置くスタック残量の検査は、**プロセスごとに違う下端**と
+ * 比べなければならない(g_stack_areaは「64KBガード + 256KBスタック」の
+ * スロットを並べた平坦な配列で、スロット長320KBは2の冪ではないのでrspから
+ * 算術で求められない)。文脈切り替えのときにここで引いて、閾値を更新する。
+ *
+ * @param rsp 調べるスタックポインタ
+ * @return 使えるスタックの下端アドレス。どのプロセススタックにも属さない場合は0
+ *         (起動直後のkernelのidleループ上では0が返る)
+ */
+UINT64 os_process_stack_low_for(UINT64 rsp);
+
 int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used);
 
 /** プロセス1つあたりのスタックサイズ(panicの診断表示用) */
