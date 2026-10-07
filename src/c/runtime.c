@@ -6,6 +6,7 @@
 #include "reader.h"
 #include "stream.h"
 #include "process.h"
+#include "za.h"
 #ifdef ISIKIOS_UNIT_TEST
 /* ネイティブ(x86_64以外を含む)ホストでのユニットテストではx87/SSE2インラインアセンブラが
    使えないため、libmの対応する関数で計算する。実機(x86_64 UEFI, ISIKIOS_UNIT_TEST未定義)
@@ -761,6 +762,13 @@ void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
     os_diag_serial_write(" byte (stack size=");
     serial_write_uint((UINT64)STACK_SIZE_FOR_PANIC);
     os_diag_serial_write(")\n");
+    /* [可用性] JITのスタック残量検査(issue #110)が一度も発火していないなら、
+       この溢れは**守られていない経路**(インタプリタ / AOT)から来ている。
+       JIT だけが守られていることを、溢れた現場で読めるようにする
+       (documents/stack-guard.md §4) */
+    os_diag_serial_write("  jit-stack-guard-hits=");
+    serial_write_uint(os_za_stack_guard_hits());
+    os_diag_serial_write(" (0 = 守られていない経路からの溢れ)\n");
 #endif
     frame_buffer *fb = get_active_frame_buffer();
     panic_write_string(fb, "PANIC: stack overflow\n  rsp=");

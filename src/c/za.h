@@ -107,6 +107,24 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
  * Phase4)をglobal_environmentへ登録する。os_bootstrap()等の他のos_register_*関数と
  * 同じタイミングでkernel_mainのブート列から呼ぶ。
  */
+/**
+ * @brief [可用性] JIT のスタック残量検査の閾値を、rspが属するスタックの下端から設定する
+ *
+ * **文脈切り替えのたびに呼ぶ。** プロセスごとにスタックが違うので、
+ * 生成コードが読む閾値も切り替えなければならない(issue #110、
+ * documents/stack-guard.md §2)。
+ *
+ * @param stack_low 使えるスタックの下端(os_process_stack_low_for の戻り値)。
+ *                  0 を渡すと検査は発火しなくなる(どのプロセススタックにも
+ *                  属さない = カーネルの idle ループ上)
+ */
+void os_za_set_stack_low(UINT64 stack_low);
+
+/** 通常時の閾値(診断用) */
+UINT64 os_za_stack_limit_value(void);
+/** 残量検査が発火した延べ回数(診断用) */
+UINT64 os_za_stack_guard_hits(void);
+
 void os_register_za_primitives(void);
 
 /**
