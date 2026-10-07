@@ -80,7 +80,7 @@
 (assert-equal 5 (jlm-nlx-ok 5))
 (defun jlm-nlx-over (x) (block nil (block nil (block nil (block nil (block nil (block nil (block nil (block nil (catch (quote jc) x))))))))))
 (assert-equal nil (%%za-compiled-p (function jlm-nlx-over)))
-(assert-equal 5431 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_NLX_DEPTH
+(assert-equal 5588 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_NLX_DEPTH
 (assert-equal 5 (jlm-nlx-over 5))
 
 ;;; --- ZA_MAX_FLET_BINDINGS ---
@@ -89,7 +89,7 @@
 (assert-equal 7 (jlm-flet-ok 7))
 (defun jlm-flet-over (x) (flet ((f1 (y) y) (f2 (y) y) (f3 (y) y) (f4 (y) y) (f5 (y) y)) (f1 x)))
 (assert-equal nil (%%za-compiled-p (function jlm-flet-over)))
-(assert-equal 6078 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_FLET_BINDINGS
+(assert-equal 6209 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_FLET_BINDINGS
 (assert-equal 7 (jlm-flet-over 7))
 
 ;;; --- ZA_MAX_TAGBODY_TAGS ---
@@ -154,7 +154,7 @@
 ;;; --- ZA_MAX_QQ_ELEMENTS --- ちょうど(16)は za_test_ext18
 (defun jlm-qqelem-over (x) `(,x 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))
 (assert-equal nil (%%za-compiled-p (function jlm-qqelem-over)))
-(assert-equal 5035 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_QQ_ELEMENTS
+(assert-equal 5072 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_QQ_ELEMENTS
 (assert-equal '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16) (jlm-qqelem-over 0))
 
 ;;; --- ZA_MAX_COMPILE_NEST (60) --- ちょうど(59)は jit_nest_depth_test
