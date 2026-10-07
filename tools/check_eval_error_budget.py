@@ -73,8 +73,20 @@ import sys
 #                g_sym_read_error へ翻訳する内部ステータスで、評価器へは漏れない
 # **したがってこの予算はもう下がらない。** 下げようとする変更があれば、
 # それは上のどちらかの性質を変えているということなので、先に設計を見直すこと。
+#
+# [issue #110] 6 -> 7。**1 箇所だけ意図的に増やした。**
+# za.c の os_za_signal_stack_exhausted(JIT のスタック残量検査の断念経路)が、
+# **予備領域の中でさらに枯渇した場合**に EVAL-ERROR を返す。
+# これは [P4-2] で 26 -> 27 にしたときと**同じ性質**である:
+# 「EVAL-ERROR を値として返す設計」を広げたのではなく、
+# **条件システム自体が使えない状態のフォールバック**である。
+# ここで signal を重ねると予備領域を食い潰して、
+# **「エラーを出そうとしてハングする」**という、保護を入れる前より
+# 分かりにくい症状になる(documents/stack-guard.md §5-5)。
+# **signal へ寄せられない唯一の理由が「signal する資源が無いこと」**なので、
+# この 1 箇所は下がらない。
 BUDGETS = {
-    "c_return": 6,
+    "c_return": 7,
     # [P4-4] 5 -> 2。file-cmd.lisp の read-file-into-vector / write-vector-to-file が
     # 見ていた EVAL-ERROR 返しは、open-input-stream / open-output-file / file-length が
     # signal(または仕様どおりの nil)へ変わったことで**起きなくなった**ため落とした。
