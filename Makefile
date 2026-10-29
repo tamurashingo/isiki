@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram
 
 all: build
 
@@ -312,8 +312,26 @@ check-jit-bail-lines:
 	@python3 tools/check_jit_bail_lines.py
 	@python3 tools/check_jit_bail_lines.py --self-test
 
+# [規則 15] **PR 本文が「成果物」として挙げたものが、マージ後の木に実在するか。**
+# PR #113 の本文は 3 件、含んでいないものを成果として書いていた(整理コミットが
+# 別ブランチに取り残されていた)。気づいたのは **1 か月後、使おうとしたとき**。
+#
+#   make check-pr-claims PR=113            本文を今の木と突き合わせる(gh が要る)
+#   make check-pr-claims PR=113 AT=33cc8b3 指定リビジョンの木と突き合わせる
+#
+# **make test に入れてあるのは自己試験のほうだけ。** 本文の突き合わせは gh
+# (= ネットワーク)が要るので、マージ後に人が 1 回走らせる形にしてある。
+# 自己試験は**履歴そのもの**を使う(#113 の本文 × 回収前/回収後の木)ので、
+# 「当時の事故を捕まえられたか」をそのまま確かめられる
+check-pr-claims:
+	@python3 tools/check_pr_claims.py $(PR) $(if $(AT),--at $(AT),)
+
+# [規則 15] 上の検出器の自己試験(規則 8)。QEMU もネットワークも要らない
+check-pr-claims-self-test:
+	@python3 tools/check_pr_claims.py --self-test
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
