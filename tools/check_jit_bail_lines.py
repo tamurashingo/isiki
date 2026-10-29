@@ -87,7 +87,8 @@ def check(za_path, lisp_files, fix=False, quiet=False):
             want_line = int(m.group(1))
             const = m.group(3)
             ordinal = int(m.group(4)[1:]) if m.group(4) else None
-            cands_now = index.get(const, [])
+            cands = index.get(const, [])
+            cands_now = cands
             have = annot.get(want_line)
             # **序数(#N)があれば、N 番目の断念箇所と一致していることまで見る。**
             # 同じ定数の別の箇所へ寄ってしまう取りこぼしを防ぐ
@@ -121,7 +122,10 @@ def check(za_path, lisp_files, fix=False, quiet=False):
             print("    %s の断念箇所: %s" % (const, " ".join(str(c) for c in cands)),
                   file=sys.stderr)
             if fix:
-                if len(cands) == 1:
+                if ordinal is not None and 1 <= ordinal <= len(cands):
+                    # **序数があるなら推量しない。** N 番目へ決定的に合わせる
+                    newline = cands[ordinal - 1]
+                elif len(cands) == 1:
                     newline = cands[0]
                 else:
                     # 複数ある場合は、ずれる前に一番近かったものへ寄せる。
