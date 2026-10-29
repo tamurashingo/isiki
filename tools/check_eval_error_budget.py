@@ -85,6 +85,23 @@ import sys
 # 分かりにくい症状になる(documents/stack-guard.md §5-5)。
 # **signal へ寄せられない唯一の理由が「signal する資源が無いこと」**なので、
 # この 1 箇所は下がらない。
+#
+# **内訳(既存 6 つと同じ水準で記録する):**
+#   za.c 1  os_za_signal_stack_exhausted。g_za_in_stack_signal が立っている
+#           (= 予備領域の中でさらに枯渇した)ときだけ通る。
+#
+# **常設の試験は置いていない。理由を書く。**
+#   この経路は**到達はする**(実測で (H EVAL-ERROR) / (HD EVAL-ERROR) を観測)。
+#   しかし**到達するかどうかがハンドラの形に対して非単調**だった:
+#     ハンドラの中の入れ子呼び出しを 5 段にすると発火し、8/10/12 段では発火しない。
+#   ハンドラ本体が JIT に乗るか(ZA_MAX_CALL_DEPTH=4)と、入れ子呼び出しが
+#   JIT フレームを重ねるかが形で変わるためである。
+#   さらに、EVAL-ERROR を**算術に流す**形にすると下流が別の signal を試みて
+#   予備領域を使い切り、**ガードページに落ちて機械が止まる**ことがあった
+#   (状態依存。同じ式が一度は EVAL-ERROR で戻り、一度は止まった)。
+#   **常設テストにすると、落ちるのではなく機械が止まる形の失敗になる。**
+#   だから置かない。observed-but-untested として記録する
+#   (documents/stack-guard.md §5-6)。
 BUDGETS = {
     "c_return": 7,
     # [P4-4] 5 -> 2。file-cmd.lisp の read-file-into-vector / write-vector-to-file が

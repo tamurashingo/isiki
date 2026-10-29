@@ -402,8 +402,9 @@ JIT対象です。1つの`flet`/`labels`で同時に束縛できるのは`ZA_MAX
   `ZA_FRAME_TOTAL` 7,480 + `push rbx`/`push r13` 16 + 戻り番地 8 +
   **呼び出し側のシャドウスペース 32**)。`documents/stack-guard.md` §5-2
 - **2026-10-07 以降、溢れる前に `<storage-exhausted>` を signal する**
-  (issue #110、`documents/stack-guard.md`)。予備領域 24,576 byte を取るので
-  **使える深さは 33 → 27 に減った。** 代わりに**ハングしなくなった**ので
+  (issue #110、`documents/stack-guard.md`)。予備領域 24,432 byte(導出式)を取るので
+  **使える深さは 33〜34 → 27 に減った**(境界が範囲なのは呼び出し元のスタック
+  使用量で 1 段動くため)。代わりに**ハングしなくなった**ので
   **深さを直接探るテストが書ける**(`test/lisp/stack_guard_test.lisp`)。
   **守られているのは JIT 経路だけである** — インタプリタ(実測 3,072 byte/段、
   約 66 段)と AOT(実測 320 byte/段、約 782 段)には検査が無い

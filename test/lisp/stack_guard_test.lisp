@@ -6,9 +6,10 @@
 ;; 直す前の症状:
 ;;   JIT 関数は 1 段 7,536 byte 使う(ZA_FRAME_TOTAL 7,480 + push rbx/r13 16 +
 ;;   戻り番地 8 + 呼び出し側のシャドウスペース 32)。プロセスのスタックは 256KB
-;;   なので **深さ 34 で溢れる。** 溢れるとガードページ #PF で止まり、報告は
+;;   なので **深さ 33〜34 で溢れる**(境界が範囲なのは呼び出し元のスタック使用量で
+;;   1 段動くため)。溢れるとガードページ #PF で止まり、報告は
 ;;   `-serial stdio` にしか出ないので、**外から見ると QEMU の無反応と区別が付かない。**
-;;   **深さ 34 は何もしていない深さである。** 素朴な再帰で踏む。
+;;   **何もしていない深さである。** 素朴な再帰で踏む。
 ;;
 ;; 直したあと:
 ;;   プロローグの先頭(`sub rsp` より前)で残量を見て、足りなければ
@@ -62,7 +63,7 @@
 ;;; --- 6. 最大深さを直接探れる(本作業の副産物) ---
 ;;
 ;; **ハングしないので、深さを 1 つずつ上げて限界を求められる。**
-;; 2026-10-07 の実測値は **27**(ZA_STACK_SIGNAL_RESERVE = 24,576)。
+;; 2026-10-07 の実測値は **27**(ZA_STACK_SIGNAL_RESERVE = 24,432。za.c の導出式)。
 ;;
 ;; 帯で見るのは、呼び出し元のスタック使用量で 1〜2 段動くため。
 ;;   **下限 20**: 予備領域を増やしすぎると深さが削られる。ここで気づく
@@ -91,6 +92,32 @@
 (defun sgt-tail (n acc) (if (= n 0) acc (sgt-tail (- n 1) (+ acc n))))
 (assert-equal t (%%za-compiled-p (function sgt-tail)))
 (assert-equal 500500 (sgt-tail 1000 0))
+
+;;; --- 7b. ハンドラは signal の動的文脈(= 深いところ)で走り、完走する ---
+;;
+;; ISLisp の `with-handler` のハンドラは**巻き戻す前**に走る。だからハンドラが
+;; 使う量も予備領域に入っていなければならない(`ZA_HANDLER_ALLOWANCE` = 4,096)。
+;; **現実的な形のハンドラ**(条件のクラス名を引き、リストを組む)が通ることを固定する。
+;;
+;; **4,096 byte を超えるハンドラは保証していない**(documents/stack-guard.md §5-6)。
+;; 超えた場合の挙動は形に依存し、`EVAL-ERROR` での劣化か報告付きの停止になる。
+;; **止まる形はテストにできない**(落ちるのではなく機械が止まる)のでここには置かない。
+(defun sgt-handler-realistic ()
+  (block done
+    (with-handler
+        (lambda (c)
+          (return-from done
+            (list 'handled (%%class-name (class-of c))
+                  (length (list 1 2 3 4 5 6 7 8 9 10)))))
+      (sgt-rec 1000))))
+(assert-equal '(handled <storage-exhausted> 10) (sgt-handler-realistic))
+;; ハンドラの中で JIT 再帰 1 段も通る
+(defun sgt-handler-rec1 ()
+  (block done
+    (with-handler (lambda (c) (return-from done (list 'h1 (sgt-rec 1)))) (sgt-rec 1000))))
+(assert-equal '(h1 1) (sgt-handler-rec1))
+;; ここまでで signal の打ち切りに当たっていないこと
+(assert-equal 0 (%%diag-signal-overflows))
 
 ;;; --- 8. 相互再帰でも発火する(1 つの関数の自己再帰に限らない) ---
 
