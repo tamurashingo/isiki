@@ -1748,7 +1748,8 @@ static UINT64 g_za_block_level_mask = 0;
  * **JIT 関数は 1 段あたり 7536 byte 使う**(ZA_FRAME_TOTAL 7480 + push rbx/r13 16
  * + 戻り番地 8 + 呼び出し側のシャドウスペース 32。塗って最高水位を読む方法で実測。
  * documents/stack-guard.md §5-2)。プロセスのスタックは 256KB なので
- * **深さ 34 で溢れる。** 溢れるとガードページ #PF で止まり、報告は
+ * **境界は深さ 33〜34**(呼び出し元のスタック使用量で 1 段動く)。
+ * 溢れるとガードページ #PF で止まり、報告は
  * -serial stdio にしか出ないので、**外から見ると QEMU の無反応と区別が付かない。**
  *
  * プロローグの先頭(sub rsp より前)で残量を見て、足りなければ
@@ -1770,46 +1771,80 @@ static UINT64 g_za_block_level_mask = 0;
  * [この検査は safety で外せない] 型の検査ではなく**資源の検査**である。
  *   宣言しても資源は増えないので省けない(documents/stack-guard.md §6)。
  */
-/** signal 1 回が使うスタックの実測上限に余裕を付けた値。
+/* ---- 予備領域は定数ではなく**導出式**にする(規則 13)-----------------------
  *
- * **実測: 8,824 byte**(塗って最高水位を読む方法。ハンドラあり 8,824 /
- * ハンドラなし 8,696。documents/stack-guard.md §5-3)。
- * GC は明示キューの while ループ(gc_scan_queue)で**反復的**なので、
- * signal 経路の途中で走っても使用量は O(1) しか増えない。
+ * **ZA_FRAME_TOTAL に比例する項が入っているので、定数で書くと案 d
+ * (フレームの実寸化)の利得をそのぶん食い残す。** しかも深さは増えるので
+ * **誰も気づかない。** tools/jit_frame_breakdown.py が内訳の合計を検算するのと
+ * 同じ扱いにして、**フレームが縮んだ日に予備領域も自動で縮む**ようにする。
  *
- * **値の決め方(下限から積む):**
- *   発火フレームの余り 7,536(検査が通った最後のフレームが使う分。断念経路は
- *                        閾値より最大これだけ下で始まる)
- * + signal 経路の実測    8,824
- * + 床                   4,096(これより下はハンドラの暴走とみなす)
- * = **20,456 が下限。** 切り上げて 24,576(24KB)。
+ *   予備領域 = 1 段ぶん + 既定の signal 経路 + ハンドラへの保証分 + 床
  *
- * 大きくすればするだけ**使える深さが減る**(1 段 7,536 byte なので 24KB は
- * 約 3.3 段ぶん。実測で最大深さ 33 → 28)。足りない場合は床で捕まえて
- * EVAL-ERROR を返すので、**ハングではなく劣化**になる(§5-5)。
+ * 各項の出どころ:
+ */
+/** JIT 関数 1 段が使うスタック量。**断念経路は閾値より最大これだけ下で始まる**
+ *  (検査が通った最後のフレームがこれだけ使うため)。
+ *  内訳: ZA_FRAME_TOTAL + push rbx/r13 16 + 戻り番地 8 + 呼び出し側のシャドウスペース 32。
+ *  **実測 7,536 と一致する**(塗って最高水位を読む方法。documents/stack-guard.md §5-2)。
+ *  **ZA_FRAME_TOTAL に比例するのはこの項である。** */
+#define ZA_STACK_PER_FRAME     (ZA_FRAME_TOTAL + 16 + 8 + 32)
+
+/** 既定の signal 経路が使う量の実測上限(**ハンドラを含まない**)。
+ *  os_signal_condition -> make-instance / signal-condition -> 既定の経路。
+ *  実測 8,696 byte(ハンドラ無しで測った値。documents/stack-guard.md §5-3)。
+ *  **GC はここに乗らない** — 収集器は明示キューの while ループ(gc_scan_queue)で
+ *  反復的なので O(1) しか増えない。 */
+#define ZA_SIGNAL_PATH_MAX     8696
+
+/** **ユーザのハンドラに保証する量。**
  *
- * **検証のために -D で上書きできる**(documents/stack-guard.md §6-4 の陽性対照)。
- * 上書きしたときは「JIT のスタック保護が発火したあとに溢れた」ことが
- * os_panic_stack_overflow の jit-stack-guard-hits で読めるので、
- * 古いバイナリを測る罠(EXTRA_CFLAGS はビルドスタンプの外)には落ちない。 */
-#ifndef ZA_STACK_SIGNAL_RESERVE
-#define ZA_STACK_SIGNAL_RESERVE 24576
-#endif
-/** 予備領域の中でさらに潜ったときに捕まえる床。断念経路(call 1 つ)が通る分だけ。
- *  **予備領域より大きくならないようにする** — 検証で ZA_STACK_SIGNAL_RESERVE を
- *  小さく上書きしたときに、床が通常の閾値より上になって逆効果になるのを防ぐ */
+ *  ISLisp の with-handler のハンドラは **signal の動的文脈で走る** = 巻き戻す前、
+ *  深いところで走る。だからハンドラが使う分は予備領域に入れておかなければならない。
+ *  実測に使った assert-error-class のハンドラ(typep / class-of / %%class-name /
+ *  list / return-from)は 8,824 - 8,696 = **128 byte** しか使っていない。
+ *
+ *  **これを超えるハンドラは保証しない。** 床を割って EVAL-ERROR になる
+ *  (ハングではなく劣化。documents/stack-guard.md §5-6)。
+ *  **再帰するハンドラは再び検査に当たるので別の話**だが、
+ *  **再帰せずに深く使うハンドラ**(format を深く使う、構造を組み立てる)は
+ *  ここで決まる。 */
+#define ZA_HANDLER_ALLOWANCE   4096
+
+/** 予備領域の中でさらに潜ったときに捕まえる床。断念経路(call 1 つ)が通る分だけ。 */
 #define ZA_STACK_HARD_FLOOR_WANT 4096
+
+/** 予備領域の下限。**これが導出式の本体である。** */
+#define ZA_STACK_RESERVE_MIN \
+    (ZA_STACK_PER_FRAME + ZA_SIGNAL_PATH_MAX + ZA_HANDLER_ALLOWANCE + ZA_STACK_HARD_FLOOR_WANT)
+
+/** 実際に使う予備領域。**16 byte 境界へ切り上げる**(4KB で丸めると、案 d で
+ *  フレームが 3,300 byte 縮んでも丸めに吸われて利得が見えない)。
+ *
+ *  **-D で上書きできる**(documents/stack-guard.md §6-4 の陽性対照)。
+ *  上書きしたときは下の _Static_assert を外す — 意図的に小さくして
+ *  「signal の途中で溢れる」ことを確かめるための経路だからである。 */
+#ifndef ZA_STACK_SIGNAL_RESERVE
+#define ZA_STACK_SIGNAL_RESERVE (((ZA_STACK_RESERVE_MIN) + 15) & ~15)
+#define ZA_STACK_RESERVE_DERIVED 1
+#endif
+
+/* 床は予備領域より大きくならないようにする(上書きで小さくしたとき、床が通常の
+   閾値より上になって逆効果になるのを防ぐ) */
 #if ZA_STACK_HARD_FLOOR_WANT * 2 >= ZA_STACK_SIGNAL_RESERVE
 #define ZA_STACK_HARD_FLOOR (ZA_STACK_SIGNAL_RESERVE / 2)
 #else
 #define ZA_STACK_HARD_FLOOR ZA_STACK_HARD_FLOOR_WANT
 #endif
-/* [設計の整合] signal 経路(実測 8,824)が床と閾値のあいだに収まっていること。
-   収まらないと、signal の途中で床を割って EVAL-ERROR になり、
+
+#ifdef ZA_STACK_RESERVE_DERIVED
+/* [設計の整合] 導出式で決めたときは、下限を満たしていること。
+   満たさないと signal の途中で床を割って EVAL-ERROR になり、
    <storage-exhausted> が出なくなる */
-_Static_assert(ZA_STACK_SIGNAL_RESERVE == ZA_STACK_HARD_FLOOR * 2 ||
-               ZA_STACK_SIGNAL_RESERVE >= 7536 + 8824 + ZA_STACK_HARD_FLOOR,
-               "ZA_STACK_SIGNAL_RESERVE が小さすぎる(documents/stack-guard.md §5-3)");
+_Static_assert(ZA_STACK_SIGNAL_RESERVE >= ZA_STACK_RESERVE_MIN,
+               "ZA_STACK_SIGNAL_RESERVE が下限を満たしていない(documents/stack-guard.md §5-3)");
+_Static_assert(ZA_STACK_HARD_FLOOR == ZA_STACK_HARD_FLOOR_WANT,
+               "導出式のときは床が削られてはならない");
+#endif
 
 /** 生成コードが cmp rsp,[r11] で読む閾値。0 のときは検査が発火しない
  *  (最初のタイマ tick より前、カーネルの idle ループ上) */

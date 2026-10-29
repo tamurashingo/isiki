@@ -32,7 +32,9 @@ ZA_MAX_NLX_DEPTH ZA_NLX_SLOT_SIZE ZA_ARG_SLOT_SIZE ZA_LOCAL_SLOT_SIZE
 ZA_MAX_CALL_DEPTH ZA_CALL_SLOT_SIZE ZA_MAX_ARITH_DEPTH ZA_ARITH_SLOT_SIZE
 ZA_MAX_QQ_DEPTH ZA_MAX_QQ_ELEMENTS ZA_QQ_SLOT_SIZE ZA_QQ_LEVEL_SIZE
 ZA_FLET_OLD_SLOT_SIZE ZA_MAX_FIXED_ENTRY_PARAMS
-ZA_FRAME_EXTRA ZA_FRAME_TOTAL""".split()
+ZA_FRAME_EXTRA ZA_FRAME_TOTAL
+ZA_STACK_PER_FRAME ZA_SIGNAL_PATH_MAX ZA_HANDLER_ALLOWANCE
+ZA_STACK_HARD_FLOOR_WANT ZA_STACK_RESERVE_MIN ZA_STACK_SIGNAL_RESERVE""".split()
 
 # 領域の境界として並べるオフセット(宣言順ではなく値順に並べ直して差を取る)
 OFFSETS = """ZA_OFF_ENV_SAVED_HEAD ZA_OFF_ENV_VAL ZA_OFF_ENV_NODE ZA_OFF_ARGS_VAL
@@ -111,6 +113,12 @@ int main(void) {{
     }}
     printf("TOTALS\\t%d\\t%d\\t%d\\n", ZA_FRAME_EXTRA, ZA_FRAME_TOTAL,
            262144 / ZA_FRAME_TOTAL);
+    printf("RESERVE\\t%d\\t%d\\t%d\\t%d\\t%d\\t%d\\n",
+           ZA_STACK_PER_FRAME, ZA_SIGNAL_PATH_MAX, ZA_HANDLER_ALLOWANCE,
+           ZA_STACK_HARD_FLOOR_WANT, ZA_STACK_RESERVE_MIN, ZA_STACK_SIGNAL_RESERVE);
+    printf("DEPTH\\t%d\\t%d\\n",
+           262144 / ZA_STACK_PER_FRAME,
+           (262144 - ZA_STACK_SIGNAL_RESERVE) / ZA_STACK_PER_FRAME);
     printf("CONSTS\\t%d\\t%d\\t%d\\t%d\\t%d\\t%d\\t%d\\n",
            ZA_MAX_LET_DEPTH, ZA_MAX_LOCALS_PER_LET, ZA_MAX_NLX_DEPTH,
            ZA_MAX_CALL_DEPTH, ZA_MAX_ARITH_DEPTH, ZA_MAX_QQ_DEPTH,
@@ -128,13 +136,17 @@ int main(void) {{
             sys.exit("ERROR: 生成した C がコンパイルできない\n" + r.stderr[:2000])
         out = subprocess.run([exe], capture_output=True, text=True).stdout
 
-    body, totals, consts = [], None, None
+    body, totals, consts, reserve, depth = [], None, None, None, None
     for ln in out.strip().split("\n"):
         f = ln.split("\t")
         if f[0] == "TOTALS":
             totals = [int(x) for x in f[1:]]
         elif f[0] == "CONSTS":
             consts = [int(x) for x in f[1:]]
+        elif f[0] == "RESERVE":
+            reserve = [int(x) for x in f[1:]]
+        elif f[0] == "DEPTH":
+            depth = [int(x) for x in f[1:]]
         else:
             body.append((f[0], int(f[1]), int(f[2])))
 
@@ -158,6 +170,39 @@ int main(void) {{
         sys.exit(f"ERROR: 内訳の合計 {s} が ZA_FRAME_TOTAL {totals[1]} と一致しない。"
                  f"数えていない領域がある")
     print("内訳の合計は ZA_FRAME_TOTAL と一致している。")
+
+    # ---- [可用性] 予備領域の内訳(issue #110)----------------------------------
+    # **予備領域は定数ではなく導出式である**(規則 13)。ZA_FRAME_TOTAL に比例する
+    # 項(ZA_STACK_PER_FRAME)が入っているので、**フレームが縮むと予備領域も縮む。**
+    # 定数で書いていると案 d の利得をそのぶん食い残し、しかも深さは増えるので
+    # 誰も気づかない。だから内訳をここで報告し、合計を検算する。
+    per_frame, sig, handler, floor, rmin, rsv = reserve
+    print()
+    print("| 予備領域の項 | byte | 出どころ |")
+    print("|---|---:|---|")
+    print(f"| `ZA_STACK_PER_FRAME` | {per_frame} | "
+          f"**ZA_FRAME_TOTAL に比例**(+ push 16 + 戻り番地 8 + シャドウ 32) |")
+    print(f"| `ZA_SIGNAL_PATH_MAX` | {sig} | 既定の signal 経路の実測 |")
+    print(f"| `ZA_HANDLER_ALLOWANCE` | {handler} | ユーザのハンドラへの保証分 |")
+    print(f"| `ZA_STACK_HARD_FLOOR_WANT` | {floor} | 床 |")
+    print(f"| **下限** | **{rmin}** | 上の合計 |")
+    print(f"| **ZA_STACK_SIGNAL_RESERVE** | **{rsv}** | 16 byte 境界へ切り上げ |")
+    print()
+    # **ベースのスタック使用量(呼び出し元のフレーム)を含まない上限である。**
+    # 実測はこれより数段少ない(2026-10-07 の計測では 31 に対して 27)。
+    # 数字が独り歩きしないよう、ここで断っておく
+    print(f"1 段 {per_frame} byte / 256KB で 保護なし {depth[0]} 段 "
+          f"-> 保護あり {depth[1]} 段"
+          f"  (**どちらもベースのスタック使用量を含まない上限。**"
+          f" 実測はこれより数段少ない)")
+    if per_frame != totals[1] + 56:
+        sys.exit(f"ERROR: ZA_STACK_PER_FRAME {per_frame} が "
+                 f"ZA_FRAME_TOTAL+56 {totals[1] + 56} と一致しない")
+    if rmin != per_frame + sig + handler + floor:
+        sys.exit(f"ERROR: 予備領域の下限 {rmin} が項の合計と一致しない")
+    if rsv < rmin:
+        sys.exit(f"ERROR: ZA_STACK_SIGNAL_RESERVE {rsv} が下限 {rmin} を下回っている")
+    print("予備領域は下限を満たし、各項の合計と一致している。")
 
 
 if __name__ == "__main__":
