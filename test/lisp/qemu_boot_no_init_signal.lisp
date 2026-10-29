@@ -72,5 +72,37 @@
 (ck "cons-alive"    (equal (list 1 2) '(1 2)))
 (ck "gc-alive"      (= (length (subseq '(1 2 3 4 5) 1 4)) 3))
 
+;;; ---------------------------------------------------------------------------
+;;; [issue #110] **条件クラスが無い状態で、JIT のスタック残量検査が発火しても
+;;; 戻ってくること。**
+;;;
+;;; ここは issue #110 の断念経路(os_za_signal_stack_exhausted)が
+;;; **条件システムが使えない状態**を通る唯一の試験である。
+;;;   ガードが発火 -> os_za_signal_stack_exhausted -> os_signal_condition が
+;;;   <STORAGE-EXHAUSTED> を引けないのでフォールバックして EVAL-ERROR を返す
+;;;   -> それがそのまま戻る。
+;;; **固定するのは「戻ってくること」であって、戻り値そのものではない**
+;;; (この状態での戻り値は仕様の範囲外。上の signal の試験と同じ扱い)。
+;;;
+;;; **init.lisp を読んだ通常の起動では <storage-exhausted> が signal される**
+;;; (test/lisp/stack_guard_test.lisp)。こちらはその裏側である。
+
+(defun sg-rec (n) (if (= n 0) 0 (+ n (sg-rec (- n 1)))))
+(ck "sg-compiled"  (%%za-compiled-p (function sg-rec)))
+(ck "sg-shallow"   (= (sg-rec 20) 210))
+;;; **深い再帰。** ここを通り越して次の #ck が出れば「戻ってきた」が言える
+;;; (1 件ごとに書き出しているので、止まった場合はここで出力が途切れる)
+(defglobal *sg-deep* (sg-rec 1000))
+(ck "sg-deep-returns" t)
+(ck "sg-alive-after"  (= (sg-rec 20) 210))
+
+;;; **ここでの %%DIAG-SIGNAL-OVERFLOWS は 0 でなくてよい。**
+;;; 巻き戻しのたびに (+ n EVAL-ERROR) が GENERIC の算術へ入り、そこが signal を
+;;; 試みる(documents/stack-guard.md §5-6)。条件クラスが無いので毎回
+;;; フォールバックするだけだが、打ち切りに当たることはありうる。
+;;; **数を固定せず、記録として出す**(規則 6: 否定の結果は消さずに残す)
+(format *s* "#sg signal-overflows=~D~%" (%%diag-signal-overflows))
+(finish-output *s*)
+
 (format *s* "~%==== isiki tests: ~D passed, ~D failed ====~%" *pass* *fail*)
 (close *s*)

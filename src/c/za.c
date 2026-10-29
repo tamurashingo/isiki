@@ -1782,12 +1782,25 @@ static UINT64 g_za_block_level_mask = 0;
  *
  * 各項の出どころ:
  */
+/* JIT 関数 1 段が使うスタック量の内訳。**数字をそのまま足さず、加数に名前を付ける**
+   (原則12: 数字入りのコメントで済ませると、定数 1 つを定数 3 つに置き換えただけになる) */
+/** プロローグが退避する callee-saved レジスタ 2 本(`push rbx` / `push r13`) */
+#define ZA_STACK_SAVED_REGS    16
+/** `call` が積む戻り番地 */
+#define ZA_STACK_RETURN_ADDR   8
+/** Microsoft x64 ABI が呼び出し元に義務付ける shadow space(`jit_call_r11` が出す) */
+#define ZA_STACK_SHADOW_SPACE  32
+
 /** JIT 関数 1 段が使うスタック量。**断念経路は閾値より最大これだけ下で始まる**
  *  (検査が通った最後のフレームがこれだけ使うため)。
- *  内訳: ZA_FRAME_TOTAL + push rbx/r13 16 + 戻り番地 8 + 呼び出し側のシャドウスペース 32。
  *  **実測 7,536 と一致する**(塗って最高水位を読む方法。documents/stack-guard.md §5-2)。
- *  **ZA_FRAME_TOTAL に比例するのはこの項である。** */
-#define ZA_STACK_PER_FRAME     (ZA_FRAME_TOTAL + 16 + 8 + 32)
+ *  **ZA_FRAME_TOTAL に比例するのはこの項である。**
+ *
+ *  **インタプリタ(os_eval の再帰)は 1 段 3,072 byte で、JIT の 2.4 分の 1 である。**
+ *  つまり**「JIT に乗らないほうがスタックに優しい」**という倒錯した性質がある
+ *  (documents/stack-guard.md §5-7)。案 d(フレームの実寸化)はこれを薄める。 */
+#define ZA_STACK_PER_FRAME \
+    (ZA_FRAME_TOTAL + ZA_STACK_SAVED_REGS + ZA_STACK_RETURN_ADDR + ZA_STACK_SHADOW_SPACE)
 
 /** 既定の signal 経路が使う量の実測上限(**ハンドラを含まない**)。
  *  os_signal_condition -> make-instance / signal-condition -> 既定の経路。

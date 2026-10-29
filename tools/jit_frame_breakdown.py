@@ -34,6 +34,7 @@ ZA_MAX_QQ_DEPTH ZA_MAX_QQ_ELEMENTS ZA_QQ_SLOT_SIZE ZA_QQ_LEVEL_SIZE
 ZA_FLET_OLD_SLOT_SIZE ZA_MAX_FIXED_ENTRY_PARAMS
 ZA_FRAME_EXTRA ZA_FRAME_TOTAL
 ZA_STACK_PER_FRAME ZA_SIGNAL_PATH_MAX ZA_HANDLER_ALLOWANCE
+ZA_STACK_SAVED_REGS ZA_STACK_RETURN_ADDR ZA_STACK_SHADOW_SPACE
 ZA_STACK_HARD_FLOOR_WANT ZA_STACK_RESERVE_MIN ZA_STACK_SIGNAL_RESERVE""".split()
 
 # 領域の境界として並べるオフセット(宣言順ではなく値順に並べ直して差を取る)
@@ -181,7 +182,8 @@ int main(void) {{
     print("| 予備領域の項 | byte | 出どころ |")
     print("|---|---:|---|")
     print(f"| `ZA_STACK_PER_FRAME` | {per_frame} | "
-          f"**ZA_FRAME_TOTAL に比例**(+ push 16 + 戻り番地 8 + シャドウ 32) |")
+          f"**ZA_FRAME_TOTAL に比例**"
+          f"(+ SAVED_REGS 16 + RETURN_ADDR 8 + SHADOW_SPACE 32) |")
     print(f"| `ZA_SIGNAL_PATH_MAX` | {sig} | 既定の signal 経路の実測 |")
     print(f"| `ZA_HANDLER_ALLOWANCE` | {handler} | ユーザのハンドラへの保証分 |")
     print(f"| `ZA_STACK_HARD_FLOOR_WANT` | {floor} | 床 |")

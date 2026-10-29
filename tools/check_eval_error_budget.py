@@ -102,6 +102,15 @@ import sys
 #   **常設テストにすると、落ちるのではなく機械が止まる形の失敗になる。**
 #   だから置かない。observed-but-untested として記録する
 #   (documents/stack-guard.md §5-6)。
+#
+#   **隣の経路は試験した(2026-10-29)。** test/lisp/qemu_boot_no_init_signal.lisp に
+#   「条件クラスが無い状態で JIT のスタック残量検査が発火しても戻ってくること」を
+#   足した(sg-compiled / sg-shallow / sg-deep-returns / sg-alive-after)。
+#   **ただしあれが通るのは os_signal_condition 側の既存のフォールバック**
+#   (クラスが引けない)であって、**g_za_in_stack_signal の分岐ではない。**
+#   7 つ目そのものは依然 observed-but-untested である。
+#   **この区別を書いておく** — 「no-init の試験があるから 7 つ目も見ている」と
+#   読まれると、実際には見ていない経路を見たことにしてしまう。
 BUDGETS = {
     "c_return": 7,
     # [P4-4] 5 -> 2。file-cmd.lisp の read-file-into-vector / write-vector-to-file が
