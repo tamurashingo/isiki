@@ -46,9 +46,15 @@
 ;; 通ってしまうと、上限を上げたのに境界が動いていない(= 効いていない)ことに
 ;; 気付けない。
 ;;
-;; ## BAIL-LINE: のコメント
+;; ## BAIL-LINE: のコメント — **複数箇所ある定数には序数を書く**
 ;;
-;; 行番号は za.c の該当行。tools/check_jit_bail_lines.sh が
+;; `; BAIL-LINE: ZA_MAX_QQ_ELEMENTS#3 (全3箇所)` は「その定数の 3 番目
+;; (行番号の昇順)の断念箇所」。**序数があると照合器の --fix は推量しない。**
+;; 序数が無いと「ずれる前に一番近かったもの」へ寄せる推量になり、
+;; **実際に 3 回取りこぼした**(NLX_DEPTH / FLET_BINDINGS / QQ_ELEMENTS。
+;; ホスト側の照合器は通るのに QEMU で落ちる)。
+;;
+;; 行番号は za.c の該当行。tools/check_jit_bail_lines.py が
 ;; 「その行に `[診断] 容量上限 <定数>` が実際に書かれているか」を za.c と
 ;; 照合する(make test に入っている)。za.c に行が入って番号がずれたら
 ;; QEMU を回す前にホスト側で落ちる。
@@ -71,7 +77,7 @@
 (assert-equal 120 (jlm-operands-ok 0))
 (defun jlm-operands-over (x) (+ x 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))
 (assert-equal nil (%%za-compiled-p (function jlm-operands-over)))
-(assert-equal 3115 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_OPERANDS
+(assert-equal 3115 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_OPERANDS#1 (全5箇所)
 (assert-equal 136 (jlm-operands-over 0))
 
 ;;; --- ZA_MAX_NLX_DEPTH --- block は 1 段ずつ消費する。最内の catch が上限を見る
@@ -80,7 +86,7 @@
 (assert-equal 5 (jlm-nlx-ok 5))
 (defun jlm-nlx-over (x) (block nil (block nil (block nil (block nil (block nil (block nil (block nil (block nil (catch (quote jc) x))))))))))
 (assert-equal nil (%%za-compiled-p (function jlm-nlx-over)))
-(assert-equal 5623 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_NLX_DEPTH
+(assert-equal 5623 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_NLX_DEPTH#3 (全6箇所)
 (assert-equal 5 (jlm-nlx-over 5))
 
 ;;; --- ZA_MAX_FLET_BINDINGS ---
@@ -89,7 +95,7 @@
 (assert-equal 7 (jlm-flet-ok 7))
 (defun jlm-flet-over (x) (flet ((f1 (y) y) (f2 (y) y) (f3 (y) y) (f4 (y) y) (f5 (y) y)) (f1 x)))
 (assert-equal nil (%%za-compiled-p (function jlm-flet-over)))
-(assert-equal 6244 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_FLET_BINDINGS
+(assert-equal 6244 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_FLET_BINDINGS#2 (全2箇所)
 (assert-equal 7 (jlm-flet-over 7))
 
 ;;; --- ZA_MAX_TAGBODY_TAGS ---
@@ -98,7 +104,7 @@
 (assert-equal (list 1 2) (jlm-tbtags-ok (list 1 2)))
 (defun jlm-tbtags-over (x) (progn (tagbody jt1 (car x) jt2 (car x) jt3 (car x) jt4 (car x) jt5 (car x) jt6 (car x) jt7 (car x) jt8 (car x) jt9 (car x) jt10 (car x) jt11 (car x) jt12 (car x) jt13 (car x) jt14 (car x) jt15 (car x) jt16 (car x) jt17 (car x)) x))
 (assert-equal nil (%%za-compiled-p (function jlm-tbtags-over)))
-(assert-equal 6649 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_TAGBODY_TAGS
+(assert-equal 6649 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_TAGBODY_TAGS#1 (全2箇所)
 (assert-equal (list 1 2) (jlm-tbtags-over (list 1 2)))
 
 ;;; --- ZA_MAX_TAGBODY_FORMS ---
@@ -130,7 +136,7 @@
 ;;; --- ZA_MAX_LOCALS_PER_LET --- ちょうど(4)は jit_frame_test
 (defun jlm-letwidth-over (x) (let ((a x) (b 1) (c 2) (d 3) (e 4)) (+ a b c d e)))
 (assert-equal nil (%%za-compiled-p (function jlm-letwidth-over)))
-(assert-equal 3741 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_LOCALS_PER_LET
+(assert-equal 3741 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_LOCALS_PER_LET#1 (全2箇所)
 (assert-equal 10 (jlm-letwidth-over 0))
 
 ;;; --- ZA_MAX_CALL_DEPTH --- ちょうど(4)は za_test_ext15
@@ -142,7 +148,7 @@
 ;;; --- ZA_MAX_ARITH_DEPTH --- ちょうど(4)は za_test_ext16
 (defun jlm-arith-over (x) (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 x))))))
 (assert-equal nil (%%za-compiled-p (function jlm-arith-over)))
-(assert-equal 3105 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_ARITH_DEPTH
+(assert-equal 3105 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_ARITH_DEPTH#1 (全2箇所)
 (assert-equal 15 (jlm-arith-over 10))
 
 ;;; --- ZA_MAX_QQ_DEPTH (6) --- ちょうど(6)は za_test_ext18
@@ -154,7 +160,7 @@
 ;;; --- ZA_MAX_QQ_ELEMENTS --- ちょうど(16)は za_test_ext18
 (defun jlm-qqelem-over (x) `(,x 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))
 (assert-equal nil (%%za-compiled-p (function jlm-qqelem-over)))
-(assert-equal 5070 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_QQ_ELEMENTS
+(assert-equal 5107 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_QQ_ELEMENTS#3 (全3箇所)
 (assert-equal '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16) (jlm-qqelem-over 0))
 
 ;;; --- ZA_MAX_COMPILE_NEST (60) --- ちょうど(59)は jit_nest_depth_test
@@ -190,7 +196,7 @@
 ;; **枠を超えたことが外から分かること**(ここが 24 で止まっていたら印が無い)
 (assert-equal t (if (> (%%diag-za-bail-count) 24) t nil))
 ;; **起点は消えていないこと。** 先頭保持なので 1 件目は容量上限の起点のまま
-(assert-equal 3741 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_LOCALS_PER_LET
+(assert-equal 3741 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_LOCALS_PER_LET#1 (全2箇所)
 ;; 保存できていない範囲は 0 を返すこと(配列の外を読んでいないこと)
 (assert-equal 0 (%%diag-za-bail-at 24))
 (assert-equal t (jlm-trunc 0))

@@ -18,6 +18,15 @@ za.c 側の正は、その行に実際に書かれている注記:
 そのどれか 1 つと一致していればよい ... のではなく、**書かれている行そのもの**が
 その定数の注記を持っていることを見る。別の定数の行に変わっていたら落ちる。
 
+**序数を書くと、同じ定数の中のどれかまで固定できる:**
+
+    (assert-equal 5107 (%%diag-za-bail-at 0))   ; BAIL-LINE: ZA_MAX_QQ_ELEMENTS#3
+
+`#3` は「その定数の 3 番目(行番号の昇順)の断念箇所」。
+**序数があるときの --fix は推量しない。** 無いときは「ずれる前に一番近かったもの」へ
+寄せる推量になり、**実際に 3 回取りこぼした**(NLX_DEPTH / FLET_BINDINGS /
+QQ_ELEMENTS)。**複数箇所ある定数には序数を書くこと。**
+
 使い方:
     tools/check_jit_bail_lines.py              照合する
     tools/check_jit_bail_lines.py --fix        ずれていたら書き換える
@@ -33,7 +42,7 @@ import tempfile
 
 ANNOT = re.compile(r"ZA_BAIL_LINE\(\);.*\[診断\] 容量上限 (ZA_MAX_[A-Z_0-9]+)")
 EXPECT = re.compile(
-    r"\(assert-equal\s+(\d+)\s+\(%%diag-za-bail-at\s+0\)\)(.*?);\s*BAIL-LINE:\s*(ZA_MAX_[A-Z_0-9]+)"
+    r"\(assert-equal\s+(\d+)\s+\(%%diag-za-bail-at\s+0\)\)(.*?);\s*BAIL-LINE:\s*(ZA_MAX_[A-Z_0-9]+)(#\d+)?"
 )
 
 
@@ -77,7 +86,25 @@ def check(za_path, lisp_files, fix=False, quiet=False):
             checked += 1
             want_line = int(m.group(1))
             const = m.group(3)
+            ordinal = int(m.group(4)[1:]) if m.group(4) else None
+            cands_now = index.get(const, [])
             have = annot.get(want_line)
+            # **序数(#N)があれば、N 番目の断念箇所と一致していることまで見る。**
+            # 同じ定数の別の箇所へ寄ってしまう取りこぼしを防ぐ
+            if have == const and ordinal is not None:
+                if 1 <= ordinal <= len(cands_now) and cands_now[ordinal - 1] == want_line:
+                    continue
+                bad += 1
+                print("%s:%d: %s の %d 番目は %s だが、期待値は %d になっている"
+                      % (path, ln + 1, const, ordinal,
+                         cands_now[ordinal - 1] if 1 <= ordinal <= len(cands_now) else "(無い)",
+                         want_line), file=sys.stderr)
+                if fix and 1 <= ordinal <= len(cands_now):
+                    lines[ln] = text.replace(m.group(0),
+                                             m.group(0).replace(m.group(1),
+                                                                str(cands_now[ordinal - 1]), 1), 1)
+                    changed = True
+                continue
             if have == const:
                 continue
             bad += 1
@@ -103,8 +130,10 @@ def check(za_path, lisp_files, fix=False, quiet=False):
                     # ZA_MAX_QQ_ELEMENTS の 3 箇所で踏んだ)。警告を出す。
                     newline = min(cands, key=lambda c: abs(c - want_line))
                     print("    警告: %s の断念箇所は %d 箇所ある。--fix は推量なので、"
-                          "QEMU のテストで実測値を確かめること"
-                          % (const, len(cands)), file=sys.stderr)
+                          "QEMU のテストで実測値を確かめること。"
+                          "**実測で確定したら `; BAIL-LINE: %s#N`(N = 何番目か)の形に"
+                          "書き換えること** — 序数を書けば --fix は推量しなくなる"
+                          % (const, len(cands), const), file=sys.stderr)
                 lines[ln] = text.replace(m.group(0),
                                          m.group(0).replace(m.group(1), str(newline), 1), 1)
                 print("    --fix: %d -> %d" % (want_line, newline), file=sys.stderr)
