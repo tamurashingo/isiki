@@ -177,7 +177,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress jit-frame-breakdown let-histogram
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram
 
 all: build
 
@@ -780,6 +780,7 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_semantics.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_limits.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_stack_guard.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
@@ -1054,6 +1055,16 @@ let-histogram:
 # test-qemu-all には入れない(通常ビルドでは意味を持たない)
 test-qemu-for-gc-stress:
 	$(MAKE) test-qemu-milestone GC_DEBUG=1 MILESTONE=test/lisp/qemu_boot_for_gc_stress.lisp
+
+# [GCデバッグ] **深い再帰から一気に巻き戻しても GC ルートの LIFO が壊れないこと。**
+# issue #110 / documents/stack-guard.md §6-2。<storage-exhausted> は深さ 27 付近で
+# signal されるので、そこからトップレベルまで戻る過程で GC_PROTECT の cleanup が
+# 一気に大量に走る。**GC_DEBUG=1 を自分で渡す。** 渡し忘れると
+# %%DIAG-GC-STRESS が無く「GC を強制したつもりで強制していない」まま通るので、
+# test/lisp/gc_debug_guard.lisp が通常ビルドで落とす。
+# test-qemu-all には入れない(通常ビルドでは意味を持たない)
+test-qemu-stack-guard-gc:
+	$(MAKE) test-qemu-milestone GC_DEBUG=1 MILESTONE=test/lisp/qemu_boot_stack_guard_gc.lisp
 
 # [性能測定] Phase1の受け入れ条件(documents/performance-measurement.md
 # 「letのImmobilized Spaceリーク」節)。クロージャ生成が実行回数に比例して

@@ -1743,6 +1743,214 @@ static UINT64 g_za_block_level_mask = 0;
 /* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
+/* ===== [可用性] スタック残量の検査(issue #110) ==================================
+ *
+ * **JIT 関数は 1 段あたり 7536 byte 使う**(ZA_FRAME_TOTAL 7480 + push rbx/r13 16
+ * + 戻り番地 8 + 呼び出し側のシャドウスペース 32。塗って最高水位を読む方法で実測。
+ * documents/stack-guard.md §5-2)。プロセスのスタックは 256KB なので
+ * **境界は深さ 33〜34**(呼び出し元のスタック使用量で 1 段動く)。
+ * 溢れるとガードページ #PF で止まり、報告は
+ * -serial stdio にしか出ないので、**外から見ると QEMU の無反応と区別が付かない。**
+ *
+ * プロローグの先頭(sub rsp より前)で残量を見て、足りなければ
+ * <storage-exhausted> を signal する。**sub rsp の後ろに置くと、既に溢れてから
+ * 気づくことになる。**
+ *
+ * [閾値]  ZA_FRAME_TOTAL + ZA_STACK_SIGNAL_RESERVE
+ *   ZA_FRAME_TOTAL だけを見て通すと、ぎりぎりで通ったときに **signal の処理中に
+ *   溢れる**(os_signal_condition は make-instance / signal-condition という
+ *   **Lisp 関数を呼び戻す**ので、使用量は C 関数 1 つ分では済まない)。
+ *   ZA_STACK_SIGNAL_RESERVE は実測値(documents/stack-guard.md §5-3)。
+ *
+ * [予備領域の開け閉め]  signal 経路そのものが閾値より下を使うので、そのあいだ
+ *   閾値を床(ZA_STACK_HARD_FLOOR)まで下げる。下げるだけで無効化しないのは、
+ *   **ハンドラがさらに深く潜った場合に床で捕まえる**ため。そのときは
+ *   g_za_in_stack_signal が立っているので signal を重ねず EVAL-ERROR を返して
+ *   巻き戻す(**signal を重ねるとハングする**)。
+ *
+ * [この検査は safety で外せない] 型の検査ではなく**資源の検査**である。
+ *   宣言しても資源は増えないので省けない(documents/stack-guard.md §6)。
+ */
+/* ---- 予備領域は定数ではなく**導出式**にする(規則 13)-----------------------
+ *
+ * **ZA_FRAME_TOTAL に比例する項が入っているので、定数で書くと案 d
+ * (フレームの実寸化)の利得をそのぶん食い残す。** しかも深さは増えるので
+ * **誰も気づかない。** tools/jit_frame_breakdown.py が内訳の合計を検算するのと
+ * 同じ扱いにして、**フレームが縮んだ日に予備領域も自動で縮む**ようにする。
+ *
+ *   予備領域 = 1 段ぶん + 既定の signal 経路 + ハンドラへの保証分 + 床
+ *
+ * 各項の出どころ:
+ */
+/** JIT 関数 1 段が使うスタック量。**断念経路は閾値より最大これだけ下で始まる**
+ *  (検査が通った最後のフレームがこれだけ使うため)。
+ *  内訳: ZA_FRAME_TOTAL + push rbx/r13 16 + 戻り番地 8 + 呼び出し側のシャドウスペース 32。
+ *  **実測 7,536 と一致する**(塗って最高水位を読む方法。documents/stack-guard.md §5-2)。
+ *  **ZA_FRAME_TOTAL に比例するのはこの項である。** */
+#define ZA_STACK_PER_FRAME     (ZA_FRAME_TOTAL + 16 + 8 + 32)
+
+/** 既定の signal 経路が使う量の実測上限(**ハンドラを含まない**)。
+ *  os_signal_condition -> make-instance / signal-condition -> 既定の経路。
+ *  実測 8,696 byte(ハンドラ無しで測った値。documents/stack-guard.md §5-3)。
+ *  **GC はここに乗らない** — 収集器は明示キューの while ループ(gc_scan_queue)で
+ *  反復的なので O(1) しか増えない。 */
+#define ZA_SIGNAL_PATH_MAX     8696
+
+/** **ユーザのハンドラに保証する量。**
+ *
+ *  ISLisp の with-handler のハンドラは **signal の動的文脈で走る** = 巻き戻す前、
+ *  深いところで走る。だからハンドラが使う分は予備領域に入れておかなければならない。
+ *  実測に使った assert-error-class のハンドラ(typep / class-of / %%class-name /
+ *  list / return-from)は 8,824 - 8,696 = **128 byte** しか使っていない。
+ *
+ *  **これを超えるハンドラは保証しない。** 床を割って EVAL-ERROR になる
+ *  (ハングではなく劣化。documents/stack-guard.md §5-6)。
+ *  **再帰するハンドラは再び検査に当たるので別の話**だが、
+ *  **再帰せずに深く使うハンドラ**(format を深く使う、構造を組み立てる)は
+ *  ここで決まる。 */
+#define ZA_HANDLER_ALLOWANCE   4096
+
+/** 予備領域の中でさらに潜ったときに捕まえる床。断念経路(call 1 つ)が通る分だけ。 */
+#define ZA_STACK_HARD_FLOOR_WANT 4096
+
+/** 予備領域の下限。**これが導出式の本体である。** */
+#define ZA_STACK_RESERVE_MIN \
+    (ZA_STACK_PER_FRAME + ZA_SIGNAL_PATH_MAX + ZA_HANDLER_ALLOWANCE + ZA_STACK_HARD_FLOOR_WANT)
+
+/** 実際に使う予備領域。**16 byte 境界へ切り上げる**(4KB で丸めると、案 d で
+ *  フレームが 3,300 byte 縮んでも丸めに吸われて利得が見えない)。
+ *
+ *  **-D で上書きできる**(documents/stack-guard.md §6-4 の陽性対照)。
+ *  上書きしたときは下の _Static_assert を外す — 意図的に小さくして
+ *  「signal の途中で溢れる」ことを確かめるための経路だからである。 */
+#ifndef ZA_STACK_SIGNAL_RESERVE
+#define ZA_STACK_SIGNAL_RESERVE (((ZA_STACK_RESERVE_MIN) + 15) & ~15)
+#define ZA_STACK_RESERVE_DERIVED 1
+#endif
+
+/* 床は予備領域より大きくならないようにする(上書きで小さくしたとき、床が通常の
+   閾値より上になって逆効果になるのを防ぐ) */
+#if ZA_STACK_HARD_FLOOR_WANT * 2 >= ZA_STACK_SIGNAL_RESERVE
+#define ZA_STACK_HARD_FLOOR (ZA_STACK_SIGNAL_RESERVE / 2)
+#else
+#define ZA_STACK_HARD_FLOOR ZA_STACK_HARD_FLOOR_WANT
+#endif
+
+#ifdef ZA_STACK_RESERVE_DERIVED
+/* [設計の整合] 導出式で決めたときは、下限を満たしていること。
+   満たさないと signal の途中で床を割って EVAL-ERROR になり、
+   <storage-exhausted> が出なくなる */
+_Static_assert(ZA_STACK_SIGNAL_RESERVE >= ZA_STACK_RESERVE_MIN,
+               "ZA_STACK_SIGNAL_RESERVE が下限を満たしていない(documents/stack-guard.md §5-3)");
+_Static_assert(ZA_STACK_HARD_FLOOR == ZA_STACK_HARD_FLOOR_WANT,
+               "導出式のときは床が削られてはならない");
+#endif
+
+/** 生成コードが cmp rsp,[r11] で読む閾値。0 のときは検査が発火しない
+ *  (最初のタイマ tick より前、カーネルの idle ループ上) */
+static UINT64 g_za_stack_limit = 0;
+/** 通常時の閾値。予備領域を閉じるときに戻す値 */
+static UINT64 g_za_stack_limit_normal = 0;
+/** 予備領域を開けているあいだの閾値(床) */
+static UINT64 g_za_stack_limit_floor = 0;
+/** signal 経路の中にいるか。入れ子の signal を防ぐ */
+static int g_za_in_stack_signal = 0;
+/** 検査が発火した延べ回数(診断用。%%DIAG-ZA-STACK-GUARD-HITS) */
+static UINT64 g_za_stack_guard_hits = 0;
+
+void os_za_set_stack_low(UINT64 stack_low) {
+    if (stack_low == 0) {
+        g_za_stack_limit_normal = 0;
+        g_za_stack_limit_floor = 0;
+        g_za_stack_limit = 0;
+        return;
+    }
+    g_za_stack_limit_normal = stack_low + ZA_FRAME_TOTAL + ZA_STACK_SIGNAL_RESERVE;
+    g_za_stack_limit_floor = stack_low + ZA_FRAME_TOTAL + ZA_STACK_HARD_FLOOR;
+    /* 予備領域を開けている最中に切り替わった場合も通常値へ戻す。
+       そのあと signal 経路が次に JIT 関数を呼ぶと断念経路へ入るが、
+       g_za_in_stack_signal が立っているので EVAL-ERROR を返して巻き戻る
+       (ハングはしない。documents/stack-guard.md §5-5) */
+    g_za_stack_limit = g_za_stack_limit_normal;
+}
+
+UINT64 os_za_stack_limit_value(void) { return g_za_stack_limit_normal; }
+UINT64 os_za_stack_guard_hits(void) { return g_za_stack_guard_hits; }
+
+/**
+ * 生成コードの断念経路から呼ばれる。<storage-exhausted> を signal する。
+ *
+ * **ここへ来た時点で rsp は閾値より下にある。** signal 経路(make-instance /
+ * signal-condition / ハンドラ)はさらに下を使うので、入る前に閾値を床まで下げて
+ * 予備領域を開け、抜けるときに戻す。
+ *
+ * **入れ子にしない。** 予備領域の中でさらに枯渇した場合(ハンドラが深く潜った)は
+ * signal を重ねず EVAL-ERROR を返す。重ねると予備領域を食い潰してハングし、
+ * 「エラーを出そうとしてハングする」というもっと分かりにくい症状になる。
+ *
+ * @return signal-conditionの戻り値(control transfer)。条件システムが使えない
+ *         起動段階では os_signal_condition が g_sym_eval_error を返す
+ */
+lisp_val_t os_za_signal_stack_exhausted(void) {
+    g_za_stack_guard_hits++;
+    if (g_za_in_stack_signal) {
+        return g_sym_eval_error;
+    }
+    g_za_in_stack_signal = 1;
+    g_za_stack_limit = g_za_stack_limit_floor;
+
+    /* <storage-exhausted> はスロットを持たないので initargs は nil。
+       クラス名は os_make_symbol でその場で引く(エラー経路なのでキャッシュ不要。
+       グローバルを増やすと gc_copy_value の追加漏れの余地が増える) */
+    lisp_val_t class_sym = os_make_symbol("<STORAGE-EXHAUSTED>");
+    GC_PROTECT(class_sym);
+    lisp_val_t r = os_signal_condition(class_sym, nil, global_environment);
+
+    g_za_stack_limit = g_za_stack_limit_normal;
+    g_za_in_stack_signal = 0;
+    return r;
+}
+
+/**
+ * [可用性] プロローグの先頭に残量の検査を出す(issue #110)。**sub rsp より前。**
+ *
+ *   mov  r11, &g_za_stack_limit     ; アドレスが32bitに収まれば 41 BB imm32(6byte)
+ *   cmp  rsp, [r11]                 ; 49 3B 23 (3byte)
+ *   jae  over                       ; 73 rel8 (2byte)
+ *   ; ---- 断念経路(ここを通るのは枯渇したときだけ) ----
+ *   mov  r11, &os_za_signal_stack_exhausted
+ *   sub  rsp, 40                    ; シャドウスペース32 + 16byte境界合わせ8
+ *   call r11
+ *   add  rsp, 40
+ *   ret
+ *  over:
+ *
+ * **通常経路で実行されるのは 3 命令**(mov / cmp / jae)。
+ *
+ * [なぜ r11 か] MS x64 の引数は rcx/rdx/r8/r9 で、**入口では r11 は死んでいる。**
+ * r11 は caller-saved なので退避も要らない。
+ *
+ * [なぜ断念経路で何も巻き戻さないか] 検査が push rbx より前にあるので、
+ * **rsp は入口のまま**であり、callee-saved レジスタも 1 つも触っていない。
+ * だから C 関数を呼んでその戻り値(rax)のまま ret できる。
+ *
+ * [閾値が 0 のとき] 発火しない(cmp rsp,0 は常に jae)。最初のタイマ tick より前は
+ * この状態である。
+ */
+static void za_emit_stack_guard(void) {
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_stack_limit);
+    jit_emit8(0x49); jit_emit8(0x3B); jit_emit8(0x23);   /* cmp rsp, [r11] */
+    jit_emit8(0x73);                                      /* jae rel8 */
+    UINT64 over_patch = g_jit_used;
+    jit_emit8(0);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_za_signal_stack_exhausted);
+    jit_sub_rsp_imm8(40);
+    jit_emit8(0x41); jit_emit8(0xFF); jit_emit8(0xD3);   /* call r11 */
+    jit_add_rsp_imm8(40);
+    jit_ret();
+    jit_patch_rel8(over_patch);
+}
+
 /** ABI-M5: パラメータスロット方式(g_za_use_param_slots)が有効な関数における、
  * インデックスiの固定パラメータの値/gc_rootnodeスロットのオフセット
  * (za_arg_val_off/za_arg_node_offと同じ「配列インデックス」パターン)。 */
@@ -6767,6 +6975,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         // za_param_val_off(i)へ書き込みリンクしてから、共有本体(jmp_to_body_patch)
         // へ合流する。
         fixed_entry_offset = g_jit_used;
+        za_emit_stack_guard();   /* [可用性] sub rsp より前。issue #110 */
         jit_push_rbx();
         jit_push_r13();
         za_emit_pin_nil();
@@ -6796,6 +7005,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
 
     // プロローグ: rbx/r13を退避し、MS x64呼び出し規約のシャドウスペース+拡張3用の
     // フレーム(env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
+    za_emit_stack_guard();   /* [可用性] sub rsp より前。issue #110 */
     jit_push_rbx();
     jit_push_r13();
     za_emit_pin_nil();

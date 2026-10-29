@@ -8,6 +8,7 @@
 #include "lisp.h"
 
 #include "interrupt.h"
+#include "za.h"
 
 
 
@@ -568,6 +569,10 @@ UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     os_set_variable(g_sym_current_process, next_cell, global_environment);
 
     UINT64 next_rsp = os_process_get_saved_rsp(cc_car(next_cell));
+    /* [可用性] JIT のスタック残量検査の閾値を、切り替え先のスタックに合わせる。
+       プロセスごとにスタックが違う(g_stack_areaの320KBスロット)ので、
+       生成コードが読む閾値もここで切り替える(issue #110) */
+    os_za_set_stack_low(os_process_stack_low_for(next_rsp));
 #ifdef ISIKIOS_GC_DEBUG
     /* [GC監査] GCの実行中に入ったtickを数える。上の*current-process* / run-queue/PCBの
        読み書きは、その瞬間には半端な状態を触っている可能性がある */
@@ -712,7 +717,16 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
                 os_diag_serial_write("\n   ** GUARD HIT (上端側): スタック溢れではない。"
                                      "基底/上限の破壊かバッファオーバーラン **\n   stack=");
             } else {
-                os_diag_serial_write("\n   ** STACK OVERFLOW (下端側): 再帰が深すぎる **\n   stack=");
+                os_diag_serial_write("\n   ** STACK OVERFLOW (下端側): 再帰が深すぎる **");
+                /* [可用性] JITのスタック残量検査(issue #110)が一度も発火して
+                   いないなら、この溢れは**守られていない経路**(インタプリタ /
+                   AOT)から来ている。1 以上なら、保護は働いたがそのあと
+                   (signal 経路の中で)溢れた = 予備領域が足りない。
+                   documents/stack-guard.md §4 / §6-4 */
+                os_diag_serial_write("\n   jit-stack-guard-hits=");
+                serial_write_hex64(os_za_stack_guard_hits());
+                os_diag_serial_write(" (0 = 守られていない経路、1以上 = 予備領域が足りない)");
+                os_diag_serial_write("\n   stack=");
             }
             serial_write_hex64(os_process_stack_base(0));
             os_diag_serial_write(" guard=");
