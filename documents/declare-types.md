@@ -534,3 +534,298 @@ single のインライン加算(bits 32-63 を取り出して加算)を出せば
 4c はグローバル変数が後から `setq` で書き換わるため、宣言した型を保ち続ける
 保証が無いという別の問題を含む。`os_decl_type_code_of` は `declare` 専用では
 ないので、4c から同じものを呼べる。
+
+---
+
+## 8. AOT 経路は `declare` / `declaim` を効かせない(2026-10-30 の判断)
+
+§5-4 の追記である。§5-4 は「`transpile-defun` の body が単一式なので書けない」と
+いう 1 点だけを書いていたが、**書ける位置を全部試して挙動を確定させた**ので、
+その結果と判断をここに残す。**結論は「効かせない」。**
+
+**この節で実装は変えていない。** 触ったのはこの文書だけである。
+
+### 8-1 調べた範囲と方法
+
+対象は次の 3 つ。
+
+| 経路 | 入口 | 宣言の扱い |
+|---|---|---|
+| AOT | `src/lisp/transpile.lisp`(ホスト SBCL 上で動く) | **無し**(本節) |
+| JIT | `src/c/za.c` | 読む(§1〜§4) |
+| インタプリタ | `src/c/eval.c` | **剥がして JIT に渡すだけ**(§8-5) |
+
+AOT の入力ファイルは `transpile.lisp` の `*aot-lisp-path*` / `*utility-lisp-path*` /
+`*fs-lisp-paths*` / `*bench-lisp-path*` / `*runtime-lisp-path*`(= `init_aot.lisp`、
+`utility.lisp`、`device.lisp`、`ide.lisp`、`partition.lisp`、`mount.lisp`、
+`file-node.lisp`、`fat16.lisp`、`fat32.lisp`、`file-cmd.lisp`、`bench_aot.lisp`、
+`test/lisp/transpile_fixture.lisp`)の 12 ファイル。
+
+方法は 2 つ。
+
+- **grep**(下の各節に実際のコマンドと結果を置く)
+- **ホスト上で変換関数を直接呼ぶ probe。**
+  `ros run --load src/lisp/transpile.lisp --load <probe.lisp> --quit` で
+  `transpile-defun` / `transpile-toplevel-form` / `macroexpand-all` を
+  `handler-case` 付きで呼び、返り値かエラーメッセージを出した。
+  **`main` を呼んでいないので生成物(`lisp_compiled.c`)は 1 byte も書かれない**
+  (実行後に `src/c/lisp_compiled.c` が「無い」ままであることと
+  `git status --porcelain` が空であることで確認した)。
+- **`make transpile` / docker ビルド / QEMU は実行していない。**
+  並行作業と競合するため。したがって「生成物そのものを見た」確認は
+  この節には**1 つも無い**(§8-9 に手順だけ置く)。
+
+### 8-2 位置ごとの挙動(probe の実測。2026-10-30)
+
+| 書いた位置 | 何が起きるか | メッセージ |
+|---|---|---|
+| `(defun f (x) (declare (type <fixnum> x)) x)` | **エラーで止まる** | `transpile-defun: bodyは単一式のみ対応です: F` |
+| `(defun f (x) (progn (declare ...) x))` | **エラーで止まる** | `transpile-call: 未対応の呼び出し先です: DECLARE` |
+| `(defun f (x) (let ((y 1)) (declare ...) (+ y x)))` | **エラーで止まる** | `transpile-call: 未対応の呼び出し先です: DECLARE` |
+| `(defun f (x) (the <fixnum> x))` | **エラーで止まる** | `transpile-call: 未対応の呼び出し先です: THE` |
+| トップレベル `(declaim (optimize (speed 3)))` | **エラーで止まる** | `transpile-call: 未対応の呼び出し先です: DECLAIM` |
+| トップレベル `(declare (type <fixnum> x))` | **エラーで止まる** | `transpile-call: 未対応の呼び出し先です: DECLARE` |
+| 同じものを `test/lisp/transpile_fixture.lisp` に書いた場合 | **黙って捨てられる** | (無し) |
+
+3 行目(`let`)が止まるのは、`let` が即時 lambda 呼び出しへ展開されて body が
+`progn` になるためで、2 行目と同じ経路である。つまり **AOT 入力には
+`declare` を書ける位置が 1 つも無い。** §5-4 の「`defun` の body に書くと止まる」
+より強い。
+
+**例外が 1 つある。** `main`(`transpile.lisp:2337`)は fixture からは
+`(remove-if-not #'toplevel-defun-p ...)` で **`defun` だけを集める**。
+他の入力ファイルには `aot-toplevel-forms` / `utility-toplevel-forms` /
+`fs-toplevel-forms` / `bench-toplevel-forms` という受け皿があるのに、
+**fixture にはそれに相当する変数が無い。** そのため fixture のトップレベルに
+置いた `declaim` は、エラーにもならず生成物にも出ず、**黙って消える**。
+これは `declaim` に限った話ではなく、fixture のトップレベル非 `defun` フォーム
+全般の性質である(fixture は現状 `defun` しか持っていないので踏まれていない)。
+
+エラーは `main-or-die`(`transpile.lisp:2329`)が掴んで exit 1 にするので、
+**`make` は赤になる**(`transpile.lisp:2316` 付近のコメント [P3] が理由)。
+
+### 8-3 なぜ止まるのか(実体)
+
+3 段ある。
+
+1. **本体 1 式制約。** `transpile.lisp:2206-2207`。
+
+   ```lisp
+   (unless (= (length body) 1)
+     (error "transpile-defun: bodyは単一式のみ対応です: ~S" name))
+   ```
+
+   `declare` を書くと式が 2 つになるのでここで止まる。
+
+2. **`macroexpand-all` は宣言を展開しない。**
+   これは**ホスト CL の `macroexpand-all` ではなく、`transpile.lisp:515` の自前の
+   再帰コードウォーカー**である(`init.lisp` の `defmacro let` 等をホスト SBCL へ
+   そのまま load できないため、マクロ本体を通常関数として移植し alist で引く方式。
+   `transpile.lisp:505-514` のコメント)。引く表は `*macro-expanders*`
+   (`transpile.lisp:284`)の 14 個だけで、`declare` / `declaim` / `the` は
+   **載っていない**。probe で `(macroexpand-all '(declare (type <fixnum> x)))` が
+   `(DECLARE (TYPE <FIXNUM> X))` を、`(macroexpand-all '(the <fixnum> x))` が
+   `(THE <FIXNUM> X)` をそのまま返すことを確認した。
+
+   **`init.lisp:465` の `(defmacro the (class-name form) form)` は AOT には効かない。**
+   あれはインタプリタが読む定義で、トランスパイラは `init.lisp` を入力にしていない。
+   「インタプリタでは `the` が no-op として素通りするのに、AOT ではビルドが止まる」
+   という食い違いになる。
+
+3. **dispatch に分岐が無い。** `transpile-expr`(`transpile.lisp:1003-1101`)の
+   `cond` に `declare` / `declaim` / `the` の節は無く、
+   `((and (consp expr) (symbolp (car expr))) (transpile-call expr scope))` に落ちる。
+   `transpile-call` は `(t ...)` 枝の `let` で先に
+   `call-target-c-name`(`transpile.lisp:537`)を呼ぶので、引数側(`(type ...)` /
+   `(optimize ...)`)より**オペレータ名のほうが先にエラーになる**。
+   だからメッセージに出るのは `DECLARE` / `DECLAIM` / `THE` である。
+
+   ```sh
+   $ grep -cE "'(declare|declaim|the|proclaim|optimize)\b" src/lisp/transpile.lisp
+   0
+   ```
+
+   (= 宣言オペレータを**シンボルとして見ている箇所が 1 つも無い**。
+   `transpile.lisp` 内に 30 箇所ある `(declare (ignore ...))` と
+   `transpile.lisp:979-1000` の `(declaim (ftype function ...))` 22 本は、
+   **ホスト SBCL 向け**である。前者は未使用引数の警告抑制、後者は
+   相互再帰する変換関数の前方宣言で、どちらも `ros run --load` で
+   `transpile.lisp` 自身がコンパイルされるときにだけ意味を持つ。
+   **AOT の入力として読まれるものではない。**)
+
+### 8-4 算術・比較の呼び先表 — 型特化版は AOT から 1 度も呼ばれていない
+
+呼び先の表は **2 つだけ**で、`transpile.lisp` 内の他の場所に C 関数名の
+文字列リテラルは無い(`grep -n '"primitive_\|"cc_' src/lisp/transpile.lisp` の
+ヒットは全部この 2 表の中。600 行以降のヒットは `cc_cdr`(box 読み出し)1 件のみ)。
+
+| 表 | 行 | 役割 | 算術・比較のエントリ |
+|---|---|---|---|
+| `*primitive-c-names*` | 101-282 | n 項 / 可変長。cons リストを組んで渡す | `+` `-` `*` `<` `>` `>=` `<=` `=` → `primitive_add` / `_subtract` / `_multiply` / `_less_than` / `_greater_than` / `_greater_equal` / `_less_equal` / `_num_equal`。他に `div` `mod` |
+| `*primitive-fixed-arity-c-names*` | 549-598 | 実引数個数が一致したときだけ使う固定引数版 | `+` `-` `=` `<` `>` `>=` の **2 引数版のみ** → `primitive_add2` / `_subtract2` / `_num_equal2` / `_less_than2` / `_greater_than2` / `_greater_equal2` |
+
+- **どちらの表も型には触っていない。** 載っているのは GENERIC 版だけである。
+- **`*` と `<=` には 2 引数版のエントリが無い。** 2 引数で書いても n 項版
+  (cons リスト構築あり)へ落ちる。意図かどうかは**不明**(表のコメントは
+  「個数が一致しない呼び出しはフォールバックする」とだけ書いており、
+  `*` を載せなかった理由は書かれていない)。
+- **`/` はどちらの表にも無い。** AOT 入力から `/` は呼べない。
+- 末尾位置も同じ表を使う。`transpile-tail-call`(`transpile.lisp:2039`)が
+  扱うのは `*known-function-names*` に載る **ユーザ定義 `defun` だけ**で、
+  プリミティブは `transpile-expr` → `transpile-call` に落ちる。
+  **3 つめの表は無い。**
+
+C 側に揃っている型特化版は **8 本**。
+
+| | fixnum | single-float |
+|---|---|---|
+| `+` | `primitive_add2_fixnum`(`runtime.h:2040`) | `primitive_add2_single`(`:2046`) |
+| `-` | `primitive_subtract2_fixnum`(`:2070`) | `primitive_subtract2_single`(`:2076`) |
+| `*` | `primitive_multiply2_fixnum`(`:2139`) | `primitive_multiply2_single`(`:2145`) |
+| `/` | `primitive_divide2_fixnum`(`:2240`) | `primitive_divide2_single`(`:2246`) |
+
+- **double-float の特化版は無い。比較の特化版も 1 本も無い**(宣言しても
+  `<` `>` `>=` `=` は GENERIC のまま)。
+- 選ぶのは `za_specialized_wrapper`(`za.c:3116`)**だけ**で、ここは
+  JIT の `za_compile_fold` からしか呼ばれない。混在(fixnum × single)は
+  GENERIC へ落とす。
+- **AOT 側には特化版の名前が 1 つも無い。**
+
+  ```sh
+  $ grep -c 'primitive_add2_fixnum\|primitive_subtract2_fixnum\|primitive_multiply2_fixnum\|primitive_divide2_fixnum\|primitive_add2_single\|primitive_subtract2_single\|primitive_multiply2_single\|primitive_divide2_single' src/lisp/transpile.lisp
+  0
+  ```
+
+**選ぶ余地はあるか。** 形の上ではある(2 表に特化版の列を足し、宣言を読んで
+切り替える)。ただしそれは**宣言を読む仕組みを `transpile.lisp` に新設する**
+作業であって、既存の表を差し替えるだけでは済まない。§8-6 の 1 番目の理由。
+
+### 8-5 インタプリタ経路との違い(1 行)
+
+> **インタプリタは `declare` を「剥がして JIT へ渡す」だけで自分では使わない。
+> AOT は剥がす仕組みすら持たないので、書くとビルドが止まる。**
+
+内訳:
+
+- `eval_defun`(`eval.c:480-494`)が `os_env_optimize` →
+  `os_scan_declaration_inline` → `os_scan_declarations` の順に読み、
+  **body から先頭の連続する `declare` を剥がし**、残りと `declared_types` を
+  `za_try_compile_defun` へ渡す(`eval.c:483` のコメント「宣言を剥がす前に読むこと」)。
+- 作用対象の無い位置の `declare` は `eval.c:1226-1234` で **`nil` に潰す**
+  (エラーにしない)。`za.c:4286` も同じく `nil`。どちらも
+  「`za_is_excluded_special_form` に入れてはいけない」と明記されている(§4-4)。
+- `declared_types` の**読み手は `za.c` だけ**(`za.c:7019` / `:7434` / `:7440`。
+  JIT 無効ビルドのスタブ `za.c:7521-7523` は `(void)declared_types;` で捨てる)。
+  `runtime.c:1799` の `%%DECLARED-TYPES-OF` は内省用で、最適化には使われない。
+- したがって**宣言は JIT 専用の入力**であり、**インタプリタ実行そのものの意味は
+  `declare` の有無で変わらない**。
+
+AOT 入力と `init.lisp` に現在ある宣言の件数:
+
+```sh
+$ grep -cE '\((declare|declaim|the) ' <AOT 入力 12 ファイル> src/lisp/init.lisp
+全ファイル 0
+```
+
+**宣言は AOT 入力にも `init.lisp` にも 1 件も書かれていない**(2026-10-30 時点)。
+宣言が使われているのは `test/lisp/declare_types_test.lisp` /
+`declaim_test.lisp` / `declare_types_bench.lisp` などテスト・ベンチ側だけで、
+これらは**インタプリタ経路で読まれる**(AOT の入力リストに入っていない)。
+
+### 8-6 結論: **効かせない**
+
+理由を 3 つ。重いほうから。
+
+1. **行き先が無い(事実)。** 型情報の消費者は `za.c` だけで、AOT は `za.c` を
+   1 行も通らない。3 経路が共有しているのは C ランタイムだけである。
+   AOT で効かせるには「宣言を読む」「表を特化版へ切り替える」という
+   **`transpile.lisp` 側の別実装**が必要で、JIT 側の成果が横に流れてくるのではない。
+2. **対照群が壊れる(事実。§8-8)。** AOT の生成物が変わると、
+   `aot/*` ベンチ行を「±0 の対照群」として使っている既存の記録の前提が崩れる。
+3. **見込みが薄い(推測。確認していない)。** §7 の実測で、JIT 側で
+   `(declare (type <fixnum> x y))` が省くのは「x / y の型ガード 118 byte」である。
+   AOT は**もともと `primitive_add2` を直接 call していて、JIT のような
+   インライン加算経路を持たない**(§8-4)。つまり AOT で特化版へ切り替えても
+   変わるのは call 先 1 つで、JIT で効いた 118 byte に相当する削減対象が無い。
+   **これは生成コードを読んだ上での推測であって、測っていない。**
+   測るには `make transpile` と QEMU が必要で、本作業では実行していない。
+
+### 8-7 `declare` を剥がすか: **剥がさない。入れないと決めた**
+
+**「できない」のではない。** `transpile-defun` の 1 式制約を外さずに
+「body 先頭の `declare` だけ読み捨てる」実装は、`length` を見る前に
+`(car form)` が `DECLARE` のフォームを落とすだけなので数行で書ける。
+**それをやらないと決めた。**
+
+理由:
+
+1. **いまは黙って食い違わない。** 書いた瞬間に止まり、メッセージに関数名が出る
+   (§8-2)。剥がして無視する実装を入れると「AOT では宣言が効いていない」ことが
+   **沈黙する**。PR #81 の AOT float リテラルが静かにずれていた件(§5-4)と
+   同じ形の罠を、自分で作ることになる。
+2. **「黙って捨てる」経路を増やす方向である。** §8-2 で見つかった唯一の
+   黙殺経路(fixture のトップレベルフォーム)は、増やすのではなく
+   いずれ塞ぐべきものである。
+3. **剥がす動機が実在していない。** 効かせないと決めたのだから、剥がす理由は
+   「同じソースを AOT とインタプリタの両方に食わせたい」だけになる。
+   いま AOT 入力と `init.lisp` は別ファイルで、宣言の件数は**両方 0 件**(§8-5)。
+   共有したいソースが存在しない。
+
+**したがって「AOT 入力に `declare` / `declaim` / `the` を書いてはいけない」という
+制約をそのまま残す。** 将来、宣言を含む同一ソースを両経路に食わせる必要が
+出たときは、**剥がす実装と「剥がした(=効いていない)ことを言う診断」を
+同時に**入れること。片方だけ入れると 1 番目の罠を踏む。
+
+### 8-8 効かせた場合に何が起きるか — 対照群が使えなくなる
+
+**AOT の生成物 `src/c/lisp_compiled.c` のテキストが変わる。**
+これは測定精度の問題ではなく、**対照群の問題**である(規則 5 / R-control)。
+
+- `documents/stack-guard.md` §4 / §5-1 は「AOT は `za.c` のプロローグを通らないので
+  **対照群になる**」「`aot/*` 全 10 行は **±0**」を前提に効果を示している。
+- `documents/for-expansion.md` §5-1 も `aot/for` を対照群に置いている。
+- 宣言を AOT で効かせると、宣言を書いた関数の**呼び先が変わって命令列が動く**。
+  以後「`aot/*` が動いたのはノイズか効果か」を切り分ける手段が無くなる。
+
+さらに `for-expansion.md` §5-3 の反省(「1 命令も動かない」は N=1,000,000 の
+ベンチでは**分解能が無く検証できない**。規則 10 / R-resolution)を踏まえると、
+**AOT 側は「時間が動かない」ではなく「生成テキストが同一」で固定しておくほうが
+強い。** テキストの `diff` は分解能が 1 byte なので、規則 10 の問題が起きない。
+
+この結論により、**「この PR で AOT の生成物は 1 文字も変わらない」を、
+後続の最適化作業でそのまま対照群として使い続けられる。**
+JIT 側の作業(型特化・インライン展開)は定義上 AOT に触らないので、
+`lisp_compiled.c` の `diff` が空であることを**毎回確かめるべき不変条件**にできる。
+
+### 8-9 「1 文字も変わらない」の確認方法
+
+**生成物はリポジトリに無い。** `.gitignore` の 8-9 行目に
+`src/c/lisp_compiled.c` と `test/c/lisp_compiled_fixture.c` が入っており、
+`git ls-files` も空、作業ツリーにも存在しない(2026-10-30 に確認)。
+したがって diff を取るには生成が必要である。
+
+```sh
+make transpile
+cp src/c/lisp_compiled.c /tmp/base_lisp_compiled.c
+# (変更を入れる)
+make transpile
+diff -u /tmp/base_lisp_compiled.c src/c/lisp_compiled.c   # 空であること
+```
+
+**生成せずに静的に言えること**(今回確認したのはこちらだけ):
+
+- 特化版 8 本の名前が `transpile.lisp` に 1 つも無い(§8-4 の `grep -c` → `0`)。
+  ゆえに生成物にも出得ない。
+- 宣言オペレータをシンボルとして見ている箇所が 1 つも無い
+  (§8-3 の `grep -cE` → `0`)。ゆえに宣言由来の出力コードは存在し得ない。
+- そもそも AOT 入力に宣言が 1 件も書かれていない(§8-5 の `grep -cE` → 全部 `0`)。
+
+**未確認(不明)のまま残すもの:**
+
+- 生成物 `src/c/lisp_compiled.c` を実際に見て
+  「宣言由来の文字列が 0 件」を確かめること。
+  **本作業では `make transpile` を実行していないので未実施。**
+- §8-6 の 3 番目(AOT で特化版へ切り替えても見込みが薄い)の**実測**。
+  読んだだけで測っていない。
+- `*primitive-fixed-arity-c-names*` に `*` と `<=` の 2 引数版が無い理由。
+  コメントに書かれていない。
