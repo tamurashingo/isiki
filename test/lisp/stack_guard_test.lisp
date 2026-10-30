@@ -78,11 +78,37 @@
     (progn (while (<= d hi)
              (progn (if (> (sgt-try d) 0) (setq best d) nil) (setq d (+ d 1))))
            best)))
-(defglobal sgt-max-depth (sgt-max 15 40))
-(format *isiki-test-stream* "#stack-guard max-depth=~D (記録値 27)~%" sgt-max-depth)
+;; 2026-10-30: **探索範囲の上端を 40 -> 80 へ広げた。**
+;;
+;; `sgt-max` は範囲 [lo, hi] の中で成功した最大の d を返すので、
+;; **真の深さが hi を超えていると hi をそのまま返す**。つまり
+;; 「ちょうど hi」と「hi より深い」を区別できない。
+;; フレームを実寸にすると深さは**増える方向**に動く(小さいフレームの関数が多いぶん
+;; 同じスタックに多く積める)ので、上端のままだと**上限側の判定が意味を失う**。
+;;
+;; **上端に張り付いていないことを明示的に見る**(下の 3 つ目の assert)。
+;; これがあれば、範囲が足りなくなった日に「黙って上端を返す」のではなく落ちる。
+(defglobal sgt-search-hi 80)
+(defglobal sgt-max-depth (sgt-max 15 sgt-search-hi))
+(format *isiki-test-stream* "#stack-guard max-depth=~D (記録値 26。2026-10-07 は 27、探索上端 ~D)~%"
+        sgt-max-depth sgt-search-hi)
 (finish-output *isiki-test-stream*)
 (assert-equal t (if (>= sgt-max-depth 20) t nil))
 (assert-equal t (if (<= sgt-max-depth 34) t nil))
+;; **探索が上端で打ち切られていないこと。** ここが落ちたら
+;; `sgt-search-hi` を上げてから深さの期待値を取り直すこと(順序を逆にすると、
+;; 上端に張り付いた値を「実測値」として記録してしまう)
+(assert-equal t (if (< sgt-max-depth sgt-search-hi) t nil))
+
+;; 2026-10-30 の実測は **26**(2026-10-07 の記録は 27)。帯(20〜34)の中なので落ちないが、
+;; **1 段動いたこと自体は記録しておく**。PR #94 の取り込みで C 側のコードが変わったので、
+;; JIT に入るまでに使う C スタックの量が変わったためと見られる(**推測。未確認**)。
+;; フレーム寸法は 7480 のまま不変で、これは jit_frame_test.lisp が別途固定している。
+;;
+;; **陽性対照(規則 8、2026-10-30 に取得)**: `sgt-search-hi` を 20(真の深さより低い)にすると
+;; 検出器は上端の 20 を返し、**上の 2 つの帯の判定(>= 20 / <= 34)は両方とも通ってしまう**。
+;; 落ちるのはこの「張り付いていないこと」の判定だけだった。
+;; つまりこの判定が無い状態では、**範囲が足りないことを誰も見ていなかった**。
 
 ;;; --- 7. 末尾呼び出しは深さを消費しないので、保護は発火しない ---
 ;;
