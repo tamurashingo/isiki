@@ -196,7 +196,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram
 
 all: build
 
@@ -349,6 +349,89 @@ check-pr-claims:
 check-pr-claims-self-test:
 	@python3 tools/check_pr_claims.py --self-test
 
+# [同一性] 「生成物が 1 文字も変わらない」を測れる形にする 2 つの手順。
+#
+# **変えていないことは、git diff には出ない。** AOT 生成物は .gitignore 済みの
+# ビルド生成物で git に 1 バイトも入っていないし、JIT の出力はそもそも
+# 実行時にしか存在しない。どちらも「黙って変わっても誰も気づかない」形
+# (documents/pitfalls.md 原則6)なので、基準を退避してから比べる口を置く。
+#
+# 下の 2 つのヘルパは、その口がビルドの印と生成器の入力を**Makefile から
+# 直接**受け取るためにある。スクリプト側に書き写すと、Makefile を直したときに
+# 黙って食い違う(BUILD_FLAG_SIGNATURE は Makefile:91 付近が唯一の真実源)
+print-build-flag-signature:
+	@echo '$(BUILD_FLAG_SIGNATURE)'
+
+print-transpile-src:
+	@echo '$(TRANSPILE_LISP_SRC)'
+
+# [同一性/AOT] $(LISP_COMPILED) と $(LISP_COMPILED_FIXTURE) が 1 文字も
+# 変わっていないことを、**生成しなおして byte 比較**して確かめる。
+# ゲストは要らない(実測 1 回 0.86 秒、2 ファイルは 1 回の生成で両方出る)。
+#
+#   make aot-identity-save    変更前に基準を退避する
+#   make aot-identity-check   生成しなおして基準と比べる(同一 0 / 相違 1 / 不成立 2)
+#
+# **check は生成物を消してから生成しなおし、byte 一致したら mtime を戻す。**
+# 消さないとファイル依存で生成器が動かず、戻さないとカーネルと
+# BOOT_FAT32_IMG がまるごと作り直される(詳しくは tools/aot_identity.sh の冒頭)
+aot-identity-save:
+	@tools/aot_identity.sh save
+
+aot-identity-check:
+	@tools/aot_identity.sh check
+
+# [規則 8] **本物の生成器**で陽性対照を取る。自己試験(下)は偽の生成器で経路を
+# 通すだけなので、「本物の生成物の 1 バイトの差を捕まえられる」ことは別に示す。
+# 生成器を動かしたうえで出てきた生成物の先頭 1 バイトを書き換えて check を走らせ、
+# 相違(1)で落ちること、そのまま生成しなおせば同一(0)に戻ることの両方を見る。
+# docker が要る(生成を 3 回ほど回す。実測 1 回 0.86 秒)が、ゲストは要らない
+aot-identity-positive-control:
+	@tools/aot_identity.sh positive-control
+
+# [規則 8] 上の検出器の自己試験。偽の生成器を使うので docker も QEMU も要らない。
+# 陽性対照: 1 文字変える / 長さを変える / ビルドの印が違う基準と比べる /
+#           基準が無い / positive-control 自体 / 入力が変わった・変わっていない
+#           の切り分け。
+# 陰性対照: 同じものを生成すれば同一になること、空白の有無だけでは「違う設定」と
+#           判定しないこと、そして **mtime が戻っていること**
+#           (戻っていなければカーネルがまるごと作り直される)。
+#           生成器が実際に呼ばれたことを呼び出し回数で確かめてから mtime を見る
+#           — **走っていないのに mtime が同じ、では何も確かめていない**
+aot-identity-self-test:
+	@tools/aot_identity.sh self-test
+
+# [同一性/JIT] JIT が出力した機械語が、全関数で 1 バイトも変わっていないことを
+# JIT_DUMP ビルドのシリアル出力([JITDUMP] 行)で確かめる。
+# **QEMU を 1 回起動する**(JIT_DUMP=1 は別ビルドなのでカーネルも作り直される)。
+#
+#   make jit-identity-save    変更前に基準を取る
+#   make jit-identity-check   同じ条件で流して基準と比べる(同一 0 / 相違 1 / 不成立 2)
+#   make jit-identity-show    何が走るかだけを見る(QEMU を起動しない)
+#
+# MILESTONE / QEMU_MEM は基準に記録され、違っていれば比べずに止まる
+# (ダンプ行は関数名を持たないので、突き合わせは出現順。条件が同じでなければ
+#  順序そのものが保証できない)
+jit-identity-save:
+	@tools/jit_dump_identity.sh save
+
+jit-identity-check:
+	@tools/jit_dump_identity.sh check
+
+# [同一性/JIT] 空運転。**1 回 10 分近い QEMU 起動を払う前に**、ビルドの印と
+# 打つコマンドと記録する条件を見る。make -n ではここまで追えない
+# (src/c/disasm_symtab.c が生成物で -n からは作られないため make が先に止まる。
+#  これは既存の挙動で、このターゲットとは無関係)
+jit-identity-show:
+	@tools/jit_dump_identity.sh show
+
+# [規則 8] 上の検出器の自己試験。合成したシリアルログを食わせるので
+# **ビルドも QEMU も要らない**。陽性対照の 1 つは
+# 「印に -DISIKIOS_JIT_DUMP が無ければ止まる」= **0 行同士を「一致」と
+# 言わせない**ことで、これが無いと計器が死んでいるのに緑が出る
+jit-identity-self-test:
+	@tools/jit_dump_identity.sh self-test
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
 # マクロの前方参照検査(tools/check_macro_forward_refs.py)。
 # **マクロ定義より前で使われたマクロは展開されず、関数呼び出しになる。**
@@ -368,7 +451,7 @@ check-macro-order:
 check-macro-order-self-test:
 	@python3 tools/check_macro_forward_refs.py --self-test
 
-test: check-macro-order check-macro-order-self-test check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) \
