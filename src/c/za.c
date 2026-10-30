@@ -1717,7 +1717,66 @@ static UINT64 g_za_block_level_mask = 0;
 #define ZA_OFF_ARITH_BASE (ZA_OFF_CALL_BASE + ZA_MAX_CALL_DEPTH * ZA_CALL_SLOT_SIZE)
 #define ZA_ARITH_SLOT_SIZE 24  /* 値8バイト+gc_rootnode16バイト */
 /* 4*24=96は元から16の倍数なので、ZA_MAX_CALL_DEPTHのように偶数に揃える特別な配慮は不要。 */
-#define ZA_OFF_FLET_BASE (ZA_OFF_ARITH_BASE + ZA_MAX_ARITH_DEPTH * ZA_ARITH_SLOT_SIZE)
+/* ===== [案 d 第 2 段] 可変にしたい領域を最上段へ寄せる並べ替え(2026-10-30) =====
+ *
+ * **寸法は変えない。並び順だけを変える。** 総量(ZA_FRAME_TOTAL)は 7480 のまま。
+ *
+ * 狙い: 寸法を関数ごとの実寸にするとき(第 3 段以降)、**出力時に「参照された
+ * 最も高い位置」を数えて寸法を決める**。だから**まれにしか使われない大きな領域が
+ * 上にあるほど、使わない関数の寸法が小さくなる**。
+ *
+ *   quasiquote   2496 byte … 実コードで 97.5% の関数が使わない
+ *   flet/labels   832 byte … 実コードで 95.7% の関数が使わない(src/lisp では 0/114)
+ *   両方          3328 byte = 総量の 44.5% を 93.2% の関数が 1 byte も使わない
+ *
+ * 2026-10-30 まで、この 2 つの**上**に常用の小領域 128 byte
+ * (setq 退避 32 + パラメータ 80 + r14 退避 16)が乗っていた。
+ * そのままでは「最も高い位置」が常に 128 byte 上に張り付くので、
+ * **使わない 3328 byte を切り落とせない。** そこで 128 byte を下へ動かした。
+ *
+ * **並べ替えが安全な理由(構造的保証)**: フレーム内の番地参照は例外なく 3 つの入口
+ * (za_load_slot / za_store_slot / za_addr_of_slot)を通り、3 つとも幅が固定の
+ * 32 bit 変位で機械語を出す。だから**命令数もバイト長も 1 つも変わらない**。
+ * ただし**変位の値は変わる**(それが並べ替えである)。したがって判定は
+ * 素のハッシュではなく**変位を伏せたハッシュ**で行う(make jit-reorder-check)。
+ *
+ * 不採用にした案: **事前にフォームを走査して寸法を予測する**。
+ * マクロ展開がコンパイル中に起きるので、**展開後に初めて現れる構文を見落とす**
+ * (= 足りない寸法で確保して静かに壊れる)。採るなら「コンパイル終了時に予測を
+ * 超えなかったことを検査し、超えたら生成を捨てる」が必須になる。
+ */
+/* 拡張19(グローバル変数setq): os_make_symbol呼び出し前にRAX(val_formの評価結果)を
+ * 退避する専用スクラッチスロット。ZA_OFF_ACC_VALは呼び出し引数loopの実行中にしか
+ * 使われず、setqの右辺(val_form)自体が別の関数呼び出しを含みうるため流用できない
+ * (za.c:980のコメント参照)。ZA_OFF_LAMBDA_TMP_VAL/NODEと同型の単一固定スロット。 */
+#define ZA_OFF_SETQ_TMP_VAL \
+    (ZA_OFF_ARITH_BASE + ZA_MAX_ARITH_DEPTH * ZA_ARITH_SLOT_SIZE)
+#define ZA_OFF_SETQ_TMP_NODE (ZA_OFF_SETQ_TMP_VAL + 8)  /* 16バイト、24バイトで終わる */
+/* 24-31: 16バイト境界(sub rsp総量を8 mod 16に保つ、ZA_OFF_NLX_BASEの264-271と
+ * 同じ考え方)を保つためのpadding */
+#define ZA_OFF_SETQ_TMP_END \
+    (ZA_OFF_SETQ_TMP_VAL + 32)
+/* ABI-M5: 固定引数エントリポイント(fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS、&restなし、
+ * lambda/flet/labelsを含まない関数のみ、za_form_disables_param_slots参照)専用の
+ * パラメータスロット。consリスト版/固定引数版どちらのプロローグも、それぞれの引数
+ * 受け渡し方式からこの固定本数のスロットへ一度だけ展開して書き込み、以降の
+ * op->is_literal==0(パラメータ参照)はza_emit_operandがconsリストを都度辿らず
+ * ここを直接読む(g_za_use_param_slots参照)。対象外の関数はこのスロットを一切
+ * 使わず、従来通りZA_OFF_ARGS_VALからのcc_car/cc_cdr都度読み直しのままにする。 */
+#define ZA_MAX_FIXED_ENTRY_PARAMS 3
+#define ZA_OFF_PARAM_BASE ZA_OFF_SETQ_TMP_END
+/* 3スロット*24byte(ZA_ARG_SLOT_SIZE)=72byteに8byte paddingを足し80byte(16の倍数)にする
+ * ことで、ZA_FRAME_EXTRA全体の16バイト境界に対する既存の関係を変えない。 */
+/* [ABI] r14はMS x64/SysVともcallee-savedである。生成コード(za_emit_fn_resolve_cached)が
+ * r14を使うので、プロローグでここへ退避し、3つの出口(通常エピローグ・末尾呼び出し2箇所)
+ * すべてで復元する。以前は退避しておらず、呼び出し元(C)の r14 を壊していた。
+ * za_compile_exprのlet本体走査は &nil を r14 に保持しており、cc_car/cc_cdr を
+ * inline化するとその割り当てになって init.lisp の make-environment のコンパイル中に
+ * 無限ループした(gdb の watch $r14 で g_imm_space 内の movabs $slot,%r14 を捕捉、2026-09-13)。
+ * 生ポインタなのでGCルートには繋がない(スロットは明示的にlinkしない限り走査されない)。
+ * 8byteのスロットに8byteのpaddingを足して、ZA_FRAME_EXTRAの16byte境界の関係を保つ。 */
+#define ZA_OFF_SAVED_R14 (ZA_OFF_PARAM_BASE + 80)
+#define ZA_OFF_FLET_BASE (ZA_OFF_PARAM_BASE + 96)
 /* flet/labels: 束縛関数を1個ずつ逐次構築して即os_set_functionで消費するため
  * (本体はインタプリタ実行=不透明データなので構築時点では評価されない、
  * za_compile_lambdaの兄弟lambdaが同じTMPスロットを再利用できる理由と同じ)、
@@ -1749,39 +1808,8 @@ static UINT64 g_za_block_level_mask = 0;
  * 要素配列(ZA_MAX_QQ_ELEMENTS個、za_arg_val_offと同じ「配列インデックス」パターン) +
  * foldアキュムレータ用1個(za_arith_val_offと同じ単一スロット)。 */
 #define ZA_QQ_LEVEL_SIZE    (8 + (ZA_MAX_QQ_ELEMENTS + 1) * ZA_QQ_SLOT_SIZE)
-/* 拡張19(グローバル変数setq): os_make_symbol呼び出し前にRAX(val_formの評価結果)を
- * 退避する専用スクラッチスロット。ZA_OFF_ACC_VALは呼び出し引数loopの実行中にしか
- * 使われず、setqの右辺(val_form)自体が別の関数呼び出しを含みうるため流用できない
- * (za.c:980のコメント参照)。ZA_OFF_LAMBDA_TMP_VAL/NODEと同型の単一固定スロット。 */
-#define ZA_OFF_SETQ_TMP_VAL \
-    (ZA_OFF_QQ_BASE + ZA_MAX_QQ_DEPTH * ZA_QQ_LEVEL_SIZE)
-#define ZA_OFF_SETQ_TMP_NODE (ZA_OFF_SETQ_TMP_VAL + 8)  /* 16バイト、24バイトで終わる */
-/* 24-31: 16バイト境界(sub rsp総量を8 mod 16に保つ、ZA_OFF_NLX_BASEの264-271と
- * 同じ考え方)を保つためのpadding */
-#define ZA_OFF_SETQ_TMP_END \
-    (ZA_OFF_SETQ_TMP_VAL + 32)
-/* ABI-M5: 固定引数エントリポイント(fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS、&restなし、
- * lambda/flet/labelsを含まない関数のみ、za_form_disables_param_slots参照)専用の
- * パラメータスロット。consリスト版/固定引数版どちらのプロローグも、それぞれの引数
- * 受け渡し方式からこの固定本数のスロットへ一度だけ展開して書き込み、以降の
- * op->is_literal==0(パラメータ参照)はza_emit_operandがconsリストを都度辿らず
- * ここを直接読む(g_za_use_param_slots参照)。対象外の関数はこのスロットを一切
- * 使わず、従来通りZA_OFF_ARGS_VALからのcc_car/cc_cdr都度読み直しのままにする。 */
-#define ZA_MAX_FIXED_ENTRY_PARAMS 3
-#define ZA_OFF_PARAM_BASE ZA_OFF_SETQ_TMP_END
-/* 3スロット*24byte(ZA_ARG_SLOT_SIZE)=72byteに8byte paddingを足し80byte(16の倍数)にする
- * ことで、ZA_FRAME_EXTRA全体の16バイト境界に対する既存の関係を変えない。 */
-/* [ABI] r14はMS x64/SysVともcallee-savedである。生成コード(za_emit_fn_resolve_cached)が
- * r14を使うので、プロローグでここへ退避し、3つの出口(通常エピローグ・末尾呼び出し2箇所)
- * すべてで復元する。以前は退避しておらず、呼び出し元(C)の r14 を壊していた。
- * za_compile_exprのlet本体走査は &nil を r14 に保持しており、cc_car/cc_cdr を
- * inline化するとその割り当てになって init.lisp の make-environment のコンパイル中に
- * 無限ループした(gdb の watch $r14 で g_imm_space 内の movabs $slot,%r14 を捕捉、2026-09-13)。
- * 生ポインタなのでGCルートには繋がない(スロットは明示的にlinkしない限り走査されない)。
- * 8byteのスロットに8byteのpaddingを足して、ZA_FRAME_EXTRAの16byte境界の関係を保つ。 */
-#define ZA_OFF_SAVED_R14 (ZA_OFF_PARAM_BASE + 80)
 #define ZA_FRAME_EXTRA \
-    (ZA_OFF_PARAM_BASE + 96)
+    (ZA_OFF_QQ_BASE + ZA_MAX_QQ_DEPTH * ZA_QQ_LEVEL_SIZE)
 /* 追加分(ZA_FRAME_EXTRA)に上端の0x28=40を足した、プロローグでsub rspする総量。
  *
  * [2026-10-30 訂正・原則12] この0x28は、2026-10-30まで「既存のシャドウスペース」と
