@@ -2319,6 +2319,7 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
             os_diag_serial_write(" (コンパイルを断念してインタプリタへ落とす)\n");
 #endif
             g_za_macroexpand_runaway++;
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_MACROEXPAND_ITER */
             return form;
         }
         lisp_val_t wrapped = os_make_cons(form, nil);
@@ -3776,15 +3777,24 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
 static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out_syms, UINT64 *out_count) {
     UINT64 count = 0;
     for (lisp_val_t cur = lambda_vars; cur != nil; cur = cc_cdr(cur)) {
+        /* [形の検査] 容量上限ではないので `[診断] 容量上限` の注記は付けない。
+           **2026-10-30: ここは黙っていた。** 入れ子が深い形ではこの検査が先に当たって
+           let のコンパイルが断念されるのに記録が残らず、`%%diag-za-bail-at 0` が
+           呼び出し側の伝播点を指していた(= 起点が消える)。実測で 26 段から当たる
+           (PR #94 の取り込み前は 27 段から)。**なぜ深さで形が崩れるのかは未解明。**
+           ここで記録しておけば、次に見る人が起点から追える。 */
         if ((cur & TAG_MASK) != TAG_CONS) {
+            ZA_BAIL_LINE();   /* [形] 仮引数が平坦なリストではない */
             return 0;
         }
         lisp_val_t sym = cc_car(cur);
         if ((sym & TAG_MASK) != TAG_SYMBOL || sym == g_sym_rest) {
+            ZA_BAIL_LINE();   /* [形] 仮引数がシンボルでない、または &rest */
             return 0;
         }
         for (UINT64 i = 0; i < count; i++) {
             if (out_syms[i] == sym) {
+                ZA_BAIL_LINE();   /* [形] 仮引数が重複している */
                 return 0;
             }
         }
@@ -3920,7 +3930,13 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     }
     if (g_za_analyze_over) {
         /* 打ち切った解析結果はbox化の判断に使えない(box化漏れは誤った実行結果になる)。
-           ZA_BAIL_LINE()はこの位置より後で定義されるため使えない。診断はシリアルに出る */
+           打ち切りの上限はZA_MAX_ANALYZE_STEPSで、za_analyze_var_usageがg_za_analyze_overを立てる。
+
+           **2026-10-30: ここには「ZA_BAIL_LINE()はこの位置より後で定義されるため使えない」と
+           書かれていたが、定義はza.c:154でこの位置より前だった**(原則12: コメントは腐る)。
+           そのせいでこの断念だけが黙り、入れ子が深い形では**起点が記録されなかった**
+           (記録されるのは呼び出し側の伝播点だけ)。記録するようにした。 */
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_ANALYZE_STEPS */
         return 0;
     }
     za_var_kind_t var_kind[ZA_MAX_LOCALS_PER_LET];
