@@ -22,6 +22,16 @@ QEMU_MEM ?= 256M
 # 「無関係な変更で症状が消える」形の問題が摂動で消えなくなる。
 EXTRA_CFLAGS ?=
 
+# [測定] GC発火テスト用の小さいヒープの大きさ(byte)。空ならソース側の既定値
+# (test/c/runtime_test.c の #ifndef SMALL_HEAP_SIZE)を使う。この値を見ている
+# ネイティブのユニットテストは runtime_test だけなので、そこにしか渡さない。
+#   make test SMALL_HEAP_SIZE=80000
+# 通る窓は数KBしかない。**小さすぎるとGC後も確保できず、os_panicがユニットテストでは
+# 無限ループになるので「失敗」ではなく「ハング」として現れる**。大きすぎると
+# isqrt等の「GCが発火する」アサーションがNGになる。組み込み関数(os_set_function)を
+# 足したときは、この口で掃引して通る最小値を実測し直す
+SMALL_HEAP_SIZE ?=
+
 # 命令数ベースの性能計測(documents/performance-measurement.md参照)で使う
 # TCGプラグインのビルドに必要な、ホストにインストール済みのqemu-system-x86_64
 # バージョン(`qemu-system-x86_64 --version`で確認)。プラグインABI
@@ -71,6 +81,10 @@ ALIGN_AUDIT_FLAGS = $(if $(ALIGN_AUDIT),-DISIKIOS_ALIGN_AUDIT,)
 # (documents/jit-tag-constants.md Step 1)
 JIT_DUMP_FLAGS = $(if $(JIT_DUMP),-DISIKIOS_JIT_DUMP,)
 
+# [測定] 上のSMALL_HEAP_SIZEをコンパイル行へ渡す形にしたもの。空のときは何も
+# 渡さないので、ソース側の#ifndefの既定値がそのまま効く
+SMALL_HEAP_FLAGS = $(if $(SMALL_HEAP_SIZE),-DSMALL_HEAP_SIZE=$(SMALL_HEAP_SIZE),)
+
 BUILD_TMPDIR = tmp
 
 # [GCデバッグ] $(TARGET)はSRC/HDRのファイル依存で追跡するため、**フラグだけ変えても
@@ -87,8 +101,13 @@ BUILD_TMPDIR = tmp
 # 2回目はSRC/HDRが更新されていないので再ビルドされず、**8byte版のバイナリのまま
 # 測って heap-align=8 と報告された**。ALIGN_AUDITが使用値を出力に混ぜていたので
 # 気づけたが、出していなければそのまま誤った比較表になっていた。
+#
+# SMALL_HEAP_FLAGSも同じ理由で含める。掃引のために**まさに付けたり外したりする**口で、
+# 署名の外に置くと「渡したつもりで古いバイナリを測る」事故が無言で成立する。
+# カーネル本体はこの値を使わないので$(TARGET)の再ビルドは本来不要だが、
+# 「新しいビルドフラグは必ず署名に入れる」を例外なしの規則にしておく方を採る
 GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
-BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(EXTRA_CFLAGS)
+BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(SMALL_HEAP_FLAGS) $(EXTRA_CFLAGS)
 .PHONY: FORCE
 FORCE:
 $(GC_DEBUG_STAMP): FORCE
@@ -352,7 +371,7 @@ check-macro-order-self-test:
 test: check-macro-order check-macro-order-self-test check-eval-error-budget check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_RUNTIME) $(TEST_SRC_RUNTIME) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
