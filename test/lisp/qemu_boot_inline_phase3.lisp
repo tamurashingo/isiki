@@ -48,9 +48,15 @@
 (format *isiki-test-stream* "#inline-of ainl=~S sinl=~S afix=~S~%"
         (%%inline-of 'p3-ainl) (%%inline-of 'p3-sinl) (%%inline-of 'p3-afix))
 (finish-output *isiki-test-stream*)
-(assert-equal 735 (%%disasm-code-len 'p3-ainl))
-(assert-equal 738 (%%disasm-code-len 'p3-sinl))
-(assert-equal 690 (%%disasm-code-len 'p3-afix))
+;; 2026-10-30: 絶対長を +181 した(735/738/690 -> 916/919/871)。
+;; PR #94 の期待値は分岐元から 71 コミット遅れた生成器で記録されていた。
+;; 内訳はスタック残量の検査 37 byte x 入口 2 つ = 74 と、arity 不一致の検出 107。
+;; **関係は無傷**(inline と nodecl の一致、decl との差 45)。
+;; この 3 件は test-qemu-all に入っていない boot ファイルにあるので、
+;; 全回帰では拾えず、命令数ゲートを回したときに落ちた。
+(assert-equal 916 (%%disasm-code-len 'p3-ainl))
+(assert-equal 919 (%%disasm-code-len 'p3-sinl))
+(assert-equal 871 (%%disasm-code-len 'p3-afix))
 (assert-equal 19134 (p3-ainl 12345 6789))
 (assert-equal 5556 (p3-sinl 12345 6789))
 
