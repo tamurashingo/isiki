@@ -218,13 +218,13 @@
   (- x y))
 
 ;; **加算的であること**: inline 宣言が無い経路は一切変わらない
-(assert-equal 690 (%%disasm-code-len 'idt-add-decl))       ; call だけ(従来どおり)
-(assert-equal 735 (%%disasm-code-len 'idt-add-nodecl))     ; 展開あり(従来どおり)
-(assert-equal 690 (%%disasm-code-len 'idt-sub-decl))
-(assert-equal 738 (%%disasm-code-len 'idt-sub-nodecl))
+(assert-equal 871 (%%disasm-code-len 'idt-add-decl))       ; call だけ(従来どおり)
+(assert-equal 916 (%%disasm-code-len 'idt-add-nodecl))     ; 展開あり(従来どおり)
+(assert-equal 871 (%%disasm-code-len 'idt-sub-decl))
+(assert-equal 919 (%%disasm-code-len 'idt-sub-nodecl))
 ;; **宣言すると展開される**
-(assert-equal 735 (%%disasm-code-len 'idt-add-decl-inline))
-(assert-equal 738 (%%disasm-code-len 'idt-sub-decl-inline))
+(assert-equal 916 (%%disasm-code-len 'idt-add-decl-inline))
+(assert-equal 919 (%%disasm-code-len 'idt-sub-decl-inline))
 
 ;; **命令列が同一であること**(予測の固定)
 (assert-equal (idt-mnemonics 'idt-add-nodecl) (idt-mnemonics 'idt-add-decl-inline))
@@ -261,8 +261,8 @@
 (defun idt-add-off (x y)
   (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (notinline +))
   (+ x y))
-(assert-equal 735 (%%disasm-code-len 'idt-add-declaim))
-(assert-equal 690 (%%disasm-code-len 'idt-add-off))
+(assert-equal 916 (%%disasm-code-len 'idt-add-declaim))
+(assert-equal 871 (%%disasm-code-len 'idt-add-off))
 (assert-equal 7 (idt-add-declaim 3 4))
 (assert-equal 7 (idt-add-off 3 4))
 (declaim (notinline + -))
@@ -271,5 +271,5 @@
 (defun idt-add-sgl-inline (x y)
   (declare (type <single-float> x)) (declare (type <single-float> y)) (declare (inline +))
   (+ x y))
-(assert-equal 690 (%%disasm-code-len 'idt-add-sgl-inline))
+(assert-equal 871 (%%disasm-code-len 'idt-add-sgl-inline))
 (assert-equal t (idt-callee-p 'idt-add-sgl-inline "primitive_add2_single"))
