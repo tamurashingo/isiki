@@ -196,7 +196,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -456,6 +456,16 @@ jit-reorder-check:
 jit-reorder-self-test:
 	@python3 tools/check_jit_dump_reorder.py --self-test
 
+# [案 d 第 3 段] フレーム内の番地参照が **3 入口だけ**を通っていることの検査。
+# 寸法は jit_emit_rsp_disp32 で数えた最高水位で決まるので、**3 入口を迂回されると
+# 水位に穴が開き、足りない寸法で確保して実行時に静かにスタックが壊れる**。
+.PHONY: check-frame-access-entries check-frame-access-entries-self-test
+check-frame-access-entries:
+	@python3 tools/check_frame_access_entries.py
+
+check-frame-access-entries-self-test:
+	@python3 tools/check_frame_access_entries.py --self-test
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
 # マクロの前方参照検査(tools/check_macro_forward_refs.py)。
 # **マクロ定義より前で使われたマクロは展開されず、関数呼び出しになる。**
@@ -475,7 +485,7 @@ check-macro-order:
 check-macro-order-self-test:
 	@python3 tools/check_macro_forward_refs.py --self-test
 
-test: check-macro-order check-macro-order-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) \

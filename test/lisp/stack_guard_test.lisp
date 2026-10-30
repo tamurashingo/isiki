@@ -93,8 +93,22 @@
 (format *isiki-test-stream* "#stack-guard max-depth=~D (記録値 26。2026-10-07 は 27、探索上端 ~D)~%"
         sgt-max-depth sgt-search-hi)
 (finish-output *isiki-test-stream*)
-(assert-equal t (if (>= sgt-max-depth 20) t nil))
-(assert-equal t (if (<= sgt-max-depth 34) t nil))
+;; 2026-10-30(案 d 第 3 段): **帯を 20〜34 から 40〜60 へ上げた。**
+;;
+;; フレームを関数ごとの実寸にしたので、この題材(let を使う再帰)の 1 段が
+;; 7480 -> 4152 byte になり、**実測の深さが 26 -> 49 に増えた**。
+;; 帯の意味は変わらない:
+;;   下限 … フレームが**太った**/ 保護が厳しくなりすぎた場合に気づく
+;;   上限 … 保護が**効かなくなった**場合に気づく
+;; **期待値を上げたこと自体が成果**なので、PR 本文にも書く(規則 9)。
+;;
+;; 落ちたときにやること:
+;;   1. make test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp で
+;;      この題材の寸法を見る(#jit-frame の行)
+;;   2. 寸法が変わっていれば、256KB / 寸法 におおよそ比例して帯を動かす
+;;   3. 寸法が変わっていないのに深さが動いたら、**保護側を疑う**
+(assert-equal t (if (>= sgt-max-depth 40) t nil))
+(assert-equal t (if (<= sgt-max-depth 60) t nil))
 ;; **探索が上端で打ち切られていないこと。** ここが落ちたら
 ;; `sgt-search-hi` を上げてから深さの期待値を取り直すこと(順序を逆にすると、
 ;; 上端に張り付いた値を「実測値」として記録してしまう)

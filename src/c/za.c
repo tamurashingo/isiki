@@ -443,6 +443,37 @@ static UINT32 g_jit_reloc_count = 0;
 static UINT64 g_jit_trampoline_jmp_patch_offsets[ZA_MAX_TRAMPOLINE_JMPS];
 static UINT32 g_jit_trampoline_jmp_count = 0;
 
+/* ===== [案 d 第 3 段] フレームの寸法を関数ごとの実寸にする ==========================
+ *
+ * **寸法は「この関数が触りうる最も高い位置」である。**
+ * フレーム内の番地参照は例外なく 3 つの入口(za_load_slot / za_store_slot /
+ * za_addr_of_slot)を通り、3 つとも jit_emit_rsp_disp32 へ合流する。だからそこで
+ * 変位の最大値を数えれば、**領域ごとの特別扱いも「どの機能を使ったか」の判定も要らない**
+ * (let / 一般呼び出し / 制御転送の領域も、使った深さのぶんだけ自動で縮む)。
+ * 3 入口以外から [rsp+disp] を出す経路が無いことは
+ * tools/check_frame_access_entries.py が見ている(**これが破れると水位に穴が開く**)。
+ *
+ * **入口で寸法は分からない。** プロローグは本体より前に出るので、確保の即値は
+ * 後から埋める。本体の途中に出る末尾呼び出しの解体も同じ。出口は本体より後なので
+ * その時点では確定しているが、**扱いを揃えるため同じ仕組みで埋める**。
+ *
+ * 上限は**導出する**。末尾呼び出し 1 件は共有スタブへの飛び越しを必ず 1 つ出すので、
+ * 末尾呼び出しの件数は ZA_MAX_TRAMPOLINE_JMPS で抑えられる。1 件につき解体を 2 つ
+ * (高速 path と fallback)出し、ほかに入口の確保が最大 2、出口の解体が最大 2
+ * (通常 + 引数個数エラー側の写し)。
+ * **固定値(128)を書いてはいけない**: 末尾呼び出しが 64 件を超える関数が
+ * 静かに機械語化されなくなる(= 黙って遅くなる)。実コードでの最大は 48 だが、
+ * 上限は構造から導く。 */
+#define ZA_MAX_FRAME_PATCHES (2 * ZA_MAX_TRAMPOLINE_JMPS + 4)
+
+/** この関数が触りうる最も高い位置(byte)。jit_emit_rsp_disp32 が更新する */
+static UINT32 g_za_frame_hwm = 0;
+/** 寸法の即値フィールドの位置(g_jit_code 内の絶対オフセット) */
+static UINT64 g_za_frame_patch_offsets[ZA_MAX_FRAME_PATCHES];
+static UINT32 g_za_frame_patch_count = 0;
+/** 寸法の即値を埋めずに出力してしまった数(あってはならない。0 でなければ生成を捨てる) */
+static UINT32 g_za_frame_patch_overflow = 0;
+
 /** 1回のza_try_compile_defun呼び出し(1defunのコンパイル試行)で、g_za_quote_slots/
  * g_za_number_slots/g_za_lambda_slots(いずれかのプール)から確保したスロットの
  * アドレスの一覧(za_try_compile_defun冒頭でリセットする)。コンパイル成功時は
@@ -571,6 +602,12 @@ static void jit_emit_rsp_disp32(UINT8 opcode, UINT8 reg, INT32 disp32) {
     jit_emit8(opcode);
     jit_emit8((UINT8)(0x80 | ((reg & 7) << 3) | 0x04));
     jit_emit8(0x24);
+    /* [案 d 第 3 段] **ここが最高水位を数える唯一の場所である。**
+       フレーム内の番地参照は 3 つの入口を通って必ずここへ合流する。
+       読み書きは 8 byte 単位なので、触る最も高い位置は disp32 + 8。 */
+    if (disp32 >= 0 && (UINT32)disp32 + 8 > g_za_frame_hwm) {
+        g_za_frame_hwm = (UINT32)disp32 + 8;
+    }
 #ifdef ISIKIOS_JIT_DUMP
     UINT64 disp_start = g_jit_used;
 #endif
@@ -1840,6 +1877,30 @@ _Static_assert((ZA_FRAME_TOTAL % 16) == 8,
                "ZA_FRAME_TOTAL must be 8 mod 16 (see the comment above)");
 _Static_assert((ZA_FRAME_EXTRA % 16) == 0,
                "ZA_FRAME_EXTRA must be a multiple of 16 (the 8 comes from the top 0x28)");
+
+/* [案 d 第 3 段] 寸法の即値を**後から埋める**ための記録つきの出力器。
+ *
+ * 入口(プロローグ)は本体より前に出るので、この時点では寸法が分からない。
+ * 本体の途中に出る末尾呼び出しの解体も同じ。出口は本体より後なので確定しているが、
+ * **扱いを揃えて同じ仕組みで埋める**(片方だけ別扱いにすると、漏れたときに
+ * ビルドは通って実行時に静かにスタックが壊れる)。
+ *
+ * 即値は 3 byte のオペコードの直後に来るので、埋める位置は g_jit_used + 3。
+ * 仮の値には**ありうる最大(ZA_FRAME_TOTAL)**を入れておく。万一埋め忘れても
+ * 「多く確保して多く戻す」側に倒れるので、整列も残量も壊れない(ただし
+ * 埋め忘れ自体は下の検査で落とす)。 */
+static void za_emit_frame_imm32(void (*emit)(UINT32)) {
+    UINT64 field = g_jit_used + 3;
+    emit(ZA_FRAME_TOTAL);
+    if (g_za_frame_patch_count < ZA_MAX_FRAME_PATCHES) {
+        g_za_frame_patch_offsets[g_za_frame_patch_count++] = field;
+    } else {
+        /* 上限超過は既存の作法に合流する(生成を捨ててインタプリタへ落ちる) */
+        g_za_frame_patch_overflow++;
+    }
+}
+static void za_emit_sub_rsp_frame(void) { za_emit_frame_imm32(jit_sub_rsp_imm32); }
+static void za_emit_add_rsp_frame(void) { za_emit_frame_imm32(jit_add_rsp_imm32); }
 
 /* ===== [可用性] スタック残量の検査(issue #110) ==================================
  *
@@ -5093,7 +5154,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             }
             jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R13);
             za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
-        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+        za_emit_add_rsp_frame();
             jit_pop_r13();
             jit_pop_rbx();
             jit_jmp_reg(ZA_REG_R11);
@@ -5117,7 +5178,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
         za_load_slot(ZA_REG_R8, ZA_OFF_FN_VAL);
         za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
-        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+        za_emit_add_rsp_frame();
         jit_pop_r13();
         jit_pop_rbx();
         jit_emit_jmp_to_trampoline(trampoline_offset);
@@ -6996,7 +7057,7 @@ static void za_emit_epilogue(void) {
     jit_call_r11();
     jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
     za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
-    jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+    za_emit_add_rsp_frame();
     jit_pop_r13();
     jit_pop_rbx();
     jit_ret();
@@ -7120,6 +7181,12 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     g_za_saw_flet_labels_escape = 0;
     g_jit_reloc_count = 0;
     g_jit_trampoline_jmp_count = 0;
+    /* [案 d 第 3 段] 寸法の水位と後埋めの記録。**関数単位のコンパイルは入れ子にならない**
+       前提に乗っている(この関数が無条件にリセットするので、入れ子になったら内側が
+       外側の記録を消す)。前提そのものを歯止めにするため、下で入れ子を検出して落とす。 */
+    g_za_frame_hwm = 0;
+    g_za_frame_patch_count = 0;
+    g_za_frame_patch_overflow = 0;
     // Phase3.6: このコンパイル試行で確保するリテラルスロット(quote/number/lambda)の
     // 一覧をリセットする。失敗exitではza_release_literal_slot_allocsで即座にフリーリストへ
     // 返却し、成功時はos_environment_register_literal_slotでenvへ登録する。
@@ -7162,7 +7229,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         jit_push_rbx();
         jit_push_r13();
         za_emit_pin_nil();
-        jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+        za_emit_sub_rsp_frame();
         za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
         za_store_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
         if (fixed_count >= 1) {
@@ -7195,7 +7262,7 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     jit_push_rbx();
     jit_push_r13();
     za_emit_pin_nil();
-    jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+    za_emit_sub_rsp_frame();
         za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
     za_store_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
     za_store_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
@@ -7324,6 +7391,33 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     // 構造的に解決済みのため、ここでの関数レベルの無条件fallbackは不要になった。
     // flet/labels束縛関数を(function name)で取り出したケースは別問題として残るため、
     // 引き続き無条件にfallbackさせる(g_za_saw_flet_labels_escapeのコメント参照)。
+    /* ===== [案 d 第 3 段] 寸法を確定して、確保・解体の即値を埋める =====
+     *
+     * ここは**本体を出し終えた後**なので、g_za_frame_hwm は確定している。
+     * 寸法 = 最高水位を 16 byte 境界へ切り上げた量 + 上端の 0x28。
+     * 上端 0x28 が 8 を出しているので、**8 mod 16 は自動で保たれる**
+     * (ZA_FRAME_TOTAL の定義の _Static_assert と同じ関係)。
+     *
+     * **ありうる最大(ZA_FRAME_TOTAL)を超えることはない**が、超えたら生成を捨てる。
+     * 残量の検査(za_emit_stack_guard)と予備領域は**最大側のまま**にしてあるので、
+     * 発火が少し早まる方向にしか動かない(= 安全側)。 */
+    {
+        UINT32 frame_extra = (g_za_frame_hwm + 15u) & ~15u;
+        UINT32 frame_total = 0x28u + frame_extra;
+        if (g_za_frame_patch_overflow > 0 || frame_total > (UINT32)ZA_FRAME_TOTAL) {
+            /* 後埋めの枠を超えた / 最大を超えた。どちらも静かに壊れるより捨てる */
+            g_jit_overflow = 1;
+        } else {
+            for (UINT32 i = 0; i < g_za_frame_patch_count; i++) {
+                UINT64 off = g_za_frame_patch_offsets[i];
+                g_jit_code[off + 0] = (UINT8)(frame_total);
+                g_jit_code[off + 1] = (UINT8)(frame_total >> 8);
+                g_jit_code[off + 2] = (UINT8)(frame_total >> 16);
+                g_jit_code[off + 3] = (UINT8)(frame_total >> 24);
+            }
+        }
+    }
+
     if (g_jit_overflow || g_za_saw_flet_labels_escape) {
         za_release_literal_slot_allocs();
         g_jit_used = entry;

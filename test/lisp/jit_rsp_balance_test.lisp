@@ -258,10 +258,40 @@
 (assert-equal t (if (= (%jrb-nadd (function %jrb-qq))      (%jrb-npop (function %jrb-qq)))      t nil))
 (assert-equal t (if (= (%jrb-nadd (function %jrb-flet))    (%jrb-npop (function %jrb-flet)))    t nil))
 
-;; 即値は ZA_FRAME_TOTAL = 7480(= 0x1d38)。jit_frame_test.lisp と同じ数字を
-;; **別の読み方**(全命令走査 vs プロローグ先頭 64 byte)で確かめている
-(assert-equal 7480 (%jrb-fsz (function %jrb-plain)))
-(assert-equal 7480 (%jrb-fsz (function %jrb-tail)))
+;; 即値を**関係**で押さえる(2026-10-30)。
+;;
+;; **ここには 7480 が 2 つ直書きされていた。** 全関数が同じ寸法だったので
+;; 「即値 = ZA_FRAME_TOTAL = 7480」と書けたが、**実寸化すると関数ごとに
+;; 違う値になる**ので、絶対値は段を越えて生き残らない。
+;; 残すのは、実寸化の前でも後でも成り立つ関係だけである:
+;;
+;;   (a) **0 より大きい** … 走査が空振りしていない(0 なら「食い違い 0」も無意味)
+;;   (b) **16 で割った余りが 8** … 呼び出し規約の整列。za.c の
+;;       `_Static_assert((ZA_FRAME_TOTAL % 16) == 8)` と同じ条件を、
+;;       **出力された機械語の即値の側から**見る。ビルド時の検査は定数 1 つに
+;;       対するものなので、**実寸化したあと「どの関数も 8 mod 16」は保証されない**
+;;   (c) **quasiquote を使う関数 >= 使わない関数** … 実寸化の前は等しく、
+;;       後は qq 側が大きい(jit_frame_test.lisp の qq >= probe と同じ方針)
+;;
+;; **関数をまたいで「等しい」ことは要求しない。** 等しさを要求すると、
+;; それは実寸化を禁じるのと同じになる。
+;; 上限(いまの全関数共通の寸法)は jit_frame_test.lisp の jit-frame-size-cap が持ち、
+;; 混在そのもの(大と小が呼び合う形)は jit_mixed_frame_test.lisp が見る。
+;;
+;; 落ちたときにやること:
+;;   (a) なら `%%disasm-code-base` / `%%disasm-code-len` が nil を返していないか、
+;;       プロローグの形(48 81 EC + imm32)が変わっていないかを見る
+;;   (b) なら `tools/jit_frame_breakdown.py` の内訳から**16 の倍数でない領域**を探す。
+;;       **判定を緩めてはいけない**(緩めると呼び出し規約が静かに壊れる)
+;;   (c) なら「使わない領域を切り落とす」方向が逆になっている
+(assert-equal t (if (> (%jrb-fsz (function %jrb-plain)) 0) t nil))
+(assert-equal t (if (> (%jrb-fsz (function %jrb-tail)) 0) t nil))
+(assert-equal t (if (> (%jrb-fsz (function %jrb-qq)) 0) t nil))
+(assert-equal 8 (mod (%jrb-fsz (function %jrb-plain)) 16))
+(assert-equal 8 (mod (%jrb-fsz (function %jrb-tail)) 16))
+(assert-equal 8 (mod (%jrb-fsz (function %jrb-qq)) 16))
+(assert-equal t (if (>= (%jrb-fsz (function %jrb-qq)) (%jrb-fsz (function %jrb-plain))) t nil))
+(assert-equal t (if (>= (%jrb-fsz (function %jrb-qq)) (%jrb-fsz (function %jrb-tail))) t nil))
 
 ;; 走査が空振りしていないこと(0 件なら「食い違い 0」も「orphan 0」も無意味)
 (assert-equal t (if (> (%jrb-nsub (function %jrb-plain)) 0) t nil))
