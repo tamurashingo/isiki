@@ -1629,8 +1629,11 @@ static void za_gc_unlink_node(gc_rootnode *node) {
  * 深さ指定スロット配列。同時に生きているspanningスロットは常に1本のスタック
  * として積み重なるため、種類を問わず同じ配列を使い回す。 */
 /* blockも(生きているblockリストの退避先として)1段消費するようになったため、
- * 4から8へ拡張した。168 + 8*24 = 360 で、直後の未使用領域(272-655)に収まる
- * (他オフセットは無変更)。 */
+ * 4から8へ拡張した。168 + 8*24 = 360 で、直後の未使用領域に収まる
+ * (他オフセットは無変更)。
+ * [2026-10-30 注・原則12] ここは「未使用領域(272-655)」と書いていた。**拡張時点の
+ * 数字である。** 伸ばした結果、その未使用領域の開始は272ではなく360になった
+ * (下のZA_ARG_SLOT_SIZE付近の訂正と documents/jit-frame-survey.md §2-2 を見ること)。 */
 #define ZA_MAX_NLX_DEPTH       8
 #define ZA_OFF_NLX_BASE        168
 /* コンパイル中の各nlx段が`block`(NLXスロットを使わず、live_blocksのpush/popだけを
@@ -1639,8 +1642,14 @@ static void za_gc_unlink_node(gc_rootnode *node) {
 static UINT64 g_za_block_level_mask = 0;
 #define ZA_NLX_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
 /* 旧ZA_OFF_ARG_BASE(=272)〜656手前は拡張15でdepth化スロット(ZA_OFF_CALL_BASE配下)へ
- * 移動した。この272-655は未使用のまま残る(ZA_OFF_LOCAL_BASE=656より前の他オフセットは
- * 無変更)。ZA_ARG_SLOT_SIZEは新しいdepth化スロットのサイズ計算にも引き続き使う。 */
+ * 移動した。この範囲は未使用のまま残る(ZA_OFF_LOCAL_BASE=656より前の他オフセットは
+ * 無変更)。ZA_ARG_SLOT_SIZEは新しいdepth化スロットのサイズ計算にも引き続き使う。
+ *
+ * [2026-10-30 訂正・原則12] このコメントは未使用の範囲を「272-655」と書いていた。
+ * **272はZA_MAX_NLX_DEPTHが4だった時代の数字である。** 8になってNLX領域が
+ * 168 + 8*24 = 360 まで伸びたので、**いま空いているのは360-655の296byte。**
+ * documents/jit-frame-survey.md §2-2・§8-6が訂正済みで、そちらが正。
+ * 死んでいる領域はこの296だけではない(合計376byte。同 §9)。 */
 #define ZA_ARG_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
 /* let-IIFEインライン化(拡張B): let-localの値+gc_rootnodeのスロット領域。
  * ネスト深さ×1letあたりの変数数で固定サイズを確保し、兄弟let同士(ネストして
@@ -1656,8 +1665,15 @@ static UINT64 g_za_block_level_mask = 0;
  * 前提が無いため、ZA_OFF_NLX_BASEと同じ深さごとの配列にする)。 */
 /* 拡張12でZA_MAX_LET_DEPTHを4から8へ拡張した際、べた書きの数値
  * (旧: 1040 = 656 + 4*4*24、1072 = 1040 + 4*8)を手計算し直す必要が
- * あるのはミスの元なので、ZA_MAX_LET_DEPTH経由の計算式に変更した
- * (656 + 8*4*24 = 1424、1424 + 8*8 = 1488、いずれも16バイト境界を保つ)。 */
+ * あるのはミスの元なので、ZA_MAX_LET_DEPTH経由の計算式に変更した。
+ *
+ * [2026-10-30 訂正・原則12] このコメントは「656 + 8*4*24 = 1424、1424 + 8*8 = 1488」と
+ * **ZA_MAX_LET_DEPTHが8であるかのように**書いていた。その後16へ引き上げられている
+ * (4→8が拡張12、8→16が後続。documents/jit-frame-survey.md §2-3の履歴表)ので、
+ * **実体は 656 + 16*4*24 = 2192、2192 + 16*8 = 2320** である。
+ * **この括弧の数字は計算式の例示であって拘束ではない** — 定数を変えたら動く。
+ * 当たっているかはtools/jit_frame_breakdown.pyで出すこと(手計算しない)。
+ * いずれの値も16バイト境界を保つ(4*24=96も16*4*24=1536も16の倍数)。 */
 #define ZA_OFF_LET_SAVED_HEAD_BASE \
     (ZA_OFF_LOCAL_BASE + ZA_MAX_LET_DEPTH * ZA_MAX_LOCALS_PER_LET * ZA_LOCAL_SLOT_SIZE)
 /* 拡張15(引数位置での一般呼び出しネスト対応): 一般呼び出し1件ごとのCALL_SAVED_HEAD+
@@ -1745,7 +1761,21 @@ static UINT64 g_za_block_level_mask = 0;
 #define ZA_OFF_SAVED_R14 (ZA_OFF_PARAM_BASE + 80)
 #define ZA_FRAME_EXTRA \
     (ZA_OFF_PARAM_BASE + 96)
-/* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
+/* 追加分(ZA_FRAME_EXTRA)に上端の0x28=40を足した、プロローグでsub rspする総量。
+ *
+ * [2026-10-30 訂正・原則12] この0x28は、2026-10-30まで「既存のシャドウスペース」と
+ * 説明されていた。**実体と違う。** MS x64のシャドウスペースは呼び出し1件ごとに
+ * jit_call_r11()が自前で出している(sub rsp,32 / call / add rsp,32。za.c:335の
+ * コメント参照)ので、プロローグのこの40byteはそれとは別物である。
+ * ZA_STACK_SHADOW_SPACE(32)が1段の使用量に足されているのも「呼び出しごとの32」の
+ * ことで、この40とは二重計上ではない。
+ *
+ * **どのZA_OFF_*もこの40byteを指していない**(ZA_OFF_ENV_SAVED_HEADはZA_FRAME_EXTRA側の
+ * 0から始まる)。つまり40byteは誰にも読まれず書かれない死んだ領域である。
+ * ただし**8byteだけは整列に要る**: sub rspの総量は8 mod 16でなければならず
+ * (入口のrspは戻り番地で8 mod 16、push rbx/push r13で元に戻る)、ZA_FRAME_EXTRAは
+ * 16の倍数なので、その8を出しているのはこの40である。**外せるのは32。**
+ * 死んでいる領域の全量(376byte)はdocuments/jit-frame-survey.md §9。 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
 
 /* ===== [可用性] スタック残量の検査(issue #110) ==================================
@@ -7093,8 +7123,11 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
 
     UINT64 cons_entry_offset = g_jit_used;
 
-    // プロローグ: rbx/r13を退避し、MS x64呼び出し規約のシャドウスペース+拡張3用の
-    // フレーム(env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
+    // プロローグ: rbx/r13を退避し、ZA_FRAME_TOTAL(上端40byte+拡張3以降用の
+    // env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
+    // [2026-10-30 訂正・原則12] ここは「MS x64呼び出し規約のシャドウスペース+…」と
+    // 書かれていたが、シャドウスペースは呼び出しごとにjit_call_r11()が確保している。
+    // 上端40byteの正体はZA_FRAME_TOTALの定義のコメントを見ること。
     za_emit_stack_guard();   /* [可用性] sub rsp より前。issue #110 */
     jit_push_rbx();
     jit_push_r13();
