@@ -119,7 +119,17 @@ PR #71 で `za_try_compile_defun` が body 2 式以上を `(progn . body)` で�
 
 ### 3-1 構文
 
-**`type` キーワード付きの形のみ。**
+> **【この決定は上書きされた (inline-arith Phase 2)】**
+> 「`type` キーワード付きの形**のみ**」は、**もう成り立っていない。**
+> `(declare (inline +))` / `(declare (notinline +))` が**効くようになった**
+> (`documents/inline-arith.md` §7)。
+> 下の「`type` 以外は黙って読み飛ばす」も、`inline` / `notinline` については
+> 当てはまらない。**それ以外の指定子(`ignore` 等)は読み飛ばしのまま。**
+>
+> 当時の「後から `inline` 等を足しやすい」という見立ては当たっていた。
+> **足したので、記述を上書きする。**
+
+**`type` キーワード付きの形のみ。**(← `inline` / `notinline` が追加された)
 
 ```lisp
 (declare (type <fixnum> x y))

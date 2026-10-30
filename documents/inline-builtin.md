@@ -294,3 +294,28 @@ tick は 10ms 単位。
   オーバーフロー検査(`jo`)とタグ操作が加わるため
 - **速度は測ってから決めること。** 本 Phase では `null` の展開が最初 11% 遅く、
   `cmov` へ変えて −30% に逆転した。**展開すれば速くなるとは限らない**
+
+---
+
+## 追記 (inline-arith Phase 2): **`declare` でも効くようになった**
+
+本 Phase では `declaim` だけが `inline` 指定の入口だったが、
+算術のインライン化(`documents/inline-arith.md` §7)で
+**`za_inline_enabled` がレキシカルスコープを見るようになった副産物として、
+`car` / `cdr` / `null` / `eq` も `(declare (inline car))` で展開されるようになった。**
+
+```lisp
+(defun f (x) (declare (inline car)) (car x))   ; 展開される(以前は展開されなかった)
+```
+
+**意図して作ったものではないが、いま動く。** 依存されてから
+「あれは副産物でした」とは言えないので、**仕様として扱い、テストを持たせた**
+(`test/lisp/inline_decl_test.lisp` の「既存の car/cdr/null/eq が壊れていないこと」)。
+
+- `declaim` / `declare` のどちらでも展開される
+- `declare` は**そのフォームの内側だけ**。`let` の本体に書けば本体だけ
+- `let` の**初期化式には効かない**
+- `notinline` で打ち消せる(内側が優先)
+
+`%%INLINE-OF` は関数単位、`%%INLINE-HERE` はフォーム単位で現在値を返す。
+
