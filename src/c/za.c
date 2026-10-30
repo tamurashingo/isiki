@@ -211,6 +211,18 @@ static void jit_emit32(UINT32 v) {
 /** g_jit_code と同じ添字で「このバイトはアドレス即値の一部か」を持つ */
 static UINT8 g_jit_dump_addr_mask[JIT_CODE_SIZE];
 
+/* 同じ添字で「このバイトは **rsp 相対変位(disp32)** の一部か」を持つ。
+ *
+ * **なぜ要るか**: フレーム内の領域を並べ替えると、命令数もバイト長も変わらないが
+ * **変位の値は変わる**(これは並べ替えの定義そのもの)。だから素のハッシュは
+ * 全関数で必ず不一致になり、「並べ替えだけで他は何も変わっていない」ことを
+ * ハッシュの一致では示せない。
+ *
+ * 変位を伏せたハッシュなら、**並べ替えでは一致し、それ以外の変更では落ちる**。
+ * 位置の判定は値ではなく**出力した場所**で行う(jit_emit_rsp_disp32 が印をつける)。
+ * フレーム内の番地参照は例外なくこの 1 つの出口を通るので、これで漏れない。 */
+static UINT8 g_jit_dump_disp_mask[JIT_CODE_SIZE];
+
 static int jit_dump_value_is_address(UINT64 v) {
     UINT64 untagged = v & ~(UINT64)TAG_MASK;
     return untagged >= JIT_DUMP_ADDR_FLOOR && untagged < JIT_DUMP_ADDR_CEILING;
@@ -559,7 +571,16 @@ static void jit_emit_rsp_disp32(UINT8 opcode, UINT8 reg, INT32 disp32) {
     jit_emit8(opcode);
     jit_emit8((UINT8)(0x80 | ((reg & 7) << 3) | 0x04));
     jit_emit8(0x24);
+#ifdef ISIKIOS_JIT_DUMP
+    UINT64 disp_start = g_jit_used;
+#endif
     jit_emit32((UINT32)disp32);
+#ifdef ISIKIOS_JIT_DUMP
+    /* 並べ替えで値だけが変わる 4 byte。伏せたハッシュのために印をつける */
+    for (UINT64 i = disp_start; i < g_jit_used && i < JIT_CODE_SIZE; i++) {
+        g_jit_dump_disp_mask[i] = 1;
+    }
+#endif
 }
 
 static void jit_lea_reg_rsp(UINT8 reg, INT32 disp32) { jit_emit_rsp_disp32(0x8D, reg, disp32); }
@@ -1777,6 +1798,20 @@ static UINT64 g_za_block_level_mask = 0;
  * 16の倍数なので、その8を出しているのはこの40である。**外せるのは32。**
  * 死んでいる領域の全量(376byte)はdocuments/jit-frame-survey.md §9。 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
+
+/* [案 d] **総量は 16 で割って 8 余らなければならない。**
+ * 入口の rsp は戻り番地で 8 mod 16 で、push rbx / push r13 で元に戻るので、
+ * sub rsp の総量が 8 mod 16 のときだけ呼び出し規約の整列が保たれる。
+ * 2026-10-30 まで**これはコメントにしか書かれていなかった**(歯止めが無かった)。
+ * 領域を並べ替えるとき・足すとき・**関数ごとの実寸にするとき**に崩れるので、
+ * ビルド時の検査にする。
+ *
+ * **陽性対照の取り方**: どれかの領域の大きさを 8 だけ変えてビルドすると、
+ * ここでコンパイルが止まる(2026-10-30 に確認)。 */
+_Static_assert((ZA_FRAME_TOTAL % 16) == 8,
+               "ZA_FRAME_TOTAL must be 8 mod 16 (see the comment above)");
+_Static_assert((ZA_FRAME_EXTRA % 16) == 0,
+               "ZA_FRAME_EXTRA must be a multiple of 16 (the 8 comes from the top 0x28)");
 
 /* ===== [可用性] スタック残量の検査(issue #110) ==================================
  *
@@ -7405,11 +7440,19 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     {
         UINT64 h = 1469598103934665603ULL;   /* FNV-1a 64bit */
         UINT64 masked = 0;
+        /* 変位も伏せた 2 本目のハッシュ。**並べ替えでは一致し、それ以外では落ちる** */
+        UINT64 hd = 1469598103934665603ULL;
+        UINT64 dispbytes = 0;
         for (UINT64 i = 0; i < code_len; i++) {
-            UINT8 byte = g_jit_dump_addr_mask[entry + i] ? (UINT8)0xAA : dest_bytes[i];
-            if (g_jit_dump_addr_mask[entry + i]) { masked++; }
+            int is_addr = g_jit_dump_addr_mask[entry + i];
+            int is_disp = g_jit_dump_disp_mask[entry + i];
+            UINT8 byte = is_addr ? (UINT8)0xAA : dest_bytes[i];
+            if (is_addr) { masked++; }
+            if (is_disp) { dispbytes++; }
             h ^= (UINT64)byte;
             h *= 1099511628211ULL;
+            hd ^= (UINT64)(is_disp ? (UINT8)0xDD : byte);
+            hd *= 1099511628211ULL;
         }
         os_diag_serial_write("[JITDUMP] size=");
         {
@@ -7437,10 +7480,29 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
             hex[o] = '\0';
             os_diag_serial_write(hex);
         }
+        os_diag_serial_write(" dispbytes=");
+        {
+            char buf[24]; int o = 0; UINT64 v = dispbytes;
+            if (v == 0) { buf[o++] = '0'; }
+            while (v > 0 && o < 23) { buf[o++] = (char)('0' + (v % 10)); v /= 10; }
+            char rev[25]; int r = 0; while (o > 0) { rev[r++] = buf[--o]; } rev[r] = '\0';
+            os_diag_serial_write(rev);
+        }
+        os_diag_serial_write(" disphash=");
+        {
+            char hex[17]; int o = 0;
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                UINT64 nib = (hd >> shift) & 0xF;
+                hex[o++] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+            }
+            hex[o] = '\0';
+            os_diag_serial_write(hex);
+        }
         os_diag_serial_write("\n");
         /* 次のコンパイルへマスクを持ち越さない */
         for (UINT64 i = entry; i < entry + code_len && i < JIT_CODE_SIZE; i++) {
             g_jit_dump_addr_mask[i] = 0;
+            g_jit_dump_disp_mask[i] = 0;
         }
     }
 #endif
