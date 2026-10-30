@@ -40,9 +40,18 @@
 #   BENCH_CASES    測るカテゴリ(既定 6 カテゴリ)
 #   BENCH_PATHS    測る経路(既定 "aot jit")
 #   BENCH_REPEAT   同じ測定を何回繰り返すか(既定 3)
-#   BENCH_ESTIMATOR  記録に使う推定量(min3 / median3 / minend3。既定 min3)
-#                  **どれを使っても 3 つとも出力に出る。**推定量を変えたら
+#   BENCH_ESTIMATOR  記録に使う推定量。**既定 median。**
+#                  名前は slope-of-medians / median / min-slope / slope-of-mins /
+#                  slope-of-maxes の 5 種(check_bench_baseline.py の ESTIMATOR_NAMES)。
+#                  **どれを使っても 5 つとも出力に出る。**推定量を変えたら
 #                  記録値は全部無効になる(documents/performance-measurement.md)
+#                  [2026-10-30 訂正・原則12] ここは「min3 / median3 / minend3。既定 min3」
+#                  と書いていた。**名前も既定も実体と違っていた。** min3 にしたのは
+#                  2026-10-02 の一時の判断で、同日「推定量を校正点で決めた」節で
+#                  median へ戻している(min 系は校正点を外す: N=10,000,000 で
+#                  真値 4.000 に対して 2.44)。実体は 3 箇所とも median:
+#                  この下の ESTIMATOR の既定値、check_bench_baseline.py の
+#                  --estimator の既定、bench_baseline.tsv の estimator 列(全行)。
 #   BENCH_EVAL_TOL os_eval の傾きの許容値(既定 0.5 命令/反復)
 #   BENCH_NO_CHECK 1 にすると記録値との照合(検出器)を省く
 #   BENCH_NO_EVAL_GATE 1 にすると os_eval のゲートを省く(**陽性対照専用**)
