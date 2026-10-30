@@ -41,13 +41,27 @@
           (setq i (+ i 1))))
       found)))
 
+;; **この検出器が見ているのは `%jit-frame-probe` の寸法である**(2026-10-30 に明記)。
+;; いまは全関数が同じ寸法なので「どの関数か」は意味を持たないが、
+;; **フレームを実寸にすると関数ごとに違う値になる**ので、題材が何かが効いてくる。
+;;   %jit-frame-probe  … let を使う葉。まれな領域(quasiquote / flet)を使わない = **小さい側**
+;;   %jit-frame-qq     … quasiquote を使う = まれな領域を取る **大きい側**
 (defun %jit-frame-probe (n) (let ((a n)) (+ a 1)))
 (assert-equal t (%%za-compiled-p (function %jit-frame-probe)))
+(defun %jit-frame-qq (n) `(a ,n))
+(assert-equal t (%%za-compiled-p (function %jit-frame-qq)))
 
 (defglobal jit-frame-size (%jit-frame-size (function %jit-frame-probe)))
-(format *isiki-test-stream* "#jit-frame ZA_FRAME_TOTAL=~D  256KB で ~D 段~%"
-        jit-frame-size (div 262144 jit-frame-size))
+(defglobal jit-frame-size-qq (%jit-frame-size (function %jit-frame-qq)))
+(format *isiki-test-stream* "#jit-frame probe=~D qq=~D  256KB で ~D 段~%"
+        jit-frame-size jit-frame-size-qq (div 262144 jit-frame-size))
 (finish-output *isiki-test-stream*)
+
+;; **大きい側が小さい側より小さくなることはない。** これは実寸化の前後どちらでも成り立つ
+;; 関係なので、行番号や絶対値と違って**段を越えて生き残る**:
+;;   実寸化の前 … 全関数が同じ寸法なので等しい
+;;   実寸化の後 … qq を使う関数だけがまれな領域を取るので大きい
+(assert-equal t (if (>= jit-frame-size-qq jit-frame-size) t nil))
 
 ;;; --- 記録値(2026-10-04、f19b434 + PR #118)---
 ;; ZA_FRAME_TOTAL = 7480 byte。内訳は tools/jit_frame_breakdown.py が出す。
