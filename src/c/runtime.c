@@ -6739,7 +6739,46 @@ lisp_val_t primitive_add2_single(lisp_val_t a, lisp_val_t b) {
                                         (double)os_single_float_value(b)));
 }
 
+/* ===== [改善 A の直し] 常道をインラインで先に捌く(2026-10-30) ====================
+ *
+ * **-O1 では「呼ばれる場所が 2 つ以上ある小さな static 関数は展開されない」。**
+ * 改善 A(ac3dc54)が fixnum の高速路を fixnum_add_signed へ切り出したので、
+ * fixnum どうしの常道でも**本物の呼び出し**になっていた。逆アセンブルで確認した現状:
+ *
+ *     push %rdi; push %rsi; push %rbx; sub $0x60,%rsp; movups %xmm6,0x50(%rsp)
+ *     ... ; lea 0x48(%rsp),%r8 ; call fixnum_add_signed
+ *
+ * **常道が重いプロローグ(0x60 のスタックと xmm6 の退避)まで払っていた。**
+ *
+ * 直し: **JIT が出している列と同じ条件**をここにも置く(za.c の
+ * za_emit_arith_call_or_inline を参照。条件も桁あふれの判定も同じ)。
+ *   両方が非負 fixnum  <=>  (a|b) & (TAG_MASK|FIXNUM_SIGN_BIT) == 0
+ *   加算の桁あふれ      <=>  和の bit63(FIXNUM_SIGN_BIT)が立つ
+ *   減算が負になる      <=>  符号無し比較で a < b
+ *
+ * **-0 は作らない**(どちらも非負で結果も非負)。符号マグニチュード表現の
+ * 不変条件(負のゼロは存在しない)を壊さない。
+ *
+ * 冷たい経路は別関数(*_slow)に出す。**こうしないと -O1 は常道にもプロローグを
+ * 出してしまう**(フレームが要るのは冷たい側だけなのに)。 */
+/* **noinline が要る。** -O1 は「呼ばれる場所が 1 箇所だけの static 関数」は
+   逆に展開してしまい、冷たい側のフレーム要求が常道にも掛かる
+   (実測: 展開されるとプロローグが 0x60 -> 0x70 に増えた)。
+   cold は分岐予測とコード配置のため。 */
+static lisp_val_t primitive_add2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
+    if (((a | b) & (TAG_MASK | FIXNUM_SIGN_BIT)) == 0) {
+        lisp_val_t sum = a + b;
+        if ((sum & FIXNUM_SIGN_BIT) == 0) {
+            return sum;
+        }
+    }
+    return primitive_add2_slow(a, b);
+}
+
+static lisp_val_t primitive_add2_slow(lisp_val_t a, lisp_val_t b) {
     lisp_val_t sum;
     if (fixnum_add_signed(a, b, &sum)) {
         return sum;
@@ -6827,7 +6866,23 @@ lisp_val_t primitive_subtract2_single(lisp_val_t a, lisp_val_t b) {
                                         (double)os_single_float_value(b)));
 }
 
+/* [改善 A の直し] add2 と同じ。条件は JIT の列と同じで、
+   非負どうしなら `a < b`(符号無し比較)でなければ素の減算で正しいタグ付き結果になる。 */
+/* **noinline が要る。** -O1 は「呼ばれる場所が 1 箇所だけの static 関数」は
+   逆に展開してしまい、冷たい側のフレーム要求が常道にも掛かる
+   (実測: 展開されるとプロローグが 0x60 -> 0x70 に増えた)。
+   cold は分岐予測とコード配置のため。 */
+static lisp_val_t primitive_subtract2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
+    if (((a | b) & (TAG_MASK | FIXNUM_SIGN_BIT)) == 0 && a >= b) {
+        return a - b;
+    }
+    return primitive_subtract2_slow(a, b);
+}
+
+static lisp_val_t primitive_subtract2_slow(lisp_val_t a, lisp_val_t b) {
     lisp_val_t diff;
     if ((b & TAG_MASK) == TAG_FIXNUM && fixnum_add_signed(a, fixnum_negate(b), &diff)) {
         return diff;

@@ -36,6 +36,45 @@
 #   c / aot の全行     run_construct_bench.sh(10 カテゴリ、3 回)
 #   jit の全行         run_jit_bench.sh(6 カテゴリ、3 回)
 #
+# 取り直しの記録(2026-10-31、規則 16): **aot の 10 行すべてを取り直した**
+#
+#   きっかけ … 改善 A の直し(3547edb。算術の常道をインラインで先に捌く)
+#   鳴った行 … **aot の 10 行すべて**(「速くなった」側で検出器が落ちた)
+#   推定量   … median、3 回、N=1,000,000、ドライバは run_construct_bench.sh
+#   ビルドの印 … 既定(GC_DEBUG / ALIGN_AUDIT / JIT_DUMP / EXTRA_CFLAGS なし)
+#
+#   | case | 旧 | 新 | 差 |
+#   |---|---:|---:|---:|
+#   | loop | 167.96 | 117.56 | -50.40 |
+#   | arith | 236.92 | 139.68 | -97.24 |
+#   | tailrec | 369.28 | 253.33 | -115.95 |
+#   | nontailrec | 368.33 | 248.10 | -120.23 |
+#   | branch | 717.00 | 577.22 | -139.78 |
+#   | let | 605.16 | 311.68 | -293.48 |
+#   | cons | 389.89 | 291.76 | -98.13 |
+#   | for | 270.51 | 159.20 | -111.31 |
+#   | vector | 662.40 | 465.31 | -197.09 |
+#   | funcall | 295.41 | 199.30 | -96.11 |
+#
+#   **測る前の宣言(規則 16)は外れた。** aot/arith と aot/loop の 2 行だけが
+#   -18〜-35 動くと宣言したが、**10 行すべてが動き、幅も 3〜10 倍大きかった**
+#   (documents/performance-measurement.md「改善 A の直し」の節に宣言と実測を併記した)。
+#
+#   **別の形の証拠で支えた**(§5-5)。各行の改善量を「1 単位あたりの算術の回数」で
+#   割ると **1 算術あたり約 47〜49 命令**で揃う:
+#     let 6 回 -> -49.0 / arith 2 回 -> -49.3 / loop 1 回 -> -46.8 / funcall 2 回 -> -48.2
+#   逆アセンブルの内訳(旧 ≈ 49 命令 -> 新 7 命令)とも一致する。
+#
+#   **対照群**: c の 10 行(素の C 実装。ランタイムを通らない)は **±0.19 以内で不変**。
+#   jit の 6 行(生成コードが常にインライン)も **±1.22 以内で不変**。
+#   **3 つの群が機序どおりに分かれている。**
+#
+#   校正点 c/for = 4.000 は許容範囲内(C ランタイムを触ったが崩れていない)。
+#
+#   issue #114 は「loop/arith が +68% 悪化」と報告していたが、**実際の退行は
+#   もっと広く、aot の 10 行すべてに及んでいた**。当時その 2 行しか追跡して
+#   いなかったので 2 行として見えていただけである。
+#
 # **N がなぜ経路で違うのか:**
 #   1 ブートあたり 11〜31M 命令のぶれがある。ゲストの状態(GC 回数・ヒープ・
 #   Immobilized・tick・計算結果)はビット単位で同一なので、**ホストの応答時間に
@@ -130,16 +169,16 @@ c	cons	insns-per-unit	median	3	81.61	0.50	10000000	bbd6915	2026-10-02
 c	for	insns-per-unit	median	3	4.00	0.50	200000000	bbd6915	2026-10-02
 c	vector	insns-per-unit	median	3	17.02	0.50	200000000	bbd6915	2026-10-02
 c	funcall	insns-per-unit	median	3	7.00	0.50	200000000	bbd6915	2026-10-02
-aot	loop	insns-per-unit	median	3	167.96	20.00	1000000	bbd6915	2026-10-02
-aot	arith	insns-per-unit	median	3	236.92	20.00	1000000	bbd6915	2026-10-02
-aot	tailrec	insns-per-unit	median	3	369.28	20.00	1000000	bbd6915	2026-10-02
-aot	nontailrec	insns-per-unit	median	3	368.33	20.00	1000000	bbd6915	2026-10-02
-aot	branch	insns-per-unit	median	3	717.00	20.00	1000000	bbd6915	2026-10-02
-aot	let	insns-per-unit	median	3	605.16	20.00	1000000	bbd6915	2026-10-02
-aot	cons	insns-per-unit	median	3	389.89	20.00	1000000	bbd6915	2026-10-02
-aot	for	insns-per-unit	median	3	270.51	20.00	1000000	bbd6915	2026-10-02
-aot	vector	insns-per-unit	median	3	662.40	20.00	1000000	bbd6915	2026-10-02
-aot	funcall	insns-per-unit	median	3	295.41	20.00	1000000	bbd6915	2026-10-02
+aot	loop	insns-per-unit	median	3	117.56	20.00	1000000	3547edb	2026-10-31
+aot	arith	insns-per-unit	median	3	139.68	20.00	1000000	3547edb	2026-10-31
+aot	tailrec	insns-per-unit	median	3	253.33	20.00	1000000	3547edb	2026-10-31
+aot	nontailrec	insns-per-unit	median	3	248.10	20.00	1000000	3547edb	2026-10-31
+aot	branch	insns-per-unit	median	3	577.22	20.00	1000000	3547edb	2026-10-31
+aot	let	insns-per-unit	median	3	311.68	20.00	1000000	3547edb	2026-10-31
+aot	cons	insns-per-unit	median	3	291.76	20.00	1000000	3547edb	2026-10-31
+aot	for	insns-per-unit	median	3	159.20	20.00	1000000	3547edb	2026-10-31
+aot	vector	insns-per-unit	median	3	465.31	20.00	1000000	3547edb	2026-10-31
+aot	funcall	insns-per-unit	median	3	199.30	20.00	1000000	3547edb	2026-10-31
 jit	loop	insns-per-unit	median	3	146.87	20.00	1000000	85c4e72+for移植	2026-10-04
 jit	arith	insns-per-unit	median	3	175.37	20.00	1000000	85c4e72+for移植	2026-10-04
 jit	tailrec	insns-per-unit	median	3	399.27	20.00	1000000	7dbacc7	2026-10-07
