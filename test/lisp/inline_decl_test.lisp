@@ -273,3 +273,56 @@
   (+ x y))
 (assert-equal 871 (%%disasm-code-len 'idt-add-sgl-inline))
 (assert-equal t (idt-callee-p 'idt-add-sgl-inline "primitive_add2_single"))
+
+;;; === safety 0 でタグ検査だけが外れること(M6、2026-10-31) ===================
+;;
+;; **分類 1(タグ検査)だけを外す。** 空リスト判定・桁あふれ検査・ゼロ除算検査・
+;; 資源の検査・引数個数の検査は外さない(documents/declaim-design.md の 4 分類と
+;; 2026-10-30 の判断)。
+;;
+;; **嘘の宣言を safety 0 で試してはいけない。** car の無検査経路は
+;; `and rax,~7` してから `[rax+off]` を読むので、cons でない値を渡すと
+;; **番地 40 のような無効な番地を読み、#PF で機械が止まる**(freestanding で
+;; ハンドラが無い)。**外から見ると QEMU の無反応と区別が付かない。**
+;; したがってここで確かめるのは
+;;   (1) 正しい値に対して正しく動くこと(nil を含む)
+;;   (2) 命令列からタグ検査が消えること(長さで見る)
+;;   (3) safety を戻すと検査が戻ること
+;; の 3 つである。**嘘の宣言は監査ビルドで捕まえる**(D6: 監査ビルドでは
+;; インライン展開を抑止するので、必ず型特化関数が呼ばれて既存の監査が効く)。
+
+(declaim (optimize (safety 1)))
+(declaim (inline car))
+(defun sft-car-safe (x) (car x))
+(declaim (optimize (safety 0)))
+(defun sft-car-unsafe (x) (car x))
+(declaim (optimize (safety 1)))
+(defun sft-car-safe2 (x) (car x))
+
+(assert-equal t (%%za-compiled-p (function sft-car-safe)))
+(assert-equal t (%%za-compiled-p (function sft-car-unsafe)))
+(assert-equal t (%%za-compiled-p (function sft-car-safe2)))
+
+;; (1) 正しい値では同じ結果
+(assert-equal 1 (sft-car-safe (quote (1 2))))
+(assert-equal 1 (sft-car-unsafe (quote (1 2))))
+(assert-equal 1 (sft-car-safe2 (quote (1 2))))
+
+;; (2) **safety 0 の側だけ短い。** 外れるのはタグ検査の 4 命令
+;;     (mov r10,rax / and r10,TAG_MASK / cmp r10,TAG_CONS / jne)。
+;;     落ちたときにやること: %%DISASM-* で生成コードを見て、タグ検査が本当に
+;;     消えているかを確かめる(消えていないなら za_safety_checks_enabled が
+;;     safety を読めていない)
+(assert-equal t (if (< (%%disasm-code-len (quote sft-car-unsafe))
+                       (%%disasm-code-len (quote sft-car-safe))) t nil))
+
+;; (3) **safety を戻すと検査が戻る。** 同じ宣言の 2 つは同じ長さ
+(assert-equal (%%disasm-code-len (quote sft-car-safe))
+              (%%disasm-code-len (quote sft-car-safe2)))
+
+;; safety の値そのものが届いていること(無検査経路に入る前提の確認)
+(declaim (optimize (safety 0)))
+(assert-equal (quote (1 0 1)) (%%current-optimize))
+(declaim (optimize (safety 1)))
+(assert-equal (quote (1 1 1)) (%%current-optimize))
+(declaim (notinline car))

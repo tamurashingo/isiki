@@ -2932,7 +2932,29 @@ static void za_inline_scope_restore(UINT64 *saved) {
 }
 
 static int za_inline_enabled(UINT64 bit) {
+#ifdef ISIKIOS_DECLARE_AUDIT
+    /* [D6] **監査ビルドでは展開しない。**
+       既存の監査(DECLARE_AUDIT_FIXNUM 等)は**型特化した C 関数の入口**で値を見る。
+       インライン展開は呼び出しを消すので、**safety 0 で壊れるまさにその場合だけ
+       監査が何も見なくなる**。展開を抑止すれば必ず関数が呼ばれ、監査がそのまま効く。
+       代償: 監査ビルドの生成コードは本番と違う。**だから監査ビルドで性能を測らない。**
+       documents/declaim-design.md「D6 / D7 の決定」 */
+    (void)bit;
+    return 0;
+#else
     return (g_za_inline_scope & bit) != 0;
+#endif
+}
+
+/** [D5] safety 0 で外してよいのは**分類 1(タグ検査)だけ**である。
+ *
+ * 外さないもの: 桁あふれ検査(符号マグニチュードなので -0 ができる)、
+ * ゼロ除算検査(#DE で機械が止まる)、資源の検査(静かにハングに戻る)、
+ * **引数個数の検査**(4 分類に席の無い契約の検査。2026-10-30 の判断で対象外)、
+ * **要素取り出しの空リスト判定**(外すと「誤りを知らせる」が「空リストを返す」に
+ * 静かに変わる)。documents/declaim-design.md「safety で外してよい検査」 */
+static int za_safety_checks_enabled(void) {
+    return OPTIMIZE_SAFETY(g_za_declaim) != 0;
 }
 
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
@@ -3540,10 +3562,23 @@ static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * @param wrapper_fn 判定を外れたときに呼ぶos_car_checked/os_cdr_checked
  */
 static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn) {
-    jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RAX);
-    jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
-    jit_cmp_reg_imm8(ZA_REG_R10, (UINT8)TAG_CONS);
-    UINT64 not_cons = jit_emit_jne_rel32_placeholder();
+    /* [safety] **分類 1(タグ検査)は safety 0 で外す。** 4 命令消える。
+     *
+     * **空リスト判定は外さない**(下の cmp/je)。外すと「誤りを知らせる」が
+     * 「空リストを返す」に静かに変わるので、仕様が黙って変わってしまう。
+     *
+     * **外したときの壊れ方**: cons でない値が来ると and rax,~7 してから
+     * [rax + off] を読むので、**fixnum 42 なら番地 40 を読む = #PF で機械が止まる**。
+     * 「ゴミを読む」で済まないことがある(documents/declaim-design.md の D7)。
+     * 宣言した人の責任である(safety 0 は仕様違反モード)。 */
+    UINT64 not_cons = 0;
+    int emit_tag_check = za_safety_checks_enabled();
+    if (emit_tag_check) {
+        jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RAX);
+        jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
+        jit_cmp_reg_imm8(ZA_REG_R10, (UINT8)TAG_CONS);
+        not_cons = jit_emit_jne_rel32_placeholder();
+    }
 
     za_emit_cmp_rax_nil();
     UINT64 is_nil = jit_emit_je_rel32_placeholder();
@@ -3552,7 +3587,9 @@ static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn) {
     jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RAX, cdr_offset);
     UINT64 done = jit_emit_jmp_rel32_placeholder();
 
-    jit_patch_rel32(not_cons);
+    if (emit_tag_check) {
+        jit_patch_rel32(not_cons);
+    }
     jit_patch_rel32(is_nil);
     jit_mov_rcx_rax();
     za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);

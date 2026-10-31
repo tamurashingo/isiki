@@ -196,7 +196,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -455,6 +455,16 @@ jit-reorder-check:
 
 jit-reorder-self-test:
 	@python3 tools/check_jit_dump_reorder.py --self-test
+
+# [D6] 監査ビルド(ISIKIOS_DECLARE_AUDIT)で**インライン展開が抑止されていること**を見る。
+# 既存の監査は型特化した C 関数の入口で値を見るので、展開して呼び出しが消えると
+# **safety 0 で壊れるまさにその場合だけ監査が何も見なくなる**。
+# 抑止を誰も見ていなければ D6 は守られているか分からないので、専用の口を置く。
+# **別ビルドになる**(ビルドの印が変わるので作り直しが走る)。
+.PHONY: test-qemu-declare-audit
+test-qemu-declare-audit:
+	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_DECLARE_AUDIT \
+	  MILESTONE=test/lisp/qemu_boot_declare_audit.lisp
 
 # [案 d 第 3 段] フレーム内の番地参照が **3 入口だけ**を通っていることの検査。
 # 寸法は jit_emit_rsp_disp32 で数えた最高水位で決まるので、**3 入口を迂回されると
