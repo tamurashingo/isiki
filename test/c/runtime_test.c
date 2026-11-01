@@ -9,6 +9,8 @@
 #include "lisp.h"
 #include "process.h"
 #include "reader.h"
+/* [可用性/#110] 枯渇の印を見るのは os_eval の入口なので、評価器の宣言が要る */
+#include "eval.h"
 
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
@@ -2689,6 +2691,258 @@ void test_scan_declarations_terminates_on_nil() {
            "空のdeclareと変数無しのtypeも読み飛ばせる");
 }
 
+// ===========================================================================
+// [可用性/#110] ヒープ枯渇が**ハングではなく <storage-exhausted>** になる
+// (M8-T5/T6。設計は documents/heap-exhaustion.md、実装の註は runtime.c)
+// ===========================================================================
+//
+// **ここは「本物の枯渇」を起こす側の試験である。** ゲスト(QEMU)側は
+// test/lisp/heap_exhaustion_test.lisp が 3 経路(インタプリタ / AOT / JIT)から
+// 大口の要求を出す。2 つの手段の役割分担:
+//
+//   | 手段 | ここで見るもの |
+//   |---|---|
+//   | ネイティブ(このファイル) | 小口の枯渇 = 印 / 予備の開閉 / 重ねない / エラー値 |
+//   | ゲスト(lisp 側) | 大口の枯渇 = 3 経路から <storage-exhausted> が signal される |
+//
+// **条件システム(init.lisp)はネイティブのユニットテストには無い。** だから
+// os_signal_condition は g_sym_eval_error を返す。これは欠陥ではなく
+// 「最後はエラー値へ落ちる」という設計のいちばん外側の挙動そのものなので、
+// ここで固定する(ハングしないこと・値が返ること)。
+//
+// [枯渇専用のヒープを別に持つ理由]
+// **SMALL_HEAP_SIZE のつまみを共有してはいけない。** あちらは os_bootstrap の
+// 恒久消費ぎりぎり(通る窓が 5KB 未満)に調整されており、組み込みを 1 つ足すだけで
+// ハングする。こちらの要件は逆で「予備領域(定数 ~68KB)が半空間に収まる」ことなので、
+// 大きいほうが都合がよい。**同じ名前を使うと、片方の要件でもう片方が壊れる。**
+/* 枯渇テスト専用のヒープの大きさ(byte)。Makefile の HEAP_EXHAUSTION_SIZE= から
+   -DHEAP_EXHAUSTION_HEAP_SIZE=... として上書きできる(掃引のため)。
+   **4MB にしてあるのは、予備領域が丸ごと入る構成でなければ検査自体が無効になる**
+   ためである(runtime.c の heap_update_soft_end: 予備が半空間の 1/8 を超える構成では
+   予備 0 = 従来どおりその場で panic。1MB だと半空間 512KB で 1/8 = 64KB < 予備 ~68KB
+   なので**無効側に入り、この試験は何も検出しなくなる**)。
+   下の「予備領域が実在すること」の判定がその番犬である */
+#ifndef HEAP_EXHAUSTION_HEAP_SIZE
+#define HEAP_EXHAUSTION_HEAP_SIZE (4 * 1024 * 1024)
+#endif
+
+static void setup_exhaustion_heap(void) {
+    void *heap = malloc(HEAP_EXHAUSTION_HEAP_SIZE);
+    assert(heap != NULL, "枯渇テスト用のヒープをmallocで確保できる");
+    os_heap_init((UINT64)heap, HEAP_EXHAUSTION_HEAP_SIZE);
+    os_reset_runtime_state_for_test();
+    os_bootstrap();
+}
+
+void test_heap_exhaustion_marks_and_signals_at_eval_entry() {
+    setup_exhaustion_heap();
+
+    assert(os_heap_guard_hits() == 0, "起動直後は枯渇を一度も知らせていない");
+    assert(os_heap_exhaustion_pending() == 0, "起動直後は枯渇の印が立っていない");
+    /* 予備領域が実在すること。**ここが 0 だと以降の試験は何も検出しない**
+       (柔らかい端 == 床 == 真の端 になり、従来どおり panic するだけになる) */
+    /* **この判定は番犬である。** 予備領域が丸ごと入らない構成では検査ごと無効になる
+       (runtime.c の heap_update_soft_end)。無効な構成でこの先へ進むと、下の
+       「埋める」ループが**印を立てられないまま床まで埋め切って os_panic へ入り、
+       ユニットテストでは hlt が無いので NG ではなくハングになる**。
+       実際に踏んだ: 陽性対照 -DHEAP_SIGNAL_RESERVE=0 が exit=124 になり、
+       出力はバッファに残ったまま失われた(2026-11-01)。
+       **ハングは NG より切り分けに時間がかかる。** ここで引き返す */
+    int guard_active = os_heap_soft_limit_normal_bytes() < os_heap_floor_limit_bytes();
+    assert(guard_active,
+           "このヒープの大きさでは枯渇の検査が有効である(無効ならこの試験は何も検出しない)");
+    if (!guard_active) {
+        return;
+    }
+    assert(os_heap_soft_limit_bytes() == os_heap_soft_limit_normal_bytes(),
+           "起動直後の常道が比べる相手は通常の柔らかい端である");
+
+    // **生きている**consを積んでいくので、GCでは回収できず必ず枯渇する。
+    // 印が立った時点で止める。止めないと予備を食い潰して床を割り、os_panicへ入る
+    // (ユニットテストのos_panicはhltが無いので、NGではなくハングになる)
+    lisp_val_t live = nil;
+    GC_PROTECT(live);
+    UINT64 gc_before = os_gc_collect_count();
+    int iterations = 0;
+    while (!os_heap_exhaustion_pending() && iterations < 1000000) {
+        live = os_make_cons(os_make_fixnum((UINT64)iterations), live);
+        iterations++;
+    }
+    assert(os_heap_exhaustion_pending() == 1,
+           "生きているconsでヒープを埋めると、確保器が枯渇の印を立てる(panicしない)");
+    /* **印が最初の確保で立っていたら、この試験は何も見ていない。**
+       予備領域の計算が壊れて柔らかい端が先頭付近へ来た場合がそれである */
+    assert(iterations > 1000,
+           "印が立つまでに確保を何度も通っている(初回の確保で立つのは設定が壊れている合図)");
+
+    /* [回収器の最中に signal しないこと]
+       **埋める過程で回収器は必ず走る**(柔らかい端を越えるたびに 1 回)。
+       そのあいだ発火回数が 0 のままであること = **GC の最中に signal していない**。
+       これが観測できる形での保証である。構造の側の保証は
+       「os_alloc_bytes は印を立てるだけで、os_heap_signal_exhausted を呼ばない」で、
+       これは grep で確かめられる(呼び出し元は大口の primitive と os_eval だけ) */
+    assert(os_gc_collect_count() > gc_before,
+           "埋める過程で回収器が実際に走っている(走っていなければ次の判定は空振り)");
+    assert(os_heap_soft_limit_bytes() == os_heap_floor_limit_bytes(),
+           "印が立っているあいだは予備領域が開いている(柔らかい端が床まで下がる)");
+    assert(os_heap_guard_hits() == 0,
+           "確保器は印を立てるだけで、まだ知らせていない(確保器の中ではsignalできない)");
+
+    /* **印を見るのは評価の入口である。** ここが設計の肝で、
+       os_eval を 1 回通すと枯渇が「値として」返ってくる */
+    lisp_val_t r = os_eval(os_make_fixnum(1), global_environment);
+    assert(r == g_sym_eval_error,
+           "枯渇の印が立っているとos_evalは知らせる。条件システムが無い段階ではEVAL-ERRORへ落ちる");
+    assert(os_heap_guard_hits() == 1, "知らせたのは1回だけ");
+    assert(os_heap_exhaustion_pending() == 0, "知らせたら印は消える(同じ枯渇で何度も鳴らない)");
+    assert(os_heap_soft_limit_bytes() == os_heap_soft_limit_normal_bytes(),
+           "知らせ終わったら予備領域は閉じる(次の枯渇のために取っておく)");
+
+    /* 知らせたあとも機械は生きている。**ハングしないことがこの試験の主旨である** */
+    lisp_val_t again = os_eval(os_make_fixnum(1), global_environment);
+    assert(again == os_make_fixnum(1),
+           "知らせたあとの評価は普通に値を返す(印が消えているので素通りする)");
+}
+
+void test_heap_exhaustion_is_detected_before_the_multiply() {
+    setup_exhaustion_heap();
+
+    /* [測り方] **先に 1 回知らせて、signal 経路が使うものを温めておく。**
+       os_make_symbol("<STORAGE-EXHAUSTED>") は初回だけsymbolと名前文字列を確保するので、
+       温めずに測ると「桁あふれの検査が確保した」ように見えてしまう */
+    (void)os_heap_signal_exhausted(global_environment);
+    UINT64 hits_before = os_heap_guard_hits();
+
+    /* 2^32 × 2^32 = 2^64。**巻き上がってちょうど 0 になる次元**である。
+       入れる前の alloc_vector_block は `total *= dims[i]` を素で回していたので、
+       total = 0 として 8*(1+2+0) = 24 byte の塊を確保し、ヘッダに「各次元 2^32」と
+       書き込んでいた。aref/set-aref の範囲検査はそのヘッダを見るので、
+       (set-aref v a 0 0) は**範囲内と判定されたうえで塊の外へ書く。**
+       つまりこれは枯渇ではなく**ヒープの踏み越え**だった。
+       だから判定は掛け算より前(掛けているその場)でなければならない */
+    lisp_val_t dims_overflow_to_zero =
+        os_make_cons(os_make_fixnum(4294967296ULL),
+                     os_make_cons(os_make_fixnum(4294967296ULL), nil));
+    GC_PROTECT(dims_overflow_to_zero);
+    lisp_val_t args_overflow = os_make_cons(dims_overflow_to_zero, nil);
+    GC_PROTECT(args_overflow);
+    UINT64 used_before = os_fixnum_magnitude(primitive_heap_used_bytes(nil, nil));
+    lisp_val_t r1 = primitive_make_array(args_overflow, nil);
+    UINT64 used_after = os_fixnum_magnitude(primitive_heap_used_bytes(nil, nil));
+    assert(r1 == g_sym_eval_error,
+           "2^32×2^32(積が巻き上がって0になる)は枯渇として知らされる");
+    assert(os_heap_guard_hits() == hits_before + 1, "知らせたのは1回");
+    assert(used_after == used_before,
+           "桁あふれの要求はヒープを1byteも進めない(小さい塊を確保してから踏み越えない)");
+
+    /* 巻き上がり先が巨大になる場合。**byte 数が 1.7e19 になるので
+       `p + aligned` のポインタ演算が回り込む。** 差で見ないと「空きがある」と
+       判定されうる(heap_request_fits の註) */
+    lisp_val_t dims_huge =
+        os_make_cons(os_make_fixnum(2000000000ULL),
+                     os_make_cons(os_make_fixnum(2000000000ULL),
+                                  os_make_cons(os_make_fixnum(2000000000ULL), nil)));
+    GC_PROTECT(dims_huge);
+    lisp_val_t r2 = primitive_make_array(os_make_cons(dims_huge, nil), nil);
+    assert(r2 == g_sym_eval_error, "2e9の3乗(積が巻き上がって巨大になる)も枯渇として知らされる");
+
+    /* 巻き上がらないが入らない大きさ。**こちらが本来の「枯渇」である** */
+    lisp_val_t r3 = primitive_create_vector(os_make_cons(os_make_fixnum(100000000000ULL), nil), nil);
+    assert(r3 == g_sym_eval_error, "1e11要素のvectorは枯渇として知らされる");
+    lisp_val_t r4 = primitive_create_string(os_make_cons(os_make_fixnum(100000000000ULL), nil), nil);
+    assert(r4 == g_sym_eval_error, "1e11文字のstringは枯渇として知らされる");
+
+    /* 負の長さ。**fixnumは2の補数ではなく符号+マグニチュードなので、
+       生シフトすると符号ビットが値に混ざって 1e17 規模の非負の長さに見える。**
+       そこまで大きいとポインタ演算が回り込むので、入れる前は
+       「空きがある」と判定されたうえで要素の書き込みが始まりうる状態だった。
+       クラスは <domain-error>(= 引数が非負整数でない)。条件システムが無い
+       この試験では EVAL-ERROR へ落ちるので、見えるのは「値が返る」ことまでである */
+    lisp_val_t r5 = primitive_create_vector(
+        os_make_cons(os_make_fixnum_signed(1, 1), nil), nil);
+    assert(r5 == g_sym_eval_error, "負の長さのcreate-vectorは値を返す(確保に進まない)");
+
+    /* 正常系(変えていないこと)。枯渇の判定を入れても普通の確保は通る */
+    lisp_val_t ok = primitive_create_vector(
+        os_make_cons(os_make_fixnum(3), os_make_cons(os_make_fixnum(7), nil)), nil);
+    GC_PROTECT(ok);
+    lisp_val_t *header = os_vector_header(ok);
+    assert(header[0] == 1 && header[1] == 3, "普通のcreate-vectorはrank1・長さ3のまま");
+    lisp_val_t aref_args = os_make_cons(ok, os_make_cons(os_make_fixnum(2), nil));
+    assert(primitive_aref(aref_args, nil) == os_make_fixnum(7), "初期値も従来どおり入る");
+}
+
+/* ---- 重ねないこと / 予備領域の開閉を、本物の signal 経路で見る ----------------
+ *
+ * **条件システムのフェイクを置く。** os_signal_condition は MAKE-INSTANCE /
+ * SIGNAL-CONDITION / %FIND-CLASS をグローバル環境から引いて呼び戻すので、
+ * そこへネイティブ関数を差し込めば**本物の経路のまま**中へ入れる
+ * (repl_test.c が %REPORT-CONDITION-STRING のフェイクを置いているのと同じ手)。
+ *
+ * フェイクの MAKE-INSTANCE の中で**もう一度** os_heap_signal_exhausted を呼ぶ。
+ * これが「ハンドラの中で大口の確保に失敗した」状況そのものである。 */
+static lisp_val_t g_fake_inner_result = 0;
+static UINT64 g_fake_soft_limit_inside = 0;
+static UINT64 g_fake_hits_inside = 0;
+static int g_fake_make_instance_called = 0;
+
+static lisp_val_t fake_find_class_for_exhaustion(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    /* 非nil・非EVAL-ERRORであればよい(os_signal_conditionはクラスが引けるかだけを見る) */
+    return g_sym_t;
+}
+
+static lisp_val_t fake_make_instance_for_exhaustion(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    g_fake_make_instance_called = 1;
+    /* **知らせている最中である。** ここで予備領域が開いていなければならない */
+    g_fake_soft_limit_inside = os_heap_soft_limit_bytes();
+    g_fake_inner_result = os_heap_signal_exhausted(global_environment);
+    g_fake_hits_inside = os_heap_guard_hits();
+    return g_sym_t;
+}
+
+static lisp_val_t fake_signal_condition_for_exhaustion(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_symbol("FAKE-SIGNALLED");
+}
+
+void test_heap_exhaustion_does_not_nest_while_reporting() {
+    setup_exhaustion_heap();
+
+    os_set_function(os_make_symbol("%FIND-CLASS"),
+                    os_make_native_function((lisp_addr_t)(void *)fake_find_class_for_exhaustion),
+                    global_environment);
+    os_set_function(os_make_symbol("MAKE-INSTANCE"),
+                    os_make_native_function((lisp_addr_t)(void *)fake_make_instance_for_exhaustion),
+                    global_environment);
+    os_set_function(os_make_symbol("SIGNAL-CONDITION"),
+                    os_make_native_function((lisp_addr_t)(void *)fake_signal_condition_for_exhaustion),
+                    global_environment);
+
+    UINT64 floor_limit = os_heap_floor_limit_bytes();
+    UINT64 normal_limit = os_heap_soft_limit_normal_bytes();
+
+    lisp_val_t outer = os_heap_signal_exhausted(global_environment);
+
+    assert(g_fake_make_instance_called == 1, "フェイクの条件システムを通って本物の経路が走った");
+    assert(outer == os_make_symbol("FAKE-SIGNALLED"),
+           "外側のsignalはsignal-conditionの戻り値をそのまま返す");
+    assert(g_fake_soft_limit_inside == floor_limit,
+           "知らせている最中だけ予備領域が開いている(柔らかい端が床まで下がっている)");
+    assert(g_fake_inner_result == g_sym_eval_error,
+           "知らせている最中の枯渇はsignalを重ねずEVAL-ERRORを返す(重ねると予備を食い潰す)");
+    assert(g_fake_hits_inside == 2, "重ねなかった回も発火回数には数える(0は「守られていない」の合図なので)");
+    assert(os_heap_soft_limit_bytes() == normal_limit, "抜けたら予備領域は閉じる");
+    assert(os_heap_exhaustion_pending() == 0, "印は残らない");
+
+    /* [計器] 予備領域の見積り(★)を実測へ直すための値。**この試験のフェイクは
+       ほとんど確保しないので小さい値しか出ない。** 本物の値はゲスト側で出る。
+       ここで見るのは「予備領域を超えていないこと」= 予備が足りているかの向きだけ */
+    assert(os_heap_signal_path_bytes() < os_heap_floor_limit_bytes() - os_heap_soft_limit_normal_bytes(),
+           "signal経路が確保した量は予備領域に収まっている(超えたら予備が足りていない)");
+}
+
 int main(int argc, char** argv) {
    (void)argc;
    (void)argv;
@@ -2817,6 +3071,12 @@ int main(int argc, char** argv) {
    test_gc_fires_during_gcd_and_isqrt_and_results_are_correct();
    test_gc_fires_during_vector_construction_and_elements_are_preserved();
    test_gc_fires_during_string_append_and_result_is_correct();
+
+   /* [可用性/#110] 枯渇が <storage-exhausted> になる。**専用のヒープを作り直す**ので
+      GC発火の掃引(SMALL_HEAP_SIZE)より後に置く */
+   test_heap_exhaustion_marks_and_signals_at_eval_entry();
+   test_heap_exhaustion_is_detected_before_the_multiply();
+   test_heap_exhaustion_does_not_nest_while_reporting();
 
    test_heap_align_holds_for_variable_length_objects_across_gc();
    /* os_heap_initを別のヒープで呼び直すので、他のテストより後に置く */
