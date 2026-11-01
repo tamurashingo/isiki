@@ -769,6 +769,7 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 | `tools/jit_frame_breakdown.py` の「合計一致」 | 内訳の合計 = `ZA_FRAME_TOTAL`、予備領域 = 各項の合計 | **無い**(下の節) | `make jit-frame-breakdown`。手で呼ぶ |
 | `make test-qemu-macro-parity` | `init.lisp` の `defmacro` と `transpile.lisp` の `*macro-expanders*` の展開形 | **無い**(下の節)。設計は双方向(`cosmetic` / `DIVERGENT` は**同じになったら落ちる**) | 手で呼ぶ。**`test-qemu-all` に入っていない** |
 | `make test-qemu-error-escape-gc` | `GC_DEBUG` ビルドで `g_gc_lifo_violations == 0` | **無い**(下の節)。手順は PR #121 本文にあるが**未実行** | `make test-qemu-all` 内(`Makefile:831`。`GC_DEBUG` の別ビルド) |
+| `make test-qemu-stack-guard-gc` | 深い再帰からの巻き戻しで GC ルートの LIFO が壊れないこと | **あり。ただし 2026-11-01 まで「1 件 NG のまま」だった**(下の節) | 手で呼ぶ。**`test-qemu-all` に入っていない** |
 
 ### 陽性対照が無い / 作れていないもの —— **4 件残っている**(2026-11-01 に 1 件解消)
 
@@ -781,6 +782,36 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 | `make test-qemu-macro-parity` | 設計としては双方向(`same` は違ったら落ちる / `cosmetic` と `DIVERGENT` は同じになったら落ちる)。**だが意図的に発火させた記録は、期待値ファイルのヘッダに書かれた「落ちる条件」しかない。** この系統のファイルに「陽性対照」「意図的」の語は `grep` で 1 件も出ない | `FOR` の判定を `same` に書き換えて落ちることを見せる(QEMU 1 起動)。**`test-qemu-all` に入っていないことも併せて直す対象** |
 | `make test-qemu-error-escape-gc` | 手順は PR #121 本文にある(期待値を 999 にする)が、**今回も含めて未実行**。しかも `GC_DEBUG` の別ビルドが要る | 本文の手順をそのまま 1 回走らせて、落ちたことを文書に残す |
 | ~~`tools/bench/check_bench_jit_sync.sh`~~ | **解消(2026-11-01、M8-T3)。** 3 通りとも落ちることを見せた。記録は `documents/performance-measurement.md`「解釈実行の経路の基準値」節の「同期検査」。**残りは 4 件。** | — |
+
+### 壊れたまま誰も見ていなかった検出器(2026-11-01 に見つけた)
+
+**`make test-qemu-stack-guard-gc` は、ずっと 1 件 NG を出していた。**
+
+```
+#count test/lisp/gc_debug_guard.lisp 0
+[NG] (LIST PATH (> N 0)) => (... NIL) (expected (... T))
+```
+
+原因: `qemu_boot_stack_guard_gc.lisp` が `gc_debug_guard.lisp` を
+**`isiki-test-load` で読んでいた**。あのファイルは**関数を 2 つ定義するだけで
+assert を 1 つも持たない**ので、`isiki-file-end-check` の
+「このファイルは検査を走らせたか(n > 0)」が**必ず落ちる**。
+
+**`qemu_boot_for_gc_stress.lisp` は最初から素の `load` で読んでいる。**
+つまり**同じファイルの読み方が 2 つのミルストンで食い違っていた。**
+
+**なぜ誰も気づかなかったか: このミルストンは `test-qemu-all` に入っていない。**
+文書にも「入っていない」と書いてあり、**入っていないこと自体は記録されていた**。
+記録されていたのは「走らせていない」ことで、
+**走らせたら落ちることは記録されていなかった。**
+
+> **「`test-qemu-all` に入っていない」は「たまに手で走らせている」ではない。**
+> 入っていない検出器は**壊れても分からない**。
+> この棚卸しの表に「門番」の列があるのは、まさにこれを見るためである。
+
+直した(素の `load` にした)。**`test-qemu-all` へ入れるかは別の判断**で、
+`GC_DEBUG` の別ビルドが要るので通しに入れると時間が伸びる
+(`test-qemu-error-escape-gc` は入っている。こちらも入れる価値はある)。
 
 > **「双方向だから陽性対照はいらない」とは言えない。**
 > 双方向は**向き**の性質で、**計器が対象を見られること**の証明ではない
