@@ -32,6 +32,18 @@ EXTRA_CFLAGS ?=
 # 足したときは、この口で掃引して通る最小値を実測し直す
 SMALL_HEAP_SIZE ?=
 
+# [測定] **ヒープ枯渇テスト専用**のヒープの大きさ(byte)。空ならソース側の既定値
+# (test/c/runtime_test.c の #ifndef HEAP_EXHAUSTION_HEAP_SIZE。既定 4MB)を使う。
+#   make test HEAP_EXHAUSTION_SIZE=2000000
+# **上の SMALL_HEAP_SIZE とは別の口である。** 共有してはいけない:
+#   SMALL_HEAP_SIZE … GC が発火することを見たい。os_bootstrap の恒久消費ぎりぎり
+#                     (通る窓 5KB 未満)。小さすぎるとハング、大きすぎると GC が出ない
+#   こちら          … **予備領域(定数 ~68KB)が丸ごと入る**ことが要件。
+#                     半空間の 1/8 に収まらないと検査自体が無効になる
+#                     (runtime.c の heap_update_soft_end)。小さすぎると
+#                     「何も検出しない試験」になるので、下限側の番犬を試験に入れてある
+HEAP_EXHAUSTION_SIZE ?=
+
 # 命令数ベースの性能計測(documents/performance-measurement.md参照)で使う
 # TCGプラグインのビルドに必要な、ホストにインストール済みのqemu-system-x86_64
 # バージョン(`qemu-system-x86_64 --version`で確認)。プラグインABI
@@ -84,6 +96,7 @@ JIT_DUMP_FLAGS = $(if $(JIT_DUMP),-DISIKIOS_JIT_DUMP,)
 # [測定] 上のSMALL_HEAP_SIZEをコンパイル行へ渡す形にしたもの。空のときは何も
 # 渡さないので、ソース側の#ifndefの既定値がそのまま効く
 SMALL_HEAP_FLAGS = $(if $(SMALL_HEAP_SIZE),-DSMALL_HEAP_SIZE=$(SMALL_HEAP_SIZE),)
+HEAP_EXHAUSTION_FLAGS = $(if $(HEAP_EXHAUSTION_SIZE),-DHEAP_EXHAUSTION_HEAP_SIZE=$(HEAP_EXHAUSTION_SIZE),)
 
 BUILD_TMPDIR = tmp
 
@@ -107,7 +120,7 @@ BUILD_TMPDIR = tmp
 # カーネル本体はこの値を使わないので$(TARGET)の再ビルドは本来不要だが、
 # 「新しいビルドフラグは必ず署名に入れる」を例外なしの規則にしておく方を採る
 GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
-BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(SMALL_HEAP_FLAGS) $(EXTRA_CFLAGS)
+BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) $(EXTRA_CFLAGS)
 .PHONY: FORCE
 FORCE:
 $(GC_DEBUG_STAMP): FORCE
@@ -196,7 +209,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -535,7 +548,7 @@ check-macro-order-self-test:
 test: check-macro-order check-macro-order-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_RUNTIME) $(TEST_SRC_RUNTIME) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
@@ -1006,6 +1019,14 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_limits.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_stack_guard.lisp
+	$(MAKE) test-qemu-heap-exhaustion
+
+# [可用性/#110] ヒープ枯渇が <storage-exhausted> になることを見る
+# (M8-T5/T6。documents/heap-exhaustion.md)。**専用の milestone にしてある**理由:
+# 枯渇の試験が万一ヒープを壊した場合に、5000 件超ある通しの試験を道連れにしない
+# (スタックガード(qemu_boot_stack_guard.lisp)と同じ扱い)。
+test-qemu-heap-exhaustion:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_heap_exhaustion.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック

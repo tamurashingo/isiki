@@ -667,6 +667,54 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size);
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
 void os_bootstrap();
 
+/* ===== [可用性] ヒープ枯渇を <storage-exhausted> にする(issue #110、D9) ======
+ *
+ * 設計は documents/heap-exhaustion.md、実装の註は runtime.c の
+ * 「ヒープ枯渇をハングではなくエラーにする」の節。**スタック側
+ * (documents/stack-guard.md / za.c の os_za_signal_stack_exhausted)と
+ * 同じ構造にしてある**: 本当の限界より上に閾値 / 床 / 知らせている間だけ
+ * 予備を開ける / 重ねない / 最後はエラー値へ落ちる。
+ *
+ * | | スタック | ヒープ |
+ * |---|---|---|
+ * | 枯渇が起きる場所 | 関数の入口(**値を返せる**) | **確保の内部**(番地を返す) |
+ * | 検査を置いた場所 | JIT のプロローグ | **確保を要求する primitive** |
+ * | 覆える経路 | JIT だけ | **3 経路(確保の要求は同じ C を通る)** |
+ *
+ * **守らない経路**: JIT / AOT の生成コードが小口(cons / instance)の確保だけを
+ * 続ける区間。印は立つが見る人がいないので、床まで達すると panic する。
+ */
+
+/** [印] ヒープ枯渇を知らせる必要があるか。**eval.c が評価の入口で直接読む。**
+ *  関数呼び出しにしないのは、常道に増える命令を 1 比較 + 1 分岐に抑えるため。
+ *  立てるのは os_alloc_bytes の遅い側だけ、消すのは os_heap_signal_exhausted だけ */
+extern int g_heap_exhausted_pending;
+
+/**
+ * ヒープ枯渇を <storage-exhausted> として signal する。
+ * **確保器(os_alloc_bytes)の中からは呼べない**(番地を返す関数で、cli で
+ * 割り込みを止めており、signal 自身が確保する)。呼ぶのは「確保を要求する
+ * primitive」と os_eval の評価の入口である。
+ * @param env signal に使う環境(通常は global_environment)
+ * @return signal-conditionの戻り値。条件システムが使えない段階では g_sym_eval_error
+ */
+lisp_val_t os_heap_signal_exhausted(lisp_val_t env);
+
+/** 枯渇の印が立っているか(診断・テスト用。常道は g_heap_exhausted_pending を直読する) */
+int os_heap_exhaustion_pending(void);
+/** 枯渇を知らせた延べ回数。**0 = 一度も発火していない**(= 守られていない経路からの停止) */
+UINT64 os_heap_guard_hits(void);
+/** signal 経路が 1 回で確保した最大バイト数の実測値(GC を挟んだ回は数えない)。
+ *  予備領域の見積り(HEAP_SIGNAL_LISP_FRAMES / HEAP_HANDLER_ALLOWANCE の ★)を
+ *  実測へ直すための計器。**これが予備領域を超えたら予備が足りていない** */
+UINT64 os_heap_signal_path_bytes(void);
+/** いま常道が比べている柔らかい端(From空間先頭からのバイト数) */
+UINT64 os_heap_soft_limit_bytes(void);
+/** 通常時の柔らかい端(予備を閉じた状態の値) */
+UINT64 os_heap_soft_limit_normal_bytes(void);
+/** 床(ここを割ったら panic する位置)。**小さいヒープでは半空間の端と一致する** */
+UINT64 os_heap_floor_limit_bytes(void);
+
 /**
  * From空間の使用率を返す(0.0〜1.0)。os_gc_collectを呼ぶべきかどうかの閾値判定に使う。
  * @return 使用中バイト数 / From空間全体のバイト数

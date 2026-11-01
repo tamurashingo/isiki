@@ -111,8 +111,32 @@ import sys
 #   7 つ目そのものは依然 observed-but-untested である。
 #   **この区別を書いておく** — 「no-init の試験があるから 7 つ目も見ている」と
 #   読まれると、実際には見ていない経路を見たことにしてしまう。
+#
+# [issue #110 / M8-T5] 7 -> 8。**1 箇所だけ意図的に増やした。**
+# runtime.c の os_heap_signal_exhausted(ヒープ枯渇を <storage-exhausted> として
+# 知らせる経路)が、**知らせている最中にまた枯渇した場合**に EVAL-ERROR を返す。
+# **7 つ目(za.c のスタック側)と同じ性質・同じ理由である。**
+# ヒープ側もスタック側も、signal を重ねると予備領域を食い潰してから panic する。
+# 「エラーを出そうとして機械が止まる」のは、保護を入れる前より分かりにくい
+# (documents/heap-exhaustion.md §7)。
+# **signal へ寄せられない唯一の理由が「signal する資源が無いこと」**なので下がらない。
+#
+# **内訳:**
+#   runtime.c 1  os_heap_signal_exhausted。g_in_heap_signal が立っている
+#                (= 知らせている最中にまた枯渇した)ときだけ通る。
+#
+# **常設の試験を置いた。これは 7 つ目(za.c)との違いである。**
+#   スタック側は「到達するかがハンドラの形に対して非単調」で試験にできなかったが、
+#   ヒープ側は**大口の確保 1 つで決定的に到達する**:
+#     test/c/runtime_test.c test_heap_exhaustion_does_not_nest_while_reporting
+#       条件システムのフェイクを差し込み、make-instance の中から
+#       もう一度 os_heap_signal_exhausted を呼んで EVAL-ERROR が返ることを見る。
+#       **陽性対照も取った**(再入フラグを外すと 2 件 NG。2026-11-01)
+#     test/lisp/heap_exhaustion_test.lisp hx-handler-nested
+#       ハンドラの中で (create-vector 100000000000) を要求し、
+#       '(outer <storage-exhausted> EVAL-ERROR) になることを見る
 BUDGETS = {
-    "c_return": 7,
+    "c_return": 8,
     # [P4-4] 5 -> 2。file-cmd.lisp の read-file-into-vector / write-vector-to-file が
     # 見ていた EVAL-ERROR 返しは、open-input-stream / open-output-file / file-length が
     # signal(または仕様どおりの nil)へ変わったことで**起きなくなった**ため落とした。

@@ -182,6 +182,170 @@ static UINT8 *g_to_ptr;
 /** To空間の終端アドレス */
 static UINT8 *g_to_end;
 
+/* ===== [可用性] ヒープ枯渇をハングではなくエラーにする(issue #110、D9) ======
+ *
+ * 設計は documents/heap-exhaustion.md。要点だけ写す。
+ *
+ * **確保器(os_alloc_bytes)の中では signal できない。** 番地を返す関数であり、
+ * cli で割り込みを止めており、signal 自身が確保する。だから検査は
+ * 「確保を要求する primitive」に置き、確保器の側は**印を立てるだけ**にする。
+ *
+ * [大口と小口]
+ *   大口(create-array / create-vector / create-string)は引数から大きさが決まり、
+ *   呼び出し元が値を受け取るので**その場で signal できる**。
+ *   小口(os_make_cons / os_make_instance)は「対を作れませんでした」を返す先が無い。
+ *   こちらは閾値と予備で受け、**印を見る場所**(大口の primitive と os_eval の
+ *   評価の入口)で signal する。
+ *
+ * [常道の命令数を 1 つも増やさない]
+ *   os_alloc_bytes の比較の相手を g_from_end から g_from_soft_end へ変えるだけで、
+ *   **比較は 1 つのままである**(定数が変わるだけ)。G1(回帰ゼロ)のために譲れない。
+ *
+ * [守らない経路を書く(スタック側が「JIT だけ守った」ことを記録したのと同じ作法)]
+ *   **JIT と AOT の小口は守らない。** 印を見るのは os_eval の入口と大口の primitive
+ *   だけなので、JIT / AOT のコードが小口の確保だけを延々と続けると、印が立ったまま
+ *   誰も見ないまま床へ達して panic する。そこを守るには JIT のプロローグと AOT の
+ *   関数入口にも検査が要る(= 常道に命令が増える)。今回は入れない。
+ */
+/* ---- 予備領域は定数ではなく**導出式**にする(規則 13。za.c の
+ *      ZA_STACK_RESERVE_MIN と同じ扱い)------------------------------------
+ *
+ * 予備領域 = 条件の実体 + signal が組む引数 + 解釈実行のフレーム + ハンドラの保証分 + 床
+ */
+/** <storage-exhausted> の実体。INSTANCE 32 + スロット配列ブロック
+ *  8*(1+1+スロット数)。<storage-exhausted> はスロットを持たないが、
+ *  make-instance は (make-array (length (%%class-slots class))) を必ず通るので
+ *  上限として 8 スロットぶんを見ておく */
+#define HEAP_CONDITION_INSTANCE_MAX  (32 + 8 * (1 + 1 + 8))
+/** os_signal_condition が組む対(make_args 1 つ + signal_args 2 つ) */
+#define HEAP_SIGNAL_ARGS_MAX         (3 * 16)
+/** ★ **未実測。** signal-condition / make-instance / %find-class を解釈実行で
+ *  呼ぶあいだに積む環境フレームと引数の対。**インタプリタでは関数を呼ぶたびに
+ *  引数リストを対で作る**ので、ここが予備領域の主項になる。
+ *  実測する手段を同梱した: os_heap_signal_path_bytes() が
+ *  「signal 経路が実際に確保した最大バイト数」を返す(GC を挟んだ回は数えない)。
+ *  test/c/runtime_test.c の枯渇テストがこの値が予備領域より小さいことを見る。
+ *  **測ったら、この値をその実測値 + 余裕へ直すこと**(規則 9) */
+#define HEAP_SIGNAL_LISP_FRAMES      32768
+/** ★ **未実測。** ユーザのハンドラに保証する量。ISLisp の with-handler の
+ *  ハンドラは signal の動的文脈で走る(巻き戻す前)ので、ハンドラが確保する分も
+ *  予備領域に入っていなければならない。既定のトップレベルハンドラは
+ *  %report-condition-string → create-string-output-stream(容量 1024)+ format を
+ *  通るので、**文字列バッファが主項**である。
+ *  **これを超えるハンドラは保証しない**(床を割って panic。劣化であってハングではない) */
+#define HEAP_HANDLER_ALLOWANCE       32768
+/** 予備領域の中でさらに枯渇したときに捕まえる床。ここを割ったら panic する。
+ *  za.c の ZA_STACK_HARD_FLOOR_WANT と同じ値・同じ役割 */
+#define HEAP_HARD_FLOOR_WANT         4096
+
+/** 予備領域の下限。**これが導出式の本体である。** */
+#define HEAP_SIGNAL_RESERVE_MIN \
+    (HEAP_CONDITION_INSTANCE_MAX + HEAP_SIGNAL_ARGS_MAX + \
+     HEAP_SIGNAL_LISP_FRAMES + HEAP_HANDLER_ALLOWANCE + HEAP_HARD_FLOOR_WANT)
+
+/** 実際に使う予備領域。**-D で上書きできる**(陽性対照のため。
+ *  意図的に小さくして「知らせている途中で床を割る」ことを確かめる口) */
+#ifndef HEAP_SIGNAL_RESERVE
+#define HEAP_SIGNAL_RESERVE \
+    (((HEAP_SIGNAL_RESERVE_MIN) + (OS_HEAP_ALIGN - 1)) & ~(OS_HEAP_ALIGN - 1ULL))
+#define HEAP_RESERVE_DERIVED 1
+#endif
+
+/* 床は予備領域の半分を超えないようにする(za.c の ZA_STACK_HARD_FLOOR と同じ扱い)。
+   **これが無いと -D で予備を小さくしたときに床が柔らかい端より上に来て、逆効果になる。**
+   実際に踏んだ: -DHEAP_SIGNAL_RESERVE=0 で陽性対照を取ったとき、予備 0 / 床 4096 に
+   なって「柔らかい端(= 真の端)を超えたら、さらに低い床と比べて必ず panic」という
+   構成が成立し、小さいヒープの試験がハングした(2026-11-01) */
+#if HEAP_HARD_FLOOR_WANT * 2 >= HEAP_SIGNAL_RESERVE
+#define HEAP_HARD_FLOOR (HEAP_SIGNAL_RESERVE / 2)
+#else
+#define HEAP_HARD_FLOOR HEAP_HARD_FLOOR_WANT
+#endif
+
+#ifdef HEAP_RESERVE_DERIVED
+_Static_assert(HEAP_SIGNAL_RESERVE >= HEAP_SIGNAL_RESERVE_MIN,
+               "HEAP_SIGNAL_RESERVE が下限を満たしていない(documents/heap-exhaustion.md)");
+_Static_assert(HEAP_SIGNAL_RESERVE % OS_HEAP_ALIGN == 0,
+               "予備領域は OS_HEAP_ALIGN の倍数でなければならない(柔らかい端が境界から外れる)");
+_Static_assert(HEAP_HARD_FLOOR == HEAP_HARD_FLOOR_WANT,
+               "導出式のときは床が削られてはならない");
+#endif
+
+/** From空間の「柔らかい端」。**os_alloc_bytes の常道が比べる相手はこれである。**
+ *  通常は g_from_soft_end_normal、予備を開けているあいだは g_from_floor_end */
+static UINT8 *g_from_soft_end;
+/** 通常時の柔らかい端(g_from_end - 予備領域) */
+static UINT8 *g_from_soft_end_normal;
+/** 床(g_from_end - 床の大きさ)。**ここを割ったら panic する。** */
+static UINT8 *g_from_floor_end;
+/** [印] 枯渇を知らせる必要があるか。**eval.c が評価の入口で直接読む。**
+ *  関数呼び出しにしないのは、常道に増える命令を 1 比較 + 1 分岐に抑えるため */
+int g_heap_exhausted_pending = 0;
+/** signal 経路の中にいるか。**入れ子の signal を防ぐ**(重ねると予備を食い潰す) */
+static int g_in_heap_signal = 0;
+/** 枯渇を知らせた延べ回数(診断用。os_heap_guard_hits) */
+static UINT64 g_heap_guard_hits = 0;
+/** signal 経路が 1 回で確保した最大バイト数の実測値(GC を挟んだ回は数えない)。
+ *  HEAP_SIGNAL_LISP_FRAMES / HEAP_HANDLER_ALLOWANCE の ★ を実測へ直すための計器 */
+static UINT64 g_heap_signal_path_bytes = 0;
+
+/** 印・signal 中かどうかから、柔らかい端を決め直す。
+ *  **予備を開けるのは「知らせている間」だけ**なので、状態が変わるたびにここを通す */
+static void heap_apply_soft_end(void) {
+    g_from_soft_end = (g_heap_exhausted_pending || g_in_heap_signal)
+        ? g_from_floor_end : g_from_soft_end_normal;
+}
+
+/** 半空間の寸法から柔らかい端と床を計算する。**os_heap_init と GC のフリップの
+ *  直後に必ず呼ぶ**(どちらも g_from_start / g_from_end を動かす)。
+ *
+ *  [入らなければ 0 にする。**切り詰めない。**]
+ *  予備領域は定数だが、半空間の大きさは構成で変わる。定数のままだと
+ *  ユニットテストの小さいヒープ(85KB = 半空間 42.5KB)では予備が半空間より
+ *  大きくなり、柔らかい端が先頭より前へ回り込んで**起動の最初の確保から
+ *  遅い側に落ちる**。
+ *
+ *  **最初は「半空間の 1/8 まで切り詰める」ことにして、実測で捨てた。**
+ *  半空間 42.5KB で予備 5.3KB を取ると、使える領域がその分減って GC の発火位置が
+ *  前へずれる。その結果 test_gc_fires_during_gcd_and_isqrt_and_results_are_correct の
+ *  「isqrt の途中で GC が発火する」判定が落ちた
+ *  (2026-11-01、ホストの gcc で base 5446 OK / 0 NG に対して 1 NG)。
+ *  SMALL_HEAP_SIZE は通る窓が 5KB 未満しかなく、**予備を取るだけで掃引し直しになる。**
+ *  つまみを共有しないという T6 の方針は、**値を分けるだけでは足りない**
+ *  (実効容量を削った時点で衝突する)。
+ *
+ *  そこで**予備が丸ごと入らない構成では検査を無効にする**(予備 0 / 床 0 =
+ *  柔らかい端も床も真の端と一致 = 従来どおりその場で panic)。
+ *  閾値は「予備が半空間の 1/8 以下であること」= 使える領域を 12.5% 以上削らないこと。
+ *  ゲスト(QEMU_MEM 256M)の半空間は MB 単位なので、**実機では常に有効である。** */
+static void heap_update_soft_end(void) {
+    UINT64 half = (UINT64)(g_from_end - g_from_start);
+    UINT64 reserve = 0;
+    UINT64 floor_bytes = 0;
+    if (HEAP_SIGNAL_RESERVE > 0 && half / 8 >= (UINT64)HEAP_SIGNAL_RESERVE) {
+        reserve = (UINT64)HEAP_SIGNAL_RESERVE;
+        floor_bytes = (UINT64)HEAP_HARD_FLOOR;
+    }
+    g_from_soft_end_normal = g_from_end - reserve;
+    g_from_floor_end       = g_from_end - floor_bytes;
+    heap_apply_soft_end();
+}
+
+/** 印を立て、予備を開ける。**os_alloc_bytes の遅い側からだけ呼ぶ。**
+ *  予備を開けるのは、開けないと**次の確保もすべて遅い側に落ちて GC が走り続ける**
+ *  ためである(印を立てただけでは柔らかい端は動かない) */
+static void heap_open_reserve(void) {
+    g_heap_exhausted_pending = 1;
+    heap_apply_soft_end();
+}
+
+int os_heap_exhaustion_pending(void) { return g_heap_exhausted_pending; }
+UINT64 os_heap_guard_hits(void) { return g_heap_guard_hits; }
+UINT64 os_heap_signal_path_bytes(void) { return g_heap_signal_path_bytes; }
+UINT64 os_heap_soft_limit_bytes(void) { return (UINT64)(g_from_soft_end - g_from_start); }
+UINT64 os_heap_soft_limit_normal_bytes(void) { return (UINT64)(g_from_soft_end_normal - g_from_start); }
+UINT64 os_heap_floor_limit_bytes(void) { return (UINT64)(g_from_floor_end - g_from_start); }
+
 /**
  * nil(自己参照するconsセル)専用の固定領域。From/To空間のどちらにも属さず、GCの
  * コピー/スワップの対象にならない(g_symbol_table等と同じ静的配列パターン)。
@@ -332,6 +496,51 @@ int os_alloc_audit_reason_of_magic(UINT64 magic) {
 }
 #endif /* ISIKIOS_ALLOC_AUDIT */
 
+/**
+ * [可用性/#110] 確保の遅い側(柔らかい端を超えた場合)。
+ *
+ * ## なぜ切り出すのか — **切り出さないと常道が 5 命令増える**
+ *
+ * 最初は os_alloc_bytes の中に素で書いていた。**それだけで常道が
+ * 15 命令から 20 命令へ増えた**(逆アセンブルで実測。2026-11-01):
+ *
+ *   push %rdi / push %rsi      ← 増えた
+ *   ...
+ *   mov  %rsi,%rax             ← 増えた
+ *   pop  %rsi / pop  %rdi      ← 増えた
+ *
+ * 遅い側が heap_apply_soft_end() の呼び出しを跨いで値を生かすので、
+ * **コンパイラが callee-saved レジスタを使い、その退避をプロローグに置く。**
+ * プロローグは常道である。**遅い側の都合を、確保のたびに全員が払う。**
+ *
+ * `os_alloc_bytes` はこの処理系でいちばん熱い関数である(対も物体も文字列も
+ * すべてここを通る)。+5 命令は G1(回帰ゼロ)に反する。
+ *
+ * **`noinline` が必須である。** 呼び出し元がちょうど 1 箇所なので、
+ * -O1 は何もしなければ畳み込んで元の木阿弥になる
+ * (M5 で同じ罠を踏んだ。documents/performance-measurement.md)。
+ *
+ * @param aligned 整列済みの要求バイト数
+ * @return 確保に使える From 空間の位置(枯渇しきった場合は戻らない)
+ */
+static __attribute__((noinline, cold)) UINT8 *os_alloc_bytes_slow(UINT64 aligned) {
+    /* From空間が枯渇。GCを1回走らせて空きを作れるか試す */
+    os_gc_collect();
+    UINT8 *p = g_from_ptr;
+    if (p + aligned > g_from_soft_end) {
+        /* GC 後もなお柔らかい端を超える。**ここでは signal できない**
+           (番地を返す関数で、cli で割り込みを止めており、signal 自身が確保する)。
+           印を立てて予備を開け、確保は続ける。知らせるのは
+           os_eval の入口か大口の primitive である(documents/heap-exhaustion.md) */
+        heap_open_reserve();
+        if (p + aligned > g_from_soft_end) {
+            /* 床まで使い切った場合は本当の枯渇として停止する(最後の砦) */
+            os_panic("out of memory (lisp heap exhausted)");
+        }
+    }
+    return p;
+}
+
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
     UINT64 aligned = os_heap_align_up(n);
 #ifndef ISIKIOS_UNIT_TEST
@@ -350,14 +559,11 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     }
 #endif
     UINT8 *p = g_from_ptr;
-    if (p + aligned > g_from_end) {
-        // From空間が枯渇。GCを1回走らせて空きを作れるか試す
-        os_gc_collect();
-        p = g_from_ptr;
-        if (p + aligned > g_from_end) {
-            // GC後もなお不足している場合は本当の枯渇として停止する
-            os_panic("out of memory (lisp heap exhausted)");
-        }
+    /* [可用性/#110] 比べる相手が g_from_end から g_from_soft_end へ変わっただけなので、
+       **常道の比較は 1 つのままである**。遅い側は os_alloc_bytes_slow へ切り出した
+       (理由は下の註。**切り出さないと常道が 5 命令増える**) */
+    if (p + aligned > g_from_soft_end) {
+        p = os_alloc_bytes_slow(aligned);
     }
     g_from_ptr = p + aligned;
 #ifndef ISIKIOS_UNIT_TEST
@@ -1435,6 +1641,16 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     g_to_start   = g_from_end;
     g_to_ptr     = g_to_start;
     g_to_end     = g_to_start + half;
+
+    /* [可用性/#110] 新しいヒープなので、前のヒープに対して立っていた印は意味を失う。
+       **先に状態を落としてから**柔らかい端を計算する(印が立ったままだと
+       heap_apply_soft_end が予備を開けた側の端を選んでしまう)。
+       ユニットテストはヒープを作り直して何度もここを通る */
+    g_heap_exhausted_pending = 0;
+    g_in_heap_signal = 0;
+    g_heap_guard_hits = 0;
+    g_heap_signal_path_bytes = 0;
+    heap_update_soft_end();
 
     // g_symbol_hash(静的配列)はCのゼロ初期化任せだと全スロットが0=「添字0が
     // 占有中」という誤った状態になってしまう(空きスロットの番兵は-1)。
@@ -3381,6 +3597,12 @@ static void os_gc_collect_body(void) {
     g_to_end = new_to_end;
     g_to_ptr = g_to_start;
 
+    /* [可用性/#110] **フリップで g_from_start / g_from_end が動くので、柔らかい端と床は
+       計算し直さなければならない。** 忘れると、柔らかい端が入れ替わる前の半空間を
+       指したまま残り、比較が無意味になる(= 枯渇の検出が黙って効かなくなる)。
+       印が立っているあいだは予備を開けた側の端が選ばれる(heap_apply_soft_end) */
+    heap_update_soft_end();
+
 #ifdef ISIKIOS_GC_DEBUG
     g_gc_debug_in_gc = 0;
 #endif
@@ -5098,6 +5320,131 @@ static lisp_val_t signal_index_out_of_range(lisp_val_t env) {
     lisp_val_t class_sym = os_make_symbol("<PROGRAM-ERROR>");
     GC_PROTECT(class_sym);
     return os_signal_condition(class_sym, nil, env);
+}
+
+/**
+ * [可用性/#110] ヒープ枯渇を <storage-exhausted> として signal する。
+ *
+ * **za.c の os_za_signal_stack_exhausted をそのまま写した形である**
+ * (再入フラグ / 閾値を床へ下げる / クラス名はその場で引く、の 3 点)。
+ * スタック側と同じ構造にしてあるのは、片方を直したときにもう片方を見に来られる
+ * ようにするためである(documents/stack-guard.md / documents/heap-exhaustion.md)。
+ *
+ * **ここへ来た時点で、確保はもう予備領域の中で行われている。** signal 経路は
+ * さらに確保する(条件の実体・引数の対・呼び戻した Lisp 関数のフレーム)ので、
+ * 入る前に柔らかい端を床まで下げて予備を開け、抜けるときに戻す。
+ *
+ * **入れ子にしない。** 予備の中でさらに枯渇した場合(ハンドラが深く確保した)は
+ * signal を重ねず EVAL-ERROR を返す。重ねると予備を食い潰してから panic するので、
+ * 「エラーを出そうとして機械が止まる」というもっと分かりにくい症状になる。
+ *
+ * @param env signal に使う環境(通常は global_environment)
+ * @return signal-conditionの戻り値。条件システムが使えない起動段階では
+ *         os_signal_condition が g_sym_eval_error を返す(= エラー値へ落ちる)
+ */
+lisp_val_t os_heap_signal_exhausted(lisp_val_t env) {
+    g_heap_guard_hits++;
+    if (g_in_heap_signal) {
+        return g_sym_eval_error;
+    }
+    g_in_heap_signal = 1;
+    /* 印は**消費する**。知らせている間にまた枯渇したら os_alloc_bytes が立て直し、
+       外側が抜けたあと次の評価の入口でもう一度知らせる(劣化はするがハングしない) */
+    g_heap_exhausted_pending = 0;
+    heap_apply_soft_end();
+
+    UINT64 used_before = (UINT64)(g_from_ptr - g_from_start);
+    UINT64 gc_before = os_gc_collect_count();
+
+    GC_PROTECT(env);
+    /* <storage-exhausted> はスロットを持たないので initargs は nil。
+       クラス名は os_make_symbol でその場で引く(エラー経路なのでキャッシュ不要。
+       グローバルを増やすと gc_copy_value の追加漏れの余地が増える) */
+    lisp_val_t class_sym = os_make_symbol("<STORAGE-EXHAUSTED>");
+    GC_PROTECT(class_sym);
+    lisp_val_t r = os_signal_condition(class_sym, nil, env);
+
+    /* [計器] 予備領域の ★ を実測へ直すための値。**GC を挟んだ回は数えない**
+       (水位が戻るので差が意味を失う。os_alloc_audit_diff と同じ註) */
+    if (os_gc_collect_count() == gc_before) {
+        UINT64 used_after = (UINT64)(g_from_ptr - g_from_start);
+        if (used_after > used_before && used_after - used_before > g_heap_signal_path_bytes) {
+            g_heap_signal_path_bytes = used_after - used_before;
+        }
+    }
+
+    g_in_heap_signal = 0;
+    heap_apply_soft_end();
+    return r;
+}
+
+/**
+ * [可用性/#110] 大口の確保要求(byte 数)が**柔らかい端より下に入るか**。
+ *
+ * **床ではなく柔らかい端で見る。** 予備領域は知らせるための領域なので、
+ * 大口の確保に食わせない(食わせると、知らせようとした時点で予備が無い)。
+ *
+ * ポインタ演算で `p + bytes` を作らないのは、**要求が巻き上がると比較が逆になる**
+ * ためである。負の fixnum を生シフトすると bit63 の符号が値に混ざって
+ * 10^17 規模の「非負の値」に見え、`p + aligned` がアドレス空間を回り込んで
+ * 「空きがある」と判定されうる。差で見れば回り込まない。
+ */
+static int heap_request_fits(UINT64 bytes) {
+    if (bytes > (UINT64)~0ULL - (OS_HEAP_ALIGN - 1)) {
+        return 0;   /* os_heap_align_up 自身が溢れる大きさ */
+    }
+    UINT64 aligned = os_heap_align_up(bytes);
+    UINT8 *p = g_from_ptr;
+    if (p >= g_from_soft_end_normal) {
+        return 0;
+    }
+    return aligned <= (UINT64)(g_from_soft_end_normal - p);
+}
+
+/**
+ * [可用性/#110] 大口の確保要求が入らないなら <storage-exhausted> を signal する。
+ * 入るなら 0 を返し、呼び出し側はそのまま確保へ進む。
+ *
+ * **GC を 1 回試す順序は os_alloc_bytes の遅い側と同じにする。** 試さずに signal すると、
+ * 「GC すれば入ったのに枯渇と言う」退行になる。
+ *
+ * @param bytes 要求する本体ブロックのバイト数
+ * @param out_signal signal した場合の戻り値を書き込む
+ * @return signal した場合 1、確保へ進んでよい場合 0
+ */
+static int heap_signal_if_too_large(UINT64 bytes, lisp_val_t *out_signal) {
+    if (heap_request_fits(bytes)) {
+        return 0;
+    }
+    /* **半空間全体にも入らない大きさなら GC しても入らない。** 桁あふれした要求も
+       ここに入るので、巨大な配列 1 つで GC を 1 回誘発させる形にはならない */
+    if (bytes <= (UINT64)(g_from_soft_end_normal - g_from_start)) {
+        os_gc_collect();
+        if (heap_request_fits(bytes)) {
+            return 0;
+        }
+    }
+    *out_signal = os_heap_signal_exhausted(global_environment);
+    return 1;
+}
+
+/**
+ * [可用性/#110] 印(小口の確保が立てた枯渇の印)が立っていれば知らせる。
+ *
+ * **印を見る場所は「大口の primitive」と「os_eval の評価の入口」だけである。**
+ * JIT / AOT の生成コードが小口の確保だけを続ける区間は守らない
+ * (守るにはそれぞれの関数入口に検査が要る = 常道に命令が増える)。
+ * 守らないことは documents/heap-exhaustion.md に書いた
+ * (スタック側が「JIT だけ守った」ことを記録したのと同じ作法)。
+ *
+ * @return signal した場合 1(*out_signal にその戻り値)、何もしなかった場合 0
+ */
+static int heap_signal_if_pending(lisp_val_t *out_signal) {
+    if (!g_heap_exhausted_pending) {
+        return 0;
+    }
+    *out_signal = os_heap_signal_exhausted(global_environment);
+    return 1;
 }
 
 /**
@@ -10019,6 +10366,28 @@ lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
 #define MAX_ARRAY_RANK 8
 
 /**
+ * [可用性/#110] 長さ / 次元の引数を UINT64 として取り出す。**負の fixnum を弾く。**
+ *
+ * **fixnum は 2 の補数ではない。符号(bit63)+ マグニチュード(bit4-62)である。**
+ * だから `v >> FIXNUM_VALUE_SHIFT` と生で書くと**符号ビットが値に混ざる**。
+ * 入れる前の create-vector / create-string / make-array はこの生シフトだけで、
+ * `(create-vector -1)` は 10^17 規模の「非負の長さ」として通っていた。
+ * そこまで大きいと `p + aligned > g_from_end` のポインタ演算が回り込むので、
+ * **「空きがある」と判定されたうえで要素の書き込みが始まりうる。**
+ *
+ * 非 fixnum(bignum / 文字列 / cons)も同じ入口から入ってくるので、ここで一緒に弾く。
+ *
+ * @return 非負の fixnum なら 1、そうでなければ 0
+ */
+static int array_size_arg(lisp_val_t v, UINT64 *out) {
+    if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+        return 0;
+    }
+    *out = os_fixnum_magnitude(v);
+    return 1;
+}
+
+/**
  * rank/dimsから配列本体の可変長ブロック(word0=rank、word[1..rank]=各次元のサイズ、
  * word[rank+1..]=データ)をヒープに確保し、ヘッダ(rank, dims)だけ書き込む。
  * データ部の初期化は呼び出し側の責務(make-array/create-vector/vectorで初期化ポリシーが
@@ -10027,13 +10396,74 @@ lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
  * @param dims 各次元のサイズ(rank個)
  * @return 確保したブロックの先頭アドレス(タグなし)
  */
-static lisp_addr_t alloc_vector_block(UINT64 rank, const UINT64 *dims) {
+/**
+ * [可用性/#110] rank/dimsから本体ブロックのバイト数を求める。
+ * **掛けながら桁あふれを見る。** 溢れたら 0 を返す(*out_bytes は不定)。
+ *
+ * ## なぜ掛け算より後ろで判定してはいけないのか
+ *
+ * 入れる前の alloc_vector_block は `total *= dims[i]` を素で回していた。
+ * **桁あふれの検査も負値の検査も無かった。** total が巻き上がると**小さい値**に
+ * なるので、枯渇の判定を掛け算の後ろに置くと**まさにこの場合だけ検査を通り抜け**、
+ * 小さい塊を確保したあとに要素を書き込んで**ヒープを踏み越える**。
+ * だから判定は掛け算より前、正確には**掛けているその場**でなければならない。
+ *
+ * [道具の選択] fixnum の乗算(fixnum_multiply_signed_unchecked)は
+ * unsigned __int128 を使っているが、あれは「59bit に収まるか」を見たいからである。
+ * ここで見たいのは「UINT64 に収まるか」なので __builtin_mul_overflow がそのまま
+ * 判定になる(documents/heap-exhaustion.md §2)。
+ */
+static int vector_block_bytes(UINT64 rank, const UINT64 *dims, UINT64 *out_bytes) {
     UINT64 total = 1;
     for (UINT64 i = 0; i < rank; i++) {
-        total *= dims[i];
+        if (__builtin_mul_overflow(total, dims[i], &total)) {
+            return 0;
+        }
+    }
+    UINT64 words = 0;
+    if (__builtin_add_overflow(total, (UINT64)(1 + rank), &words)) {
+        return 0;
+    }
+    UINT64 bytes = 0;
+    if (__builtin_mul_overflow(words, (UINT64)8, &bytes)) {
+        return 0;
+    }
+    *out_bytes = bytes;
+    return 1;
+}
+
+/**
+ * [可用性/#110] rank/dims の要求が入らないなら <storage-exhausted> を signal する。
+ *
+ * **桁あふれと枯渇は同じ答えにする。** 要求が表せる大きさを超えているなら、
+ * それは「入らない」のであって <storage-exhausted> が正しい。別の条件を作ると、
+ * 呼び出し側が 2 つを区別して扱う理由が無いのに区別させることになる
+ * (documents/heap-exhaustion.md §2 の註)。
+ *
+ * @return signal した場合 1(*out_signal にその戻り値)、確保へ進んでよい場合 0
+ */
+static int vector_block_signal_if_too_large(UINT64 rank, const UINT64 *dims,
+                                            lisp_val_t *out_signal) {
+    UINT64 bytes = 0;
+    if (!vector_block_bytes(rank, dims, &bytes)) {
+        *out_signal = os_heap_signal_exhausted(global_environment);
+        return 1;
+    }
+    return heap_signal_if_too_large(bytes, out_signal);
+}
+
+static lisp_addr_t alloc_vector_block(UINT64 rank, const UINT64 *dims) {
+    UINT64 bytes = 0;
+    if (!vector_block_bytes(rank, dims, &bytes)) {
+        /* [可用性/#110] **ここへ来るのは primitive 側の事前判定を通り抜けた場合だけ**
+           である。C の内部から呼ぶ経路(os_make_vector_from_list /
+           os_make_vector_raw / os_make_array_from_nested_list)の dims は実在する
+           リストの長さなので、積は要素数を超えず溢れない。
+           番地を返す関数なので signal できない。最後の砦として停止する */
+        os_panic("vector size overflow (lisp heap)");
     }
     ALLOC_AUDIT_REASON(ALLOC_REASON_VECTOR_BLOCK);
-    lisp_addr_t addr = os_alloc_bytes(8 * (1 + rank + total));
+    lisp_addr_t addr = os_alloc_bytes(bytes);
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = rank;
     for (UINT64 i = 0; i < rank; i++) {
@@ -10121,10 +10551,23 @@ lisp_val_t primitive_vector(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 count = cc_car(args) >> FIXNUM_VALUE_SHIFT;
+    lisp_val_t count_arg = cc_car(args);
     lisp_val_t rest = cc_cdr(args);
     lisp_val_t init = (rest != nil) ? cc_car(rest) : nil;
     GC_PROTECT(init);
+
+    /* [可用性/#110] **確保の要求は 3 経路(インタプリタ / AOT / JIT)が共有する
+       この primitive を通る。** だから判定を 1 箇所に置けば 3 経路を覆える
+       (スタック側は JIT だけしか守れなかった。documents/heap-exhaustion.md §1) */
+    UINT64 count = 0;
+    if (!array_size_arg(count_arg, &count)) {
+        return signal_domain_error_for_class(count_arg, "<INTEGER>", global_environment);
+    }
+    lisp_val_t exhausted = nil;
+    if (heap_signal_if_pending(&exhausted) ||
+        vector_block_signal_if_too_large(1, &count, &exhausted)) {
+        return exhausted;
+    }
 
     lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
     GC_PROTECT(vec);
@@ -10206,12 +10649,29 @@ lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
     UINT64 dims[MAX_ARRAY_RANK];
     UINT64 rank = 0;
 
+    /* [可用性/#110] **次元は非負の fixnum でなければならない。**
+       生シフトのままだと負の次元が巨大な非負の値に化ける(array_size_arg の註) */
     if ((dims_arg & TAG_MASK) == TAG_FIXNUM) {
-        dims[rank++] = dims_arg >> FIXNUM_VALUE_SHIFT;
+        if (!array_size_arg(dims_arg, &dims[rank])) {
+            return signal_domain_error_for_class(dims_arg, "<INTEGER>", global_environment);
+        }
+        rank++;
     } else {
         for (lisp_val_t cur = dims_arg; cur != nil && rank < MAX_ARRAY_RANK; cur = cc_cdr(cur)) {
-            dims[rank++] = cc_car(cur) >> FIXNUM_VALUE_SHIFT;
+            lisp_val_t d = cc_car(cur);
+            if (!array_size_arg(d, &dims[rank])) {
+                return signal_domain_error_for_class(d, "<INTEGER>", global_environment);
+            }
+            rank++;
         }
+    }
+
+    /* [可用性/#110] **判定は掛け算より前**(正確には掛けているその場)。
+       溢れた total は小さい値に巻き上がるので、後ろで見ると素通りする */
+    lisp_val_t exhausted = nil;
+    if (heap_signal_if_pending(&exhausted) ||
+        vector_block_signal_if_too_large(rank, dims, &exhausted)) {
+        return exhausted;
     }
 
     UINT64 total = 1;
@@ -10405,15 +10865,31 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 len = cc_car(args) >> FIXNUM_VALUE_SHIFT;
+    lisp_val_t len_arg = cc_car(args);
     lisp_val_t char_arg = cc_cdr(args);
     UINT8 fill = ' ';
     if (char_arg != nil) {
         fill = (UINT8)(cc_car(char_arg) >> CHAR_VALUE_SHIFT);
     }
 
+    /* [可用性/#110] 大口の確保。長さの検査と枯渇の判定を**確保より前**に置く
+       (STRING は 8 + len なので掛け算は無いが、`+ 8` は溢れうる) */
+    UINT64 len = 0;
+    if (!array_size_arg(len_arg, &len)) {
+        return signal_domain_error_for_class(len_arg, "<INTEGER>", global_environment);
+    }
+    UINT64 str_bytes = 0;
+    if (__builtin_add_overflow(len, (UINT64)8, &str_bytes)) {
+        return os_heap_signal_exhausted(global_environment);
+    }
+    lisp_val_t exhausted = nil;
+    if (heap_signal_if_pending(&exhausted) ||
+        heap_signal_if_too_large(str_bytes, &exhausted)) {
+        return exhausted;
+    }
+
     ALLOC_AUDIT_REASON(ALLOC_REASON_STRING);
-    lisp_addr_t addr = os_alloc_bytes(8 + len);
+    lisp_addr_t addr = os_alloc_bytes(str_bytes);
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = len;
     UINT8 *bytes = (UINT8 *)(addr + 8);

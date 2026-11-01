@@ -1172,6 +1172,15 @@ void os_register_eval_primitives(void) {
  * @return 評価結果
  */
 lisp_val_t os_eval(lisp_val_t exp, lisp_val_t env) {
+    /* [可用性/#110] **ヒープ枯渇の印を見る唯一の「評価の入口」である。**
+       小口の確保(os_make_cons / os_make_instance)は失敗を返せないので、
+       確保器は印を立てて予備領域から確保を続ける。知らせるのはここと
+       大口の primitive(create-array / create-vector / create-string)だけで、
+       **JIT と AOT の小口は守らない**(documents/heap-exhaustion.md §3)。
+       常道で増えるのは 1 比較 + 1 分岐である(だから関数呼び出しにしていない)。 */
+    if (g_heap_exhausted_pending) {
+        return os_heap_signal_exhausted(global_environment);
+    }
     if (exp == nil) {
         return nil;
     }
