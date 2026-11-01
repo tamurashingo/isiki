@@ -805,6 +805,7 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 |---|---|---|---|
 | 2026-10-02(PR #115) | ベンチ測定中に 1 回、ゲストが起動途中で落ちた。`aot/let` が N=3,000,000 で `total_insns=1,104,582,976` を返し `test-results.txt` が無かった | **せず** | ベンチのドライバに 1 回だけの再試行と `[FLAKE]` ログを入れた |
 | 2026-10-29(PR #121) | `make test-qemu-all` の `qemu_boot_partition`(gpt_multi)が `test-results.txt` を出さずに落ちた | **せず**(単体で 38 passed、全体の再実行でも通過) | — |
+| 2026-11-01(PR #150) | **CI** の `qemu_boot_partition`(gpt_multi)が `test-results.txt` を出さずに落ちた。**ステップ全体が 7 秒**で、ゲストが起動しきっていない | **せず**(**同じコミットのもう 1 本は pass**、再実行も pass) | **3 件目。下の仕組みを入れた** |
 
 **共通点**: どちらも**ゲストが `test-results.txt` を書く前に終わっている**。
 `make` 側は `test -f test-results.txt` で落ちるので、
@@ -813,3 +814,31 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 > **3 件目が来たら族として扱う。** そのときは「`test-results.txt` が無い」を
 > 失敗と区別して再試行する仕組みを、ベンチだけでなく `test-qemu-milestone` 側にも
 > 入れることになる。
+
+### 3 件目が来たので入れた(2026-11-01)
+
+`tools/run_qemu_milestone.sh`。`test-qemu-milestone` がこれを呼ぶ。
+**QEMU のオプションは Makefile 側が唯一の真実源**のままで、スクリプトは
+組み立て済みのコマンド行を受け取るだけにした。
+
+| 何が起きたか | どうするか |
+|---|---|
+| **結果が無い**(ゲストが `test-results.txt` を書く前に終わった) | **1 回だけ再試行する。** `[FLAKE]` を 1 行出し `tmp/qemu_flakes.txt` に追記 |
+| **結果があって失敗している** | **再試行しない。** 1 件でも failed なら即座に落とす |
+| 2 回とも結果が無い | 落とす。**「2 回続くなら flake ではない」**と書いて、次に見るものを並べる |
+
+**この区別が要点である。失敗を再試行で隠してはいけない。**
+
+**自己試験**(`make check-qemu-retry-self-test`、`make test` の前提に入れた):
+4 経路すべてを意図的に発火させる —
+①結果が無い(2 回とも) → `rc=1`・flake 1 件
+②**結果があって失敗 → `rc=1`・flake 0 件**(再試行しない)
+③1 回目で成功 → `rc=0`・flake 0 件
+④1 回目は結果が無く 2 回目で成功 → **`rc=0` だが flake 1 件**(事実を消さない)。
+**②が落ちることを確かめるのが肝心**で、ここが壊れると
+**本物の失敗を再試行で隠す仕組み**になってしまう。QEMU は起動しないので秒で終わる。
+
+**まだやっていないこと**: `test-qemu-all` の 15 段のうち、ベンチ 2 つ
+(`test-qemu-jit-bench` / `test-qemu-construct-bench`)は独自のドライバを持つので
+この仕組みを通っていない(ベンチ側には元から 1 回の再試行がある)。
+**`test-qemu-instcount-gate` の 2 パスも未対応。**

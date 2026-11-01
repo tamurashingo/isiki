@@ -196,7 +196,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -461,6 +461,14 @@ jit-reorder-self-test:
 # **safety 0 で壊れるまさにその場合だけ監査が何も見なくなる**。
 # 抑止を誰も見ていなければ D6 は守られているか分からないので、専用の口を置く。
 # **別ビルドになる**(ビルドの印が変わるので作り直しが走る)。
+# [規則 8] 再試行の仕組み自身の自己試験。**4 経路すべてを意図的に発火させる**
+# (結果が無い / 結果があって失敗 / 1 回目で成功 / 2 回目で成功)。
+# **「結果があって失敗」で再試行しないこと**が肝心で、ここが壊れると
+# 本物の失敗を再試行で隠す仕組みになってしまう。QEMU は起動しない(秒で終わる)。
+.PHONY: check-qemu-retry-self-test
+check-qemu-retry-self-test:
+	@tools/run_qemu_milestone.sh --self-test
+
 .PHONY: test-qemu-declare-audit
 test-qemu-declare-audit:
 	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_DECLARE_AUDIT \
@@ -495,7 +503,7 @@ check-macro-order:
 check-macro-order-self-test:
 	@python3 tools/check_macro_forward_refs.py --self-test
 
-test: check-macro-order check-macro-order-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) \
@@ -1116,12 +1124,19 @@ test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		echo $$ec > $(BUILD_TMPDIR)/qemu-exit.txt
 	rm -f .qemu-test-trigger
 
+# [flake] **「結果が無い」を「テストが失敗した」と区別し、結果が無いときだけ 1 回再試行する。**
+# ゲストが test-results.txt を書く前に終わると、以前は `test -f` で落ちて
+# **本物の失敗と区別が付かなかった**。同じ形の flake が 3 件記録されている
+# (2026-10-02 / 2026-10-29 / 2026-11-01。**後ろの 2 件は同じ qemu_boot_partition**)。
+# documents/records-and-measurement-rules.md「付録: QEMU 実行の flake 記録」。
+#
+# **結果があって失敗している場合は再試行しない**(失敗の隠蔽をしない)。
+# 再試行したときは [FLAKE] を 1 行出し、tmp/qemu_flakes.txt に追記する。
+# **QEMU のオプションはここが唯一の真実源**で、スクリプトはコマンド行を受け取るだけ。
 test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
-	rm -f .qemu-test-trigger test-results.txt
-	echo "$(MILESTONE)" > .qemu-test-trigger
-	qemu-system-x86_64 \
+	@tools/run_qemu_milestone.sh "$(MILESTONE)" 'qemu-system-x86_64 \
 		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
@@ -1130,11 +1145,7 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		$(QEMU_EXTRA_FLAGS) \
-		-no-reboot
-	rm -f .qemu-test-trigger
-	test -f test-results.txt
-	cat test-results.txt
-	grep -q " 0 failed" test-results.txt
+		-no-reboot'
 
 # 命令数ベースの性能計測基盤(documents/performance-measurement.md参照)。
 # ゲストが実際に実行した命令数を、ホストの実行速度・スケジューリング
