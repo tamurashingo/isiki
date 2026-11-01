@@ -753,7 +753,7 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 |---|---|---|---|
 | `tools/check_macro_forward_refs.py` | マクロ定義より前での使用 | **あり。** `--self-test`(一時ファイルに資料を作り、陽性 2 件・陰性 1 件。`L:131-171`) | `make test` の先頭。**自己試験も `make test` に入っている**(`check-macro-order-self-test`) |
 | `tools/check_eval_error_budget.py` | EVAL-ERROR を値として返す箇所の残数(予算 `c_return:7` `lisp_quote:2`) | **あり**(`--self-test`、`L:335-397`)。**ただし `make test` も CI もこれを呼んでいない。**`Makefile:307` は `--self-test` 無しの 1 行だけ | 門番は `make test`。**自己試験は手で呼ぶしかない** |
-| `tools/bench/check_bench_jit_sync.sh` | `bench_jit.lisp` が `bench_aot.lisp` から生成したものと一致 | **記録無し。** 中身は再生成して `diff` を取るだけなので 1 文字変えれば落ちる形だが、**落ちることを見せた記録は見つからない** | `make test` |
+| `tools/bench/check_bench_jit_sync.sh` | `bench_jit.lisp` と `bench_interp.lisp` が `bench_aot.lisp` から生成したものと一致 + **手書きの陽性対照 `%%bench-interp-loopcost` の内側の `let*` が真実源の逐語の写しであること** | **あり(2026-11-01 に足した)。** 3 通りとも落ちることを実際に見せた記録が `documents/performance-measurement.md`「解釈実行の経路の基準値」節の「同期検査」にある(`bench_jit.lisp` に 1 行足す / `bench_interp.lisp` に 1 行足す / 対照の `let*` を 5 束縛から 4 束縛へ)。**以前は「記録無し」で、この棚卸しが見つけた項だった** | `make test` |
 | `tools/bench/check_estimator.sh` | 推定量が校正点(`c/for = 4.000`)を通ること | **あり。検査の中に入っている。** `min-slope` / `slope-of-mins` が校正点を外して**落ちること**を毎回見せる | `make test`(QEMU 不要) |
 | `tools/check_jit_bail_lines.py` | `ZA_BAIL_LINE()` の行番号の期待値と `za.c` の注記の照合 | **あり。** `--self-test`(`za.c` を 1 行ずらして落ちることを見る) | `make check-jit-bail-lines` が本体と自己試験を**両方**呼ぶ(`Makefile:331-332`)。`make test` に入っている |
 | `tools/check_pr_claims.py` | PR 本文が挙げたファイル / make ターゲットの実在(規則 15) | **あり。** `--self-test`。**合成資料ではなく履歴そのもの**を使う(`33cc8b3` で落ち、`HEAD` で通る) | 自己試験は `make test`。本文の突き合わせは手で 1 回(`gh` が要る) |
@@ -770,7 +770,7 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 | `make test-qemu-macro-parity` | `init.lisp` の `defmacro` と `transpile.lisp` の `*macro-expanders*` の展開形 | **無い**(下の節)。設計は双方向(`cosmetic` / `DIVERGENT` は**同じになったら落ちる**) | 手で呼ぶ。**`test-qemu-all` に入っていない** |
 | `make test-qemu-error-escape-gc` | `GC_DEBUG` ビルドで `g_gc_lifo_violations == 0` | **無い**(下の節)。手順は PR #121 本文にあるが**未実行** | `make test-qemu-all` 内(`Makefile:831`。`GC_DEBUG` の別ビルド) |
 
-### 陽性対照が無い / 作れていないもの —— **5 件残っている**
+### 陽性対照が無い / 作れていないもの —— **4 件残っている**(2026-11-01 に 1 件解消)
 
 **隠さずに書く。**「無い」と分かっていることは、無いと知らないことより良い。
 
@@ -780,7 +780,7 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 | `tools/jit_frame_breakdown.py` の「合計一致」 | **道具が持っているつまみ(`LOCALS=` `DEPTH=` など)で領域の大きさを変えても、総量と内訳が同時に動くので落ちない。** 2026-10-30 に `LOCALS=8` と `DEPTH=2 LOCALS=2` で実際に試し、**どちらも終了コード 0** を確認した。つまみは `#define` を上書きしてプリプロセッサに計算させるので、`ZA_FRAME_TOTAL` も内訳も同じ入力から出る | **「内訳と総量の一方だけを動かす」細工が必要**(例: 内訳側のオフセット表だけを 1 項ずらす)。**これは「作れない」のではなく「作り方が決まっている」状態である** |
 | `make test-qemu-macro-parity` | 設計としては双方向(`same` は違ったら落ちる / `cosmetic` と `DIVERGENT` は同じになったら落ちる)。**だが意図的に発火させた記録は、期待値ファイルのヘッダに書かれた「落ちる条件」しかない。** この系統のファイルに「陽性対照」「意図的」の語は `grep` で 1 件も出ない | `FOR` の判定を `same` に書き換えて落ちることを見せる(QEMU 1 起動)。**`test-qemu-all` に入っていないことも併せて直す対象** |
 | `make test-qemu-error-escape-gc` | 手順は PR #121 本文にある(期待値を 999 にする)が、**今回も含めて未実行**。しかも `GC_DEBUG` の別ビルドが要る | 本文の手順をそのまま 1 回走らせて、落ちたことを文書に残す |
-| `tools/bench/check_bench_jit_sync.sh` | **再生成して `diff` を取るだけ**なので 1 文字変えれば落ちる形ではあるが、**落ちることを見せた記録が無い。** この項は作業指示に挙がっていなかったもので、**棚卸しで見つけた** | `bench_jit.lisp` を 1 行変えて落ちることを 1 回見せる(秒で終わる) |
+| ~~`tools/bench/check_bench_jit_sync.sh`~~ | **解消(2026-11-01、M8-T3)。** 3 通りとも落ちることを見せた。記録は `documents/performance-measurement.md`「解釈実行の経路の基準値」節の「同期検査」。**残りは 4 件。** | — |
 
 > **「双方向だから陽性対照はいらない」とは言えない。**
 > 双方向は**向き**の性質で、**計器が対象を見られること**の証明ではない

@@ -196,7 +196,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-jit-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -314,9 +314,11 @@ check-eval-error-budget:
 check-eval-error-budget-self-test:
 	@python3 tools/check_eval_error_budget.py --self-test
 
-# [性能測定] src/lisp/bench_jit.lisp が真実源(src/lisp/bench_aot.lisp)から
-# 生成したものと一致していることを固定する。ベンチ本体の S 式が AOT 版と
-# JIT 版で食い違うと、2 つの経路の命令数を比べた数字に意味が無くなる。
+# [性能測定] src/lisp/bench_jit.lisp と src/lisp/bench_interp.lisp が
+# 真実源(src/lisp/bench_aot.lisp)から生成したものと一致していることを固定する。
+# ベンチ本体の S 式が経路ごとに食い違うと、経路の命令数を比べた数字に
+# 意味が無くなる。**陽性対照(手書きの %%bench-interp-loopcost が真実源の
+# let* の逐語の写しであること)も同じスクリプトが見る。**
 # 数秒で終わるホスト側の検査なので make test の前提に入れてある
 check-bench-jit-sync:
 	@tools/bench/check_bench_jit_sync.sh
@@ -972,6 +974,7 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
 	$(MAKE) test-qemu-bench-jit
+	$(MAKE) test-qemu-bench-interp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_semantics.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_limits.lisp
@@ -1224,6 +1227,34 @@ BENCH_N_JIT ?= 1000000
 test-qemu-jit-bench: $(INSTCOUNT_PLUGIN) build
 	BENCH_N=$(BENCH_N_JIT) tools/bench/run_jit_bench.sh
 
+# [性能測定] **解釈実行(インタプリタ)経路**の構文別ベンチマーク
+# (documents/performance-measurement.md「解釈実行の経路の基準値」節)。
+# **test-qemu-construct-bench(c / aot)と test-qemu-jit-bench(aot / jit)は
+# 解釈実行の経路を 1 行も測っていない。** したがって解釈実行に費用を足しても、
+# 記録された基準値は 1 つも動かない。M8-T4/T5 でヒープ枯渇の検査を評価の
+# 入口に置くと、その費用はここにしか現れない。
+# 3 カテゴリ x 2 点 x **3 回**(BENCH_REPEAT の既定)+ ウォームアップで 19 起動。
+# test-qemu-perf 等と同じくローカル専用。
+#
+# **N は他経路より 1 桁小さい**(既定 100,000 対 1,000,000)。
+# 解釈実行は AOT/JIT より 1〜2 桁遅いので、同じ N では測定時間が爆発する。
+# **したがってこの行を c / aot / jit の行と比べてはいけない**
+# (N が違う傾きは比較できない。check_bench_baseline.py が n 列を照合する)。
+# 用途は「解釈実行の経路の中での前後比較」だけである。
+#
+# **ゲートは JIT 側の逆向きである。**どちらが落ちても測定値を 1 つも出さない:
+#   ゲート1 %%za-compiled-p が **NIL** であること(test/lisp/bench_interp_guard.lisp)
+#   ゲート2 **os_eval 区間の命令数の N に対する傾きが 0 でないこと**
+#           (解釈実行なら仕事はすべて os_eval の中で起きる。0 なら
+#            それは解釈実行ではない)
+# 陽性対照(解釈実行に費用を足すと値が動くこと。規則 8):
+#   BENCH_CASES="loop loopcost" BENCH_REPEAT=1 BENCH_NO_CHECK=1 \
+#     make test-qemu-interp-bench
+BENCH_N_INTERP ?= 100000
+
+test-qemu-interp-bench: $(INSTCOUNT_PLUGIN) build
+	BENCH_N=$(BENCH_N_INTERP) tools/bench/run_interp_bench.sh
+
 # [性能測定] JIT 経路のベンチの正当性テスト(数秒)。
 #   - 測定対象が JIT に乗っていること(%%za-compiled-p)
 #   - AOT 版と同じ計算をしていること
@@ -1231,6 +1262,16 @@ test-qemu-jit-bench: $(INSTCOUNT_PLUGIN) build
 # 計測と違い短時間で終わるので test-qemu-all に入れてある
 test-qemu-bench-jit:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_jit.lisp
+
+# [性能測定] 解釈実行の経路のベンチの正当性テスト(数秒)。
+#   - 測定対象が**インタプリタで走っている**こと(%%za-compiled-p が NIL。
+#     JIT 側の逆向き)
+#   - AOT 版と同じ計算をしていること
+#   - ゲートの**陰性対照と陽性対照**(規則 8)
+#   - 1 反復あたりの確保量が出ること(#interp-alloc-per-iter の行)
+# 計測と違い短時間で終わるので test-qemu-all に入れてある
+test-qemu-bench-interp:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_interp.lisp
 
 # [二重定義マクロの照合] src/lisp/init.lisp の defmacro と src/lisp/transpile.lisp の
 # *macro-expanders* が、同じフォームを同じ形に展開するかを突き合わせる。
