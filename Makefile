@@ -196,7 +196,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -475,6 +475,33 @@ check-qemu-retry-self-test:
 test-qemu-declare-audit:
 	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_DECLARE_AUDIT \
 	  MILESTONE=test/lisp/qemu_boot_declare_audit.lisp
+
+# [計器] 確保の理由別の数え上げ(M8-T1。documents/heap-allocation-reasons.md)。
+# ALLOC_AUDIT のビルドで、理由ごとの確保量と回数を Lisp から読めるようにする。
+#
+# **既定ビルドには 1 命令も入らない**(runtime.h のマクロが ((void)0) に畳まれ、
+# 組み込み関数も登録されない)。既定の組み込み数を変えないので
+# test/c/runtime_test.c の SMALL_HEAP_SIZE(余裕 5KB 未満)の再調整が要らない。
+#
+# ここで見るのは 3 つ:
+#   1. 理由の番号が実際にその理由を指していること(物を作って縛る)
+#   2. 合計が %%HEAP-USED-BYTES と一致すること(二重計上していない)
+#   3. **未分類の桶が 0 であること**(数え漏れが無い)
+# 3 が検出器である。理由を置かずに確保する経路を足すと、ここが落ちる。
+#
+# EXTRA_CFLAGS 経由にしているのは declare-audit と同じ理由(既に
+# BUILD_FLAG_SIGNATURE に入っているので、付け外しで古いバイナリを測る事故を防げる)
+test-qemu-alloc-audit:
+	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_ALLOC_AUDIT \
+	  MILESTONE=test/lisp/qemu_boot_alloc_audit.lisp
+
+# [計器] インタプリタ for の 1 反復あたりの確保を理由別に出す(M8-T2)。
+# **絶対値は事前に導けない**(測る行為そのものが確保する)ので、
+# n=100 と n=200 の差を 100 で割って 1 反復あたりを出す。
+# 内訳の主張(対 64 + 脱出の印 32 = 96)はこの試験が固定する
+test-qemu-alloc-breakdown:
+	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_ALLOC_AUDIT \
+	  MILESTONE=test/lisp/qemu_boot_alloc_breakdown.lisp
 
 # [案 d 第 3 段] フレーム内の番地参照が **3 入口だけ**を通っていることの検査。
 # 寸法は jit_emit_rsp_disp32 で数えた最高水位で決まるので、**3 入口を迂回されると

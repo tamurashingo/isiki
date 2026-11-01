@@ -816,6 +816,126 @@ void os_align_audit_report(void);
 
 #endif /* ISIKIOS_ALIGN_AUDIT */
 
+/* ========================= [計器] 確保の理由別の数え上げ =========================
+ * documents/heap-allocation-reasons.md。M8-T1。
+ *
+ * ## なぜ要るか
+ *
+ * 既にある計器は 2 つとも**「何のために確保したか」では分けられない**:
+ *
+ *   %%HEAP-USED-BYTES  … From 空間の割り当てポインタの進んだ量。**合計しか出ない**
+ *   ALIGN_SITE_*       … 確保の**入口**ごと。Lisp の物体はほぼ全部が
+ *                        os_alloc_bytes という 1 つの入口を通るので、
+ *                        入口で分けても 1 本の棒にしかならない
+ *
+ * そのためインタプリタループの「96 byte/反復」の内訳が
+ * documents/for-expansion.md で「〜など」のまま止まっている。
+ * **単位(タグ付きの物体 32 / 対 16)は分かっていても、個数の組み合わせが
+ * 32×1+16×4 / 32×2+16×2 / 32×3 のどれか決められない。**
+ *
+ * ## 合計が合うことを、検査ではなく構造で保証する
+ *
+ * 「理由ごとに数える」実装でありがちな失敗は、**数え漏れと二重計上**である。
+ * ここでは次の形にして、**どちらも起こりえないように**した:
+ *
+ *   1. 理由は確保の**直前**に ALLOC_AUDIT_REASON() で置く(「次の確保の理由」)
+ *   2. 数えるのは os_alloc_bytes の**中の 1 箇所だけ**。整列後の量を、
+ *      置かれていた理由の桶へ入れ、理由を未分類へ戻す
+ *
+ * こうすると **1 回の確保はちょうど 1 つの桶に入る**ので、
+ * 合計は常に %%HEAP-USED-BYTES と一致する(数え漏れ・二重計上が構造的に不可能)。
+ *
+ * ## 数え漏れは「黙って」起きない
+ *
+ * 理由を置かずに確保すると ALLOC_REASON_UNATTRIBUTED に入る。
+ * **これ自身が検出器である**: 新しい確保を足した人が理由を置き忘れると、
+ * 未分類の桶が 0 でなくなって試験が落ちる。
+ * 検査スクリプトを別に用意して「呼び出し口を数える」形にしなかったのは、
+ * **その検査自身が腐る**(原則 12)のに対し、未分類の桶は実行時の事実だからである。
+ *
+ * ## 既定ビルドは 1 命令も増えない
+ *
+ * ALLOC_AUDIT=1 のときだけ有効になる。既定ビルドではマクロが空になり、
+ * **生成コードが 1 byte も変わらないことを M2 の同一性比較器で確かめられる**
+ * (make aot-identity-check / jit-identity-check)。
+ * 組み込み関数も**監査ビルドでしか登録しない**。既定の組み込み数を増やすと
+ * test/c/runtime_test.c の SMALL_HEAP_SIZE(余裕 5KB 未満)を再調整する必要が
+ * 生じるためで、この計器のためにその綱渡りを増やす価値はない。
+ *
+ * ## 測る量がぶれないこと
+ *
+ * 命令数と違い**確保量はぶれない**(規則 11 で「断言してよい計器」とされている)。
+ * したがって監査ビルドで測った内訳は、既定ビルドの内訳としてそのまま使える。
+ * 計器を入れたビルドで測っても結論が歪まない、数少ない量である。
+ */
+#define ALLOC_REASON_UNATTRIBUTED   0  /* 理由を置かずに確保した = 数え漏れ。0 であるべき */
+#define ALLOC_REASON_CONS           1  /* os_make_cons(対。16 byte) */
+#define ALLOC_REASON_SYMBOL         2  /* os_make_symbol(インターンされる記号) */
+#define ALLOC_REASON_SYMBOL_UNINT   3  /* os_make_uninterned_symbol(gensym 等) */
+#define ALLOC_REASON_SYMBOL_NAME    4  /* 記号名の文字列ブロック */
+#define ALLOC_REASON_BIGNUM_LIMB    5  /* os_make_integer の limb 配列 */
+#define ALLOC_REASON_VECTOR_BLOCK   6  /* alloc_vector_block(配列本体) */
+#define ALLOC_REASON_STRING         7  /* 文字列の本体ブロック */
+#define ALLOC_REASON_RAW            8  /* os_alloc_raw(公開版。呼び出し元の事情は分からない) */
+/* 以下はタグ付きの物体 32 byte。os_make_instance の magic で分かれる。
+ * **go / block / catch を分けているのが要点**: インタプリタループの 96 byte の
+ * 内訳を知るには、脱出の印をいくつ作っているかが分からないと決められない */
+#define ALLOC_REASON_INST_FN_NATIVE 9
+#define ALLOC_REASON_INST_FN_INTERP 10
+#define ALLOC_REASON_INST_PROCESS   11
+#define ALLOC_REASON_INST_MACRO     12
+#define ALLOC_REASON_INST_BLOCK     13  /* MAGIC_BLOCK_EXIT(block からの脱出の印) */
+#define ALLOC_REASON_INST_STREAM    14
+#define ALLOC_REASON_INST_CLASS_INST 15
+#define ALLOC_REASON_INST_CATCH     16  /* MAGIC_CATCH_EXIT */
+#define ALLOC_REASON_INST_GO        17  /* MAGIC_GO_EXIT(tagbody / for の go の印) */
+#define ALLOC_REASON_INST_BIGNUM    18
+#define ALLOC_REASON_INST_VECTOR    19
+#define ALLOC_REASON_INST_FLOAT     20
+#define ALLOC_REASON_INST_CLASS     21  /* BUILTIN_CLASS / STANDARD_CLASS */
+#define ALLOC_REASON_INST_OTHER     22  /* 上のどれでもない magic */
+#define ALLOC_REASON_COUNT          23
+
+#ifdef ISIKIOS_ALLOC_AUDIT
+
+/** 「次の 1 回の確保の理由」を置く。os_alloc_bytes が消費する */
+void os_alloc_audit_set_reason(int reason);
+/** 理由を桶へ入れる(os_alloc_bytes の中の 1 箇所だけが呼ぶ) */
+void os_alloc_audit_charge(UINT64 aligned_bytes);
+/** 理由別の確保量(byte)を返す */
+UINT64 os_alloc_audit_bytes(int reason);
+/** 理由別の確保回数を返す */
+UINT64 os_alloc_audit_count(int reason);
+/** 全部の桶を 0 に戻す(測る区間の前で呼ぶ) */
+void os_alloc_audit_reset(void);
+/** magic から理由を引く(os_make_instance が使う) */
+int os_alloc_audit_reason_of_magic(UINT64 magic);
+/** 桶の合計と「reset からヒープが進んだ量」の差。**計器が正しければ必ず 0**。
+    Lisp から 2 つの計器を読んで引き算する形は、測る行為自身が確保するため
+    原理的に成立しない(runtime.c の註を見ること)。だから C の中で差を取る */
+UINT64 os_alloc_audit_diff(void);
+/** reset 以降に GC が走った回数。0 でなければ上の差は意味を持たない */
+UINT64 os_alloc_audit_gc_since_reset(void);
+
+#define ALLOC_AUDIT_REASON(reason)        os_alloc_audit_set_reason((reason))
+#define ALLOC_AUDIT_REASON_MAGIC(magic)   os_alloc_audit_set_reason(os_alloc_audit_reason_of_magic((magic)))
+#define ALLOC_AUDIT_CHARGE(aligned)       os_alloc_audit_charge((UINT64)(aligned))
+
+/** 組み込み関数。**監査ビルドでしか登録しない**(上の「既定ビルドは〜」参照) */
+lisp_val_t primitive_alloc_audit_bytes(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_count(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_reset(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_diff(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_gc_since_reset(lisp_val_t args, lisp_val_t env);
+
+#else
+
+#define ALLOC_AUDIT_REASON(reason)        ((void)0)
+#define ALLOC_AUDIT_REASON_MAGIC(magic)   ((void)0)
+#define ALLOC_AUDIT_CHARGE(aligned)       ((void)0)
+
+#endif /* ISIKIOS_ALLOC_AUDIT */
+
 /* ============================== Immobilized Space ==============================
  * GC(copy GC)が移動・破棄しない固定領域。JITコードやFunction Cellなど、Cのポインタとして
  * 直接掴んでおきたいデータの置き場所として使う。os_gc_collectのスキャン対象外であり、
