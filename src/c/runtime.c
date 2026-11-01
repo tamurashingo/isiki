@@ -6134,6 +6134,45 @@ int num_both_nonneg_fixnum(lisp_val_t a, lisp_val_t b) {
     return ((a | b) & (TAG_MASK | FIXNUM_SIGN_BIT)) == 0;
 }
 
+/* [A] 非負 fixnum どうしの常道。**どれも always_inline が要る**
+ * (-O1 は「呼ばれる場所が 2 つ以上ある小さな static 関数」を展開しないので、
+ *  放っておくとこの判定自体が呼び出しになる。改善 A がまさにこれを踏んだ)。
+ *
+ * 生の値 = マグニチュード << FIXNUM_VALUE_SHIFT なので:
+ *   加算 … そのまま足して bit63(FIXNUM_SIGN_BIT)で桁あふれを見る
+ *   減算 … a >= b(符号無し)なら そのまま引く
+ *   乗算 … (a >> SHIFT) * b。**巻き上がりは __builtin_mul_overflow で見る**
+ *          (生の 64 bit 乗算が巻き上がると bit63 だけでは分からない)
+ *   除算 … b != 0 なら (a / b) << SHIFT。**ゼロ除算の検査は外せない**(#DE で機械が止まる)
+ * **-0 は作らない**(どちらも非負で結果も非負)。 */
+static inline __attribute__((always_inline))
+int fixnum_fast_add(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    lisp_val_t sum = a + b;
+    if ((sum & FIXNUM_SIGN_BIT) != 0) { return 0; }
+    *out = sum;
+    return 1;
+}
+static inline __attribute__((always_inline))
+int fixnum_fast_sub(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if (a < b) { return 0; }
+    *out = a - b;
+    return 1;
+}
+static inline __attribute__((always_inline))
+int fixnum_fast_mul(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    lisp_val_t prod;
+    if (__builtin_mul_overflow(a >> FIXNUM_VALUE_SHIFT, b, &prod)) { return 0; }
+    if ((prod & FIXNUM_SIGN_BIT) != 0) { return 0; }
+    *out = prod;
+    return 1;
+}
+static inline __attribute__((always_inline))
+int fixnum_fast_div(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if (b == 0) { return 0; }   /* ゼロ除算。**div を実行する前に必ず弾く** */
+    *out = (a / b) << FIXNUM_VALUE_SHIFT;
+    return 1;
+}
+
 static int num_lt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_LESS; }
 static int num_gt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_GREATER; }
 static int num_eq(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_EQUAL; }
@@ -6720,7 +6759,23 @@ static void declare_audit_fail(const char *fn, const char *expected, lisp_val_t 
  * @param b 第二オペランド(同上)
  * @return a+b
  */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_add2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_add2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_add(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_add2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_add2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
     DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", a);
     DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", b);
     lisp_val_t sum;
@@ -6847,7 +6902,23 @@ static lisp_val_t primitive_add2_slow(lisp_val_t a, lisp_val_t b) {
  * @param b 減数(同上)
  * @return a-b
  */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_subtract2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_subtract2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_sub(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_subtract2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_subtract2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
     DECLARE_AUDIT_FIXNUM("primitive_subtract2_fixnum", a);
     DECLARE_AUDIT_FIXNUM("primitive_subtract2_fixnum", b);
     lisp_val_t diff;
@@ -7206,7 +7277,23 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド(同上)
  * @return a*b
  */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_multiply2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_multiply2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_mul(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_multiply2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_multiply2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
     DECLARE_AUDIT_FIXNUM("primitive_multiply2_fixnum", a);
     DECLARE_AUDIT_FIXNUM("primitive_multiply2_fixnum", b);
     lisp_val_t prod;
@@ -7239,7 +7326,23 @@ lisp_val_t primitive_multiply2_single(lisp_val_t a, lisp_val_t b) {
                                         (double)os_single_float_value(b)));
 }
 
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_multiply2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_mul(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_multiply2_slow(a, b);
+}
+
+static lisp_val_t primitive_multiply2_slow(lisp_val_t a, lisp_val_t b) {
     /* [改善B] 符号つきのまま計算し、桁溢れ判定に除算を使わない。
        以前は「両方とも非負」に限られていたため `(* -2 3)` が bignum 機構を通った */
     lisp_val_t prod;
@@ -7402,7 +7505,23 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
  * @param b 除数(同上)
  * @return a/b(ゼロ方向に切り捨て)。除数が0ならEVAL-ERROR
  */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_divide2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_divide2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_div(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_divide2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_divide2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
     DECLARE_AUDIT_FIXNUM("primitive_divide2_fixnum", a);
     DECLARE_AUDIT_FIXNUM("primitive_divide2_fixnum", b);
     lisp_val_t quot;
@@ -7443,7 +7562,23 @@ lisp_val_t primitive_divide2_single(lisp_val_t a, lisp_val_t b) {
                                         (double)os_single_float_value(b)));
 }
 
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_divide2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_div(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_divide2_slow(a, b);
+}
+
+static lisp_val_t primitive_divide2_slow(lisp_val_t a, lisp_val_t b) {
     /* [改善C] **内側の cons が消える。** 以前は整数どうしのとき無条件に
        cons を 2 個作って n 項版 primitive_divide へ委譲していた
        (documents/divide-direct-call.md §4-2)。PR #88 が消したのは
