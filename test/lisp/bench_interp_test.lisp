@@ -116,19 +116,26 @@
 ;; 使い回す(**同じものを 2 箇所に書けば片方だけ直される**)。あちらは
 ;; funcall で呼ぶだけなので、defglobal に入った lambda でもそのまま使える。
 ;;
-;; n1/n2 を 2000/6000 と小さく取るのは **GC を走らせないため**である。
-;; 96 byte/反復なら (6000 + 2000) x 96 ≒ 768KB で、
-;; 実測で GC 0 回だった範囲(60,000 反復 x 32 byte ≒ 1.9MB)の中に収まる。
-;; GC が走ると計器は -1 を返し、下のアサーションが落ちる(**黙って嘘の 0 を
-;; 返すことはない**)
+;; n1/n2 を **200/600 と小さく**取るのは **GC を走らせないため**である。
+;;
+;; **最初は 2000/6000 にして、`let` と `loopcost` が -1 になった**(= 窓の中で
+;; GC が走った)。見積もりを `loop` の 96 byte/反復で立てたのが間違いで、
+;; **`let` 系は 1 反復ごとに環境を作るので桁が 1 つ違う**
+;; (documents/for-expansion.md の実測では、内側の `let` 1 つで 832 byte だった)。
+;; 8,000 反復ぶんだと数 MB になり、半空間を使い切って GC が走る。
+;;
+;; 200/600 なら、仮に 1 反復 1KB でも (600 + 200) x 1KB ≒ 800KB で収まる。
+;; 傾き法なので n が小さくても値は正確である(GC が走らない限り)。
+;; **GC が走ると計器は -1 を返し、下のアサーションが落ちる**(黙って嘘の 0 を
+;; 返すことはない)
 (defglobal bench-interp-alloc-loop
-  (bench-jit-alloc-per-iter %%bench-interp-loop 2000 6000))
+  (bench-jit-alloc-per-iter %%bench-interp-loop 200 600))
 (defglobal bench-interp-alloc-arith
-  (bench-jit-alloc-per-iter %%bench-interp-arith 2000 6000))
+  (bench-jit-alloc-per-iter %%bench-interp-arith 200 600))
 (defglobal bench-interp-alloc-let
-  (bench-jit-alloc-per-iter %%bench-interp-let 2000 6000))
+  (bench-jit-alloc-per-iter %%bench-interp-let 200 600))
 (defglobal bench-interp-alloc-loopcost
-  (bench-jit-alloc-per-iter %%bench-interp-loopcost 2000 6000))
+  (bench-jit-alloc-per-iter %%bench-interp-loopcost 200 600))
 
 ;; **値は親が測って記録する。**ここでは出力に残すだけ
 ;; (規則 9: 測っていない数字を期待値として書かない)
