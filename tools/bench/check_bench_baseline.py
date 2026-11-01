@@ -22,6 +22,12 @@ documents/performance-measurement.md「JIT 経路の基準値」節 /
 「AOT の性能」でもない。**N に対する os_eval の命令数の傾きが 0 でない
 カテゴリは、測定値を出さずに落とす。**
 
+**解釈実行の経路(path=interp)では、このゲートが逆向きになる。**
+解釈実行なら仕事はすべて os_eval の中で起きるので、傾きが 0 なら
+「それは解釈実行ではない」。同じ計器を逆向きに読むだけで
+「本当にインタプリタを測っている」ことの証拠になる(INTERP_PATHS)。
+documents/performance-measurement.md「解釈実行の経路の基準値」節。
+
 入力(--results)の形式は 1 行 1 測定の TSV:
     path  case  rep  n  lo  hi  [lo_eval  hi_eval]
 lo は N 回、hi は 3N 回の**ブート全体の総命令数**。傾き (hi-lo)/(2N) が
@@ -225,30 +231,78 @@ def print_measured(g, estimator):
               f"**{e[estimator]:.2f}** | {cells} | {s[0]:.2f} | {s[-1]:.2f} |")
 
 
+# **解釈実行を測る経路。** ここだけ os_eval のゲートが逆向きになる
+# (documents/performance-measurement.md「解釈実行の経路の基準値」節)。
+#
+# c / aot / jit は「os_eval の傾きが 0 であること」= 反復ごとに
+# インタプリタへ落ちていないことを条件にする。**interp はその逆で、
+# 傾きが 0 でないことが条件である。** 解釈実行なら仕事はすべて os_eval の
+# 中で起きるので、傾きが 0 なら「それは解釈実行ではない」
+# (lambda がコンパイルされた / 本体が走っていない)。
+# **同じ計器を逆向きに読むだけなので、新しい検査を足していない。**
+INTERP_PATHS = {"interp"}
+
+
+def eval_gate_ok(path, worst, tol):
+    """os_eval の傾きの判定。**interp だけ向きが逆である。**"""
+    if path in INTERP_PATHS:
+        return worst > tol
+    return abs(worst) <= tol
+
+
+def eval_gate_ng_reason(path, worst):
+    """ゲートが落ちたときに何が起きているかを書く。向きごとに別の話になる。"""
+    if path in INTERP_PATHS:
+        return (f"**os_eval へ落ちていない(傾き {worst:+.3f} 命令/反復)。"
+                f"測定値は出さない。** 解釈実行なら仕事はすべて os_eval の中で"
+                f"起きるので、傾きが 0 ならこれは解釈実行ではない"
+                f"(lambda がコンパイルされた / 本体が走っていない)")
+    return (f"**os_eval へ反復ごとに落ちている(傾き {worst:+.3f} "
+            f"命令/反復)。測定値は出さない。**"
+            f"この数字は JIT でも AOT でもない何かを測っている")
+
+
 def print_eval(g, tol):
-    """os_eval 区間の命令数の傾き。**0 でなければ反復ごとに落ちている。**"""
+    """os_eval 区間の命令数の傾き。
+
+    **c / aot / jit は 0 でなければ反復ごとに落ちている。**
+    **interp は 0 ならそれが解釈実行ではない**(向きが逆。INTERP_PATHS)。
+    """
     have = {k: v for k, v in g.items() if v[0]["eval_slope"] is not None}
     if not have:
         print()
         print("(os_eval の区間を測っていない。range_insns の列が無い)")
         return {}
     print()
-    print("**os_eval 区間の命令数(インタプリタ落ちの検出)**")
+    print("**os_eval 区間の命令数(インタプリタ落ちの検出。"
+          "interp 行だけ条件が逆向き)**")
     print()
-    print("| 経路 | カテゴリ | 固定費(N 回側) | 傾き(命令/反復) | 判定 |")
-    print("|---|---|---:|---:|---|")
+    print("| 経路 | カテゴリ | 固定費(N 回側) | 傾き(命令/反復) | 条件 | 判定 |")
+    print("|---|---|---:|---:|---|---|")
     verdict = {}
     for (p, case) in sorted(have):
         rows = have[(p, case)]
         slopes = [r["eval_slope"] for r in rows]
-        # 傾きは本来ちょうど 0 になる(os_eval へ落ちていなければ range_insns は
-        # N に依存しない)。最大値で判定する: 1 回でも増えていれば疑う
-        worst = max(slopes, key=abs)
+        interp = p in INTERP_PATHS
+        if interp:
+            # interp は「落ちていること」が条件なので、**いちばん落ちていない
+            # 回**で判定する(1 回でも 0 に近ければ疑う)
+            worst = min(slopes)
+        else:
+            # 傾きは本来ちょうど 0 になる(os_eval へ落ちていなければ
+            # range_insns は N に依存しない)。最大値で判定する:
+            # 1 回でも増えていれば疑う
+            worst = max(slopes, key=abs)
         fixed = rows[0]["lo_eval"]
-        ok = abs(worst) <= tol
+        ok = eval_gate_ok(p, worst, tol)
         verdict[(p, case)] = (ok, worst, fixed)
-        print(f"| {p} | {case} | {fixed} | {worst:+.3f} | "
-              f"{'OK(落ちていない)' if ok else '**NG(反復ごとに落ちている)**'} |")
+        if interp:
+            cond = f"> {tol}"
+            msg = "OK(解釈実行である)" if ok else "**NG(解釈実行になっていない)**"
+        else:
+            cond = f"|傾き| <= {tol}"
+            msg = "OK(落ちていない)" if ok else "**NG(反復ごとに落ちている)**"
+        print(f"| {p} | {case} | {fixed} | {worst:+.3f} | {cond} | {msg} |")
     return verdict
 
 
@@ -257,8 +311,13 @@ def print_cross(g, estimator, verdict):
 
     「経路」の列が無かったことが issue #114 を 165 コミット見逃した原因である。
     """
-    cases = sorted({case for (_, case) in g})
     have = {k: estimates(v)[estimator] for k, v in g.items()}
+    # **interp はこの表に出さない。** N が 1 桁違うので、同じ列に並べた時点で
+    # 誰かが比を取る。比を取ってよいのは同じ N の行だけである
+    # (interp は下の print_interp が別に出す)
+    cases = sorted({case for (p, case) in g if p not in INTERP_PATHS})
+    if not cases:
+        return
 
     def mark(key):
         v = verdict.get(key)
@@ -282,6 +341,41 @@ def print_cross(g, estimator, verdict):
         print(f"| {case} | {cs} | {as_} | {js} | {ac} | {jd} | {ja} |")
 
 
+def print_interp(g, estimator, verdict):
+    """解釈実行の行を**別の表で**出す。
+
+    **他経路と同じ表に並べない。** N が 1 桁違うので、並べた時点で誰かが
+    比を取る。比を取ってよいのは同じ N の行だけである(check() が n 列を
+    照合して落とすのは、まさにそれを防ぐためである)。
+
+    代わりに「**os_eval が総命令数の何割か**」を出す。これは同じブートの
+    2 つのカウンタの比なので N に依存せず、**本当に解釈実行を測っているか**の
+    手触りになる(1 に近いほど、仕事が os_eval の中で起きている)。
+    """
+    rows = {k: v for k, v in g.items() if k[0] in INTERP_PATHS}
+    if not rows:
+        return
+    print()
+    print(f"**解釈実行の経路(推定量 {estimator})。"
+          f"他経路と N が違うので、同じ表には並べない**")
+    print()
+    print("| 経路 | カテゴリ | N | 命令/単位 | os_eval の傾き | "
+          "os_eval が占める割合 | 判定 |")
+    print("|---|---|---:|---:|---:|---:|---|")
+    for (p, case) in sorted(rows):
+        e = estimates(rows[(p, case)])
+        v = verdict.get((p, case))
+        slope = e[estimator]
+        ev = v[1] if v is not None else None
+        share = "-" if (ev is None or not slope) else f"{ev / slope:.2f}"
+        ok = "-" if v is None else ("OK" if v[0] else "**NG**")
+        evs = "-" if ev is None else f"{ev:+.3f}"
+        print(f"| {p} | {case} | {e['n']} | {slope:.2f} | {evs} | {share} | {ok} |")
+    print()
+    print("**この値を c / aot / jit の値と比べてはいけない**"
+          "(N が 1 桁違う。解釈実行の経路の中での前後比較にだけ使う)。")
+
+
 def check(g, base, estimator, tight_band, verdict):
     print()
     print("=== 記録値との照合(検出器、双方向) ===")
@@ -291,10 +385,7 @@ def check(g, base, estimator, tight_band, verdict):
         e = estimates(g[(p, case)])
         v = verdict.get((p, case))
         if v is not None and not v[0]:
-            ng.append((p, case,
-                       f"**os_eval へ反復ごとに落ちている(傾き {v[1]:+.3f} "
-                       f"命令/反復)。測定値は出さない。**"
-                       f"この数字は JIT でも AOT でもない何かを測っている"))
+            ng.append((p, case, eval_gate_ng_reason(p, v[1])))
             continue
         b = base.get((p, case))
         med = e[estimator]
@@ -413,7 +504,9 @@ def main():
                          "median3 なら 3.0 まで詰められた(推定量を変えた代償)")
     ap.add_argument("--eval-tol", type=float, default=0.5,
                     help="os_eval の傾きの許容値(既定 0.5 命令/反復)。"
-                         "本来ちょうど 0 になる")
+                         "c / aot / jit では本来ちょうど 0 になる。"
+                         "**interp 行ではこれを『超えていること』が条件になる**"
+                         "(向きが逆。INTERP_PATHS)")
     ap.add_argument("--no-eval-gate", action="store_true",
                     help="os_eval のゲートを外す(**陽性対照専用**)")
     ap.add_argument("--calibration", default="tools/bench/bench_calibration.tsv",
@@ -445,6 +538,7 @@ def main():
         print("(--no-eval-gate: os_eval のゲートを外している。陽性対照専用)")
         verdict = {}
     print_cross(g, args.estimator, verdict)
+    print_interp(g, args.estimator, verdict)
 
     if args.no_check or not args.baseline:
         print()
@@ -455,8 +549,8 @@ def main():
             print()
             print("=== os_eval のゲートが落ちました ===")
             for p, case in sorted(bad):
-                print(f"[NG] {p}/{case}: 反復ごとに os_eval へ落ちている"
-                      f"(傾き {verdict[(p, case)][1]:+.3f} 命令/反復)")
+                print(f"[NG] {p}/{case}: "
+                      f"{eval_gate_ng_reason(p, verdict[(p, case)][1])}")
             return 1
         return cal_rc
     return check(g, read_baseline(args.baseline), args.estimator,
