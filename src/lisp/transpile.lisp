@@ -483,7 +483,7 @@
                (mapcar #'find-lambda-forms (if (consp (car expr)) expr (cdr expr)))
                :initial-value nil))))
 
-(defun captured-params (body params)
+(defun captured-params (body params &optional transparent-inlinable-immediate)
   "BODY中のどこかにネストして現れるlambdaが自由変数として必要とする変数のうち、
    PARAMS(この関数自身のパラメータ)に含まれるものを集めて返す(=このパラメータは
    何らかのネストしたlambdaに捕捉される、という判定)。find-lambda-formsで見つけた
@@ -493,7 +493,9 @@
   (intersection params
                 (reduce #'union
                         (mapcar (lambda (l) (free-variables (third l) (second l)))
-                                (find-lambda-forms body))
+                                (if transparent-inlinable-immediate
+                                    (find-capturing-lambda-forms body)
+                                    (find-lambda-forms body)))
                         :initial-value nil)))
 
 (defun boxed-params (body params)
@@ -1110,6 +1112,64 @@
    『ベンチマークのletが実はフォールバックしていた』という取り違えを防ぐため、
    mainの最後に集計を標準エラーへ出す")
 
+(defun immediate-lambda-inlinable-quiet-p (params body args)
+  "immediate-lambda-inlinable-p と同じ判定を、**ログを書かずに**行う。
+   捕捉の判定(captured-params)の途中から呼ぶために要る: ログ付きのものを
+   呼ぶと、判定のための問い合わせが *inline-fallback-log* に積まれて
+   「インライン化し損ねた箇所」の記録が読めなくなる。
+   **判定の本体はこちらにあり、ログ付きは薄い包みである**(2 つの判定器に
+   分かれると食い違いがバグ源になる。captured-params の註と同じ理由)"
+  (multiple-value-bind (fixed-params rest-param) (split-rest-param params)
+    (and (not rest-param)
+         (every #'symbolp params)
+         (= (length fixed-params) (length args))
+         (null (captured-params body fixed-params t)))))
+
+(defun inlinable-immediate-app-p (expr)
+  "EXPR が ((lambda (params) body) args) の形で、しかも**インライン展開される**
+   即時適用かどうか。let/let* の展開形がこれである。
+   **この形の lambda は捕捉しない**: params は同じ C フレームのローカルに
+   なるので、束縛変数の寿命が C スタックフレームを超えない"
+  (and (consp expr)
+       (consp (car expr))
+       (eq (car (car expr)) 'lambda)
+       (= (length (car expr)) 3)
+       (immediate-lambda-inlinable-quiet-p (second (car expr)) (third (car expr)) (cdr expr))))
+
+(defun find-capturing-lambda-forms (expr)
+  "find-lambda-forms と同じだが、**インライン展開される即時適用の lambda を
+   透過する**(その body と args を同じフレームとして走査し、中にある
+   「本物の」lambda だけを集める)。
+
+   なぜ要るか(G7):
+     `let` は ((lambda (vars) body) inits) へ展開されるので、
+     **let を入れ子にすると lambda が入れ子になる。**
+     素の find-lambda-forms はそれを「捕捉する lambda」と数えるため、
+     外側の let がインライン展開を諦めてクロージャになる。
+     実測では for の展開形を入れ子にしただけで**クロージャが 6 個増えた**
+     (documents/for-expansion.md)。
+
+   安全側について:
+     透過した lambda の params が外側の名前を隠している場合、
+     さらに内側の本物の lambda がその名前を参照すると、外側の param への
+     捕捉として数えてしまう。**これは安全側の誤り**(インライン化を諦める)
+     なので許容する。逆向きの誤り(捕捉を見落とす)は GC タイミング依存の
+     破壊になるので、絶対に倒してはいけない側である"
+  (cond
+    ((atom expr) nil)
+    ((eq (car expr) 'quote) nil)
+    ((inlinable-immediate-app-p expr)
+     ;; 透過する。body と args の両方を同じフレームとして走査する
+     (append (find-capturing-lambda-forms (third (car expr)))
+             (reduce #'append
+                     (mapcar #'find-capturing-lambda-forms (cdr expr))
+                     :initial-value nil)))
+    ((and (eq (car expr) 'lambda) (= (length expr) 3)) (list expr))
+    (t (reduce #'append
+               (mapcar #'find-capturing-lambda-forms
+                       (if (consp (car expr)) expr (cdr expr)))
+               :initial-value nil))))
+
 (defun immediate-lambda-inlinable-p (params body args)
   "((lambda (params) body) args) をクロージャ生成を経由せずCブロックへ
    インライン展開してよいかを判定する。判定に迷うものは必ずフォールバック側
@@ -1126,9 +1186,12 @@
       ((not (= (length fixed-params) (length args)))
        (push (list :arity params) *inline-fallback-log*) nil)
       ;; 束縛変数がネストしたlambdaに捕捉される場合、その変数はCローカルに
-      ;; 置けない(クロージャの寿命がCスタックフレームより長くなりdanglingする)
-      ((captured-params body fixed-params)
-       (push (list :captured (captured-params body fixed-params)) *inline-fallback-log*) nil)
+      ;; 置けない(クロージャの寿命がCスタックフレームより長くなりdanglingする)。
+      ;; **ただしインライン展開される即時適用(let/let* の展開形)は透過する**:
+      ;; その lambda の params も同じ C フレームのローカルになるので、
+      ;; 寿命がフレームを超えない(G7。find-capturing-lambda-forms の註)
+      ((captured-params body fixed-params t)
+       (push (list :captured (captured-params body fixed-params t)) *inline-fallback-log*) nil)
       (t t))))
 
 (defun transpile-inline-binds (params temps inits body outer-scope inner-scope)
