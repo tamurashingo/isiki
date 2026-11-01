@@ -496,6 +496,51 @@ int os_alloc_audit_reason_of_magic(UINT64 magic) {
 }
 #endif /* ISIKIOS_ALLOC_AUDIT */
 
+/**
+ * [可用性/#110] 確保の遅い側(柔らかい端を超えた場合)。
+ *
+ * ## なぜ切り出すのか — **切り出さないと常道が 5 命令増える**
+ *
+ * 最初は os_alloc_bytes の中に素で書いていた。**それだけで常道が
+ * 15 命令から 20 命令へ増えた**(逆アセンブルで実測。2026-11-01):
+ *
+ *   push %rdi / push %rsi      ← 増えた
+ *   ...
+ *   mov  %rsi,%rax             ← 増えた
+ *   pop  %rsi / pop  %rdi      ← 増えた
+ *
+ * 遅い側が heap_apply_soft_end() の呼び出しを跨いで値を生かすので、
+ * **コンパイラが callee-saved レジスタを使い、その退避をプロローグに置く。**
+ * プロローグは常道である。**遅い側の都合を、確保のたびに全員が払う。**
+ *
+ * `os_alloc_bytes` はこの処理系でいちばん熱い関数である(対も物体も文字列も
+ * すべてここを通る)。+5 命令は G1(回帰ゼロ)に反する。
+ *
+ * **`noinline` が必須である。** 呼び出し元がちょうど 1 箇所なので、
+ * -O1 は何もしなければ畳み込んで元の木阿弥になる
+ * (M5 で同じ罠を踏んだ。documents/performance-measurement.md)。
+ *
+ * @param aligned 整列済みの要求バイト数
+ * @return 確保に使える From 空間の位置(枯渇しきった場合は戻らない)
+ */
+static __attribute__((noinline, cold)) UINT8 *os_alloc_bytes_slow(UINT64 aligned) {
+    /* From空間が枯渇。GCを1回走らせて空きを作れるか試す */
+    os_gc_collect();
+    UINT8 *p = g_from_ptr;
+    if (p + aligned > g_from_soft_end) {
+        /* GC 後もなお柔らかい端を超える。**ここでは signal できない**
+           (番地を返す関数で、cli で割り込みを止めており、signal 自身が確保する)。
+           印を立てて予備を開け、確保は続ける。知らせるのは
+           os_eval の入口か大口の primitive である(documents/heap-exhaustion.md) */
+        heap_open_reserve();
+        if (p + aligned > g_from_soft_end) {
+            /* 床まで使い切った場合は本当の枯渇として停止する(最後の砦) */
+            os_panic("out of memory (lisp heap exhausted)");
+        }
+    }
+    return p;
+}
+
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
     UINT64 aligned = os_heap_align_up(n);
 #ifndef ISIKIOS_UNIT_TEST
@@ -514,23 +559,11 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     }
 #endif
     UINT8 *p = g_from_ptr;
-    /* [可用性/#110] 比べる相手が g_from_end から g_from_soft_end へ変わっただけで、
-       **常道の比較は 1 つのままである**(命令数は増えない。設計の G1) */
+    /* [可用性/#110] 比べる相手が g_from_end から g_from_soft_end へ変わっただけなので、
+       **常道の比較は 1 つのままである**。遅い側は os_alloc_bytes_slow へ切り出した
+       (理由は下の註。**切り出さないと常道が 5 命令増える**) */
     if (p + aligned > g_from_soft_end) {
-        // From空間が枯渇。GCを1回走らせて空きを作れるか試す
-        os_gc_collect();
-        p = g_from_ptr;
-        if (p + aligned > g_from_soft_end) {
-            /* GC 後もなお柔らかい端を超える。**ここでは signal できない**
-               (番地を返す関数で、cli で割り込みを止めており、signal 自身が確保する)。
-               印を立てて予備を開け、確保は続ける。知らせるのは
-               os_eval の入口か大口の primitive である(documents/heap-exhaustion.md) */
-            heap_open_reserve();
-            if (p + aligned > g_from_soft_end) {
-                // 床まで使い切った場合は本当の枯渇として停止する(最後の砦)
-                os_panic("out of memory (lisp heap exhausted)");
-            }
-        }
+        p = os_alloc_bytes_slow(aligned);
     }
     g_from_ptr = p + aligned;
 #ifndef ISIKIOS_UNIT_TEST
