@@ -75,6 +75,45 @@
 #   もっと広く、aot の 10 行すべてに及んでいた**。当時その 2 行しか追跡して
 #   いなかったので 2 行として見えていただけである。
 #
+# 取り直しの記録(2026-10-31、2 回目。規則 16): **比較の直しで aot 10 行 + jit 6 行**
+#
+#   きっかけ … 比較 6 つの常道をインラインで先に捌く(83c57c3)
+#   鳴った行 … **aot の 10 行と jit の 6 行すべて**(「速くなった」側)
+#   推定量   … median、3 回、N=1,000,000。aot は run_construct_bench.sh、jit は run_jit_bench.sh
+#   ビルドの印 … 既定
+#
+#   | case | aot 旧 | aot 新 | jit 旧 | jit 新 |
+#   |---|---:|---:|---:|---:|
+#   | loop | 117.56 | 42.68 | 146.87 | 69.22 |
+#   | arith | 139.68 | 64.23 | 175.37 | 101.37 |
+#   | tailrec | 253.33 | 171.29 | 399.27 | 316.77 |
+#   | nontailrec | 248.10 | 174.19 | - | - |
+#   | branch | 577.22 | 199.53 | - | - |
+#   | let | 311.68 | 236.55 | 557.74 | 483.46 |
+#   | cons | 291.76 | 218.02 | - | - |
+#   | for | 159.20 | 79.74 | 199.08 | 118.76 |
+#   | vector | 465.31 | 314.61 | - | - |
+#   | funcall | 199.30 | 124.74 | 368.07 | 293.13 |
+#
+#   **宣言(規則 16)の当たり外れ**:
+#     R-set(どの行が動くか)… **当たった。** aot 10 行 + jit 6 行が動き、c 10 行は不変。
+#       **M5 では集合を外した**(2 行だけと宣言して 10 行動いた)が、今回は
+#       「比較はほぼ全ベンチのループ条件に入る」と広く取って当てた。
+#       jit も動くという ★ つきの前提も当たった(**比較は JIT がインライン展開して
+#       いない**ので、呼び先の C 関数が速くなれば jit も速くなる)
+#     幅 … **外した。** -11 〜 -25 と宣言して実測は -74 〜 -378。
+#       原因は**ラッパーの逆アセンブル(22 -> 11 命令)だけを数えて、
+#       number_compare4 とその呼び先の連鎖を数え忘れた**こと。
+#       M5 では連鎖(11 + 15 + 15 + 8 ≈ 49)を数えて当てていたので、同じ手順を踏めていない
+#
+#   **別の形の証拠**(§5-5): 各行の改善量を**1 単位あたりの比較の回数**で割ると
+#   **1 比較あたり約 74〜75 命令**で **16 行すべてが揃う**:
+#     loop 1 回 -> 74.9 / arith 1 回 -> 75.5 / let 1 回 -> 75.1 /
+#     **branch 5 回 -> 75.5** / **vector 2 回 -> 75.3** / jit の 6 行 -> 74.0〜82.5
+#
+#   **対照群**: c の 10 行(素の C 実装)は **±0.04 以内で不変**。
+#   校正点 c/arith = 4.000 も許容範囲内。
+#
 # **N がなぜ経路で違うのか:**
 #   1 ブートあたり 11〜31M 命令のぶれがある。ゲストの状態(GC 回数・ヒープ・
 #   Immobilized・tick・計算結果)はビット単位で同一なので、**ホストの応答時間に
@@ -169,19 +208,19 @@ c	cons	insns-per-unit	median	3	81.61	0.50	10000000	bbd6915	2026-10-02
 c	for	insns-per-unit	median	3	4.00	0.50	200000000	bbd6915	2026-10-02
 c	vector	insns-per-unit	median	3	17.02	0.50	200000000	bbd6915	2026-10-02
 c	funcall	insns-per-unit	median	3	7.00	0.50	200000000	bbd6915	2026-10-02
-aot	loop	insns-per-unit	median	3	117.56	20.00	1000000	3547edb	2026-10-31
-aot	arith	insns-per-unit	median	3	139.68	20.00	1000000	3547edb	2026-10-31
-aot	tailrec	insns-per-unit	median	3	253.33	20.00	1000000	3547edb	2026-10-31
-aot	nontailrec	insns-per-unit	median	3	248.10	20.00	1000000	3547edb	2026-10-31
-aot	branch	insns-per-unit	median	3	577.22	20.00	1000000	3547edb	2026-10-31
-aot	let	insns-per-unit	median	3	311.68	20.00	1000000	3547edb	2026-10-31
-aot	cons	insns-per-unit	median	3	291.76	20.00	1000000	3547edb	2026-10-31
-aot	for	insns-per-unit	median	3	159.20	20.00	1000000	3547edb	2026-10-31
-aot	vector	insns-per-unit	median	3	465.31	20.00	1000000	3547edb	2026-10-31
-aot	funcall	insns-per-unit	median	3	199.30	20.00	1000000	3547edb	2026-10-31
-jit	loop	insns-per-unit	median	3	146.87	20.00	1000000	85c4e72+for移植	2026-10-04
-jit	arith	insns-per-unit	median	3	175.37	20.00	1000000	85c4e72+for移植	2026-10-04
-jit	tailrec	insns-per-unit	median	3	399.27	20.00	1000000	7dbacc7	2026-10-07
-jit	let	insns-per-unit	median	3	557.74	20.00	1000000	85c4e72+for移植	2026-10-04
-jit	for	insns-per-unit	median	3	199.08	20.00	1000000	85c4e72+for移植	2026-10-04
-jit	funcall	insns-per-unit	median	3	368.07	20.00	1000000	7dbacc7	2026-10-07
+aot	loop	insns-per-unit	median	3	42.68	20.00	1000000	5278e5f	2026-10-31
+aot	arith	insns-per-unit	median	3	64.23	20.00	1000000	5278e5f	2026-10-31
+aot	tailrec	insns-per-unit	median	3	171.29	20.00	1000000	5278e5f	2026-10-31
+aot	nontailrec	insns-per-unit	median	3	174.19	20.00	1000000	5278e5f	2026-10-31
+aot	branch	insns-per-unit	median	3	199.53	20.00	1000000	5278e5f	2026-10-31
+aot	let	insns-per-unit	median	3	236.55	20.00	1000000	5278e5f	2026-10-31
+aot	cons	insns-per-unit	median	3	218.02	20.00	1000000	5278e5f	2026-10-31
+aot	for	insns-per-unit	median	3	79.74	20.00	1000000	5278e5f	2026-10-31
+aot	vector	insns-per-unit	median	3	314.61	20.00	1000000	5278e5f	2026-10-31
+aot	funcall	insns-per-unit	median	3	124.74	20.00	1000000	5278e5f	2026-10-31
+jit	loop	insns-per-unit	median	3	69.22	20.00	1000000	5278e5f	2026-10-31
+jit	arith	insns-per-unit	median	3	101.37	20.00	1000000	5278e5f	2026-10-31
+jit	tailrec	insns-per-unit	median	3	316.77	20.00	1000000	5278e5f	2026-10-31
+jit	let	insns-per-unit	median	3	483.46	20.00	1000000	5278e5f	2026-10-31
+jit	for	insns-per-unit	median	3	118.76	20.00	1000000	5278e5f	2026-10-31
+jit	funcall	insns-per-unit	median	3	293.13	20.00	1000000	5278e5f	2026-10-31

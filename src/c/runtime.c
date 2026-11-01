@@ -6121,6 +6121,19 @@ static lisp_val_t compare_pair_domain_error(lisp_val_t a, lisp_val_t b) {
     return signal_domain_error_for_class(bad, "<NUMBER>", global_environment);
 }
 
+/* [M7] **両方が非負 fixnum なら、生のタグ付き値の符号無し比較で大小関係がそのまま保たれる。**
+ * タグ bits 0..3 と符号 bit63 がどちらも 0 で、マグニチュードが bits 4..62 にあるため
+ * (生の値 = マグニチュード << 4)。JIT の `-` の高速路と同じ根拠
+ * (za.c の za_emit_arith_call_or_inline のコメント)。
+ *
+ * **always_inline が要る。** -O1 は「呼ばれる場所が 2 つ以上ある小さな static 関数」を
+ * 展開しないので、6 箇所から呼ぶこの判定を放っておくと**呼び出しになる**
+ * (改善 A がまさにこれを踏んだ。documents/performance-measurement.md)。 */
+static inline __attribute__((always_inline))
+int num_both_nonneg_fixnum(lisp_val_t a, lisp_val_t b) {
+    return ((a | b) & (TAG_MASK | FIXNUM_SIGN_BIT)) == 0;
+}
+
 static int num_lt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_LESS; }
 static int num_gt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_GREATER; }
 static int num_eq(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_EQUAL; }
@@ -7517,7 +7530,20 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
  *
  * どちらも optimize 側の作業と重なるため、この PR では踏み込まない。
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_less_than2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a < b) ? g_sym_t : nil;
+    }
+    return primitive_less_than2_slow(a, b);
+}
+
+static lisp_val_t primitive_less_than2_slow(lisp_val_t a, lisp_val_t b) {
     if (num_lt(a, b)) {
         return g_sym_t;
     }
@@ -7557,7 +7583,20 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a>bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_greater_than2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a > b) ? g_sym_t : nil;
+    }
+    return primitive_greater_than2_slow(a, b);
+}
+
+static lisp_val_t primitive_greater_than2_slow(lisp_val_t a, lisp_val_t b) {
     if (num_gt(a, b)) {
         return g_sym_t;
     }
@@ -7597,7 +7636,20 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a=bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_num_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a == b) ? g_sym_t : nil;
+    }
+    return primitive_num_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_num_equal2_slow(lisp_val_t a, lisp_val_t b) {
     if (num_eq(a, b)) {
         return g_sym_t;
     }
@@ -7655,7 +7707,20 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a≠b(非順序を含む)ならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_num_not_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a != b) ? g_sym_t : nil;
+    }
+    return primitive_num_not_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_num_not_equal2_slow(lisp_val_t a, lisp_val_t b) {
     /* [P5] n項版と同じ理由で、比較結果そのものを見る(上のコメント参照) */
     int c = number_compare4(a, b);
     if (c == NUM_CMP_NOT_NUMBER) {
@@ -7692,7 +7757,20 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a>=bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_greater_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a >= b) ? g_sym_t : nil;
+    }
+    return primitive_greater_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_greater_equal2_slow(lisp_val_t a, lisp_val_t b) {
     if (num_ge(a, b)) {
         return g_sym_t;
     }
@@ -7732,7 +7810,20 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a<=bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_less_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a <= b) ? g_sym_t : nil;
+    }
+    return primitive_less_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_less_equal2_slow(lisp_val_t a, lisp_val_t b) {
     if (num_le(a, b)) {
         return g_sym_t;
     }
