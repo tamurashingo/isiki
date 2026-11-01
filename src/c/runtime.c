@@ -221,6 +221,117 @@ lisp_val_t cc_diag_gc_stress(lisp_val_t args, lisp_val_t env) {
 }
 #endif
 
+#ifdef ISIKIOS_ALLOC_AUDIT
+/* [計器] 確保の理由別の数え上げ(M8-T1)。設計の理屈は runtime.h の
+   「確保の理由別の数え上げ」の節にある。要点は
+   **1 回の確保がちょうど 1 つの桶に入る**ので合計が構造的に合うこと。 */
+static UINT64 g_alloc_audit_bytes[ALLOC_REASON_COUNT];
+static UINT64 g_alloc_audit_count[ALLOC_REASON_COUNT];
+/* 「次の 1 回の確保の理由」。消費したら未分類へ戻すので、
+   理由を置き忘れた確保は必ず未分類の桶に入る(= 数え漏れが黙って起きない) */
+static int g_alloc_audit_pending = ALLOC_REASON_UNATTRIBUTED;
+/* reset した時点のヒープ位置と GC 回数。**不変量を C 側で判定するために要る**
+   (理由は下の os_alloc_audit_diff の註)。 */
+static UINT64 g_alloc_audit_heap_at_reset = 0;
+static UINT64 g_alloc_audit_gc_at_reset = 0;
+
+void os_alloc_audit_set_reason(int reason) {
+    g_alloc_audit_pending = reason;
+}
+
+void os_alloc_audit_charge(UINT64 aligned_bytes) {
+    int r = g_alloc_audit_pending;
+    if (r < 0 || r >= ALLOC_REASON_COUNT) {
+        r = ALLOC_REASON_UNATTRIBUTED;
+    }
+    g_alloc_audit_bytes[r] += aligned_bytes;
+    g_alloc_audit_count[r] += 1;
+    /* **必ず戻す。** 戻さないと直後の無印の確保が前の理由に紛れ込み、
+       「数え漏れが未分類に出る」という検出器の性質が壊れる */
+    g_alloc_audit_pending = ALLOC_REASON_UNATTRIBUTED;
+}
+
+UINT64 os_alloc_audit_bytes(int reason) {
+    if (reason < 0 || reason >= ALLOC_REASON_COUNT) {
+        return 0;
+    }
+    return g_alloc_audit_bytes[reason];
+}
+
+UINT64 os_alloc_audit_count(int reason) {
+    if (reason < 0 || reason >= ALLOC_REASON_COUNT) {
+        return 0;
+    }
+    return g_alloc_audit_count[reason];
+}
+
+void os_alloc_audit_reset(void) {
+    for (int i = 0; i < ALLOC_REASON_COUNT; i++) {
+        g_alloc_audit_bytes[i] = 0;
+        g_alloc_audit_count[i] = 0;
+    }
+    g_alloc_audit_pending = ALLOC_REASON_UNATTRIBUTED;
+    g_alloc_audit_heap_at_reset = (UINT64)(g_from_ptr - g_from_start);
+    g_alloc_audit_gc_at_reset = os_gc_collect_count();
+}
+
+/* [計器] 桶の合計と、reset からヒープが進んだ量の差。**計器が正しければ必ず 0**。
+ *
+ * ## なぜ Lisp 側で引き算しないのか(最初はそうして間違えた)
+ *
+ * **インタプリタでは「測る行為そのものが確保する」。** 関数を呼ぶたびに引数リストを
+ * 対で作るので、
+ *
+ *     (assert-equal (- (%%heap-used-bytes) h0) (ar-total))
+ *
+ * と書くと、左辺を読んだ後・右辺を数える間にも確保が起き、**必ずずれる**。
+ * 実際に 2026-11-01 の最初の版はこれで落ちた(桶の合計 4304 / ヒープの差 3584。
+ * 差 720 は reset と「ヒープを読む」の間に挟まった評価の確保だった)。
+ *
+ * **2 つの計器を Lisp から読んで引き算する形は、原理的に成立しない。**
+ * 差は C の中で、間に何も挟まらない形で取る。こうすると
+ * **いつ呼んでも 0** になる(呼ぶまでの確保は合計と水位の両方に等しく入る)。
+ */
+UINT64 os_alloc_audit_diff(void) {
+    UINT64 sum = 0;
+    for (int i = 0; i < ALLOC_REASON_COUNT; i++) {
+        sum += g_alloc_audit_bytes[i];
+    }
+    UINT64 heap = (UINT64)(g_from_ptr - g_from_start);
+    /* GC が走ると水位は戻るが桶は累積なので、差は意味を失う。
+       呼び出し側は %%ALLOC-REASON-GC-SINCE-RESET が 0 であることを先に見る */
+    if (heap < g_alloc_audit_heap_at_reset) {
+        return sum;   /* 判定不能。0 にはしない */
+    }
+    UINT64 advanced = heap - g_alloc_audit_heap_at_reset;
+    return (sum > advanced) ? (sum - advanced) : (advanced - sum);
+}
+
+UINT64 os_alloc_audit_gc_since_reset(void) {
+    return os_gc_collect_count() - g_alloc_audit_gc_at_reset;
+}
+
+int os_alloc_audit_reason_of_magic(UINT64 magic) {
+    switch (magic) {
+        case MAGIC_FUNCTION_NATIVE:      return ALLOC_REASON_INST_FN_NATIVE;
+        case MAGIC_FUNCTION_INTERPRETED: return ALLOC_REASON_INST_FN_INTERP;
+        case MAGIC_PROCESS:              return ALLOC_REASON_INST_PROCESS;
+        case MAGIC_MACRO:                return ALLOC_REASON_INST_MACRO;
+        case MAGIC_BLOCK_EXIT:           return ALLOC_REASON_INST_BLOCK;
+        case MAGIC_STREAM:               return ALLOC_REASON_INST_STREAM;
+        case MAGIC_CLASS_INSTANCE:       return ALLOC_REASON_INST_CLASS_INST;
+        case MAGIC_CATCH_EXIT:           return ALLOC_REASON_INST_CATCH;
+        case MAGIC_GO_EXIT:              return ALLOC_REASON_INST_GO;
+        case MAGIC_BIGNUM:               return ALLOC_REASON_INST_BIGNUM;
+        case MAGIC_VECTOR:               return ALLOC_REASON_INST_VECTOR;
+        case MAGIC_FLOAT:                return ALLOC_REASON_INST_FLOAT;
+        case MAGIC_BUILTIN_CLASS:        return ALLOC_REASON_INST_CLASS;
+        case MAGIC_STANDARD_CLASS:       return ALLOC_REASON_INST_CLASS;
+        default:                         return ALLOC_REASON_INST_OTHER;
+    }
+}
+#endif /* ISIKIOS_ALLOC_AUDIT */
+
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
     UINT64 aligned = os_heap_align_up(n);
 #ifndef ISIKIOS_UNIT_TEST
@@ -253,6 +364,9 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     __asm__ __volatile__ ("sti");
 #endif
     ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_ALLOC_BYTES, (UINT64)p, aligned);
+    /* [計器] 確保の理由別の数え上げ。**数えるのはここ 1 箇所だけ**なので、
+       1 回の確保がちょうど 1 つの桶に入り、合計は %%HEAP-USED-BYTES と必ず一致する */
+    ALLOC_AUDIT_CHARGE(aligned);
     return (UINT64)p;
 }
 
@@ -1164,6 +1278,8 @@ void os_panic(const char *msg) {
 }
 
 lisp_addr_t os_alloc_raw(UINT64 n) {
+    /* [計器] 公開版。呼び出し元の事情はここでは分からないので一括で RAW へ */
+    ALLOC_AUDIT_REASON(ALLOC_REASON_RAW);
     return os_alloc_bytes(n);
 }
 
@@ -1262,6 +1378,10 @@ static lisp_val_t os_make_string_for(const char *s, int uppercase_flag) {
         len++;
     }
 
+    /* [計器] uppercase_flag は**記号名かどうか**をそのまま表している
+       (呼び出し元は os_make_symbol / os_make_uninterned_symbol / os_make_string の 3 つで、
+        前 2 つだけが 1 を渡す)。つまみを足さずに理由を分けられる */
+    ALLOC_AUDIT_REASON(uppercase_flag ? ALLOC_REASON_SYMBOL_NAME : ALLOC_REASON_STRING);
     lisp_addr_t addr = os_alloc_bytes(8 + len);
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = len;
@@ -1417,6 +1537,49 @@ lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env) {
     (void)env;
     return os_make_fixnum((UINT64)(g_from_ptr - g_from_start));
 }
+
+#ifdef ISIKIOS_ALLOC_AUDIT
+/* [計器] 確保の理由別の数え上げを Lisp から読む口(M8-T1)。
+   **監査ビルドでしか登録しない。** 既定の組み込み数を増やすと
+   test/c/runtime_test.c の SMALL_HEAP_SIZE(余裕 5KB 未満)を再調整する必要が
+   生じるので、計器のためにその綱渡りを増やさない。 */
+
+/** 組み込み関数 %%ALLOC-REASON-BYTES。理由の番号を受け取り確保量(byte)を返す */
+lisp_val_t primitive_alloc_audit_bytes(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_bytes((int)os_fixnum_magnitude(cc_car(args))));
+}
+
+/** 組み込み関数 %%ALLOC-REASON-COUNT。理由の番号を受け取り確保回数を返す */
+lisp_val_t primitive_alloc_audit_count(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_count((int)os_fixnum_magnitude(cc_car(args))));
+}
+
+/** 組み込み関数 %%ALLOC-REASON-DIFF。桶の合計と水位の差。**正しければ必ず 0** */
+lisp_val_t primitive_alloc_audit_diff(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_diff());
+}
+
+/** 組み込み関数 %%ALLOC-REASON-GC-SINCE-RESET。reset 以降に GC が走った回数。
+    0 でなければ %%ALLOC-REASON-DIFF の判定は成立しない */
+lisp_val_t primitive_alloc_audit_gc_since_reset(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_gc_since_reset());
+}
+
+/** 組み込み関数 %%ALLOC-REASON-RESET。全部の桶を 0 に戻す。
+    **測る区間の直前で呼ぶ**(ブート中の確保を含めると内訳が埋まってしまう) */
+lisp_val_t primitive_alloc_audit_reset(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    os_alloc_audit_reset();
+    return nil;
+}
+#endif /* ISIKIOS_ALLOC_AUDIT */
 
 /** os_gc_collectが呼ばれた延べ回数。テストが「計算中に実際にGCが発火したか」を確認するために使う */
 static UINT64 g_gc_collect_count = 0;
@@ -3463,6 +3626,15 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%MOST-NEGATIVE-DOUBLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_negative_double_float), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
+#ifdef ISIKIOS_ALLOC_AUDIT
+        /* [計器] 確保の理由別の数え上げ(M8-T1)。**監査ビルドだけ**。
+           既定ビルドの組み込み数を変えないので SMALL_HEAP_SIZE の再調整が要らない */
+        os_set_function(os_make_symbol("%%ALLOC-REASON-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_bytes), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_count), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-RESET"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_reset), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-DIFF"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_diff), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-GC-SINCE-RESET"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_gc_since_reset), global_environment);
+#endif
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
         os_set_function(os_make_symbol("%%DIAG-FN-CELL-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_fn_cell_count), global_environment);
         os_set_function(os_make_symbol("%%PINNED-REGISTER"), os_make_native_function((lisp_addr_t)(void *)primitive_pinned_register), global_environment);  /* [実験] */
@@ -3790,6 +3962,7 @@ int os_fixnum_is_negative(lisp_val_t val) {
 lisp_val_t os_make_cons(lisp_val_t car, lisp_val_t cdr) {
     GC_PROTECT(car);
     GC_PROTECT(cdr);
+    ALLOC_AUDIT_REASON(ALLOC_REASON_CONS);
     lisp_addr_t cons_addr = os_alloc_bytes(16);
     lisp_val_t *cell = (lisp_val_t *)cons_addr;
     cell[0] = car;
@@ -3824,6 +3997,7 @@ lisp_val_t os_make_symbol(const char *name) {
 
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
     GC_PROTECT(name_str);
+    ALLOC_AUDIT_REASON(ALLOC_REASON_SYMBOL);
     lisp_addr_t addr = os_alloc_bytes(32);
     lisp_val_t *sym = (lisp_val_t *)addr;
     sym[0] = name_str; // string へのポインタ
@@ -3904,6 +4078,7 @@ lisp_val_t os_make_symbol_cached(int *cache_idx, const char *name) {
 lisp_val_t os_make_uninterned_symbol(const char *name) {
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
     GC_PROTECT(name_str);
+    ALLOC_AUDIT_REASON(ALLOC_REASON_SYMBOL_UNINT);
     lisp_addr_t addr = os_alloc_bytes(32);
     lisp_val_t *sym = (lisp_val_t *)addr;
     sym[0] = name_str;          // string へのポインタ
@@ -4043,6 +4218,10 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
     // 次第でビルドごと・ASLRごとに非決定的)。gc_scan_instance(このオブジェクトが
     // 生き残った後のGCで実際に辿るフィールド)と同じ基準で、本当にタグ付き値である
     // フィールドだけをGC_PROTECTする。
+    /* [計器] magic から理由を引いて置く。**switch の中の 5 つの確保はすべて 32 byte で
+       同じ物体**なので、ここで 1 回置けば足りる(GC_PROTECT は確保しないので、
+       置いてから実際に確保するまでの間に別の確保は挟まらない) */
+    ALLOC_AUDIT_REASON_MAGIC(magic);
     lisp_addr_t addr;
     switch (magic) {
         case MAGIC_FUNCTION_NATIVE: {
@@ -5834,6 +6013,7 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
     lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
     GC_PROTECT(bignum);
 
+    ALLOC_AUDIT_REASON(ALLOC_REASON_BIGNUM_LIMB);
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
@@ -9519,6 +9699,7 @@ lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env) {
         total_len += ((lisp_val_t *)addr)[0];
     }
 
+    ALLOC_AUDIT_REASON(ALLOC_REASON_STRING);
     lisp_addr_t out_addr = os_alloc_bytes(8 + total_len);
     ((lisp_val_t *)out_addr)[0] = total_len;
     UINT8 *out_bytes = (UINT8 *)(out_addr + 8);
@@ -9851,6 +10032,7 @@ static lisp_addr_t alloc_vector_block(UINT64 rank, const UINT64 *dims) {
     for (UINT64 i = 0; i < rank; i++) {
         total *= dims[i];
     }
+    ALLOC_AUDIT_REASON(ALLOC_REASON_VECTOR_BLOCK);
     lisp_addr_t addr = os_alloc_bytes(8 * (1 + rank + total));
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = rank;
@@ -10230,6 +10412,7 @@ lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
         fill = (UINT8)(cc_car(char_arg) >> CHAR_VALUE_SHIFT);
     }
 
+    ALLOC_AUDIT_REASON(ALLOC_REASON_STRING);
     lisp_addr_t addr = os_alloc_bytes(8 + len);
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = len;
@@ -10539,6 +10722,7 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
         }
         case TAG_STRING: {
             GC_PROTECT(seq);
+            ALLOC_AUDIT_REASON(ALLOC_REASON_STRING);
             lisp_addr_t out_addr = os_alloc_bytes(8 + out_len);
             lisp_addr_t addr = seq & ~TAG_MASK;
             UINT8 *bytes = (UINT8 *)(addr + 8);
