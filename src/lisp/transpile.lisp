@@ -810,17 +810,34 @@
   (destructuring-bind (for-kw bindings test-and-result &rest body) form
     (declare (ignore for-kw))
     (let ((temps (%%for-temp-names bindings 1)))
-      `(let ,(append (%%for-let-bindings bindings) (%%for-temp-let-bindings temps))
-         (block nil
-           (tagbody
-            %for-loop
-            (if ,(car test-and-result)
-                (return-from nil (progn ,@(cdr test-and-result)))
-                (progn
-                  ,@body
-                  ,@(%%for-step-setqs bindings temps)
-                  ,@(%%for-commit-setqs bindings temps)
-                  (go %for-loop)))))))))
+      ;; [G7] **一時変数は入れ子の let に置く。** init.lisp の for と**同じ展開形**に
+      ;; するためである(macro-parity の FOR が cosmetic から same になる)。
+      ;;
+      ;; 以前は 1 つの let に append していた。AOT には 1 つの let の束縛数の上限が
+      ;; 無いのでそれでも動くが、**init.lisp 側は入れ子にせざるを得ない**:
+      ;; JIT の ZA_MAX_LOCALS_PER_LET = 4 を超えると束縛 3 個の for が JIT に
+      ;; 乗らなくなる(documents/for-expansion.md §5-4)。
+      ;; **揃えるなら、上限のある側に合わせるしかない。**
+      ;;
+      ;; **生成される C は 1 バイトも変わらない**(測って確かめた)。
+      ;; transpile-inline-binds が**束縛 1 個ごとに入れ子のブロックを出す**ので、
+      ;; 「1 つの let に 2N 束縛」と「N 束縛の let を 2 段」は同じ C に落ちる。
+      ;;
+      ;; **これが成り立つのは捕捉解析を直したあとだけである。** 直す前は
+      ;; 入れ子の let が入れ子の lambda と見なされてクロージャに落ち、
+      ;; **クロージャが 6 個増えた**(documents/aot-capture-analysis.md §1)。
+      `(let ,(%%for-let-bindings bindings)
+         (let ,(%%for-temp-let-bindings temps)
+           (block nil
+             (tagbody
+              %for-loop
+              (if ,(car test-and-result)
+                  (return-from nil (progn ,@(cdr test-and-result)))
+                  (progn
+                    ,@body
+                    ,@(%%for-step-setqs bindings temps)
+                    ,@(%%for-commit-setqs bindings temps)
+                    (go %for-loop))))))))))
 
 (defun expand-while (form)
   (destructuring-bind (while-kw test &rest body) form
