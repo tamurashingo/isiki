@@ -766,21 +766,21 @@ BENCH_NO_CHECK=1 make test-qemu-construct-bench  (c と aot、10 カテゴリ、
 | `test/lisp/jit_limits_test.lisp` + `%%DIAG-ZA-BAIL-AT` | どの容量上限で JIT が諦めたか | **あり。ファイル自身が陽性対照を兼ねる**(`L:7,14`)。1 つ超えの式を食わせて、診断がその上限の行を名指しすることを見る | `make test-qemu-all` 内(`qemu_boot_jit_limits.lisp`) |
 | `isiki-file-end-check`(`test/lisp/test_framework.lisp:236`) | 宣言(`%%current-inline`)の汚染と、**ファイル単位の件数が 0 でないこと** | **あり。そして一度壊れていた**(上の表の PR #94)。`#count` 行を出すので、どのファイルが何件減ったかが出力差分に出る | 各試験ファイルの出口 |
 | `_Static_assert` 群(**91 箇所**。`runtime.h` 68 / `runtime.c` 9 / `za.c` 8 / `za_jit_tags.h` 4 / `za.h` 1 / `types.h` 1) | コンパイル時の不変条件 | **ほぼ無い。91 箇所のうち記録があるのは 1 箇所だけ**(`runtime.c:1702`。`INLINE_BIT_COUNT` をわざと 9 にしてビルドが落ちることを確認。`documents/inline-arith.md` §8-2) | ビルドごと |
-| `tools/jit_frame_breakdown.py` の「合計一致」 | 内訳の合計 = `ZA_FRAME_TOTAL`、予備領域 = 各項の合計 | **無い**(下の節) | `make jit-frame-breakdown`。手で呼ぶ |
-| `make test-qemu-macro-parity` | `init.lisp` の `defmacro` と `transpile.lisp` の `*macro-expanders*` の展開形 | **無い**(下の節)。設計は双方向(`cosmetic` / `DIVERGENT` は**同じになったら落ちる**) | 手で呼ぶ。**`test-qemu-all` に入っていない** |
-| `make test-qemu-error-escape-gc` | `GC_DEBUG` ビルドで `g_gc_lifo_violations == 0` | **無い**(下の節)。手順は PR #121 本文にあるが**未実行** | `make test-qemu-all` 内(`Makefile:831`。`GC_DEBUG` の別ビルド) |
+| `tools/jit_frame_breakdown.py` の「合計一致」 | 内訳の各領域の合計が `ZA_FRAME_TOTAL` と一致すること | **あり(2026-11-02)。** プローブの数え上げから領域を 1 つ落として `ERROR: 内訳の合計 7464 が ZA_FRAME_TOTAL 7480 と一致しない` で落ちることを見せた。**「大きさを変える」では落ちない**(和が望遠鏡的に畳まれる。下の註) | `make jit-frame-breakdown`(QEMU 不要・docker 不要) |
+| `make test-qemu-macro-parity` | `init.lisp` の `defmacro` と `transpile.lisp` の `*macro-expanders*` の展開形 | **あり(2026-11-02)。双方向とも発火させた。** `same` と偽った `LET` で rc=1 / `cosmetic` と偽った `FOR`(実際は一致)で rc=1 | 手で呼ぶ。**`test-qemu-all` に入っていない**。**陽性対照は QEMU 不要**(判定はホスト側) |
+| `make test-qemu-error-escape-gc` | `GC_DEBUG` ビルドで `g_gc_lifo_violations == 0` | **あり(2026-11-02)。** 期待値を 0 → 999 にして `[NG] (%%DIAG-GC-LIFO-VIOLATIONS) => 0 (expected 999)`、**372 passed / 1 failed** | `make test-qemu-all` 内(`GC_DEBUG` の別ビルド) |
 | `make test-qemu-stack-guard-gc` | 深い再帰からの巻き戻しで GC ルートの LIFO が壊れないこと | **あり。ただし 2026-11-01 まで「1 件 NG のまま」だった**(下の節) | 手で呼ぶ。**`test-qemu-all` に入っていない** |
 
-### 陽性対照が無い / 作れていないもの —— **4 件残っている**(2026-11-01 に 1 件解消)
+### 陽性対照が無い / 作れていないもの —— **1 件残っている**(2026-11-02 に 3 件解消)
 
 **隠さずに書く。**「無い」と分かっていることは、無いと知らないことより良い。
 
 | 項目 | 理由 | 作るなら |
 |---|---|---|
 | `_Static_assert` 群(**90 / 91 箇所**) | **ビルドで落ちる検査なので、「落ちることを見せた」記録を残しにくい。** 1 箇所ずつわざと壊して `make` を失敗させる手順は書けるが、**通るビルドと落ちるビルドを 1 回の `make` で両立できない。** 記録があるのは `INLINE_BIT_COUNT` の 1 箇所だけ | 壊した版を別ディレクトリでコンパイルするだけの小さな走者。**まだ誰も書いていない** |
-| `tools/jit_frame_breakdown.py` の「合計一致」 | **道具が持っているつまみ(`LOCALS=` `DEPTH=` など)で領域の大きさを変えても、総量と内訳が同時に動くので落ちない。** 2026-10-30 に `LOCALS=8` と `DEPTH=2 LOCALS=2` で実際に試し、**どちらも終了コード 0** を確認した。つまみは `#define` を上書きしてプリプロセッサに計算させるので、`ZA_FRAME_TOTAL` も内訳も同じ入力から出る | **「内訳と総量の一方だけを動かす」細工が必要**(例: 内訳側のオフセット表だけを 1 項ずらす)。**これは「作れない」のではなく「作り方が決まっている」状態である** |
-| `make test-qemu-macro-parity` | 設計としては双方向(`same` は違ったら落ちる / `cosmetic` と `DIVERGENT` は同じになったら落ちる)。**だが意図的に発火させた記録は、期待値ファイルのヘッダに書かれた「落ちる条件」しかない。** この系統のファイルに「陽性対照」「意図的」の語は `grep` で 1 件も出ない | `FOR` の判定を `same` に書き換えて落ちることを見せる(QEMU 1 起動)。**`test-qemu-all` に入っていないことも併せて直す対象** |
-| `make test-qemu-error-escape-gc` | 手順は PR #121 本文にある(期待値を 999 にする)が、**今回も含めて未実行**。しかも `GC_DEBUG` の別ビルドが要る | 本文の手順をそのまま 1 回走らせて、落ちたことを文書に残す |
+| ~~`tools/jit_frame_breakdown.py` の「合計一致」~~ | **解消(2026-11-02)。** 忠実な対照は「大きさを変える」ではなく **「領域を 1 つ数え落とす」**だった(和が望遠鏡的に畳まれるので途中の境界をずらしても変わらない。下の註)。`ERROR: 内訳の合計 7464 が ZA_FRAME_TOTAL 7480 と一致しない` で rc=1 | — |
+| ~~`make test-qemu-macro-parity`~~ | **解消(2026-11-02)。両方向とも発火させた。** `same` と偽った `LET` で rc=1 / `cosmetic` と偽った `FOR`(実際は一致)で rc=1。**QEMU は 1 回も起動していない**(判定はホスト側の python で、ゲストの出力は `tmp/` に残っていた) | — |
+| ~~`make test-qemu-error-escape-gc`~~ | **解消(2026-11-02)。** 期待値を 0 → 999 にして 1 回走らせ、`[NG] (%%DIAG-GC-LIFO-VIOLATIONS) => 0 (expected 999)` で **372 passed / 1 failed** | — |
 | ~~`tools/bench/check_bench_jit_sync.sh`~~ | **解消(2026-11-01、M8-T3)。** 3 通りとも落ちることを見せた。記録は `documents/performance-measurement.md`「解釈実行の経路の基準値」節の「同期検査」。**残りは 4 件。** | — |
 
 ### 壊れたまま誰も見ていなかった検出器(2026-11-01 に見つけた)
@@ -812,6 +812,48 @@ assert を 1 つも持たない**ので、`isiki-file-end-check` の
 直した(素の `load` にした)。**`test-qemu-all` へ入れるかは別の判断**で、
 `GC_DEBUG` の別ビルドが要るので通しに入れると時間が伸びる
 (`test-qemu-error-escape-gc` は入っている。こちらも入れる価値はある)。
+
+#### 「合計一致」が落としにくかった本当の理由 — **和が望遠鏡的に畳まれる**(2026-11-02)
+
+棚卸しには「つまみで領域の大きさを変えても、**総量と内訳が同時に動く**ので落ちない」と
+書いてあった。それは症状としては正しいが、**理由はもう 1 段深い。**
+
+プローブは**隣接するオフセットの差**を出している:
+
+```c
+int end = (i + 1 < n) ? e[i+1].off : ZA_FRAME_EXTRA;
+printf("%s\t%d\t%d\n", e[i].name, e[i].off, end - e[i].off);
+```
+
+差の総和は**望遠鏡的に畳まれて `ZA_FRAME_EXTRA − 最小オフセット` になる。**
+つまり **途中の境界をいくらずらしても和は変わらない**(隣り合う 2 項で打ち消す)。
+動くのは**両端だけ**である。
+
+したがって忠実な対照は「大きさを変える」ではなく **「領域を 1 つ数え落とす」**:
+プローブの出力ループに `if (i == 0) continue;` を入れると、
+和が 7480 → 7464 になって検査が当たる。
+**これは検査の趣旨(「数えていない領域がある」)そのものである。**
+
+> **「つまみを回しても落ちない」で止めずに、**
+> **その計器が何の恒等式を見ているのかまで降りると、作り方が決まる。**
+
+#### macro-parity の陽性対照に **QEMU は要らなかった**(2026-11-02)
+
+棚卸しには「作るなら…**QEMU 1 起動**」と書いてあったが、**それが誤りだった。**
+
+`tools/check_macro_parity.sh` は 3 段に分かれている:
+
+1. host 側の展開を docker で出す → `tmp/macro_parity_host.txt`
+2. guest 側の展開を QEMU で出す → `tmp/macro_parity_guest.txt`
+3. **期待値表と突き合わせる(ホスト側の python)**
+
+**陽性対照で確かめたいのは 3 だけ**である。1 と 2 の出力は前回の実行のまま
+`tmp/` に残っているので、**判定部分だけを別の期待値表で呼び直せばよい。**
+
+> **「この検出器を試すには QEMU が要る」と思われていたことが、
+> 試されていなかった理由だったとみられる。**
+> 棚卸しの表に「作るなら」の欄を設けたこと自体は正しかったが、
+> **そこに書いた見積もりが間違っていた。**
 
 > **「双方向だから陽性対照はいらない」とは言えない。**
 > 双方向は**向き**の性質で、**計器が対象を見られること**の証明ではない
