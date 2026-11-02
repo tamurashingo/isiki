@@ -64,6 +64,15 @@
 # documents/performance-measurement.md「解釈実行の経路の基準値」節。
 # ---------------------------------------------------------------------------
 #
+# 取り直しの記録(2026-11-01、規則 16): **aot/cons だけを取り直した** 218.02 -> 198.34
+#   捕捉解析の修正(fc38b62)で、%%bench-aot-cons の内側の let が外側の total を
+#   捕捉していたのが解消し、クロージャと箱入れ(boxing)の間接が消えた。
+#   **R-set は生成物の差分から導いた**: 連番を正規化して本体を突き合わせ、
+#   bench で構造が変わったのは cons の 2 関数だけだった(aot/let は 1 バイトも
+#   変わっていない = 最初から完全にインライン化されていた)。
+#   他の行は取り直さない(差は ±1.84 以内で既知のセッション間の幅の中)。
+#   documents/aot-capture-analysis.md §5
+#
 # 取り直しの記録(2026-10-31、規則 16): **aot の 10 行すべてを取り直した**
 #
 #   きっかけ … 改善 A の直し(3547edb。算術の常道をインラインで先に捌く)
@@ -242,7 +251,7 @@ aot	tailrec	insns-per-unit	median	3	171.29	20.00	1000000	5278e5f	2026-10-31
 aot	nontailrec	insns-per-unit	median	3	174.19	20.00	1000000	5278e5f	2026-10-31
 aot	branch	insns-per-unit	median	3	199.53	20.00	1000000	5278e5f	2026-10-31
 aot	let	insns-per-unit	median	3	236.55	20.00	1000000	5278e5f	2026-10-31
-aot	cons	insns-per-unit	median	3	218.02	20.00	1000000	5278e5f	2026-10-31
+aot	cons	insns-per-unit	median	3	198.34	20.00	1000000	fc38b62	2026-11-01
 aot	for	insns-per-unit	median	3	79.74	20.00	1000000	5278e5f	2026-10-31
 aot	vector	insns-per-unit	median	3	314.61	20.00	1000000	5278e5f	2026-10-31
 aot	funcall	insns-per-unit	median	3	124.74	20.00	1000000	5278e5f	2026-10-31
