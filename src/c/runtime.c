@@ -6,6 +6,7 @@
 #include "reader.h"
 #include "stream.h"
 #include "process.h"
+#include "za.h"
 #ifdef ISIKIOS_UNIT_TEST
 /* ネイティブ(x86_64以外を含む)ホストでのユニットテストではx87/SSE2インラインアセンブラが
    使えないため、libmの対応する関数で計算する。実機(x86_64 UEFI, ISIKIOS_UNIT_TEST未定義)
@@ -58,6 +59,17 @@ lisp_val_t g_sym_unwind_protect;
 lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 lisp_val_t g_sym_flet;
+lisp_val_t g_sym_declaim;
+lisp_val_t g_sym_declare;
+lisp_val_t g_sym_type;
+lisp_val_t g_sym_null;
+lisp_val_t g_sym_eq;
+lisp_val_t g_sym_inline;
+lisp_val_t g_sym_notinline;
+lisp_val_t g_sym_optimize;
+lisp_val_t g_sym_speed;
+lisp_val_t g_sym_safety;
+lisp_val_t g_sym_space;
 /** labels特殊形式を表すシンボル */
 lisp_val_t g_sym_labels;
 /** defvar特殊形式を表すシンボル */
@@ -86,6 +98,10 @@ lisp_val_t g_sym_car;
 lisp_val_t g_sym_cdr;
 /** cons関数を表すシンボル */
 lisp_val_t g_sym_cons;
+lisp_val_t g_sym_plus;
+lisp_val_t g_sym_minus;
+lisp_val_t g_sym_asterisk;
+lisp_val_t g_sym_slash;
 
 /** 構文エラーを表すシンボル */
 lisp_val_t g_sym_read_error;
@@ -166,6 +182,170 @@ static UINT8 *g_to_ptr;
 /** To空間の終端アドレス */
 static UINT8 *g_to_end;
 
+/* ===== [可用性] ヒープ枯渇をハングではなくエラーにする(issue #110、D9) ======
+ *
+ * 設計は documents/heap-exhaustion.md。要点だけ写す。
+ *
+ * **確保器(os_alloc_bytes)の中では signal できない。** 番地を返す関数であり、
+ * cli で割り込みを止めており、signal 自身が確保する。だから検査は
+ * 「確保を要求する primitive」に置き、確保器の側は**印を立てるだけ**にする。
+ *
+ * [大口と小口]
+ *   大口(create-array / create-vector / create-string)は引数から大きさが決まり、
+ *   呼び出し元が値を受け取るので**その場で signal できる**。
+ *   小口(os_make_cons / os_make_instance)は「対を作れませんでした」を返す先が無い。
+ *   こちらは閾値と予備で受け、**印を見る場所**(大口の primitive と os_eval の
+ *   評価の入口)で signal する。
+ *
+ * [常道の命令数を 1 つも増やさない]
+ *   os_alloc_bytes の比較の相手を g_from_end から g_from_soft_end へ変えるだけで、
+ *   **比較は 1 つのままである**(定数が変わるだけ)。G1(回帰ゼロ)のために譲れない。
+ *
+ * [守らない経路を書く(スタック側が「JIT だけ守った」ことを記録したのと同じ作法)]
+ *   **JIT と AOT の小口は守らない。** 印を見るのは os_eval の入口と大口の primitive
+ *   だけなので、JIT / AOT のコードが小口の確保だけを延々と続けると、印が立ったまま
+ *   誰も見ないまま床へ達して panic する。そこを守るには JIT のプロローグと AOT の
+ *   関数入口にも検査が要る(= 常道に命令が増える)。今回は入れない。
+ */
+/* ---- 予備領域は定数ではなく**導出式**にする(規則 13。za.c の
+ *      ZA_STACK_RESERVE_MIN と同じ扱い)------------------------------------
+ *
+ * 予備領域 = 条件の実体 + signal が組む引数 + 解釈実行のフレーム + ハンドラの保証分 + 床
+ */
+/** <storage-exhausted> の実体。INSTANCE 32 + スロット配列ブロック
+ *  8*(1+1+スロット数)。<storage-exhausted> はスロットを持たないが、
+ *  make-instance は (make-array (length (%%class-slots class))) を必ず通るので
+ *  上限として 8 スロットぶんを見ておく */
+#define HEAP_CONDITION_INSTANCE_MAX  (32 + 8 * (1 + 1 + 8))
+/** os_signal_condition が組む対(make_args 1 つ + signal_args 2 つ) */
+#define HEAP_SIGNAL_ARGS_MAX         (3 * 16)
+/** ★ **未実測。** signal-condition / make-instance / %find-class を解釈実行で
+ *  呼ぶあいだに積む環境フレームと引数の対。**インタプリタでは関数を呼ぶたびに
+ *  引数リストを対で作る**ので、ここが予備領域の主項になる。
+ *  実測する手段を同梱した: os_heap_signal_path_bytes() が
+ *  「signal 経路が実際に確保した最大バイト数」を返す(GC を挟んだ回は数えない)。
+ *  test/c/runtime_test.c の枯渇テストがこの値が予備領域より小さいことを見る。
+ *  **測ったら、この値をその実測値 + 余裕へ直すこと**(規則 9) */
+#define HEAP_SIGNAL_LISP_FRAMES      32768
+/** ★ **未実測。** ユーザのハンドラに保証する量。ISLisp の with-handler の
+ *  ハンドラは signal の動的文脈で走る(巻き戻す前)ので、ハンドラが確保する分も
+ *  予備領域に入っていなければならない。既定のトップレベルハンドラは
+ *  %report-condition-string → create-string-output-stream(容量 1024)+ format を
+ *  通るので、**文字列バッファが主項**である。
+ *  **これを超えるハンドラは保証しない**(床を割って panic。劣化であってハングではない) */
+#define HEAP_HANDLER_ALLOWANCE       32768
+/** 予備領域の中でさらに枯渇したときに捕まえる床。ここを割ったら panic する。
+ *  za.c の ZA_STACK_HARD_FLOOR_WANT と同じ値・同じ役割 */
+#define HEAP_HARD_FLOOR_WANT         4096
+
+/** 予備領域の下限。**これが導出式の本体である。** */
+#define HEAP_SIGNAL_RESERVE_MIN \
+    (HEAP_CONDITION_INSTANCE_MAX + HEAP_SIGNAL_ARGS_MAX + \
+     HEAP_SIGNAL_LISP_FRAMES + HEAP_HANDLER_ALLOWANCE + HEAP_HARD_FLOOR_WANT)
+
+/** 実際に使う予備領域。**-D で上書きできる**(陽性対照のため。
+ *  意図的に小さくして「知らせている途中で床を割る」ことを確かめる口) */
+#ifndef HEAP_SIGNAL_RESERVE
+#define HEAP_SIGNAL_RESERVE \
+    (((HEAP_SIGNAL_RESERVE_MIN) + (OS_HEAP_ALIGN - 1)) & ~(OS_HEAP_ALIGN - 1ULL))
+#define HEAP_RESERVE_DERIVED 1
+#endif
+
+/* 床は予備領域の半分を超えないようにする(za.c の ZA_STACK_HARD_FLOOR と同じ扱い)。
+   **これが無いと -D で予備を小さくしたときに床が柔らかい端より上に来て、逆効果になる。**
+   実際に踏んだ: -DHEAP_SIGNAL_RESERVE=0 で陽性対照を取ったとき、予備 0 / 床 4096 に
+   なって「柔らかい端(= 真の端)を超えたら、さらに低い床と比べて必ず panic」という
+   構成が成立し、小さいヒープの試験がハングした(2026-11-01) */
+#if HEAP_HARD_FLOOR_WANT * 2 >= HEAP_SIGNAL_RESERVE
+#define HEAP_HARD_FLOOR (HEAP_SIGNAL_RESERVE / 2)
+#else
+#define HEAP_HARD_FLOOR HEAP_HARD_FLOOR_WANT
+#endif
+
+#ifdef HEAP_RESERVE_DERIVED
+_Static_assert(HEAP_SIGNAL_RESERVE >= HEAP_SIGNAL_RESERVE_MIN,
+               "HEAP_SIGNAL_RESERVE が下限を満たしていない(documents/heap-exhaustion.md)");
+_Static_assert(HEAP_SIGNAL_RESERVE % OS_HEAP_ALIGN == 0,
+               "予備領域は OS_HEAP_ALIGN の倍数でなければならない(柔らかい端が境界から外れる)");
+_Static_assert(HEAP_HARD_FLOOR == HEAP_HARD_FLOOR_WANT,
+               "導出式のときは床が削られてはならない");
+#endif
+
+/** From空間の「柔らかい端」。**os_alloc_bytes の常道が比べる相手はこれである。**
+ *  通常は g_from_soft_end_normal、予備を開けているあいだは g_from_floor_end */
+static UINT8 *g_from_soft_end;
+/** 通常時の柔らかい端(g_from_end - 予備領域) */
+static UINT8 *g_from_soft_end_normal;
+/** 床(g_from_end - 床の大きさ)。**ここを割ったら panic する。** */
+static UINT8 *g_from_floor_end;
+/** [印] 枯渇を知らせる必要があるか。**eval.c が評価の入口で直接読む。**
+ *  関数呼び出しにしないのは、常道に増える命令を 1 比較 + 1 分岐に抑えるため */
+int g_heap_exhausted_pending = 0;
+/** signal 経路の中にいるか。**入れ子の signal を防ぐ**(重ねると予備を食い潰す) */
+static int g_in_heap_signal = 0;
+/** 枯渇を知らせた延べ回数(診断用。os_heap_guard_hits) */
+static UINT64 g_heap_guard_hits = 0;
+/** signal 経路が 1 回で確保した最大バイト数の実測値(GC を挟んだ回は数えない)。
+ *  HEAP_SIGNAL_LISP_FRAMES / HEAP_HANDLER_ALLOWANCE の ★ を実測へ直すための計器 */
+static UINT64 g_heap_signal_path_bytes = 0;
+
+/** 印・signal 中かどうかから、柔らかい端を決め直す。
+ *  **予備を開けるのは「知らせている間」だけ**なので、状態が変わるたびにここを通す */
+static void heap_apply_soft_end(void) {
+    g_from_soft_end = (g_heap_exhausted_pending || g_in_heap_signal)
+        ? g_from_floor_end : g_from_soft_end_normal;
+}
+
+/** 半空間の寸法から柔らかい端と床を計算する。**os_heap_init と GC のフリップの
+ *  直後に必ず呼ぶ**(どちらも g_from_start / g_from_end を動かす)。
+ *
+ *  [入らなければ 0 にする。**切り詰めない。**]
+ *  予備領域は定数だが、半空間の大きさは構成で変わる。定数のままだと
+ *  ユニットテストの小さいヒープ(85KB = 半空間 42.5KB)では予備が半空間より
+ *  大きくなり、柔らかい端が先頭より前へ回り込んで**起動の最初の確保から
+ *  遅い側に落ちる**。
+ *
+ *  **最初は「半空間の 1/8 まで切り詰める」ことにして、実測で捨てた。**
+ *  半空間 42.5KB で予備 5.3KB を取ると、使える領域がその分減って GC の発火位置が
+ *  前へずれる。その結果 test_gc_fires_during_gcd_and_isqrt_and_results_are_correct の
+ *  「isqrt の途中で GC が発火する」判定が落ちた
+ *  (2026-11-01、ホストの gcc で base 5446 OK / 0 NG に対して 1 NG)。
+ *  SMALL_HEAP_SIZE は通る窓が 5KB 未満しかなく、**予備を取るだけで掃引し直しになる。**
+ *  つまみを共有しないという T6 の方針は、**値を分けるだけでは足りない**
+ *  (実効容量を削った時点で衝突する)。
+ *
+ *  そこで**予備が丸ごと入らない構成では検査を無効にする**(予備 0 / 床 0 =
+ *  柔らかい端も床も真の端と一致 = 従来どおりその場で panic)。
+ *  閾値は「予備が半空間の 1/8 以下であること」= 使える領域を 12.5% 以上削らないこと。
+ *  ゲスト(QEMU_MEM 256M)の半空間は MB 単位なので、**実機では常に有効である。** */
+static void heap_update_soft_end(void) {
+    UINT64 half = (UINT64)(g_from_end - g_from_start);
+    UINT64 reserve = 0;
+    UINT64 floor_bytes = 0;
+    if (HEAP_SIGNAL_RESERVE > 0 && half / 8 >= (UINT64)HEAP_SIGNAL_RESERVE) {
+        reserve = (UINT64)HEAP_SIGNAL_RESERVE;
+        floor_bytes = (UINT64)HEAP_HARD_FLOOR;
+    }
+    g_from_soft_end_normal = g_from_end - reserve;
+    g_from_floor_end       = g_from_end - floor_bytes;
+    heap_apply_soft_end();
+}
+
+/** 印を立て、予備を開ける。**os_alloc_bytes の遅い側からだけ呼ぶ。**
+ *  予備を開けるのは、開けないと**次の確保もすべて遅い側に落ちて GC が走り続ける**
+ *  ためである(印を立てただけでは柔らかい端は動かない) */
+static void heap_open_reserve(void) {
+    g_heap_exhausted_pending = 1;
+    heap_apply_soft_end();
+}
+
+int os_heap_exhaustion_pending(void) { return g_heap_exhausted_pending; }
+UINT64 os_heap_guard_hits(void) { return g_heap_guard_hits; }
+UINT64 os_heap_signal_path_bytes(void) { return g_heap_signal_path_bytes; }
+UINT64 os_heap_soft_limit_bytes(void) { return (UINT64)(g_from_soft_end - g_from_start); }
+UINT64 os_heap_soft_limit_normal_bytes(void) { return (UINT64)(g_from_soft_end_normal - g_from_start); }
+UINT64 os_heap_floor_limit_bytes(void) { return (UINT64)(g_from_floor_end - g_from_start); }
+
 /**
  * nil(自己参照するconsセル)専用の固定領域。From/To空間のどちらにも属さず、GCの
  * コピー/スワップの対象にならない(g_symbol_table等と同じ静的配列パターン)。
@@ -205,6 +385,162 @@ lisp_val_t cc_diag_gc_stress(lisp_val_t args, lisp_val_t env) {
 }
 #endif
 
+#ifdef ISIKIOS_ALLOC_AUDIT
+/* [計器] 確保の理由別の数え上げ(M8-T1)。設計の理屈は runtime.h の
+   「確保の理由別の数え上げ」の節にある。要点は
+   **1 回の確保がちょうど 1 つの桶に入る**ので合計が構造的に合うこと。 */
+static UINT64 g_alloc_audit_bytes[ALLOC_REASON_COUNT];
+static UINT64 g_alloc_audit_count[ALLOC_REASON_COUNT];
+/* 「次の 1 回の確保の理由」。消費したら未分類へ戻すので、
+   理由を置き忘れた確保は必ず未分類の桶に入る(= 数え漏れが黙って起きない) */
+static int g_alloc_audit_pending = ALLOC_REASON_UNATTRIBUTED;
+/* reset した時点のヒープ位置と GC 回数。**不変量を C 側で判定するために要る**
+   (理由は下の os_alloc_audit_diff の註)。 */
+static UINT64 g_alloc_audit_heap_at_reset = 0;
+static UINT64 g_alloc_audit_gc_at_reset = 0;
+
+void os_alloc_audit_set_reason(int reason) {
+    g_alloc_audit_pending = reason;
+}
+
+void os_alloc_audit_charge(UINT64 aligned_bytes) {
+    int r = g_alloc_audit_pending;
+    if (r < 0 || r >= ALLOC_REASON_COUNT) {
+        r = ALLOC_REASON_UNATTRIBUTED;
+    }
+    g_alloc_audit_bytes[r] += aligned_bytes;
+    g_alloc_audit_count[r] += 1;
+    /* **必ず戻す。** 戻さないと直後の無印の確保が前の理由に紛れ込み、
+       「数え漏れが未分類に出る」という検出器の性質が壊れる */
+    g_alloc_audit_pending = ALLOC_REASON_UNATTRIBUTED;
+}
+
+UINT64 os_alloc_audit_bytes(int reason) {
+    if (reason < 0 || reason >= ALLOC_REASON_COUNT) {
+        return 0;
+    }
+    return g_alloc_audit_bytes[reason];
+}
+
+UINT64 os_alloc_audit_count(int reason) {
+    if (reason < 0 || reason >= ALLOC_REASON_COUNT) {
+        return 0;
+    }
+    return g_alloc_audit_count[reason];
+}
+
+void os_alloc_audit_reset(void) {
+    for (int i = 0; i < ALLOC_REASON_COUNT; i++) {
+        g_alloc_audit_bytes[i] = 0;
+        g_alloc_audit_count[i] = 0;
+    }
+    g_alloc_audit_pending = ALLOC_REASON_UNATTRIBUTED;
+    g_alloc_audit_heap_at_reset = (UINT64)(g_from_ptr - g_from_start);
+    g_alloc_audit_gc_at_reset = os_gc_collect_count();
+}
+
+/* [計器] 桶の合計と、reset からヒープが進んだ量の差。**計器が正しければ必ず 0**。
+ *
+ * ## なぜ Lisp 側で引き算しないのか(最初はそうして間違えた)
+ *
+ * **インタプリタでは「測る行為そのものが確保する」。** 関数を呼ぶたびに引数リストを
+ * 対で作るので、
+ *
+ *     (assert-equal (- (%%heap-used-bytes) h0) (ar-total))
+ *
+ * と書くと、左辺を読んだ後・右辺を数える間にも確保が起き、**必ずずれる**。
+ * 実際に 2026-11-01 の最初の版はこれで落ちた(桶の合計 4304 / ヒープの差 3584。
+ * 差 720 は reset と「ヒープを読む」の間に挟まった評価の確保だった)。
+ *
+ * **2 つの計器を Lisp から読んで引き算する形は、原理的に成立しない。**
+ * 差は C の中で、間に何も挟まらない形で取る。こうすると
+ * **いつ呼んでも 0** になる(呼ぶまでの確保は合計と水位の両方に等しく入る)。
+ */
+UINT64 os_alloc_audit_diff(void) {
+    UINT64 sum = 0;
+    for (int i = 0; i < ALLOC_REASON_COUNT; i++) {
+        sum += g_alloc_audit_bytes[i];
+    }
+    UINT64 heap = (UINT64)(g_from_ptr - g_from_start);
+    /* GC が走ると水位は戻るが桶は累積なので、差は意味を失う。
+       呼び出し側は %%ALLOC-REASON-GC-SINCE-RESET が 0 であることを先に見る */
+    if (heap < g_alloc_audit_heap_at_reset) {
+        return sum;   /* 判定不能。0 にはしない */
+    }
+    UINT64 advanced = heap - g_alloc_audit_heap_at_reset;
+    return (sum > advanced) ? (sum - advanced) : (advanced - sum);
+}
+
+UINT64 os_alloc_audit_gc_since_reset(void) {
+    return os_gc_collect_count() - g_alloc_audit_gc_at_reset;
+}
+
+int os_alloc_audit_reason_of_magic(UINT64 magic) {
+    switch (magic) {
+        case MAGIC_FUNCTION_NATIVE:      return ALLOC_REASON_INST_FN_NATIVE;
+        case MAGIC_FUNCTION_INTERPRETED: return ALLOC_REASON_INST_FN_INTERP;
+        case MAGIC_PROCESS:              return ALLOC_REASON_INST_PROCESS;
+        case MAGIC_MACRO:                return ALLOC_REASON_INST_MACRO;
+        case MAGIC_BLOCK_EXIT:           return ALLOC_REASON_INST_BLOCK;
+        case MAGIC_STREAM:               return ALLOC_REASON_INST_STREAM;
+        case MAGIC_CLASS_INSTANCE:       return ALLOC_REASON_INST_CLASS_INST;
+        case MAGIC_CATCH_EXIT:           return ALLOC_REASON_INST_CATCH;
+        case MAGIC_GO_EXIT:              return ALLOC_REASON_INST_GO;
+        case MAGIC_BIGNUM:               return ALLOC_REASON_INST_BIGNUM;
+        case MAGIC_VECTOR:               return ALLOC_REASON_INST_VECTOR;
+        case MAGIC_FLOAT:                return ALLOC_REASON_INST_FLOAT;
+        case MAGIC_BUILTIN_CLASS:        return ALLOC_REASON_INST_CLASS;
+        case MAGIC_STANDARD_CLASS:       return ALLOC_REASON_INST_CLASS;
+        default:                         return ALLOC_REASON_INST_OTHER;
+    }
+}
+#endif /* ISIKIOS_ALLOC_AUDIT */
+
+/**
+ * [可用性/#110] 確保の遅い側(柔らかい端を超えた場合)。
+ *
+ * ## なぜ切り出すのか — **切り出さないと常道が 5 命令増える**
+ *
+ * 最初は os_alloc_bytes の中に素で書いていた。**それだけで常道が
+ * 15 命令から 20 命令へ増えた**(逆アセンブルで実測。2026-11-01):
+ *
+ *   push %rdi / push %rsi      ← 増えた
+ *   ...
+ *   mov  %rsi,%rax             ← 増えた
+ *   pop  %rsi / pop  %rdi      ← 増えた
+ *
+ * 遅い側が heap_apply_soft_end() の呼び出しを跨いで値を生かすので、
+ * **コンパイラが callee-saved レジスタを使い、その退避をプロローグに置く。**
+ * プロローグは常道である。**遅い側の都合を、確保のたびに全員が払う。**
+ *
+ * `os_alloc_bytes` はこの処理系でいちばん熱い関数である(対も物体も文字列も
+ * すべてここを通る)。+5 命令は G1(回帰ゼロ)に反する。
+ *
+ * **`noinline` が必須である。** 呼び出し元がちょうど 1 箇所なので、
+ * -O1 は何もしなければ畳み込んで元の木阿弥になる
+ * (M5 で同じ罠を踏んだ。documents/performance-measurement.md)。
+ *
+ * @param aligned 整列済みの要求バイト数
+ * @return 確保に使える From 空間の位置(枯渇しきった場合は戻らない)
+ */
+static __attribute__((noinline, cold)) UINT8 *os_alloc_bytes_slow(UINT64 aligned) {
+    /* From空間が枯渇。GCを1回走らせて空きを作れるか試す */
+    os_gc_collect();
+    UINT8 *p = g_from_ptr;
+    if (p + aligned > g_from_soft_end) {
+        /* GC 後もなお柔らかい端を超える。**ここでは signal できない**
+           (番地を返す関数で、cli で割り込みを止めており、signal 自身が確保する)。
+           印を立てて予備を開け、確保は続ける。知らせるのは
+           os_eval の入口か大口の primitive である(documents/heap-exhaustion.md) */
+        heap_open_reserve();
+        if (p + aligned > g_from_soft_end) {
+            /* 床まで使い切った場合は本当の枯渇として停止する(最後の砦) */
+            os_panic("out of memory (lisp heap exhausted)");
+        }
+    }
+    return p;
+}
+
 static lisp_addr_t os_alloc_bytes(UINT64 n) {
     UINT64 aligned = os_heap_align_up(n);
 #ifndef ISIKIOS_UNIT_TEST
@@ -223,20 +559,20 @@ static lisp_addr_t os_alloc_bytes(UINT64 n) {
     }
 #endif
     UINT8 *p = g_from_ptr;
-    if (p + aligned > g_from_end) {
-        // From空間が枯渇。GCを1回走らせて空きを作れるか試す
-        os_gc_collect();
-        p = g_from_ptr;
-        if (p + aligned > g_from_end) {
-            // GC後もなお不足している場合は本当の枯渇として停止する
-            os_panic("out of memory (lisp heap exhausted)");
-        }
+    /* [可用性/#110] 比べる相手が g_from_end から g_from_soft_end へ変わっただけなので、
+       **常道の比較は 1 つのままである**。遅い側は os_alloc_bytes_slow へ切り出した
+       (理由は下の註。**切り出さないと常道が 5 命令増える**) */
+    if (p + aligned > g_from_soft_end) {
+        p = os_alloc_bytes_slow(aligned);
     }
     g_from_ptr = p + aligned;
 #ifndef ISIKIOS_UNIT_TEST
     __asm__ __volatile__ ("sti");
 #endif
     ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_ALLOC_BYTES, (UINT64)p, aligned);
+    /* [計器] 確保の理由別の数え上げ。**数えるのはここ 1 箇所だけ**なので、
+       1 回の確保がちょうど 1 つの桶に入り、合計は %%HEAP-USED-BYTES と必ず一致する */
+    ALLOC_AUDIT_CHARGE(aligned);
     return (UINT64)p;
 }
 
@@ -750,6 +1086,13 @@ void os_panic_stack_overflow(UINT64 rsp, UINT64 stack_low, UINT64 stack_used) {
     os_diag_serial_write(" byte (stack size=");
     serial_write_uint((UINT64)STACK_SIZE_FOR_PANIC);
     os_diag_serial_write(")\n");
+    /* [可用性] JITのスタック残量検査(issue #110)が一度も発火していないなら、
+       この溢れは**守られていない経路**(インタプリタ / AOT)から来ている。
+       JIT だけが守られていることを、溢れた現場で読めるようにする
+       (documents/stack-guard.md §4) */
+    os_diag_serial_write("  jit-stack-guard-hits=");
+    serial_write_uint(os_za_stack_guard_hits());
+    os_diag_serial_write(" (0 = 守られていない経路からの溢れ)\n");
 #endif
     frame_buffer *fb = get_active_frame_buffer();
     panic_write_string(fb, "PANIC: stack overflow\n  rsp=");
@@ -1141,6 +1484,8 @@ void os_panic(const char *msg) {
 }
 
 lisp_addr_t os_alloc_raw(UINT64 n) {
+    /* [計器] 公開版。呼び出し元の事情はここでは分からないので一括で RAW へ */
+    ALLOC_AUDIT_REASON(ALLOC_REASON_RAW);
     return os_alloc_bytes(n);
 }
 
@@ -1239,6 +1584,10 @@ static lisp_val_t os_make_string_for(const char *s, int uppercase_flag) {
         len++;
     }
 
+    /* [計器] uppercase_flag は**記号名かどうか**をそのまま表している
+       (呼び出し元は os_make_symbol / os_make_uninterned_symbol / os_make_string の 3 つで、
+        前 2 つだけが 1 を渡す)。つまみを足さずに理由を分けられる */
+    ALLOC_AUDIT_REASON(uppercase_flag ? ALLOC_REASON_SYMBOL_NAME : ALLOC_REASON_STRING);
     lisp_addr_t addr = os_alloc_bytes(8 + len);
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = len;
@@ -1292,6 +1641,16 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size) {
     g_to_start   = g_from_end;
     g_to_ptr     = g_to_start;
     g_to_end     = g_to_start + half;
+
+    /* [可用性/#110] 新しいヒープなので、前のヒープに対して立っていた印は意味を失う。
+       **先に状態を落としてから**柔らかい端を計算する(印が立ったままだと
+       heap_apply_soft_end が予備を開けた側の端を選んでしまう)。
+       ユニットテストはヒープを作り直して何度もここを通る */
+    g_heap_exhausted_pending = 0;
+    g_in_heap_signal = 0;
+    g_heap_guard_hits = 0;
+    g_heap_signal_path_bytes = 0;
+    heap_update_soft_end();
 
     // g_symbol_hash(静的配列)はCのゼロ初期化任せだと全スロットが0=「添字0が
     // 占有中」という誤った状態になってしまう(空きスロットの番兵は-1)。
@@ -1395,6 +1754,49 @@ lisp_val_t primitive_heap_used_bytes(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum((UINT64)(g_from_ptr - g_from_start));
 }
 
+#ifdef ISIKIOS_ALLOC_AUDIT
+/* [計器] 確保の理由別の数え上げを Lisp から読む口(M8-T1)。
+   **監査ビルドでしか登録しない。** 既定の組み込み数を増やすと
+   test/c/runtime_test.c の SMALL_HEAP_SIZE(余裕 5KB 未満)を再調整する必要が
+   生じるので、計器のためにその綱渡りを増やさない。 */
+
+/** 組み込み関数 %%ALLOC-REASON-BYTES。理由の番号を受け取り確保量(byte)を返す */
+lisp_val_t primitive_alloc_audit_bytes(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_bytes((int)os_fixnum_magnitude(cc_car(args))));
+}
+
+/** 組み込み関数 %%ALLOC-REASON-COUNT。理由の番号を受け取り確保回数を返す */
+lisp_val_t primitive_alloc_audit_count(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_count((int)os_fixnum_magnitude(cc_car(args))));
+}
+
+/** 組み込み関数 %%ALLOC-REASON-DIFF。桶の合計と水位の差。**正しければ必ず 0** */
+lisp_val_t primitive_alloc_audit_diff(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_diff());
+}
+
+/** 組み込み関数 %%ALLOC-REASON-GC-SINCE-RESET。reset 以降に GC が走った回数。
+    0 でなければ %%ALLOC-REASON-DIFF の判定は成立しない */
+lisp_val_t primitive_alloc_audit_gc_since_reset(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    return os_make_fixnum(os_alloc_audit_gc_since_reset());
+}
+
+/** 組み込み関数 %%ALLOC-REASON-RESET。全部の桶を 0 に戻す。
+    **測る区間の直前で呼ぶ**(ブート中の確保を含めると内訳が埋まってしまう) */
+lisp_val_t primitive_alloc_audit_reset(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    os_alloc_audit_reset();
+    return nil;
+}
+#endif /* ISIKIOS_ALLOC_AUDIT */
+
 /** os_gc_collectが呼ばれた延べ回数。テストが「計算中に実際にGCが発火したか」を確認するために使う */
 static UINT64 g_gc_collect_count = 0;
 /** [GC監査] gc_copy_valueがコピー不能なタグ(TAG_FORWARD等)を渡された回数。
@@ -1450,17 +1852,31 @@ void os_boot_alloc_init(UINT64 base, UINT64 size) {
     g_boot_alloc_end = (UINT8 *)(base + size);
 }
 
-void *os_boot_alloc(UINT64 size, UINT64 align) {
+void *os_boot_alloc_try(UINT64 size, UINT64 align) {
     UINT64 addr = ((UINT64)g_boot_alloc_bump + align - 1) & ~(align - 1);
     if ((UINT8 *)(addr + size) > g_boot_alloc_end) {
-        frame_buffer *fb = get_active_frame_buffer();
-        fb->write_string(fb, "boot_alloc: space exhausted...");
-        for (;;) {
-        }
+        return 0;
     }
     g_boot_alloc_bump = (UINT8 *)(addr + size);
     ALIGN_AUDIT_NOTE_ALLOC(ALIGN_SITE_BOOT_ALLOC, addr, size);
     return (void *)addr;
+}
+
+void *os_boot_alloc(UINT64 size, UINT64 align) {
+    void *p = os_boot_alloc_try(size, align);
+    if (p == 0) {
+        /* 仮想バッファの初期化より前に枯渇した場合、フレームバッファの
+           関数ポインタはまだ0なのでそのまま呼ぶとページフォルトになる。
+           表示できないなら黙って停止するしかないが、少なくとも
+           「別の場所で落ちた」ように見えるのは避ける */
+        frame_buffer *fb = get_active_frame_buffer();
+        if (fb != 0 && fb->write_string != 0) {
+            fb->write_string(fb, "boot_alloc: space exhausted...");
+        }
+        for (;;) {
+        }
+    }
+    return p;
 }
 
 UINT64 os_boot_alloc_finalize(UINT64 *out_heap_base, UINT64 *out_heap_size) {
@@ -1520,6 +1936,30 @@ static UINT8 *g_imm_bump = g_imm_space;
 /** os_imm_page_freeで返却されたページのフリーリスト(各ページの先頭8byteをnextポインタとして使う) */
 static void *g_imm_free_list = 0;
 
+/* ---- JITコードのパッキング(環境ごとのbumpカーソル)の診断カウンタ ----
+   充填率が想定より低かったときに、原因が「環境の切り替え」なのか
+   「1ページに収まらない大きい関数」なのかを切り分けるために数える
+   (documents/pitfalls.md 原則6: 失敗は観測可能にすること)。 */
+/** カーソルから切り出せた回数(ページを新たに取らずに済んだ) */
+static UINT64 g_code_alloc_from_cursor = 0;
+/** 新しいページを取った回数(1ページ以内の関数) */
+static UINT64 g_code_alloc_new_page = 0;
+/** 1ページに収まらず連続確保へ回した回数 */
+static UINT64 g_code_alloc_multipage = 0;
+/** ページ末尾を使い切れずに捨てた回数(= 分断) */
+static UINT64 g_code_tail_abandoned = 0;
+/** 同、捨てたbyte数の合計 */
+static UINT64 g_code_tail_abandoned_bytes = 0;
+/** コードのために取ったページの総数(単一ページ+連続確保ぶん)。充填率の分母 */
+static UINT64 g_code_pages_taken = 0;
+/** 切り出したコードのbyte数の合計(16byteアライン後)。充填率の分子 */
+static UINT64 g_code_bytes_allocated = 0;
+/** 走行を延長してページ境界をまたいだ回数 */
+static UINT64 g_code_run_extended = 0;
+/** 1ページを超える関数をページ単位へ切り上げたことで生じた未使用byte。
+ * カーソルを介さないので、ここは詰められない(充填率の残る損失の内訳) */
+static UINT64 g_code_multipage_waste = 0;
+
 /** g_imm_bumpがこれまでにg_imm_spaceから切り出した延べページ数。M13で、init.lispから
  * トランスパイル対象関数を移動したことによるImmobilized Space使用量の削減を測定する
  * テストのためのアクセサ(os_gc_collect_countと同じ、テスト専用の内部状態公開) */
@@ -1578,10 +2018,199 @@ static UINT64 g_function_cell_count = 0;
 
 /** 組み込み関数%%DIAG-FN-CELL-COUNT。これまでに作られたFunction Cellの総数。
  * GCがgc_fixup_all_function_cellsで毎回走査する件数でもある。 */
+/** [実験] 組み込み関数%%PINNED-REGISTER。r12の現在値をfixnumで返す。
+ * documents/bench-pinned-nil.md の 4-2(r12にnilが入っているかの確認)専用。
+ * 通常ビルドでは意味のある値ではない(gccがr12を作業用に使っているため)。 */
+lisp_val_t primitive_pinned_register(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+#if defined(__x86_64__) && !defined(ISIKIOS_UNIT_TEST)
+    UINT64 v = 0;
+    __asm__ __volatile__("mov %%r12, %0" : "=r"(v));
+    return os_make_fixnum(v);
+#else
+    return os_make_fixnum(0);
+#endif
+}
+
 lisp_val_t primitive_fn_cell_count(lisp_val_t args, lisp_val_t env) {
     (void)args;
     (void)env;
     return os_make_fixnum(g_function_cell_count);
+}
+
+/** 詰めたoptimize値を (speed safety space) のリストへ展開する */
+static lisp_val_t optimize_to_list(UINT64 packed) {
+    lisp_val_t l3 = os_make_cons(os_make_fixnum(OPTIMIZE_SPACE(packed)), nil);
+    lisp_val_t l2 = os_make_cons(os_make_fixnum(OPTIMIZE_SAFETY(packed)), l3);
+    return os_make_cons(os_make_fixnum(OPTIMIZE_SPEED(packed)), l2);
+}
+
+/** 組み込み関数%%CURRENT-OPTIMIZE。現在の環境が属するenvironmentのoptimize指定を
+ * (speed safety space) で返す。frameの中で呼んでも囲みのenvironmentの値になる。 */
+lisp_val_t primitive_current_optimize(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    return optimize_to_list(os_env_optimize(env));
+}
+
+/** インラインビットを、指定されている名前のリストへ展開する。
+ * 順序は INLINE_BIT_* の並びに合わせる(car cdr null eq) */
+/** インライン展開の対象の名前表。**ビットと名前の対応はここ 1 箇所だけにある。**
+ *
+ * 以前は「名前 → ビット」(os_inline_bit_of)と「ビット → 名前」(inline_to_list)が
+ * 別々に並んでいて、**片方だけに足すと %%CURRENT-INLINE が黙って nil を返した**
+ * (実際に踏んだ。documents/inline-arith.md §7-4)。表を 1 つにして両方をそこから
+ * 導き、要素数を _Static_assert で INLINE_BIT_COUNT と突き合わせる。
+ * **ビットを足して表に足し忘れると、ビルドが落ちる。**
+ *
+ * シンボルは g_sym_* への**ポインタ**で持つ。値をコピーで持つと GC の移動に
+ * 追随できない(g_sym_* 自身は gc_copy_value で更新される)。
+ * 並びは %%CURRENT-INLINE の出力順である。 */
+static const struct {
+    UINT64 bit;
+    lisp_val_t *sym;
+} g_inline_names[] = {
+    { INLINE_BIT_CAR,  &g_sym_car },
+    { INLINE_BIT_CDR,  &g_sym_cdr },
+    { INLINE_BIT_NULL, &g_sym_null },
+    { INLINE_BIT_EQ,   &g_sym_eq },
+    { INLINE_BIT_ADD,  &g_sym_plus },
+    { INLINE_BIT_SUB,  &g_sym_minus },
+    { INLINE_BIT_MUL,  &g_sym_asterisk },
+    { INLINE_BIT_DIV,  &g_sym_slash },
+};
+_Static_assert(sizeof(g_inline_names) / sizeof(g_inline_names[0]) == INLINE_BIT_COUNT,
+               "インライン対象のビットを増減したら g_inline_names と "
+               "INLINE_BIT_COUNT の両方を更新すること");
+
+static lisp_val_t inline_to_list(UINT64 packed) {
+    UINT64 bits = DECLAIM_INLINE_BITS(packed);
+    lisp_val_t r = nil;
+    /* 表の末尾から積むと表の順(= %%CURRENT-INLINE の出力順)になる。
+       **os_make_cons は引数を GC_PROTECT するので、ここでの確保は安全である**
+       (シンボルはすべて g_sym_* なので、cons の前に確保が走ることも無い)。
+       一時期ここで os_make_symbol("+") を呼んでいたが、それは cons へ入る前に
+       確保が走る形で原則4に触れていた(documents/inline-arith.md §8-2) */
+    for (UINT64 i = INLINE_BIT_COUNT; i > 0; i--) {
+        if (bits & g_inline_names[i - 1].bit) {
+            r = os_make_cons(*g_inline_names[i - 1].sym, r);
+        }
+    }
+    return r;
+}
+
+/** 組み込み関数%%CURRENT-INLINE。現在の環境でinline指定されている名前のリスト。 */
+lisp_val_t primitive_current_inline(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    return inline_to_list(os_env_optimize(env));
+}
+
+/** 組み込み関数%%INLINE-HERE。**いまのレキシカルスコープで効いている inline 指定**を
+ * ビット集合(fixnum)で返す。
+ *
+ * **JIT ではコンパイル時に即値へ畳まれる**(za.c)。この C 実装が走るのは
+ * インタプリタ実行のときだけで、そちらは declare のレキシカルスコープを持たないので
+ * **environment の declaim をそのまま返す**(documents/inline-arith.md §7-3)。
+ * 両者が食い違うのは「JIT 済み関数の let の内側」だけで、そこを見るのが
+ * この関数の用途である。 */
+lisp_val_t primitive_inline_here(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    return os_make_fixnum(DECLAIM_INLINE_BITS(os_env_optimize(env)));
+}
+
+/** 組み込み関数%%INLINE-BIT-OF。名前に対応するビットを fixnum で返す。対象外は0。
+ * %%INLINE-HERE の戻り値を読むために要る(ビット位置は C 側にしか無い) */
+lisp_val_t primitive_inline_bit_of(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return os_make_fixnum(os_inline_bit_of(cc_car(args)));
+}
+
+/** 組み込み関数%%INLINE-OF。関数がコンパイルされたときのinline指定。
+ * インタプリタ実行の関数(metaを持たない)はnil。 */
+lisp_val_t primitive_inline_of(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_SYMBOL) {
+        val = os_get_function(val, env);
+    }
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE || obj[1] == 0) {
+        return nil;
+    }
+    return inline_to_list(((za_fn_meta_t *)obj[1])->optimize);
+}
+
+/** 組み込み関数%%OPTIMIZE-OF。関数がコンパイルされたときに有効だったoptimize指定を
+ * (speed safety space) で返す。インタプリタ実行の関数(metaを持たない)はnil。 */
+lisp_val_t primitive_optimize_of(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_SYMBOL) {
+        val = os_get_function(val, env);
+    }
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE || obj[1] == 0) {
+        return nil;
+    }
+    return optimize_to_list(((za_fn_meta_t *)obj[1])->optimize);
+}
+
+/** 組み込み関数%%DECLARED-TYPES-OF。(declare (type ...)) で宣言された仮引数の型を
+ * **仮引数の位置順のリスト**で返す(Phase 4a-2)。
+ *
+ *   (defun add-integer (x y) (declare (type <fixnum> x y)) (+ x y))
+ *   (%%declared-types-of 'add-integer)   ; => (<FIXNUM> <FIXNUM>)
+ *
+ * 宣言の無い位置はnil、実在するが符号を持たないクラスは<OTHER>、クラスとして
+ * 解決できなかった名前は<UNKNOWN>になる(§3-3「無視されたことが分かる」)。
+ * 末尾の連続するnil(宣言の無い引数)は落とす。
+ *
+ * **変数名ではなく位置で返す。** 記録先のza_fn_meta_tはImmobilized Space上で
+ * GCのルート走査の対象外のため、シンボルを置けない(os_decl_types_t参照)。
+ * 名前が要る場合は仮引数リストと突き合わせる。
+ *
+ * インタプリタ実行の関数(metaを持たない)はnil。%%OPTIMIZE-OF/%%INLINE-OFと同じで、
+ * **ユニットテストのビルドではJITが常に断念する**ため、この関数の確認は
+ * make test-qemu 側で行う。 */
+lisp_val_t primitive_declared_types_of(lisp_val_t args, lisp_val_t env) {
+    lisp_val_t val = cc_car(args);
+    if ((val & TAG_MASK) == TAG_SYMBOL) {
+        val = os_get_function(val, env);
+    }
+    if ((val & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(val & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE || obj[1] == 0) {
+        return nil;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    os_decl_types_t types;
+    types.w[0] = meta->declared_types[0];
+    types.w[1] = meta->declared_types[1];
+
+    UINT64 last = 0;
+    int any = 0;
+    for (UINT64 i = 0; i < OS_DECL_TYPES_MAX_VARS; i++) {
+        if (os_decl_types_get(types, i) != OS_DECL_TYPE_NONE) {
+            last = i;
+            any = 1;
+        }
+    }
+    if (!any) {
+        return nil;
+    }
+    /* 後ろから積む。os_make_consは確保するのでresultをGC_PROTECTしておく */
+    lisp_val_t result = nil;
+    GC_PROTECT(result);
+    for (INT64 i = (INT64)last; i >= 0; i--) {
+        lisp_val_t name = os_decl_type_name(os_decl_types_get(types, (UINT64)i));
+        result = os_make_cons(name, result);
+    }
+    return result;
 }
 
 static imm_slot_cursor_t g_fn_meta_cursor;
@@ -1610,6 +2239,153 @@ int os_addr_region(lisp_addr_t addr) {
     if (p >= g_to_start && p < g_to_end) { return 1; }
     if (p >= g_imm_space && p < g_imm_space + IMM_SPACE_SIZE) { return 2; }
     return 4;
+}
+
+/* ===================== disassembler用のアドレス分類 ===================== */
+
+/* カーネルイメージの.textセクションの実行時範囲。0,0なら未確定(=判定対象外)。
+   UEFIはイメージを起動ごとに違うアドレスへ再配置するため、ビルド時の値は使えない */
+static lisp_addr_t g_text_start = 0;
+static lisp_addr_t g_text_end = 0;
+static int g_addr_regions_ready = 0;
+
+#ifndef ISIKIOS_UNIT_TEST
+/* mingwのPEリンカが定義するイメージ先頭。ロード後の実アドレスを指す */
+extern char __ImageBase[];
+
+static UINT16 pe_rd16(const UINT8 *p) {
+    return (UINT16)((UINT16)p[0] | ((UINT16)p[1] << 8));
+}
+
+static UINT32 pe_rd32(const UINT8 *p) {
+    return (UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24);
+}
+
+/**
+ * __ImageBaseからPE/COFFヘッダを辿り、.textセクションの実行時範囲を求める。
+ *
+ * 「既知の関数のアドレス±16MB」で代用する手もあるが、この配置では.bssが.textの
+ * わずか2MB先から始まり、その.bssの中に16MBのg_imm_space(Immobilized Space)が
+ * ある。±16MBではImmobilized Spaceを丸ごとカーネルコードと誤判定してしまうため、
+ * セクション表から正確な範囲を取る。
+ *
+ * ヘッダが期待した形でなければ何もしない(g_text_start/endは0のままで、
+ * .textの判定だけが行われなくなる)。
+ */
+static void classify_init_text_range(void) {
+    const UINT8 *base = (const UINT8 *)(void *)__ImageBase;
+    if (base[0] != 'M' || base[1] != 'Z') {
+        return;
+    }
+    UINT32 pe_off = pe_rd32(base + 0x3C);
+    if (pe_off < 0x40 || pe_off > 0x1000) {
+        return;
+    }
+    const UINT8 *pe = base + pe_off;
+    if (pe[0] != 'P' || pe[1] != 'E' || pe[2] != 0 || pe[3] != 0) {
+        return;
+    }
+    /* COFFヘッダ(pe+4から20byte)のうち必要なのはセクション数と
+       オプショナルヘッダのサイズだけ。セクション表はその直後に並ぶ */
+    UINT16 section_count = pe_rd16(pe + 6);
+    UINT16 optional_header_size = pe_rd16(pe + 20);
+    if (section_count == 0 || section_count > 96) {
+        return;
+    }
+    const UINT8 *section = pe + 24 + optional_header_size;
+    for (UINT16 i = 0; i < section_count; i++, section += 40) {
+        /* セクション名は8byte固定長で、8文字ちょうどならNUL終端されない */
+        if (section[0] == '.' && section[1] == 't' && section[2] == 'e' &&
+            section[3] == 'x' && section[4] == 't' && section[5] == 0) {
+            UINT32 virtual_size = pe_rd32(section + 8);
+            UINT32 virtual_addr = pe_rd32(section + 12);
+            if (virtual_size == 0) {
+                return;
+            }
+            g_text_start = (lisp_addr_t)(void *)(base + virtual_addr);
+            g_text_end = g_text_start + virtual_size;
+            return;
+        }
+    }
+}
+#else
+/* ネイティブgccのユニットテストビルドはELFで__ImageBaseが無い。.textの範囲は
+   未確定のままにする(os_classify_addrが.textの判定だけを行わなくなる)。
+   実機での.text判定はtest/lisp/disassemble_test.lispが確認する */
+static void classify_init_text_range(void) {
+}
+#endif
+
+static void classify_ensure_ready(void) {
+    if (g_addr_regions_ready) {
+        return;
+    }
+    g_addr_regions_ready = 1;
+    classify_init_text_range();
+}
+
+os_addr_region_t os_classify_addr(lisp_addr_t addr) {
+    classify_ensure_ready();
+    UINT8 *p = (UINT8 *)addr;
+    /* Immobilized SpaceはカーネルイメージのBSS内にある静的配列なので、
+       .textより先に判定する(順序を入れ替えても.textの範囲はBSSを含まないため
+       結果は変わらないが、包含関係の意図を残しておく) */
+    if (p >= g_imm_space && p < g_imm_space + IMM_SPACE_SIZE) {
+        return OS_ADDR_IMMOBILIZED;
+    }
+    /* From/Toは連続しているが、片方だけが未初期化という状態を作らないため
+       それぞれ独立に判定する。どちらもGCヒープとして同じ扱いにする */
+    if (g_from_start != g_from_end && p >= g_from_start && p < g_from_end) {
+        return OS_ADDR_GC_HEAP;
+    }
+    if (g_to_start != g_to_end && p >= g_to_start && p < g_to_end) {
+        return OS_ADDR_GC_HEAP;
+    }
+    if (g_text_start != g_text_end && addr >= g_text_start && addr < g_text_end) {
+        return OS_ADDR_KERNEL_TEXT;
+    }
+    return OS_ADDR_UNKNOWN;
+}
+
+const char *os_addr_region_name(os_addr_region_t region) {
+    switch (region) {
+        case OS_ADDR_KERNEL_TEXT: return "kernel";
+        case OS_ADDR_IMMOBILIZED: return "immobilized";
+        case OS_ADDR_GC_HEAP:     return "gc-heap";
+        default:                  return 0;
+    }
+}
+
+int os_addr_region_bounds(os_addr_region_t region, lisp_addr_t *out_start, lisp_addr_t *out_end) {
+    classify_ensure_ready();
+    lisp_addr_t start = 0;
+    lisp_addr_t end = 0;
+    switch (region) {
+        case OS_ADDR_KERNEL_TEXT:
+            start = g_text_start;
+            end = g_text_end;
+            break;
+        case OS_ADDR_IMMOBILIZED:
+            start = (lisp_addr_t)(void *)g_imm_space;
+            end = start + IMM_SPACE_SIZE;
+            break;
+        case OS_ADDR_GC_HEAP:
+            /* From/Toは隣接した2つの半分なので1区間で表せる。ただし**GCのたびに
+               入れ替わる**(os_gc_collect_body末尾のnew_from_start/new_to_start)ので、
+               「Fromが常に下位半分」と決め打ってはならない。
+               以前は start=g_from_start / end=g_to_end としており、GCが奇数回走った
+               後は start==end(どちらも中間点)になって「境界が未確定」と誤報していた
+               (実測: GC 0/2/4回後は正しく、1/3回後にnilが返る)。
+               両者の最小と最大を取ることで入れ替わりに依らなくなる */
+            start = (lisp_addr_t)(void *)(g_from_start < g_to_start ? g_from_start : g_to_start);
+            end = (lisp_addr_t)(void *)(g_from_end > g_to_end ? g_from_end : g_to_end);
+            break;
+        default:
+            break;
+    }
+    if (out_start) { *out_start = start; }
+    if (out_end) { *out_end = end; }
+    return start != end;
 }
 
 /** [GC監査] GC実行中に入ったタイマー割り込みの回数を返す。
@@ -1719,6 +2495,280 @@ void *os_imm_slot_alloc(imm_slot_cursor_t *cursor, UINT64 size) {
     return slot;
 }
 
+/**
+ * environmentのcode-cursorスロット(9番目)を取り出す。frameは持たないのでnilになる。
+ * 戻り値はスロットのcons自体((code-cursor . 値))で、呼び出し元が値を読み書きする。
+ * @param env environment(frameやnilを渡してもnilが返るだけで壊れない)
+ * @return スロットのcons、持たない場合はnil
+ */
+static lisp_val_t imm_code_cursor_slot(lisp_val_t env) {
+    if (env == nil || env == 0) {
+        return nil;
+    }
+    /* 9番目 = cddddr(cddddr(env))のcar。8スロットしか持たないframeでは
+       cc_cdrがnilを返し続け、cc_car(nil)==nilになるので安全に「持たない」を表せる */
+    lisp_val_t rest = cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env))))))));
+    lisp_val_t slot = cc_car(rest);
+    /* nil(=frame、またはリストの終端)を書き込み先にしてはならない。
+       nilは自己参照consなので、cdrを書き換えるとnilそのものが壊れる */
+    if ((slot & TAG_MASK) != TAG_CONS || slot == nil) {
+        return nil;
+    }
+    return slot;
+}
+
+/**
+ * environmentのdeclaimスロット(10番目)を取り出す。frameは持たないのでnilになる。
+ * @param env environment(frameやnilを渡してもnilが返るだけで壊れない)
+ * @return スロットのcons、持たない場合はnil
+ */
+static lisp_val_t declaim_slot_of(lisp_val_t env) {
+    if (env == nil || env == 0) {
+        return nil;
+    }
+    /* 10番目 = 先頭から9個cdrを辿った先のcar。9スロットしか持たない旧環境や
+       8スロットのframeではcc_cdrがnilを返し続け、cc_car(nil)==nilになる */
+    lisp_val_t rest = cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))))))));
+    lisp_val_t slot = cc_car(rest);
+    /* nilを書き込み先にしてはならない(nilは自己参照consなのでcdrを書くと壊れる) */
+    if ((slot & TAG_MASK) != TAG_CONS || slot == nil) {
+        return nil;
+    }
+    return slot;
+}
+
+/**
+ * envが属するenvironmentのoptimize指定を読む。frameはos_definition_envで読み飛ばす。
+ * @param env 任意の環境(frame可)
+ * @return 詰めたoptimize値(speed | safety<<2 | space<<4)。見つからなければ既定値
+ */
+/**
+ * インライン展開の対象名に対応するビットを返す。
+ * 対象は「アロケーションせず、分岐しない」builtinのみ(documents/inline-builtin.md)。
+ * 対象外・未知の名前は0を返し、declaimはそれを黙って無視する。
+ * @param sym 関数名のシンボル
+ * @return INLINE_BIT_*、対象外なら0
+ */
+
+
+UINT64 os_inline_bit_of(lisp_val_t sym) {
+    for (UINT64 i = 0; i < INLINE_BIT_COUNT; i++) {
+        if (sym == *g_inline_names[i].sym) {
+            return g_inline_names[i].bit;
+        }
+    }
+    return 0;
+}
+
+/** os_scan_declaration_inline の 1 指定子ぶん。(inline f...) / (notinline f...) 以外は無視 */
+static UINT64 decl_apply_inline_spec(lisp_val_t spec, UINT64 bits) {
+    if ((spec & TAG_MASK) != TAG_CONS) {
+        return bits;
+    }
+    lisp_val_t kind = cc_car(spec);
+    if (kind != g_sym_inline && kind != g_sym_notinline) {
+        return bits;
+    }
+    /* [重要] 終端は nil との比較で見ること(nil は TAG_CONS タグを持つ)。
+       decl_apply_spec と同じ理由。 */
+    for (lisp_val_t names = cc_cdr(spec); names != nil && (names & TAG_MASK) == TAG_CONS;
+         names = cc_cdr(names)) {
+        UINT64 bit = os_inline_bit_of(cc_car(names));
+        if (bit == 0) {
+            continue;               /* 未知の名前は黙って無視(declaim と同じ) */
+        }
+        if (kind == g_sym_inline) {
+            bits |= bit;
+        } else {
+            bits &= ~bit;
+        }
+    }
+    return bits;
+}
+
+UINT64 os_scan_declaration_inline(lisp_val_t body, UINT64 inherited) {
+    UINT64 bits = inherited & DECLAIM_INLINE_MASK;
+    /* os_scan_declarations と同じ「先頭に連続する declare だけ」の規則 */
+    for (lisp_val_t rest = body; rest != nil && (rest & TAG_MASK) == TAG_CONS; rest = cc_cdr(rest)) {
+        lisp_val_t form = cc_car(rest);
+        if ((form & TAG_MASK) != TAG_CONS || cc_car(form) != g_sym_declare) {
+            break;
+        }
+        for (lisp_val_t specs = cc_cdr(form); specs != nil && (specs & TAG_MASK) == TAG_CONS;
+             specs = cc_cdr(specs)) {
+            bits = decl_apply_inline_spec(cc_car(specs), bits);
+        }
+    }
+    return bits;
+}
+
+UINT64 os_env_optimize(lisp_val_t env) {
+    lisp_val_t slot = declaim_slot_of(os_definition_env(env));
+    if (slot == nil) {
+        return OPTIMIZE_DEFAULT;
+    }
+    lisp_val_t v = cc_cdr(slot);
+    if ((v & TAG_MASK) != TAG_FIXNUM) {
+        return OPTIMIZE_DEFAULT;
+    }
+    return os_fixnum_magnitude(v);
+}
+
+/**
+ * envが属するenvironmentのoptimize指定を書き換える。確保しないのでGCは走らない。
+ * @param env 任意の環境(frame可。os_definition_envで囲みのenvironmentへ届く)
+ * @param packed 詰めたoptimize値
+ * @return 書き込めたら1、declaimスロットを持たない環境だったら0
+ */
+int os_env_set_optimize(lisp_val_t env, UINT64 packed) {
+    lisp_val_t slot = declaim_slot_of(os_definition_env(env));
+    if (slot == nil) {
+        return 0;
+    }
+    ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum(packed);
+    return 1;
+}
+
+/**
+ * JITコードの配置先をImmobilized Spaceから切り出す(パッキング)。
+ *
+ * ページを環境ごとのbumpカーソルで分け合う。**1ページは必ず1つの環境に属する**:
+ * 別の環境のdefunが来たらそのページは使わず新しいページを取る。これは
+ * destroy-environmentがページ単位で回収するため(os_environment_reclaim_pages →
+ * os_imm_page_free)で、同居させると解放されたページの先頭8byteが
+ * フリーリストのnextポインタで上書きされ、生きているコードが壊れる。
+ *
+ * ページまたぎは行わない。1ページに収まらない関数は従来どおり
+ * os_imm_pages_alloc_contiguousで連続確保し、カーソルには影響させない。
+ *
+ * 単一ページの取得はos_imm_page_alloc(フリーリストを見る)を使う。これにより
+ * destroy-environmentで返ったページがコードとして再利用される。
+ *
+ * @param owner_env 登録先の環境(capture_envではなくowner_env。frameを渡すと
+ *                  カーソルを持たないので毎回新しいページになる)
+ * @param size 必要なbyte数
+ * @param out_new_pages 新たに取ったページの先頭(取らなかった場合は0)
+ * @param out_new_page_count 新たに取ったページ数(取らなかった場合は0)。
+ *                  呼び出し元はこれが非0のときだけos_environment_register_pagesを呼ぶ
+ * @return 配置先アドレス(16byteアライン)。確保できなければ0
+ */
+void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
+                        void **out_new_pages, UINT64 *out_new_page_count) {
+    *out_new_pages = 0;
+    *out_new_page_count = 0;
+    UINT64 aligned = (size + 15) & ~15ULL;
+    g_imm_last_request_bytes = aligned;
+
+    /* 1ページに収まらない関数は連続領域が要る。フリーリストは単一ページの鎖で
+       連続領域を切り出せないので、従来どおりbumpから取る。カーソルには影響させない */
+    if (aligned > IMM_PAGE_SIZE) {
+        UINT64 count = (aligned + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
+        void *pages = os_imm_pages_alloc_contiguous(count);
+        if (pages == 0) {
+            return 0;
+        }
+        g_code_alloc_multipage++;
+        g_code_pages_taken += count;
+        g_code_bytes_allocated += aligned;
+        g_code_multipage_waste += count * IMM_PAGE_SIZE - aligned;
+        *out_new_pages = pages;
+        *out_new_page_count = count;
+        return pages;
+    }
+
+    lisp_val_t slot = imm_code_cursor_slot(owner_env);
+    if (slot != nil) {
+        lisp_val_t cur = cc_cdr(slot);
+        if (cur != nil) {
+            UINT64 packed = os_fixnum_magnitude(cur);
+            UINT64 off = packed & 0xFFFFFFFFULL;
+            UINT64 end = packed >> 32;
+
+            /* (1) 走行の残りに収まる */
+            if (aligned <= end - off) {
+                g_code_alloc_from_cursor++;
+                g_code_bytes_allocated += aligned;
+                ((lisp_val_t *)(slot & ~TAG_MASK))[1] =
+                    os_make_fixnum(((end) << 32) | (off + aligned));
+                return (void *)(g_imm_space + off);
+            }
+
+            /* (2) 走行を延長できるならまたぐ。
+               成立条件は「走行の終端がg_imm_bumpと一致していること」で、そのときに限り
+               bumpから取る次のページが走行と物理的に連続する(g_imm_spaceは16MBの
+               連続した静的配列)。またいだ2ページはどちらも同じownerのもので、
+               両方ともpagesスロットへ登録されるためdestroy-environmentの回収単位は
+               壊れない。禁じたいのは「1ページに複数の環境」であって「1関数が2ページ」
+               ではない。
+
+               [仕様] 延長が成立するのはbump由来のページだけで、フリーリストから
+               取ったページでは基本的に成立しない(bumpは巻き戻らないので、
+               フリーリスト由来のページの直後がbumpになるのは、それが最後に
+               切り出されたページだった場合に限られる)。この非対称は意図したもので、
+               「空きが飛び飛びの位置にあるならまたがない」が自動的に満たされる。
+               なお仮に成立した場合も、2ページは物理的に連続しており両方とも
+               同じownerへ登録されるので安全である。
+
+               [重要] 1ページを超える要求は上で処理済みなので、ここでは
+               aligned <= IMM_PAGE_SIZE が保証される。したがって1ページ足せば
+               必ず収まる((end - off) + IMM_PAGE_SIZE >= aligned)。 */
+            if ((UINT8 *)(g_imm_space + end) == g_imm_bump) {
+                void *page = os_imm_pages_alloc_contiguous(1);
+                if (page != 0) {
+                    g_code_run_extended++;
+                    g_code_pages_taken++;
+                    g_code_bytes_allocated += aligned;
+                    UINT64 new_end = end + IMM_PAGE_SIZE;
+                    ((lisp_val_t *)(slot & ~TAG_MASK))[1] =
+                        os_make_fixnum((new_end << 32) | (off + aligned));
+                    *out_new_pages = page;
+                    *out_new_page_count = 1;
+                    return (void *)(g_imm_space + off);
+                }
+                /* 空間が尽きていた。下の新規ページ確保でもう一度試みる */
+            }
+
+            /* (3) 延長できないので走行を張り直す。末尾は捨てる(= 分断) */
+            if (end > off) {
+                g_code_tail_abandoned++;
+                g_code_tail_abandoned_bytes += (end - off);
+            }
+        }
+    }
+
+    /* 新しいページを取る。os_imm_page_allocはフリーリストを先に見るので、
+       destroy-environmentで返ったページがここで再利用される */
+    void *page = os_imm_page_alloc();
+    g_code_alloc_new_page++;
+    g_code_pages_taken++;
+    g_code_bytes_allocated += aligned;
+    *out_new_pages = page;
+    *out_new_page_count = 1;
+    if (slot != nil) {
+        UINT64 off = (UINT64)((UINT8 *)page - g_imm_space);
+        UINT64 end = off + IMM_PAGE_SIZE;
+        ((lisp_val_t *)(slot & ~TAG_MASK))[1] = os_make_fixnum((end << 32) | (off + aligned));
+    }
+    return page;
+}
+
+/** 組み込み関数%%DIAG-CODE-PACKING。パッキングの内訳を
+ * (カーソルから ページ新規 複数ページ 分断回数 分断byte 総ページ数 総確保byte 延長回数
+ *  複数ページ確保の端数byte)
+ * のリストで返す。充填率 = 総確保byte / (総ページ数 * 4096)。 */
+lisp_val_t primitive_diag_code_packing(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    lisp_val_t l9 = os_make_cons(os_make_fixnum(g_code_multipage_waste), nil);
+    lisp_val_t l8 = os_make_cons(os_make_fixnum(g_code_run_extended), l9);
+    lisp_val_t l7 = os_make_cons(os_make_fixnum(g_code_bytes_allocated), l8);
+    lisp_val_t l6 = os_make_cons(os_make_fixnum(g_code_pages_taken), l7);
+    lisp_val_t l5 = os_make_cons(os_make_fixnum(g_code_tail_abandoned_bytes), l6);
+    lisp_val_t l4 = os_make_cons(os_make_fixnum(g_code_tail_abandoned), l5);
+    lisp_val_t l3 = os_make_cons(os_make_fixnum(g_code_alloc_multipage), l4);
+    lisp_val_t l2 = os_make_cons(os_make_fixnum(g_code_alloc_new_page), l3);
+    return os_make_cons(os_make_fixnum(g_code_alloc_from_cursor), l2);
+}
+
 /** Function Cell(os_get_function_cell/os_set_function参照)の確保に使う
  * バンプカーソル。全environment共通の1本のみ持つ(現状はどのenvironmentが所有する
  * ページかを区別しない、Phase3でenvironmentごとの所有ページリストに置き換える予定) */
@@ -1733,6 +2783,18 @@ za_fn_meta_t *os_fn_meta_alloc(UINT64 cons_entry) {
     meta->cons_entry = cons_entry;
     meta->fixed_entry = 0;
     meta->arity = 0;
+    /* code_base/code_lenはza_try_compile_defunだけが後から埋める。0のままなら
+       「逆アセンブルできる機械語を持たない」(組み込みprimitive/AOT)を意味する */
+    meta->code_base = 0;
+    meta->code_len = 0;
+    /* [Phase 4a-2] Immobilized Spaceは**ゼロ初期化されない**
+       (os_imm_page_allocはbumpかフリーリストから切り出すだけで、再利用ページには
+       前の内容が残っている)。ここで潰さないと、組み込みprimitiveのように
+       za_try_compile_defunを通らずmetaだけ持つ関数に対して
+       %%OPTIMIZE-OF / %%DECLARED-TYPES-OF が前の内容を読んでしまう。 */
+    meta->optimize = OPTIMIZE_DEFAULT;
+    meta->declared_types[0] = 0;
+    meta->declared_types[1] = 0;
     return meta;
 }
 
@@ -2181,6 +3243,14 @@ static void gc_relocate_stream(UINT64 *words) {
     // 表面化しにくかった一方、write-from!経由の書き込みで顕在化した。
     new_stream->self_handle = gc_copy_value(new_stream->self_handle);
 
+    // write-from!/read-into!が非局所脱出したときに預かる制御転送値
+    // (stream.hのpending_transfer参照)。mount_file_node/self_handleと全く同じ理由で
+    // コピー後にgc_copy_valueし直す。**ここを落とすと、脱出値を預けてから
+    // Lispへ返すまでの間にGCが1回走っただけで、古いFrom空間のアドレスを
+    // 「制御転送値」として返すことになる**([ファイルI/O]#49のself_handleと同じ
+    // 落とし方。documents/pitfalls.md 原則8: 構造体フィールドはGC_PROTECTでは守れない)
+    new_stream->pending_transfer = gc_copy_value(new_stream->pending_transfer);
+
     words[1] = (UINT64)new_stream;
 }
 
@@ -2441,6 +3511,17 @@ static void os_gc_collect_body(void) {
     g_sym_unwind_protect = gc_copy_value(g_sym_unwind_protect);
     g_sym_function = gc_copy_value(g_sym_function);
     g_sym_flet = gc_copy_value(g_sym_flet);
+    g_sym_declaim = gc_copy_value(g_sym_declaim);
+    g_sym_declare = gc_copy_value(g_sym_declare);
+    g_sym_type = gc_copy_value(g_sym_type);
+    g_sym_null = gc_copy_value(g_sym_null);
+    g_sym_eq = gc_copy_value(g_sym_eq);
+    g_sym_inline = gc_copy_value(g_sym_inline);
+    g_sym_notinline = gc_copy_value(g_sym_notinline);
+    g_sym_optimize = gc_copy_value(g_sym_optimize);
+    g_sym_speed = gc_copy_value(g_sym_speed);
+    g_sym_safety = gc_copy_value(g_sym_safety);
+    g_sym_space = gc_copy_value(g_sym_space);
     g_sym_labels = gc_copy_value(g_sym_labels);
     g_sym_defvar = gc_copy_value(g_sym_defvar);
     g_sym_defconstant = gc_copy_value(g_sym_defconstant);
@@ -2455,6 +3536,10 @@ static void os_gc_collect_body(void) {
     g_sym_car = gc_copy_value(g_sym_car);
     g_sym_cdr = gc_copy_value(g_sym_cdr);
     g_sym_cons = gc_copy_value(g_sym_cons);
+    g_sym_plus = gc_copy_value(g_sym_plus);
+    g_sym_minus = gc_copy_value(g_sym_minus);
+    g_sym_asterisk = gc_copy_value(g_sym_asterisk);
+    g_sym_slash = gc_copy_value(g_sym_slash);
     g_sym_read_error = gc_copy_value(g_sym_read_error);
     g_sym_eval_error = gc_copy_value(g_sym_eval_error);
     g_sym_top_level_block = gc_copy_value(g_sym_top_level_block);
@@ -2512,6 +3597,12 @@ static void os_gc_collect_body(void) {
     g_to_end = new_to_end;
     g_to_ptr = g_to_start;
 
+    /* [可用性/#110] **フリップで g_from_start / g_from_end が動くので、柔らかい端と床は
+       計算し直さなければならない。** 忘れると、柔らかい端が入れ替わる前の半空間を
+       指したまま残り、比較が無意味になる(= 枯渇の検出が黙って効かなくなる)。
+       印が立っているあいだは予備を開けた側の端が選ばれる(heap_apply_soft_end) */
+    heap_update_soft_end();
+
 #ifdef ISIKIOS_GC_DEBUG
     g_gc_debug_in_gc = 0;
 #endif
@@ -2540,6 +3631,8 @@ static void os_gc_collect_body(void) {
 }
 
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
+lisp_val_t cc_diag_signal_overflows(lisp_val_t args, lisp_val_t env);
+
 void os_bootstrap() {
     // NIL の作成。From/To空間どちらにも属さない専用の固定領域(g_nil_cell)を使う
     {
@@ -2599,6 +3692,17 @@ void os_bootstrap() {
         g_sym_unwind_protect = os_make_symbol("UNWIND-PROTECT");
         g_sym_function = os_make_symbol("FUNCTION");
         g_sym_flet = os_make_symbol("FLET");
+        g_sym_declaim = os_make_symbol("DECLAIM");
+        g_sym_declare = os_make_symbol("DECLARE");
+        g_sym_type = os_make_symbol("TYPE");
+        g_sym_null = os_make_symbol("NULL");
+        g_sym_eq = os_make_symbol("EQ");
+        g_sym_inline = os_make_symbol("INLINE");
+        g_sym_notinline = os_make_symbol("NOTINLINE");
+        g_sym_optimize = os_make_symbol("OPTIMIZE");
+        g_sym_speed = os_make_symbol("SPEED");
+        g_sym_safety = os_make_symbol("SAFETY");
+        g_sym_space = os_make_symbol("SPACE");
         g_sym_labels = os_make_symbol("LABELS");
         g_sym_defvar = os_make_symbol("DEFVAR");
         g_sym_defconstant = os_make_symbol("DEFCONSTANT");
@@ -2613,6 +3717,10 @@ void os_bootstrap() {
         g_sym_car = os_make_symbol("CAR");
         g_sym_cdr = os_make_symbol("CDR");
         g_sym_cons = os_make_symbol("CONS");
+        g_sym_plus = os_make_symbol("+");
+        g_sym_minus = os_make_symbol("-");
+        g_sym_asterisk = os_make_symbol("*");
+        g_sym_slash = os_make_symbol("/");
 
         g_sym_read_error = os_make_symbol("READ-ERROR");
         g_sym_eval_error = os_make_symbol("EVAL-ERROR");
@@ -2727,13 +3835,39 @@ void os_bootstrap() {
         os_set_function(os_make_symbol("%%DIAG-GC-LIFO-VIOLATIONS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_gc_lifo_violations), global_environment);
 
         #endif
+        os_set_function(os_make_symbol("%%DIAG-SIGNAL-OVERFLOWS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_signal_overflows), global_environment);
         os_set_function(os_make_symbol("%%DIAG-TICK-SAMPLE-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_tick_sample_pub), global_environment);
         os_set_function(os_make_symbol("%%DIAG-IMAGE-ANCHOR-PUB"), os_make_native_function((lisp_addr_t)(void *)cc_diag_image_anchor_pub), global_environment);
         os_set_function(os_make_symbol("%%FIXNUM-MAGNITUDE-MASK"), os_make_native_function((lisp_addr_t)(void *)primitive_fixnum_magnitude_mask), global_environment);
+        os_set_function(os_make_symbol("%%SINGLE-FLOAT-P"), os_make_native_function((lisp_addr_t)(void *)primitive_single_float_p), global_environment);
+        os_set_function(os_make_symbol("%%NARROW-TO-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_narrow_to_single_float), global_environment);
+        os_set_function(os_make_symbol("%%DEFAULT-FLOAT-FORMAT"), os_make_native_function((lisp_addr_t)(void *)primitive_default_float_format), global_environment);
+        os_set_function(os_make_symbol("%%MOST-POSITIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_single_float), global_environment);
+        os_set_function(os_make_symbol("%%MOST-NEGATIVE-SINGLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_negative_single_float), global_environment);
+        os_set_function(os_make_symbol("%%MOST-POSITIVE-DOUBLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_positive_double_float), global_environment);
+        os_set_function(os_make_symbol("%%MOST-NEGATIVE-DOUBLE-FLOAT"), os_make_native_function((lisp_addr_t)(void *)primitive_most_negative_double_float), global_environment);
         os_set_function(os_make_symbol("%%HEAP-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%HEAP-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_heap_used_bytes), global_environment);
+#ifdef ISIKIOS_ALLOC_AUDIT
+        /* [計器] 確保の理由別の数え上げ(M8-T1)。**監査ビルドだけ**。
+           既定ビルドの組み込み数を変えないので SMALL_HEAP_SIZE の再調整が要らない */
+        os_set_function(os_make_symbol("%%ALLOC-REASON-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_bytes), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_count), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-RESET"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_reset), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-DIFF"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_diff), global_environment);
+        os_set_function(os_make_symbol("%%ALLOC-REASON-GC-SINCE-RESET"), os_make_native_function((lisp_addr_t)(void *)primitive_alloc_audit_gc_since_reset), global_environment);
+#endif
         os_set_function(os_make_symbol("%%GC-COLLECT-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_gc_collect_count), global_environment);
         os_set_function(os_make_symbol("%%DIAG-FN-CELL-COUNT"), os_make_native_function((lisp_addr_t)(void *)primitive_fn_cell_count), global_environment);
+        os_set_function(os_make_symbol("%%PINNED-REGISTER"), os_make_native_function((lisp_addr_t)(void *)primitive_pinned_register), global_environment);  /* [実験] */
+        os_set_function(os_make_symbol("%%DIAG-CODE-PACKING"), os_make_native_function((lisp_addr_t)(void *)primitive_diag_code_packing), global_environment);
+        os_set_function(os_make_symbol("%%CURRENT-OPTIMIZE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_optimize), global_environment);
+        os_set_function(os_make_symbol("%%OPTIMIZE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_optimize_of), global_environment);
+        os_set_function(os_make_symbol("%%CURRENT-INLINE"), os_make_native_function((lisp_addr_t)(void *)primitive_current_inline), global_environment);
+        os_set_function(os_make_symbol("%%INLINE-HERE"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_here), global_environment);
+        os_set_function(os_make_symbol("%%INLINE-BIT-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_bit_of), global_environment);
+        os_set_function(os_make_symbol("%%INLINE-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_inline_of), global_environment);
+        os_set_function(os_make_symbol("%%DECLARED-TYPES-OF"), os_make_native_function((lisp_addr_t)(void *)primitive_declared_types_of), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-TOTAL-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_total_bytes), global_environment);
         os_set_function(os_make_symbol("%%IMM-SPACE-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_imm_space_used_bytes), global_environment);
         os_set_function(os_make_symbol("%%BOOT-ALLOC-USED-BYTES"), os_make_native_function((lisp_addr_t)(void *)primitive_boot_alloc_used_bytes), global_environment);
@@ -2801,6 +3935,17 @@ void os_bootstrap() {
  * @param env 検索を開始する環境
  * @return 見つかった値。未定義の場合はnil
  */
+/**
+ * envおよびその親を順に辿り、symの変数の値を取得する。**未束縛でも signal しない。**
+ *
+ * process.c / interrupt.c が *RUN-QUEUE* / *CURRENT-PROCESS* の「まだ束縛されて
+ * いない」を nil で判定しているため、この入口は従来どおり nil を返す。
+ * **interrupt.c の呼び出しは割り込みハンドラの中**なので、ここから Lisp の
+ * make-instance を呼ぶわけにはいかない。
+ * @param sym 検索するsymbol
+ * @param env 検索を開始する環境
+ * @return 見つかった値。未束縛の場合はnil
+ */
 lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env) {
     GC_DEBUG_ASSERT_LIVE(env, "os_get_variable");
     lisp_val_t current_env = env;
@@ -2848,10 +3993,77 @@ lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env) {
 
         current_env = cc_cdr(par_slot); // parent の値
     }
-
-
     // TODO: UNBOUND VARIABLE 等を返し、評価のタイミングでエラーとする
+    //       (ISLisp の変数参照は os_get_variable_checked を使うこと)
     return nil;
+}
+
+/**
+ * [P5] os_get_variable と同じ探索を行い、**未束縛なら <unbound-variable> を signal する。**
+ * ISLisp の変数参照(eval.c のシンボル評価、za.c が生成するグローバル変数読み出し)
+ * が使う入口。nil が束縛されている場合とは区別される(alist に pair があるため、
+ * 値が nil でも上の分岐で返る)。
+ *
+ * **探索ループを os_get_variable と共有せず写しているのは計測の結果である。**
+ * 共通の static 関数へ括り出して2つの薄い入口から呼ぶ形にすると、-O1 の gcc は
+ * インライン展開せず os_get_variable が「呼ぶだけの5命令の踏み台」になった
+ * (39 -> 5 命令)。always_inline を付けると展開はされるが、レジスタ割付が変わって
+ * **親環境をたどるループが1命令増えた**(39 -> 40)。P5 の完了条件は
+ * 「正常系の経路に命令が増えていないこと」なので、写して両方を据え置く形にした。
+ * **片方を直したらもう片方も直すこと。**
+ * @param sym 検索するsymbol
+ * @param env 検索を開始する環境
+ * @return 見つかった値。未束縛なら signal-condition の戻り値
+ */
+lisp_val_t os_get_variable_checked(lisp_val_t sym, lisp_val_t env) {
+    GC_DEBUG_ASSERT_LIVE(env, "os_get_variable_checked");
+    lisp_val_t current_env = env;
+
+    /*
+     * env の構造
+     * '((name . env-name)
+     *   (variables . ((sym2 . val1)
+     *                 (sym2 . val2)
+     *                 (sym3 . val3)))
+     *   (functions . ((sym1 . fn1)
+     *                 (sym2 . fn2)
+     *                 (sym3 . fn3)))
+     *   (parent . ((name . parent-env-name)
+     *              (variables . ((p-sym1 . p-val1)
+     *                            (p-sym2 . p-val2)
+     *                            (p-sym3 . p-val3)))
+     *              (functions . ((p-sym1 . p-fn1)
+     *                            (p-sym2 . p-fn2)
+     *                            (p-sym3 . p-fn3)))
+     *              (parent . ()))))
+     */
+
+    while (current_env != nil) {
+        // 現在の環境から variables slot (cadr) を取得
+        lisp_val_t va_slot = cc_car(cc_cdr(current_env));
+
+        // variables slot の cdr にある alist を取得
+        lisp_val_t alist = cc_cdr(va_slot);
+
+        // alist に対して assoc
+        lisp_val_t pair = cc_assoc_eq(sym, alist);
+
+        if (pair != nil) {
+            // みつかった pair の cdr を返す
+            return cc_cdr(pair);
+        }
+
+
+        // 現在の環境で見つからなければ parent の環境で探す
+        lisp_val_t cell1 = cc_cdr(current_env); // cdr
+        lisp_val_t cell2 = cc_cdr(cell1); // cddr
+        lisp_val_t cell3 = cc_cdr(cell2); // cdddr
+        lisp_val_t par_slot = cc_car(cell3); // cadddr (parent . env)
+
+        current_env = cc_cdr(par_slot); // parent の値
+    }
+    /* [P5] ISLisp の変数参照。spec:899-902 / spec:7255-7257 */
+    return os_signal_unbound_variable(sym, global_environment);
 }
 
 
@@ -2944,14 +4156,6 @@ lisp_val_t primitive_fixnum_magnitude_mask(lisp_val_t args, lisp_val_t env) {
  * @param magnitude 絶対値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
-    lisp_val_t val = (lisp_val_t)(magnitude << FIXNUM_VALUE_SHIFT);
-    if (negative && magnitude != 0) {
-        val |= FIXNUM_SIGN_BIT;
-    }
-    return val;
-}
-
 /**
  * FIXNUMのマグニチュード(絶対値)を取り出す。
  * @param val タグ付けされたFIXNUM
@@ -2980,6 +4184,7 @@ int os_fixnum_is_negative(lisp_val_t val) {
 lisp_val_t os_make_cons(lisp_val_t car, lisp_val_t cdr) {
     GC_PROTECT(car);
     GC_PROTECT(cdr);
+    ALLOC_AUDIT_REASON(ALLOC_REASON_CONS);
     lisp_addr_t cons_addr = os_alloc_bytes(16);
     lisp_val_t *cell = (lisp_val_t *)cons_addr;
     cell[0] = car;
@@ -3014,6 +4219,7 @@ lisp_val_t os_make_symbol(const char *name) {
 
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
     GC_PROTECT(name_str);
+    ALLOC_AUDIT_REASON(ALLOC_REASON_SYMBOL);
     lisp_addr_t addr = os_alloc_bytes(32);
     lisp_val_t *sym = (lisp_val_t *)addr;
     sym[0] = name_str; // string へのポインタ
@@ -3094,6 +4300,7 @@ lisp_val_t os_make_symbol_cached(int *cache_idx, const char *name) {
 lisp_val_t os_make_uninterned_symbol(const char *name) {
     lisp_val_t name_str = os_make_string_for(name, 1 /* uppercase */);
     GC_PROTECT(name_str);
+    ALLOC_AUDIT_REASON(ALLOC_REASON_SYMBOL_UNINT);
     lisp_addr_t addr = os_alloc_bytes(32);
     lisp_val_t *sym = (lisp_val_t *)addr;
     sym[0] = name_str;          // string へのポインタ
@@ -3156,6 +4363,17 @@ void os_reset_runtime_state_for_test(void) {
     g_function_cell_count = 0;
     g_fn_meta_cursor.page = 0;
     g_fn_meta_cursor.offset = 0;
+    /* コードカーソルの実体は各環境のスロット側にあり、環境ごと作り直されるので
+       ここでリセットするのは診断カウンタだけでよい */
+    g_code_alloc_from_cursor = 0;
+    g_code_alloc_new_page = 0;
+    g_code_alloc_multipage = 0;
+    g_code_tail_abandoned = 0;
+    g_code_tail_abandoned_bytes = 0;
+    g_code_pages_taken = 0;
+    g_code_bytes_allocated = 0;
+    g_code_run_extended = 0;
+    g_code_multipage_waste = 0;
 }
 
 
@@ -3222,6 +4440,10 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
     // 次第でビルドごと・ASLRごとに非決定的)。gc_scan_instance(このオブジェクトが
     // 生き残った後のGCで実際に辿るフィールド)と同じ基準で、本当にタグ付き値である
     // フィールドだけをGC_PROTECTする。
+    /* [計器] magic から理由を引いて置く。**switch の中の 5 つの確保はすべて 32 byte で
+       同じ物体**なので、ここで 1 回置けば足りる(GC_PROTECT は確保しないので、
+       置いてから実際に確保するまでの間に別の確保は挟まらない) */
+    ALLOC_AUDIT_REASON_MAGIC(magic);
     lisp_addr_t addr;
     switch (magic) {
         case MAGIC_FUNCTION_NATIVE: {
@@ -3348,6 +4570,26 @@ static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env
     GC_PROTECT(pages_symbol);
     lisp_val_t literal_slots_symbol = os_make_symbol("literal-slots");
     GC_PROTECT(literal_slots_symbol);
+    /* 9番目のスロット(code-cursor)はenvironmentにだけ持たせる。frameは
+       let/fletの評価ごとに作られるhot pathなので、consを1つ増やさない。
+       defunの登録先はos_definition_envがframeを読み飛ばして必ずenvironmentを返すため、
+       frameがコードページを所有することは無い(os_imm_code_allocも念のため検査する)。 */
+    int want_code_cursor = (slot_tag != g_sym_frame);
+    lisp_val_t code_cursor_symbol = nil;
+    if (want_code_cursor) {
+        code_cursor_symbol = os_make_symbol("code-cursor");
+    }
+    GC_PROTECT(code_cursor_symbol);
+    /* 10番目のスロット(declaim)もenvironmentにだけ持たせる。frameが持たないのは
+       code-cursorと同じ理由(let/fletの評価ごとのhot path)で、加えて
+       「declaimを保持するのはenvironmentのみ」という仕様そのものでもある
+       (documents/declaim-design.md)。frame内でdeclaimしてもos_definition_envが
+       読み飛ばして囲みのenvironmentへ届く。 */
+    lisp_val_t declaim_symbol = nil;
+    if (want_code_cursor) {
+        declaim_symbol = os_make_symbol("declaim");
+    }
+    GC_PROTECT(declaim_symbol);
 
     lisp_val_t name_slot = os_make_cons(name_symbol, env_symbol);
     GC_PROTECT(name_slot);
@@ -3364,8 +4606,32 @@ static lisp_val_t os_make_environment_tagged(lisp_val_t slot_tag, lisp_val_t env
     lisp_val_t pages_slot = os_make_cons(pages_symbol, nil);
     GC_PROTECT(pages_slot);
     lisp_val_t literal_slots_slot = os_make_cons(literal_slots_symbol, nil);
+    GC_PROTECT(literal_slots_slot);
 
-    lisp_val_t list_step7 = os_make_cons(literal_slots_slot, nil);
+    /* code-cursorの値は「g_imm_spaceの先頭からの、次に使えるbyteオフセット」を表す
+       fixnum、またはカーソル未設定を表すnil。fixnumは即値(os_make_fixnumは確保しない)
+       なので、切り出しのたびにconsを作らずスロットのcdrを書き換えるだけで済む。
+       (off & (IMM_PAGE_SIZE-1)) == 0 は「現在のページを使い切った」を意味する
+       (次のページの所有権は無いので、残り容量は0として扱う)。 */
+    /* declaimの値は speed | (safety << 2) | (space << 4) を1つのfixnumへ詰めたもの。
+       各2bitで値域0〜3。**親からは引き継がず、必ずデフォルト(1 1 1)で始める。**
+       fixnumは即値なので、GCルートが増えず、値の更新でも確保が起きない
+       (Cheneyコピーはスロットのconsを普通に複製し、中身のfixnumは素通しする)。 */
+    lisp_val_t list_step9 = nil;
+    if (want_code_cursor) {
+        lisp_val_t declaim_slot = os_make_cons(declaim_symbol, os_make_fixnum(OPTIMIZE_DEFAULT));
+        list_step9 = os_make_cons(declaim_slot, nil);
+    }
+    GC_PROTECT(list_step9);
+
+    lisp_val_t list_step8 = nil;
+    if (want_code_cursor) {
+        lisp_val_t code_cursor_slot = os_make_cons(code_cursor_symbol, nil);
+        list_step8 = os_make_cons(code_cursor_slot, list_step9);
+    }
+    GC_PROTECT(list_step8);
+
+    lisp_val_t list_step7 = os_make_cons(literal_slots_slot, list_step8);
     lisp_val_t list_step6 = os_make_cons(pages_slot, list_step7);
     lisp_val_t list_step5 = os_make_cons(cells_slot, list_step6);
     lisp_val_t list_step4 = os_make_cons(constants_slot, list_step5);
@@ -3552,6 +4818,235 @@ lisp_val_t os_make_jit_function_dual(UINT64 cons_entry, UINT64 fixed_entry, UINT
 }
 
 /**
+ * JITコンパイル済み関数のza_fn_meta_tへ、逆アセンブル用のコード範囲を記録する。
+ * @param fn os_make_jit_function(_dual)が返したMAGIC_FUNCTION_NATIVEの関数
+ * @param code_base 機械語ブロックの先頭アドレス(Immobilized Space上)
+ * @param code_len 同ブロックのバイト長
+ */
+/**
+ * 関数オブジェクトのmetaへ、コンパイル時に有効だったoptimize指定を記録する。
+ * %%OPTIMIZE-OFが事後確認のために読む。コンパイルへの入力ではない
+ * (入力はza_try_compile_defunの引数で渡す)。
+ * @param fn 関数オブジェクト
+ * @param packed 詰めたoptimize値
+ */
+void os_fn_set_optimize(lisp_val_t fn, UINT64 packed) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE) {
+        return;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    if (meta == 0) {
+        return;
+    }
+    meta->optimize = packed;
+}
+
+/* ===== declare による型宣言(Phase 4a-2) ============================== */
+
+/**
+ * 型符号 → 正準クラス名 の対応表。**符号化と復号の両方がこの1つの表だけを見る**
+ * (符号 i の名前が g_decl_type_names[i - 1])。
+ *
+ * 並びはinit_aot.lispの%register-builtin-class呼び出しと同じにしてある。
+ * ここに無いクラス(ユーザ定義クラス等)は OS_DECL_TYPE_OTHER になる。
+ * **この表は名前解決の表ではない。** 名前からクラスを引くのは*classes*(=%find-class
+ * と同じ経路)で、この表が受け取るのは既に解決済みのクラスの**正準名**である
+ * (runtime.h の os_decl_types_t のコメント参照)。
+ */
+static const char *const g_decl_type_names[] = {
+    "<OBJECT>",
+    "<BASIC-ARRAY>",
+    "<BASIC-ARRAY*>",
+    "<GENERAL-ARRAY*>",
+    "<BASIC-VECTOR>",
+    "<GENERAL-VECTOR>",
+    "<STRING>",
+    "<BUILT-IN-CLASS>",
+    "<CHARACTER>",
+    "<FUNCTION>",
+    "<GENERIC-FUNCTION>",
+    "<STANDARD-GENERIC-FUNCTION>",
+    "<LIST>",
+    "<CONS>",
+    "<SYMBOL>",
+    "<NULL>",
+    "<NUMBER>",
+    "<INTEGER>",
+    "<FLOAT>",
+    "<FIXNUM>",
+    "<BIGNUM>",
+    "<SINGLE-FLOAT>",
+    "<DOUBLE-FLOAT>",
+    "<STANDARD-CLASS>",
+    "<STANDARD-OBJECT>",
+    "<STREAM>",
+};
+#define DECL_TYPE_NAME_COUNT ((UINT64)(sizeof(g_decl_type_names) / sizeof(g_decl_type_names[0])))
+
+/* [型特化] 個別の型符号(runtime.h)が表の並びと一致していることを、
+   **文字列比較ではなくビルド時に**確かめる。表へ要素を挿入すると符号がずれ、
+   「fixnum と宣言したのに single 用の呼び先を呼ぶ」という静かな誤りになる。 */
+_Static_assert(OS_DECL_TYPE_FIXNUM >= 1 && OS_DECL_TYPE_FIXNUM <= 26,
+               "OS_DECL_TYPE_FIXNUM が g_decl_type_names の範囲外");
+_Static_assert(OS_DECL_TYPE_SINGLE_FLOAT >= 1 && OS_DECL_TYPE_SINGLE_FLOAT <= 26,
+               "OS_DECL_TYPE_SINGLE_FLOAT が g_decl_type_names の範囲外");
+
+/* 符号は1始まりで、254(OTHER)/255(UNKNOWN)とぶつかってはならない */
+_Static_assert(sizeof(g_decl_type_names) / sizeof(g_decl_type_names[0]) < 254,
+               "g_decl_type_names got too large: codes would collide with OS_DECL_TYPE_OTHER/UNKNOWN");
+
+static lisp_val_t find_interned_symbol(const char *name);
+
+/**
+ * nameで登録済みのクラスオブジェクトを引く。init_aot.lispの
+ * `(defun %find-class (name) (cdr (assoc name (dynamic *classes*))))` と
+ * **同じ *classes* を同じ順序で走査する**(別の表を作らない)。
+ *
+ * Lisp側の%find-classをosApplyFunctionで呼ぶ実装(os_resolve_class)にしないのは、
+ * あちらが確保を伴いGCを誘発するためである。この関数はコンパイル中
+ * (za_compile_let)からも呼ばれるので、確保してはいけない
+ * (documents/pitfalls.md 原則4: コンパイル中のGCは手元のASTをstaleにする)。
+ */
+static lisp_val_t decl_find_class(lisp_val_t class_name_sym) {
+    lisp_val_t classes_sym = find_interned_symbol("*CLASSES*");
+    if (classes_sym == nil) {
+        return nil;     /* init_aot.lispがまだ読まれていない */
+    }
+    lisp_val_t pair = cc_assoc_eq(class_name_sym, os_get_dynamic(classes_sym));
+    return (pair != nil) ? cc_cdr(pair) : nil;
+}
+
+UINT8 os_decl_type_code_of(lisp_val_t class_name_sym) {
+    if ((class_name_sym & TAG_MASK) != TAG_SYMBOL) {
+        return OS_DECL_TYPE_UNKNOWN;
+    }
+    lisp_val_t cls = decl_find_class(class_name_sym);
+    if (cls == nil || (cls & TAG_MASK) != TAG_INSTANCE) {
+        return OS_DECL_TYPE_UNKNOWN;    /* §3-3: エラーにせず無視する */
+    }
+    UINT64 *obj = (UINT64 *)(cls & ~TAG_MASK);
+    if (obj[0] != MAGIC_BUILTIN_CLASS && obj[0] != MAGIC_STANDARD_CLASS) {
+        return OS_DECL_TYPE_UNKNOWN;
+    }
+    /* [別名] 利用者が書いた class_name_sym ではなく、**解決したクラスの正準名**
+       (word1)で突き合わせる。<short-float>は<single-float>と同一のクラス
+       オブジェクトなので、ここでは<SINGLE-FLOAT>が出てきて同じ符号になる */
+    lisp_val_t canonical = obj[1];
+    for (UINT64 i = 0; i < DECL_TYPE_NAME_COUNT; i++) {
+        if (canonical == find_interned_symbol(g_decl_type_names[i])) {
+            return (UINT8)(i + 1);
+        }
+    }
+    return OS_DECL_TYPE_OTHER;          /* 実在するが符号を持たない */
+}
+
+lisp_val_t os_decl_type_name(UINT8 code) {
+    if (code == OS_DECL_TYPE_NONE) {
+        return nil;
+    }
+    if (code == OS_DECL_TYPE_OTHER) {
+        return os_make_symbol("<OTHER>");
+    }
+    if (code == OS_DECL_TYPE_UNKNOWN || (UINT64)code > DECL_TYPE_NAME_COUNT) {
+        return os_make_symbol("<UNKNOWN>");
+    }
+    return os_make_symbol(g_decl_type_names[code - 1]);
+}
+
+/**
+ * 1つの宣言指定子 (type <fixnum> x y) を読み、var_symsに現れる変数へ符号を配る。
+ * type以外の指定子(将来のinline等)は黙って読み飛ばす。
+ */
+static void decl_apply_spec(lisp_val_t spec, const lisp_val_t *var_syms, UINT64 var_count,
+                            os_decl_types_t *out) {
+    if ((spec & TAG_MASK) != TAG_CONS) {
+        return;
+    }
+    /* §3-1: (type <class> v...) の形のみ。(fixnum v) のような裸の型名は採らない */
+    if (cc_car(spec) != g_sym_type) {
+        return;
+    }
+    lisp_val_t rest = cc_cdr(spec);
+    if ((rest & TAG_MASK) != TAG_CONS) {
+        return;
+    }
+    UINT8 code = os_decl_type_code_of(cc_car(rest));
+    /* [重要] 終端は **nil との比較**で見ること。nil は g_nil_cell | TAG_CONS、
+       つまり **TAG_CONS タグを持つ Lisp 値**なので、`(v & TAG_MASK) == TAG_CONS`
+       だけでは終端を弾けず、cc_cdr(nil) == nil が返り続けて無限ループになる
+       (runtime.c 先頭の g_nil_cell のコメント参照)。 */
+    for (lisp_val_t vars = cc_cdr(rest); vars != nil && (vars & TAG_MASK) == TAG_CONS; vars = cc_cdr(vars)) {
+        lisp_val_t v = cc_car(vars);
+        for (UINT64 i = 0; i < var_count; i++) {
+            if (var_syms[i] == v) {
+                /* 同じ変数を2回宣言したら後勝ち(CommonLispは未定義。ここでは単純に上書き) */
+                os_decl_types_set(out, i, code);
+            }
+        }
+    }
+}
+
+lisp_val_t os_scan_declarations(lisp_val_t body, const lisp_val_t *var_syms, UINT64 var_count,
+                                os_decl_types_t *out_types) {
+    *out_types = os_decl_types_empty();
+    if (var_count > OS_DECL_TYPES_MAX_VARS) {
+        var_count = OS_DECL_TYPES_MAX_VARS;
+    }
+    /* §3-5: bodyの**先頭に連続する**declareだけを宣言として扱う。
+       途中に現れたものはここで止まるので通常の式のまま残り、
+       評価時/コンパイル時にno-op(nil)として扱われる */
+    /* [重要] nil は TAG_CONS タグを持つ(decl_apply_spec のコメント参照)。
+       終端は必ず nil との比較で見ること。 */
+    while (body != nil && (body & TAG_MASK) == TAG_CONS) {
+        lisp_val_t form = cc_car(body);
+        if (form == nil || (form & TAG_MASK) != TAG_CONS || cc_car(form) != g_sym_declare) {
+            break;
+        }
+        for (lisp_val_t specs = cc_cdr(form); specs != nil && (specs & TAG_MASK) == TAG_CONS; specs = cc_cdr(specs)) {
+            decl_apply_spec(cc_car(specs), var_syms, var_count, out_types);
+        }
+        body = cc_cdr(body);
+    }
+    return body;
+}
+
+void os_fn_set_declared_types(lisp_val_t fn, os_decl_types_t types) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE) {
+        return;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    if (meta == 0) {
+        return;
+    }
+    meta->declared_types[0] = types.w[0];
+    meta->declared_types[1] = types.w[1];
+}
+
+void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len) {
+    if ((fn & TAG_MASK) != TAG_INSTANCE) {
+        return;
+    }
+    UINT64 *obj = (UINT64 *)(fn & ~TAG_MASK);
+    if (obj[0] != MAGIC_FUNCTION_NATIVE) {
+        return;
+    }
+    za_fn_meta_t *meta = (za_fn_meta_t *)obj[1];
+    if (meta == 0) {
+        return;
+    }
+    meta->code_base = code_base;
+    meta->code_len = code_len;
+}
+
+/**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
  * その定義時の捕捉環境として保持するTAG_INSTANCEオブジェクトを作る。
  * @param fnptr 呼び出すリフト済みlambda本体のC関数のアドレス
@@ -3578,22 +5073,100 @@ lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnpt
     return os_make_instance(MAGIC_FUNCTION_NATIVE, (UINT64)(void *)meta, os_make_fixnum(2), captured_env);
 }
 
+/* [P4] **conditionの構築そのものが失敗する状態では、signalは再帰する。**
+ *
+ * os_signal_conditionは「init.lisp未ロード」をmake-instance/signal-conditionが
+ * 未定義かどうかで判定しているが、**この2つはinit_aot.lisp側にある**。つまり
+ * AOTフォームだけ実行してinit.lispを読んでいない状態(素のカーネル起動、
+ * boot-entryスクリプトが(load "src/lisp/init.lisp")を持たない場合)では、
+ * 関数はあるのに**条件クラスが1つも登録されていない**という食い違いが起きる。
+ *
+ * そこでmake-instanceは (%find-class '<DOMAIN-ERROR>) にnilを得て、
+ * (%%class-slots nil) が型検査の無いまま生の値を読み、その値をlengthに渡す。
+ * P4でlengthが非シーケンスをsignalするようになったため、ここから
+ *   length -> signal -> make-instance -> %%class-slots -> length -> ...
+ * という無限再帰になり、スタックガードページに当たって停止していた
+ * (QEMU上で #PF: CR2 = RSP-8、gdbスタブで確認)。P4以前はlengthが
+ * EVAL-ERRORを「値として」返していたため再帰にならず、黙って壊れた値が
+ * 流れるだけだった。
+ *
+ * 深さで打ち切り、未ロード時と同じフォールバック(EVAL-ERROR)へ落とす。
+ * 正常系(init.lispロード済み)ではハンドラの入れ子がこの深さに達することは
+ * 無い(signal-conditionはハンドラを呼ぶ前に*handlers*をcdrへ進めるため、
+ * 入れ子の深さはハンドラの数で頭打ちになる)。
+ */
+#define SIGNAL_MAX_DEPTH 16
+static UINT64 g_signal_depth = 0;
+static UINT64 g_signal_overflow_count = 0;
+
+/** (%%diag-signal-overflows) → 上の打ち切りが起きた延べ回数。0が正常。 */
+lisp_val_t cc_diag_signal_overflows(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_signal_overflow_count);
+}
+
+/* 非局所脱出は戻り値(control transfer)で伝わるのでlongjmpは無いが、returnが
+   複数あるのでGC_PROTECTと同じくcleanup属性で確実に戻す */
+static void signal_depth_pop(UINT64 *saved) { g_signal_depth = *saved; }
+
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env) {
     GC_PROTECT(env);
+    if (g_signal_depth >= SIGNAL_MAX_DEPTH) {
+        g_signal_overflow_count++;
+        return g_sym_eval_error;
+    }
+    UINT64 _signal_depth_saved __attribute__((cleanup(signal_depth_pop))) = g_signal_depth;
+    g_signal_depth++;
+    GC_PROTECT(class_sym);
+    GC_PROTECT(initargs);
     lisp_val_t make_instance_fn = os_get_function(g_sym_make_instance, env);
+    /* [GC安全性] **make_instance_fnはここで守らなければならない。**
+       下のos_make_consはヒープを確保するのでGCが走りうる。GCはコピー方式なので、
+       守られていないローカルは転送先へ追随せず、os_apply_functionへ**旧番地**が
+       渡る。GC_DEBUGビルドでこれを踏むと、make-instanceが壊れたclassを受け取り、
+       (%%class-slots class)がEVAL-ERRORを返し、それをlengthがsignalし、signalが
+       また make-instance を呼ぶ……という無限再帰でスタックを食い潰していた
+       (documents/pitfalls.md 原則4) */
+    GC_PROTECT(make_instance_fn);
     lisp_val_t signal_condition_fn = os_get_function(g_sym_signal_condition, env);
     GC_PROTECT(signal_condition_fn);
-    if (make_instance_fn == nil || signal_condition_fn == nil) {
-        // init.lisp未ロード(make-instance/signal-conditionが未定義)時のフォールバック
+    /* [P4] **関数の有無だけでは「条件システムが使えるか」を判定できない。**
+       make-instance / signal-condition / %find-class はどれもinit_aot.lisp側に
+       あるので、init.lispを読んでいない起動(boot-entryスクリプトが
+       (load "src/lisp/init.lisp")を持たない場合)でも**存在する**。一方で
+       条件クラス(<simple-error>や<domain-error>)はinit.lispのdefclassで
+       登録されるため、そちらは1つも無い。
+       その食い違いのままmake-instanceへ進むと、classにnilが渡り、
+       (%%class-slots nil)の生の読み出しを経てlengthがsignalし、signalがまた
+       make-instanceを呼ぶ無限再帰になる。クラスが引けるかどうかも併せて見て、
+       関数が無い場合と**同じ1つのフォールバック**へ落とす。 */
+    lisp_val_t resolved_class = nil;
+    if (make_instance_fn != nil && signal_condition_fn != nil &&
+        (class_sym & TAG_MASK) == TAG_SYMBOL) {
+        resolved_class = os_resolve_class(class_sym, env);
+        if (os_is_control_transfer(resolved_class)) {
+            return resolved_class;
+        }
+        if (resolved_class == g_sym_eval_error) {
+            resolved_class = nil;
+        }
+    }
+    if (make_instance_fn == nil || signal_condition_fn == nil ||
+        ((class_sym & TAG_MASK) == TAG_SYMBOL && resolved_class == nil)) {
+        // 条件システムが使えない(init.lisp未ロード等)ときのフォールバック
         return g_sym_eval_error;
     }
 
-    lisp_val_t condition = os_apply_function(make_instance_fn, os_make_cons(class_sym, initargs), env);
+    lisp_val_t make_args = os_make_cons(class_sym, initargs);
+    GC_PROTECT(make_args);
+    lisp_val_t condition = os_apply_function(make_instance_fn, make_args, env);
     if (os_is_control_transfer(condition)) {
         return condition;
     }
+    GC_PROTECT(condition);
 
     lisp_val_t signal_args = os_make_cons(condition, os_make_cons(nil, nil));
+    GC_PROTECT(signal_args);
     return os_apply_function(signal_condition_fn, signal_args, env);
 }
 
@@ -3676,6 +5249,379 @@ static lisp_val_t signal_domain_error_for_class(lisp_val_t offending_object, con
     initargs = os_make_cons(offending_object, initargs);
     initargs = os_make_cons(g_sym_kw_object, initargs);
     return os_signal_condition(g_sym_class_domain_error, initargs, env);
+}
+
+/**
+ * [P4] 0除算を<division-by-zero>としてsignalする。
+ * 仕様の error-id: div/mod は spec:4889、quotient/reciprocal は spec:4347/4365。
+ *
+ * spec §29.3.1 の <arithmetic-error> は operation / operands のデータを持つ。
+ * **operation にはシンボルを入れる。** 仕様の型は <function> だが、このコードベースは
+ * 既に %quotient2(init.lisp)と init_test.lisp がシンボルを入れる形で揃っており、
+ * report-condition の ~A も関数オブジェクトでは #<FUNCTION-BUILTIN> としか出ない。
+ * 既存の形に合わせる(PR に仕様との差として記録した)。
+ *
+ * キーワードとクラス名は os_make_symbol でその場で引く。エラー経路なのでキャッシュの
+ * 必要が無く、**グローバルを増やすと gc_copy_value の追加を忘れる余地が増える**
+ * ([ファイルI/O]#49 と同じ落とし方)ため。symbol は intern 済みなので table は増えない。
+ *
+ * @param operation_name 演算の名前(例 "/")
+ * @param operands 受け取った引数のリスト
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ */
+static lisp_val_t signal_division_by_zero(const char *operation_name, lisp_val_t operands, lisp_val_t env) {
+    GC_PROTECT(operands);
+    GC_PROTECT(env);
+    lisp_val_t operation = os_make_symbol(operation_name);
+    GC_PROTECT(operation);
+    lisp_val_t kw_operands = os_make_symbol(":OPERANDS");
+    GC_PROTECT(kw_operands);
+    lisp_val_t kw_operation = os_make_symbol(":OPERATION");
+    GC_PROTECT(kw_operation);
+    lisp_val_t class_sym = os_make_symbol("<DIVISION-BY-ZERO>");
+    GC_PROTECT(class_sym);
+
+    /* 確保を1つずつ行い、それぞれの結果を次の確保を跨いで保護する
+       (C言語の引数評価順に依存したネストは避ける。documents/pitfalls.md 原則4) */
+    lisp_val_t initargs = os_make_cons(operands, nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(kw_operands, initargs);
+    initargs = os_make_cons(operation, initargs);
+    initargs = os_make_cons(kw_operation, initargs);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
+/**
+ * [P4] 添字が範囲外のときの<program-error>をsignalする。
+ *
+ * 仕様の error-id は index-out-of-range(elt/set-elt/subseq。spec:5320 等)で、
+ * §29.4 の対応表(spec:7249-7252)が **「conditions of class <program-error>」**と
+ * 定めている。専用クラスは仕様のクラス階層(spec:994-1010)に存在しない。
+ *
+ * **<program-error> はスロットを持たないので、どのシーケンスのどの添字だったかは
+ * 運べない。** report-condition も既定メソッドでクラス名だけを出す。
+ * 情報を足すには <index-out-of-range> のような部分クラスを増やすことになるが、
+ * それは仕様に無いクラスの追加なので別途の判断とする(PRに記録した)。
+ *
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ */
+/* [P4-2] **signal には global_environment を渡す。** os_signal_conditionがenvを使うのは
+   MAKE-INSTANCE / SIGNAL-CONDITION の解決だけで、どちらも global_environment にしか
+   登録されない(どのenvの親鎖もそこへ行き着く)。呼び出し元のenvをエラー分岐まで
+   生かすと、**成功経路の側**でcallee-savedレジスタへの退避(push/pop)が増える。
+   実測(objdump): elt を env 引きまわしにすると primitive_elt2 が 5->6 命令、
+   primitive_elt_impl のプロローグが +2 命令になった。エラー分岐は稀なので、
+   その場で global_environment を読むほうが安い。primitive_divide2_fixnum が
+   0除算時に primitive_divide(args, global_environment) へ委譲しているのと同じ考え方。 */
+static lisp_val_t signal_index_out_of_range(lisp_val_t env) {
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol("<PROGRAM-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, nil, env);
+}
+
+/**
+ * [可用性/#110] ヒープ枯渇を <storage-exhausted> として signal する。
+ *
+ * **za.c の os_za_signal_stack_exhausted をそのまま写した形である**
+ * (再入フラグ / 閾値を床へ下げる / クラス名はその場で引く、の 3 点)。
+ * スタック側と同じ構造にしてあるのは、片方を直したときにもう片方を見に来られる
+ * ようにするためである(documents/stack-guard.md / documents/heap-exhaustion.md)。
+ *
+ * **ここへ来た時点で、確保はもう予備領域の中で行われている。** signal 経路は
+ * さらに確保する(条件の実体・引数の対・呼び戻した Lisp 関数のフレーム)ので、
+ * 入る前に柔らかい端を床まで下げて予備を開け、抜けるときに戻す。
+ *
+ * **入れ子にしない。** 予備の中でさらに枯渇した場合(ハンドラが深く確保した)は
+ * signal を重ねず EVAL-ERROR を返す。重ねると予備を食い潰してから panic するので、
+ * 「エラーを出そうとして機械が止まる」というもっと分かりにくい症状になる。
+ *
+ * @param env signal に使う環境(通常は global_environment)
+ * @return signal-conditionの戻り値。条件システムが使えない起動段階では
+ *         os_signal_condition が g_sym_eval_error を返す(= エラー値へ落ちる)
+ */
+lisp_val_t os_heap_signal_exhausted(lisp_val_t env) {
+    g_heap_guard_hits++;
+    if (g_in_heap_signal) {
+        return g_sym_eval_error;
+    }
+    g_in_heap_signal = 1;
+    /* 印は**消費する**。知らせている間にまた枯渇したら os_alloc_bytes が立て直し、
+       外側が抜けたあと次の評価の入口でもう一度知らせる(劣化はするがハングしない) */
+    g_heap_exhausted_pending = 0;
+    heap_apply_soft_end();
+
+    UINT64 used_before = (UINT64)(g_from_ptr - g_from_start);
+    UINT64 gc_before = os_gc_collect_count();
+
+    GC_PROTECT(env);
+    /* <storage-exhausted> はスロットを持たないので initargs は nil。
+       クラス名は os_make_symbol でその場で引く(エラー経路なのでキャッシュ不要。
+       グローバルを増やすと gc_copy_value の追加漏れの余地が増える) */
+    lisp_val_t class_sym = os_make_symbol("<STORAGE-EXHAUSTED>");
+    GC_PROTECT(class_sym);
+    lisp_val_t r = os_signal_condition(class_sym, nil, env);
+
+    /* [計器] 予備領域の ★ を実測へ直すための値。**GC を挟んだ回は数えない**
+       (水位が戻るので差が意味を失う。os_alloc_audit_diff と同じ註) */
+    if (os_gc_collect_count() == gc_before) {
+        UINT64 used_after = (UINT64)(g_from_ptr - g_from_start);
+        if (used_after > used_before && used_after - used_before > g_heap_signal_path_bytes) {
+            g_heap_signal_path_bytes = used_after - used_before;
+        }
+    }
+
+    g_in_heap_signal = 0;
+    heap_apply_soft_end();
+    return r;
+}
+
+/**
+ * [可用性/#110] 大口の確保要求(byte 数)が**柔らかい端より下に入るか**。
+ *
+ * **床ではなく柔らかい端で見る。** 予備領域は知らせるための領域なので、
+ * 大口の確保に食わせない(食わせると、知らせようとした時点で予備が無い)。
+ *
+ * ポインタ演算で `p + bytes` を作らないのは、**要求が巻き上がると比較が逆になる**
+ * ためである。負の fixnum を生シフトすると bit63 の符号が値に混ざって
+ * 10^17 規模の「非負の値」に見え、`p + aligned` がアドレス空間を回り込んで
+ * 「空きがある」と判定されうる。差で見れば回り込まない。
+ */
+static int heap_request_fits(UINT64 bytes) {
+    if (bytes > (UINT64)~0ULL - (OS_HEAP_ALIGN - 1)) {
+        return 0;   /* os_heap_align_up 自身が溢れる大きさ */
+    }
+    UINT64 aligned = os_heap_align_up(bytes);
+    UINT8 *p = g_from_ptr;
+    if (p >= g_from_soft_end_normal) {
+        return 0;
+    }
+    return aligned <= (UINT64)(g_from_soft_end_normal - p);
+}
+
+/**
+ * [可用性/#110] 大口の確保要求が入らないなら <storage-exhausted> を signal する。
+ * 入るなら 0 を返し、呼び出し側はそのまま確保へ進む。
+ *
+ * **GC を 1 回試す順序は os_alloc_bytes の遅い側と同じにする。** 試さずに signal すると、
+ * 「GC すれば入ったのに枯渇と言う」退行になる。
+ *
+ * @param bytes 要求する本体ブロックのバイト数
+ * @param out_signal signal した場合の戻り値を書き込む
+ * @return signal した場合 1、確保へ進んでよい場合 0
+ */
+static int heap_signal_if_too_large(UINT64 bytes, lisp_val_t *out_signal) {
+    if (heap_request_fits(bytes)) {
+        return 0;
+    }
+    /* **半空間全体にも入らない大きさなら GC しても入らない。** 桁あふれした要求も
+       ここに入るので、巨大な配列 1 つで GC を 1 回誘発させる形にはならない */
+    if (bytes <= (UINT64)(g_from_soft_end_normal - g_from_start)) {
+        os_gc_collect();
+        if (heap_request_fits(bytes)) {
+            return 0;
+        }
+    }
+    *out_signal = os_heap_signal_exhausted(global_environment);
+    return 1;
+}
+
+/**
+ * [可用性/#110] 印(小口の確保が立てた枯渇の印)が立っていれば知らせる。
+ *
+ * **印を見る場所は「大口の primitive」と「os_eval の評価の入口」だけである。**
+ * JIT / AOT の生成コードが小口の確保だけを続ける区間は守らない
+ * (守るにはそれぞれの関数入口に検査が要る = 常道に命令が増える)。
+ * 守らないことは documents/heap-exhaustion.md に書いた
+ * (スタック側が「JIT だけ守った」ことを記録したのと同じ作法)。
+ *
+ * @return signal した場合 1(*out_signal にその戻り値)、何もしなかった場合 0
+ */
+static int heap_signal_if_pending(lisp_val_t *out_signal) {
+    if (!g_heap_exhausted_pending) {
+        return 0;
+    }
+    *out_signal = os_heap_signal_exhausted(global_environment);
+    return 1;
+}
+
+/**
+ * [P4-3] 未定義の関数を <undefined-function> として signal する。
+ *
+ * 仕様は「関数名前空間に束縛が無ければ error を signal する(error-id.
+ * undefined-function)」と定めている(関数適用: spec:1455-1457 / spec:1461、
+ * function 特殊形式: spec:1512-1513)。§29.4 の対応表(spec:7261-7263)が
+ * そのクラスを <undefined-function> と定めている。
+ *
+ * <undefined-entity> のスロットは name と namespace の2つで、namespace は
+ * variable / dynamic-variable / function / class のいずれかのシンボル
+ * (spec:7160-7163、spec:7181-7182)。ここは関数名前空間なので function を入れる。
+ *
+ * @param name_sym 未定義だった関数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env) {
+    GC_PROTECT(name_sym);
+    GC_PROTECT(env);
+    lisp_val_t initargs = os_make_cons(os_make_symbol("FUNCTION"), nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(os_make_symbol(":NAMESPACE"), initargs);
+    initargs = os_make_cons(name_sym, initargs);
+    initargs = os_make_cons(os_make_symbol(":NAME"), initargs);
+    lisp_val_t class_sym = os_make_symbol("<UNDEFINED-FUNCTION>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
+/**
+ * [P6] arity 不一致(仮引数の個数と実引数の個数が合わない)を signal する。
+ *
+ * spec:896-898(§9.2 (2))「an error shall be signaled if a function is activated
+ * with a number of arguments which is different than the number of parameters as
+ * required in the function definition (error-id. arity-error)」、
+ * spec:1549-1550(lambda)も同じことを定めている。
+ * §29.4 の対応表(spec:7191-7194)がそのクラスを **<program-error>** と定める。
+ *
+ * **<program-error> はスロットを持たないので、期待した個数と実際の個数は
+ * condition に載せられない。** 専用クラスは仕様のクラス階層(spec:994-1010)に無く、
+ * 仕様に無いクラスを増やさない方針(P4-2 の index-out-of-range と同じ)で通している。
+ *
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_arity_error(lisp_val_t env) {
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol("<PROGRAM-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, nil, env);
+}
+
+/**
+ * [P5] 未束縛の変数を <unbound-variable> として signal する。
+ *
+ * 仕様は「識別子が表す実体が存在しなければ error を signal する
+ * (error-id. undefined-entity)」とし、その代表例として unbound-variable を挙げている
+ * (spec:899-902)。§29.4 の対応表(spec:7255-7257)がそのクラスを
+ * <unbound-variable> と定めている。
+ *
+ * <undefined-entity> のスロットは name と namespace で、namespace は
+ * variable / dynamic-variable / function / class のいずれか(spec:7160-7163、
+ * spec:7181-7182)。ここは変数名前空間なので variable を入れる。
+ *
+ * @param name_sym 未束縛だった変数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_unbound_variable(lisp_val_t name_sym, lisp_val_t env) {
+    GC_PROTECT(name_sym);
+    GC_PROTECT(env);
+    lisp_val_t initargs = os_make_cons(os_make_symbol("VARIABLE"), nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(os_make_symbol(":NAMESPACE"), initargs);
+    initargs = os_make_cons(name_sym, initargs);
+    initargs = os_make_cons(os_make_symbol(":NAME"), initargs);
+    lisp_val_t class_sym = os_make_symbol("<UNBOUND-VARIABLE>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
+/**
+ * [P4-3] 変更できない束縛への代入を <program-error> として signal する。
+ *
+ * defconstant の束縛は immutable(spec:1699-1700)で、immutable binding を
+ * 変更しようとするのは error-id. immutable-binding(spec:435-437)。
+ * §29.4 の対応表(spec:7239-7241)がそのクラスを <program-error> と定めている。
+ * **<program-error> はスロットを持たないので、どのシンボルだったかは運べない。**
+ *
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_immutable_binding(lisp_val_t env) {
+    GC_PROTECT(env);
+    lisp_val_t class_sym = os_make_symbol("<PROGRAM-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, nil, env);
+}
+
+/* [P4-4] os_signal_io_error がメッセージを組み立てるための切り詰め付き連結。
+   nostdlib のため strcat/snprintf は使えない */
+#define IO_ERROR_MSG_MAX 256
+static void io_error_append(char *out, UINT64 cap, UINT64 *pos, const char *src) {
+    if (src == 0) {
+        return;
+    }
+    while (*src != '\0' && *pos + 1 < cap) {
+        out[(*pos)++] = *src++;
+    }
+}
+
+/**
+ * [P4-4] 入出力の失敗を <simple-error> として signal する。
+ *
+ * **クラスの選択は仕様未確認。** open-input-file / open-output-file / open-io-file に
+ * ついて仕様が定めている誤りは「filename が文字列でないこと」だけで、開く操作自体は
+ * "The corresponding file is opened in an implementation-defined way"(spec:6266-6268)と
+ * されている。**開けなかった場合の error-id は挙げられていない。** load は
+ * そもそも ISLisp 仕様に無い(実装独自)。
+ *
+ * <stream-error> を使わないのは、そのスロットが stream ただ1つで、仕様が
+ * 「the stream on which the error occurred」(spec:7146-7147)と定めているためである。
+ * ここで失敗しているのは**ストリームを開く操作そのもの**で、載せられるストリームが
+ * 存在しない。nil を入れるとクラスの定義と食い違う上、report-condition も
+ * 「stream error on NIL」としか出せず、どのファイルで失敗したのか分からない。
+ * <simple-error> なら失敗したパスと下位層のメッセージをそのまま運べる。
+ *
+ * format-string は "~A" 固定にして、本文は format-arguments 側へ渡す。
+ * **パスに ~ が含まれていても format の指示子として解釈されないようにするため。**
+ *
+ * @param what 失敗した操作(例 "open-input-file")
+ * @param path 対象のパス
+ * @param detail 下位層のメッセージ。不要なら0
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_io_error(const char *what, const char *path, const char *detail, lisp_val_t env) {
+    GC_PROTECT(env);
+    char msg[IO_ERROR_MSG_MAX];
+    UINT64 pos = 0;
+    io_error_append(msg, sizeof(msg), &pos, what);
+    io_error_append(msg, sizeof(msg), &pos, ": ");
+    io_error_append(msg, sizeof(msg), &pos, path);
+    if (detail != 0 && detail[0] != '\0') {
+        io_error_append(msg, sizeof(msg), &pos, ": ");
+        io_error_append(msg, sizeof(msg), &pos, detail);
+    }
+    msg[pos] = '\0';
+
+    lisp_val_t body = os_make_string(msg);
+    GC_PROTECT(body);
+    lisp_val_t fmt_args = os_make_cons(body, nil);
+    GC_PROTECT(fmt_args);
+    lisp_val_t initargs = os_make_cons(fmt_args, nil);
+    GC_PROTECT(initargs);
+    initargs = os_make_cons(os_make_symbol(":FORMAT-ARGUMENTS"), initargs);
+    initargs = os_make_cons(os_make_string("~A"), initargs);
+    initargs = os_make_cons(os_make_symbol(":FORMAT-STRING"), initargs);
+    lisp_val_t class_sym = os_make_symbol("<SIMPLE-ERROR>");
+    GC_PROTECT(class_sym);
+    return os_signal_condition(class_sym, initargs, env);
+}
+
+/**
+ * [P4-3] 関数でないものを関数として呼ぼうとした場合を <domain-error> として signal する。
+ *
+ * spec:1667「An error shall be signaled if function is not a function
+ * (error-id. domain-error)」(funcall)。
+ *
+ * @param obj 関数ではなかった値
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_not_a_function(lisp_val_t obj, lisp_val_t env) {
+    return signal_domain_error_for_class(obj, "<FUNCTION>", env);
 }
 
 static lisp_val_t signal_domain_error(lisp_val_t offending_object, lisp_val_t env) {
@@ -3774,11 +5720,13 @@ lisp_val_t os_setq_variable(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
  * @param sym 設定するsymbol
  * @param val 設定する値
  * @param env 探索を開始する環境
- * @return val、またはsymが定数の場合はg_sym_eval_error
+ * @return val、またはsymが定数の場合は<program-error>をsignalした結果
  */
 lisp_val_t os_setq_variable_checked(lisp_val_t sym, lisp_val_t val, lisp_val_t env) {
     if (os_is_constant(sym, env)) {
-        return g_sym_eval_error;
+        /* [P4-3] eval_setqと同じくerror-id. immutable-binding(spec:435-437)。
+           クラスは<program-error>(spec:7239-7241) */
+        return os_signal_immutable_binding(global_environment);
     }
     return os_setq_variable(sym, val, env);
 }
@@ -3977,7 +5925,14 @@ lisp_val_t os_get_function_cell(lisp_val_t sym, lisp_val_t env) {
  */
 lisp_val_t os_apply_via_cell(lisp_val_t cell, lisp_val_t evaluated_args, lisp_val_t env) {
     if (cell == nil) {
-        return os_apply_function(nil, evaluated_args, env);
+        /* [P4-3] **cellがnilは「その名前に関数束縛が無い」ことそのもの**である
+           (os_get_function_cellが未定義の名前に対してnilを返す)。
+           インタプリタ側(eval_form)と同じ<undefined-function>にする。
+           os_apply_functionへ回すと「nilは関数ではない」=<domain-error>になり、
+           同じソースがJITコンパイルされたかどうかでクラスが変わってしまう。
+           **名前はここまで運ばれてこない**ので name スロットは nil になる
+           (JIT側で名前を渡すのはABI変更を伴うため P6 の範囲) */
+        return os_signal_undefined_function(nil, global_environment);
     }
     lisp_addr_t cell_addr = (lisp_addr_t)(cell & ~TAG_MASK);
     lisp_val_t fn_obj = *(lisp_val_t *)cell_addr;
@@ -4005,6 +5960,13 @@ void os_environment_register_pages(lisp_val_t env, void *first_page, UINT64 coun
 }
 
 void os_environment_reclaim_pages(lisp_val_t env) {
+    /* コードカーソルは解放するページのどれかを指しているので、必ず先に畳む。
+       残したままにすると、破棄済み環境へdefunしたときに他の環境へ払い出された
+       ページへコードを書き込むことになる */
+    lisp_val_t cursor_slot = imm_code_cursor_slot(env);
+    if (cursor_slot != nil) {
+        ((lisp_val_t *)(cursor_slot & ~TAG_MASK))[1] = nil;
+    }
     lisp_val_t pages_slot = cc_car(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(cc_cdr(env)))))));
     lisp_val_t list = cc_cdr(pages_slot);
 
@@ -4238,6 +6200,9 @@ typedef struct {
  * FIXNUMまたはMAGIC_BIGNUMのINSTANCEを符号付きマグニチュードのビューに分解する。
  * bignumのlimb配列はコピーせずオブジェクト自身の配列を直接指す。
  */
+/* decomposeが整数以外を弾くために使う。定義は下(float/bignum判定の節)にある */
+static int is_bignum(lisp_val_t val);
+
 static void decompose(lisp_val_t v, signed_mag_t *out) {
     if ((v & TAG_MASK) == TAG_FIXNUM) {
         UINT64 magnitude = os_fixnum_magnitude(v);
@@ -4246,11 +6211,28 @@ static void decompose(lisp_val_t v, signed_mag_t *out) {
         out->fixnum_buf[1] = magnitude >> 32;
         out->limbs = out->fixnum_buf;
         out->count = mag_len(out->fixnum_buf, 2);
-    } else {
+    } else if (is_bignum(v)) {
         UINT64 *obj = (UINT64 *)(v & ~TAG_MASK);
         out->sign = (int)obj[1];
         out->limbs = (UINT64 *)obj[3];
         out->count = obj[2];
+    } else {
+        /* [single-float] 整数でない値は0として扱う。
+           以前はここも無条件に (v & ~TAG_MASK) をデリファレンスしていた。
+           doubleを渡すとMAGIC_FLOATのword1〜3をsign/count/limbsとして読むという
+           既に間違った動作だったが、アドレスは有効なヒープ内だったので落ちなかった。
+           **single-floatは即値なので、同じことをすると生のビットパターンを
+           アドレスとして読んで即座に落ちる。**
+           整数専用の関数(div/mod/gcd/lcm/isqrt等)にfloatを渡すのは元々
+           定義域エラーであり、ここで正しい答えを出すつもりはない。
+           「未定義の入力で segfault しない」ことだけを保証する。
+           floatを正しく扱う必要がある関数(abs等)は、decomposeへ来る前に
+           is_floatで分岐すること。 */
+        out->sign = 0;
+        out->fixnum_buf[0] = 0;
+        out->fixnum_buf[1] = 0;
+        out->limbs = out->fixnum_buf;
+        out->count = 0;
     }
 }
 
@@ -4378,6 +6360,7 @@ lisp_val_t os_make_integer(int sign, UINT64 *limbs, UINT64 count) {
     lisp_val_t bignum = os_make_instance(MAGIC_BIGNUM, (UINT64)sign, 0, 0);
     GC_PROTECT(bignum);
 
+    ALLOC_AUDIT_REASON(ALLOC_REASON_BIGNUM_LIMB);
     lisp_addr_t limb_addr = os_alloc_bytes(8 * count);
     UINT64 *dst = (UINT64 *)limb_addr;
     for (UINT64 i = 0; i < count; i++) {
@@ -4408,9 +6391,62 @@ static int bignum_equal(const UINT64 *obj_a, const UINT64 *obj_b) {
     return 1;
 }
 
-/** valがfloat(MAGIC_FLOATのINSTANCE)かどうかを判定する */
+/* ===== float の型昇格(float contagion) =================================
+ *
+ * 「より広い形式へ寄せる。整数は float に従う」。
+ * 値が大きいほど広い形式なので、**オペランドの kind の最大値がそのまま結果の型**に
+ * なる。整数は FLOAT_KIND_NONE なので何も要求せず、float 側の形式に合わせる。
+ *
+ *   fixnum/bignum × single → single
+ *   fixnum/bignum × double → double
+ *   single × single        → single
+ *   single × double        → double
+ *
+ * documents/float-contagion.md
+ */
+/** floatが1つも無い(= 整数だけ) */
+#define FLOAT_KIND_NONE   0
+/** 最も広いオペランドが single-float */
+#define FLOAT_KIND_SINGLE 1
+/** 最も広いオペランドが double-float */
+#define FLOAT_KIND_DOUBLE 2
+
+/** 値の float 種別を返す。整数(および数値でない値)は FLOAT_KIND_NONE */
+static int float_kind_of(lisp_val_t val) {
+    if (os_is_single_float(val)) {
+        return FLOAT_KIND_SINGLE;
+    }
+    if ((val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT) {
+        return FLOAT_KIND_DOUBLE;
+    }
+    return FLOAT_KIND_NONE;
+}
+
+/** 2つの kind のうち広いほう。**これが型昇格の規則そのもの** */
+static int float_kind_max(int a, int b) {
+    return a > b ? a : b;
+}
+
+/** doubleで持っている値を kind の形式へ丸める。
+ *  single のときだけ単精度へ落とす(NONE は整数だけなので丸めない)。 */
+static double float_round_to_kind(int kind, double value) {
+    return (kind == FLOAT_KIND_SINGLE) ? (double)(float)value : value;
+}
+
+/** doubleで計算した値を kind の Lisp 値にする。
+ *  **single はタグ0x4の即値なのでヒープを確保しない。** これが c-1 の性能上の眼目。 */
+static lisp_val_t os_make_float_of_kind(int kind, double value) {
+    return (kind == FLOAT_KIND_SINGLE) ? os_make_single_float((float)value)
+                                       : os_make_float(value);
+}
+
+/** valがfloat(single/doubleのどちらか)かどうかを判定する。
+ *
+ * **single-floatもここで真になる。** 算術・比較・floatpはすべてこの述語を
+ * 通るので、ここ1箇所でsingleを受け入れれば「single-floatは数として普通に
+ * 使える」が成り立つ。 */
 static int is_float(lisp_val_t val) {
-    return (val & TAG_MASK) == TAG_INSTANCE && ((UINT64 *)(val & ~TAG_MASK))[0] == MAGIC_FLOAT;
+    return float_kind_of(val) != FLOAT_KIND_NONE;
 }
 
 /** valがbignum(MAGIC_BIGNUMのINSTANCE)かどうかを判定する */
@@ -4425,9 +6461,26 @@ lisp_val_t os_make_float(double value) {
 }
 
 double os_float_value(lisp_val_t val) {
+    if (os_is_single_float(val)) {
+        return (double)os_single_float_value(val);
+    }
     union { double d; UINT64 u; } conv;
     conv.u = ((UINT64 *)(val & ~TAG_MASK))[1];
     return conv.d;
+}
+
+lisp_val_t os_make_single_float(float value) {
+    /* ビットパターンの移動はunion経由。*(UINT32 *)&value はstrict aliasing違反で、
+       最適化によって黙って別の値になりうる */
+    union { float f; UINT32 u; } conv;
+    conv.f = value;
+    return ((lisp_val_t)conv.u) << SINGLE_FLOAT_VALUE_SHIFT | TAG_SINGLE_FLOAT;
+}
+
+float os_single_float_value(lisp_val_t val) {
+    union { float f; UINT32 u; } conv;
+    conv.u = (UINT32)(val >> SINGLE_FLOAT_VALUE_SHIFT);
+    return conv.f;
 }
 
 double bignum_to_double(lisp_val_t val) {
@@ -4442,18 +6495,62 @@ double bignum_to_double(lisp_val_t val) {
     return sign ? -result : result;
 }
 
-/**
- * argsの中にfloat(MAGIC_FLOATのINSTANCE)が1つでも含まれるかどうかを判定する。
- * 四則演算プリミティブが整数専用の高速/一般パスとfloatパスのどちらを使うかを
- * 振り分けるために使う。
- */
-static int any_float(lisp_val_t args) {
+/* [P5] 数値(fixnum / bignum / float)かどうか。既存の判定を組み合わせるだけで、
+   新しい型情報は持たない。
+   **この判定は「正常系の速い経路」からは呼ばない。** decompose が非数値を 0 として
+   扱ってしまう経路(= もう遅い経路に入っている場所)でだけ使う。 */
+static int is_number_val(lisp_val_t v) {
+    return (v & TAG_MASK) == TAG_FIXNUM || is_float(v) || is_bignum(v);
+}
+
+/* [P5] args の中で最初に現れる非数値を返す。すべて数値なら 0 を返す
+   (0 は lisp_val_t として有効な値ではないので番人に使える)。 */
+static lisp_val_t first_non_number(lisp_val_t args) {
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        if (is_float(cc_car(cur))) {
-            return 1;
+        if (!is_number_val(cc_car(cur))) {
+            return cc_car(cur);
         }
     }
     return 0;
+}
+
+/**
+ * argsの中で最も広いfloat種別を返す。floatが1つも無ければ FLOAT_KIND_NONE。
+ *
+ * 四則演算プリミティブが「整数専用の高速/一般パスとfloatパスのどちらを使うか」と
+ * 「floatパスの結果の型」を同時に決めるために使う。
+ * **戻り値がそのまま結果の型**になる(型昇格の規則 = kind の最大値)。
+ */
+static int args_float_kind(lisp_val_t args) {
+    int kind = FLOAT_KIND_NONE;
+    for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
+        kind = float_kind_max(kind, float_kind_of(cc_car(cur)));
+    }
+    return kind;
+}
+
+/**
+ * 数学関数(sqrt/log/exp/sin/cos/atan2 等)の結果の型を決める。
+ *
+ * **float が絡めば c-1 の型昇格規則そのまま**(args_float_kind = kind の最大値)。
+ * 二項の atan2 もこれで正しくなるので、新しい判定は書かない。
+ *
+ * **整数だけのときは *read-default-float-format* に従う。**
+ * CommonLisp は有理数入力に single を返すと定めているが、isiki-os では
+ * この変数を型の中心に据えているのでそちらへ揃える。こうすると
+ * リテラルと数学関数の結果が同じ型になり、
+ * (approx= 1.4142135623730951 (sqrt 2)) のような比較が既定をどちらにしても成立する。
+ *
+ * 変数が読めないとき(ブート初期・unbound・想定外の値)のフォールバックは
+ * os_read_default_float_format_is_single が持っている(documents/single-float.md)。
+ * ここで別に用意はしない。
+ */
+static int math_result_kind(lisp_val_t args) {
+    int kind = args_float_kind(args);
+    if (kind != FLOAT_KIND_NONE) {
+        return kind;
+    }
+    return os_read_default_float_format_is_single() ? FLOAT_KIND_SINGLE : FLOAT_KIND_DOUBLE;
 }
 
 /**
@@ -4476,11 +6573,42 @@ static double to_double(lisp_val_t v) {
  * 高速パスを使う。いずれかがfloatの場合は両方をdoubleへ変換して比較する。
  * @return a<bなら負、a==bなら0、a>bなら正
  */
-static int number_compare(lisp_val_t a, lisp_val_t b) {
+/* [NaN] 数値比較の結果。**三値では NaN を扱えない。**
+   IEEE 754 では NaN が絡む比較は「小さい」「等しい」「大きい」のいずれでもない
+   **非順序(unordered)** になる。旧 number_compare は float 経路で
+   `da < db ? -1 : (da > db ? 1 : 0)` としていたため、NaN では < も > も偽になり
+   **0(等しい)へ落ちて `(= nan nan)` が真を返していた**
+   (documents/float-default.md §4-1 に既知の問題として記録されていたもの)。
+
+   第四の状態を足すだけでは足りない。旧関数の戻り値を呼び出し側で直接
+   `>= 0` のように比べる書き方が残っていると、UNORDERED が「大きい」として
+   通ってしまう。そこで**関数名を変え**、呼び出し側は必ず下の述語
+   (num_lt / num_gt / ...)を通す形にした。古い名前を消したので、
+   **扱い漏れがコンパイルエラーになる**。 */
+#define NUM_CMP_LESS      (-1)
+#define NUM_CMP_EQUAL     0
+#define NUM_CMP_GREATER   1
+#define NUM_CMP_UNORDERED 2
+/* [P5] どちらかが数値でない。spec:4204-4205(=)、spec:4250-4251(< > <= >=)の
+   「An error shall be signaled if either x1 or x2 is not a number
+   (error-id. domain-error)」に対応する。**この値は fixnum どうしの高速経路からは
+   決して返らない**ので、整数どうしの比較(正常系)には命令が増えない。 */
+#define NUM_CMP_NOT_NUMBER 3
+
+static int number_compare4(lisp_val_t a, lisp_val_t b) {
     if (is_float(a) || is_float(b)) {
+        /* [P5] 片方が float でも、もう片方が数値とは限らない */
+        if (!is_number_val(a) || !is_number_val(b)) {
+            return NUM_CMP_NOT_NUMBER;
+        }
         double da = to_double(a);
         double db = to_double(b);
-        return da < db ? -1 : (da > db ? 1 : 0);
+        if (da < db) { return NUM_CMP_LESS; }
+        if (da > db) { return NUM_CMP_GREATER; }
+        if (da == db) { return NUM_CMP_EQUAL; }
+        /* <, >, == のいずれも偽になるのは NaN が絡むときだけである。
+           **無限大はここへ来ない**(順序づけられるため。§3-2)。 */
+        return NUM_CMP_UNORDERED;
     }
 
     if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM) {
@@ -4495,6 +6623,11 @@ static int number_compare(lisp_val_t a, lisp_val_t b) {
         return neg_a ? -cmp : cmp;
     }
 
+    /* [P5] float でもなく、両方 fixnum でもない。ここまで来たら bignum か非数値。
+       **fixnum どうしは上で返っているので、正常系にはこの判定が乗らない** */
+    if (!is_number_val(a) || !is_number_val(b)) {
+        return NUM_CMP_NOT_NUMBER;
+    }
     signed_mag_t ma, mb;
     decompose(a, &ma);
     decompose(b, &mb);
@@ -4503,6 +6636,80 @@ static int number_compare(lisp_val_t a, lisp_val_t b) {
     }
     int cmp = mag_compare(ma.limbs, ma.count, mb.limbs, mb.count);
     return ma.sign ? -cmp : cmp;
+}
+
+/* [NaN] 比較述語。**非順序の扱いはここに集約する。**
+   整数どうしは NUM_CMP_UNORDERED を返さないので、挙動は従来と完全に同じである
+   (documents/nan-comparison.md §3-4)。 */
+/* [P5] number_compare4 が NUM_CMP_NOT_NUMBER を返したときに呼ぶ。
+   **比較が偽になった分岐の内側からしか呼ばない**ので、真の側には命令が増えない。 */
+static lisp_val_t compare_pair_domain_error(lisp_val_t a, lisp_val_t b) {
+    lisp_val_t bad = is_number_val(a) ? b : a;
+    return signal_domain_error_for_class(bad, "<NUMBER>", global_environment);
+}
+
+/* [M7] **両方が非負 fixnum なら、生のタグ付き値の符号無し比較で大小関係がそのまま保たれる。**
+ * タグ bits 0..3 と符号 bit63 がどちらも 0 で、マグニチュードが bits 4..62 にあるため
+ * (生の値 = マグニチュード << 4)。JIT の `-` の高速路と同じ根拠
+ * (za.c の za_emit_arith_call_or_inline のコメント)。
+ *
+ * **always_inline が要る。** -O1 は「呼ばれる場所が 2 つ以上ある小さな static 関数」を
+ * 展開しないので、6 箇所から呼ぶこの判定を放っておくと**呼び出しになる**
+ * (改善 A がまさにこれを踏んだ。documents/performance-measurement.md)。 */
+static inline __attribute__((always_inline))
+int num_both_nonneg_fixnum(lisp_val_t a, lisp_val_t b) {
+    return ((a | b) & (TAG_MASK | FIXNUM_SIGN_BIT)) == 0;
+}
+
+/* [A] 非負 fixnum どうしの常道。**どれも always_inline が要る**
+ * (-O1 は「呼ばれる場所が 2 つ以上ある小さな static 関数」を展開しないので、
+ *  放っておくとこの判定自体が呼び出しになる。改善 A がまさにこれを踏んだ)。
+ *
+ * 生の値 = マグニチュード << FIXNUM_VALUE_SHIFT なので:
+ *   加算 … そのまま足して bit63(FIXNUM_SIGN_BIT)で桁あふれを見る
+ *   減算 … a >= b(符号無し)なら そのまま引く
+ *   乗算 … (a >> SHIFT) * b。**巻き上がりは __builtin_mul_overflow で見る**
+ *          (生の 64 bit 乗算が巻き上がると bit63 だけでは分からない)
+ *   除算 … b != 0 なら (a / b) << SHIFT。**ゼロ除算の検査は外せない**(#DE で機械が止まる)
+ * **-0 は作らない**(どちらも非負で結果も非負)。 */
+static inline __attribute__((always_inline))
+int fixnum_fast_add(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    lisp_val_t sum = a + b;
+    if ((sum & FIXNUM_SIGN_BIT) != 0) { return 0; }
+    *out = sum;
+    return 1;
+}
+static inline __attribute__((always_inline))
+int fixnum_fast_sub(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if (a < b) { return 0; }
+    *out = a - b;
+    return 1;
+}
+static inline __attribute__((always_inline))
+int fixnum_fast_mul(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    lisp_val_t prod;
+    if (__builtin_mul_overflow(a >> FIXNUM_VALUE_SHIFT, b, &prod)) { return 0; }
+    if ((prod & FIXNUM_SIGN_BIT) != 0) { return 0; }
+    *out = prod;
+    return 1;
+}
+static inline __attribute__((always_inline))
+int fixnum_fast_div(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if (b == 0) { return 0; }   /* ゼロ除算。**div を実行する前に必ず弾く** */
+    *out = (a / b) << FIXNUM_VALUE_SHIFT;
+    return 1;
+}
+
+static int num_lt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_LESS; }
+static int num_gt(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_GREATER; }
+static int num_eq(lisp_val_t a, lisp_val_t b) { return number_compare4(a, b) == NUM_CMP_EQUAL; }
+static int num_le(lisp_val_t a, lisp_val_t b) {
+    int c = number_compare4(a, b);
+    return c == NUM_CMP_LESS || c == NUM_CMP_EQUAL;
+}
+static int num_ge(lisp_val_t a, lisp_val_t b) {
+    int c = number_compare4(a, b);
+    return c == NUM_CMP_GREATER || c == NUM_CMP_EQUAL;
 }
 
 /**
@@ -4753,41 +6960,222 @@ lisp_val_t primitive_cdr(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * FIXNUMの符号を反転した新しいFIXNUMを返す(即値、ヒープ確保なし)。
+ * **valがTAG_FIXNUMであることは呼び出し側が保証すること。**
+ * 符号マグニチュード表現なので反転は常に正確で、2の補数のINT_MINのような
+ * 「反転できない値」は存在しない。マグニチュード0の場合はos_make_fixnum_signedが
+ * 符号を落とすため -0 にはならない。
+ */
+static lisp_val_t fixnum_negate(lisp_val_t val) {
+    return os_make_fixnum_signed(!os_fixnum_is_negative(val), os_fixnum_magnitude(val));
+}
+
+/**
+ * [改善A] FIXNUMどうしを**符号込みで**加算し、結果が60bitに収まればFIXNUMを*outへ
+ * 書いて1を返す。入力がFIXNUMでない、または結果が60bitを超える場合は0を返す
+ * (呼び出し元はbignumを含む一般パスへ落とす)。
+ *
+ * 以前はこの判定が「両方とも**非負**FIXNUM」に限られており、`(+ -1 1)` のような
+ * 両方FIXNUM・結果もFIXNUMの式が decompose → limb_alloc → mag_sub →
+ * os_make_integer というbignum用の機構を丸ごと通っていた(実測で9.7倍遅い。
+ * documents/type-system-survey.md §10-4)。符号マグニチュード表現のままでも、
+ * 符号の一致・不一致で加算と減算を選び分ければ済む。
+ *
+ * [表現への依存] fixnumは符号マグニチュード表現(bit63=符号、bit3〜62=絶対値60bit)
+ * であり、2の補数ではない。マグニチュードは高々2^60-1なので ma+mb は
+ * 2^61未満に収まり、UINT64の加算で桁あふれしない(この上限チェックの前に
+ * 溢れることはない)。表現を変える場合はここも作り直す必要がある。
+ *
+ * [-0を作らない] 結果が0になるのは (1) 符号が同じでma=mb=0、(2) 符号が違って
+ * ma==mb、の2通り。どちらもos_make_fixnum_signedがマグニチュード0のとき符号を
+ * 落とすため、必ず正のゼロ(生値0)になる。
+ */
+/* [型特化] fixnum 加算のコア。**タグ検査をしない。**
+   両方が fixnum であることを呼び出し側が保証する。
+   0 を返すのは**桁溢れのときだけ**である(タグ検査をしないため、それ以外に
+   失敗する理由が無い)。
+
+   タグ検査つきの fixnum_add_signed と**コアを共有する**のが要点である。
+   別実装を書くと、桁溢れの境界や符号の扱いが GENERIC と乖離しうる
+   (documents/declare-typed-add.md §3-5 の「結果が GENERIC と一致する」が崩れる)。 */
+static int fixnum_add_signed_unchecked(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    UINT64 mag_a = os_fixnum_magnitude(a);
+    UINT64 mag_b = os_fixnum_magnitude(b);
+    int neg_a = os_fixnum_is_negative(a);
+    int neg_b = os_fixnum_is_negative(b);
+
+    if (neg_a == neg_b) {
+        /* 同符号: マグニチュードを足す。60bitを超えたらbignumへ */
+        UINT64 sum = mag_a + mag_b;
+        if (sum > FIXNUM_MAGNITUDE_MASK) {
+            return 0;
+        }
+        *out = os_make_fixnum_signed(neg_a, sum);
+        return 1;
+    }
+    /* 異符号: マグニチュードの大きいほうから小さいほうを引き、符号は大きいほうに従う。
+       結果のマグニチュードは元の最大値以下なので60bitを超えることはない */
+    if (mag_a >= mag_b) {
+        *out = os_make_fixnum_signed(neg_a, mag_a - mag_b);
+    } else {
+        *out = os_make_fixnum_signed(neg_b, mag_b - mag_a);
+    }
+    return 1;
+}
+
+/** fixnum 加算(タグ検査つき)。GENERIC(primitive_add2)が使う。
+ *  **0 を返すのは「どちらかが fixnum でない」か「桁溢れ」のどちらか**である。
+ *  呼び出し側はどちらも「この経路では扱えない」として次の経路へ落とすので、
+ *  区別する必要が無い。 */
+static int fixnum_add_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
+        return 0;
+    }
+    return fixnum_add_signed_unchecked(a, b, out);
+}
+
+/* [改善B] fixnum 乗算のコア。**タグ検査をしない。**
+   両方が fixnum であることを呼び出し側が保証する。
+   0 を返すのは**桁溢れのときだけ**である。
+
+   **`+` `-` より単純である。** 符号は `neg_a ^ neg_b` で決まり、マグニチュードの
+   計算に符号が影響しない。`+` のような「同符号なら加算、異符号ならマグニチュードを
+   比較して減算」の場合分けが要らない
+   (documents/fixnum-signed-fastpath.md §5-1 の予告どおり)。
+
+   [桁溢れ判定に除算を使わない] マグニチュードは高々 2^60-1 なので積は高々 2^120。
+   **128bit で受ければ `prod > FIXNUM_MAGNITUDE_MASK` の比較 1 回で済む。**
+   以前は `mag_b <= FIXNUM_MAGNITUDE_MASK / mag_a` と 64bit 除算で判定しており、
+   `mag_a == 0` の場合分けも要った(0 除算を避けるため)。
+
+   [__int128 を選んだ理由] __builtin_mul_overflow は「64bit に収まるか」しか
+   見ないので、そのあとさらに FIXNUM_MAGNITUDE_MASK との比較が要り、判定が
+   2 段になる。__int128 なら上の 1 行が**そのまま桁溢れの定義**になる。
+   x86-64 では u64 × u64 → u128 は `mul` 1 命令で、libgcc の呼び出しは出ない
+   (libgcc が要るのは 128bit の除算・剰余である)。
+
+   [-0 を作らない] os_make_fixnum_signed がマグニチュード 0 の符号を落とすので、
+   `(* 0 -1)` は正のゼロになる。 */
+static int fixnum_multiply_signed_unchecked(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    unsigned __int128 prod =
+        (unsigned __int128)os_fixnum_magnitude(a) * (unsigned __int128)os_fixnum_magnitude(b);
+    if (prod > (unsigned __int128)FIXNUM_MAGNITUDE_MASK) {
+        return 0;
+    }
+    *out = os_make_fixnum_signed(os_fixnum_is_negative(a) != os_fixnum_is_negative(b),
+                                 (UINT64)prod);
+    return 1;
+}
+
+/** fixnum 乗算(タグ検査つき)。GENERIC(primitive_multiply / primitive_multiply2)が使う。
+ *  **0 を返すのは「どちらかが fixnum でない」か「桁溢れ」のどちらか**である。
+ *  fixnum_add_signed と同じ立場で、呼び出し側はどちらも次の経路へ落とす。 */
+static int fixnum_multiply_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
+        return 0;
+    }
+    return fixnum_multiply_signed_unchecked(a, b, out);
+}
+
+/* [改善C] fixnum 除算のコア。
+
+   **`_unchecked` が外しているのは「タグ検査」だけである。ゼロ検査は外していない。**
+   宣言が正しくても除数は 0 になりうる(`<fixnum>` の 0 は正しい fixnum である)。
+   x86-64 の `div` は除数 0 で #DE を出し、**freestanding の UEFI 環境では
+   ハンドラが無いので機械が止まる。** `+` `*` の嘘の宣言は「ゴミの値」で済んだが、
+   除算は質が違う。**ここのゼロ検査は性能のためではなく、落とさないためにある。**
+
+   [桁溢れしない] マグニチュードの商は必ず被除数のマグニチュード以下なので、
+   fixnum ÷ fixnum が bignum へ昇格することはない。`+` `*` が持っていた
+   「桁溢れしたら GENERIC へ」という分岐は要らない。0 を返す理由は
+   **除数が 0 のときだけ**である。
+
+   [ゼロ方向の切り捨てが自動で得られる] 符号なし除算は必ず切り捨てなので、
+   マグニチュードどうしを割って符号を後から付ければ、そのままゼロ方向になる。
+   `(/ -7 2)` = -3(床方向なら -4)。**本作業で切り捨て方向は変えていない。**
+
+   [(/ *most-negative-fixnum* -1) が安全] 2 の補数なら INT64_MIN / -1 は
+   商が表現できず #DE になるが、符号マグニチュードでは
+   マグニチュード 2^59-1 を 1 で割るだけなので何も起きない。
+
+   [-0 を作らない] os_make_fixnum_signed がマグニチュード 0 の符号を落とす。 */
+static int fixnum_divide_signed_unchecked(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    UINT64 mag_b = os_fixnum_magnitude(b);
+    if (mag_b == 0) {
+        return 0;               /* ゼロ除算。**div を実行する前に必ず弾く** */
+    }
+    /* 符号は neg_a ^ neg_b。* と同じで、マグニチュードの計算に符号が影響しない */
+    *out = os_make_fixnum_signed(os_fixnum_is_negative(a) != os_fixnum_is_negative(b),
+                                 os_fixnum_magnitude(a) / mag_b);
+    return 1;
+}
+
+/** fixnum 除算(タグ検査つき)。GENERIC(primitive_divide / primitive_divide2)が使う。
+ *  **0 を返すのは「どちらかが fixnum でない」か「除数が 0」のどちらか**である。
+ *  呼び出し側はどちらも次の経路へ落とし、そこで EVAL-ERROR になる。 */
+static int fixnum_divide_signed(lisp_val_t a, lisp_val_t b, lisp_val_t *out) {
+    if ((a & TAG_MASK) != TAG_FIXNUM || (b & TAG_MASK) != TAG_FIXNUM) {
+        return 0;
+    }
+    return fixnum_divide_signed_unchecked(a, b, out);
+}
+
+/**
  * 組み込み関数+。argsの全数値(FIXNUM/bignum/float、負数も可)を合計する。
- * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して合計する。
- * それ以外で全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの
- * 高速パスを使い、それ以外(負数・bignumが絡む、桁あふれの恐れがある)は符号付き
- * マグニチュードによる一般パスにフォールバックする。
+ * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (整数×single→single、single×double→double。documents/float-contagion.md)。
+ * それ以外で全オペランドがFIXNUM(**符号は問わない**)かつ途中経過が60bitに
+ * 収まる場合はヒープ確保なしの高速パスを使い、それ以外(bignumが絡む、
+ * 桁あふれする)は符号付きマグニチュードによる一般パスにフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
  * @return 合計値の数値(floatが絡まなければFIXNUM_MAGNITUDE_MASK以内ならFIXNUM、それを超えるならbignum)
  */
 lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    if (any_float(args)) {
+    /* [型昇格] 結果の型は全オペランドの最も広い形式(args_float_kind)。
+       計算はdoubleで行い、**そこまでに見た形式へ毎回丸める**。こうすると
+       (+ a b c) と (+ (+ a b) c) が一致する(左畳み込みと同じ結果になる)。
+       丸めを最後の1回だけにすると精度は上がるが、n引数版と2引数版の合成で
+       答えが食い違うので採らない。 */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
         double sum = 0.0;
+        int kind = FLOAT_KIND_NONE;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-            sum += to_double(cc_car(cur));
+            lisp_val_t v = cc_car(cur);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
+            kind = float_kind_max(kind, float_kind_of(v));
+            sum = float_round_to_kind(kind, sum + to_double(v));
         }
-        return os_make_float(sum);
+        return os_make_float_of_kind(kind, sum);
     }
 
+    /* [改善A] 途中経過(sum_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない。
+       argsを辿るcc_cdrも確保しないため、このループ中にGCは走らない */
     int fast = 1;
-    UINT64 sum = 0;
+    lisp_val_t sum_val = os_make_fixnum(0);
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        lisp_val_t v = cc_car(cur);
-        if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
-            fast = 0;
-            break;
-        }
-        sum += os_fixnum_magnitude(v);
-        if (sum > FIXNUM_MAGNITUDE_MASK) {
+        if (!fixnum_add_signed(sum_val, cc_car(cur), &sum_val)) {
             fast = 0;
             break;
         }
     }
     if (fast) {
-        return os_make_fixnum(sum);
+        return sum_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -4839,19 +7227,172 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env) {
  * 無くなっても呼び出し先(このラッパー自身)が同じconsを構築し続けており、
  * 正味のヒープ確保削減になっていなかった。両方が非負FIXNUMで和がオーバーフロー
  * しない(=primitive_add本体のfast-path条件と同じ)場合はconsを一切構築せず
- * 直接計算する高速pathを追加し、それ以外(負数・float・bignum昇格が絡む稀な
+ * 直接計算する高速pathを追加し、それ以外(float・bignum昇格が絡む稀な
  * ケース)のみ従来通りconsリストを組み立てて委譲する。
+ *
+ * [改善A] 高速pathの条件を fixnum_add_signed へ寄せた。以前は「両方とも非負」に
+ * 限られていたため `(+ -1 1)` がconsを2個作ってbignum機構を通っていた。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_addと同じ規則で計算した合計値
  */
-lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
-    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
-        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
-        UINT64 sum = os_fixnum_magnitude(a) + os_fixnum_magnitude(b);
-        if (sum <= FIXNUM_MAGNITUDE_MASK) {
-            return os_make_fixnum(sum);
+/* ===== 型特化した + (documents/type-specialized-dispatch.md) ==========
+ *
+ * **宣言された型を無検査で信じる。** タグを一切見ない。
+ * 宣言が嘘なら壊れるが、それが仕様である(CommonLisp の (safety 0) と同じ立場。
+ * documents/declare-typed-add.md §3-1)。
+ *
+ * 監査ビルド(ISIKIOS_DECLARE_AUDIT)でだけ、渡された値が宣言どおりかを確認して
+ * 合わなければ os_panic で止める。**通常ビルドの実行時コストはゼロ**である。
+ */
+#ifdef ISIKIOS_DECLARE_AUDIT
+static void declare_audit_fail(const char *fn, const char *expected, lisp_val_t got) {
+    os_diag_serial_write("\nPANIC: declare が嘘をついている\n  関数: ");
+    os_diag_serial_write(fn);
+    os_diag_serial_write("\n  宣言された型: ");
+    os_diag_serial_write(expected);
+    os_diag_serial_write("\n  実際のタグ: 0x");
+    {
+        UINT64 t = got & TAG_MASK;
+        char hex[2];
+        hex[0] = (char)(t < 10 ? ('0' + t) : ('A' + t - 10));
+        hex[1] = '\0';
+        os_diag_serial_write(hex);
+    }
+    os_diag_serial_write(" (0=fixnum 4=single-float 7=instance)\n");
+    os_panic("declare audit: 宣言と実際の型が一致しない");
+}
+#define DECLARE_AUDIT_FIXNUM(fn, v) \
+    do { if (((v) & TAG_MASK) != TAG_FIXNUM) { declare_audit_fail((fn), "<fixnum>", (v)); } } while (0)
+#define DECLARE_AUDIT_SINGLE(fn, v) \
+    do { if (!os_is_single_float(v)) { declare_audit_fail((fn), "<single-float>", (v)); } } while (0)
+#else
+#define DECLARE_AUDIT_FIXNUM(fn, v) ((void)0)
+#define DECLARE_AUDIT_SINGLE(fn, v) ((void)0)
+#endif
+
+/**
+ * 型特化した + (fixnum × fixnum)。**タグを見ない。**
+ *
+ * 桁溢れは GENERIC と同じく bignum へ昇格させる必要があるため、コアを共有する
+ * fixnum_add_signed_unchecked を使う。**タグ検査だけを省く**ので、
+ * 桁溢れの境界や符号の扱いが GENERIC と乖離しない
+ * (別実装を書くとそこが乖離しうる)。
+ *
+ * **宣言が嘘なら壊れる。** unchecked はタグを見ずに os_fixnum_magnitude を
+ * 呼ぶため、fixnum でない値を渡すとマグニチュードとしてゴミを読む。
+ * これは意図した挙動である(documents/declare-typed-add.md §3-1)。
+ * @param a 第一オペランド(<fixnum> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a+b
+ */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_add2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_add2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_add(a, b, &r)) {
+            return r;
         }
+    }
+    return primitive_add2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_add2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_add2_fixnum", b);
+    lisp_val_t sum;
+    if (fixnum_add_signed_unchecked(a, b, &sum)) {
+        return sum;
+    }
+    /* 桁溢れ。GENERIC と同じ経路で bignum へ昇格させる */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_add(args, global_environment);
+}
+
+/**
+ * 型特化した + (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。** single どうしの和は正確な結果が
+ * double で表現できるため、double で足してから single へ丸めても
+ * single で直接足した結果と一致する(除算だけは二重丸めになるので別扱い。
+ * documents/single-float.md)。
+ * @param a 第一オペランド(<single-float> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a+b
+ */
+lisp_val_t primitive_add2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_add2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_add2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) +
+                                        (double)os_single_float_value(b)));
+}
+
+/* ===== [改善 A の直し] 常道をインラインで先に捌く(2026-10-30) ====================
+ *
+ * **-O1 では「呼ばれる場所が 2 つ以上ある小さな static 関数は展開されない」。**
+ * 改善 A(ac3dc54)が fixnum の高速路を fixnum_add_signed へ切り出したので、
+ * fixnum どうしの常道でも**本物の呼び出し**になっていた。逆アセンブルで確認した現状:
+ *
+ *     push %rdi; push %rsi; push %rbx; sub $0x60,%rsp; movups %xmm6,0x50(%rsp)
+ *     ... ; lea 0x48(%rsp),%r8 ; call fixnum_add_signed
+ *
+ * **常道が重いプロローグ(0x60 のスタックと xmm6 の退避)まで払っていた。**
+ *
+ * 直し: **JIT が出している列と同じ条件**をここにも置く(za.c の
+ * za_emit_arith_call_or_inline を参照。条件も桁あふれの判定も同じ)。
+ *   両方が非負 fixnum  <=>  (a|b) & (TAG_MASK|FIXNUM_SIGN_BIT) == 0
+ *   加算の桁あふれ      <=>  和の bit63(FIXNUM_SIGN_BIT)が立つ
+ *   減算が負になる      <=>  符号無し比較で a < b
+ *
+ * **-0 は作らない**(どちらも非負で結果も非負)。符号マグニチュード表現の
+ * 不変条件(負のゼロは存在しない)を壊さない。
+ *
+ * 冷たい経路は別関数(*_slow)に出す。**こうしないと -O1 は常道にもプロローグを
+ * 出してしまう**(フレームが要るのは冷たい側だけなのに)。 */
+/* **noinline が要る。** -O1 は「呼ばれる場所が 1 箇所だけの static 関数」は
+   逆に展開してしまい、冷たい側のフレーム要求が常道にも掛かる
+   (実測: 展開されるとプロローグが 0x60 -> 0x70 に増えた)。
+   cold は分岐予測とコード配置のため。 */
+static lisp_val_t primitive_add2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
+    if (((a | b) & (TAG_MASK | FIXNUM_SIGN_BIT)) == 0) {
+        lisp_val_t sum = a + b;
+        if ((sum & FIXNUM_SIGN_BIT) == 0) {
+            return sum;
+        }
+    }
+    return primitive_add2_slow(a, b);
+}
+
+static lisp_val_t primitive_add2_slow(lisp_val_t a, lisp_val_t b) {
+    lisp_val_t sum;
+    if (fixnum_add_signed(a, b, &sum)) {
+        return sum;
+    }
+    /* [型昇格] floatが絡むならconsを作らずここで計算する。
+       **singleどうしなら結果も即値なので、この経路はヒープを一切確保しない。**
+       consを2個作ってprimitive_addへ委譲していた頃は、型が正しくても
+       確保が残っていた(改善Aで見つけた「32byte/回」の正体と同じ構図)。 */
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
+        return os_make_float_of_kind(kind, to_double(a) + to_double(b));
     }
     GC_PROTECT(a);
     GC_PROTECT(b);
@@ -4861,21 +7402,114 @@ lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b) {
 
 /**
  * primitive_subtractを2引数固定で呼ぶためのラッパー。primitive_add2と同じ
- * 理由で高速pathを追加した。両方が非負FIXNUMでb<=a(=結果が非負、
- * primitive_subtract本体のfast-path条件と同じ)の場合はconsを一切構築せず
+ * 理由で高速pathを追加した。両方がFIXNUMで結果が60bitに収まる
+ * (=primitive_subtract本体のfast-path条件と同じ)場合はconsを一切構築せず
  * 直接計算し、それ以外は従来通りconsリストを組み立てて委譲する。
+ *
+ * [改善A] a-b を a+(-b) に帰着させて fixnum_add_signed へ寄せた。以前は
+ * 「両方とも非負」かつ「b<=a」に限られていたため、`(- 1 -1)` や `(- 1 2)` の
+ * ように**結果がFIXNUMに収まる式でも**bignum機構を通っていた。
  * @param a 第一オペランド
  * @param b 第二オペランド
  * @return primitive_subtractと同じ規則で計算したa-b
  */
-lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
-    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
-        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
-        UINT64 mag_a = os_fixnum_magnitude(a);
-        UINT64 mag_b = os_fixnum_magnitude(b);
-        if (mag_b <= mag_a) {
-            return os_make_fixnum(mag_a - mag_b);
+/**
+ * 型特化した - (fixnum × fixnum)。**タグを見ない。**
+ *
+ * GENERIC(primitive_subtract2)と同じく a-b を a+(-b) に帰着させ、
+ * fixnum_add_signed_unchecked を共有する。**タグ検査だけを省く**ので、
+ * 桁溢れの境界や符号の扱いが GENERIC と乖離しない。
+ *
+ * GENERIC 側の `(b & TAG_MASK) == TAG_FIXNUM` は fixnum_negate が
+ * os_fixnum_magnitude を読むための前提確認なので、両方 fixnum と分かっている
+ * ここでは省ける。**- 用に新しいコアを書き足してはいない。**
+ *
+ * **宣言が嘘なら壊れる**(documents/declare-typed-add.md §3-1)。
+ * @param a 被減数(<fixnum> と宣言されている)
+ * @param b 減数(同上)
+ * @return a-b
+ */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_subtract2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_subtract2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_sub(a, b, &r)) {
+            return r;
         }
+    }
+    return primitive_subtract2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_subtract2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_subtract2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_subtract2_fixnum", b);
+    lisp_val_t diff;
+    if (fixnum_add_signed_unchecked(a, fixnum_negate(b), &diff)) {
+        return diff;
+    }
+    /* 桁溢れ。GENERIC と同じ経路で bignum へ昇格させる */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_subtract(args, global_environment);
+}
+
+/**
+ * 型特化した - (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。** single どうしの差は正確な結果が
+ * double で表現できるため、double で引いてから single へ丸めても
+ * single で直接引いた結果と一致する(+ と同じ理由。除算だけは二重丸めになるので
+ * 別扱い。documents/single-float.md)。
+ * @param a 被減数(<single-float> と宣言されている)
+ * @param b 減数(同上)
+ * @return a-b
+ */
+lisp_val_t primitive_subtract2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_subtract2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_subtract2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) -
+                                        (double)os_single_float_value(b)));
+}
+
+/* [改善 A の直し] add2 と同じ。条件は JIT の列と同じで、
+   非負どうしなら `a < b`(符号無し比較)でなければ素の減算で正しいタグ付き結果になる。 */
+/* **noinline が要る。** -O1 は「呼ばれる場所が 1 箇所だけの static 関数」は
+   逆に展開してしまい、冷たい側のフレーム要求が常道にも掛かる
+   (実測: 展開されるとプロローグが 0x60 -> 0x70 に増えた)。
+   cold は分岐予測とコード配置のため。 */
+static lisp_val_t primitive_subtract2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
+    if (((a | b) & (TAG_MASK | FIXNUM_SIGN_BIT)) == 0 && a >= b) {
+        return a - b;
+    }
+    return primitive_subtract2_slow(a, b);
+}
+
+static lisp_val_t primitive_subtract2_slow(lisp_val_t a, lisp_val_t b) {
+    lisp_val_t diff;
+    if ((b & TAG_MASK) == TAG_FIXNUM && fixnum_add_signed(a, fixnum_negate(b), &diff)) {
+        return diff;
+    }
+    /* [型昇格] add2と同じ。singleどうしならヒープ確保ゼロ */
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
+        return os_make_float_of_kind(kind, to_double(a) - to_double(b));
     }
     GC_PROTECT(a);
     GC_PROTECT(b);
@@ -4885,9 +7519,11 @@ lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b) {
 
 /**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として
- * 符号を反転する。floatが1つでも含まれる場合は全オペランドをdoubleへ変換して減算する。
- * それ以外で全オペランドが非負FIXNUMかつ結果が負にならない場合はヒープ確保なしの
- * 高速パスを使い、それ以外は符号付きマグニチュードによる一般パスにフォールバックする。
+ * 符号を反転する。floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (単項マイナスは第一引数の型をそのまま保つ。documents/float-contagion.md)。
+ * それ以外で全オペランドがFIXNUM(**符号は問わない**)かつ途中経過が60bitに収まる
+ * 場合はヒープ確保なしの高速パスを使い、それ以外は符号付きマグニチュードによる
+ * 一般パスにフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
  * @return 減算結果の数値(floatが絡まなければFIXNUM_MAGNITUDE_MASK以内ならFIXNUM、それを超えるならbignum)
@@ -4896,46 +7532,72 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t first = cc_car(args);
 
-    if (any_float(args)) {
+    /* [型昇格] +と同じ規則。単項マイナスは第一引数の型をそのまま保つ */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
+        if (!is_number_val(first)) {
+            return signal_domain_error_for_class(first, "<NUMBER>", global_environment);
+        }
+        int kind = float_kind_of(first);
         double result = to_double(first);
         if (cc_cdr(args) == nil) {
-            return os_make_float(-result);
+            return os_make_float_of_kind(kind, -result);
         }
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
-            result -= to_double(cc_car(rest));
+            lisp_val_t v = cc_car(rest);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
+            kind = float_kind_max(kind, float_kind_of(v));
+            result = float_round_to_kind(kind, result - to_double(v));
         }
-        return os_make_float(result);
+        return os_make_float_of_kind(kind, result);
     }
 
     if (cc_cdr(args) == nil) {
         // 単項マイナス: 0 - x
         if ((first & TAG_MASK) == TAG_FIXNUM) {
-            return os_make_fixnum_signed(!os_fixnum_is_negative(first), os_fixnum_magnitude(first));
+            return fixnum_negate(first);   /* [改善A] 同じ式が2箇所にあったので寄せた */
+        }
+        /* [P5] fixnum でない単項マイナス。bignum でなければ数値ではない */
+        if (!is_number_val(first)) {
+            return signal_domain_error_for_class(first, "<NUMBER>", global_environment);
         }
         signed_mag_t operand;
         decompose(first, &operand);
         return os_make_integer(!operand.sign, operand.limbs, operand.count);
     }
 
-    int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
-    UINT64 result = fast ? os_fixnum_magnitude(first) : 0;
+    /* [改善A] 符号を問わずFIXNUMどうしなら a-b = a+(-b) で処理する。
+       途中経過(result_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない */
+    int fast = (first & TAG_MASK) == TAG_FIXNUM;
+    lisp_val_t result_val = first;
     if (fast) {
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
             lisp_val_t v = cc_car(rest);
-            if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+            if ((v & TAG_MASK) != TAG_FIXNUM) {
                 fast = 0;
                 break;
             }
-            UINT64 mag = os_fixnum_magnitude(v);
-            if (mag > result) {
+            if (!fixnum_add_signed(result_val, fixnum_negate(v), &result_val)) {
                 fast = 0;
                 break;
             }
-            result -= mag;
         }
     }
     if (fast) {
-        return os_make_fixnum(result);
+        return result_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -5040,7 +7702,8 @@ lisp_val_t primitive_null1(lisp_val_t a) {
 
 /**
  * 組み込み関数*。argsの全数値(FIXNUM/bignum/float、負数も可)を乗算する。
- * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して乗算する。
+ * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (documents/float-contagion.md)。
  * それ以外で全オペランドが非負FIXNUMかつ桁あふれの恐れがない場合はヒープ確保なしの高速パスを使い、
  * それ以外は符号付きマグニチュードによる一般パス(素朴なO(n*m)乗算)にフォールバックする。
  * @param args 評価済みの引数リスト(すべて数値)
@@ -5049,31 +7712,48 @@ lisp_val_t primitive_null1(lisp_val_t a) {
  */
 lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    if (any_float(args)) {
+    /* [型昇格] +と同じ規則 */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
         double product = 1.0;
+        int kind = FLOAT_KIND_NONE;
         for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-            product *= to_double(cc_car(cur));
+            lisp_val_t v = cc_car(cur);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
+            kind = float_kind_max(kind, float_kind_of(v));
+            product = float_round_to_kind(kind, product * to_double(v));
         }
-        return os_make_float(product);
+        return os_make_float_of_kind(kind, product);
     }
 
+    /* [改善B] 途中経過(prod_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない。
+       以前は「全オペランドが**非負**」を要求していたため、`(* -2 3)` のように
+       結果がFIXNUMに収まる式でもbignum機構(decompose→limb_alloc→mag_mul→
+       os_make_integer)を丸ごと通っていた。改善Aが `+`/`-` で直したのと同じ構図で、
+       fixnum_multiply_signed へ寄せて符号つきのまま計算する */
     int fast = 1;
-    UINT64 product = 1;
+    lisp_val_t prod_val = os_make_fixnum(1);
     for (lisp_val_t cur = args; cur != nil; cur = cc_cdr(cur)) {
-        lisp_val_t v = cc_car(cur);
-        if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+        if (!fixnum_multiply_signed(prod_val, cc_car(cur), &prod_val)) {
             fast = 0;
             break;
         }
-        UINT64 mag = os_fixnum_magnitude(v);
-        if (mag != 0 && product > FIXNUM_MAGNITUDE_MASK / mag) {
-            fast = 0;
-            break;
-        }
-        product *= mag;
     }
     if (fast) {
-        return os_make_fixnum(product);
+        return prod_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // curはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -5113,14 +7793,101 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return primitive_multiplyと同じ規則で計算したa*b
  */
-lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
-    if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM &&
-        !os_fixnum_is_negative(a) && !os_fixnum_is_negative(b)) {
-        UINT64 mag_a = os_fixnum_magnitude(a);
-        UINT64 mag_b = os_fixnum_magnitude(b);
-        if (mag_a == 0 || mag_b <= FIXNUM_MAGNITUDE_MASK / mag_a) {
-            return os_make_fixnum(mag_a * mag_b);
+/**
+ * 型特化した * (fixnum × fixnum)。**タグを見ない。**
+ *
+ * 桁溢れは GENERIC と同じく bignum へ昇格させる必要があるため、コアを共有する
+ * fixnum_multiply_signed_unchecked を使う。**タグ検査だけを省く。**
+ *
+ * **宣言が嘘なら壊れる**(documents/declare-typed-add.md §3-1)。
+ * @param a 第一オペランド(<fixnum> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a*b
+ */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_multiply2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_multiply2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_mul(a, b, &r)) {
+            return r;
         }
+    }
+    return primitive_multiply2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_multiply2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_multiply2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_multiply2_fixnum", b);
+    lisp_val_t prod;
+    if (fixnum_multiply_signed_unchecked(a, b, &prod)) {
+        return prod;
+    }
+    /* 桁溢れ。GENERIC と同じ経路で bignum へ昇格させる */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_multiply(args, global_environment);
+}
+
+/**
+ * 型特化した * (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。** single どうしの積は正確な結果が
+ * double で表現できる(仮数 24bit × 24bit = 48bit ≦ 53bit、指数も double の
+ * 範囲に収まる)ため、double で掛けてから single へ丸めても single で直接
+ * 掛けた結果と一致する(除算だけは二重丸めになるので別扱い。
+ * documents/single-float.md)。
+ * @param a 第一オペランド(<single-float> と宣言されている)
+ * @param b 第二オペランド(同上)
+ * @return a*b
+ */
+lisp_val_t primitive_multiply2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_multiply2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_multiply2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) *
+                                        (double)os_single_float_value(b)));
+}
+
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_multiply2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_mul(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_multiply2_slow(a, b);
+}
+
+static lisp_val_t primitive_multiply2_slow(lisp_val_t a, lisp_val_t b) {
+    /* [改善B] 符号つきのまま計算し、桁溢れ判定に除算を使わない。
+       以前は「両方とも非負」に限られていたため `(* -2 3)` が bignum 機構を通った */
+    lisp_val_t prod;
+    if (fixnum_multiply_signed(a, b, &prod)) {
+        return prod;
+    }
+    /* [型昇格] add2と同じ。singleどうしならヒープ確保ゼロ */
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
+        return os_make_float_of_kind(kind, to_double(a) * to_double(b));
     }
     GC_PROTECT(a);
     GC_PROTECT(b);
@@ -5130,45 +7897,73 @@ lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b) {
 
 /**
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
- * floatが1つでも含まれる場合は全オペランドをdoubleへ変換して除算する
+ * floatが1つでも含まれる場合は**最も広いオペランドの形式**で結果を返す
+ * (documents/float-contagion.md)
  * (0除算はIEEE754の挙動どおり+inf/-inf/nanを返す。domain-error未実装のための簡略化)。
  * それ以外で全オペランドが非負FIXNUMの場合はヒープ確保なしの高速パスを使い、それ以外
  * (負数・bignumが絡む)は符号付きマグニチュードによる一般パス(1bitずつのシフト&サブトラクトに
  * よる長除算)にフォールバックする。商の符号は絶対値の商にオペランドの符号のXORを付与して決める。
  * @param args 評価済みの引数リスト(すべて数値)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果の数値。floatが絡まず0除算の場合はg_sym_eval_error
+ * @return 除算結果の数値。floatが絡まず0除算の場合は<division-by-zero>をsignalする
+ *         ([P4] 以前はg_sym_eval_errorを値として返していた)
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t first = cc_car(args);
 
-    if (any_float(args)) {
+    /* [型昇格] +と同じ規則。0除算はIEEE754どおり inf/nan を返す(従来どおり) */
+    if (args_float_kind(args) != FLOAT_KIND_NONE) {
+        if (!is_number_val(first)) {
+            return signal_domain_error_for_class(first, "<NUMBER>", global_environment);
+        }
+        int kind = float_kind_of(first);
         double result = to_double(first);
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
-            result /= to_double(cc_car(rest));
+            lisp_val_t v = cc_car(rest);
+            if (!is_number_val(v)) {
+                return signal_domain_error_for_class(v, "<NUMBER>", global_environment);
+            }
+            kind = float_kind_max(kind, float_kind_of(v));
+            result = float_round_to_kind(kind, result / to_double(v));
         }
-        return os_make_float(result);
+        return os_make_float_of_kind(kind, result);
     }
 
-    int fast = (first & TAG_MASK) == TAG_FIXNUM && !os_fixnum_is_negative(first);
-    UINT64 result = fast ? os_fixnum_magnitude(first) : 0;
+    /* [改善C] 途中経過(quot_val)は常にFIXNUMの即値なのでヒープ確保もGCも起きない。
+       以前は「全オペランドが**非負**」を要求していたため、`(/ -6 3)` のように
+       結果がFIXNUMに収まる式でもbignum機構(decompose→limb_alloc→mag_divmod→
+       os_make_integer)を丸ごと通っていた。改善Aが `+`/`-` で、PR #92 が `*` で
+       直したのと**同じ構図の 3 例目**である。
+       ゼロ除算は従来どおり、割る前にg_sym_eval_errorで返す */
+    int fast = (first & TAG_MASK) == TAG_FIXNUM;
+    lisp_val_t quot_val = first;
     if (fast) {
         for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
             lisp_val_t v = cc_car(rest);
-            if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+            if ((v & TAG_MASK) != TAG_FIXNUM) {
                 fast = 0;
                 break;
             }
-            UINT64 divisor = os_fixnum_magnitude(v);
-            if (divisor == 0) {
-                return g_sym_eval_error;
+            if (!fixnum_divide_signed_unchecked(quot_val, v, &quot_val)) {
+                /* 除数が0。桁溢れはありえない */
+                return signal_division_by_zero("/", args, env);
             }
-            result /= divisor;
         }
     }
     if (fast) {
-        return os_make_fixnum(result);
+        return quot_val;
+    }
+
+    /* [P5] **ここへ来るのは fixnum の高速経路から外れたときだけ**なので、
+       全部 fixnum の正常系には命令が1つも増えない。
+       spec:4283-4284「An error shall be signaled if any x is not a number
+       (error-id. domain-error)」(+ と *)、spec:4306 / spec:4324(-)、
+       spec:4363-4365(quotient)。 */
+    {
+        lisp_val_t p5_bad = first_non_number(args);
+        if (p5_bad != 0) {
+            return signal_domain_error_for_class(p5_bad, "<NUMBER>", global_environment);
+        }
     }
 
     // restはループ内でos_alloc_bytesを呼ぶため、イテレーションを跨いで
@@ -5188,7 +7983,7 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
         decompose(cc_car(rest), &operand);
 
         if (operand.count == 1 && operand.limbs[0] == 0) {
-            return g_sym_eval_error;
+            return signal_division_by_zero("/", args, env);
         }
 
         decompose(acc_val, &acc);
@@ -5208,6 +8003,137 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
 }
 
 /**
+ * primitive_divideを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定で、**floatが絡むならconsを一切構築しない**
+ * (primitive_add2と同じ形。PR #80)。
+ *
+ * **ISLispに / は無い。** これは quotient の実装(init.lisp の %quotient2)が
+ * 内部で使う経路である。ゼロ除算はIEEE754どおり inf/nan を返し、
+ * <division-by-zero> を出すのは quotient 側の責務である
+ * (%quotient2 がここへ来る前に除数0を弾く)。
+ *
+ * **整数どうしはn項版へ委譲する。** bignum除算の経路が長く、二項版へ展開すると
+ * 重複が大きい。そのぶんcons 2個(32byte)が残る
+ * (documents/divide-direct-call.md §4-2)。
+ * @param a 被除数
+ * @param b 除数
+ * @return a/b
+ */
+/**
+ * 型特化した / (fixnum × fixnum)。**型のタグを見ない。ゼロ検査はする。**
+ *
+ * コアを共有する fixnum_divide_signed_unchecked を使う。
+ * **外れるのは除数が 0 のときだけ**なので、そこだけ GENERIC へ落として
+ * EVAL-ERROR を返す(値の作り方を二重に書かないため)。
+ *
+ * **宣言が嘘なら壊れる**(documents/declare-typed-add.md §3-1)。
+ * ただし**ゼロ除算で機械が止まることはない**。
+ * @param a 被除数(<fixnum> と宣言されている)
+ * @param b 除数(同上)
+ * @return a/b(ゼロ方向に切り捨て)。除数が0ならEVAL-ERROR
+ */
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_divide2_fixnum_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_divide2_fixnum(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_div(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_divide2_fixnum_slow(a, b);
+}
+
+static lisp_val_t primitive_divide2_fixnum_slow(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_FIXNUM("primitive_divide2_fixnum", a);
+    DECLARE_AUDIT_FIXNUM("primitive_divide2_fixnum", b);
+    lisp_val_t quot;
+    if (fixnum_divide_signed_unchecked(a, b, &quot)) {
+        return quot;
+    }
+    /* 除数が 0。GENERIC と同じ経路で EVAL-ERROR を返す */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_divide(args, global_environment);
+}
+
+/**
+ * 型特化した / (single-float × single-float)。**タグを見ない。**
+ *
+ * **GENERIC と同じく double を経由する。**
+ * `+` `-` `*` では「single どうしの結果が double で正確に表せるから一致する」
+ * という理由だったが、**除算はその理由が成り立たない**(商は無限小数になりうる)。
+ * double で割ってから single へ丸めると**二重丸め**になり、single で直接割った
+ * 結果と食い違う場合がある。
+ *
+ * **それでも double を経由するのは、GENERIC と一致させるためである。**
+ * 直接 single で割るほうが正確だが、そうすると宣言の有無で答えが変わる。
+ * 二重丸めは GENERIC が元から持っている性質で、**本作業では変えない**
+ * (直すなら GENERIC 側の別作業。documents/single-float.md)。
+ *
+ * ゼロ除算は divss がマスクされた MXCSR(0x1F80)の下で inf/nan を返すだけで、
+ * 例外は出ない(interrupt.c の init_fpu と process.c の FXSAVE 既定状態)。
+ * @param a 被除数(<single-float> と宣言されている)
+ * @param b 除数(同上)
+ * @return a/b
+ */
+lisp_val_t primitive_divide2_single(lisp_val_t a, lisp_val_t b) {
+    DECLARE_AUDIT_SINGLE("primitive_divide2_single", a);
+    DECLARE_AUDIT_SINGLE("primitive_divide2_single", b);
+    return os_make_single_float((float)((double)os_single_float_value(a) /
+                                        (double)os_single_float_value(b)));
+}
+
+/* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
+   (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+    付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */
+static lisp_val_t primitive_divide2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        lisp_val_t r;
+        if (fixnum_fast_div(a, b, &r)) {
+            return r;
+        }
+    }
+    return primitive_divide2_slow(a, b);
+}
+
+static lisp_val_t primitive_divide2_slow(lisp_val_t a, lisp_val_t b) {
+    /* [改善C] **内側の cons が消える。** 以前は整数どうしのとき無条件に
+       cons を 2 個作って n 項版 primitive_divide へ委譲していた
+       (documents/divide-direct-call.md §4-2)。PR #88 が消したのは
+       **呼び出し側(外側)**の cons で、これは別物である */
+    lisp_val_t quot;
+    if (fixnum_divide_signed(a, b, &quot)) {
+        return quot;
+    }
+    int kind = float_kind_max(float_kind_of(a), float_kind_of(b));
+    if (kind != FLOAT_KIND_NONE) {
+        /* [P5] 片方が float でももう片方が数値とは限らない。
+           **高速経路(両方 fixnum)を抜けた後なので正常系には効かない** */
+        if (!is_number_val(a)) {
+            return signal_domain_error_for_class(a, "<NUMBER>", global_environment);
+        }
+        if (!is_number_val(b)) {
+            return signal_domain_error_for_class(b, "<NUMBER>", global_environment);
+        }
+        return os_make_float_of_kind(kind, to_double(a) / to_double(b));
+    }
+    /* 整数だが fixnum でない(bignum)か、除数が 0。どちらも n 項版へ */
+    GC_PROTECT(a);
+    GC_PROTECT(b);
+    lisp_val_t args = os_make_cons(a, os_make_cons(b, nil));
+    return primitive_divide(args, global_environment);
+}
+
+/**
  * 組み込み関数<。argsが単調増加(a<b<c<...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -5216,7 +8142,12 @@ lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) >= 0) {
+        if (!num_lt(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -5234,8 +8165,56 @@ lisp_val_t primitive_less_than(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a<bならg_sym_t、そうでなければnil
  */
+/* [P5] **2 引数版の比較 6 個は「安全側」に倒してある。**
+ *
+ * これらは za.c が (< a b) 等に対して直接呼ぶ入口(za.c の
+ * za_compile_call 付近を参照)なので、コンパイル済みループの 1 反復ごとに
+ * この検査が乗る。逆アセンブルで成功経路が **+5 命令**になることを確認している
+ * (変更前は分岐が無く cmov 1 個で済んでいた。内訳は cmp+jcc が約 2 と、
+ *  「どちらの引数が数値でなかったか」を報告するために a/b を
+ *  number_compare4 の call を跨いで生かすための退避が 4)。
+ *
+ * **それでも検査を入れる側へ倒した。** 黙って壊れた値を返すより遅いほうがよい
+ * (pitfalls 原則5)。仕様も無条件に signal を要求している(spec:4250-4251)。
+ *
+ * **安くする道は 2 本あり、どちらも別作業である。**
+ *
+ *   1. declaim の safety で入口を分ける。受け皿は既にある
+ *      (runtime.h の OPTIMIZE_SAFETY / za.c の g_za_declaim。
+ *       documents/declaim-design.md)。safety 0 のときだけ
+ *      「検査しない双子の入口」を呼ぶ形にすれば、cmov の 8 命令へ完全に戻せる。
+ *      **既定は検査する**(OPTIMIZE_DEFAULT は safety=1)。
+ *      既存の primitive_add2_fixnum 等が declare で入口を切り替えているのと同じ仕組み。
+ *   2. 両方 fixnum の比較をこの入口へインライン展開する。成功経路から
+ *      number_compare4 の call が消えるので上記の退避 4 命令も要らなくなり、
+ *      **現状より速くなる**(いまは fixnum どうしでも必ず call している)。
+ *      documents/type-system-survey.md の「< / > / = に fixnum インライン化が無い」と同じ項目。
+ *
+ * どちらも optimize 側の作業と重なるため、この PR では踏み込まない。
+ */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_less_than2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) < 0 ? g_sym_t : nil;
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a < b) ? g_sym_t : nil;
+    }
+    return primitive_less_than2_slow(a, b);
+}
+
+static lisp_val_t primitive_less_than2_slow(lisp_val_t a, lisp_val_t b) {
+    if (num_lt(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する(真の側には命令が増えない)。
+       安全側へ倒した判断と、安くする道は上のコメントを見ること */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -5247,7 +8226,12 @@ lisp_val_t primitive_less_than2(lisp_val_t a, lisp_val_t b) {
 lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) <= 0) {
+        if (!num_gt(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -5261,8 +8245,29 @@ lisp_val_t primitive_greater_than(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a>bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_greater_than2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) > 0 ? g_sym_t : nil;
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a > b) ? g_sym_t : nil;
+    }
+    return primitive_greater_than2_slow(a, b);
+}
+
+static lisp_val_t primitive_greater_than2_slow(lisp_val_t a, lisp_val_t b) {
+    if (num_gt(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -5274,7 +8279,12 @@ lisp_val_t primitive_greater_than2(lisp_val_t a, lisp_val_t b) {
 lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) != 0) {
+        if (!num_eq(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -5288,8 +8298,29 @@ lisp_val_t primitive_num_equal(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a=bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_num_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) == 0 ? g_sym_t : nil;
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a == b) ? g_sym_t : nil;
+    }
+    return primitive_num_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_num_equal2_slow(lisp_val_t a, lisp_val_t b) {
+    if (num_eq(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -5300,14 +8331,64 @@ lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b) {
  * @param env 呼び出し時の環境(未使用)
  * @return 隣接ペアがすべて等しくないならg_sym_t、そうでなければnil
  */
+/* **`/=` は IEEE 754 で NaN に対して真を返す唯一の比較である。**
+   「等しくない」は非順序も含む。= の否定として書くこと自体が仕様であり、
+   独立に「小さいか大きい」と書くと NaN で偽になって誤る(§3-1)。
+   [P5] 述語 num_ne は使わなくなった(下のコメント参照)ので消してある。 */
 lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) == 0) {
+        /* [P5] **`/=` だけは「偽の側で判定する」手が使えない。**
+           num_ne は「等しくない」なので、数値でない相手に対して**真**を返してしまう
+           (NUM_CMP_NOT_NUMBER != NUM_CMP_EQUAL)。他の比較と違い、ここは
+           比較結果そのものを見て分岐する。**`/=` の正常系には cmp が1つ増える。**
+           spec:4204-4205 */
+        int c = number_compare4(cc_car(rest), cc_car(cc_cdr(rest)));
+        if (c == NUM_CMP_NOT_NUMBER) {
+            return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+        }
+        if (c == NUM_CMP_EQUAL) {
             return nil;
         }
     }
     return g_sym_t;
+}
+
+/**
+ * primitive_num_not_equalを2引数固定で呼ぶためのラッパー。primitive_num_equal2と
+ * 同じ理由でnum_ne(=number_compare4)へ直接委譲する(consを一切構築しない)。
+ *
+ * **比較演算子で二項版が欠けていたのは/=だけだった**ため、za_compile_binaryの
+ * 専用経路に乗れず、n項版への一般呼び出しに落ちていた(引数のconsを2個作るので
+ * 1回あたり32byte確保し、生成コードも2倍。documents/binary-not-equal.md)。
+ *
+ * **num_neを使うこと。** /=は非順序(NaN)で**真**を返す唯一の比較である
+ * (documents/nan-comparison.md §3-1)。`num_lt(a,b) || num_gt(a,b)`と書くと
+ * 非順序がどちらにも該当せず偽になり、IEEE 754に反する。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a≠b(非順序を含む)ならg_sym_t、そうでなければnil
+ */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_num_not_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
+lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b) {
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a != b) ? g_sym_t : nil;
+    }
+    return primitive_num_not_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_num_not_equal2_slow(lisp_val_t a, lisp_val_t b) {
+    /* [P5] n項版と同じ理由で、比較結果そのものを見る(上のコメント参照) */
+    int c = number_compare4(a, b);
+    if (c == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return (c == NUM_CMP_EQUAL) ? nil : g_sym_t;
 }
 
 /**
@@ -5319,7 +8400,12 @@ lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env) {
 lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) < 0) {
+        if (!num_ge(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -5333,8 +8419,29 @@ lisp_val_t primitive_greater_equal(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a>=bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_greater_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) >= 0 ? g_sym_t : nil;
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a >= b) ? g_sym_t : nil;
+    }
+    return primitive_greater_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_greater_equal2_slow(lisp_val_t a, lisp_val_t b) {
+    if (num_ge(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -5346,7 +8453,12 @@ lisp_val_t primitive_greater_equal2(lisp_val_t a, lisp_val_t b) {
 lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
     (void)env;
     for (lisp_val_t rest = args; rest != nil && cc_cdr(rest) != nil; rest = cc_cdr(rest)) {
-        if (number_compare(cc_car(rest), cc_car(cc_cdr(rest))) > 0) {
+        if (!num_le(cc_car(rest), cc_car(cc_cdr(rest)))) {
+            /* [P5] **偽になった分岐の内側で判定する。** 真のまま回るループ
+               (正常系)には命令が増えない。spec:4250-4251 / spec:4204-4205 */
+            if (number_compare4(cc_car(rest), cc_car(cc_cdr(rest))) == NUM_CMP_NOT_NUMBER) {
+                return compare_pair_domain_error(cc_car(rest), cc_car(cc_cdr(rest)));
+            }
             return nil;
         }
     }
@@ -5360,8 +8472,29 @@ lisp_val_t primitive_less_equal(lisp_val_t args, lisp_val_t env) {
  * @param b 第二オペランド
  * @return a<=bならg_sym_t、そうでなければnil
  */
+/* [M7] 常道(両方が非負 fixnum)をインラインで先に捌く。冷たい経路は noinline で
+   別関数に出す — **-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
+   付けないと冷たい側のフレーム要求が常道に残る(M5 で実測。0x60 -> 0x70 に増えた)。 */
+static lisp_val_t primitive_less_equal2_slow(lisp_val_t a, lisp_val_t b)
+    __attribute__((noinline, cold));
+
 lisp_val_t primitive_less_equal2(lisp_val_t a, lisp_val_t b) {
-    return number_compare(a, b) <= 0 ? g_sym_t : nil;
+    if (num_both_nonneg_fixnum(a, b)) {
+        return (a <= b) ? g_sym_t : nil;
+    }
+    return primitive_less_equal2_slow(a, b);
+}
+
+static lisp_val_t primitive_less_equal2_slow(lisp_val_t a, lisp_val_t b) {
+    if (num_le(a, b)) {
+        return g_sym_t;
+    }
+    /* [P5] 偽の側でだけ非数値を判定する。安全側へ倒した判断は
+       primitive_less_than2 の前のコメントを見ること */
+    if (number_compare4(a, b) == NUM_CMP_NOT_NUMBER) {
+        return compare_pair_domain_error(a, b);
+    }
+    return nil;
 }
 
 /**
@@ -5375,9 +8508,17 @@ lisp_val_t primitive_max(lisp_val_t args, lisp_val_t env) {
     lisp_val_t best = cc_car(args);
     for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
         lisp_val_t v = cc_car(rest);
-        if (number_compare(v, best) > 0) {
+        if (num_gt(v, best)) {
             best = v;
+        } else if (number_compare4(v, best) == NUM_CMP_NOT_NUMBER) {
+            /* [P5] 偽の側でだけ判定する。spec:4390「An error shall be signaled
+               if any x is not a number (error-id. domain-error)」 */
+            return compare_pair_domain_error(v, best);
         }
+    }
+    /* [P5] 引数が1つだけ(ループを回らない)のときも第一引数を検査する */
+    if (!is_number_val(best)) {
+        return signal_domain_error_for_class(best, "<NUMBER>", global_environment);
     }
     return best;
 }
@@ -5393,9 +8534,17 @@ lisp_val_t primitive_min(lisp_val_t args, lisp_val_t env) {
     lisp_val_t best = cc_car(args);
     for (lisp_val_t rest = cc_cdr(args); rest != nil; rest = cc_cdr(rest)) {
         lisp_val_t v = cc_car(rest);
-        if (number_compare(v, best) < 0) {
+        if (num_lt(v, best)) {
             best = v;
+        } else if (number_compare4(v, best) == NUM_CMP_NOT_NUMBER) {
+            /* [P5] 偽の側でだけ判定する。spec:4390「An error shall be signaled
+               if any x is not a number (error-id. domain-error)」 */
+            return compare_pair_domain_error(v, best);
         }
+    }
+    /* [P5] 引数が1つだけ(ループを回らない)のときも第一引数を検査する */
+    if (!is_number_val(best)) {
+        return signal_domain_error_for_class(best, "<NUMBER>", global_environment);
     }
     return best;
 }
@@ -5417,6 +8566,30 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
         return os_make_fixnum(os_fixnum_magnitude(val));
     }
 
+    /* [single-float] floatを明示的に分ける。**型は保存する**
+       (singleを渡したらsingleが返る。ここは演算の型昇格ではなく符号の除去なので、
+       (c) の対象ではない)。
+       以前はfloatもdecomposeへ落ちていた。doubleのビットパターンを
+       sign/count/limbsとして読むという既に間違った動作だったが、
+       2.0 や -0.0 では偶然 sign=0 になって val がそのまま返っていただけである。 */
+    if (is_float(val)) {
+        double d = os_float_value(val);
+        if (d < 0.0) {
+            d = -d;
+            return os_is_single_float(val) ? os_make_single_float((float)d) : os_make_float(d);
+        }
+        /* -0.0 は d < 0.0 に入らないのでそのまま返る(single-float導入前と同じ)。
+           equal は float を値で比べるので (abs -0.0) と 0.0 は等しい */
+        return val;
+    }
+
+    /* [P5] fixnum でも float でもない。bignum でなければ数値ではない。
+       **fixnum / float の経路は上で返っているので正常系には効かない。**
+       spec:4414「An error shall be signaled if x is not a number
+       (error-id. domain-error)」 */
+    if (!is_number_val(val)) {
+        return signal_domain_error_for_class(val, "<NUMBER>", global_environment);
+    }
     signed_mag_t m;
     decompose(val, &m);
     if (!m.sign) {
@@ -5430,10 +8603,9 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env) {
  * 商は-∞方向へ切り捨てる)。floor_divmodを参照。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の商。z2が0の場合はg_sym_eval_error
+ * @return floor除算の商。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
 
@@ -5441,7 +8613,7 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
     int div_by_zero;
     floor_divmod(z1, z2, &div_out, &mod_out, &div_by_zero);
     if (div_by_zero) {
-        return g_sym_eval_error;
+        return signal_division_by_zero("DIV", args, env);
     }
     return div_out;
 }
@@ -5451,10 +8623,9 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env) {
  * 一致する)。floor_divmodを参照。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の余り。z2が0の場合はg_sym_eval_error
+ * @return floor除算の余り。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t z1 = cc_car(args);
     lisp_val_t z2 = cc_car(cc_cdr(args));
 
@@ -5462,7 +8633,7 @@ lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env) {
     int div_by_zero;
     floor_divmod(z1, z2, &div_out, &mod_out, &div_by_zero);
     if (div_by_zero) {
-        return g_sym_eval_error;
+        return signal_division_by_zero("MOD", args, env);
     }
     return mod_out;
 }
@@ -5533,15 +8704,15 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env) {
  * mag_isqrtを参照)。zが負の場合は定義域エラー。
  * @param args 評価済みの引数リスト(非負整数1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
+ * @return floor(sqrt(z))。zが負の場合は<domain-error>をsignalする(spec:4984)
  */
 lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t val = cc_car(args);
     signed_mag_t m;
     decompose(val, &m);
     if (m.sign) {
-        return g_sym_eval_error;
+        /* spec:4984 「z が非負整数でなければ error-id. domain-error」 */
+        return signal_domain_error_for_class(val, "<INTEGER>", env);
     }
 
     return mag_isqrt(val);
@@ -5582,7 +8753,7 @@ lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
         if (d < 0.0) {
             return signal_domain_error(val, env);
         }
-        return os_make_float(sqrt_fpu(d));
+        return os_make_float_of_kind(math_result_kind(args), sqrt_fpu(d));
     }
 
     GC_PROTECT(val);
@@ -5606,7 +8777,9 @@ lisp_val_t primitive_sqrt(lisp_val_t args, lisp_val_t env) {
         return root;
     }
 
-    return os_make_float(sqrt_fpu(to_double(val)));
+    /* 完全平方でなければfloatにする。整数入力なので型は
+       *read-default-float-format* に従う(math_result_kind) */
+    return os_make_float_of_kind(math_result_kind(args), sqrt_fpu(to_double(val)));
 }
 
 /**
@@ -5645,7 +8818,7 @@ lisp_val_t primitive_log(lisp_val_t args, lisp_val_t env) {
     if (x <= 0.0) {
         return signal_domain_error(val, env);
     }
-    return os_make_float(log_fpu(x));
+    return os_make_float_of_kind(math_result_kind(args), log_fpu(x));
 }
 
 /**
@@ -5716,7 +8889,7 @@ static double exp_fpu(double x) {
  */
 lisp_val_t primitive_exp(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    return os_make_float(exp_fpu(to_double(cc_car(args))));
+    return os_make_float_of_kind(math_result_kind(args), exp_fpu(to_double(cc_car(args))));
 }
 
 /**
@@ -5750,7 +8923,7 @@ static double sin_fpu(double x) {
  */
 lisp_val_t primitive_sin(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    return os_make_float(sin_fpu(to_double(cc_car(args))));
+    return os_make_float_of_kind(math_result_kind(args), sin_fpu(to_double(cc_car(args))));
 }
 
 /**
@@ -5783,7 +8956,7 @@ static double cos_fpu(double x) {
  */
 lisp_val_t primitive_cos(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    return os_make_float(cos_fpu(to_double(cc_car(args))));
+    return os_make_float_of_kind(math_result_kind(args), cos_fpu(to_double(cc_car(args))));
 }
 
 /**
@@ -5820,9 +8993,10 @@ static double atan2_fpu(double y, double x) {
  */
 lisp_val_t primitive_atan2(lisp_val_t args, lisp_val_t env) {
     (void)env;
+    /* 二項なのでc-1の型昇格規則がそのまま効く(引数リストを丸ごと見る) */
     double y = to_double(cc_car(args));
     double x = to_double(cc_car(cc_cdr(args)));
-    return os_make_float(atan2_fpu(y, x));
+    return os_make_float_of_kind(math_result_kind(args), atan2_fpu(y, x));
 }
 
 /**
@@ -6010,6 +9184,9 @@ lisp_val_t primitive_numberp1(lisp_val_t val) {
     if ((val & TAG_MASK) == TAG_FIXNUM) {
         return g_sym_t;
     }
+    if ((val & TAG_MASK) == TAG_SINGLE_FLOAT) {
+        return g_sym_t;
+    }
     if ((val & TAG_MASK) == TAG_INSTANCE) {
         UINT64 magic = ((UINT64 *)(val & ~TAG_MASK))[0];
         if (magic == MAGIC_BIGNUM || magic == MAGIC_FLOAT) {
@@ -6083,21 +9260,221 @@ lisp_val_t primitive_floatp1(lisp_val_t val) {
 }
 
 /**
+ * 組み込み関数%%NARROW-TO-SINGLE-FLOAT。数値をsingle-floatへ**狭める**。
+ *
+ * **型昇格(c-1)は広いほうへ寄せるので、Lispだけでは狭められない。**
+ * (* double 1.0f0) は double のままだし、(float x) は float をそのまま返す。
+ * convert が double → <single-float> を提供するにはこの経路が要る
+ * (documents/convert-float.md)。
+ *
+ * 範囲判定も**ここで行う**。理由は documents/convert-float.md §4-3:
+ * (float)(double) の結果が無限大になったかだけで判定すると、
+ * **入力が元々無限大だった場合と、変換であふれた場合を区別できない。**
+ * そこで「入力がfloatか整数か」で先に分けてから見る。
+ *
+ *   入力がfloatで NaN / ±無限大 → そのまま単精度のNaN / ±無限大にする
+ *                                   (singleでも表現できる値なのでエラーにしない)
+ *   入力がfloatで有限、|x| > FLT_MAX → **範囲外**
+ *   入力が整数で、doubleにした時点で無限大 → **範囲外**(元は有限なのであふれた)
+ *   入力が整数で |x| > FLT_MAX          → **範囲外**
+ *   それ以外 → 単精度へ丸める。FLT_MINより小さい値は0へ丸まるが、
+ *              **0は有限の表現可能な結果なのでエラーにしない**(アンダーフローは
+ *              正しく丸めた結果だが、オーバーフローには有限の答えが無い)
+ *
+ * 範囲外のときは**nilを返す**。domain-errorの送出はLisp側(%convert)に任せる
+ * — 期待クラスの指定や条件クラスの組み立てはそちらのほうが素直だからである。
+ * 戻り値がsingle-float(TAG_SINGLE_FLOAT)かnil(TAG_CONSのセンチネル)かは
+ * タグで区別できるので、正常値と混ざることはない。
+ *
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatへ丸めた値。数値でない、または範囲外ならnil
+ */
+lisp_val_t primitive_narrow_to_single_float(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    lisp_val_t val = cc_car(args);
+
+    /* [境界] 数値をハードコードしない。PR #79 でC側に作った
+       SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS から導く */
+    union { float f; UINT32 u; } flt_max;
+    flt_max.u = (UINT32)SINGLE_FLOAT_MAX_BITS;
+    const double max_single = (double)flt_max.f;
+    union { double d; UINT64 u; } dbl_max;
+    dbl_max.u = DOUBLE_FLOAT_MAX_BITS;
+    const double max_double = dbl_max.d;
+
+    if (is_float(val)) {
+        double d = os_float_value(val);
+        /* NaN。自分自身と等しくないことで判定する */
+        if (d != d) {
+            return os_make_single_float((float)d);
+        }
+        /* ±無限大。doubleの最大有限値を超えていれば無限大である */
+        if (d > max_double || d < -max_double) {
+            return os_make_single_float((float)d);
+        }
+        if (d > max_single || d < -max_single) {
+            return nil;   /* 有限だがsingleでは表せない大きさ */
+        }
+        return os_make_single_float((float)d);
+    }
+
+    if ((val & TAG_MASK) == TAG_FIXNUM || is_bignum(val)) {
+        double d = to_double(val);
+        /* 整数は必ず有限なので、doubleにした時点で無限大ならそこであふれている */
+        if (d > max_double || d < -max_double) {
+            return nil;
+        }
+        if (d > max_single || d < -max_single) {
+            return nil;
+        }
+        return os_make_single_float((float)d);
+    }
+
+    return nil;   /* 数値ではない */
+}
+
+/**
+ * 組み込み関数%%SINGLE-FLOAT-P。第一引数がsingle-float(TAG_SINGLE_FLOATの即値)か
+ * どうかを判定する。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    return primitive_single_float_p1(cc_car(args));
+}
+
+/**
+ * primitive_single_float_pの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p1(lisp_val_t val) {
+    return os_is_single_float(val) ? g_sym_t : nil;
+}
+
+/* float境界の定数4つ。値はC側の SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS から
+   導く(Lisp側に数値リテラルを書かないための経路。init.lispのdefconstantが呼ぶ)。
+
+   負側も専用にするのは、Lispで (- 0 *most-positive-single-float*) と書くと
+   演算の型昇格が未実装のためsingleがdoubleへ落ちてしまうからである。
+   ビット単位では符号bitを立てるだけなので、値の丸めも起きない。 */
+
+/** 組み込み関数%%MOST-POSITIVE-SINGLE-FLOAT。単精度の最大有限値 */
+lisp_val_t primitive_most_positive_single_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { float f; UINT32 u; } conv;
+    conv.u = (UINT32)SINGLE_FLOAT_MAX_BITS;
+    return os_make_single_float(conv.f);
+}
+
+/** 組み込み関数%%MOST-NEGATIVE-SINGLE-FLOAT。単精度の最小有限値(最大有限値の符号反転) */
+lisp_val_t primitive_most_negative_single_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { float f; UINT32 u; } conv;
+    conv.u = (UINT32)SINGLE_FLOAT_MAX_BITS | 0x80000000UL;
+    return os_make_single_float(conv.f);
+}
+
+/** 組み込み関数%%MOST-POSITIVE-DOUBLE-FLOAT。倍精度の最大有限値 */
+lisp_val_t primitive_most_positive_double_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { double d; UINT64 u; } conv;
+    conv.u = DOUBLE_FLOAT_MAX_BITS;
+    return os_make_float(conv.d);
+}
+
+/** 組み込み関数%%MOST-NEGATIVE-DOUBLE-FLOAT。倍精度の最小有限値(最大有限値の符号反転) */
+lisp_val_t primitive_most_negative_double_float(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    union { double d; UINT64 u; } conv;
+    conv.u = DOUBLE_FLOAT_MAX_BITS | 0x8000000000000000ULL;
+    return os_make_float(conv.d);
+}
+
+/**
+ * リーダ・プリンタが参照する *read-default-float-format* の現在値を解決する。
+ *
+ * 動的変数は g_dynamic_bindings という**単一のグローバル**に入っているので、
+ * プロセスをまたいで共有される(documents/type-system-survey.md §4)。
+ * F1で変えるとF2の読み取りも変わる。これは現状の動的変数の仕組みそのままで、
+ * 本作業では変えない。
+ *
+ * **読めない状況で落ちないことを最優先にする。** ブート初期(init.lispの
+ * defdynamicより前)・unboundのとき・想定外のシンボルが入っているときは、
+ * どれもC側の既定値へ倒す。
+ * @return single-floatなら非0、double-floatなら0
+ */
+/**
+ * 既にinternされているsymbolだけを引く(**確保しない**)。未登録ならnil。
+ *
+ * os_make_symbol は見つからなければ新しく作るので `os_alloc_bytes` を通り、
+ * GCが走りうる。プリンタの内側(print_value)から呼ぶとGCが印字中の値を
+ * 動かしてしまい、Cのローカル変数はGCルートでないので参照が腐る。
+ * ここは**引くだけ**にして、その経路を断つ。
+ */
+static lisp_val_t find_interned_symbol(const char *name) {
+    int found = symbol_hash_lookup(name);
+    return (found >= 0) ? g_symbol_table[found] : nil;
+}
+
+/**
+ * 組み込み関数%%DEFAULT-FLOAT-FORMAT。C側の既定をクラス名シンボルとして返す。
+ * init.lisp の defdynamic がこれを使う(Lisp側にクラス名を直接書かないため)。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return <SINGLE-FLOAT> または <DOUBLE-FLOAT> のシンボル
+ */
+lisp_val_t primitive_default_float_format(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_symbol(DEFAULT_FLOAT_FORMAT_IS_SINGLE ? "<SINGLE-FLOAT>" : "<DOUBLE-FLOAT>");
+}
+
+int os_read_default_float_format_is_single(void) {
+    /* 動的変数がまだ1つも無い間(ブート最初期)は引くまでもない */
+    if (g_dynamic_bindings == nil) {
+        return DEFAULT_FLOAT_FORMAT_IS_SINGLE;
+    }
+    lisp_val_t name = find_interned_symbol("*READ-DEFAULT-FLOAT-FORMAT*");
+    if (name == nil) {
+        return DEFAULT_FLOAT_FORMAT_IS_SINGLE;   /* まだinternされていない */
+    }
+    lisp_val_t value = os_get_dynamic(name);
+    if (value == nil) {
+        return DEFAULT_FLOAT_FORMAT_IS_SINGLE;   /* 未定義 */
+    }
+    /* 比較相手もinterned symbolのはず。未登録なら nil になり、value(非nil)とは
+       一致しないので自然にフォールバックへ落ちる */
+    if (value == find_interned_symbol("<SINGLE-FLOAT>")) {
+        return 1;
+    }
+    if (value == find_interned_symbol("<DOUBLE-FLOAT>")) {
+        return 0;
+    }
+    /* 想定外の値。エラーにはせず既定へ倒す(リーダもプリンタも落ちてはいけない) */
+    return DEFAULT_FLOAT_FORMAT_IS_SINGLE;
+}
+
+/**
  * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
  * @param args 評価済みの引数リスト(数値1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
+ * @return floatに変換した値。数値以外が渡された場合は<domain-error>をsignalする(spec:4734)
  */
 lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env) {
-    (void)env;
     lisp_val_t x = cc_car(args);
     if (is_float(x)) {
         return x;
     }
     if ((x & TAG_MASK) == TAG_FIXNUM || is_bignum(x)) {
-        return os_make_float(to_double(x));
+        /* 整数→floatの型は *read-default-float-format* に従う(sqrt等と同じ規則)。
+           第2引数で形式を指定する拡張は本作業では扱わない */
+        return os_make_float_of_kind(math_result_kind(args), to_double(x));
     }
-    return g_sym_eval_error;
+    /* spec:4734 「x が数でなければ error-id. domain-error」 */
+    return signal_domain_error(x, env);
 }
 
 /**
@@ -6231,6 +9608,12 @@ static int values_equal(lisp_val_t a, lisp_val_t b) {
     }
 
     switch (tag_a) {
+        case TAG_SINGLE_FLOAT:
+            /* 即値なのでビットパターンが同じなら上の a == b で既に真。ここへ来るのは
+               ビットパターンが違う場合だけで、+0.0 と -0.0 がそれにあたる。
+               数値はeql比較(ISLisp §13)なので値として比べる */
+            return os_single_float_value(a) == os_single_float_value(b);
+
         case TAG_CONS:
             return values_equal(cc_car(a), cc_car(b)) && values_equal(cc_cdr(a), cc_cdr(b));
 
@@ -6663,6 +10046,7 @@ lisp_val_t primitive_string_append(lisp_val_t args, lisp_val_t env) {
         total_len += ((lisp_val_t *)addr)[0];
     }
 
+    ALLOC_AUDIT_REASON(ALLOC_REASON_STRING);
     lisp_addr_t out_addr = os_alloc_bytes(8 + total_len);
     ((lisp_val_t *)out_addr)[0] = total_len;
     UINT8 *out_bytes = (UINT8 *)(out_addr + 8);
@@ -6788,15 +10172,25 @@ lisp_val_t primitive_set_current_environment(lisp_val_t args, lisp_val_t env) {
  * そのまま(レキシカルに)子フォームへ伝播するだけで、%%set-current-environmentによる
  * proc->envの書き換えを一切参照しないため、単にbodyを(progn ...)へまとめて
  * %%set-current-environmentするだけでは対象環境で評価したことにならない。
+ * [P2] **os_eval_top_levelではなくos_evalを使う。** 以前はここでも
+ * os_eval_top_levelを呼んでいたため、**内側にもう1つ block %TOP-LEVEL が張られ、
+ * %abort-top-levelがそこで止まってしまっていた。** その結果、
+ * (progn (with-environment e (error "x")) (note 'after)) の 'after まで評価が
+ * 進み、conditionがwith-environment式の値になっていた(調査文書 §3-3、
+ * 「<error>オブジェクトが値として返る」唯一の実測ケース)。
+ * ここをos_evalにすると、脱出は呼び出し元へそのまま伝播し、本物のトップレベルの
+ * %TOP-LEVELまで届く。with-environment(init.lisp)のunwind-protectは
+ * 脱出経路でも走るので、environmentの復元は従来どおり保証される。
+ *
  * @param args (form env) formは未評価のS式(呼び出し側でquote済み)
  * @param env 呼び出し時の環境(未使用、formの評価にはargsのenvを使う)
- * @return formをargsのenvのもとで評価した結果
+ * @return formをargsのenvのもとで評価した結果。非局所脱出はそのまま伝播する
  */
 lisp_val_t primitive_eval_in_environment(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t form = cc_car(args);
     lisp_val_t target_env = cc_car(cc_cdr(args));
-    return os_eval_top_level(form, target_env);
+    return os_eval(form, target_env);
 }
 
 /**
@@ -6972,6 +10366,28 @@ lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
 #define MAX_ARRAY_RANK 8
 
 /**
+ * [可用性/#110] 長さ / 次元の引数を UINT64 として取り出す。**負の fixnum を弾く。**
+ *
+ * **fixnum は 2 の補数ではない。符号(bit63)+ マグニチュード(bit4-62)である。**
+ * だから `v >> FIXNUM_VALUE_SHIFT` と生で書くと**符号ビットが値に混ざる**。
+ * 入れる前の create-vector / create-string / make-array はこの生シフトだけで、
+ * `(create-vector -1)` は 10^17 規模の「非負の長さ」として通っていた。
+ * そこまで大きいと `p + aligned > g_from_end` のポインタ演算が回り込むので、
+ * **「空きがある」と判定されたうえで要素の書き込みが始まりうる。**
+ *
+ * 非 fixnum(bignum / 文字列 / cons)も同じ入口から入ってくるので、ここで一緒に弾く。
+ *
+ * @return 非負の fixnum なら 1、そうでなければ 0
+ */
+static int array_size_arg(lisp_val_t v, UINT64 *out) {
+    if ((v & TAG_MASK) != TAG_FIXNUM || os_fixnum_is_negative(v)) {
+        return 0;
+    }
+    *out = os_fixnum_magnitude(v);
+    return 1;
+}
+
+/**
  * rank/dimsから配列本体の可変長ブロック(word0=rank、word[1..rank]=各次元のサイズ、
  * word[rank+1..]=データ)をヒープに確保し、ヘッダ(rank, dims)だけ書き込む。
  * データ部の初期化は呼び出し側の責務(make-array/create-vector/vectorで初期化ポリシーが
@@ -6980,12 +10396,74 @@ lisp_val_t primitive_gensym(lisp_val_t args, lisp_val_t env) {
  * @param dims 各次元のサイズ(rank個)
  * @return 確保したブロックの先頭アドレス(タグなし)
  */
-static lisp_addr_t alloc_vector_block(UINT64 rank, const UINT64 *dims) {
+/**
+ * [可用性/#110] rank/dimsから本体ブロックのバイト数を求める。
+ * **掛けながら桁あふれを見る。** 溢れたら 0 を返す(*out_bytes は不定)。
+ *
+ * ## なぜ掛け算より後ろで判定してはいけないのか
+ *
+ * 入れる前の alloc_vector_block は `total *= dims[i]` を素で回していた。
+ * **桁あふれの検査も負値の検査も無かった。** total が巻き上がると**小さい値**に
+ * なるので、枯渇の判定を掛け算の後ろに置くと**まさにこの場合だけ検査を通り抜け**、
+ * 小さい塊を確保したあとに要素を書き込んで**ヒープを踏み越える**。
+ * だから判定は掛け算より前、正確には**掛けているその場**でなければならない。
+ *
+ * [道具の選択] fixnum の乗算(fixnum_multiply_signed_unchecked)は
+ * unsigned __int128 を使っているが、あれは「59bit に収まるか」を見たいからである。
+ * ここで見たいのは「UINT64 に収まるか」なので __builtin_mul_overflow がそのまま
+ * 判定になる(documents/heap-exhaustion.md §2)。
+ */
+static int vector_block_bytes(UINT64 rank, const UINT64 *dims, UINT64 *out_bytes) {
     UINT64 total = 1;
     for (UINT64 i = 0; i < rank; i++) {
-        total *= dims[i];
+        if (__builtin_mul_overflow(total, dims[i], &total)) {
+            return 0;
+        }
     }
-    lisp_addr_t addr = os_alloc_bytes(8 * (1 + rank + total));
+    UINT64 words = 0;
+    if (__builtin_add_overflow(total, (UINT64)(1 + rank), &words)) {
+        return 0;
+    }
+    UINT64 bytes = 0;
+    if (__builtin_mul_overflow(words, (UINT64)8, &bytes)) {
+        return 0;
+    }
+    *out_bytes = bytes;
+    return 1;
+}
+
+/**
+ * [可用性/#110] rank/dims の要求が入らないなら <storage-exhausted> を signal する。
+ *
+ * **桁あふれと枯渇は同じ答えにする。** 要求が表せる大きさを超えているなら、
+ * それは「入らない」のであって <storage-exhausted> が正しい。別の条件を作ると、
+ * 呼び出し側が 2 つを区別して扱う理由が無いのに区別させることになる
+ * (documents/heap-exhaustion.md §2 の註)。
+ *
+ * @return signal した場合 1(*out_signal にその戻り値)、確保へ進んでよい場合 0
+ */
+static int vector_block_signal_if_too_large(UINT64 rank, const UINT64 *dims,
+                                            lisp_val_t *out_signal) {
+    UINT64 bytes = 0;
+    if (!vector_block_bytes(rank, dims, &bytes)) {
+        *out_signal = os_heap_signal_exhausted(global_environment);
+        return 1;
+    }
+    return heap_signal_if_too_large(bytes, out_signal);
+}
+
+static lisp_addr_t alloc_vector_block(UINT64 rank, const UINT64 *dims) {
+    UINT64 bytes = 0;
+    if (!vector_block_bytes(rank, dims, &bytes)) {
+        /* [可用性/#110] **ここへ来るのは primitive 側の事前判定を通り抜けた場合だけ**
+           である。C の内部から呼ぶ経路(os_make_vector_from_list /
+           os_make_vector_raw / os_make_array_from_nested_list)の dims は実在する
+           リストの長さなので、積は要素数を超えず溢れない。
+           番地を返す関数なので signal できない。最後の砦として停止する */
+        os_panic("vector size overflow (lisp heap)");
+    }
+    ALLOC_AUDIT_REASON(ALLOC_REASON_VECTOR_BLOCK);
+    lisp_addr_t addr = os_alloc_bytes(bytes);
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = rank;
     for (UINT64 i = 0; i < rank; i++) {
@@ -7073,10 +10551,23 @@ lisp_val_t primitive_vector(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_create_vector(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 count = cc_car(args) >> FIXNUM_VALUE_SHIFT;
+    lisp_val_t count_arg = cc_car(args);
     lisp_val_t rest = cc_cdr(args);
     lisp_val_t init = (rest != nil) ? cc_car(rest) : nil;
     GC_PROTECT(init);
+
+    /* [可用性/#110] **確保の要求は 3 経路(インタプリタ / AOT / JIT)が共有する
+       この primitive を通る。** だから判定を 1 箇所に置けば 3 経路を覆える
+       (スタック側は JIT だけしか守れなかった。documents/heap-exhaustion.md §1) */
+    UINT64 count = 0;
+    if (!array_size_arg(count_arg, &count)) {
+        return signal_domain_error_for_class(count_arg, "<INTEGER>", global_environment);
+    }
+    lisp_val_t exhausted = nil;
+    if (heap_signal_if_pending(&exhausted) ||
+        vector_block_signal_if_too_large(1, &count, &exhausted)) {
+        return exhausted;
+    }
 
     lisp_val_t vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
     GC_PROTECT(vec);
@@ -7158,12 +10649,29 @@ lisp_val_t primitive_make_array(lisp_val_t args, lisp_val_t env) {
     UINT64 dims[MAX_ARRAY_RANK];
     UINT64 rank = 0;
 
+    /* [可用性/#110] **次元は非負の fixnum でなければならない。**
+       生シフトのままだと負の次元が巨大な非負の値に化ける(array_size_arg の註) */
     if ((dims_arg & TAG_MASK) == TAG_FIXNUM) {
-        dims[rank++] = dims_arg >> FIXNUM_VALUE_SHIFT;
+        if (!array_size_arg(dims_arg, &dims[rank])) {
+            return signal_domain_error_for_class(dims_arg, "<INTEGER>", global_environment);
+        }
+        rank++;
     } else {
         for (lisp_val_t cur = dims_arg; cur != nil && rank < MAX_ARRAY_RANK; cur = cc_cdr(cur)) {
-            dims[rank++] = cc_car(cur) >> FIXNUM_VALUE_SHIFT;
+            lisp_val_t d = cc_car(cur);
+            if (!array_size_arg(d, &dims[rank])) {
+                return signal_domain_error_for_class(d, "<INTEGER>", global_environment);
+            }
+            rank++;
         }
+    }
+
+    /* [可用性/#110] **判定は掛け算より前**(正確には掛けているその場)。
+       溢れた total は小さい値に巻き上がるので、後ろで見ると素通りする */
+    lisp_val_t exhausted = nil;
+    if (heap_signal_if_pending(&exhausted) ||
+        vector_block_signal_if_too_large(rank, dims, &exhausted)) {
+        return exhausted;
     }
 
     UINT64 total = 1;
@@ -7210,8 +10718,8 @@ static UINT64 array_offset(lisp_val_t *header, UINT64 rank, lisp_val_t cur, int 
 /**
  * 組み込み関数AREF。第一引数の配列から、残りの引数(各次元の添字)が指す要素を返す。
  * @param args 評価済みの引数リスト(第一引数はVECTOR、残りはFIXNUM)
- * @param env 呼び出し時の環境(未使用)
- * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ * @param env 呼び出し時の環境
+ * @return 添字が指す要素。範囲外の添字が指定された場合は<program-error>をsignalする
  */
 lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -7222,7 +10730,12 @@ lisp_val_t primitive_aref(lisp_val_t args, lisp_val_t env) {
     int out_of_bounds;
     UINT64 offset = array_offset(header, rank, cc_cdr(args), &out_of_bounds);
     if (out_of_bounds) {
-        return g_sym_eval_error;
+        /* [P4] **仕様未確認。** aref の誤り条件として仕様が挙げているのは
+           「basic-array でない」「添字が非負整数でない」の2つだけで、
+           「非負整数だが次元より大きい」は明示されていない(spec:5049-5056)。
+           同じ添字アクセスである elt の index-out-of-range(§29.4 -> <program-error>)に
+           揃えた */
+        return signal_index_out_of_range(global_environment);
     }
 
     lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
@@ -7250,7 +10763,8 @@ lisp_val_t primitive_array_dimensions(lisp_val_t args, lisp_val_t env) {
     }
 
     if (!is_vector(array)) {
-        return g_sym_eval_error;
+        /* spec:5077「basic-array でなければ error-id. domain-error」 */
+        return signal_domain_error_for_class(array, "<BASIC-ARRAY>", global_environment);
     }
 
     lisp_val_t *header = vector_header(array);
@@ -7319,7 +10833,7 @@ lisp_val_t primitive_set_cdr2(lisp_val_t target, lisp_val_t val) {
  * 組み込み関数SET-AREF。第一引数の配列の、続く添字が指す要素を最後の引数で破壊的に書き換える。
  * @param args 評価済みの引数リスト(array idx1 idx2 ... value の並び)
  * @param env 呼び出し時の環境(未使用)
- * @return 書き込んだ値(最後の引数)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 書き込んだ値(最後の引数)。範囲外の添字が指定された場合は<program-error>をsignalする
  */
 lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -7333,7 +10847,8 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
     lisp_val_t idx_cur = cc_cdr(cc_cdr(args));
     UINT64 offset = array_offset(header, rank, idx_cur, &out_of_bounds);
     if (out_of_bounds) {
-        return g_sym_eval_error;
+        /* aref と同じ扱い(spec:5085「制約は aref と同じ」) */
+        return signal_index_out_of_range(global_environment);
     }
 
     lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
@@ -7350,14 +10865,31 @@ lisp_val_t primitive_set_aref(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 len = cc_car(args) >> FIXNUM_VALUE_SHIFT;
+    lisp_val_t len_arg = cc_car(args);
     lisp_val_t char_arg = cc_cdr(args);
     UINT8 fill = ' ';
     if (char_arg != nil) {
         fill = (UINT8)(cc_car(char_arg) >> CHAR_VALUE_SHIFT);
     }
 
-    lisp_addr_t addr = os_alloc_bytes(8 + len);
+    /* [可用性/#110] 大口の確保。長さの検査と枯渇の判定を**確保より前**に置く
+       (STRING は 8 + len なので掛け算は無いが、`+ 8` は溢れうる) */
+    UINT64 len = 0;
+    if (!array_size_arg(len_arg, &len)) {
+        return signal_domain_error_for_class(len_arg, "<INTEGER>", global_environment);
+    }
+    UINT64 str_bytes = 0;
+    if (__builtin_add_overflow(len, (UINT64)8, &str_bytes)) {
+        return os_heap_signal_exhausted(global_environment);
+    }
+    lisp_val_t exhausted = nil;
+    if (heap_signal_if_pending(&exhausted) ||
+        heap_signal_if_too_large(str_bytes, &exhausted)) {
+        return exhausted;
+    }
+
+    ALLOC_AUDIT_REASON(ALLOC_REASON_STRING);
+    lisp_addr_t addr = os_alloc_bytes(str_bytes);
     lisp_val_t *header = (lisp_val_t *)addr;
     header[0] = len;
     UINT8 *bytes = (UINT8 *)(addr + 8);
@@ -7371,7 +10903,7 @@ lisp_val_t primitive_create_string(lisp_val_t args, lisp_val_t env) {
  * 組み込み関数STRING-ELT。第一引数のSTRINGの第二引数(0起算)番目の文字を返す。
  * @param args 評価済みの引数リスト(第一引数はSTRING、第二引数はFIXNUM)
  * @param env 呼び出し時の環境(未使用)
- * @return 添字が指す文字(CHAR)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 添字が指す文字(CHAR)。範囲外の添字が指定された場合は<program-error>をsignalする
  */
 lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
     (void)env;
@@ -7381,7 +10913,9 @@ lisp_val_t primitive_string_elt(lisp_val_t args, lisp_val_t env) {
     lisp_addr_t addr = str & ~TAG_MASK;
     UINT64 len = ((lisp_val_t *)addr)[0];
     if (idx >= len) {
-        return g_sym_eval_error;
+        /* [P4] **仕様未確認。** string-elt は ISLisp 仕様に無い実装独自の関数。
+           文字列に対する elt と同じ index-out-of-range に揃えた */
+        return signal_index_out_of_range(global_environment);
     }
     UINT8 *bytes = (UINT8 *)(addr + 8);
     return os_make_char(bytes[idx])  /* [4bit化] bytesはUINT8*。charへ落とすと符号拡張する */;
@@ -7415,7 +10949,7 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
         }
         case TAG_INSTANCE: {
             if (!is_vector(seq)) {
-                return g_sym_eval_error;
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
             }
             lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
@@ -7426,7 +10960,11 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
             return os_make_fixnum(total);
         }
         default:
-            return g_sym_eval_error;
+            /* spec:5290「basic-vector でも list でもなければ error-id. domain-error」。
+               **仕様の「basic-vector または list」を1つのクラスでは表せない**
+               (ISLisp に <sequence> は無い)ので、expected-class には受け付ける
+               クラスの一方を入れる。以下の elt/set-elt/subseq も同じ扱い */
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -7437,7 +10975,8 @@ lisp_val_t primitive_length(lisp_val_t args, lisp_val_t env) {
  * どちらからも呼ばれる。
  * @param seq LIST/STRING/VECTOR
  * @param idx 0起算の添字(タグを外した生の値)
- * @return 添字が指す要素。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 添字が指す要素。範囲外なら<program-error>、型違いなら<domain-error>をsignalする
+ *         (signalに使うenvはglobal_environment。signal_index_out_of_rangeのコメント参照)
  */
 static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
@@ -7447,7 +10986,8 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
                 cur = cc_cdr(cur);
             }
             if (cur == nil) {
-                return g_sym_eval_error;
+                /* spec:5316「z が範囲外の整数なら error-id. index-out-of-range」 */
+                return signal_index_out_of_range(global_environment);
             }
             return cc_car(cur);
         }
@@ -7455,14 +10995,15 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
             lisp_addr_t addr = seq & ~TAG_MASK;
             UINT64 len = ((lisp_val_t *)addr)[0];
             if (idx >= len) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             UINT8 *bytes = (UINT8 *)(addr + 8);
             return os_make_char(bytes[idx])  /* [4bit化] bytesはUINT8*。charへ落とすと符号拡張する */;
         }
         case TAG_INSTANCE: {
             if (!is_vector(seq)) {
-                return g_sym_eval_error;
+                /* spec:5319「basic-vector でも list でもなければ error-id. domain-error」 */
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
             }
             lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
@@ -7471,13 +11012,13 @@ static lisp_val_t primitive_elt_impl(lisp_val_t seq, UINT64 idx) {
                 total *= header[1 + i];
             }
             if (idx >= total) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
             return data[idx];
         }
         default:
-            return g_sym_eval_error;
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -7506,7 +11047,8 @@ lisp_val_t primitive_elt2(lisp_val_t seq, lisp_val_t idx) {
  * @param obj 新しい値
  * @param seq LIST/STRING/VECTOR
  * @param idx 0起算の添字(タグを外した生の値)
- * @return 書き込んだ値(obj)。範囲外の添字が指定された場合はg_sym_eval_error
+ * @return 書き込んだ値(obj)。範囲外なら<program-error>、型違いなら<domain-error>をsignalする
+ *         (signalに使うenvはglobal_environment。signal_index_out_of_rangeのコメント参照)
  */
 static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 idx) {
     switch (seq & TAG_MASK) {
@@ -7516,7 +11058,8 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
                 cur = cc_cdr(cur);
             }
             if (cur == nil) {
-                return g_sym_eval_error;
+                /* spec:5347「z が有効な添字の範囲外なら error-id. index-out-of-range」 */
+                return signal_index_out_of_range(global_environment);
             }
             cc_set_car(cur, obj);
             return obj;
@@ -7525,7 +11068,7 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
             lisp_addr_t addr = seq & ~TAG_MASK;
             UINT64 len = ((lisp_val_t *)addr)[0];
             if (idx >= len) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             UINT8 *bytes = (UINT8 *)(addr + 8);
             bytes[idx] = (UINT8)(obj >> CHAR_VALUE_SHIFT);
@@ -7533,7 +11076,7 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
         }
         case TAG_INSTANCE: {
             if (!is_vector(seq)) {
-                return g_sym_eval_error;
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
             }
             lisp_val_t *header = vector_header(seq);
             UINT64 rank = header[0];
@@ -7542,14 +11085,14 @@ static lisp_val_t primitive_set_elt_impl(lisp_val_t obj, lisp_val_t seq, UINT64 
                 total *= header[1 + i];
             }
             if (idx >= total) {
-                return g_sym_eval_error;
+                return signal_index_out_of_range(global_environment);
             }
             lisp_val_t *data = (lisp_val_t *)((lisp_addr_t)header + 8 * (1 + rank));
             data[idx] = obj;
             return obj;
         }
         default:
-            return g_sym_eval_error;
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -7578,14 +11121,56 @@ lisp_val_t primitive_set_elt3(lisp_val_t obj, lisp_val_t seq, lisp_val_t idx) {
  * 範囲を要素とする、同じクラスの新規シーケンスを返す。
  * @param args 評価済みの引数リスト(第一引数はLIST/STRING/VECTOR、第二・第三引数は
  *             FIXNUM(z1, z2))
- * @param env 呼び出し時の環境(未使用)
- * @return 新規に確保したシーケンス(元と同じクラス)
+ * @param env 呼び出し時の環境
+ * @return 新規に確保したシーケンス(元と同じクラス)。範囲外なら<program-error>、
+ *         型違いなら<domain-error>をsignalする
  */
 lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t seq = cc_car(args);
     UINT64 z1 = cc_car(cc_cdr(args)) >> FIXNUM_VALUE_SHIFT;
     UINT64 z2 = cc_car(cc_cdr(cc_cdr(args))) >> FIXNUM_VALUE_SHIFT;
+
+    /* [P4] **範囲検査がそもそも無かった。** 仕様は 0 <= z1 <= z2 <= (length seq) を
+       要求し、外れたら index-out-of-range(spec:5374-5376)としているが、
+       検査が無いため (subseq "abc" 1 99) が確保済み領域の外を読んでいた
+       (list なら nil の cdr が自分自身なので nil を out_len 個並べて返していた)。
+       EVAL-ERROR 返しの置き換えに合わせて、この抜けもここで塞ぐ。
+       lengthの計算は既存のprimitive_lengthに委ねず、各分岐の前に1回だけ行う */
+    UINT64 seq_len;
+    switch (seq & TAG_MASK) {
+        case TAG_CONS: {
+            seq_len = 0;
+            for (lisp_val_t cur = seq; cur != nil; cur = cc_cdr(cur)) {
+                seq_len++;
+            }
+            break;
+        }
+        case TAG_STRING:
+            seq_len = ((lisp_val_t *)(seq & ~TAG_MASK))[0];
+            break;
+        case TAG_INSTANCE: {
+            if (!is_vector(seq)) {
+                return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
+            }
+            lisp_val_t *header = vector_header(seq);
+            UINT64 rank = header[0];
+            seq_len = 1;
+            for (UINT64 i = 0; i < rank; i++) {
+                seq_len *= header[1 + i];
+            }
+            break;
+        }
+        default:
+            /* nilはTAG_CONS付きのLisp値(os_bootstrap)なので、空リストは上のTAG_CONSへ行く。
+               ここへ来るのはfixnum/char/symbol等 */
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
+    }
+    /* z1/z2はタグを外した非負の生値なので、負数は表現されない。
+       0 <= z1 <= z2 <= seq_len の残りを見る */
+    if (z1 > z2 || z2 > seq_len) {
+        return signal_index_out_of_range(global_environment);
+    }
     UINT64 out_len = z2 - z1;
 
     switch (seq & TAG_MASK) {
@@ -7613,6 +11198,7 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
         }
         case TAG_STRING: {
             GC_PROTECT(seq);
+            ALLOC_AUDIT_REASON(ALLOC_REASON_STRING);
             lisp_addr_t out_addr = os_alloc_bytes(8 + out_len);
             lisp_addr_t addr = seq & ~TAG_MASK;
             UINT8 *bytes = (UINT8 *)(addr + 8);
@@ -7624,9 +11210,6 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
             return (lisp_val_t)(out_addr | TAG_STRING);
         }
         case TAG_INSTANCE: {
-            if (!is_vector(seq)) {
-                return g_sym_eval_error;
-            }
             GC_PROTECT(seq);
             lisp_val_t out_vec = os_make_instance(MAGIC_VECTOR, 0, 0, 0);
             GC_PROTECT(out_vec);
@@ -7643,7 +11226,9 @@ lisp_val_t primitive_subseq(lisp_val_t args, lisp_val_t env) {
             return out_vec;
         }
         default:
-            return g_sym_eval_error;
+            /* 上の長さ計算で型は検査済みなので**到達しない**。同じ判定を2回書くより、
+               万一到達したときに黙って値を返さないほうがよいのでsignalしておく */
+            return signal_domain_error_for_class(seq, "<BASIC-VECTOR>", global_environment);
     }
 }
 
@@ -7696,7 +11281,23 @@ lisp_val_t primitive_class_name(lisp_val_t args, lisp_val_t env) {
  */
 lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env) {
     (void)env;
-    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    lisp_val_t cls = cc_car(args);
+    /* [防御] クラスオブジェクトでなければ「親なし」として空リストを返す。
+       subclasspは (eq c1 c2) が偽なら無条件に %%class-supers を呼ぶので、
+       class-of が **nil を返したとき**(そのクラス名が *classes* に未登録)に
+       ここへ nil が来る。以前は nil をそのままデリファレンスして
+       g_nil_cell の外(16byteしかない)を読んでいた。読めた値が偶然 nil なら
+       素通りし、そうでなければ落ちる — つまり**グローバルの並び順しだいで
+       壊れる**状態だった(single-float でグローバルが増えた結果、
+       lisp_compiled_test が実際に落ちて発覚した)。
+       空リストを返せば subclassp は正しく偽になる。 */
+    if ((cls & TAG_MASK) != TAG_INSTANCE) {
+        return nil;
+    }
+    UINT64 *obj = (UINT64 *)(cls & ~TAG_MASK);
+    if (obj[0] != MAGIC_BUILTIN_CLASS && obj[0] != MAGIC_STANDARD_CLASS) {
+        return nil;
+    }
     return obj[2];
 }
 
@@ -7707,8 +11308,19 @@ lisp_val_t primitive_class_supers(lisp_val_t args, lisp_val_t env) {
  * @return slots(スロット記述子のlist)
  */
 lisp_val_t primitive_class_slots(lisp_val_t args, lisp_val_t env) {
-    (void)env;
-    UINT64 *obj = (UINT64 *)(cc_car(args) & ~TAG_MASK);
+    lisp_val_t cls = cc_car(args);
+    /* [P4] **型検査が無く、任意の値のword3を生で読んでいた。**
+       nilを渡すとg_nil_cell(2語しかない)の外を読み、生のワードがそのまま
+       Lisp値として流れる。実際に (%%class-slots nil) が 6931512 を返し、
+       make-instanceがそれを(make-array 6931512)に使ってヒープを使い切っていた。
+       クラス以外を渡すのは呼び出し側の誤りなのでdomain-errorにする。 */
+    if ((cls & TAG_MASK) != TAG_INSTANCE) {
+        return signal_domain_error_for_class(cls, "<STANDARD-CLASS>", env);
+    }
+    UINT64 *obj = (UINT64 *)(cls & ~TAG_MASK);
+    if (obj[0] != MAGIC_BUILTIN_CLASS && obj[0] != MAGIC_STANDARD_CLASS) {
+        return signal_domain_error_for_class(cls, "<STANDARD-CLASS>", env);
+    }
     return obj[3];
 }
 
@@ -7843,14 +11455,19 @@ lisp_val_t primitive_set_dynamic(lisp_val_t args, lisp_val_t env) {
  * @param args (sym . rest) 評価済みの引数リスト。symは呼び出したい関数名のシンボル、
  *             restはsymへ渡す評価済み引数のリスト
  * @param env rest内の関数呼び出しに使う環境(sym解決には使わない)
- * @return symの呼び出し結果。symがglobal_environment上で未定義の場合はg_sym_eval_error
+ * @return symの呼び出し結果。symがglobal_environment上で未定義の場合は
+ *         <undefined-function>をsignalする
  */
 lisp_val_t primitive_funcall_by_name(lisp_val_t args, lisp_val_t env) {
     lisp_val_t sym = cc_car(args);
     lisp_val_t rest = cc_cdr(args);
     lisp_val_t fn = os_get_function(sym, global_environment);
     if (fn == nil) {
-        return g_sym_eval_error;
+        /* [P4-3] error-id. undefined-function(spec:1461)。クラスはspec:7261-7263。
+           **envではなくglobal_environmentを渡す。** この関数のenvはrest内の
+           関数呼び出し用で、sym解決には元々使っていない(上のos_get_function参照)。
+           AOT生成コードからは0が渡ることもあり、os_get_functionへ回すと落ちる */
+        return os_signal_undefined_function(sym, global_environment);
     }
     return os_apply_function(fn, rest, env);
 }

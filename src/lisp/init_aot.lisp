@@ -306,6 +306,29 @@
 ;;; 埋め込まれ実行時に呼ばれる)は、M15(documents/fs.md)でdevice.lisp/
 ;;; fat16.lisp/fat32.lispをAOT化するため、ここへ移動する。
 
+;;; --- [probe] AOT と実行時で float の既定形式がずれていないかを見張る ---
+;;;
+;;; **これは消さないこと。使われていない定数に見えるが、検出器である。**
+;;;
+;;; *read-default-float-format* の既定は2箇所で決まる:
+;;;   - 実行時   : runtime.h の DEFAULT_FLOAT_FORMAT_IS_SINGLE
+;;;                (init.lisp が %%default-float-format 経由で読む)
+;;;   - AOT変換時: transpile.lisp の read-all-forms がホストCLの
+;;;                *read-default-float-format* を束縛する値
+;;;
+;;; **transpile.lisp はホストCL上で動くので runtime.h を読めない。手で合わせるしかない。**
+;;; 合っていないと、接尾辞なしの `1.5` が「AOTでは single、インタプリタでは double」
+;;; のように経路で別の型になる。
+;;;
+;;; ここまで踏まれていなかったのは、**AOT対象に裸のfloatリテラルが1つも
+;;; 無かったから**にすぎない(PR #81 §4-3)。そこで逆手に取って、
+;;; 裸のリテラルをわざと1つ置く。この関数はAOTコンパイルされるので、
+;;; 返る値の型が「transpile.lisp が何を既定だと思っているか」そのものになる。
+;;;
+;;; 実行時の既定と一致することを test/lisp/float_default_test.lisp が確かめる。
+;;; 片方だけ変えるとそこが落ちる。
+(defun %aot-float-format-probe () 1.5)
+
 ;; plistからkeyに対応する値を探す。見つからなければdefault
 (defun %plist-get (plist key default)
   (if (null plist)
@@ -368,6 +391,18 @@
 (%register-builtin-class '<number> '(<object>))
 (%register-builtin-class '<integer> '(<number>))
 (%register-builtin-class '<float> '(<number>))
+;; 内部表現を型階層に出す拡張(ISLispには<fixnum>/<bignum>/<single-float>/
+;; <double-float>は無い。documents/type-system-survey.md §4-1)。
+;; class-ofは<integer>/<float>ではなくこの4つのどれかを返すようになる。
+(%register-builtin-class '<fixnum> '(<integer>))
+(%register-builtin-class '<bignum> '(<integer>))
+(%register-builtin-class '<single-float> '(<float>))
+(%register-builtin-class '<double-float> '(<float>))
+;; <short-float>/<long-float>は**別名**であってサブクラスではない。
+;; 同一のクラスオブジェクトを2つ目の名前で*classes*へ登録する。
+;; サブクラスにすると、class-ofが決して返さない到達不能クラスができてしまう。
+(%register-class '<short-float> (%find-class '<single-float>))
+(%register-class '<long-float> (%find-class '<double-float>))
 (%register-builtin-class '<standard-class> '(<object>))
 (%register-builtin-class '<standard-object> '(<object>))
 (%register-builtin-class '<stream> '(<object>))
@@ -465,8 +500,15 @@
     ((stringp obj) (%find-class '<string>))
     ((general-vector-p obj) (%find-class '<general-vector>))
     ((general-array*-p obj) (%find-class '<general-array*>))
-    ((floatp obj) (%find-class '<float>))
-    ((integerp obj) (%find-class '<integer>))
+    ;; floatとintegerは**既存の分岐位置を動かさず**、その内側で内部表現を分ける。
+    ;; 分岐順序を動かすと他の型への影響が読めない(documents/type-system-survey.md §3-2)。
+    ;; 判定の安い述語を先に置く(fixnumpはタグ検査4命令、bignumpは8命令)
+    ((floatp obj) (if (%%single-float-p obj)
+                      (%find-class '<single-float>)
+                    (%find-class '<double-float>)))
+    ((integerp obj) (if (fixnump obj)
+                        (%find-class '<fixnum>)
+                      (%find-class '<bignum>)))
     ((numberp obj) (%find-class '<number>))
     ((functionp obj) (%find-class '<function>))
     ((streamp obj) (%find-class '<stream>))
@@ -683,27 +725,35 @@
 ;;; init.lispからの移動。*handlers*のdefdynamic自体とwith-handlerマクロは
 ;;; init.lisp常駐のまま変更不要(Phase7と同じ理由)。
 
-;; *handlers*の先頭(最も内側)のhandler-functionを、一時的に自分自身を取り除いた状態で
+;; *handlers*の先頭(最も内側)のエントリを、一時的に自分自身を取り除いた状態で
 ;; 呼び出す(ハンドラ内でのsignal-conditionが次の外側のハンドラに渡るようにするため)。
 ;; 呼び出し後は*handlers*を元に戻す(unwind-protectでどの脱出経路でも保証する)。
+;; エントリは (handler-function . 脱出タグ) のペア(init.lispのwith-handler参照)。
+;;
 ;; continuableな呼び出しはconditionに%continuable/%continue-tagを記録した上でcatchで
 ;; 包み、continue-conditionからのthrowで指定した値を返して呼び出し元(signal-conditionの
-;; 呼び出し元)へ復帰できるようにする。continuableでないconditionでハンドラが
-;; (非局所脱出せず)普通に返ってきた場合は、仕様上はエラーだがトップレベルへのabortに
-;; フォールバックする。
+;; 呼び出し元)へ復帰できるようにする。
+;;
+;; **非継続コンディションでハンドラが(非局所脱出せず)正常returnした場合は、
+;; そのハンドラを張ったwith-handlerの脱出タグへthrowし、ハンドラの戻り値を
+;; with-handler式の値にする。** 以前はトップレベルへabortしていたが、それだと
+;; 外側のwith-handlerもblockも飛び越えてしまい、利用者から見て驚きが大きかった
+;; (spec:6929 は「consequences are undefined」なのでどちらも仕様違反ではない)。
+;; 外側へ譲りたいハンドラは、spec:6932 のとおり自分でsignal-conditionを呼ぶ。
 (defun signal-condition (condition continuable)
   (let ((handlers (dynamic *handlers*)))
     (if (null handlers)
         (if continuable nil (%abort-top-level condition))
-        (let ((tag (gensym)))
+        (let ((entry (car handlers))
+              (tag (gensym)))
           (set-slot-value condition '%continuable continuable)
           (set-slot-value condition '%continue-tag tag)
           (catch tag
             (unwind-protect
                 (progn
                   (%%set-dynamic '*handlers* (cdr handlers))
-                  (let ((result (funcall (car handlers) condition)))
-                    (if continuable result (%abort-top-level condition))))
+                  (let ((result (funcall (car entry) condition)))
+                    (if continuable result (throw (cdr entry) result))))
               (%%set-dynamic '*handlers* handlers)))))))
 
 ;; (condition-continuable condition) → <object> : signal-conditionが記録した

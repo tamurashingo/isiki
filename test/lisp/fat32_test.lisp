@@ -441,7 +441,9 @@
 (defglobal fat32-test-rfitv-readback (read-file-into-vector "/mnt/RFITV.BIN"))
 (assert-equal t (if fat32-test-rfitv-readback t nil))
 (assert-equal fat32-test-rfitv-vec fat32-test-rfitv-readback)
-(assert-equal nil (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
+;; [P4-4] open-input-stream が開けないと <simple-error> を signal するようになり、
+;; read-file-into-vector はそれを握り潰さずそのまま通す(nil 返しではなくなった)
+(assert-error-class '<simple-error> (read-file-into-vector "/mnt/NO-SUCH-FILE.BIN"))
 
 ;;; --- [ファイルI/O]#51(M8): cat ---
 ;; fat16_test.lispと同じ検証をFAT32側でも行う(コメントはfat16_test.lisp参照)。

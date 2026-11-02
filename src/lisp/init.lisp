@@ -144,14 +144,45 @@
       (cons (list (car (car bindings)) (car (cdr (car bindings))))
             (%for-let-bindings (cdr bindings)))))
 
-;; list-exprが指す一時リストからvar群へ順にcar/cdrで取り出してsetqする式を作る。
-;; nextの式群は先に(list ...)としてまとめて評価されるため、do構文同様、
-;; 各step式は「更新前」の値を参照でき、複数変数の同時更新が成立する。
-(defun %for-setqs (bindings list-expr)
+;; 一時変数の名前は**固定のシンボルを使い回す。gensymを使ってはいけない。**
+;; マクロは評価されるたびに展開され直すので、gensymだと多重ループで
+;; シンボルテーブルが枯渇する(下のforのコメントにある旧実装の失敗がそれ)。
+;; 名前はtranspile.lisp側の%%for-temp-namesと同じ%FOR-TMP-nに揃えてある。
+;; internが無く名前を作れないため、プールから必要な数だけ取る形にする。
+(defun %for-temp-name-pool ()
+  '(%for-tmp-1 %for-tmp-2 %for-tmp-3 %for-tmp-4 %for-tmp-5 %for-tmp-6
+    %for-tmp-7 %for-tmp-8 %for-tmp-9 %for-tmp-10 %for-tmp-11 %for-tmp-12
+    %for-tmp-13 %for-tmp-14 %for-tmp-15 %for-tmp-16))
+
+(defun %for-take (n lst)
+  (if (= n 0) nil (cons (car lst) (%for-take (- n 1) (cdr lst)))))
+
+;; 束縛の個数ぶんの一時変数名を返す。**プールを超えたら黙って壊れた展開形を
+;; 作るのではなくエラーにする**((car nil)がnilを返すので、黙ると
+;; (setq nil ...)という形になって原因が分からなくなる)
+(defun %for-temp-names (bindings)
+  (if (> (length bindings) (length (%for-temp-name-pool)))
+      (error "for: 束縛が多すぎます(上限は%for-temp-name-poolの長さ)")
+    (%for-take (length bindings) (%for-temp-name-pool))))
+
+(defun %for-temp-let-bindings (temps)
+  (if (null temps)
+      nil
+      (cons (list (car temps) nil) (%for-temp-let-bindings (cdr temps)))))
+
+;; 全step式を一時変数へ評価する。束縛変数はまだ書き換えない(並列束縛の意味論)
+(defun %for-step-setqs (bindings temps)
   (if (null bindings)
       nil
-      (cons `(setq ,(car (car bindings)) (car ,list-expr))
-            (%for-setqs (cdr bindings) `(cdr ,list-expr)))))
+      (cons `(setq ,(car temps) ,(%for-next (car bindings)))
+            (%for-step-setqs (cdr bindings) (cdr temps)))))
+
+;; 全step式の評価が終わってから、一時変数の値を各束縛変数へ書き戻す
+(defun %for-commit-setqs (bindings temps)
+  (if (null bindings)
+      nil
+      (cons `(setq ,(car (car bindings)) ,(car temps))
+            (%for-commit-setqs (cdr bindings) (cdr temps)))))
 
 ;; (for ((var1 init1 [step1]) ...) (test result...) body...) を、
 ;; varをletで束縛したのちtagbody/goによる繰り返しとsetqによる更新に展開する。
@@ -164,18 +195,49 @@
 ;; tagbodyは自身の最後の式の値を返さず常にnilを返すため、testが成立したときの
 ;; result部の値は(return-from nil ...)で明示的にblockの脱出値として返す必要がある。
 ;; block nilで囲むことで、body中の(return-from nil 値)による早期脱出もできる。
+;;
+;; [性能測定] **2026-10-04: 一時変数方式へ移植した。**transpile.lisp側の
+;; expand-forと同じ展開形である(documents/for-expansion.md)。
+;; 旧展開形はループ本体で毎反復
+;;     (let ((%for-next-values (list step1 step2 ...))) (setq v1 (car ...)) ...)
+;; を評価しており、**1反復あたり16byte×束縛数を確保していた**
+;; (実測: 2束縛のJIT経路で32.00byte/反復、インタプリタ経路で928byte/反復)。
+;; AOT側は「ループ本体のlet廃止」で既に作り直されていたため、**同じS式なのに
+;; 経路によって展開形が違い、命令数も2.6倍違う**という状態が続いていた
+;; (transpile.lisp:721のコメントが「同じ展開規則」と書いていて嘘になっていた)。
+;;
+;; 一時変数をループの外側のletで一度だけ束縛し、ループ本体では素のsetqだけを
+;; 使う。**全step式を一時変数へ評価しきってから各束縛変数へ書き戻すため、
+;; 並列束縛の意味論は保たれる**((for ((a 0 b) (b 1 (+ a b))) ...)のように
+;; 互いの旧値を参照するstepでも正しい)。3経路での確認は
+;; test/lisp/for_semantics_test.lisp と test/lisp/for_expansion_test.lisp。
+;;
+;; **一時変数は入れ子のletで束縛する。transpile.lisp側は1つのletにappendして
+;; いるが、こちらは同じにできない。** JITの単一letの束縛数の上限が
+;; ZA_MAX_LOCALS_PER_LET=4(src/c/za.c:963)で、1つのletに2N個入れると
+;; **束縛3個のforがJITに乗らなくなる**(実測: 4束縛までT、5束縛以上はNIL。
+;; PR #115で未調査だった%%bench-aot-let5parがJITに乗らないのも同じ上限)。
+;; 入れ子なら外側N個・内側N個でどちらも4以下に収まり、**移植前と同じ
+;; 「4変数までJIT」を保てる**(ZA_MAX_LET_DEPTHは16なので深さは問題ない)。
+;; AOT側にこの上限は無いので、transpile.lisp側を変える必要はない。
+;; 入れ子にしても意味は同じ(一時変数は新しい名前で、外側の束縛を隠さない)。
+;; この差は tools/macro_parity_expected.tsv で cosmetic として記録してある。
+;;
+;; 二重定義マクロの照合は `make test-qemu-macro-parity` が行う。
 (defmacro for (bindings test-and-result &rest body)
-  `(let ,(%for-let-bindings bindings)
-     (block nil
-       (tagbody
-        %for-loop
-        (if ,(car test-and-result)
-            (return-from nil (progn ,@(cdr test-and-result)))
-            (progn
-              ,@body
-              (let ((%for-next-values (list ,@(%for-nexts bindings))))
-                ,@(%for-setqs bindings '%for-next-values))
-              (go %for-loop)))))))
+  (let ((temps (%for-temp-names bindings)))
+    `(let ,(%for-let-bindings bindings)
+       (let ,(%for-temp-let-bindings temps)
+         (block nil
+           (tagbody
+            %for-loop
+            (if ,(car test-and-result)
+                (return-from nil (progn ,@(cdr test-and-result)))
+                (progn
+                  ,@body
+                  ,@(%for-step-setqs bindings temps)
+                  ,@(%for-commit-setqs bindings temps)
+                  (go %for-loop)))))))))
 
 ;; while同様にtagbody/goで展開する。ループを終わらせるにはtestがnilになるか、
 ;; body中でreturn-fromを使う。
@@ -542,20 +604,35 @@
 (defclass <end-of-stream> (<stream-error>) ())
 (defclass <storage-exhausted> (<serious-condition>) ())
 
-;; *handlers*はwith-handlerの動的スコープの間だけpush/popする、有効なhandler-functionの
+;; *handlers*はwith-handlerの動的スコープの間だけpush/popする、有効なハンドラの
 ;; リスト(内側が先頭)。*classes*と同じ理由でdefdynamic+%%set-dynamicを使う(冒頭の
 ;; 既知の制約: defvar+setqでは関数呼び出しの内側からのpush/popが呼び出し元に見えない)。
+;;
+;; **要素は (handler-function . 脱出タグ) のペアである。**
+;; 脱出タグは、そのwith-handlerが張っているcatchのタグ(実行時のgensym)。
+;; ハンドラが非継続コンディションで正常returnしたとき、signal-conditionは
+;; このタグへthrowして「そのwith-handlerまで」戻る(init_aot.lispのsignal-condition)。
+;; *handlers*へ直接pushするコードは、この形に合わせること。
 (defdynamic *handlers* nil)
 
 ;; handler-formを1度だけ評価し、bodyの動的スコープの間だけ*handlers*の先頭に積む。
 ;; unwind-protectでbodyがどう脱出しても(非局所脱出でも)必ずpopする。
+;;
+;; **catchのタグは実行時のgensymでなければならない。** マクロ展開時に1つ作って
+;; 焼き込むと、同じwith-handlerフォームが再帰的に入れ子になったときに内側と外側が
+;; 同じタグになり、「内側ハンドラがsignal-conditionで外側へ譲り、外側ハンドラが
+;; 正常returnした」場合のthrowが**内側のcatch**に捕まってしまう(catchは最も内側の
+;; 一致を拾うため)。動的な出現ごとに別のタグが要る。
 (defmacro with-handler (handler-form &rest body)
-  (let ((saved (gensym)))
-    `(let ((,saved (dynamic *handlers*)))
-       (%%set-dynamic '*handlers* (cons ,handler-form ,saved))
-       (unwind-protect
-           (progn ,@body)
-         (%%set-dynamic '*handlers* ,saved)))))
+  (let ((saved (gensym)) (tag (gensym)))
+    `(let ((,saved (dynamic *handlers*))
+           (,tag (gensym)))
+       (catch ,tag
+         (progn
+           (%%set-dynamic '*handlers* (cons (cons ,handler-form ,tag) ,saved))
+           (unwind-protect
+               (progn ,@body)
+             (%%set-dynamic '*handlers* ,saved)))))))
 
 ;; %abort-top-levelはsrc/lisp/init_aot.lispへ移動した(M12 Phase 7、#27)。
 
@@ -606,6 +683,27 @@
 (defmethod report-condition ((condition <undefined-entity>) stream)
   (format stream "undefined ~A: ~A" (slot-value condition 'namespace) (slot-value condition 'name))
   condition)
+
+;; [P2] トップレベルが打ち切られたときの表示に使う。conditionのreport-conditionを
+;; 文字列にして返す。C側(repl.c)がos_get_function+os_apply_functionで呼ぶ。
+;;
+;; **表示の途中でさらにエラーが起きても、そこで巻き添えにしない。** report-condition
+;; はユーザが特殊化できる総称関数なので、中でエラーをsignalしうる。その場合はnilを
+;; 返し、C側は従来どおり #<INSTANCE-OF ...> の表示へ落とす。
+;;
+;; **ここでハンドラを張らないと無限再帰になる。** この関数はos_eval_top_levelを
+;; 抜けた後に呼ばれるので、block %TOP-LEVEL はもう生きていない。その状態で
+;; signal-conditionが%abort-top-levelへ落ちると、return-fromの宛先が生きていない
+;; ため<control-error>がsignalされ、それがまた%abort-top-levelへ……と回り続ける。
+;;
+;; 戻り値の文字列は呼び出し側(C)が固定長バッファへ取り出すので、長すぎる場合は
+;; 途中で切れる(create-string-output-streamの容量1024も同様の上限)。
+(defun %report-condition-string (condition)
+  (block %report-condition-string
+    (with-handler (lambda (c) (return-from %report-condition-string nil))
+      (let ((s (create-string-output-stream)))
+        (report-condition condition s)
+        (get-output-stream-string s)))))
 
 ;;; --- ignore-errors ---
 
@@ -664,11 +762,44 @@
     (format s "~A" obj)
     (get-output-stream-string s)))
 
+;; (convert obj <single-float>) / (convert obj <double-float>) の実体。
+;;
+;; **float の形式を変換する手段は convert だけである。** 型昇格(c-1)は広いほうへ
+;; 寄せるので演算では狭められず((* double 1.0f0) は double のまま)、
+;; (float x) は float をそのまま返す(型保存)。
+;; documents/convert-float.md
+;;
+;; 狭める側は C の %%narrow-to-single-float が丸めと範囲判定の両方を行い、
+;; 範囲外なら nil を返す。ここで domain-error に変える。
+;; **精度が落ちるのは変換の目的そのものなので黙って落とす。**
+;; 表現できない大きさだけをエラーにする(アンダーフローは 0 への正しい丸めなので
+;; エラーにしない)。
+(defun %convert-to-single-float (obj class-name)
+  (if (numberp obj)
+      (let ((v (%%narrow-to-single-float obj)))
+        (if (null v) (%convert-error obj class-name) v))
+    (%convert-error obj class-name)))
+
+;; 広げる側は Lisp で書ける。1.0d0 倍は値を変えない(無限大・NaN も素通しする)。
+;; 整数・single・double のどれを渡しても double になる。
+(defun %convert-to-double-float (obj class-name)
+  (if (numberp obj)
+      (* obj 1.0d0)
+    (%convert-error obj class-name)))
+
 ;; ISLisp仕様§17 convertの変換表(tmp/islisp-spec.txt 3888-3895行)を実装する。
 ;; 「=」(恒等)と「X」(必須)に加え、「I」(実装定義だが提供必須)は文字<->整数を
 ;; 文字コードで、文字/シンボル<->文字列を名前文字列で対応させる。「–」はdomain-error
+;;
+;; **ディスパッチはクラス名シンボルの case である**(クラスオブジェクトの同一性では
+;; ない)。したがって <short-float>/<long-float> のような別名は、*classes* 上で
+;; 同じクラスオブジェクトを指していても**自動では効かない**。case のキーに並べて
+;; 明示する必要がある(documents/convert-float.md §4-1)。
 (defun %convert (obj class-name)
   (case class-name
+    ;; float の形式指定。<short-float>/<long-float> は別名(PR #79)
+    ((<single-float> <short-float>) (%convert-to-single-float obj class-name))
+    ((<double-float> <long-float>)  (%convert-to-double-float obj class-name))
     ((<character>)
      (cond ((characterp obj) obj)
            ((integerp obj) (code-char obj))
@@ -735,8 +866,20 @@
   (apply #'make-instance class (%create-normalize-initargs initargs)))
 
 ;; (convert obj class-name) : class-nameは評価しない
+;;
+;; ISLisp仕様どおり (convert 3 <float>) と裸で書く形が本来である。
+;; **(convert 3 '<float>) とクオート付きで書かれた場合も同じ意味に取る。**
+;; 評価しない引数にクオートを付けたくなるのは自然な間違いで、そのまま渡すと
+;; class-name が (quote <float>) というリストになり、%convert の case が
+;; どの枝にも当たらず domain-error になる — 原因の分かりにくい失敗の仕方をする。
+;; 仕様準拠のプログラムがこの形に意味を持たせることはないので、受けてよい。
 (defmacro convert (obj class-name)
-  `(%convert ,obj ',class-name))
+  `(%convert ,obj ',(if (and (consp class-name)
+                             (eq (car class-name) 'quote)
+                             (consp (cdr class-name))
+                             (null (cdr (cdr class-name))))
+                        (car (cdr class-name))
+                      class-name)))
 
 ;;; --- symbol property list (§18.2): property / set-property / remove-property ---
 ;;;
@@ -889,12 +1032,50 @@
 ;;; --- miscellaneous (§30) ---
 (defun identity (obj) obj)
 
-;;; --- number class (§19) float ---
-;;; IEEE754 binary64のDBL_MAX/-DBL_MAX相当。reader.cのfloatリテラル構文(§19.2)を
-;;; そのまま使って表現する(quotient/exp/log等の未実装超越関数と違い、
-;;; 定数の束縛だけなのでCコードの追加は不要)。
-(defconstant *most-positive-float* 1.7976931348623157E308)
-(defconstant *most-negative-float* -1.7976931348623157E308)
+;;; --- number class (§19) リーダ/プリンタの既定float型 ---
+;;; 指数マーカーが e/E のとき、および指数部が無いときに、リーダがどちらの型で
+;;; floatを作るかを決める。プリンタも同じ変数を見て、一致する型は接尾辞なし、
+;;; 一致しない型は接尾辞付き("1.5d0")で出す。
+;;;
+;;; **このdefdynamicより前の行にfloatリテラルを置かないこと。** loadは
+;;; 「1フォーム読む→評価する」の繰り返しなので、この行を評価するまでの
+;;; floatリテラルはC側のフォールバック(double-float)で読まれる。
+;;;
+;;; 動的変数はg_dynamic_bindingsという単一のグローバルにあり、**プロセス間で
+;;; 共有される**(documents/type-system-survey.md §4)。あるプロセスで
+;;; setqすると別のプロセスの読み取り・印字も変わる。現状の仕組みのままとする。
+;;;
+;;; **初期値は必ずC側の DEFAULT_FLOAT_FORMAT_IS_SINGLE(runtime.h)から導く。**
+;;; Lisp側に <double-float> と直接書かないこと。同じ既定を決めている場所が
+;;; 増えると、片方だけ動かしたときに静かにずれる
+;;; (documents/float-default.md)。
+;;;
+;;; **既定は <double-float>。CommonLisp の既定(single-float)とは違う。**
+;;; single 既定だと 1.5 の有効桁が約7桁になり、素朴に書いた数値計算が黙って
+;;; 精度を失う。single 即値化の価値は既定とは独立に成立していて、性能が要る
+;;; 場所で 1.5f0 と書けばヒープ確保ゼロの利益はすでに得られる。
+;;; 明示的に f0 を書いた人は精度を落とすことを承知している。
+;;; 判断の経緯は documents/float-default.md。
+(defdynamic *read-default-float-format* (%%default-float-format))
+
+;;; --- number class (§19) float の境界 ---
+;;; 値は必ずC側(runtime.h の SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS)から
+;;; 導く。Lisp側に 1.7976931348623157E308 のような数値リテラルを直書きすると、
+;;; (1) リーダの組み立て(mantissa * 10^exp のループ)が正しい丸めをしないため
+;;;     そもそも DBL_MAX ちょうどにならない
+;;; (2) *read-default-float-format* の値しだいで型が変わってしまう
+;;; の2つでC側と黙ってずれる。負側も専用のプリミティブにするのは、
+;;; (- 0 x) と書くと演算の型昇格(未実装)を通ってsingleがdoubleへ落ちるため。
+(defconstant *most-positive-single-float* (%%most-positive-single-float))
+(defconstant *most-negative-single-float* (%%most-negative-single-float))
+(defconstant *most-positive-double-float* (%%most-positive-double-float))
+(defconstant *most-negative-double-float* (%%most-negative-double-float))
+
+;;; ISLisp仕様(§19)の *most-positive-float* / *most-negative-float*。
+;;; isikiでは <float> が single/double の両方を指すようになったが、この2つは
+;;; 従来どおり double 側の端を指す(値も型も single-float 導入前と同じ)。
+(defconstant *most-positive-float* *most-positive-double-float*)
+(defconstant *most-negative-float* *most-negative-double-float*)
 
 ;;; --- number class (§19) fixnum の境界 ---
 ;;; fixnumが表現できる範囲の両端。値は必ずC側の FIXNUM_MAGNITUDE_MASK
@@ -919,11 +1100,18 @@
       (signal-condition
         (make-instance '<division-by-zero> ':operation 'quotient ':operands (list dividend divisor))
         nil)
+      ;; **float が絡むときは / にそのまま任せる。** (float x) は整数を
+      ;; *read-default-float-format* に従って変換するので、
+      ;; (quotient 1 2.0f0) のように片方だけが float のときに
+      ;; 整数側が double になって結果を double へ引きずってしまう
+      ;; (documents/float-math-contagion.md §3)。
+      ;; float への変換が要るのは「両方整数で割り切れない」ときだけである。
       (if (and (or (fixnump dividend) (bignump dividend))
-               (or (fixnump divisor) (bignump divisor))
-               (= (mod dividend divisor) 0))
-          (div dividend divisor)
-          (/ (float dividend) (float divisor)))))
+               (or (fixnump divisor) (bignump divisor)))
+          (if (= (mod dividend divisor) 0)
+              (div dividend divisor)
+              (/ (float dividend) (float divisor)))
+          (/ dividend divisor))))
 
 (defun quotient (dividend &rest divisors)
   (if divisors
@@ -932,13 +1120,33 @@
 
 (defun reciprocal (x) (quotient 1 x))
 
+;;; --- float の単位元・零元をサンプルの型に合わせるヘルパー (c-2) ---
+;;; **接尾辞なしの float リテラルは double である**(*read-default-float-format*
+;;; の既定)。それを単位元・零元・種として使うと、型昇格が正しく働いていても
+;;; 結果が double に引きずられる。
+;;;
+;;; 実例: %expt-integer の単位元が 1.0(double)だったため、
+;;; (expt 1.5f0 2) が途中で (* 1.5f0 1.0d0) を通って double になっていた。
+;;; documents/float-math-contagion.md
+(defun %float-one-like (sample)
+  (if (%%single-float-p sample) 1.0f0 1.0d0))
+
+(defun %float-zero-like (sample)
+  (if (%%single-float-p sample) 0.0f0 0.0d0))
+
+;; x を sample と同じ(またはそれより広い)float形式へ寄せる。
+;; 1.0 倍は値を変えない(無限大・NaNも素通しする)ので、型だけを動かす手段として使える。
+;; x が double で sample が single なら、型昇格の規則どおり double のままになる。
+(defun %widen-float-like (x sample)
+  (* x (%float-one-like sample)))
+
 ;; x1^x2(x2が非負整数)を*による繰り返し二乗法で計算する。x1の型(整数/float)は
-;; そのまま結果の型に伝わる(floatp baseなら1.0、それ以外は1を基底値とする)。
+;; そのまま結果の型に伝わる(単位元を base と同じ形式にしてあるため)。
 ;; x1が負でもlogを経由しないため、負の底×整数指数(spec例: (expt -100 2) => 10000、
 ;; (expt -0.25 -1) => -4.0)を正しく扱える。
 (defun %expt-integer (base power)
   (if (= power 0)
-      (if (floatp base) 1.0 1)
+      (if (floatp base) (%float-one-like base) 1)
       (if (= (mod power 2) 0)
           (let ((half (%expt-integer base (quotient power 2))))
             (* half half))
@@ -953,14 +1161,17 @@
      (cond
        ((and (numberp x2) (< x2 0)) (error "expt: 0 to a negative power ~S" x2))
        ((and (floatp x2) (= x2 0.0)) (error "expt: 0 to a float power of 0.0"))
-       (t (if (floatp x2) 0.0 0))))
+       (t (if (floatp x2) (%float-zero-like x2) 0))))
     ((or (fixnump x2) (bignump x2))
      (if (>= x2 0)
          (%expt-integer x1 x2)
          (reciprocal (%expt-integer x1 (- x2)))))
     ((< x1 0)
      (error "expt: negative base ~S with non-integer power ~S" x1 x2))
-    (t (exp (* (float x2) (log (float x1)))))))
+    ;; 指数が非整数floatのケース。**log へ渡す前に x1 を x2 の型へ寄せる。**
+    ;; (float x1) だと整数の x1 が *read-default-float-format* に従ってしまい、
+    ;; 既定が double のとき (expt 2 0.5f0) が double になる
+    (t (exp (* x2 (log (%widen-float-like x1 x2)))))))
 
 (defun tan (x) (/ (sin x) (cos x)))
 
@@ -985,12 +1196,17 @@
 
 ;; |x| >= 1のときlogの引数(1+x または 1-x)が0以下になり、logのdomain-errorが
 ;; そのまま伝播する(spec 4658-4669行が要求するatanhのdomain-errorを合成の副産物で満たす)
-(defun atanh (x) (* 0.5 (- (log (+ 1 x)) (log (- 1 x)))))
+;; 係数は 0.5 ではなく整数 2 での除算にする。0.5 は double リテラルなので、
+;; single を渡しても結果が double に引きずられてしまう(上の %float-one-like の注参照)
+(defun atanh (x) (/ (- (log (+ 1 x)) (log (- 1 x))) 2))
 
 ;; spec 4505行「*pi* → <float> named constant」の通り、通常の変数参照(*pi*)で
 ;; 読める必要があるためdefdynamicではなくdefconstantを使う(defdynamicの値は
 ;; (dynamic name)経由でしか読めず、bareなシンボル参照は未定義変数アクセスになる)
-(defconstant *pi* 3.141592653589793)
+;; 'd' 接尾辞を付けて double-float であることを明示する。*read-default-float-format*
+;; の既定は今のところ <double-float> なので付けなくても同じ値になるが、
+;; 既定を切り替えたときに単精度(有効桁7)へ落ちないよう明示しておく
+(defconstant *pi* 3.141592653589793d0)
 
 ;;; Environment操作ユーティリティ(documents/environment.md Phase4)。Q4の決定に従い、
 ;;; make-environment等は特殊形式ではなく通常のLisp関数として実装する。名前(第一引数)は
@@ -1114,3 +1330,8 @@
         (%%destroy-environment-reclaim env)
         (%%set-dynamic '*environments* (%environment-remove env (dynamic *environments*)))
         t)))
+
+;;; JIT生成コードの逆アセンブラ((disassemble 'fib))。
+;;; init.lispが定義するwhile/formatに依存するため、最後にloadする。
+;;; 実体のデコーダはsrc/c/disasm.c(documents/disasm-backend-decision.md)。
+(load "src/lisp/disassemble.lisp")

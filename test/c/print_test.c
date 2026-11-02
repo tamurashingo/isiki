@@ -235,6 +235,78 @@ void test_os_print_float_small_fixed_point() {
     assert(strcmp(captured(), "0.001") == 0, "0.001程度のfloatは固定小数点表記で表示される");
 }
 
+/* --- single-float と *read-default-float-format* に応じた接尾辞 (Phase 4a) ---
+   このテストバイナリでも os_set_dynamic で動的変数を直接置けば
+   os_read_default_float_format_is_single が効く。
+   置かない間はC側のフォールバック(double-float)なので、上のdouble側の
+   テストは接尾辞なしのまま通る。 */
+
+/** *read-default-float-format* を設定する(この節のテスト専用) */
+static void set_default_float_format(const char *class_name) {
+    os_set_dynamic(os_make_symbol("*READ-DEFAULT-FLOAT-FORMAT*"), os_make_symbol(class_name));
+}
+
+void test_os_print_single_float_matches_default_has_no_suffix() {
+    set_default_float_format("<SINGLE-FLOAT>");
+    reset_capture();
+    os_print(os_make_single_float(1.5f), &g_frame_buffer);
+    assert(strcmp(captured(), "1.5") == 0,
+           "既定が<single-float>ならsingle-floatは接尾辞なしで表示される");
+    set_default_float_format("<DOUBLE-FLOAT>");
+}
+
+void test_os_print_double_float_against_single_default_gets_d_suffix() {
+    set_default_float_format("<SINGLE-FLOAT>");
+    reset_capture();
+    os_print(os_make_float(1.5), &g_frame_buffer);
+    assert(strcmp(captured(), "1.5d0") == 0,
+           "既定が<single-float>ならdouble-floatは\"1.5d0\"と表示される");
+    set_default_float_format("<DOUBLE-FLOAT>");
+}
+
+void test_os_print_single_float_against_double_default_gets_f_suffix() {
+    set_default_float_format("<DOUBLE-FLOAT>");
+    reset_capture();
+    os_print(os_make_single_float(1.5f), &g_frame_buffer);
+    assert(strcmp(captured(), "1.5f0") == 0,
+           "既定が<double-float>ならsingle-floatは\"1.5f0\"と表示される");
+}
+
+void test_os_print_double_float_matches_default_has_no_suffix() {
+    set_default_float_format("<DOUBLE-FLOAT>");
+    reset_capture();
+    os_print(os_make_float(1.5), &g_frame_buffer);
+    assert(strcmp(captured(), "1.5") == 0,
+           "既定が<double-float>ならdouble-floatは接尾辞なしで表示される");
+}
+
+void test_os_print_float_suffix_replaces_exponent_marker() {
+    /* E表記になる値では、接尾辞ではなく**指数マーカーそのもの**が型を表す */
+    set_default_float_format("<SINGLE-FLOAT>");
+    reset_capture();
+    os_print(os_make_float(1.5e20), &g_frame_buffer);
+    assert(strcmp(captured(), "1.5d20") == 0,
+           "E表記のdouble-floatは既定が<single-float>のとき\"1.5d20\"になる");
+
+    set_default_float_format("<DOUBLE-FLOAT>");
+    reset_capture();
+    os_print(os_make_single_float(1.5e20f), &g_frame_buffer);
+    assert(strcmp(captured(), "1.5f20") == 0,
+           "E表記のsingle-floatは既定が<double-float>のとき\"1.5f20\"になる");
+}
+
+void test_os_print_single_float_zero_and_negative() {
+    set_default_float_format("<SINGLE-FLOAT>");
+    reset_capture();
+    os_print(os_make_single_float(0.0f), &g_frame_buffer);
+    assert(strcmp(captured(), "0.0") == 0, "single-floatの0.0は\"0.0\"と表示される");
+
+    reset_capture();
+    os_print(os_make_single_float(-2.5f), &g_frame_buffer);
+    assert(strcmp(captured(), "-2.5") == 0, "負のsingle-float -2.5は\"-2.5\"と表示される");
+    set_default_float_format("<DOUBLE-FLOAT>");
+}
+
 void test_os_print_symbol() {
     reset_capture();
     os_print(os_make_symbol("foo"), &g_frame_buffer);
@@ -347,6 +419,12 @@ int main(int argc, char** argv) {
     test_os_print_float_large_exponent_uses_e_notation();
     test_os_print_float_negative_exponent_uses_e_notation();
     test_os_print_float_small_fixed_point();
+    test_os_print_single_float_matches_default_has_no_suffix();
+    test_os_print_double_float_against_single_default_gets_d_suffix();
+    test_os_print_single_float_against_double_default_gets_f_suffix();
+    test_os_print_double_float_matches_default_has_no_suffix();
+    test_os_print_float_suffix_replaces_exponent_marker();
+    test_os_print_single_float_zero_and_negative();
     test_os_print_symbol();
     test_os_print_string();
     test_os_print_nil();

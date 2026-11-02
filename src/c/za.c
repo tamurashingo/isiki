@@ -110,6 +110,53 @@ lisp_val_t primitive_za_heap_imm_count(lisp_val_t args, lisp_val_t env) {
 /** サポートする+のオペランドの最大個数(同上) */
 #define ZA_MAX_OPERANDS 16
 
+/* [診断] 断念箇所の記録の機構は、**使用箇所より前に置く必要がある**ため
+   フレームレイアウト定数群より前のここに置く。2026-10-04 に容量上限の検査へ
+   計器を広げたとき、za_validate_params(za.c 前方)の検査から呼べずリンクに
+   失敗した。マクロなので前方宣言できない。 */
+/* [性能測定] Phase5 第2部 2-3: JITがコンパイルを断念した位置を観測可能にする。
+   断念は*ok=0を書くだけで黙って進むため、外からは「なぜJIT化されなかったか」が
+   一切分からず切り分けに時間がかかっていた(cc_car/cc_cdrのinline化回帰の調査で
+   実際に問題になった)。直近の断念箇所の行番号を記録し、%%DIAG-ZA-BAIL-LINEで読む */
+static int g_za_bail_line = 0;
+
+/* [GC監査] 断念行を1つしか持たないと、記録されるのは**伝播点**であって起点ではない。
+   実測でza.c:4711(za_compile_body_formsが0を返したときの伝播)しか出なかった。
+   最初のN件を順に残せば、先頭が最も内側 = 起点に近いものになる。
+   なお、計器の追加先は慎重に選ぶこと。za_compile_fold/binary/unaryの`return 0;`は
+   「この特化経路は当てはまらない」という**正常な否定**であって断念ではない。
+   ここへ一括で計器を入れると正常経路を断念として拾う(documents/pitfalls.md 原則6の
+   実例そのもの)。計器を入れてあるのは失敗パスであることを確認済みのものだけである。
+
+   **2026-10-04: 容量上限の検査 30 箇所すべてに広げた**(既存 9 + 追加 21)。
+   なお ZA_MAX_COMPILE_NEST の検査(za_compile_expr 冒頭)には「ZA_BAIL_LINE は
+   この位置ではまだ未定義なので使えない」というコメントが付いていた。この定義を
+   ここ(ファイル先頭)へ移したことでその制約が消え、計器を入れられるようになった。
+   容量上限(`if (x >= ZA_MAX_...) return 0;`)は上の「正常な否定」とは性質が違い、
+   **常に失敗である**(呼び出し元はいずれも `return za_compile_X(...)` で
+   そのまま伝播させており、フォールバックしない — 実際に確認した)。
+   広げる前は 3 つの違う原因(letの幅・letの深さ・3引数比較)がすべて
+   唯一の伝播点(za_try_compile_defunの中の1行)を返していた。
+   documents/jit-frame-survey.md §5。
+   **行番号は1行足すたびに動く。**上限の名前はこのファイルのコメントにあるが、
+   診断が返すのは行番号だけである。対応表は
+   test/lisp/jit_limits_test.lisp が境界テストとして維持する。 */
+#define ZA_BAIL_MAX 24
+static int g_za_bail_lines[ZA_BAIL_MAX];
+static int g_za_bail_count = 0;
+
+/* g_za_bail_countは**打ち切らずに数える**。枠(ZA_BAIL_MAX)を超えた分は保存しないが、
+   countが枠より大きいこと自体が「切り詰めた」印になる。打ち切って数えると
+   count==ZA_BAIL_MAX が「ちょうど24件」と「24件以上」のどちらなのか外から
+   区別できない(実測: 入れ子tagbody 24段/26段/30段がすべて count=24 を返した)。
+   読み出し側(cc_diag_za_bail_at)はZA_BAIL_MAXでも頭打ちにすること — countだけで
+   境界検査すると配列の外を読む。 */
+#define ZA_BAIL_LINE() do { \
+        if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } \
+        if (g_za_bail_count < ZA_BAIL_MAX) { g_za_bail_lines[g_za_bail_count] = __LINE__; } \
+        g_za_bail_count++; \
+    } while (0)
+
 static UINT8 g_jit_code[JIT_CODE_SIZE] __attribute__((aligned(16)));
 static UINT64 g_jit_used = 0;
 /** jit_emit8がg_jit_codeの残り容量を使い切ったことを示すフラグ。立った場合は
@@ -164,6 +211,18 @@ static void jit_emit32(UINT32 v) {
 /** g_jit_code と同じ添字で「このバイトはアドレス即値の一部か」を持つ */
 static UINT8 g_jit_dump_addr_mask[JIT_CODE_SIZE];
 
+/* 同じ添字で「このバイトは **rsp 相対変位(disp32)** の一部か」を持つ。
+ *
+ * **なぜ要るか**: フレーム内の領域を並べ替えると、命令数もバイト長も変わらないが
+ * **変位の値は変わる**(これは並べ替えの定義そのもの)。だから素のハッシュは
+ * 全関数で必ず不一致になり、「並べ替えだけで他は何も変わっていない」ことを
+ * ハッシュの一致では示せない。
+ *
+ * 変位を伏せたハッシュなら、**並べ替えでは一致し、それ以外の変更では落ちる**。
+ * 位置の判定は値ではなく**出力した場所**で行う(jit_emit_rsp_disp32 が印をつける)。
+ * フレーム内の番地参照は例外なくこの 1 つの出口を通るので、これで漏れない。 */
+static UINT8 g_jit_dump_disp_mask[JIT_CODE_SIZE];
+
 static int jit_dump_value_is_address(UINT64 v) {
     UINT64 untagged = v & ~(UINT64)TAG_MASK;
     return untagged >= JIT_DUMP_ADDR_FLOOR && untagged < JIT_DUMP_ADDR_CEILING;
@@ -185,9 +244,93 @@ static void jit_emit64(UINT64 v) {
 #endif
 }
 
+/* ---- 64bit即値の materialize ----------------------------------------------
+   movabs(REX.W + B8+rd + imm64)は常に10byte。一方 mov r32, imm32(B8+rd + imm32、
+   REXは上位レジスタのときだけ)は5〜6byteで、**書き込み時に上位32bitがゼロ拡張される**
+   ので、値が2^32未満なら完全に等価である。
+
+   実測(documents/jit-immediate-operands.md): JITが即値で焼くもの——nil(g_nil_cell)、
+   カーネル関数のアドレス、.bss上のスロットアドレス——はすべてカーネルイメージか
+   その.bssにあり、**RAMを8GBに増やしてもアドレスは3,036MB止まりで4GBを超えない**
+   (QEMUのPCIホールで低位RAMが約3GBに制限され、UEFIはそこへロードするため)。
+   4GB超のRAMではGCヒープだけが4GBを超えるが、**GCヒープのアドレスは設計上焼かない**
+   (移動するため。za_classify_operandを参照)。
+
+   したがって短い形がほぼ常に効くが、**収まらない場合は必ずmovabsへフォールバックする**。
+   判定はJIT時に実アドレスが分かっているので値を見るだけでよい。
+
+   [重要] jit_movabs_self_refはこの短縮を使ってはならない(後から即値を8byte書き換える
+   前提で patch_offset = g_jit_used + 2 を記録しているため)。専用に
+   jit_movabs_reg_full を使う。 */
+
+/* ---- 即値の発行位置の記録(原則8の監査用)--------------------------------
+   「生成コードにGCヒープのアドレスが焼かれていないか」をza_try_compile_defunの末尾で
+   確認している。以前は生成コードをバイト走査して movabs(10byte)のパターンを探して
+   いたが、短縮形 mov r32, imm32 は **先頭1byteが0xB8〜0xBF というだけ**なので、
+   バイト走査に足すと他の命令の途中に大量に誤マッチする(実測: RAM 4GBの構成で
+   GCヒープ範囲が広いため247件の誤検出)。
+
+   そこで**発行した時点で位置と幅を記録する**。デコードが要らないので誤検出がゼロになり、
+   短縮形も漏れなく拾える。 */
+#define ZA_MAX_IMM_SITES 4096
+static UINT64 g_za_imm_site_off[ZA_MAX_IMM_SITES];  /* g_jit_code内の即値フィールド先頭 */
+static UINT8  g_za_imm_site_width[ZA_MAX_IMM_SITES];/* 4 or 8 */
+static UINT64 g_za_imm_site_count = 0;
+/** 記録しきれなかった件数。0でなければ監査は「不完全」である */
+static UINT64 g_za_imm_site_overflow = 0;
+
+static void za_record_imm_site(UINT64 field_off, UINT8 width) {
+    if (g_za_imm_site_count < ZA_MAX_IMM_SITES) {
+        g_za_imm_site_off[g_za_imm_site_count] = field_off;
+        g_za_imm_site_width[g_za_imm_site_count] = width;
+        g_za_imm_site_count++;
+    } else {
+        g_za_imm_site_overflow++;
+    }
+}
+
+/** movabs reg, imm64。**常に10byte**。あとから即値を書き換える箇所専用 */
+static void jit_movabs_reg_full(UINT8 reg, UINT64 imm) {
+    jit_emit8((UINT8)(0x48 | ((reg >> 3) & 1)));
+    jit_emit8((UINT8)(0xB8 | (reg & 7)));
+    za_record_imm_site(g_jit_used, 8);
+    jit_emit64(imm);
+}
+
+#ifdef ISIKIOS_PINNED_NIL
+/* [実験] nil を r12 常駐にする場合に jit_load_imm_reg が使う。実体は下方 */
+#define ZA_PINNED_NIL_REG 12
+static void jit_mov_reg_reg(UINT8 dst, UINT8 src);
+#endif
+
+/** 値をregへ置く。2^32未満なら mov r32, imm32(5〜6byte)、そうでなければ movabs(10byte) */
+static void jit_load_imm_reg(UINT8 reg, UINT64 imm) {
+#ifdef ISIKIOS_PINNED_NIL
+    /* [実験] nil を r12 常駐にした場合の比較用(documents/bench-pinned-nil.md)。
+       **これは実装ではなく計測のための仕掛けである。** 全経路の r12 保存対応
+       (spawn の regs[3] 仕込み、診断プローブの移設)はしていないので、
+       -ffixed-r12 でビルドしたときにしか成立しない。
+       mov r64, r64 は 3 byte で、mov r32, imm32 の 5 byte より短い */
+    if (imm == nil && reg != ZA_PINNED_NIL_REG) {
+        jit_mov_reg_reg(reg, ZA_PINNED_NIL_REG);
+        return;
+    }
+#endif
+    if (imm <= 0xFFFFFFFFULL) {
+        if (reg >= 8) {
+            jit_emit8(0x41);            /* REX.B。REX.Wは付けない(ゼロ拡張させる) */
+        }
+        jit_emit8((UINT8)(0xB8 | (reg & 7)));
+        za_record_imm_site(g_jit_used, 4);
+        jit_emit32((UINT32)imm);
+        return;
+    }
+    jit_movabs_reg_full(reg, imm);
+}
+
 // 手書き用の命令
-static void jit_movabs_rax(UINT64 imm) { jit_emit8(0x48); jit_emit8(0xB8); jit_emit64(imm); }
-static void jit_movabs_r11(UINT64 imm) { jit_emit8(0x49); jit_emit8(0xBB); jit_emit64(imm); }
+static void jit_movabs_rax(UINT64 imm) { jit_load_imm_reg(0, imm); }
+static void jit_movabs_r11(UINT64 imm) { jit_load_imm_reg(11, imm); }
 
 static void jit_push_rbx(void) { jit_emit8(0x53); }
 static void jit_pop_rbx(void) { jit_emit8(0x5B); }
@@ -254,12 +397,23 @@ static void jit_cmp_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x39, ds
 /** test dst, src (dst&srcのフラグのみ、"test r/m64, r64"opcode0x85) */
 static void jit_test_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x85, dst, src); }
 
-/** movabs reg, imm64 (任意レジスタ版。既存のjit_movabs_rax/r11の一般化) */
-static void jit_movabs_reg(UINT8 reg, UINT64 imm) {
-    UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
+/** cmove dst, src (ZFが立っていればsrcをdstへ。"cmovcc r64, r/m64"はREX.W + 0F 4x /r)。
+ * jit_emit_reg_reg_opが使っている0x89系は reg=src / rm=dst だが、cmovccは
+ * **reg=dst / rm=src で向きが逆**なので個別に組む。
+ * 分岐を出さずに真偽値を選ぶために使う(documents/inline-builtin.md)。 */
+static void jit_cmove_reg_reg(UINT8 dst, UINT8 src) {
+    UINT8 rex = (UINT8)(0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
     jit_emit8(rex);
-    jit_emit8((UINT8)(0xB8 | (reg & 7)));
-    jit_emit64(imm);
+    jit_emit8(0x0F);
+    jit_emit8(0x44);
+    jit_emit8((UINT8)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+
+/** 値をregへ置く(任意レジスタ版)。収まれば mov r32, imm32 へ短縮する。
+ * 名前は歴史的経緯でmovabsのままだが、常にmovabsを出すわけではない
+ * (書き換え前提の箇所は jit_movabs_reg_full を使うこと) */
+static void jit_movabs_reg(UINT8 reg, UINT64 imm) {
+    jit_load_imm_reg(reg, imm);
 }
 
 /** g_jit_code内の自己参照movabs(g_jit_code+offset形式の即値)の最大記録数。
@@ -288,6 +442,37 @@ static UINT32 g_jit_reloc_count = 0;
 #define ZA_MAX_TRAMPOLINE_JMPS 128
 static UINT64 g_jit_trampoline_jmp_patch_offsets[ZA_MAX_TRAMPOLINE_JMPS];
 static UINT32 g_jit_trampoline_jmp_count = 0;
+
+/* ===== [案 d 第 3 段] フレームの寸法を関数ごとの実寸にする ==========================
+ *
+ * **寸法は「この関数が触りうる最も高い位置」である。**
+ * フレーム内の番地参照は例外なく 3 つの入口(za_load_slot / za_store_slot /
+ * za_addr_of_slot)を通り、3 つとも jit_emit_rsp_disp32 へ合流する。だからそこで
+ * 変位の最大値を数えれば、**領域ごとの特別扱いも「どの機能を使ったか」の判定も要らない**
+ * (let / 一般呼び出し / 制御転送の領域も、使った深さのぶんだけ自動で縮む)。
+ * 3 入口以外から [rsp+disp] を出す経路が無いことは
+ * tools/check_frame_access_entries.py が見ている(**これが破れると水位に穴が開く**)。
+ *
+ * **入口で寸法は分からない。** プロローグは本体より前に出るので、確保の即値は
+ * 後から埋める。本体の途中に出る末尾呼び出しの解体も同じ。出口は本体より後なので
+ * その時点では確定しているが、**扱いを揃えるため同じ仕組みで埋める**。
+ *
+ * 上限は**導出する**。末尾呼び出し 1 件は共有スタブへの飛び越しを必ず 1 つ出すので、
+ * 末尾呼び出しの件数は ZA_MAX_TRAMPOLINE_JMPS で抑えられる。1 件につき解体を 2 つ
+ * (高速 path と fallback)出し、ほかに入口の確保が最大 2、出口の解体が最大 2
+ * (通常 + 引数個数エラー側の写し)。
+ * **固定値(128)を書いてはいけない**: 末尾呼び出しが 64 件を超える関数が
+ * 静かに機械語化されなくなる(= 黙って遅くなる)。実コードでの最大は 48 だが、
+ * 上限は構造から導く。 */
+#define ZA_MAX_FRAME_PATCHES (2 * ZA_MAX_TRAMPOLINE_JMPS + 4)
+
+/** この関数が触りうる最も高い位置(byte)。jit_emit_rsp_disp32 が更新する */
+static UINT32 g_za_frame_hwm = 0;
+/** 寸法の即値フィールドの位置(g_jit_code 内の絶対オフセット) */
+static UINT64 g_za_frame_patch_offsets[ZA_MAX_FRAME_PATCHES];
+static UINT32 g_za_frame_patch_count = 0;
+/** 寸法の即値を埋めずに出力してしまった数(あってはならない。0 でなければ生成を捨てる) */
+static UINT32 g_za_frame_patch_overflow = 0;
 
 /** 1回のza_try_compile_defun呼び出し(1defunのコンパイル試行)で、g_za_quote_slots/
  * g_za_number_slots/g_za_lambda_slots(いずれかのプール)から確保したスロットの
@@ -329,7 +514,9 @@ static void jit_movabs_self_ref(UINT8 reg, UINT64 target_off) {
     } else {
         g_jit_overflow = 1;
     }
-    jit_movabs_reg(reg, (UINT64)(void *)(g_jit_code + target_off));
+    /* [重要] 短縮してはならない。上で記録した patch_offset(= g_jit_used + 2)へ
+       za_try_compile_defunが後から8byteを書き込むため、命令長が変わると壊れる */
+    jit_movabs_reg_full(reg, (UINT64)(void *)(g_jit_code + target_off));
 }
 
 /** and reg, imm8 (符号拡張、"and r/m64, imm8"opcode0x83 /4でエンコード) */
@@ -338,6 +525,60 @@ static void jit_and_reg_imm8(UINT8 reg, UINT8 imm8) {
     jit_emit8(rex);
     jit_emit8(0x83);
     jit_emit8((UINT8)(0xC0 | (4 << 3) | (reg & 7)));
+    jit_emit8(imm8);
+}
+
+
+/** test eax, eax (2byte、REXなし)。"os_is_control_transferの戻り値が0か"のような
+ *  int(32bit)の真偽判定専用。`mov r11d, 0` + `cmp rax, r11`(2命令9byte)の置き換えで、
+ *  MS x64 ABIではintの戻り値はeaxにあり上位32bitは未定義なので32bitで見るのが正しい。 */
+static void jit_test_eax_eax(void) {
+    jit_emit8(0x85);
+    jit_emit8(0xC0);
+}
+
+/** [実験] プロローグで r12 へ nil を載せる(ISIKIOS_PINNED_NIL のときだけ)。
+ * mov r12d, imm32 を直接出す(jit_load_imm_reg を通すと nil→r12 の置換で
+ * mov r12,r12 になってしまうため)。
+ * **-ffixed-r12 でビルドすることが前提。** そうでなければ C 側が r12 を使うので
+ * 壊れる(documents/jit-pinned-register.md)。gcc が r12 を使わないなら
+ * JIT が壊しても C に影響しないので、保存・復元は要らない。 */
+static void za_emit_pin_nil(void) {
+#ifdef ISIKIOS_PINNED_NIL
+    jit_emit8(0x41);                 /* REX.B */
+    jit_emit8(0xB8 | (ZA_REG_R12 & 7));
+    jit_emit32((UINT32)nil);
+#endif
+}
+
+/* 実体は下方。za_emit_cmp_rax_nil がこの順序より前に使うため前方宣言する */
+static void jit_cmp_rax_r11(void);
+
+/** rax と nil を比較する(フラグだけを立てる)。
+ * 通常は mov r11, nil(5byte)+ cmp rax, r11(3byte)の2命令。
+ * [実験] ISIKIOS_PINNED_NIL では cmp rax, r12 の1命令(3byte)になる。
+ * **命令数が 2 → 1 に減るのはここだけで、速度差が出るとすればこの形である。** */
+static void za_emit_cmp_rax_nil(void) {
+#ifdef ISIKIOS_PINNED_NIL
+    jit_cmp_reg_reg(ZA_REG_RAX, ZA_PINNED_NIL_REG);
+#else
+    /* [注意] ここを「jit_movabs_reg(R11, nil); jit_cmp_rax_r11();」の形で書くと、
+       呼び出し側をこの関数へ機械的に置換したときに**自分自身も置換されて無限再帰**する。
+       実際に一度やってしまい、ビルドA(ISIKIOS_PINNED_NIL 無し)だけがスタック溢れで
+       落ちた(ビルドBは#ifdef側が選ばれるので露見しなかった)。
+       jit_load_imm_reg を直接呼ぶ形にして、パターンが一致しないようにしてある。 */
+    jit_load_imm_reg(ZA_REG_R11, nil);
+    jit_cmp_rax_r11();
+#endif
+}
+
+/** cmp reg, imm8 (符号拡張、"cmp r/m64, imm8"opcode0x83 /7でエンコード)。
+ * jit_and_reg_imm8と同じ0x83グループで、/digitだけが違う */
+static void jit_cmp_reg_imm8(UINT8 reg, UINT8 imm8) {
+    UINT8 rex = (UINT8)(0x48 | ((reg >> 3) & 1));
+    jit_emit8(rex);
+    jit_emit8(0x83);
+    jit_emit8((UINT8)(0xC0 | (7 << 3) | (reg & 7)));
     jit_emit8(imm8);
 }
 
@@ -361,7 +602,22 @@ static void jit_emit_rsp_disp32(UINT8 opcode, UINT8 reg, INT32 disp32) {
     jit_emit8(opcode);
     jit_emit8((UINT8)(0x80 | ((reg & 7) << 3) | 0x04));
     jit_emit8(0x24);
+    /* [案 d 第 3 段] **ここが最高水位を数える唯一の場所である。**
+       フレーム内の番地参照は 3 つの入口を通って必ずここへ合流する。
+       読み書きは 8 byte 単位なので、触る最も高い位置は disp32 + 8。 */
+    if (disp32 >= 0 && (UINT32)disp32 + 8 > g_za_frame_hwm) {
+        g_za_frame_hwm = (UINT32)disp32 + 8;
+    }
+#ifdef ISIKIOS_JIT_DUMP
+    UINT64 disp_start = g_jit_used;
+#endif
     jit_emit32((UINT32)disp32);
+#ifdef ISIKIOS_JIT_DUMP
+    /* 並べ替えで値だけが変わる 4 byte。伏せたハッシュのために印をつける */
+    for (UINT64 i = disp_start; i < g_jit_used && i < JIT_CODE_SIZE; i++) {
+        g_jit_dump_disp_mask[i] = 1;
+    }
+#endif
 }
 
 static void jit_lea_reg_rsp(UINT8 reg, INT32 disp32) { jit_emit_rsp_disp32(0x8D, reg, disp32); }
@@ -432,6 +688,38 @@ static UINT64 jit_emit_jne_rel32_placeholder(void) {
     UINT64 offset = g_jit_used;
     jit_emit32(0);
     return offset;
+}
+
+/**
+ * jne rel8(1byte変位)のプレースホルダ。**着地点までの距離が構造的に127byte以内だと
+ * 言い切れる短い前方ジャンプにだけ使うこと。** 距離が可変な(=式のコンパイル結果を
+ * 跨ぐ)ジャンプには使ってはならない。
+ * 使い方はjit_emit_jne_rel32_placeholderと同じで、jit_patch_rel8でpatchする。
+ */
+static UINT64 jit_emit_jne_rel8_placeholder(void) {
+    jit_emit8(0x75);
+    UINT64 offset = g_jit_used;
+    jit_emit8(0);
+    return offset;
+}
+
+/**
+ * patch_offsetにある1バイトのrel8フィールドへ現在位置までの相対距離を書き込む。
+ * **届かない場合はg_jit_overflowを立てる。** そうするとza_try_compile_defunが
+ * この関数のコンパイルを丸ごとロールバックしてインタプリタへフォールバックする
+ * (既存のグレースフル・フォールバックに乗せる)。黙って壊れたjmpを残さないための保険で、
+ * 呼び出し元が距離を固定している限り実際には発火しない。
+ */
+static void jit_patch_rel8(UINT64 patch_offset) {
+    if (g_jit_overflow || patch_offset + 1 > JIT_CODE_SIZE) {
+        return;
+    }
+    INT64 rel = (INT64)g_jit_used - (INT64)(patch_offset + 1);
+    if (rel < -128 || rel > 127) {
+        g_jit_overflow = 1;
+        return;
+    }
+    g_jit_code[patch_offset] = (UINT8)((UINT64)rel & 0xFF);
 }
 
 /** js rel32(サインフラグ=1)のプレースホルダ。jit_emit_je_rel32_placeholderと同様 */
@@ -508,28 +796,57 @@ static void jit_serialize_icache(void) {
 
 /**
  * 制御転送チェック&早期脱出パターン(拡張5: block/return-from/catch/throw/tagbody)。
- * raxに評価済みの値がある状態で呼ぶ: os_is_control_transfer(rax)(eval.h:82、
+ * raxに評価済みの値がある状態で呼ぶ: os_is_control_transfer(rax)(eval.h、
  * TAG_INSTANCE+MAGIC_BLOCK_EXIT/MAGIC_CATCH_EXIT/MAGIC_GO_EXITのいずれかを判定する
- * ヒープ確保無しの単純な比較)を呼び出し、
- *  - 制御転送でなければraxを元の値に復元してフォールスルーする。
- *  - 制御転送であればraxを元の値に復元した上でプレースホルダjmpを発行し、そのオフセット
+ * ヒープ確保無しの単純な比較)と**同一の判定**を行い、
+ *  - 制御転送でなければraxを元の値のままフォールスルーする。
+ *  - 制御転送であればraxを元の値に復元した上でプレースホルダjneを発行し、そのオフセット
  *    を返す(呼び出し元がjit_patch_rel32/jit_patch_rel32_targetで伝播先へpatchする)。
- * os_is_control_transferはヒープ確保を一切しないため、呼び出し前後でr13へ元の値を
- * 退避するだけで安全(GCによる再配置を心配しなくてよい)。
+ *
+ * [改善B-α] **タグ判定を生成コードへインライン展開し、大多数の値でcallを回避する。**
+ * 制御転送値は3種(BLOCK_EXIT/CATCH_EXIT/GO_EXIT)ともTAG_INSTANCEのヒープオブジェクト
+ * なので、**タグがTAG_INSTANCEでなければその時点で「制御転送でない」が確定する**。
+ * fixnum/cons/symbol/string等はここで4命令で抜けられる。
+ *
+ *   旧: 常にcall。通常経路で16命令(JIT側10 + 呼び先6)/ 49byte
+ *   新: 通常経路は4命令 / 47byte。TAG_INSTANCEのときだけ従来どおりcallする
+ *
+ * 3つのmagic比較まではインライン展開しない。os_is_control_transferの実体は
+ * lea/cmp/setbe/sete/orで分岐無しに書かれており、同じ形をJITで出すのは手間の割に
+ * 効果が薄い(TAG_INSTANCE自体が稀なため)。
+ *
+ * [レジスタ] タグ判定にrdxを使う。**この関数は従来から無条件にcallを発行しており、
+ * MS x64 ABIでrdxはvolatile(呼び出しで破壊される)なので、呼び出し元がこの
+ * ヘルパーを跨いでrdxを生かしているケースは元から存在しない。** 破壊するレジスタの
+ * 集合は従来と同じか、早期脱出経路ではむしろ小さくなる(rcx/r8/r9/r10/r11を壊さない)。
+ *
+ * [GC安全性] 早期脱出経路はcallを一切発行しないので退避も不要(raxはそのまま)。
+ * call経路は従来どおりr13へ退避する。os_is_control_transferはヒープ確保を一切
+ * しないため、これでGC安全(GCによる再配置を心配しなくてよい)。
+ *
+ * [フラグ] `test eax, eax`の後にraxを復元してからjneする。movはフラグを変えないので
+ * 順序を入れ替えても判定は変わらず、`mov rax, r13`とjmpを1組ずつ減らせる。
  */
 static UINT64 za_emit_ct_check_and_jmp_if_transfer(void) {
+    /* 早期脱出: タグがTAG_INSTANCEでなければ制御転送ではありえない */
+    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RAX);
+    jit_and_reg_imm8(ZA_REG_RDX, (UINT8)TAG_MASK);
+    jit_cmp_reg_imm8(ZA_REG_RDX, (UINT8)TAG_INSTANCE);
+    /* 着地点はこの関数の末尾で固定(下の命令列の合計byte数ぶんだけ先)なので、
+       距離は常にrel8に収まる。万一収まらなければjit_patch_rel8がg_jit_overflowを
+       立ててコンパイル全体をロールバックする */
+    UINT64 jne_not_instance = jit_emit_jne_rel8_placeholder();
+
     jit_mov_rcx_rax();
     jit_mov_r13_rax();
     jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_is_control_transfer);
     jit_call_r11();
-    jit_movabs_r11(0);
-    jit_cmp_rax_r11();
-    UINT64 je_not_transfer = jit_emit_je_rel32_placeholder();
-    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
-    UINT64 jmp_transfer = jit_emit_jmp_rel32_placeholder();
-    jit_patch_rel32(je_not_transfer);
-    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
-    return jmp_transfer;
+    jit_test_eax_eax();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);   /* movはフラグを変えない */
+    UINT64 jne_transfer = jit_emit_jne_rel32_placeholder();
+
+    jit_patch_rel8(jne_not_instance);
+    return jne_transfer;
 }
 
 /** src_reg(TAG_INSTANCEでタグ付けされた値)のタグを外した実アドレスをdst_regへ計算する
@@ -556,7 +873,8 @@ static int za_is_bignum_literal(lisp_val_t val) {
 }
 
 /**
- * is_literal: 0=paramsのidx番目を参照、1=fixnum即値(literalをそのままmovabs)、
+ * is_literal: 0=paramsのidx番目を参照、1=即値(fixnum/char/single-float。
+ *             literalをそのままmovabs)、
  * 2=quoteシンボル(literalは現在のタグ付きシンボル値だが、GCで移動しうるため
  * emit時はmovabsで直接埋め込まず名前から再解決する。za_emit_operand参照)、
  * 3=&restパラメータそのものへの参照(param_indexはcdrする回数=fixed_countを保持する。
@@ -680,7 +998,11 @@ static int za_classify_quoted_value(lisp_val_t quoted, za_operand_t *out) {
         out->literal = quoted;
         return 1;
     }
-    if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM || (quoted & TAG_MASK) == TAG_CHAR) {
+    /* [float契約] single-floatもタグ0x4の即値なので、fixnum/charと同じく
+       movabsで直接埋め込める。GCが動かさないのでスロットもルート登録も要らない
+       (os_tag_is_heap_refが偽なので、defun末尾の焼き込み監査も通る) */
+    if (quoted == nil || (quoted & TAG_MASK) == TAG_FIXNUM ||
+        (quoted & TAG_MASK) == TAG_CHAR || (quoted & TAG_MASK) == TAG_SINGLE_FLOAT) {
         out->is_literal = 1;
         out->literal = quoted;
         return 1;
@@ -723,8 +1045,21 @@ typedef enum za_var_kind {
 typedef struct za_local_var {
     lisp_val_t sym;
     UINT32 val_off;
-    za_var_kind_t kind;
+    /* [Phase 4a-2] kindはza_var_kind_t(値は0/1の2つだけ)だが、UINT16として持つ。
+       enumのまま4byte使うと、直後のdecl_typeを足した時点で構造体が16→24byteへ
+       太り、za_local_scope_tが1段あたり32byte増える(ZA_MAX_LET_DEPTH=16段で+512byte)。
+       UINT16へ落とせば型宣言を1byte足しても16byteのままで、**増加量は0**になる
+       (documents/declare-types.md §3の測定)。 */
+    UINT16 kind;
+    /** (declare (type ...)) で宣言された型の符号(os_decl_types_t参照)。
+        本Phaseではコード生成に使わず、記録するだけ */
+    UINT8 decl_type;
+    UINT8 _pad;
 } za_local_var_t;
+
+/* 型宣言のフィールドを足しても1変数16byteのままであること(上のコメントの前提) */
+_Static_assert(sizeof(za_local_var_t) == 16,
+               "za_local_var_t grew past 16 bytes: za_local_scope_t cost changed");
 
 /** let-IIFEインライン化(拡張B)のネスト深さ・1letあたりの変数数の上限
  * (ZA_MAX_NLX_DEPTH等と同じ考え方の実装上の固定上限)。za_local_scope_tが
@@ -871,6 +1206,7 @@ static int za_validate_params(lisp_val_t params, UINT64 *out_fixed_count) {
         }
         count++;
         if (count > ZA_MAX_PARAMS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_PARAMS */
             return 0;
         }
     }
@@ -909,12 +1245,25 @@ static int za_local_lookup(const za_local_scope_t *locals, lisp_val_t sym, UINT3
         for (UINT64 i = 0; i < s->count; i++) {
             if (s->vars[i].sym == sym) {
                 *out_val_off = s->vars[i].val_off;
-                *out_kind = s->vars[i].kind;
+                *out_kind = (za_var_kind_t)s->vars[i].kind;
                 return 1;
             }
         }
     }
     return 0;
+}
+
+/** let 束縛変数に (declare (type ...)) で宣言された型の符号を引く。
+ *  見つからなければ OS_DECL_TYPE_NONE。 */
+static UINT8 za_local_decl_type(const za_local_scope_t *locals, lisp_val_t sym) {
+    for (const za_local_scope_t *s = locals; s != 0; s = s->parent) {
+        for (UINT64 i = 0; i < s->count; i++) {
+            if (s->vars[i].sym == sym) {
+                return s->vars[i].decl_type;
+            }
+        }
+    }
+    return OS_DECL_TYPE_NONE;
 }
 
 /**
@@ -938,6 +1287,17 @@ static int za_classify_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_
     // (quoteされたcharケースは既に上のquote分岐(is_literal=1、nil/fixnum/charの
     // 即値判定)で対応済み)。
     if ((form & TAG_MASK) == TAG_CHAR) {
+        out->is_literal = 1;
+        out->literal = form;
+        return 1;
+    }
+    // [float契約] 裸のsingle-floatリテラル。charと同じ理由でmovabsに埋め込める。
+    // **ここが無いとza_classify_operandが0を返し、single-floatリテラルを含む
+    // defunがまるごとJITコンパイルを諦める。** そうなるとインタプリタ経路
+    // (引数ごとにconsを作る)を通るので、single即値化の意味が無くなる
+    // (実測: JITに乗らないと128 byte/回、乗ると0 byte/回)。
+    // doubleはTAG_INSTANCEでGCが動かすので、下のスロット方式のままにする。
+    if ((form & TAG_MASK) == TAG_SINGLE_FLOAT) {
         out->is_literal = 1;
         out->literal = form;
         return 1;
@@ -1067,6 +1427,13 @@ typedef struct {
     lisp_val_t gt;      /* ">" */
     lisp_val_t le;      /* "<=" */
     lisp_val_t ge;      /* ">=" */
+    lisp_val_t ne;      /* "/=" (二項版はPR #86で追加。それ以前は一般呼び出しへ落ちていた) */
+    lisp_val_t slash;   /* "/" (ISLispに / は無く、quotient の実装が内部で使う経路) */
+    /* [inline] (%%inline-here) はコンパイル時に畳む組み込み。**そのフォームが
+       置かれたレキシカルスコープで効いている inline ビット**を fixnum の即値として
+       返す。let の内側の declare が届いているかをテストから読むために置いた
+       (%%INLINE-OF は関数単位までしか見えない。documents/inline-arith.md §7-3) */
+    lisp_val_t inline_here;
     lisp_val_t eqp;     /* "EQ" (ポインタ同一性比較) */
     lisp_val_t nullsym; /* "NULL" */
     lisp_val_t atom;    /* "ATOM" */
@@ -1098,7 +1465,7 @@ typedef struct {
    ではないので、stale領域を読まないからである。
    配列とみなして一括linkするため、平坦であることを機械的に保証しておく。 */
 #define ZA_SYMS_FIELD_COUNT (sizeof(za_syms_t) / sizeof(lisp_val_t))
-_Static_assert(sizeof(za_syms_t) == 25 * sizeof(lisp_val_t),
+_Static_assert(sizeof(za_syms_t) == 28 * sizeof(lisp_val_t),
                "za_syms_tはlisp_val_tだけの平坦な構造体でなければならない"
                "(フィールドを増減したらこの数も更新すること)");
 
@@ -1320,8 +1687,11 @@ static void za_gc_unlink_node(gc_rootnode *node) {
  * 深さ指定スロット配列。同時に生きているspanningスロットは常に1本のスタック
  * として積み重なるため、種類を問わず同じ配列を使い回す。 */
 /* blockも(生きているblockリストの退避先として)1段消費するようになったため、
- * 4から8へ拡張した。168 + 8*24 = 360 で、直後の未使用領域(272-655)に収まる
- * (他オフセットは無変更)。 */
+ * 4から8へ拡張した。168 + 8*24 = 360 で、直後の未使用領域に収まる
+ * (他オフセットは無変更)。
+ * [2026-10-30 注・原則12] ここは「未使用領域(272-655)」と書いていた。**拡張時点の
+ * 数字である。** 伸ばした結果、その未使用領域の開始は272ではなく360になった
+ * (下のZA_ARG_SLOT_SIZE付近の訂正と documents/jit-frame-survey.md §2-2 を見ること)。 */
 #define ZA_MAX_NLX_DEPTH       8
 #define ZA_OFF_NLX_BASE        168
 /* コンパイル中の各nlx段が`block`(NLXスロットを使わず、live_blocksのpush/popだけを
@@ -1330,8 +1700,14 @@ static void za_gc_unlink_node(gc_rootnode *node) {
 static UINT64 g_za_block_level_mask = 0;
 #define ZA_NLX_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
 /* 旧ZA_OFF_ARG_BASE(=272)〜656手前は拡張15でdepth化スロット(ZA_OFF_CALL_BASE配下)へ
- * 移動した。この272-655は未使用のまま残る(ZA_OFF_LOCAL_BASE=656より前の他オフセットは
- * 無変更)。ZA_ARG_SLOT_SIZEは新しいdepth化スロットのサイズ計算にも引き続き使う。 */
+ * 移動した。この範囲は未使用のまま残る(ZA_OFF_LOCAL_BASE=656より前の他オフセットは
+ * 無変更)。ZA_ARG_SLOT_SIZEは新しいdepth化スロットのサイズ計算にも引き続き使う。
+ *
+ * [2026-10-30 訂正・原則12] このコメントは未使用の範囲を「272-655」と書いていた。
+ * **272はZA_MAX_NLX_DEPTHが4だった時代の数字である。** 8になってNLX領域が
+ * 168 + 8*24 = 360 まで伸びたので、**いま空いているのは360-655の296byte。**
+ * documents/jit-frame-survey.md §2-2・§8-6が訂正済みで、そちらが正。
+ * 死んでいる領域はこの296だけではない(合計376byte。同 §9)。 */
 #define ZA_ARG_SLOT_SIZE       24   /* 値8バイト+gc_rootnode16バイト */
 /* let-IIFEインライン化(拡張B): let-localの値+gc_rootnodeのスロット領域。
  * ネスト深さ×1letあたりの変数数で固定サイズを確保し、兄弟let同士(ネストして
@@ -1347,8 +1723,15 @@ static UINT64 g_za_block_level_mask = 0;
  * 前提が無いため、ZA_OFF_NLX_BASEと同じ深さごとの配列にする)。 */
 /* 拡張12でZA_MAX_LET_DEPTHを4から8へ拡張した際、べた書きの数値
  * (旧: 1040 = 656 + 4*4*24、1072 = 1040 + 4*8)を手計算し直す必要が
- * あるのはミスの元なので、ZA_MAX_LET_DEPTH経由の計算式に変更した
- * (656 + 8*4*24 = 1424、1424 + 8*8 = 1488、いずれも16バイト境界を保つ)。 */
+ * あるのはミスの元なので、ZA_MAX_LET_DEPTH経由の計算式に変更した。
+ *
+ * [2026-10-30 訂正・原則12] このコメントは「656 + 8*4*24 = 1424、1424 + 8*8 = 1488」と
+ * **ZA_MAX_LET_DEPTHが8であるかのように**書いていた。その後16へ引き上げられている
+ * (4→8が拡張12、8→16が後続。documents/jit-frame-survey.md §2-3の履歴表)ので、
+ * **実体は 656 + 16*4*24 = 2192、2192 + 16*8 = 2320** である。
+ * **この括弧の数字は計算式の例示であって拘束ではない** — 定数を変えたら動く。
+ * 当たっているかはtools/jit_frame_breakdown.pyで出すこと(手計算しない)。
+ * いずれの値も16バイト境界を保つ(4*24=96も16*4*24=1536も16の倍数)。 */
 #define ZA_OFF_LET_SAVED_HEAD_BASE \
     (ZA_OFF_LOCAL_BASE + ZA_MAX_LET_DEPTH * ZA_MAX_LOCALS_PER_LET * ZA_LOCAL_SLOT_SIZE)
 /* 拡張15(引数位置での一般呼び出しネスト対応): 一般呼び出し1件ごとのCALL_SAVED_HEAD+
@@ -1358,7 +1741,8 @@ static UINT64 g_za_block_level_mask = 0;
  * 引数スロットは内側呼び出しの実行中も生き続ける必要があり、単一スロットでは
  * 内側が同じ番地を上書きしてしまう(ZA_OFF_FN_VAL/ZA_OFF_ACC_VALは呼び出し引数loopが
  * 完全に終わった後にしか書き込まれないため、こちらは単一スロットのままで安全)。 */
-#define ZA_MAX_CALL_DEPTH 4  /* ZA_MAX_NLX_DEPTHと同じ値。392mod16=8のため偶数を保つ */
+#define ZA_MAX_CALL_DEPTH 4  /* ZA_MAX_ARITH_DEPTHと同じ値(ZA_MAX_NLX_DEPTHは8で別物)。
+                               392mod16=8のため偶数を保つ */
 #define ZA_OFF_CALL_BASE (ZA_OFF_LET_SAVED_HEAD_BASE + ZA_MAX_LET_DEPTH * 8)
 #define ZA_CALL_SLOT_SIZE (8 + ZA_MAX_OPERANDS * ZA_ARG_SLOT_SIZE)  /* SAVED_HEAD(8)+引数16本(24*16=384)=392 */
 /* 拡張16(算術/比較/car/cdr/null/atom/eq/consのオペランド位置への複合式ネスト対応):
@@ -1370,7 +1754,66 @@ static UINT64 g_za_block_level_mask = 0;
 #define ZA_OFF_ARITH_BASE (ZA_OFF_CALL_BASE + ZA_MAX_CALL_DEPTH * ZA_CALL_SLOT_SIZE)
 #define ZA_ARITH_SLOT_SIZE 24  /* 値8バイト+gc_rootnode16バイト */
 /* 4*24=96は元から16の倍数なので、ZA_MAX_CALL_DEPTHのように偶数に揃える特別な配慮は不要。 */
-#define ZA_OFF_FLET_BASE (ZA_OFF_ARITH_BASE + ZA_MAX_ARITH_DEPTH * ZA_ARITH_SLOT_SIZE)
+/* ===== [案 d 第 2 段] 可変にしたい領域を最上段へ寄せる並べ替え(2026-10-30) =====
+ *
+ * **寸法は変えない。並び順だけを変える。** 総量(ZA_FRAME_TOTAL)は 7480 のまま。
+ *
+ * 狙い: 寸法を関数ごとの実寸にするとき(第 3 段以降)、**出力時に「参照された
+ * 最も高い位置」を数えて寸法を決める**。だから**まれにしか使われない大きな領域が
+ * 上にあるほど、使わない関数の寸法が小さくなる**。
+ *
+ *   quasiquote   2496 byte … 実コードで 97.5% の関数が使わない
+ *   flet/labels   832 byte … 実コードで 95.7% の関数が使わない(src/lisp では 0/114)
+ *   両方          3328 byte = 総量の 44.5% を 93.2% の関数が 1 byte も使わない
+ *
+ * 2026-10-30 まで、この 2 つの**上**に常用の小領域 128 byte
+ * (setq 退避 32 + パラメータ 80 + r14 退避 16)が乗っていた。
+ * そのままでは「最も高い位置」が常に 128 byte 上に張り付くので、
+ * **使わない 3328 byte を切り落とせない。** そこで 128 byte を下へ動かした。
+ *
+ * **並べ替えが安全な理由(構造的保証)**: フレーム内の番地参照は例外なく 3 つの入口
+ * (za_load_slot / za_store_slot / za_addr_of_slot)を通り、3 つとも幅が固定の
+ * 32 bit 変位で機械語を出す。だから**命令数もバイト長も 1 つも変わらない**。
+ * ただし**変位の値は変わる**(それが並べ替えである)。したがって判定は
+ * 素のハッシュではなく**変位を伏せたハッシュ**で行う(make jit-reorder-check)。
+ *
+ * 不採用にした案: **事前にフォームを走査して寸法を予測する**。
+ * マクロ展開がコンパイル中に起きるので、**展開後に初めて現れる構文を見落とす**
+ * (= 足りない寸法で確保して静かに壊れる)。採るなら「コンパイル終了時に予測を
+ * 超えなかったことを検査し、超えたら生成を捨てる」が必須になる。
+ */
+/* 拡張19(グローバル変数setq): os_make_symbol呼び出し前にRAX(val_formの評価結果)を
+ * 退避する専用スクラッチスロット。ZA_OFF_ACC_VALは呼び出し引数loopの実行中にしか
+ * 使われず、setqの右辺(val_form)自体が別の関数呼び出しを含みうるため流用できない
+ * (za.c:980のコメント参照)。ZA_OFF_LAMBDA_TMP_VAL/NODEと同型の単一固定スロット。 */
+#define ZA_OFF_SETQ_TMP_VAL \
+    (ZA_OFF_ARITH_BASE + ZA_MAX_ARITH_DEPTH * ZA_ARITH_SLOT_SIZE)
+#define ZA_OFF_SETQ_TMP_NODE (ZA_OFF_SETQ_TMP_VAL + 8)  /* 16バイト、24バイトで終わる */
+/* 24-31: 16バイト境界(sub rsp総量を8 mod 16に保つ、ZA_OFF_NLX_BASEの264-271と
+ * 同じ考え方)を保つためのpadding */
+#define ZA_OFF_SETQ_TMP_END \
+    (ZA_OFF_SETQ_TMP_VAL + 32)
+/* ABI-M5: 固定引数エントリポイント(fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS、&restなし、
+ * lambda/flet/labelsを含まない関数のみ、za_form_disables_param_slots参照)専用の
+ * パラメータスロット。consリスト版/固定引数版どちらのプロローグも、それぞれの引数
+ * 受け渡し方式からこの固定本数のスロットへ一度だけ展開して書き込み、以降の
+ * op->is_literal==0(パラメータ参照)はza_emit_operandがconsリストを都度辿らず
+ * ここを直接読む(g_za_use_param_slots参照)。対象外の関数はこのスロットを一切
+ * 使わず、従来通りZA_OFF_ARGS_VALからのcc_car/cc_cdr都度読み直しのままにする。 */
+#define ZA_MAX_FIXED_ENTRY_PARAMS 3
+#define ZA_OFF_PARAM_BASE ZA_OFF_SETQ_TMP_END
+/* 3スロット*24byte(ZA_ARG_SLOT_SIZE)=72byteに8byte paddingを足し80byte(16の倍数)にする
+ * ことで、ZA_FRAME_EXTRA全体の16バイト境界に対する既存の関係を変えない。 */
+/* [ABI] r14はMS x64/SysVともcallee-savedである。生成コード(za_emit_fn_resolve_cached)が
+ * r14を使うので、プロローグでここへ退避し、3つの出口(通常エピローグ・末尾呼び出し2箇所)
+ * すべてで復元する。以前は退避しておらず、呼び出し元(C)の r14 を壊していた。
+ * za_compile_exprのlet本体走査は &nil を r14 に保持しており、cc_car/cc_cdr を
+ * inline化するとその割り当てになって init.lisp の make-environment のコンパイル中に
+ * 無限ループした(gdb の watch $r14 で g_imm_space 内の movabs $slot,%r14 を捕捉、2026-09-13)。
+ * 生ポインタなのでGCルートには繋がない(スロットは明示的にlinkしない限り走査されない)。
+ * 8byteのスロットに8byteのpaddingを足して、ZA_FRAME_EXTRAの16byte境界の関係を保つ。 */
+#define ZA_OFF_SAVED_R14 (ZA_OFF_PARAM_BASE + 80)
+#define ZA_OFF_FLET_BASE (ZA_OFF_PARAM_BASE + 96)
 /* flet/labels: 束縛関数を1個ずつ逐次構築して即os_set_functionで消費するため
  * (本体はインタプリタ実行=不透明データなので構築時点では評価されない、
  * za_compile_lambdaの兄弟lambdaが同じTMPスロットを再利用できる理由と同じ)、
@@ -1402,41 +1845,283 @@ static UINT64 g_za_block_level_mask = 0;
  * 要素配列(ZA_MAX_QQ_ELEMENTS個、za_arg_val_offと同じ「配列インデックス」パターン) +
  * foldアキュムレータ用1個(za_arith_val_offと同じ単一スロット)。 */
 #define ZA_QQ_LEVEL_SIZE    (8 + (ZA_MAX_QQ_ELEMENTS + 1) * ZA_QQ_SLOT_SIZE)
-/* 拡張19(グローバル変数setq): os_make_symbol呼び出し前にRAX(val_formの評価結果)を
- * 退避する専用スクラッチスロット。ZA_OFF_ACC_VALは呼び出し引数loopの実行中にしか
- * 使われず、setqの右辺(val_form)自体が別の関数呼び出しを含みうるため流用できない
- * (za.c:980のコメント参照)。ZA_OFF_LAMBDA_TMP_VAL/NODEと同型の単一固定スロット。 */
-#define ZA_OFF_SETQ_TMP_VAL \
-    (ZA_OFF_QQ_BASE + ZA_MAX_QQ_DEPTH * ZA_QQ_LEVEL_SIZE)
-#define ZA_OFF_SETQ_TMP_NODE (ZA_OFF_SETQ_TMP_VAL + 8)  /* 16バイト、24バイトで終わる */
-/* 24-31: 16バイト境界(sub rsp総量を8 mod 16に保つ、ZA_OFF_NLX_BASEの264-271と
- * 同じ考え方)を保つためのpadding */
-#define ZA_OFF_SETQ_TMP_END \
-    (ZA_OFF_SETQ_TMP_VAL + 32)
-/* ABI-M5: 固定引数エントリポイント(fixed_count<=ZA_MAX_FIXED_ENTRY_PARAMS、&restなし、
- * lambda/flet/labelsを含まない関数のみ、za_form_disables_param_slots参照)専用の
- * パラメータスロット。consリスト版/固定引数版どちらのプロローグも、それぞれの引数
- * 受け渡し方式からこの固定本数のスロットへ一度だけ展開して書き込み、以降の
- * op->is_literal==0(パラメータ参照)はza_emit_operandがconsリストを都度辿らず
- * ここを直接読む(g_za_use_param_slots参照)。対象外の関数はこのスロットを一切
- * 使わず、従来通りZA_OFF_ARGS_VALからのcc_car/cc_cdr都度読み直しのままにする。 */
-#define ZA_MAX_FIXED_ENTRY_PARAMS 3
-#define ZA_OFF_PARAM_BASE ZA_OFF_SETQ_TMP_END
-/* 3スロット*24byte(ZA_ARG_SLOT_SIZE)=72byteに8byte paddingを足し80byte(16の倍数)にする
- * ことで、ZA_FRAME_EXTRA全体の16バイト境界に対する既存の関係を変えない。 */
-/* [ABI] r14はMS x64/SysVともcallee-savedである。生成コード(za_emit_fn_resolve_cached)が
- * r14を使うので、プロローグでここへ退避し、3つの出口(通常エピローグ・末尾呼び出し2箇所)
- * すべてで復元する。以前は退避しておらず、呼び出し元(C)の r14 を壊していた。
- * za_compile_exprのlet本体走査は &nil を r14 に保持しており、cc_car/cc_cdr を
- * inline化するとその割り当てになって init.lisp の make-environment のコンパイル中に
- * 無限ループした(gdb の watch $r14 で g_imm_space 内の movabs $slot,%r14 を捕捉、2026-09-13)。
- * 生ポインタなのでGCルートには繋がない(スロットは明示的にlinkしない限り走査されない)。
- * 8byteのスロットに8byteのpaddingを足して、ZA_FRAME_EXTRAの16byte境界の関係を保つ。 */
-#define ZA_OFF_SAVED_R14 (ZA_OFF_PARAM_BASE + 80)
 #define ZA_FRAME_EXTRA \
-    (ZA_OFF_PARAM_BASE + 96)
-/* 既存のシャドウスペース(0x28=40)に追加分を足した、プロローグでsub rspする総量 */
+    (ZA_OFF_QQ_BASE + ZA_MAX_QQ_DEPTH * ZA_QQ_LEVEL_SIZE)
+/* 追加分(ZA_FRAME_EXTRA)に上端の0x28=40を足した、プロローグでsub rspする総量。
+ *
+ * [2026-10-30 訂正・原則12] この0x28は、2026-10-30まで「既存のシャドウスペース」と
+ * 説明されていた。**実体と違う。** MS x64のシャドウスペースは呼び出し1件ごとに
+ * jit_call_r11()が自前で出している(sub rsp,32 / call / add rsp,32。za.c:335の
+ * コメント参照)ので、プロローグのこの40byteはそれとは別物である。
+ * ZA_STACK_SHADOW_SPACE(32)が1段の使用量に足されているのも「呼び出しごとの32」の
+ * ことで、この40とは二重計上ではない。
+ *
+ * **どのZA_OFF_*もこの40byteを指していない**(ZA_OFF_ENV_SAVED_HEADはZA_FRAME_EXTRA側の
+ * 0から始まる)。つまり40byteは誰にも読まれず書かれない死んだ領域である。
+ * ただし**8byteだけは整列に要る**: sub rspの総量は8 mod 16でなければならず
+ * (入口のrspは戻り番地で8 mod 16、push rbx/push r13で元に戻る)、ZA_FRAME_EXTRAは
+ * 16の倍数なので、その8を出しているのはこの40である。**外せるのは32。**
+ * 死んでいる領域の全量(376byte)はdocuments/jit-frame-survey.md §9。 */
 #define ZA_FRAME_TOTAL         (0x28 + ZA_FRAME_EXTRA)
+
+/* [案 d] **総量は 16 で割って 8 余らなければならない。**
+ * 入口の rsp は戻り番地で 8 mod 16 で、push rbx / push r13 で元に戻るので、
+ * sub rsp の総量が 8 mod 16 のときだけ呼び出し規約の整列が保たれる。
+ * 2026-10-30 まで**これはコメントにしか書かれていなかった**(歯止めが無かった)。
+ * 領域を並べ替えるとき・足すとき・**関数ごとの実寸にするとき**に崩れるので、
+ * ビルド時の検査にする。
+ *
+ * **陽性対照の取り方**: どれかの領域の大きさを 8 だけ変えてビルドすると、
+ * ここでコンパイルが止まる(2026-10-30 に確認)。 */
+_Static_assert((ZA_FRAME_TOTAL % 16) == 8,
+               "ZA_FRAME_TOTAL must be 8 mod 16 (see the comment above)");
+_Static_assert((ZA_FRAME_EXTRA % 16) == 0,
+               "ZA_FRAME_EXTRA must be a multiple of 16 (the 8 comes from the top 0x28)");
+
+/* [案 d 第 3 段] 寸法の即値を**後から埋める**ための記録つきの出力器。
+ *
+ * 入口(プロローグ)は本体より前に出るので、この時点では寸法が分からない。
+ * 本体の途中に出る末尾呼び出しの解体も同じ。出口は本体より後なので確定しているが、
+ * **扱いを揃えて同じ仕組みで埋める**(片方だけ別扱いにすると、漏れたときに
+ * ビルドは通って実行時に静かにスタックが壊れる)。
+ *
+ * 即値は 3 byte のオペコードの直後に来るので、埋める位置は g_jit_used + 3。
+ * 仮の値には**ありうる最大(ZA_FRAME_TOTAL)**を入れておく。万一埋め忘れても
+ * 「多く確保して多く戻す」側に倒れるので、整列も残量も壊れない(ただし
+ * 埋め忘れ自体は下の検査で落とす)。 */
+static void za_emit_frame_imm32(void (*emit)(UINT32)) {
+    UINT64 field = g_jit_used + 3;
+    emit(ZA_FRAME_TOTAL);
+    if (g_za_frame_patch_count < ZA_MAX_FRAME_PATCHES) {
+        g_za_frame_patch_offsets[g_za_frame_patch_count++] = field;
+    } else {
+        /* 上限超過は既存の作法に合流する(生成を捨ててインタプリタへ落ちる) */
+        g_za_frame_patch_overflow++;
+    }
+}
+static void za_emit_sub_rsp_frame(void) { za_emit_frame_imm32(jit_sub_rsp_imm32); }
+static void za_emit_add_rsp_frame(void) { za_emit_frame_imm32(jit_add_rsp_imm32); }
+
+/* ===== [可用性] スタック残量の検査(issue #110) ==================================
+ *
+ * **JIT 関数は 1 段あたり 7536 byte 使う**(ZA_FRAME_TOTAL 7480 + push rbx/r13 16
+ * + 戻り番地 8 + 呼び出し側のシャドウスペース 32。塗って最高水位を読む方法で実測。
+ * documents/stack-guard.md §5-2)。プロセスのスタックは 256KB なので
+ * **境界は深さ 33〜34**(呼び出し元のスタック使用量で 1 段動く)。
+ * 溢れるとガードページ #PF で止まり、報告は
+ * -serial stdio にしか出ないので、**外から見ると QEMU の無反応と区別が付かない。**
+ *
+ * プロローグの先頭(sub rsp より前)で残量を見て、足りなければ
+ * <storage-exhausted> を signal する。**sub rsp の後ろに置くと、既に溢れてから
+ * 気づくことになる。**
+ *
+ * [閾値]  ZA_FRAME_TOTAL + ZA_STACK_SIGNAL_RESERVE
+ *   ZA_FRAME_TOTAL だけを見て通すと、ぎりぎりで通ったときに **signal の処理中に
+ *   溢れる**(os_signal_condition は make-instance / signal-condition という
+ *   **Lisp 関数を呼び戻す**ので、使用量は C 関数 1 つ分では済まない)。
+ *   ZA_STACK_SIGNAL_RESERVE は実測値(documents/stack-guard.md §5-3)。
+ *
+ * [予備領域の開け閉め]  signal 経路そのものが閾値より下を使うので、そのあいだ
+ *   閾値を床(ZA_STACK_HARD_FLOOR)まで下げる。下げるだけで無効化しないのは、
+ *   **ハンドラがさらに深く潜った場合に床で捕まえる**ため。そのときは
+ *   g_za_in_stack_signal が立っているので signal を重ねず EVAL-ERROR を返して
+ *   巻き戻す(**signal を重ねるとハングする**)。
+ *
+ * [この検査は safety で外せない] 型の検査ではなく**資源の検査**である。
+ *   宣言しても資源は増えないので省けない(documents/stack-guard.md §6)。
+ */
+/* ---- 予備領域は定数ではなく**導出式**にする(規則 13)-----------------------
+ *
+ * **ZA_FRAME_TOTAL に比例する項が入っているので、定数で書くと案 d
+ * (フレームの実寸化)の利得をそのぶん食い残す。** しかも深さは増えるので
+ * **誰も気づかない。** tools/jit_frame_breakdown.py が内訳の合計を検算するのと
+ * 同じ扱いにして、**フレームが縮んだ日に予備領域も自動で縮む**ようにする。
+ *
+ *   予備領域 = 1 段ぶん + 既定の signal 経路 + ハンドラへの保証分 + 床
+ *
+ * 各項の出どころ:
+ */
+/* JIT 関数 1 段が使うスタック量の内訳。**数字をそのまま足さず、加数に名前を付ける**
+   (原則12: 数字入りのコメントで済ませると、定数 1 つを定数 3 つに置き換えただけになる) */
+/** プロローグが退避する callee-saved レジスタ 2 本(`push rbx` / `push r13`) */
+#define ZA_STACK_SAVED_REGS    16
+/** `call` が積む戻り番地 */
+#define ZA_STACK_RETURN_ADDR   8
+/** Microsoft x64 ABI が呼び出し元に義務付ける shadow space(`jit_call_r11` が出す) */
+#define ZA_STACK_SHADOW_SPACE  32
+
+/** JIT 関数 1 段が使うスタック量。**断念経路は閾値より最大これだけ下で始まる**
+ *  (検査が通った最後のフレームがこれだけ使うため)。
+ *  **実測 7,536 と一致する**(塗って最高水位を読む方法。documents/stack-guard.md §5-2)。
+ *  **ZA_FRAME_TOTAL に比例するのはこの項である。**
+ *
+ *  **インタプリタ(os_eval の再帰)は 1 段 3,072 byte で、JIT の 2.4 分の 1 である。**
+ *  つまり**「JIT に乗らないほうがスタックに優しい」**という倒錯した性質がある
+ *  (documents/stack-guard.md §5-7)。案 d(フレームの実寸化)はこれを薄める。 */
+#define ZA_STACK_PER_FRAME \
+    (ZA_FRAME_TOTAL + ZA_STACK_SAVED_REGS + ZA_STACK_RETURN_ADDR + ZA_STACK_SHADOW_SPACE)
+
+/** 既定の signal 経路が使う量の実測上限(**ハンドラを含まない**)。
+ *  os_signal_condition -> make-instance / signal-condition -> 既定の経路。
+ *  実測 8,696 byte(ハンドラ無しで測った値。documents/stack-guard.md §5-3)。
+ *  **GC はここに乗らない** — 収集器は明示キューの while ループ(gc_scan_queue)で
+ *  反復的なので O(1) しか増えない。 */
+#define ZA_SIGNAL_PATH_MAX     8696
+
+/** **ユーザのハンドラに保証する量。**
+ *
+ *  ISLisp の with-handler のハンドラは **signal の動的文脈で走る** = 巻き戻す前、
+ *  深いところで走る。だからハンドラが使う分は予備領域に入れておかなければならない。
+ *  実測に使った assert-error-class のハンドラ(typep / class-of / %%class-name /
+ *  list / return-from)は 8,824 - 8,696 = **128 byte** しか使っていない。
+ *
+ *  **これを超えるハンドラは保証しない。** 床を割って EVAL-ERROR になる
+ *  (ハングではなく劣化。documents/stack-guard.md §5-6)。
+ *  **再帰するハンドラは再び検査に当たるので別の話**だが、
+ *  **再帰せずに深く使うハンドラ**(format を深く使う、構造を組み立てる)は
+ *  ここで決まる。 */
+#define ZA_HANDLER_ALLOWANCE   4096
+
+/** 予備領域の中でさらに潜ったときに捕まえる床。断念経路(call 1 つ)が通る分だけ。 */
+#define ZA_STACK_HARD_FLOOR_WANT 4096
+
+/** 予備領域の下限。**これが導出式の本体である。** */
+#define ZA_STACK_RESERVE_MIN \
+    (ZA_STACK_PER_FRAME + ZA_SIGNAL_PATH_MAX + ZA_HANDLER_ALLOWANCE + ZA_STACK_HARD_FLOOR_WANT)
+
+/** 実際に使う予備領域。**16 byte 境界へ切り上げる**(4KB で丸めると、案 d で
+ *  フレームが 3,300 byte 縮んでも丸めに吸われて利得が見えない)。
+ *
+ *  **-D で上書きできる**(documents/stack-guard.md §6-4 の陽性対照)。
+ *  上書きしたときは下の _Static_assert を外す — 意図的に小さくして
+ *  「signal の途中で溢れる」ことを確かめるための経路だからである。 */
+#ifndef ZA_STACK_SIGNAL_RESERVE
+#define ZA_STACK_SIGNAL_RESERVE (((ZA_STACK_RESERVE_MIN) + 15) & ~15)
+#define ZA_STACK_RESERVE_DERIVED 1
+#endif
+
+/* 床は予備領域より大きくならないようにする(上書きで小さくしたとき、床が通常の
+   閾値より上になって逆効果になるのを防ぐ) */
+#if ZA_STACK_HARD_FLOOR_WANT * 2 >= ZA_STACK_SIGNAL_RESERVE
+#define ZA_STACK_HARD_FLOOR (ZA_STACK_SIGNAL_RESERVE / 2)
+#else
+#define ZA_STACK_HARD_FLOOR ZA_STACK_HARD_FLOOR_WANT
+#endif
+
+#ifdef ZA_STACK_RESERVE_DERIVED
+/* [設計の整合] 導出式で決めたときは、下限を満たしていること。
+   満たさないと signal の途中で床を割って EVAL-ERROR になり、
+   <storage-exhausted> が出なくなる */
+_Static_assert(ZA_STACK_SIGNAL_RESERVE >= ZA_STACK_RESERVE_MIN,
+               "ZA_STACK_SIGNAL_RESERVE が下限を満たしていない(documents/stack-guard.md §5-3)");
+_Static_assert(ZA_STACK_HARD_FLOOR == ZA_STACK_HARD_FLOOR_WANT,
+               "導出式のときは床が削られてはならない");
+#endif
+
+/** 生成コードが cmp rsp,[r11] で読む閾値。0 のときは検査が発火しない
+ *  (最初のタイマ tick より前、カーネルの idle ループ上) */
+static UINT64 g_za_stack_limit = 0;
+/** 通常時の閾値。予備領域を閉じるときに戻す値 */
+static UINT64 g_za_stack_limit_normal = 0;
+/** 予備領域を開けているあいだの閾値(床) */
+static UINT64 g_za_stack_limit_floor = 0;
+/** signal 経路の中にいるか。入れ子の signal を防ぐ */
+static int g_za_in_stack_signal = 0;
+/** 検査が発火した延べ回数(診断用。%%DIAG-ZA-STACK-GUARD-HITS) */
+static UINT64 g_za_stack_guard_hits = 0;
+
+void os_za_set_stack_low(UINT64 stack_low) {
+    if (stack_low == 0) {
+        g_za_stack_limit_normal = 0;
+        g_za_stack_limit_floor = 0;
+        g_za_stack_limit = 0;
+        return;
+    }
+    g_za_stack_limit_normal = stack_low + ZA_FRAME_TOTAL + ZA_STACK_SIGNAL_RESERVE;
+    g_za_stack_limit_floor = stack_low + ZA_FRAME_TOTAL + ZA_STACK_HARD_FLOOR;
+    /* 予備領域を開けている最中に切り替わった場合も通常値へ戻す。
+       そのあと signal 経路が次に JIT 関数を呼ぶと断念経路へ入るが、
+       g_za_in_stack_signal が立っているので EVAL-ERROR を返して巻き戻る
+       (ハングはしない。documents/stack-guard.md §5-5) */
+    g_za_stack_limit = g_za_stack_limit_normal;
+}
+
+UINT64 os_za_stack_limit_value(void) { return g_za_stack_limit_normal; }
+UINT64 os_za_stack_guard_hits(void) { return g_za_stack_guard_hits; }
+
+/**
+ * 生成コードの断念経路から呼ばれる。<storage-exhausted> を signal する。
+ *
+ * **ここへ来た時点で rsp は閾値より下にある。** signal 経路(make-instance /
+ * signal-condition / ハンドラ)はさらに下を使うので、入る前に閾値を床まで下げて
+ * 予備領域を開け、抜けるときに戻す。
+ *
+ * **入れ子にしない。** 予備領域の中でさらに枯渇した場合(ハンドラが深く潜った)は
+ * signal を重ねず EVAL-ERROR を返す。重ねると予備領域を食い潰してハングし、
+ * 「エラーを出そうとしてハングする」というもっと分かりにくい症状になる。
+ *
+ * @return signal-conditionの戻り値(control transfer)。条件システムが使えない
+ *         起動段階では os_signal_condition が g_sym_eval_error を返す
+ */
+lisp_val_t os_za_signal_stack_exhausted(void) {
+    g_za_stack_guard_hits++;
+    if (g_za_in_stack_signal) {
+        return g_sym_eval_error;
+    }
+    g_za_in_stack_signal = 1;
+    g_za_stack_limit = g_za_stack_limit_floor;
+
+    /* <storage-exhausted> はスロットを持たないので initargs は nil。
+       クラス名は os_make_symbol でその場で引く(エラー経路なのでキャッシュ不要。
+       グローバルを増やすと gc_copy_value の追加漏れの余地が増える) */
+    lisp_val_t class_sym = os_make_symbol("<STORAGE-EXHAUSTED>");
+    GC_PROTECT(class_sym);
+    lisp_val_t r = os_signal_condition(class_sym, nil, global_environment);
+
+    g_za_stack_limit = g_za_stack_limit_normal;
+    g_za_in_stack_signal = 0;
+    return r;
+}
+
+/**
+ * [可用性] プロローグの先頭に残量の検査を出す(issue #110)。**sub rsp より前。**
+ *
+ *   mov  r11, &g_za_stack_limit     ; アドレスが32bitに収まれば 41 BB imm32(6byte)
+ *   cmp  rsp, [r11]                 ; 49 3B 23 (3byte)
+ *   jae  over                       ; 73 rel8 (2byte)
+ *   ; ---- 断念経路(ここを通るのは枯渇したときだけ) ----
+ *   mov  r11, &os_za_signal_stack_exhausted
+ *   sub  rsp, 40                    ; シャドウスペース32 + 16byte境界合わせ8
+ *   call r11
+ *   add  rsp, 40
+ *   ret
+ *  over:
+ *
+ * **通常経路で実行されるのは 3 命令**(mov / cmp / jae)。
+ *
+ * [なぜ r11 か] MS x64 の引数は rcx/rdx/r8/r9 で、**入口では r11 は死んでいる。**
+ * r11 は caller-saved なので退避も要らない。
+ *
+ * [なぜ断念経路で何も巻き戻さないか] 検査が push rbx より前にあるので、
+ * **rsp は入口のまま**であり、callee-saved レジスタも 1 つも触っていない。
+ * だから C 関数を呼んでその戻り値(rax)のまま ret できる。
+ *
+ * [閾値が 0 のとき] 発火しない(cmp rsp,0 は常に jae)。最初のタイマ tick より前は
+ * この状態である。
+ */
+static void za_emit_stack_guard(void) {
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&g_za_stack_limit);
+    jit_emit8(0x49); jit_emit8(0x3B); jit_emit8(0x23);   /* cmp rsp, [r11] */
+    jit_emit8(0x73);                                      /* jae rel8 */
+    UINT64 over_patch = g_jit_used;
+    jit_emit8(0);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_za_signal_stack_exhausted);
+    jit_sub_rsp_imm8(40);
+    jit_emit8(0x41); jit_emit8(0xFF); jit_emit8(0xD3);   /* call r11 */
+    jit_add_rsp_imm8(40);
+    jit_ret();
+    jit_patch_rel8(over_patch);
+}
 
 /** ABI-M5: パラメータスロット方式(g_za_use_param_slots)が有効な関数における、
  * インデックスiの固定パラメータの値/gc_rootnodeスロットのオフセット
@@ -1598,7 +2283,7 @@ static void za_emit_operand(const za_operand_t *op) {
         jit_call_r11();
         jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_variable);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_get_variable_checked);
         jit_call_r11();
         return;
     }
@@ -1665,6 +2350,15 @@ static UINT64 za_ensure_trampoline(void) {
     // r8はFunction Cell(TAG_RAW_POINTER付き、Immobilized Space上の固定アドレス)。
     // 中身(現在のfn、TAG_INSTANCE)を読み出してr8を差し替えてから、以降は従来通り
     // fn自体に対する分岐を行う(拡張: 間接呼び出し化)。
+    //
+    // [P4-3] **cellをr9へ退避しておく。** 下のfallbackでos_apply_functionではなく
+    // os_apply_via_cellを呼ぶために要る。cellがnilは「その名前に関数束縛が無い」
+    // ことそのもので、os_apply_via_cellはそれを<undefined-function>にする。
+    // fn(=nil)だけを渡すos_apply_functionでは「nilは関数ではない」=<domain-error>に
+    // なり、**同じソースが末尾呼び出しかどうかでクラスが変わってしまう**。
+    // 追加は高速path側でこのmov 1命令だけで、fallback側は従来の4回のローテートが
+    // 3回に減る(計測: 下記PR)。r9はこのスタブ内でfallbackでしか使っていない。
+    jit_mov_reg_reg(ZA_REG_R9, ZA_REG_R8);
     jit_mov_reg_reg(ZA_REG_R10, ZA_REG_R8);
     jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK); // タグを落として実アドレスにする
     jit_mov_reg_from_mem_disp8(ZA_REG_R8, ZA_REG_R10, 0); // r8 = *cell (fn, タグ付き)
@@ -1684,8 +2378,7 @@ static UINT64 za_ensure_trampoline(void) {
     // 差し替える。eval.cのapply_functionが行う分岐と同じ判断をここでも行う必要がある
     // (このtrampolineはapply_functionを経由しない直接jmpの高速pathだから)
     jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 24); // rax = obj[3] (word3)
-    jit_movabs_reg(ZA_REG_R11, nil);
-    jit_cmp_rax_r11();
+    za_emit_cmp_rax_nil();
     UINT64 je_no_env = jit_emit_je_rel32_placeholder();
     jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RAX); // rdx = obj[3] (definition/captured env)
     jit_patch_rel32(je_no_env);
@@ -1700,13 +2393,15 @@ static UINT64 za_ensure_trampoline(void) {
     jit_jmp_reg(ZA_REG_R11);
 
     jit_patch_rel32(jne_patch);
-    // fallback: os_apply_function(fn, evaluated_args, env)はrcx=fn,rdx=args,r8=envの
-    // 順。入ってきた時点でrcx=args,rdx=env,r8=fnなので3点をローテートする。
-    jit_mov_reg_reg(ZA_REG_R9, ZA_REG_RCX);
-    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R8);
+    // fallback: os_apply_via_cell(cell, evaluated_args, env)はrcx=cell,rdx=args,r8=env
+    // の順。この時点でrcx=args,rdx=env,r9=cell(冒頭で退避)なので、
+    // r8 <- rdx, rdx <- rcx, rcx <- r9 の順に詰め替える(この順ならrcxを潰す前に
+    // 読み終わっている)。os_apply_via_cellはcellの中身を読んでos_apply_functionへ
+    // 委譲するので、ここまでの分岐の意味は変わらない。
     jit_mov_reg_reg(ZA_REG_R8, ZA_REG_RDX);
-    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_R9);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_function);
+    jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_RCX);
+    jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_R9);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_apply_via_cell);
     jit_jmp_reg(ZA_REG_R11);
 
     if (g_jit_overflow) {
@@ -1778,6 +2473,7 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
             os_diag_serial_write(" (コンパイルを断念してインタプリタへ落とす)\n");
 #endif
             g_za_macroexpand_runaway++;
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_MACROEXPAND_ITER */
             return form;
         }
         lisp_val_t wrapped = os_make_cons(form, nil);
@@ -1801,11 +2497,16 @@ static int za_is_excluded_special_form(lisp_val_t head) {
     // flet/labels(za_compile_flet_labels)・quasiquote(za_compile_quasiquote)は
     // ここから除外する(za_compile_exprが一般呼び出し判定より前で無条件に認識するため、
     // ここに来た時点でどれでもない)。
+    // declaimはza.cが機械語を出せる形を持たない(environmentの10番目のスロットを
+    // 書き換える特殊形式)。ここへ入れておかないと一般呼び出しとしてコンパイルされ、
+    // 実行時にDECLAIMという関数が見つからずEVAL-ERRORになる。
+    // 本体にdeclaimを含む関数はインタプリタへ落とす(defun等と同じ扱い)
     return head == g_sym_quote ||
            head == g_sym_defun || head == g_sym_lambda || head == g_sym_defmacro ||
            head == g_sym_function ||
            head == g_sym_defvar || head == g_sym_defconstant ||
-           head == g_sym_defglobal;
+           head == g_sym_defglobal ||
+           head == g_sym_declaim;
 }
 
 /**
@@ -2198,6 +2899,64 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
 /** 現在のza_compile_expr再帰段数。za_try_compile_defunの冒頭で0に戻す */
 static UINT64 g_za_compile_nest = 0;
 
+/** このコンパイル試行に効いているdeclaim値(optimize下位6bit + inlineビットbit8〜)。
+ * za_try_compile_defunの冒頭でownerから読んだ値を入れる。emitterへ引数で持ち回ると
+ * 署名が広範囲に波及するため、g_jit_overflow等と同じくコンパイル単位のfile-staticにする
+ * (documents/inline-builtin.md)。 */
+static UINT64 g_za_declaim = OPTIMIZE_DEFAULT;
+
+/** [Phase 4a-2] このコンパイル試行で宣言された仮引数の型(位置順の符号)。
+ * g_za_declaimと同じ理由でグローバルに置く(引数で持ち回ると署名が
+ * za_compile_*の全域へ波及する)。本Phaseではコード生成に使わない。 */
+static os_decl_types_t g_za_param_decl_types;
+
+/** [Phase 4a-2][診断] 直近のコンパイル試行で、letの束縛変数に対して記録した
+ * 型宣言の個数。%%DIAG-ZA-LOCAL-DECLS が読む。let-localの型は関数オブジェクトに
+ * 残らない(za_local_scope_tはコンパイル時だけのCスタック上の構造)ため、
+ * 配管が通っていることを外から確かめる手段がこれしかない。 */
+static UINT64 g_za_local_decl_count = 0;
+
+/** nameのbuiltinがこのコンパイルでインライン展開対象か */
+/** [inline] **いまコンパイルしているレキシカルスコープで効いている**ビット集合。
+ *
+ * g_za_declaim は environment 単位の declaim(+ defun 本体の declare を畳み込んだもの)で、
+ * こちらは **let の内側などフォーム単位の declare** まで反映した現在値である。
+ * g_za_fn_scope と同じ「グローバルを save/restore する」方式を採る
+ * (C の再帰がレキシカルネストと 1 対 1 に対応するので、
+ *  パラメータで持ち回るのと意味的に等価。za_fn_scope のコメント参照)。 */
+static UINT64 g_za_inline_scope = 0;
+
+/** cleanup 属性で使う復元。body のコンパイルが途中で失敗して return しても戻る */
+static void za_inline_scope_restore(UINT64 *saved) {
+    g_za_inline_scope = *saved;
+}
+
+static int za_inline_enabled(UINT64 bit) {
+#ifdef ISIKIOS_DECLARE_AUDIT
+    /* [D6] **監査ビルドでは展開しない。**
+       既存の監査(DECLARE_AUDIT_FIXNUM 等)は**型特化した C 関数の入口**で値を見る。
+       インライン展開は呼び出しを消すので、**safety 0 で壊れるまさにその場合だけ
+       監査が何も見なくなる**。展開を抑止すれば必ず関数が呼ばれ、監査がそのまま効く。
+       代償: 監査ビルドの生成コードは本番と違う。**だから監査ビルドで性能を測らない。**
+       documents/declaim-design.md「D6 / D7 の決定」 */
+    (void)bit;
+    return 0;
+#else
+    return (g_za_inline_scope & bit) != 0;
+#endif
+}
+
+/** [D5] safety 0 で外してよいのは**分類 1(タグ検査)だけ**である。
+ *
+ * 外さないもの: 桁あふれ検査(符号マグニチュードなので -0 ができる)、
+ * ゼロ除算検査(#DE で機械が止まる)、資源の検査(静かにハングに戻る)、
+ * **引数個数の検査**(4 分類に席の無い契約の検査。2026-10-30 の判断で対象外)、
+ * **要素取り出しの空リスト判定**(外すと「誤りを知らせる」が「空リストを返す」に
+ * 静かに変わる)。documents/declaim-design.md「safety で外してよい検査」 */
+static int za_safety_checks_enabled(void) {
+    return OPTIMIZE_SAFETY(g_za_declaim) != 0;
+}
+
 static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env, int is_tail,
                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
@@ -2329,7 +3088,7 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  * 呼ばずに(副作用、特にis_literal==7の新規リテラルスロット登録を二重に踏まないため)
  * 判定する。za_emit_operandの各分岐を確認した結果、以下の3パターンだけがCALL命令を
  * 一切発行しない(movabs/レジスタ・スタックのMOVのみ):
- *   - is_literal==1相当(TAG_FIXNUM/TAG_CHARの裸リテラル): jit_movabs_raxのみ
+ *   - is_literal==1相当(TAG_FIXNUM/TAG_CHAR/TAG_SINGLE_FLOATの裸リテラル): jit_movabs_raxのみ
  *   - is_literal==4相当(let-IIFEでbox化されていないローカル変数): za_load_slotのみ
  *   - is_literal==0かつg_za_use_param_slots(ABI-M5のパラメータスロット方式が有効な
  *     関数での固定引数params参照): za_load_slotのみ
@@ -2343,7 +3102,9 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
  */
 static int za_operand_is_safe_leaf(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                                     const za_local_scope_t *locals) {
-    if ((form & TAG_MASK) == TAG_FIXNUM || (form & TAG_MASK) == TAG_CHAR) {
+    /* [float契約] single-floatもmovabs1命令だけで済むのでleafに含める */
+    if ((form & TAG_MASK) == TAG_FIXNUM || (form & TAG_MASK) == TAG_CHAR ||
+        (form & TAG_MASK) == TAG_SINGLE_FLOAT) {
         return 1;
     }
     if ((form & TAG_MASK) == TAG_SYMBOL) {
@@ -2410,23 +3171,48 @@ static int za_compile_operand(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
 /**
  * JIT算術インライン展開(Phase2、documents/abi-redesign.md参照): rcx=a, rdx=bとして
  * wrapper_fn(a, b)相当を計算しraxへ結果を残す。wrapper_fnが`primitive_add2`/
- * `primitive_subtract2`の場合、それぞれのC実装が持つfixnum高速path(共に非負fixnum
- * かつ結果が60bitに収まる)と完全に同一の条件・結果になるインラインアセンブリを
- * 生成し、条件を満たす限りwrapper_fnへの間接callを一切発行しない。条件を満たさない
- * 場合(型不一致・負数・オーバーフロー)、またはそれ以外のwrapper_fn(primitive_
- * multiply2等、オーバーフロー判定に除算を要し単純なインライン化が困難なもの)は、
- * 従来通りwrapper_fnへの間接callにフォールバックする。
+ * `primitive_subtract2`の場合、**両方が非負fixnumかつ結果が60bitに収まる**ときだけ
+ * インラインで計算し、条件を満たす限りwrapper_fnへの間接callを一切発行しない。
+ * 条件を満たさない場合(型不一致・負数・オーバーフロー)、またはそれ以外のwrapper_fn
+ * (primitive_multiply2等、オーバーフロー判定に除算を要し単純なインライン化が困難な
+ * もの)は、従来通りwrapper_fnへの間接callにフォールバックする。
+ *
+ * [改善A以降] ここがカバーする条件は、**C側(fixnum_add_signed)の高速pathの真部分集合**
+ * である。C側は符号が絡むfixnumどうしも処理するようになったが、ここは非負どうしに
+ * 限ったままなので、`(+ -1 1)` のような式はこのインラインを外れてprimitive_add2へ
+ * callする(そのcall先が速くなった)。**結果の値はどちらの経路でも同一である。**
+ * ここを符号込みに広げると分岐が増え、TCGでは命令数がそのままコストになるため
+ * 割に合わない可能性がある(未測定。documents/fixnum-signed-fastpath.md 参照)。
  *
  * rcx/rdxの値は、フォールバック時にそのままwrapper_fn(a=rcx, b=rdx)の引数として
  * 使う必要があるため、インライン試行部分は破壊せずr10を計算用スコッチとして使う
  * (add/subの結果をr10で計算してからraxへ移す。rcx/rdx自体は最後まで不変)。
  */
 static void za_emit_arith_call_or_inline(void *wrapper_fn) {
-    if (wrapper_fn != (void *)primitive_add2 && wrapper_fn != (void *)primitive_subtract2) {
+    int is_add = (wrapper_fn == (void *)primitive_add2);
+    int is_sub = (wrapper_fn == (void *)primitive_subtract2);
+    /* [inline] **型宣言つきの特化版でも、inline 宣言があれば同じ高速路を出す。**
+       出る命令列は宣言なしの経路と同一で、違うのは**通らないフォールバックの
+       呼び先**だけ(GENERIC ではなく特化版になる)。
+
+       **加算的な変更である。** inline 宣言が無ければ従来どおり call だけで、
+       宣言なしの経路(is_add / is_sub がそのまま真になる側)は一切触らない。
+       「inline 宣言が無ければ展開しない」という方針へ寄せるのは、
+       宣言なしの経路が遅くなる変更なので**別の PR**で行う
+       (documents/inline-arith.md §1-3)。 */
+    if (!is_add && !is_sub) {
+        if (wrapper_fn == (void *)primitive_add2_fixnum && za_inline_enabled(INLINE_BIT_ADD)) {
+            is_add = 1;
+        } else if (wrapper_fn == (void *)primitive_subtract2_fixnum && za_inline_enabled(INLINE_BIT_SUB)) {
+            is_sub = 1;
+        }
+    }
+    if (!is_add && !is_sub) {
         jit_movabs_r11((UINT64)wrapper_fn);
         jit_call_r11();
         return;
     }
+    (void)is_sub;
 
     // 両方非負fixnum(タグ3bit=000かつ符号bit63=0)かどうかを、a|bへ
     // (TAG_MASK|FIXNUM_SIGN_BIT)を掛けた結果が0かどうかで一括判定する
@@ -2439,18 +3225,20 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
     UINT64 fallback_count = 0;
     fallback_patches[fallback_count++] = jit_emit_jne_rel32_placeholder();
 
-    if (wrapper_fn == (void *)primitive_add2) {
+    if (is_add) {
         // 生のタグ付き値同士をそのまま加算するだけでよい(下位3bitは両方0のまま、
         // マグニチュード和が60bitを超えるとbit63(符号bit)が1になるので、
-        // それをオーバーフロー検出に使う。primitive_add2の
+        // それをオーバーフロー検出に使う。fixnum_add_signedの同符号側の
         // `sum <= FIXNUM_MAGNITUDE_MASK`判定と数学的に同値)。
         jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
         jit_add_reg_reg(ZA_REG_R10, ZA_REG_RDX);
         fallback_patches[fallback_count++] = jit_emit_js_rel32_placeholder();
     } else {
-        // primitive_subtract2の`mag_b <= mag_a`判定(=結果が非負)を、生のタグ付き
+        // 非負どうしのとき a-b が非負になる条件(`mag_b <= mag_a`)を、生のタグ付き
         // 値同士の符号無し比較(タグ・符号bitが両方0なので大小関係が保たれる)で
         // 直接判定する。満たせばそのままsubで正しいタグ付き結果が得られる。
+        // 満たさない場合(結果が負)はprimitive_subtract2へ落ちる。改善A以降、
+        // その落ち先はbignum機構を通らずfixnumのまま計算して返す。
         jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
         fallback_patches[fallback_count++] = jit_emit_jb_rel32_placeholder();
         jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
@@ -2470,6 +3258,71 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
 
     jit_patch_rel32(fast_done_patch);
 }
+/* [型特化] オペランドの宣言型を引く。**declare からのみ。**
+   リテラルや式からの推論はしない(documents/declare-typed-add.md §3-4)。
+   `(+ x (f y))` のように片方が式なら、その型は不明として GENERIC へ落ちる。 */
+static UINT8 za_operand_decl_type(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
+                                   const za_local_scope_t *locals) {
+    if ((form & TAG_MASK) != TAG_SYMBOL) {
+        return OS_DECL_TYPE_NONE;   /* 式・リテラルは不明 */
+    }
+    UINT8 t = za_local_decl_type(locals, form);
+    if (t != OS_DECL_TYPE_NONE) {
+        return t;                   /* let 束縛変数の宣言(内側が優先) */
+    }
+    UINT64 idx;
+    if (za_param_index(params, form, fixed_count, &idx)) {
+        return os_decl_types_get(g_za_param_decl_types, idx);
+    }
+    return OS_DECL_TYPE_NONE;
+}
+
+/* [型特化] 宣言された型の組から呼び先を選ぶ。**引数 2 つのときだけ**呼ばれる。
+   選べなければ 0 を返し、呼び出し元は GENERIC のままにする
+   (documents/type-specialized-dispatch.md §4)。
+
+   **混在(fixnum × single)は本作業では扱わない。** 変換のコストと、
+   2^24 を超える fixnum で桁が落ちる問題があるため、GENERIC へ落とす
+   (documents/declare-typed-add.md §3-3)。
+
+   対象は `+` `-` `*` `/`(PR #89 / #91 / #92 / 本 PR)。四則が揃った
+   (documents/declare-typed-arith.md)。
+   **単項の `-`(符号反転)は対象外。** za_compile_fold は引数 2 つ未満で
+   そもそも呼ばれない。 */
+static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
+    if (ta == OS_DECL_TYPE_FIXNUM && tb == OS_DECL_TYPE_FIXNUM) {
+        if (generic_fn == (void *)primitive_add2) {
+            return (void *)primitive_add2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_subtract2) {
+            return (void *)primitive_subtract2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_multiply2) {
+            return (void *)primitive_multiply2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_divide2) {
+            return (void *)primitive_divide2_fixnum;
+        }
+        return 0;
+    }
+    if (ta == OS_DECL_TYPE_SINGLE_FLOAT && tb == OS_DECL_TYPE_SINGLE_FLOAT) {
+        if (generic_fn == (void *)primitive_add2) {
+            return (void *)primitive_add2_single;
+        }
+        if (generic_fn == (void *)primitive_subtract2) {
+            return (void *)primitive_subtract2_single;
+        }
+        if (generic_fn == (void *)primitive_multiply2) {
+            return (void *)primitive_multiply2_single;
+        }
+        if (generic_fn == (void *)primitive_divide2) {
+            return (void *)primitive_divide2_single;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                             UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
@@ -2477,6 +3330,7 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     GC_PROTECT(params);
     GC_PROTECT(env);
     if (arith_depth >= ZA_MAX_ARITH_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_ARITH_DEPTH */
         return 0;
     }
     lisp_val_t operand_forms[ZA_MAX_OPERANDS];
@@ -2486,6 +3340,7 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
             return 0;
         }
         if (count >= ZA_MAX_OPERANDS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
             return 0;
         }
         operand_forms[count++] = cc_car(rest);
@@ -2516,6 +3371,20 @@ static int za_compile_fold(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         if (!za_operand_is_safe_leaf(operand_forms[i], params, fixed_count, locals)) {
             skip_protect = 0;
             break;
+        }
+    }
+
+    /* [型特化] **引数がちょうど 2 つで、両方の型が宣言されているときだけ**
+       呼び先を専用関数へ差し替える。3 つ以上は型が分かっていても GENERIC のまま
+       (documents/type-specialized-dispatch.md §4)。
+       宣言は無検査で信じる。タグ検査は出さない(§3-1)。 */
+    if (count == 2) {
+        void *specialized = za_specialized_wrapper(
+            wrapper_fn,
+            za_operand_decl_type(operand_forms[0], params, fixed_count, locals),
+            za_operand_decl_type(operand_forms[1], params, fixed_count, locals));
+        if (specialized != 0) {
+            wrapper_fn = specialized;
         }
     }
 
@@ -2617,6 +3486,10 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
                             call_depth, arith_depth, (void *)primitive_subtract2);
 }
 
+/* インライン展開のエミッタ(実体は下方。za_compile_unary/binaryから使う) */
+static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn);
+static void za_emit_inline_bool_from_flags(void);
+
 /**
  * 「(op operand)」(ちょうど1オペランド)を検証しつつ、1引数ラッパー(cc_car/cc_cdr/
  * primitive_null1/primitive_atom1)を呼んでraxへ結果を残す機械語を出力する。オペランドは
@@ -2628,7 +3501,7 @@ static int za_compile_minus(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
 static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                              const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                              UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
-                             UINT64 arith_depth, void *wrapper_fn) {
+                             UINT64 arith_depth, void *wrapper_fn, UINT64 inline_bit) {
     GC_PROTECT(params);
     GC_PROTECT(env);
     lisp_val_t rest = cc_cdr(form);
@@ -2643,19 +3516,119 @@ static int za_compile_unary(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     // 保護すべき値が無いので新規スロットは不要。制御転送ならwrapper呼び出しを
     // スキップしてrax(=転送値)のまま終端へ合流するだけでよい。
     UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
-    jit_mov_rcx_rax();
-    jit_movabs_r11((UINT64)wrapper_fn);
-    jit_call_r11();
+    if (inline_bit == INLINE_BIT_NULL && za_inline_enabled(INLINE_BIT_NULL)) {
+        /* [インライン展開] primitive_null1(a == nil ? t : nil)と等価 */
+        za_emit_cmp_rax_nil();
+        za_emit_inline_bool_from_flags();
+    } else {
+        jit_mov_rcx_rax();
+        jit_movabs_r11((UINT64)wrapper_fn);
+        jit_call_r11();
+    }
     jit_patch_rel32(ct_patch);
     return 1;
 }
 
 /** za_compile_unaryの、wrapper_fn(rcx=オペランド, rdx=env)に自分のenv(ZA_OFF_ENV_VAL)も
  * 渡す版。conditionをsignalしうる関数(os_car_checked等)用。 */
+/**
+ * [インライン展開] raxにある値に対するcar/cdrを、call無しの命令列として出力する。
+ *
+ * **os_car_checked / os_cdr_checked と等価でなければならない**(documents/inline-builtin.md)。
+ * どちらも「nilでも、TAG_CONSでもない」ならdomain-errorをsignalする。単なるタグ剥がし +
+ * オフセット読みに置き換えると (car nil) が domain-error にならず nil を返してしまう
+ * (nil自身が自己参照consなので、読めてしまう)。
+ *
+ * そこで速いpathの前に判定を置き、外れたら**従来と同じwrapper呼び出しへ落とす**。
+ * wrapperはenvを要るのでrdxへ積む。エラー経路の振る舞いは従来と1命令も変わらない。
+ *
+ *     mov  r10, rax
+ *     and  r10, 7
+ *     cmp  r10, TAG_CONS
+ *     jne  slow
+ *     movabs r11, nil        ; nilはTAG_CONSを持つので別途弾く必要がある
+ *     cmp  rax, r11
+ *     je   slow
+ *     and  rax, ~7           ; タグ剥がし
+ *     mov  rax, [rax + off]  ; car=+0 / cdr=+8
+ *     jmp  done
+ *   slow:
+ *     mov  rcx, rax / mov rdx, env / movabs r11, wrapper / call
+ *   done:
+ *
+ * GCは起こさない。cc_car/cc_cdrはメモリを読むだけで確保しないため、
+ * 中間値がGCから見えなくなる窓も生じない(展開前のwrapper呼び出しも同じ)。
+ * @param cdr_offset carなら0、cdrなら8
+ * @param wrapper_fn 判定を外れたときに呼ぶos_car_checked/os_cdr_checked
+ */
+static void za_emit_inline_car_cdr(UINT8 cdr_offset, void *wrapper_fn) {
+    /* [safety] **分類 1(タグ検査)は safety 0 で外す。** 4 命令消える。
+     *
+     * **空リスト判定は外さない**(下の cmp/je)。外すと「誤りを知らせる」が
+     * 「空リストを返す」に静かに変わるので、仕様が黙って変わってしまう。
+     *
+     * **外したときの壊れ方**: cons でない値が来ると and rax,~7 してから
+     * [rax + off] を読むので、**fixnum 42 なら番地 40 を読む = #PF で機械が止まる**。
+     * 「ゴミを読む」で済まないことがある(documents/declaim-design.md の D7)。
+     * 宣言した人の責任である(safety 0 は仕様違反モード)。 */
+    UINT64 not_cons = 0;
+    int emit_tag_check = za_safety_checks_enabled();
+    if (emit_tag_check) {
+        jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RAX);
+        jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
+        jit_cmp_reg_imm8(ZA_REG_R10, (UINT8)TAG_CONS);
+        not_cons = jit_emit_jne_rel32_placeholder();
+    }
+
+    za_emit_cmp_rax_nil();
+    UINT64 is_nil = jit_emit_je_rel32_placeholder();
+
+    jit_and_reg_imm8(ZA_REG_RAX, 0xF8);
+    jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_RAX, cdr_offset);
+    UINT64 done = jit_emit_jmp_rel32_placeholder();
+
+    if (emit_tag_check) {
+        jit_patch_rel32(not_cons);
+    }
+    jit_patch_rel32(is_nil);
+    jit_mov_rcx_rax();
+    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+    jit_movabs_r11((UINT64)wrapper_fn);
+    jit_call_r11();
+
+    jit_patch_rel32(done);
+}
+
+/**
+ * [インライン展開] 直前のcmpが立てたフラグから、g_sym_t / nil をraxへ置く。
+ * primitive_null1(a == nil ? t : nil)と primitive_eq2(a == b ? t : nil)の
+ * 「比較の後」の部分で、どちらも同じ形になる。
+ * **分岐を使わない(cmov)。** 呼び出し元はcmpを出した直後にこれを呼ぶこと。
+ */
+static void za_emit_inline_bool_from_flags(void) {
+    /* [原則8] g_sym_tは**GCヒープ上にあり移動する**(os_gc_collect_bodyが
+       g_sym_t = gc_copy_value(g_sym_t) で更新する)。値を即値として焼き込むと、
+       GCが1回走った時点で旧From空間のアドレスを返すようになり、呼び出し元が
+       ゴミを掴む。実際にこれを踏み、printが壊れたオブジェクトを辿って
+       50MBの出力を吐いた。**グローバル変数のアドレスをmovabsしてderefする**こと。
+       nilは g_nil_cell というFrom/To空間の外の固定領域にあり移動しないので
+       即値で焼いてよい(既存コードも jit_movabs_rax(nil) を多数使っている)。
+
+       [重要] 呼び出し元のcmpが立てたフラグを、cmoveまで壊してはならない。
+       movabs(mov r64,imm64)もmov r64,[r64]もフラグを変えないので、この並びは安全。
+
+       分岐で組んだ版から cmov へ変えた理由は実測(documents/inline-builtin.md):
+       QEMU(TCG)では分岐の追加が重く、nullの展開が**呼び出しより 11% 遅かった**。 */
+    jit_movabs_reg(ZA_REG_R10, (UINT64)(void *)&g_sym_t);
+    jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);
+    jit_movabs_rax(nil);
+    jit_cmove_reg_reg(ZA_REG_RAX, ZA_REG_R10);
+}
+
 static int za_compile_unary_env(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                                  const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                                  UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
-                                 UINT64 arith_depth, void *wrapper_fn) {
+                                 UINT64 arith_depth, void *wrapper_fn, UINT64 inline_bit) {
     GC_PROTECT(params);
     GC_PROTECT(env);
     lisp_val_t rest = cc_cdr(form);
@@ -2668,10 +3641,15 @@ static int za_compile_unary_env(lisp_val_t form, lisp_val_t params, UINT64 fixed
         return 0;
     }
     UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
-    jit_mov_rcx_rax();
-    za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
-    jit_movabs_r11((UINT64)wrapper_fn);
-    jit_call_r11();
+    if (inline_bit != 0 && za_inline_enabled(inline_bit)) {
+        /* car=+0 / cdr=+8。INLINE_BIT_CDRのときだけオフセット8 */
+        za_emit_inline_car_cdr((inline_bit == INLINE_BIT_CDR) ? 8 : 0, wrapper_fn);
+    } else {
+        jit_mov_rcx_rax();
+        za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
+        jit_movabs_r11((UINT64)wrapper_fn);
+        jit_call_r11();
+    }
     jit_patch_rel32(ct_patch);
     return 1;
 }
@@ -2692,10 +3670,11 @@ static int za_compile_unary_env(lisp_val_t form, lisp_val_t params, UINT64 fixed
 static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                               const za_local_scope_t *locals, const za_syms_t *syms, lisp_val_t env,
                               UINT64 trampoline_offset, UINT64 nlx_depth, za_tagbody_ctx_t *tb_ctx, UINT64 call_depth,
-                              UINT64 arith_depth, void *wrapper_fn) {
+                              UINT64 arith_depth, void *wrapper_fn, UINT64 inline_bit) {
     GC_PROTECT(params);
     GC_PROTECT(env);
     if (arith_depth >= ZA_MAX_ARITH_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_ARITH_DEPTH */
         return 0;
     }
     lisp_val_t rest = cc_cdr(form);
@@ -2710,6 +3689,21 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
     }
     lisp_val_t op1_form = cc_car(rest2);
     GC_PROTECT(op1_form);
+
+    /* [型特化] **両方の型が宣言されているときだけ**呼び先を専用関数へ差し替える。
+       za_compile_fold と同じ仕組みだが、`/` はこちらを通る
+       (documents/divide-direct-call.md §3-1)。za_specialized_wrapper は
+       GENERIC の関数ポインタで振り分けるので、比較演算子が誤って
+       差し替わることはない(表に載っていないので 0 が返る)。 */
+    {
+        void *specialized = za_specialized_wrapper(
+            wrapper_fn,
+            za_operand_decl_type(op0_form, params, fixed_count, locals),
+            za_operand_decl_type(op1_form, params, fixed_count, locals));
+        if (specialized != 0) {
+            wrapper_fn = specialized;
+        }
+    }
 
     // JIT GC保護コスト削減(Phase1): za_compile_foldと同じ理由・同じ判定基準
     // (za_operand_is_safe_leaf参照)で、op1がGCを誘発しうる呼び出しを一切含まない
@@ -2738,8 +3732,15 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
 
     jit_mov_rdx_rax();
     za_load_slot(ZA_REG_RCX, val_off);
-    jit_movabs_r11((UINT64)wrapper_fn);
-    jit_call_r11();
+    if (inline_bit == INLINE_BIT_EQ && za_inline_enabled(INLINE_BIT_EQ)) {
+        /* [インライン展開] primitive_eq2(a == b ? t : nil)と等価。
+           rcx=第一オペランド、rdx=第二オペランドが揃っているのでそのまま比較する */
+        jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
+        za_emit_inline_bool_from_flags();
+    } else {
+        jit_movabs_r11((UINT64)wrapper_fn);
+        jit_call_r11();
+    }
 
     if (skip_protect) {
         // 何もlinkしていないためunlink/cleanupは不要。ct_patch1(op1はleafなので
@@ -2967,19 +3968,29 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
 static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out_syms, UINT64 *out_count) {
     UINT64 count = 0;
     for (lisp_val_t cur = lambda_vars; cur != nil; cur = cc_cdr(cur)) {
+        /* [形の検査] 容量上限ではないので `[診断] 容量上限` の注記は付けない。
+           **2026-10-30: ここは黙っていた。** 入れ子が深い形ではこの検査が先に当たって
+           let のコンパイルが断念されるのに記録が残らず、`%%diag-za-bail-at 0` が
+           呼び出し側の伝播点を指していた(= 起点が消える)。実測で 26 段から当たる
+           (PR #94 の取り込み前は 27 段から)。**なぜ深さで形が崩れるのかは未解明。**
+           ここで記録しておけば、次に見る人が起点から追える。 */
         if ((cur & TAG_MASK) != TAG_CONS) {
+            ZA_BAIL_LINE();   /* [形] 仮引数が平坦なリストではない */
             return 0;
         }
         lisp_val_t sym = cc_car(cur);
         if ((sym & TAG_MASK) != TAG_SYMBOL || sym == g_sym_rest) {
+            ZA_BAIL_LINE();   /* [形] 仮引数がシンボルでない、または &rest */
             return 0;
         }
         for (UINT64 i = 0; i < count; i++) {
             if (out_syms[i] == sym) {
+                ZA_BAIL_LINE();   /* [形] 仮引数が重複している */
                 return 0;
             }
         }
         if (count >= ZA_MAX_LOCALS_PER_LET) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_LOCALS_PER_LET */
             return 0;
         }
         out_syms[count++] = sym;
@@ -3032,6 +4043,29 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     if (!za_local_validate_lambda_vars(lambda_vars, var_syms, &var_count)) {
         return 0;
     }
+
+    /* [Phase 4a-2] let本体の先頭のdeclareを剥がし、束縛変数の型を記録する。
+       letは `((lambda (v...) . body) init...)` へマクロ展開されるが、letマクロは
+       bodyを `,@body` でそのまま通すので、**展開後もdeclareはlambda本体の先頭に
+       そのまま残っている**。したがって展開前に手を入れる必要はなく、ここで剥がせば
+       よい(documents/declare-types.md §2-1の調査結果)。
+
+       この代入より下でlambda_bodyを読むのは解析ループと本体コンパイルループだけ
+       なので、ここで差し替えれば両方が宣言を取り除いたbodyを見る。
+
+       os_scan_declarationsは確保を行わないため、**コンパイル中にGCを誘発しない**
+       (documents/pitfalls.md 原則4)。Lisp側の%find-classをosApplyFunctionで
+       呼ぶ実装にしなかったのはこのためである。 */
+    /* [inline] **剥がす前に**読む。適用するのは body のコンパイルの直前だけで、
+       ここではまだ g_za_inline_scope を触らない。
+       let は `((lambda (v...) . body) init...)` なので、**init 式はこの下で
+       body より先にコンパイルされる。** 適用位置を body ループの直前にすることで、
+       「let の初期化式には効かない」が自然に成り立つ(CommonLisp と同じ。
+       documents/inline-arith.md §7-2) */
+    UINT64 body_inline_bits = os_scan_declaration_inline(lambda_body, g_za_inline_scope);
+
+    os_decl_types_t local_decl_types;
+    lambda_body = os_scan_declarations(lambda_body, var_syms, var_count, &local_decl_types);
 
     // SBCL方式のcell昇格(za_local_var_tのコメント参照): setqされ、かつエスケープする
     // lambdaに捕捉される変数だけをZA_VAR_BOXEDにする。bodyをコンパイルする前に
@@ -3087,7 +4121,13 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     }
     if (g_za_analyze_over) {
         /* 打ち切った解析結果はbox化の判断に使えない(box化漏れは誤った実行結果になる)。
-           ZA_BAIL_LINE()はこの位置より後で定義されるため使えない。診断はシリアルに出る */
+           打ち切りの上限はZA_MAX_ANALYZE_STEPSで、za_analyze_var_usageがg_za_analyze_overを立てる。
+
+           **2026-10-30: ここには「ZA_BAIL_LINE()はこの位置より後で定義されるため使えない」と
+           書かれていたが、定義はza.c:154でこの位置より前だった**(原則12: コメントは腐る)。
+           そのせいでこの断念だけが黙り、入れ子が深い形では**起点が記録されなかった**
+           (記録されるのは呼び出し側の伝播点だけ)。記録するようにした。 */
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_ANALYZE_STEPS */
         return 0;
     }
     za_var_kind_t var_kind[ZA_MAX_LOCALS_PER_LET];
@@ -3100,6 +4140,7 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         depth++;
     }
     if (depth >= ZA_MAX_LET_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_LET_DEPTH */
         return 0;
     }
 
@@ -3110,6 +4151,7 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
             return 0;
         }
         if (init_count >= ZA_MAX_LOCALS_PER_LET) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_LOCALS_PER_LET */
             return 0;
         }
         init_forms[init_count++] = cc_car(rest);
@@ -3201,9 +4243,21 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
     for (UINT64 i = 0; i < var_count; i++) {
         new_scope.vars[i].sym = var_syms[i];
         new_scope.vars[i].val_off = za_local_val_off(depth, i);
-        new_scope.vars[i].kind = var_kind[i];
+        new_scope.vars[i].kind = (UINT16)var_kind[i];
+        /* [Phase 4a-2] 型はコンパイル時のこの構造にだけ置く。frameにも環境にも
+           残さない(letのhot pathを重くしないため。指示書 §1) */
+        new_scope.vars[i].decl_type = os_decl_types_get(local_decl_types, i);
+        new_scope.vars[i]._pad = 0;
+        if (new_scope.vars[i].decl_type != OS_DECL_TYPE_NONE) {
+            g_za_local_decl_count++;
+        }
         za_gc_protect_batch_push(&local_scope_nodes[i], &new_scope.vars[i].sym);
     }
+
+    /* [inline] ここから body。**init 式のコンパイルは既に終わっている。**
+       cleanup 属性にしてあるので、body の途中で return 0 しても復元される */
+    UINT64 saved_inline_scope __attribute__((cleanup(za_inline_scope_restore))) = g_za_inline_scope;
+    g_za_inline_scope = body_inline_bits;
 
     UINT64 body_end_patches[ZA_MAX_OPERANDS];
     UINT64 body_end_patch_count = 0;
@@ -3227,6 +4281,7 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
             }
             if (!is_last) {
                 if (body_end_patch_count >= ZA_MAX_OPERANDS) {
+                    ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
                     return 0;
                 }
                 body_end_patches[body_end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -3279,6 +4334,7 @@ static int za_compile_progn(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
             }
             if (!is_last) {
                 if (body_end_patch_count >= ZA_MAX_OPERANDS) {
+                    ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
                     return 0;
                 }
                 body_end_patches[body_end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -3328,9 +4384,13 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
        二度と評価されないので、外からは「固まった」ようにしか見えない。
        断念すれば遅くなるだけで正しく動く。 */
     if (g_za_compile_nest >= ZA_MAX_COMPILE_NEST) {
-        /* ZA_MAX_JIT_RELOCS等の固定上限と同じ形で知らせる(ZA_BAIL_LINEはこの位置では
-           まだ未定義なので使えない)。g_jit_overflowが立つとza_try_compile_defunは
-           コード生成を捨ててnilを返し、呼び出し元はインタプリタへ落ちる */
+        /* ZA_MAX_JIT_RELOCS等の固定上限と同じ形で知らせる。g_jit_overflowが立つと
+           za_try_compile_defunはコード生成を捨ててnilを返し、呼び出し元はインタプリタ
+           へ落ちる。
+           2026-10-04: 以前ここには「ZA_BAIL_LINEはこの位置ではまだ未定義なので使えない」
+           と書いてあった。ZA_BAIL_LINEの定義をファイル先頭(ZA_MAX_OPERANDSの直後)へ
+           移したので、その制約は無くなった。他の容量上限と同じく行番号を記録する */
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_COMPILE_NEST */
         g_jit_overflow = 1;
         return 0;
     }
@@ -3407,6 +4467,17 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
         return za_compile_progn(form, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth,
                                  tb_ctx, call_depth, arith_depth);
     }
+    /* [Phase 4a-2] 宣言として扱われなかった位置のdeclare(body途中、あるいは
+       対象にしていない束縛形式の中)をnilへ潰す。
+       **za_is_excluded_special_formへ入れてはいけない。** 入れると
+       「declareを書いた関数がコンパイルされなくなる」という本末転倒になる
+       (declaimがまさにその形。documents/type-system-survey.md §6-4)。
+       一般呼び出しとしてコンパイルするのも駄目で、実行時にDECLAREという関数が
+       見つからずEVAL-ERRORになる。インタプリタ側のeval_declareと同じくnilを返す */
+    if (head == g_sym_declare) {
+        jit_movabs_rax(nil);
+        return 1;
+    }
     if (head == syms->plus) {
         if (cc_cdr(form) == nil) {
             jit_movabs_rax(os_make_fixnum(0)); // ISLisp仕様§19.4: (+) => 0
@@ -3429,107 +4500,125 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
     }
     if (head == syms->lt) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_less_than2);
+                                  call_depth, arith_depth, (void *)primitive_less_than2, 0);
     }
     if (head == syms->eq) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_num_equal2);
+                                  call_depth, arith_depth, (void *)primitive_num_equal2, 0);
     }
     if (head == syms->gt) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_greater_than2);
+                                  call_depth, arith_depth, (void *)primitive_greater_than2, 0);
     }
     if (head == syms->le) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_less_equal2);
+                                  call_depth, arith_depth, (void *)primitive_less_equal2, 0);
     }
     if (head == syms->ge) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_greater_equal2);
+                                  call_depth, arith_depth, (void *)primitive_greater_equal2, 0);
+    }
+    if (head == syms->ne) {
+        return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                  call_depth, arith_depth, (void *)primitive_num_not_equal2, 0);
+    }
+    if (head == syms->inline_here && cc_cdr(form) == nil) {
+        /* [inline] コンパイル時に畳む。**実行時には何も起きない。**
+           いまのレキシカルスコープのビット集合をそのまま即値で返す */
+        jit_movabs_rax(os_make_fixnum(g_za_inline_scope));
+        return 1;
+    }
+    if (head == syms->slash) {
+        /* **二項のみ。** (/ a b c) は一般呼び出しへ落ちる(n項の型昇格規則は C 側が持つ)。
+           za_compile_binary は比較だけでなく**確保しうる呼び先**も扱える:
+           GC 保護の形が za_compile_fold(primitive_add2 を呼ぶ)と同一だからである
+           (documents/divide-direct-call.md §3-1)。 */
+        return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
+                                  call_depth, arith_depth, (void *)primitive_divide2, 0);
     }
     if (head == g_sym_car) {
         // consでない引数はdomain-error(ISLisp仕様§21.2、primitive_carと同じ)。envが要るので
         // os_car_checked(x, env)をrdx=envで呼ぶ
         return za_compile_unary_env(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth,
-                                     tb_ctx, call_depth, arith_depth, (void *)os_car_checked);
+                                     tb_ctx, call_depth, arith_depth, (void *)os_car_checked, INLINE_BIT_CAR);
     }
     if (head == g_sym_cdr) {
         return za_compile_unary_env(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth,
-                                     tb_ctx, call_depth, arith_depth, (void *)os_cdr_checked);
+                                     tb_ctx, call_depth, arith_depth, (void *)os_cdr_checked, INLINE_BIT_CDR);
     }
     if (head == syms->nullsym) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_null1);
+                                 call_depth, arith_depth, (void *)primitive_null1, INLINE_BIT_NULL);
     }
     if (head == syms->notsym) {
         // NOTはnullとISLisp仕様上完全に同一(runtime.cのos_bootstrapがprimitive_null実体を
         // 共用しているのと同じ理由)なので、za側もprimitive_null1をそのまま再利用する。
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_null1);
+                                 call_depth, arith_depth, (void *)primitive_null1, INLINE_BIT_NULL);
     }
     if (head == syms->atom) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_atom1);
+                                 call_depth, arith_depth, (void *)primitive_atom1, 0);
     }
     if (head == syms->consp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_consp1);
+                                 call_depth, arith_depth, (void *)primitive_consp1, 0);
     }
     if (head == syms->listp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_listp1);
+                                 call_depth, arith_depth, (void *)primitive_listp1, 0);
     }
     if (head == syms->numberp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_numberp1);
+                                 call_depth, arith_depth, (void *)primitive_numberp1, 0);
     }
     if (head == syms->fixnump) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_fixnump1);
+                                 call_depth, arith_depth, (void *)primitive_fixnump1, 0);
     }
     if (head == syms->bignump) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_bignump1);
+                                 call_depth, arith_depth, (void *)primitive_bignump1, 0);
     }
     if (head == syms->floatp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_floatp1);
+                                 call_depth, arith_depth, (void *)primitive_floatp1, 0);
     }
     if (head == syms->symbolp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_symbolp1);
+                                 call_depth, arith_depth, (void *)primitive_symbolp1, 0);
     }
     if (head == syms->stringp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_stringp1);
+                                 call_depth, arith_depth, (void *)primitive_stringp1, 0);
     }
     if (head == syms->functionp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_functionp1);
+                                 call_depth, arith_depth, (void *)primitive_functionp1, 0);
     }
     if (head == syms->characterp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_characterp1);
+                                 call_depth, arith_depth, (void *)primitive_characterp1, 0);
     }
     if (head == syms->streamp) {
         return za_compile_unary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                 call_depth, arith_depth, (void *)primitive_streamp1);
+                                 call_depth, arith_depth, (void *)primitive_streamp1, 0);
     }
     if (head == syms->setcar) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_set_car2);
+                                  call_depth, arith_depth, (void *)primitive_set_car2, 0);
     }
     if (head == syms->setcdr) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_set_cdr2);
+                                  call_depth, arith_depth, (void *)primitive_set_cdr2, 0);
     }
     if (head == syms->eqp) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)primitive_eq2);
+                                  call_depth, arith_depth, (void *)primitive_eq2, INLINE_BIT_EQ);
     }
     if (head == g_sym_cons) {
         return za_compile_binary(form, params, fixed_count, locals, syms, env, trampoline_offset, nlx_depth, tb_ctx,
-                                  call_depth, arith_depth, (void *)os_make_cons);
+                                  call_depth, arith_depth, (void *)os_make_cons, 0);
     }
     if (za_is_raw_lambda(form)) {
         return za_compile_lambda(form, params, fixed_count, locals);
@@ -3567,8 +4656,7 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
         // 評価を行わず、if全体の結果としてそのまま伝播する(ct_patchはif全体の終端、
         // つまり通常経路がthen/elseを評価し終えて流れ落ちる地点と同じ着地点へ合流する)。
         UINT64 ct_patch = za_emit_ct_check_and_jmp_if_transfer();
-        jit_movabs_r11(nil);
-        jit_cmp_rax_r11();
+        za_emit_cmp_rax_nil();
         UINT64 je_patch = jit_emit_je_rel32_placeholder();
 
         if (!za_compile_expr(then_form, params, fixed_count, locals, syms, env, is_tail, trampoline_offset, nlx_depth,
@@ -3814,6 +4902,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
                             UINT64 call_depth, UINT64 arith_depth) {
     GC_PROTECT(env);
     if (call_depth >= ZA_MAX_CALL_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_CALL_DEPTH */
         return 0;
     }
     // fn_symがflet/labels束縛関数を指す場合、名前再解決ではなくgensymスロット経由で
@@ -3839,6 +4928,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             return 0;
         }
         if (argc >= ZA_MAX_OPERANDS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
             return 0;
         }
         arg_forms[argc++] = cc_car(rest);
@@ -4101,7 +5191,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
             }
             jit_mov_reg_reg(ZA_REG_R11, ZA_REG_R13);
             za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
-        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+        za_emit_add_rsp_frame();
             jit_pop_r13();
             jit_pop_rbx();
             jit_jmp_reg(ZA_REG_R11);
@@ -4125,7 +5215,7 @@ static int za_compile_call(lisp_val_t form, lisp_val_t fn_sym, lisp_val_t params
         za_load_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
         za_load_slot(ZA_REG_R8, ZA_OFF_FN_VAL);
         za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
-        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
+        za_emit_add_rsp_frame();
         jit_pop_r13();
         jit_pop_rbx();
         jit_emit_jmp_to_trampoline(trampoline_offset);
@@ -4221,6 +5311,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
         }
     }
     if (qq_depth >= ZA_MAX_QQ_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_DEPTH */
         return 0;
     }
 
@@ -4253,6 +5344,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
         if (elem == g_sym_quasiquote ||
             ((elem == g_sym_unquote || elem == g_sym_unquote_splicing) && level > 0)) {
             if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+                ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_ELEMENTS */
                 return 0;
             }
             items[item_count].data = elem;
@@ -4278,6 +5370,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
                 return 0;
             }
             if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+                ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_ELEMENTS */
                 return 0;
             }
             items[item_count].data = cc_car(splice_rest);
@@ -4288,6 +5381,7 @@ static int za_compile_quasiquote(lisp_val_t template_form, lisp_val_t params, UI
             continue;
         }
         if (item_count >= ZA_MAX_QQ_ELEMENTS) {
+            ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_QQ_ELEMENTS */
             return 0;
         }
         items[item_count].data = elem;
@@ -4426,6 +5520,7 @@ static int za_compile_body_forms(lisp_val_t forms, lisp_val_t params, UINT64 fix
         }
         if (!is_last) {
             if (end_patch_count >= ZA_MAX_OPERANDS) {
+                ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_OPERANDS */
                 return 0;
             }
             end_patches[end_patch_count++] = za_emit_ct_check_and_jmp_if_transfer();
@@ -4543,6 +5638,7 @@ static int za_compile_return_from(lisp_val_t form, lisp_val_t params, UINT64 fix
         return 0;
     }
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -4644,6 +5740,7 @@ static int za_compile_defdynamic(lisp_val_t form, lisp_val_t params, UINT64 fixe
         return 0;
     }
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -4800,6 +5897,7 @@ static int za_compile_catch(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     lisp_val_t body = cc_cdr(rest);
     GC_PROTECT(body);
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -4880,6 +5978,7 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     lisp_val_t result_form = cc_car(rest2);
     GC_PROTECT(result_form);
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
+        ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
         return 0;
     }
 
@@ -4922,27 +6021,6 @@ static int za_compile_throw(lisp_val_t form, lisp_val_t params, UINT64 fixed_cou
     return 1;
 }
 
-/* [性能測定] Phase5 第2部 2-3: JITがコンパイルを断念した位置を観測可能にする。
-   断念は*ok=0を書くだけで黙って進むため、外からは「なぜJIT化されなかったか」が
-   一切分からず切り分けに時間がかかっていた(cc_car/cc_cdrのinline化回帰の調査で
-   実際に問題になった)。直近の断念箇所の行番号を記録し、%%DIAG-ZA-BAIL-LINEで読む */
-static int g_za_bail_line = 0;
-
-/* [GC監査] 断念行を1つしか持たないと、記録されるのは**伝播点**であって起点ではない。
-   実測でza.c:4711(za_compile_body_formsが0を返したときの伝播)しか出なかった。
-   最初のN件を順に残せば、先頭が最も内側 = 起点に近いものになる。
-   なお、計器の追加先は慎重に選ぶこと。za_compile_fold/binary/unaryの`return 0;`は
-   「この特化経路は当てはまらない」という**正常な否定**であって断念ではない。
-   ここへ一括で計器を入れると正常経路を断念として拾う(documents/pitfalls.md 原則6の
-   実例そのもの)。現状の44箇所は失敗パスであることを確認済みのものだけである。 */
-#define ZA_BAIL_MAX 24
-static int g_za_bail_lines[ZA_BAIL_MAX];
-static int g_za_bail_count = 0;
-
-#define ZA_BAIL_LINE() do { \
-        if (g_za_bail_line == 0) { g_za_bail_line = __LINE__; } \
-        if (g_za_bail_count < ZA_BAIL_MAX) { g_za_bail_lines[g_za_bail_count++] = __LINE__; } \
-    } while (0)
 /* [性能測定] 計器を入れる対象は「失敗を表す返却」だけにすること。以前
    `return nil;`へ一括で入れたところ、za_rewrite_body_listのリスト終端(正常終了)
    まで拾って誤った箇所を指した。逆にreturn 0だけに絞ると、za_try_compile_defunが
@@ -4952,6 +6030,30 @@ static int g_za_bail_count = 0;
 lisp_val_t cc_diag_za_bail_line(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
     return os_make_fixnum((UINT64)g_za_bail_line);
+}
+
+/** [Phase 4a-2][診断] 直近のコンパイル試行にコンパイラが受け取った仮引数の型宣言の
+ * 個数。%%DECLARED-TYPES-OF が読むのは**コンパイル後にmetaへ書き戻した結果**なので、
+ * 「コンパイラ本体へ届いていたか」はこちらでしか確かめられない
+ * (コンパイルに失敗した関数では両者が食い違う)。 */
+lisp_val_t cc_diag_za_param_decls(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    UINT64 n = 0;
+    for (UINT64 i = 0; i < OS_DECL_TYPES_MAX_VARS; i++) {
+        if (os_decl_types_get(g_za_param_decl_types, i) != OS_DECL_TYPE_NONE) {
+            n++;
+        }
+    }
+    return os_make_fixnum(n);
+}
+
+/** [Phase 4a-2][診断] 直近のコンパイル試行でletの束縛変数に記録した型宣言の個数。
+ * let-localの型はza_local_scope_t(Cスタック上のコンパイル時構造)にしか置かず
+ * 関数オブジェクトに残らないため、%%DECLARED-TYPES-OFのようには引けない。
+ * 配管が通っていることを外から確かめる唯一の手段。 */
+lisp_val_t cc_diag_za_local_decls(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_fixnum(g_za_local_decl_count);
 }
 
 /** 記録された断念行の件数(先頭ほど内側 = 起点に近い) */
@@ -4983,27 +6085,11 @@ lisp_val_t cc_diag_za_code_len(lisp_val_t args, lisp_val_t env) {
     動いたか」も分かる */
 lisp_val_t cc_diag_za_scan(lisp_val_t args, lisp_val_t env) {
     (void)args; (void)env;
-    g_za_scan_count = 0;
-    if (g_za_last_code == 0 || g_za_last_code_len < 10) {
-        return os_make_fixnum(0);
-    }
-    for (UINT64 i = 0; i + 10 <= g_za_last_code_len; i++) {
-        UINT8 rex = g_za_last_code[i];
-        UINT8 op = g_za_last_code[i + 1];
-        if ((rex != 0x48 && rex != 0x49) || (op & 0xF8) != 0xB8) {
-            continue;
-        }
-        UINT64 imm = 0;
-        for (UINT64 b = 0; b < 8; b++) {
-            imm |= ((UINT64)g_za_last_code[i + 2 + b]) << (b * 8);
-        }
-        if (g_za_scan_count < ZA_MAX_SCAN_IMM) {
-            g_za_scan_off[g_za_scan_count] = i;
-            g_za_scan_val[g_za_scan_count] = imm;
-            g_za_scan_count++;
-        }
-        i += 9; /* この命令の残りは読み飛ばす */
-    }
+    /* za_try_compile_defunの末尾(原則8の監査)が、発行時に記録した即値の位置から
+       g_za_scan_off/valを埋めている。ここではその件数を返すだけでよい。
+       以前はここで生成コードをバイト走査し直していたが、短縮形 mov r32, imm32 を
+       正しくデコードできず誤検出するため、記録ベースへ統一した
+       (documents/jit-immediate-operands.md)。 */
     return os_make_fixnum(g_za_scan_count);
 }
 
@@ -5051,11 +6137,13 @@ lisp_val_t cc_diag_za_bail_count(lisp_val_t args, lisp_val_t env) {
     return os_make_fixnum((UINT64)g_za_bail_count);
 }
 
-/** i番目の断念行 */
+/** i番目の断念行。保存できたのは先頭ZA_BAIL_MAX件だけなので、
+ *  g_za_bail_countが枠を超えていてもそこで頭打ちにする(配列の外を読まないため)。
+ *  **countが枠より大きければ切り詰めている** — 呼び出し側はそれで判断できる。 */
 lisp_val_t cc_diag_za_bail_at(lisp_val_t args, lisp_val_t env) {
     (void)env;
     UINT64 i = os_fixnum_magnitude(cc_car(args));
-    if ((int)i >= g_za_bail_count) { return os_make_fixnum(0); }
+    if ((int)i >= g_za_bail_count || i >= (UINT64)ZA_BAIL_MAX) { return os_make_fixnum(0); }
     return os_make_fixnum((UINT64)g_za_bail_lines[i]);
 }
 
@@ -5299,7 +6387,7 @@ static lisp_val_t za_rewrite_fn_refs(lisp_val_t form, lisp_val_t env, const za_f
             }
             lisp_val_t name = cc_car(binding);
             if (inner_scope.count >= ZA_MAX_FLET_BINDINGS) {
-                *ok = 0; ZA_BAIL_LINE();
+                *ok = 0; ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_FLET_BINDINGS */
                 return form;
             }
             inner_scope.bindings[inner_scope.count].orig_name = name;
@@ -5403,7 +6491,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
     GC_PROTECT(body);
 
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
-        { ZA_BAIL_LINE(); return 0; }
+        { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
     }
 
     // bindings検証: 「(name params . body)」の形を持つ、重複を許す平坦なリスト
@@ -5430,7 +6518,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
             { ZA_BAIL_LINE(); return 0; }
         }
         if (binding_count >= ZA_MAX_FLET_BINDINGS) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_FLET_BINDINGS */
         }
         name_syms[binding_count] = name;
         binding_params[binding_count] = cc_car(brest);
@@ -5528,7 +6616,7 @@ static int za_compile_flet_labels(lisp_val_t form, int is_labels, lisp_val_t par
         } else if (g_za_lambda_slot_count < ZA_MAX_LAMBDA_SLOTS) {
             lambda_slot_idx = g_za_lambda_slot_count++;
         } else {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_LAMBDA_SLOTS */
         }
         g_za_lambda_slots[lambda_slot_idx].v = os_make_cons(binding_params[i], binding_bodies[i]);
         os_gc_register_root(&g_za_lambda_slots[lambda_slot_idx].v);
@@ -5677,8 +6765,7 @@ static void za_emit_load_callee_env_rcx(void) {
     jit_mov_reg_from_mem_disp8(ZA_REG_R10, ZA_REG_R10, 0);   // fn_obj(タグ付き)
     jit_and_reg_imm8(ZA_REG_R10, JIT_IMM8_UNTAG_MASK);
     jit_mov_reg_from_mem_disp8(ZA_REG_RAX, ZA_REG_R10, 24);  // rax = fn_obj word3
-    jit_movabs_reg(ZA_REG_R11, nil);
-    jit_cmp_rax_r11();
+    za_emit_cmp_rax_nil();
     UINT64 je_nil = jit_emit_je_rel32_placeholder();
     jit_mov_reg_reg(ZA_REG_RCX, ZA_REG_RAX);
     UINT64 jmp_done = jit_emit_jmp_rel32_placeholder();
@@ -5702,7 +6789,7 @@ static int za_compile_unwind_protect(lisp_val_t form, lisp_val_t params, UINT64 
     lisp_val_t cleanup_forms = cc_cdr(rest);
     GC_PROTECT(cleanup_forms);
     if (nlx_depth >= ZA_MAX_NLX_DEPTH) {
-        { ZA_BAIL_LINE(); return 0; }
+        { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_NLX_DEPTH */
     }
 
     // protected-formの評価結果は制御転送かどうかに関わらずcleanupへ進む
@@ -5836,7 +6923,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
             }
             if (idx < 0) {
                 if (new_ctx.tag_count >= ZA_MAX_TAGBODY_TAGS) {
-                    { ZA_BAIL_LINE(); return 0; }
+                    { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_TAGS */
                 }
                 idx = new_ctx.tag_count++;
                 new_ctx.tags[idx].tag = elem;
@@ -5853,7 +6940,7 @@ static int za_compile_tagbody(lisp_val_t form, lisp_val_t params, UINT64 fixed_c
         }
 
         if (end_patch_count >= ZA_MAX_TAGBODY_FORMS) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_FORMS */
         }
         if (!za_compile_expr(elem, params, fixed_count, locals, syms, env, 0, trampoline_offset, nlx_depth, &new_ctx,
                               call_depth, arith_depth)) {
@@ -5954,7 +7041,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
     }
     if (idx < 0) {
         if (tb_ctx->tag_count >= ZA_MAX_TAGBODY_TAGS) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_TAGS */
         }
         idx = tb_ctx->tag_count++;
         tb_ctx->tags[idx].tag = tag;
@@ -5972,7 +7059,7 @@ static int za_compile_go(lisp_val_t form, UINT64 nlx_depth, za_tagbody_ctx_t *tb
         jit_emit_jmp_to(tb_ctx->tags[idx].offset);
     } else {
         if (tb_ctx->tags[idx].pending_count >= ZA_MAX_TAGBODY_GOTOS_PER_TAG) {
-            { ZA_BAIL_LINE(); return 0; }
+            { ZA_BAIL_LINE(); return 0; }   /* [診断] 容量上限 ZA_MAX_TAGBODY_GOTOS_PER_TAG */
         }
         tb_ctx->tags[idx].pending[tb_ctx->tags[idx].pending_count++] = jit_emit_jmp_rel32_placeholder();
     }
@@ -5993,8 +7080,29 @@ lisp_val_t cc_diag_jit_used(lisp_val_t args, lisp_val_t env) {
     「何度も呼ばれている」かを切り分けるため、タイマーサンプラから読む */
 UINT64 g_za_compile_calls = 0;
 
+/* [P6] エピローグ(gc_rootsの巻き戻し・退避レジスタの復元・ret)を出す。
+   通常の出口と、arity エラー側の出口の2箇所で使う。
+   **arity エラー側はここへ jmp で戻らず写す。** jmp で戻すと関数の最後の命令が
+   jmp になり、「コードブロックの末尾は ret」という不変条件
+   (test/lisp/disassemble_test.lisp)が崩れるため。
+   za_gc_unlinkの呼び出し自体がrcxを使うため、本体の結果(rax)は先にr13へ退避してから
+   呼び、戻ってから復元する。 */
+static void za_emit_epilogue(void) {
+    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
+    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
+    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
+    jit_call_r11();
+    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
+    za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
+    za_emit_add_rsp_frame();
+    jit_pop_r13();
+    jit_pop_rbx();
+    jit_ret();
+}
+
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
-                                lisp_val_t capture_env, lisp_val_t owner_env) {
+                                lisp_val_t capture_env, lisp_val_t owner_env,
+                                UINT64 optimize, os_decl_types_t declared_types) {
     g_za_compile_calls++;
     g_za_analyze_steps = 0;
     g_za_analyze_over = 0;
@@ -6026,10 +7134,28 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         { ZA_BAIL_LINE(); return nil; }
     }
 
-    if (body == nil || (body & TAG_MASK) != TAG_CONS || cc_cdr(body) != nil) {
+    if (body == nil || (body & TAG_MASK) != TAG_CONS) {
         { ZA_BAIL_LINE(); return nil; }
     }
-    lisp_val_t form = cc_car(body);
+
+    /* [Phase 4a-1] bodyが2式以上なら `(progn . body)` で包んでからコンパイルする。
+       以前はここで `cc_cdr(body) != nil` を見て断念していたため、
+       `(defun f (x) a b)` はJIT化されず、`(defun f (x) (progn a b))` だけが通っていた
+       (documents/type-system-survey.md §6-3の実測)。包んでいなかっただけで、
+       za_compile_prognは既にbodyの複数式を正しく扱える。
+
+       [なぜprognで足りるか] za_compile_prognは非最終フォームごとに
+       za_emit_ct_check_and_jmp_if_transferを出すので、bodyの途中でreturn-from/throw/go
+       が起きたら残りのフォームを評価せずに伝播する(インタプリタのeval_prognと同じ規約)。
+       またcall_depth/arith_depth/nlx_depth/let深さのいずれも増やさずに素通しするため、
+       **包むことで既存のネスト上限が実質的に厳しくなることはない**。
+       唯一増える制約は非最終フォーム数の上限(ZA_MAX_OPERANDS=16、つまりbody 17式まで)。
+
+       [GC安全性] bodyはここまで保護していない(関数冒頭のコメント参照)。
+       os_make_consは確保を伴うので、その前に繋ぐ。os_make_cons自身も引数を
+       GC_PROTECTするため、確保中にGCが走っても正しいbodyがcdrに入る。 */
+    GC_PROTECT(body);
+    lisp_val_t form = (cc_cdr(body) == nil) ? cc_car(body) : os_make_cons(g_sym_progn, body);
     GC_PROTECT(form);
     za_syms_t syms;
     /* [原則8] 埋める**前に**全フィールドをnilにしてshadow stackへ繋ぐ。
@@ -6052,6 +7178,9 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     syms.gt = os_make_symbol(">");
     syms.le = os_make_symbol("<=");
     syms.ge = os_make_symbol(">=");
+    syms.ne = os_make_symbol("/=");
+    syms.slash = os_make_symbol("/");
+    syms.inline_here = os_make_symbol("%%INLINE-HERE");
     syms.eqp = os_make_symbol("EQ");
     syms.nullsym = os_make_symbol("NULL");
     syms.atom = os_make_symbol("ATOM");
@@ -6071,12 +7200,30 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     syms.setcdr = os_make_symbol("SET-CDR");
 
     g_jit_overflow = 0;
+    /* [declaim] このコンパイル試行に効くoptimize/inline指定。emitterはg_za_declaimを
+       見る(引数で持ち回ると署名が広範囲に波及するため) */
+    g_za_declaim = optimize;
+    /* [inline] レキシカルスコープの現在値を、この関数に効く指定で初期化する。
+       let の内側の declare はここから重ねていく(za_compile_let) */
+    g_za_inline_scope = DECLAIM_INLINE_BITS(optimize);
+    /* [Phase 4a-2] このコンパイル試行に効く仮引数の型宣言 */
+    g_za_param_decl_types = declared_types;
+    g_za_local_decl_count = 0;
+    /* 即値サイトの記録をこのコンパイル試行ぶんだけにする(原則8の監査用) */
+    g_za_imm_site_count = 0;
+    g_za_imm_site_overflow = 0;
     /* 前回の試行が途中で長いジャンプ(setjmp等)で抜けた場合に備えて0に戻す。
        通常はラッパが必ずデクリメントするので0のままのはず */
     g_za_compile_nest = 0;
     g_za_saw_flet_labels_escape = 0;
     g_jit_reloc_count = 0;
     g_jit_trampoline_jmp_count = 0;
+    /* [案 d 第 3 段] 寸法の水位と後埋めの記録。**関数単位のコンパイルは入れ子にならない**
+       前提に乗っている(この関数が無条件にリセットするので、入れ子になったら内側が
+       外側の記録を消す)。前提そのものを歯止めにするため、下で入れ子を検出して落とす。 */
+    g_za_frame_hwm = 0;
+    g_za_frame_patch_count = 0;
+    g_za_frame_patch_overflow = 0;
     // Phase3.6: このコンパイル試行で確保するリテラルスロット(quote/number/lambda)の
     // 一覧をリセットする。失敗exitではza_release_literal_slot_allocsで即座にフリーリストへ
     // 返却し、成功時はos_environment_register_literal_slotでenvへ登録する。
@@ -6115,9 +7262,11 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         // za_param_val_off(i)へ書き込みリンクしてから、共有本体(jmp_to_body_patch)
         // へ合流する。
         fixed_entry_offset = g_jit_used;
+        za_emit_stack_guard();   /* [可用性] sub rsp より前。issue #110 */
         jit_push_rbx();
         jit_push_r13();
-        jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+        za_emit_pin_nil();
+        za_emit_sub_rsp_frame();
         za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
         za_store_slot(ZA_REG_RCX, ZA_OFF_ENV_VAL);
         if (fixed_count >= 1) {
@@ -6141,11 +7290,16 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
 
     UINT64 cons_entry_offset = g_jit_used;
 
-    // プロローグ: rbx/r13を退避し、MS x64呼び出し規約のシャドウスペース+拡張3用の
-    // フレーム(env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
+    // プロローグ: rbx/r13を退避し、ZA_FRAME_TOTAL(上端40byte+拡張3以降用の
+    // env/args/fn/acc/引数スロットとそれぞれのgc_rootnode)を確保する。
+    // [2026-10-30 訂正・原則12] ここは「MS x64呼び出し規約のシャドウスペース+…」と
+    // 書かれていたが、シャドウスペースは呼び出しごとにjit_call_r11()が確保している。
+    // 上端40byteの正体はZA_FRAME_TOTALの定義のコメントを見ること。
+    za_emit_stack_guard();   /* [可用性] sub rsp より前。issue #110 */
     jit_push_rbx();
     jit_push_r13();
-    jit_sub_rsp_imm32(ZA_FRAME_TOTAL);
+    za_emit_pin_nil();
+    za_emit_sub_rsp_frame();
         za_store_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] callee-saved r14 を退避 */
     za_store_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
     za_store_slot(ZA_REG_RDX, ZA_OFF_ENV_VAL);
@@ -6155,11 +7309,36 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     za_emit_gc_link_slot(ZA_OFF_ENV_VAL, ZA_OFF_ENV_NODE);
     za_emit_gc_link_slot(ZA_OFF_ARGS_VAL, ZA_OFF_ARGS_NODE);
 
+    /* [P6] arity 検査(consリストエントリだけに置く)。
+     *
+     * **固定引数エントリには置かない。** 呼び出し側が meta->arity と argc を
+     * 照合してから入る入口なので、合わない呼び出しは必ずこちらへ落ちてくる
+     * (za_compile_call の高速path判定を参照)。したがって速い経路には1命令も増えない。
+     *
+     * 検査は**2回だけ**で、仮引数の個数に比例しない。cc_car(nil)/cc_cdr(nil) が
+     * どちらも nil なので、途中で実引数が尽きていれば最後の仮引数の時点でも
+     * 必ず nil になっている(documents/unbound-arity-survey.md §5)。
+     *   - 足りない: 最後の固定引数を読む直前に ARGS_VAL が nil かどうか
+     *   - 多すぎ  : 全部読み終えたあとの残りが nil でないかどうか(&rest があれば不要)
+     *
+     * エラー側の機械語は**エピローグの後ろ**(retの先)へ置き、そこからエピローグへ
+     * jmpで戻る。本体の通常経路には jmp すら増えない。 */
+    UINT64 arity_patches[2];
+    UINT64 arity_patch_count = 0;
+    lisp_val_t arity_rest_sym;
+    int has_rest = za_rest_param_symbol(params, fixed_count, &arity_rest_sym) != 0;
+
     if (use_param_slots) {
         // ABI-M5: consリストエントリポイント側も、都度cc_car/cc_cdrで辿る代わりに
         // 一度だけARGS_VALをfixed_count回分だけ展開してza_param_val_off(i)へ
         // 書き込む(za_emit_operandがis_literal==0参照でここを直接読むようになる)。
         for (UINT64 i = 0; i < fixed_count; i++) {
+            if (i + 1 == fixed_count) {
+                /* [P6] 最後の固定引数の直前。ここが nil なら実引数が足りない */
+                za_load_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
+                za_emit_cmp_rax_nil();
+                arity_patches[arity_patch_count++] = jit_emit_je_rel32_placeholder();
+            }
             za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
             jit_movabs_r11((UINT64)(void *)cc_car);
             jit_call_r11();
@@ -6170,7 +7349,42 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
             jit_call_r11();
             za_store_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
         }
+        /* [P6] 残りが nil でなければ実引数が多すぎる。use_param_slots は
+           &rest なしが条件(上の判定参照)なので、無条件に検査してよい。
+           **jmp_to_body のパッチより前に置く**ので固定引数エントリは通らない */
+        za_load_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
+        za_emit_cmp_rax_nil();
+        arity_patches[arity_patch_count++] = jit_emit_jne_rel32_placeholder();
         jit_patch_rel32(jmp_to_body_patch);
+    } else {
+        /* [P6] パラメータスロットを使わない関数(&rest つき / 引数が
+           ZA_MAX_FIXED_ENTRY_PARAMS より多い / lambda・flet・labels を含む)。
+           **こちらには固定引数エントリが無い**ので、全ての呼び出しがここを通る。
+           展開ループが無いため、最後の固定引数のセルまで自分で cdr を辿る。
+           cc_cdr の回数は固定引数1個を参照するのと同じ(この経路は元から
+           参照ごとに辿っている)。 */
+        if (fixed_count > 0) {
+            za_load_slot(ZA_REG_RCX, ZA_OFF_ARGS_VAL);
+            for (UINT64 i = 0; i + 1 < fixed_count; i++) {
+                jit_movabs_r11((UINT64)(void *)cc_cdr);
+                jit_call_r11();
+                jit_mov_rcx_rax();
+            }
+            jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_RCX);
+            za_emit_cmp_rax_nil();
+            arity_patches[arity_patch_count++] = jit_emit_je_rel32_placeholder();
+            if (!has_rest) {
+                jit_movabs_r11((UINT64)(void *)cc_cdr);
+                jit_call_r11();
+                za_emit_cmp_rax_nil();
+                arity_patches[arity_patch_count++] = jit_emit_jne_rel32_placeholder();
+            }
+        } else if (!has_rest) {
+            /* 引数を取らない関数。渡されていたら多すぎ */
+            za_load_slot(ZA_REG_RAX, ZA_OFF_ARGS_VAL);
+            za_emit_cmp_rax_nil();
+            arity_patches[arity_patch_count++] = jit_emit_jne_rel32_placeholder();
+        }
     }
 
     if (!za_compile_expr(form, params, fixed_count, 0, &syms, capture_env, 1, trampoline_offset, 0, 0, 0, 0)) {
@@ -6186,22 +7400,61 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     // エピローグ(末尾呼び出しでトランポリンへjmpせずここへ流れ落ちた場合のみ通る経路)。
     // za_gc_unlinkの呼び出し自体がrcxを使うため、本体の結果(rax)は先にr13へ退避してから
     // 呼び、戻ってから復元する。
-    jit_mov_reg_reg(ZA_REG_R13, ZA_REG_RAX);
-    za_load_slot(ZA_REG_RCX, ZA_OFF_ENV_SAVED_HEAD);
-    jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)za_gc_unlink);
-    jit_call_r11();
-    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R13);
-    za_load_slot(ZA_REG_R14, ZA_OFF_SAVED_R14); /* [ABI] r14 を復元 */
-        jit_add_rsp_imm32(ZA_FRAME_TOTAL);
-    jit_pop_r13();
-    jit_pop_rbx();
-    jit_ret();
+    za_emit_epilogue();
+
+    /* [P6] arity エラー側。**retの後ろ**に置くので、本体の通常経路には
+       1命令も増えない(条件分岐の not-taken 側を通るだけ)。
+       rax に signal の戻り値を入れてから**エピローグを写す**。
+       エピローグへ jmp で戻る形にすると関数の最後の命令が jmp になり、
+       「コードブロックの末尾は ret」という不変条件
+       (test/lisp/disassemble_test.lisp)が崩れるため、写す側を選んだ。
+       写しても実行されるのは arity が合わなかった呼び出しのときだけで、
+       増えるのは静的なサイズだけである。
+       エピローグの za_gc_unlink(ENV_SAVED_HEAD) が、ここまでにリンクした
+       env/args/パラメータスロットをまとめて外す。 */
+    if (arity_patch_count > 0) {
+        for (UINT64 i = 0; i < arity_patch_count; i++) {
+            jit_patch_rel32(arity_patches[i]);
+        }
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)&global_environment);
+        jit_mov_reg_from_mem_disp8(ZA_REG_RCX, ZA_REG_R11, 0);
+        jit_movabs_reg(ZA_REG_R11, (UINT64)(void *)os_signal_arity_error);
+        jit_call_r11();
+        za_emit_epilogue();
+    }
 
     // setqとエスケープするlambdaが同一let-local変数に対して両方起きるケースは、
     // 変数単位のcell昇格(ZA_VAR_BOXED、za_analyze_var_usage/za_compile_let参照)で
     // 構造的に解決済みのため、ここでの関数レベルの無条件fallbackは不要になった。
     // flet/labels束縛関数を(function name)で取り出したケースは別問題として残るため、
     // 引き続き無条件にfallbackさせる(g_za_saw_flet_labels_escapeのコメント参照)。
+    /* ===== [案 d 第 3 段] 寸法を確定して、確保・解体の即値を埋める =====
+     *
+     * ここは**本体を出し終えた後**なので、g_za_frame_hwm は確定している。
+     * 寸法 = 最高水位を 16 byte 境界へ切り上げた量 + 上端の 0x28。
+     * 上端 0x28 が 8 を出しているので、**8 mod 16 は自動で保たれる**
+     * (ZA_FRAME_TOTAL の定義の _Static_assert と同じ関係)。
+     *
+     * **ありうる最大(ZA_FRAME_TOTAL)を超えることはない**が、超えたら生成を捨てる。
+     * 残量の検査(za_emit_stack_guard)と予備領域は**最大側のまま**にしてあるので、
+     * 発火が少し早まる方向にしか動かない(= 安全側)。 */
+    {
+        UINT32 frame_extra = (g_za_frame_hwm + 15u) & ~15u;
+        UINT32 frame_total = 0x28u + frame_extra;
+        if (g_za_frame_patch_overflow > 0 || frame_total > (UINT32)ZA_FRAME_TOTAL) {
+            /* 後埋めの枠を超えた / 最大を超えた。どちらも静かに壊れるより捨てる */
+            g_jit_overflow = 1;
+        } else {
+            for (UINT32 i = 0; i < g_za_frame_patch_count; i++) {
+                UINT64 off = g_za_frame_patch_offsets[i];
+                g_jit_code[off + 0] = (UINT8)(frame_total);
+                g_jit_code[off + 1] = (UINT8)(frame_total >> 8);
+                g_jit_code[off + 2] = (UINT8)(frame_total >> 16);
+                g_jit_code[off + 3] = (UINT8)(frame_total >> 24);
+            }
+        }
+    }
+
     if (g_jit_overflow || g_za_saw_flet_labels_escape) {
         za_release_literal_slot_allocs();
         g_jit_used = entry;
@@ -6215,8 +7468,16 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     // entryへロールバックして再利用する(呼び出し元が確保する512KBの予算は
     // コンパイル済み関数の総量ではなく「1関数分の最悪サイズ」だけで済む)。
     UINT64 code_len = g_jit_used - entry;
-    UINT64 page_count = (code_len + IMM_PAGE_SIZE - 1) / IMM_PAGE_SIZE;
-    void *dest = os_imm_pages_alloc_contiguous(page_count);
+    /* [パッキング] 以前はcode_lenを4096へ切り上げて丸ごと1ページ以上を専有していたため、
+       200byteの関数でも4096byteを使い、実測の充填率は37.9%だった
+       (documents/measurement-jit-code-length-distribution.md)。os_imm_code_allocは
+       owner_envごとのbumpカーソルから必要なbyte数だけ切り出す。ページを環境ごとに
+       分けるのはdestroy-environmentがページ単位で回収するためで、混ぜると解放された
+       ページの先頭8byteがフリーリストのnextで上書きされ生きたコードが壊れる。
+       新しいページを取ったときだけ(new_page_count != 0)登録すればよい。 */
+    void *new_pages = 0;
+    UINT64 new_page_count = 0;
+    void *dest = os_imm_code_alloc(owner_env, code_len, &new_pages, &new_page_count);
     if (dest == 0) {
         za_release_literal_slot_allocs();
         g_jit_used = entry;
@@ -6277,20 +7538,32 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
        fixnum即値がたまたまヒープ範囲に落ちる誤検出を避けるため、タグが
        ヒープオブジェクトを表すもの(CONS/SYMBOL/STRING/INSTANCE)に限って判定する。
        FIXNUM(0)・CHAR(3)・RAW_POINTER(7)の即値は対象外。 */
-    for (UINT64 i = 0; i + 10 <= code_len; i++) {
-        UINT8 rex = dest_bytes[i];
-        UINT8 opc = dest_bytes[i + 1];
-        if ((rex != 0x48 && rex != 0x49) || (opc & 0xF8) != 0xB8) {
+    /* [記録ベース] バイト走査ではなく、発行時に記録した即値の位置を使う
+       (za_record_imm_site参照)。短縮形 mov r32, imm32 は先頭1byteが0xB8〜0xBFと
+       いうだけなので、バイト走査に足すと他の命令の途中へ大量に誤マッチする。
+       記録なら誤検出がゼロで、短縮形も漏れない。
+       オフセットはg_jit_code基準なのでentryを引いてdest_bytes基準へ直す。 */
+    g_za_scan_count = 0;
+    for (UINT64 k = 0; k < g_za_imm_site_count; k++) {
+        UINT64 off = g_za_imm_site_off[k];
+        if (off < entry || off >= g_jit_used) {
+            continue;   /* このコンパイル試行のものではない(ロールバック分など) */
+        }
+        UINT64 rel = off - entry;
+        UINT8 w = g_za_imm_site_width[k];
+        if (rel + w > code_len) {
             continue;
         }
         UINT64 imm = 0;
-        for (UINT64 b = 0; b < 8; b++) {
-            imm |= ((UINT64)dest_bytes[i + 2 + b]) << (b * 8);
+        for (UINT64 b = 0; b < w; b++) {
+            imm |= ((UINT64)dest_bytes[rel + b]) << (b * 8);
         }
-        i += 9;
+        if (g_za_scan_count < ZA_MAX_SCAN_IMM) {
+            g_za_scan_off[g_za_scan_count] = rel;
+            g_za_scan_val[g_za_scan_count] = imm;
+            g_za_scan_count++;
+        }
         /* [単一の真実源] 「GCで動く値か」はos_tag_is_heap_refに集約している。
-           かつてはCONS/SYMBOL/STRING/INSTANCEを直接列挙しており、
-           TAG_FORWARDが黙って漏れていた(runtime.h参照)。
            fixnum即値がたまたまヒープ範囲に落ちるのを拾わない性質は保たれる
            (FIXNUM/CHAR/RAW_POINTERはos_tag_is_heap_refが0を返す) */
         if (!os_tag_is_heap_ref(imm & TAG_MASK)) {
@@ -6300,12 +7573,17 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
         if (region == 0 || region == 1) {
             g_za_heap_imm_count++;
             if (g_za_heap_imm_first_off == 0) {
-                g_za_heap_imm_first_off = i - 9;
+                g_za_heap_imm_first_off = rel;
             }
         }
     }
 
-    os_environment_register_pages(owner_env, dest, page_count);
+    /* [パッキング] 既存のカーソルページから切り出せた場合は、そのページは
+       前回の確保時に登録済みなので何もしない(二重登録するとdestroy-environmentが
+       同じページを2回os_imm_page_freeへ渡し、フリーリストが自分自身を指す輪になる) */
+    if (new_page_count != 0) {
+        os_environment_register_pages(owner_env, new_pages, new_page_count);
+    }
 
     // Phase3.6: このコンパイル試行で確保したリテラルスロットをenvの所有物として登録する
     // (pagesスロットと同じタイミング)。環境破棄時にos_environment_reclaim_literal_slotsが
@@ -6321,11 +7599,19 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     {
         UINT64 h = 1469598103934665603ULL;   /* FNV-1a 64bit */
         UINT64 masked = 0;
+        /* 変位も伏せた 2 本目のハッシュ。**並べ替えでは一致し、それ以外では落ちる** */
+        UINT64 hd = 1469598103934665603ULL;
+        UINT64 dispbytes = 0;
         for (UINT64 i = 0; i < code_len; i++) {
-            UINT8 byte = g_jit_dump_addr_mask[entry + i] ? (UINT8)0xAA : dest_bytes[i];
-            if (g_jit_dump_addr_mask[entry + i]) { masked++; }
+            int is_addr = g_jit_dump_addr_mask[entry + i];
+            int is_disp = g_jit_dump_disp_mask[entry + i];
+            UINT8 byte = is_addr ? (UINT8)0xAA : dest_bytes[i];
+            if (is_addr) { masked++; }
+            if (is_disp) { dispbytes++; }
             h ^= (UINT64)byte;
             h *= 1099511628211ULL;
+            hd ^= (UINT64)(is_disp ? (UINT8)0xDD : byte);
+            hd *= 1099511628211ULL;
         }
         os_diag_serial_write("[JITDUMP] size=");
         {
@@ -6353,10 +7639,29 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
             hex[o] = '\0';
             os_diag_serial_write(hex);
         }
+        os_diag_serial_write(" dispbytes=");
+        {
+            char buf[24]; int o = 0; UINT64 v = dispbytes;
+            if (v == 0) { buf[o++] = '0'; }
+            while (v > 0 && o < 23) { buf[o++] = (char)('0' + (v % 10)); v /= 10; }
+            char rev[25]; int r = 0; while (o > 0) { rev[r++] = buf[--o]; } rev[r] = '\0';
+            os_diag_serial_write(rev);
+        }
+        os_diag_serial_write(" disphash=");
+        {
+            char hex[17]; int o = 0;
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                UINT64 nib = (hd >> shift) & 0xF;
+                hex[o++] = (char)(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
+            }
+            hex[o] = '\0';
+            os_diag_serial_write(hex);
+        }
         os_diag_serial_write("\n");
         /* 次のコンパイルへマスクを持ち越さない */
         for (UINT64 i = entry; i < entry + code_len && i < JIT_CODE_SIZE; i++) {
             g_jit_dump_addr_mask[i] = 0;
+            g_jit_dump_disp_mask[i] = 0;
         }
     }
 #endif
@@ -6369,11 +7674,25 @@ lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
     // use_param_slotsでない場合はcons_entry_offset==entryなので、
     // dest_bytes+0==dest_bytesとなり従来と完全に同じアドレスになる。
     lisp_addr_t cons_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (cons_entry_offset - entry));
+    // disassembler(src/c/disasm.c)が後から機械語を読めるよう、エントリポイントとは別に
+    // ブロック全体の範囲[dest_bytes, dest_bytes+code_len)をza_fn_meta_tへ記録する。
+    // os_fn_set_code_rangeは生フィールドへの代入だけで確保しないため、fnを受け取ってから
+    // 呼ぶまでの間にGCは走らない
     if (use_param_slots) {
         lisp_addr_t fixed_entry_addr = (lisp_addr_t)(void *)(dest_bytes + (fixed_entry_offset - entry));
-        return os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, capture_env);
+        lisp_val_t fn = os_make_jit_function_dual(cons_entry_addr, fixed_entry_addr, fixed_count, capture_env);
+        os_fn_set_code_range(fn, (UINT64)(lisp_addr_t)dest_bytes, code_len);
+        /* [declaim] このコンパイルに効いていたoptimizeを事後確認用に記録する
+           (%%OPTIMIZE-OF)。本Phaseではコード生成に使っていない */
+        os_fn_set_optimize(fn, optimize);
+        os_fn_set_declared_types(fn, declared_types);
+        return fn;
     }
-    return os_make_jit_function(cons_entry_addr, capture_env);
+    lisp_val_t fn = os_make_jit_function(cons_entry_addr, capture_env);
+    os_fn_set_code_range(fn, (UINT64)(lisp_addr_t)dest_bytes, code_len);
+    os_fn_set_optimize(fn, optimize);
+    os_fn_set_declared_types(fn, declared_types);
+    return fn;
 }
 
 /**
@@ -6414,6 +7733,8 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DIAG-ZA-MX-CALLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_mx_calls), global_environment);
         os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-LOCAL-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_local_decls), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-PARAM-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_param_decls), global_environment);
 }
 
 #else /* !defined(__x86_64__) */
@@ -6445,10 +7766,15 @@ void os_register_za_primitives(void) {
     os_set_function(os_make_symbol("%%DIAG-ZA-IMM-REGION"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_imm_region), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-COUNT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_count), global_environment);
     os_set_function(os_make_symbol("%%DIAG-ZA-BAIL-AT"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_bail_at), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-LOCAL-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_local_decls), global_environment);
+    os_set_function(os_make_symbol("%%DIAG-ZA-PARAM-DECLS"), os_make_native_function((lisp_addr_t)(void *)cc_diag_za_param_decls), global_environment);
 }
 
 lisp_val_t za_try_compile_defun(lisp_val_t params, lisp_val_t body,
-                                lisp_val_t capture_env, lisp_val_t owner_env) {
+                                lisp_val_t capture_env, lisp_val_t owner_env,
+                                UINT64 optimize, os_decl_types_t declared_types) {
+    (void)optimize;
+    (void)declared_types;
     (void)params;
     (void)body;
     (void)capture_env;

@@ -22,6 +22,28 @@ QEMU_MEM ?= 256M
 # 「無関係な変更で症状が消える」形の問題が摂動で消えなくなる。
 EXTRA_CFLAGS ?=
 
+# [測定] GC発火テスト用の小さいヒープの大きさ(byte)。空ならソース側の既定値
+# (test/c/runtime_test.c の #ifndef SMALL_HEAP_SIZE)を使う。この値を見ている
+# ネイティブのユニットテストは runtime_test だけなので、そこにしか渡さない。
+#   make test SMALL_HEAP_SIZE=80000
+# 通る窓は数KBしかない。**小さすぎるとGC後も確保できず、os_panicがユニットテストでは
+# 無限ループになるので「失敗」ではなく「ハング」として現れる**。大きすぎると
+# isqrt等の「GCが発火する」アサーションがNGになる。組み込み関数(os_set_function)を
+# 足したときは、この口で掃引して通る最小値を実測し直す
+SMALL_HEAP_SIZE ?=
+
+# [測定] **ヒープ枯渇テスト専用**のヒープの大きさ(byte)。空ならソース側の既定値
+# (test/c/runtime_test.c の #ifndef HEAP_EXHAUSTION_HEAP_SIZE。既定 4MB)を使う。
+#   make test HEAP_EXHAUSTION_SIZE=2000000
+# **上の SMALL_HEAP_SIZE とは別の口である。** 共有してはいけない:
+#   SMALL_HEAP_SIZE … GC が発火することを見たい。os_bootstrap の恒久消費ぎりぎり
+#                     (通る窓 5KB 未満)。小さすぎるとハング、大きすぎると GC が出ない
+#   こちら          … **予備領域(定数 ~68KB)が丸ごと入る**ことが要件。
+#                     半空間の 1/8 に収まらないと検査自体が無効になる
+#                     (runtime.c の heap_update_soft_end)。小さすぎると
+#                     「何も検出しない試験」になるので、下限側の番犬を試験に入れてある
+HEAP_EXHAUSTION_SIZE ?=
+
 # 命令数ベースの性能計測(documents/performance-measurement.md参照)で使う
 # TCGプラグインのビルドに必要な、ホストにインストール済みのqemu-system-x86_64
 # バージョン(`qemu-system-x86_64 --version`で確認)。プラグインABI
@@ -41,8 +63,11 @@ SRCDIR = src/c
 TRANSPILE_LISP_SRC = src/lisp/transpile.lisp test/lisp/transpile_fixture.lisp src/lisp/init_aot.lisp src/lisp/utility.lisp src/lisp/device.lisp src/lisp/ide.lisp src/lisp/partition.lisp src/lisp/mount.lisp src/lisp/file-node.lisp src/lisp/fat16.lisp src/lisp/fat32.lisp src/lisp/file-cmd.lisp src/lisp/bench_aot.lisp
 LISP_COMPILED = $(SRCDIR)/lisp_compiled.c
 LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
-HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/za_jit_tags.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/bench_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_symtab.c $(SRCDIR)/disasm_symtab_lookup.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED)
+# $(TARGET) の依存には生成物(disasm_symtab.c)を含めない。含めると自分が作る
+# ファイルに依存して毎回作り直しになる
+SRC_NO_SYMTAB = $(filter-out $(SRCDIR)/disasm_symtab.c,$(SRC))
+HDR = $(SRCDIR)/kernel.h $(SRCDIR)/interrupt.h $(SRCDIR)/framebuffer.h $(SRCDIR)/process.h $(SRCDIR)/version.h $(SRCDIR)/font8x16.h $(SRCDIR)/runtime.h $(SRCDIR)/lisp.h $(SRCDIR)/reader.h $(SRCDIR)/za.h $(SRCDIR)/za_jit_tags.h $(SRCDIR)/disasm.h $(SRCDIR)/disasm_lisp.h $(SRCDIR)/eval.h $(SRCDIR)/print.h $(SRCDIR)/repl.h $(SRCDIR)/subprimitive.h $(SRCDIR)/drivers/pci.h $(SRCDIR)/drivers/virtio.h $(SRCDIR)/drivers/virtqueue.h $(SRCDIR)/drivers/ide.h $(SRCDIR)/block_device.h $(SRCDIR)/ide_subprimitive.h $(SRCDIR)/bench_subprimitive.h $(SRCDIR)/p9.h $(SRCDIR)/p9_transport.h $(SRCDIR)/transport_virtio9p.h $(SRCDIR)/virtio9p.h $(SRCDIR)/stream.h $(SRCDIR)/stream_lisp.h $(SRCDIR)/mount.h $(SRCDIR)/format.h $(SRCDIR)/load.h $(SRCDIR)/clock.h
 
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -68,6 +93,11 @@ ALIGN_AUDIT_FLAGS = $(if $(ALIGN_AUDIT),-DISIKIOS_ALIGN_AUDIT,)
 # (documents/jit-tag-constants.md Step 1)
 JIT_DUMP_FLAGS = $(if $(JIT_DUMP),-DISIKIOS_JIT_DUMP,)
 
+# [測定] 上のSMALL_HEAP_SIZEをコンパイル行へ渡す形にしたもの。空のときは何も
+# 渡さないので、ソース側の#ifndefの既定値がそのまま効く
+SMALL_HEAP_FLAGS = $(if $(SMALL_HEAP_SIZE),-DSMALL_HEAP_SIZE=$(SMALL_HEAP_SIZE),)
+HEAP_EXHAUSTION_FLAGS = $(if $(HEAP_EXHAUSTION_SIZE),-DHEAP_EXHAUSTION_HEAP_SIZE=$(HEAP_EXHAUSTION_SIZE),)
+
 BUILD_TMPDIR = tmp
 
 # [GCデバッグ] $(TARGET)はSRC/HDRのファイル依存で追跡するため、**フラグだけ変えても
@@ -84,8 +114,13 @@ BUILD_TMPDIR = tmp
 # 2回目はSRC/HDRが更新されていないので再ビルドされず、**8byte版のバイナリのまま
 # 測って heap-align=8 と報告された**。ALIGN_AUDITが使用値を出力に混ぜていたので
 # 気づけたが、出していなければそのまま誤った比較表になっていた。
+#
+# SMALL_HEAP_FLAGSも同じ理由で含める。掃引のために**まさに付けたり外したりする**口で、
+# 署名の外に置くと「渡したつもりで古いバイナリを測る」事故が無言で成立する。
+# カーネル本体はこの値を使わないので$(TARGET)の再ビルドは本来不要だが、
+# 「新しいビルドフラグは必ず署名に入れる」を例外なしの規則にしておく方を採る
 GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
-BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(EXTRA_CFLAGS)
+BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) $(EXTRA_CFLAGS)
 .PHONY: FORCE
 FORCE:
 $(GC_DEBUG_STAMP): FORCE
@@ -124,13 +159,13 @@ TEST_BIN_REPL = $(BUILD_TMPDIR)/repl_test
 TEST_SRC_SUBPRIMITIVE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/subprimitive.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(TESTDIR)/subprimitive_test.c
 TEST_BIN_SUBPRIMITIVE = $(BUILD_TMPDIR)/subprimitive_test
 
-TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
+TEST_SRC_SCRIPT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_symtab_lookup.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/format.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(LISP_COMPILED) $(TESTDIR)/script_test.c
 TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
 TEST_BIN_STREAM = $(BUILD_TMPDIR)/stream_test
 
-TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
+TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/print.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
 TEST_BIN_LOAD = $(BUILD_TMPDIR)/load_test
 
 TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(TESTDIR)/stream_lisp_test.c
@@ -160,11 +195,21 @@ TEST_BIN_LISP_COMPILED = $(BUILD_TMPDIR)/lisp_compiled_test
 TEST_SRC_IDE = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(TESTDIR)/ide_test.c
 TEST_BIN_IDE = $(BUILD_TMPDIR)/ide_test
 
+# framebuffer.cもランタイムに依存しない(contentの確保は呼び出し側の責任)ので
+# 単体でリンクできる。履歴リングと表示窓の境界条件を検証する
+TEST_SRC_FRAMEBUFFER = $(SRCDIR)/framebuffer.c $(TESTDIR)/framebuffer_test.c
+TEST_BIN_FRAMEBUFFER = $(BUILD_TMPDIR)/framebuffer_test
+
+# disasm.cはランタイムに依存しない純粋なデコーダ(Lispからの入口はdisasm_lisp.c側)
+# なので、stream_testと同じく単体でリンクしてバイト列を直接食わせて検証できる
+TEST_SRC_DISASM = $(SRCDIR)/disasm.c $(TESTDIR)/disasm_test.c
+TEST_BIN_DISASM = $(BUILD_TMPDIR)/disasm_test
+
 TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(TESTDIR)/mount_test.c
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -183,7 +228,7 @@ image:
 # BOOT_FAT32_IMGが常に再ビルドされてしまっていた)。
 $(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
-		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main-or-die)" --quit'
 
 # (main)は$(LISP_COMPILED)と$(LISP_COMPILED_FIXTURE)を1回の実行で両方生成するが、
 # 独立したルールにしているため、両方が古い状態から`make test`のように両方を
@@ -193,7 +238,7 @@ $(LISP_COMPILED): $(TRANSPILE_LISP_SRC)
 # 互換性を優先しここでは使わない
 $(LISP_COMPILED_FIXTURE): $(TRANSPILE_LISP_SRC)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
-		-c 'ros run --load src/lisp/transpile.lisp --eval "(main)" --quit'
+		-c 'ros run --load src/lisp/transpile.lisp --eval "(main-or-die)" --quit'
 
 transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 
@@ -201,9 +246,20 @@ transpile: $(LISP_COMPILED) $(LISP_COMPILED_FIXTURE)
 # 「実際にソース/ヘッダが変更された時だけ」再生成されるようにする土台になる
 # (buildをphonyのままにしていると、buildを経由するあらゆる後続ターゲットが
 # 常に再実行されてしまう)。
-$(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
-	mkdir -p esp_dir/EFI/BOOT
-	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
+# [シンボル解決] 逆アセンブル用のシンボル表は**2 パス**で作る
+# (documents/disasm-symbols.md §3)。
+#
+#   1. 空のテーブルでリンク      → アドレスが確定する
+#   2. nm で抽出してテーブル生成
+#   3. テーブルを含めて再リンク
+#   4. **再抽出して 1 と照合**   → ずれていたらビルドを止める
+#
+# 実測では .rdata が 80KB 増えても .text のシンボルは 1 つも動かなかった
+# (.text が最初のセクションで、テーブルは .rdata へ載るため)。
+# それでも 4 を入れてあるのは、**将来リンカの挙動が変わったときに、
+# 黙って古いテーブルを積んだイメージができるのを防ぐ**ためである。
+DISASM_SYMTAB = $(SRCDIR)/disasm_symtab.c
+KERNEL_LINK = docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-gcc -v "$(PWD)":/workspace isiki-builder \
 		-nostdlib -mno-red-zone -O1 -shared \
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
@@ -212,6 +268,22 @@ $(TARGET): $(SRC) $(HDR) $(GC_DEBUG_STAMP)
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
+NM_IN_DOCKER = docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-nm -v "$(PWD)":/workspace isiki-builder
+OBJDUMP_IN_DOCKER = docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w64-mingw32-objdump -v "$(PWD)":/workspace isiki-builder
+
+$(TARGET): $(SRC_NO_SYMTAB) $(HDR) $(GC_DEBUG_STAMP)
+	mkdir -p esp_dir/EFI/BOOT $(BUILD_TMPDIR)
+	@echo '/* placeholder */' > $(DISASM_SYMTAB)
+	@printf '#include "runtime.h"\n#include "disasm_symtab.h"\n' >> $(DISASM_SYMTAB)
+	@printf 'const UINT64 g_disasm_link_image_base = 0;\nconst UINT64 g_disasm_sym_count = 0;\n' >> $(DISASM_SYMTAB)
+	@printf 'const UINT64 g_disasm_sym_addr[1] = {0};\nconst UINT32 g_disasm_sym_name_off[1] = {0};\nconst char g_disasm_sym_names[1] = {0};\n' >> $(DISASM_SYMTAB)
+	$(KERNEL_LINK)
+	@$(NM_IN_DOCKER) $(TARGET) > $(BUILD_TMPDIR)/nm_pass1.txt
+	@$(OBJDUMP_IN_DOCKER) -p $(TARGET) | awk '/^ImageBase/ { print $$2 }' > $(BUILD_TMPDIR)/imagebase.txt
+	@sh tools/gen_disasm_symtab.sh $(BUILD_TMPDIR)/nm_pass1.txt "$$(cat $(BUILD_TMPDIR)/imagebase.txt)" > $(DISASM_SYMTAB)
+	$(KERNEL_LINK)
+	@$(NM_IN_DOCKER) $(TARGET) > $(BUILD_TMPDIR)/nm_pass2.txt
+	@sh tools/check_disasm_symtab.sh $(BUILD_TMPDIR)/nm_pass1.txt $(BUILD_TMPDIR)/nm_pass2.txt
 
 # [測定の落とし穴] `build`は以前 $(TARGET)(= esp_dir/.../BOOTX64.EFI)だけを作って
 # いた。QEMUが実際に起動するのは $(BOOT_FAT32_IMG) の中にコピーされたEFIなので、
@@ -239,11 +311,244 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
 		-o $@ $<
 
+# EVAL-ERROR を「値として返す」箇所の残数を予算と突き合わせる(計器)。
+# 上限を超えても下回っても落ちる ratchet。詳しくは tools/check_eval_error_budget.py
+# と documents/error-unwind-survey.md §A-4 / §7-5。
+# **潰し漏れは静かに残る**(戻り値の形が変わるだけでテストの無い経路は誰も気づかない)ので、
+# 減らす作業を始める前に数える仕掛けを置く
+check-eval-error-budget:
+	@python3 tools/check_eval_error_budget.py
+
+# [検出器の陽性対照] 2026-10-30: この検出器は --self-test を持っていたのに、
+# **make も CI もそれを呼んでいなかった**(検出器の棚卸しで見つけた。
+# documents/records-and-measurement-rules.md「棚卸し: 検出器と陽性対照」)。
+# 規則 8 のとおり、試していない検出器は働かない。
+.PHONY: check-eval-error-budget-self-test
+check-eval-error-budget-self-test:
+	@python3 tools/check_eval_error_budget.py --self-test
+
+# [性能測定] src/lisp/bench_jit.lisp と src/lisp/bench_interp.lisp が
+# 真実源(src/lisp/bench_aot.lisp)から生成したものと一致していることを固定する。
+# ベンチ本体の S 式が経路ごとに食い違うと、経路の命令数を比べた数字に
+# 意味が無くなる。**陽性対照(手書きの %%bench-interp-loopcost が真実源の
+# let* の逐語の写しであること)も同じスクリプトが見る。**
+# 数秒で終わるホスト側の検査なので make test の前提に入れてある
+check-bench-jit-sync:
+	@tools/bench/check_bench_jit_sync.sh
+
+# [性能測定] **推定量の検査。**QEMU を起動しないので make test の前提に入れてある。
+# 真の値が分かっている行(c/for = 4.000。逆アセンブルで確定)を 5 回測った
+# 固定資料に対して、既定の推定量が真値に入ること(陰性対照)と、
+# **min 系の推定量が落ちること**(陽性対照)を見る。
+# documents/performance-measurement.md「推定量を校正点で決めた」節
+check-estimator:
+	@tools/bench/check_estimator.sh
+
+# [診断] JIT が容量上限でコンパイルを断念した「行番号」の期待値を、za.c の
+# 注記(`ZA_BAIL_LINE(); /* [診断] 容量上限 <定数> */`)と照合する。
+# 診断は __LINE__ を記録するので、za.c に 1 行入れただけで境界テストの
+# 期待値が全部ずれる。QEMU を回さないと分からないのでは遅い(1 回 8 分)ので、
+# ホスト側・1 秒で落ちるようにして make test の前提に入れてある。
+# --self-test は規則 8 の陽性対照(za.c を 1 行ずらして検出器が落ちることを見る)
+check-jit-bail-lines:
+	@python3 tools/check_jit_bail_lines.py
+	@python3 tools/check_jit_bail_lines.py --self-test
+
+# [規則 15] **PR 本文が「成果物」として挙げたものが、マージ後の木に実在するか。**
+# PR #113 の本文は 3 件、含んでいないものを成果として書いていた(整理コミットが
+# 別ブランチに取り残されていた)。気づいたのは **1 か月後、使おうとしたとき**。
+#
+#   make check-pr-claims PR=113            本文を今の木と突き合わせる(gh が要る)
+#   make check-pr-claims PR=113 AT=33cc8b3 指定リビジョンの木と突き合わせる
+#
+# **make test に入れてあるのは自己試験のほうだけ。** 本文の突き合わせは gh
+# (= ネットワーク)が要るので、マージ後に人が 1 回走らせる形にしてある。
+# 自己試験は**履歴そのもの**を使う(#113 の本文 × 回収前/回収後の木)ので、
+# 「当時の事故を捕まえられたか」をそのまま確かめられる
+check-pr-claims:
+	@python3 tools/check_pr_claims.py $(PR) $(if $(AT),--at $(AT),)
+
+# [規則 15] 上の検出器の自己試験(規則 8)。QEMU もネットワークも要らない
+check-pr-claims-self-test:
+	@python3 tools/check_pr_claims.py --self-test
+
+# [同一性] 「生成物が 1 文字も変わらない」を測れる形にする 2 つの手順。
+#
+# **変えていないことは、git diff には出ない。** AOT 生成物は .gitignore 済みの
+# ビルド生成物で git に 1 バイトも入っていないし、JIT の出力はそもそも
+# 実行時にしか存在しない。どちらも「黙って変わっても誰も気づかない」形
+# (documents/pitfalls.md 原則6)なので、基準を退避してから比べる口を置く。
+#
+# 下の 2 つのヘルパは、その口がビルドの印と生成器の入力を**Makefile から
+# 直接**受け取るためにある。スクリプト側に書き写すと、Makefile を直したときに
+# 黙って食い違う(BUILD_FLAG_SIGNATURE は Makefile:91 付近が唯一の真実源)
+print-build-flag-signature:
+	@echo '$(BUILD_FLAG_SIGNATURE)'
+
+print-transpile-src:
+	@echo '$(TRANSPILE_LISP_SRC)'
+
+# [同一性/AOT] $(LISP_COMPILED) と $(LISP_COMPILED_FIXTURE) が 1 文字も
+# 変わっていないことを、**生成しなおして byte 比較**して確かめる。
+# ゲストは要らない(実測 1 回 0.86 秒、2 ファイルは 1 回の生成で両方出る)。
+#
+#   make aot-identity-save    変更前に基準を退避する
+#   make aot-identity-check   生成しなおして基準と比べる(同一 0 / 相違 1 / 不成立 2)
+#
+# **check は生成物を消してから生成しなおし、byte 一致したら mtime を戻す。**
+# 消さないとファイル依存で生成器が動かず、戻さないとカーネルと
+# BOOT_FAT32_IMG がまるごと作り直される(詳しくは tools/aot_identity.sh の冒頭)
+aot-identity-save:
+	@tools/aot_identity.sh save
+
+aot-identity-check:
+	@tools/aot_identity.sh check
+
+# [規則 8] **本物の生成器**で陽性対照を取る。自己試験(下)は偽の生成器で経路を
+# 通すだけなので、「本物の生成物の 1 バイトの差を捕まえられる」ことは別に示す。
+# 生成器を動かしたうえで出てきた生成物の先頭 1 バイトを書き換えて check を走らせ、
+# 相違(1)で落ちること、そのまま生成しなおせば同一(0)に戻ることの両方を見る。
+# docker が要る(生成を 3 回ほど回す。実測 1 回 0.86 秒)が、ゲストは要らない
+aot-identity-positive-control:
+	@tools/aot_identity.sh positive-control
+
+# [規則 8] 上の検出器の自己試験。偽の生成器を使うので docker も QEMU も要らない。
+# 陽性対照: 1 文字変える / 長さを変える / ビルドの印が違う基準と比べる /
+#           基準が無い / positive-control 自体 / 入力が変わった・変わっていない
+#           の切り分け。
+# 陰性対照: 同じものを生成すれば同一になること、空白の有無だけでは「違う設定」と
+#           判定しないこと、そして **mtime が戻っていること**
+#           (戻っていなければカーネルがまるごと作り直される)。
+#           生成器が実際に呼ばれたことを呼び出し回数で確かめてから mtime を見る
+#           — **走っていないのに mtime が同じ、では何も確かめていない**
+aot-identity-self-test:
+	@tools/aot_identity.sh self-test
+
+# [同一性/JIT] JIT が出力した機械語が、全関数で 1 バイトも変わっていないことを
+# JIT_DUMP ビルドのシリアル出力([JITDUMP] 行)で確かめる。
+# **QEMU を 1 回起動する**(JIT_DUMP=1 は別ビルドなのでカーネルも作り直される)。
+#
+#   make jit-identity-save    変更前に基準を取る
+#   make jit-identity-check   同じ条件で流して基準と比べる(同一 0 / 相違 1 / 不成立 2)
+#   make jit-identity-show    何が走るかだけを見る(QEMU を起動しない)
+#
+# MILESTONE / QEMU_MEM は基準に記録され、違っていれば比べずに止まる
+# (ダンプ行は関数名を持たないので、突き合わせは出現順。条件が同じでなければ
+#  順序そのものが保証できない)
+jit-identity-save:
+	@tools/jit_dump_identity.sh save
+
+jit-identity-check:
+	@tools/jit_dump_identity.sh check
+
+# [同一性/JIT] 空運転。**1 回 10 分近い QEMU 起動を払う前に**、ビルドの印と
+# 打つコマンドと記録する条件を見る。make -n ではここまで追えない
+# (src/c/disasm_symtab.c が生成物で -n からは作られないため make が先に止まる。
+#  これは既存の挙動で、このターゲットとは無関係)
+jit-identity-show:
+	@tools/jit_dump_identity.sh show
+
+# [規則 8] 上の検出器の自己試験。合成したシリアルログを食わせるので
+# **ビルドも QEMU も要らない**。陽性対照の 1 つは
+# 「印に -DISIKIOS_JIT_DUMP が無ければ止まる」= **0 行同士を「一致」と
+# 言わせない**ことで、これが無いと計器が死んでいるのに緑が出る
+jit-identity-self-test:
+	@tools/jit_dump_identity.sh self-test
+
+# [案 d 第 2 段] **並べ替えだけ**であることの判定。
+# 素のハッシュは変位の値が変わるぶん必ず落ちる(実測: 1340 関数すべてで hash 不一致、
+# size/maskedbytes は 0 件)。だから**変位を伏せたハッシュ**で見る。
+# 理由と実測は tools/check_jit_dump_reorder.py の冒頭。
+# 基準は make jit-identity-save が残すシリアルログをそのまま使う。
+jit-reorder-check:
+	@test -f tmp/identity/jit/save.serial.txt || { \
+	  echo "ERROR: 基準が無い。並べ替える**前**の木で make jit-identity-save"; exit 2; }
+	@$(MAKE) test-qemu-milestone JIT_DUMP=1 MILESTONE=test/lisp/qemu_boot_test.lisp \
+	  QEMU_EXTRA_FLAGS="-serial file:$(PWD)/tmp/identity/jit/reorder.serial.txt" >/dev/null
+	@python3 tools/check_jit_dump_reorder.py \
+	  tmp/identity/jit/save.serial.txt tmp/identity/jit/reorder.serial.txt
+
+jit-reorder-self-test:
+	@python3 tools/check_jit_dump_reorder.py --self-test
+
+# [D6] 監査ビルド(ISIKIOS_DECLARE_AUDIT)で**インライン展開が抑止されていること**を見る。
+# 既存の監査は型特化した C 関数の入口で値を見るので、展開して呼び出しが消えると
+# **safety 0 で壊れるまさにその場合だけ監査が何も見なくなる**。
+# 抑止を誰も見ていなければ D6 は守られているか分からないので、専用の口を置く。
+# **別ビルドになる**(ビルドの印が変わるので作り直しが走る)。
+# [規則 8] 再試行の仕組み自身の自己試験。**4 経路すべてを意図的に発火させる**
+# (結果が無い / 結果があって失敗 / 1 回目で成功 / 2 回目で成功)。
+# **「結果があって失敗」で再試行しないこと**が肝心で、ここが壊れると
+# 本物の失敗を再試行で隠す仕組みになってしまう。QEMU は起動しない(秒で終わる)。
+.PHONY: check-qemu-retry-self-test
+check-qemu-retry-self-test:
+	@tools/run_qemu_milestone.sh --self-test
+
+.PHONY: test-qemu-declare-audit
+test-qemu-declare-audit:
+	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_DECLARE_AUDIT \
+	  MILESTONE=test/lisp/qemu_boot_declare_audit.lisp
+
+# [計器] 確保の理由別の数え上げ(M8-T1。documents/heap-allocation-reasons.md)。
+# ALLOC_AUDIT のビルドで、理由ごとの確保量と回数を Lisp から読めるようにする。
+#
+# **既定ビルドには 1 命令も入らない**(runtime.h のマクロが ((void)0) に畳まれ、
+# 組み込み関数も登録されない)。既定の組み込み数を変えないので
+# test/c/runtime_test.c の SMALL_HEAP_SIZE(余裕 5KB 未満)の再調整が要らない。
+#
+# ここで見るのは 3 つ:
+#   1. 理由の番号が実際にその理由を指していること(物を作って縛る)
+#   2. 合計が %%HEAP-USED-BYTES と一致すること(二重計上していない)
+#   3. **未分類の桶が 0 であること**(数え漏れが無い)
+# 3 が検出器である。理由を置かずに確保する経路を足すと、ここが落ちる。
+#
+# EXTRA_CFLAGS 経由にしているのは declare-audit と同じ理由(既に
+# BUILD_FLAG_SIGNATURE に入っているので、付け外しで古いバイナリを測る事故を防げる)
+test-qemu-alloc-audit:
+	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_ALLOC_AUDIT \
+	  MILESTONE=test/lisp/qemu_boot_alloc_audit.lisp
+
+# [計器] インタプリタ for の 1 反復あたりの確保を理由別に出す(M8-T2)。
+# **絶対値は事前に導けない**(測る行為そのものが確保する)ので、
+# n=100 と n=200 の差を 100 で割って 1 反復あたりを出す。
+# 内訳の主張(対 64 + 脱出の印 32 = 96)はこの試験が固定する
+test-qemu-alloc-breakdown:
+	$(MAKE) test-qemu-milestone EXTRA_CFLAGS=-DISIKIOS_ALLOC_AUDIT \
+	  MILESTONE=test/lisp/qemu_boot_alloc_breakdown.lisp
+
+# [案 d 第 3 段] フレーム内の番地参照が **3 入口だけ**を通っていることの検査。
+# 寸法は jit_emit_rsp_disp32 で数えた最高水位で決まるので、**3 入口を迂回されると
+# 水位に穴が開き、足りない寸法で確保して実行時に静かにスタックが壊れる**。
+.PHONY: check-frame-access-entries check-frame-access-entries-self-test
+check-frame-access-entries:
+	@python3 tools/check_frame_access_entries.py
+
+check-frame-access-entries-self-test:
+	@python3 tools/check_frame_access_entries.py --self-test
+
 # ネイティブgccでビルドし、そのままコンテナ内で実行するユニットテスト
-test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(HDR) | $(BUILD_TMPDIR)
+# マクロの前方参照検査(tools/check_macro_forward_refs.py)。
+# **マクロ定義より前で使われたマクロは展開されず、関数呼び出しになる。**
+# その名前の関数は存在しないので EVAL-ERROR が**値として**返り、制御転送では
+# ないので黙って流れて捨てられる。エラーにならないので気づけない。
+# とくに defun は JIT が定義時にコンパイルするので call が焼き込まれる。
+# 静的検査で一瞬で終わるので make test の先頭に置く
+# (実際に踏んだ: documents/inline-arith.md §8-1)
+.PHONY: check-macro-order
+check-macro-order:
+	@python3 tools/check_macro_forward_refs.py
+
+# [規則 8] 上の検出器の自己試験。**試していない検出器は働かない。**
+# 一時ファイル(tempfile)に「定義より前で使っている資料」を作って検出器にかけ、
+# 陽性対照 = 前方参照が報告されること、陰性対照 = 正しい順なら 0 件であること
+# を確かめる。QEMU もネットワークも要らないので make test に入れてある
+check-macro-order-self-test:
+	@python3 tools/check_macro_forward_refs.py --self-test
+
+test: check-macro-order check-macro-order-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
-		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
+		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_RUNTIME) $(TEST_SRC_RUNTIME) -lm
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
@@ -336,6 +641,16 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_MOUNT) $(TEST_SRC_MOUNT) -lm
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_DISASM) $(TEST_SRC_DISASM)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_FRAMEBUFFER) $(TEST_SRC_FRAMEBUFFER)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_RUNTIME) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_PROCESS) -v "$(PWD)":/workspace isiki-builder
@@ -355,6 +670,8 @@ test: $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP_COMPILED) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_IDE) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_MOUNT) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_DISASM) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_FRAMEBUFFER) -v "$(PWD)":/workspace isiki-builder
 
 clean:
 	rm -rf esp_dir $(BUILD_TMPDIR) $(IMAGES_DIR)
@@ -671,16 +988,45 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # 順に実行してまとめて検証する(いずれかが失敗すればmakeはそこで停止する)。
 # fat16_test.lispはディスク上にファイルを作成・書き込みする破壊的なテストのため、
 # 前回実行分のディスクイメージが残っているとpristineな状態を前提にしたアサーション
-# (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする
+# (ディレクトリ一覧やファイル内容の期待値)が失敗する。毎回作り直すため事前にrmする。
+#
+# [P0〜P6] test-qemu-error-escape-gcはGC_DEBUGビルドでエラー脱出を流し、
+# g_gc_lifo_violations == 0 を確認する。通常ビルドではこのカウンタが存在しないため
+# test-qemuには含められず、ここで別ビルドとして回す。
+#
+# [P4] qemu_boot_no_init_signal.lispは**init.lispを読まない**唯一のboot-entryで、
+# 条件クラスが1つも無い状態でsignalしても戻ってくることを見る。他のmilestoneは
+# すべて先頭で(load "src/lisp/init.lisp")するため、この状態はここでしか通らない。
+#
+# [P1] qemu_boot_fat_callback_transfer.lispは**必ずqemu_boot_m6_fat16.lispより後**に
+# 置くこと。FAT16イメージのルートへP1BASE.TXT等を作るので、先に走らせると
+# fat16_test.lispのルートディレクトリ一覧のアサーションが落ちる
 test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_no_init_signal.lisp
+	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat_callback_transfer.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
+	$(MAKE) test-qemu-bench-jit
+	$(MAKE) test-qemu-bench-interp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_for_semantics.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_frame.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_limits.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_stack_guard.lisp
+	$(MAKE) test-qemu-heap-exhaustion
+
+# [可用性/#110] ヒープ枯渇が <storage-exhausted> になることを見る
+# (M8-T5/T6。documents/heap-exhaustion.md)。**専用の milestone にしてある**理由:
+# 枯渇の試験が万一ヒープを壊した場合に、5000 件超ある通しの試験を道連れにしない
+# (スタックガード(qemu_boot_stack_guard.lisp)と同じ扱い)。
+test-qemu-heap-exhaustion:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_heap_exhaustion.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
@@ -801,6 +1147,16 @@ AUDIT_TIMEOUT ?= 1800
 test-inline-expansion: $(LISP_COMPILED)
 	tools/bench/check_inline_expansion.sh
 
+# [P0〜P6 の回帰] エラー脱出を GC_DEBUG ビルドで流し、shadow stack の LIFO 規律が
+# 破れていないこと(g_gc_lifo_violations == 0)を確認する。
+#
+# **フェーズごとに手で確認していただけだと、将来の変更で静かに破れる。**
+# g_gc_lifo_violations は GC_DEBUG ビルドにしか無いカウンタで、破れても
+# エラーにならず数が増えるだけ(pitfalls 原則6)なので、常設のテストで見張る。
+# GC_DEBUG は通常ビルドと別のビルドスタンプになるため、test-qemu とは別ターゲットにする。
+test-qemu-error-escape-gc:
+	$(MAKE) GC_DEBUG=1 test-qemu-milestone MILESTONE=test/lisp/qemu_boot_error_escape_gc.lisp
+
 test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
@@ -819,12 +1175,19 @@ test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		echo $$ec > $(BUILD_TMPDIR)/qemu-exit.txt
 	rm -f .qemu-test-trigger
 
+# [flake] **「結果が無い」を「テストが失敗した」と区別し、結果が無いときだけ 1 回再試行する。**
+# ゲストが test-results.txt を書く前に終わると、以前は `test -f` で落ちて
+# **本物の失敗と区別が付かなかった**。同じ形の flake が 3 件記録されている
+# (2026-10-02 / 2026-10-29 / 2026-11-01。**後ろの 2 件は同じ qemu_boot_partition**)。
+# documents/records-and-measurement-rules.md「付録: QEMU 実行の flake 記録」。
+#
+# **結果があって失敗している場合は再試行しない**(失敗の隠蔽をしない)。
+# 再試行したときは [FLAKE] を 1 行出し、tmp/qemu_flakes.txt に追記する。
+# **QEMU のオプションはここが唯一の真実源**で、スクリプトはコマンド行を受け取るだけ。
 test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
-	rm -f .qemu-test-trigger test-results.txt
-	echo "$(MILESTONE)" > .qemu-test-trigger
-	qemu-system-x86_64 \
+	@tools/run_qemu_milestone.sh "$(MILESTONE)" 'qemu-system-x86_64 \
 		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
@@ -833,11 +1196,7 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 		$(QEMU_EXTRA_FLAGS) \
-		-no-reboot
-	rm -f .qemu-test-trigger
-	test -f test-results.txt
-	cat test-results.txt
-	grep -q " 0 failed" test-results.txt
+		-no-reboot'
 
 # 命令数ベースの性能計測基盤(documents/performance-measurement.md参照)。
 # ゲストが実際に実行した命令数を、ホストの実行速度・スケジューリング
@@ -847,6 +1206,12 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # (ソースからの再ビルドを前提とし、.soはgit管理対象外)。stderrへ
 # `[isiki_instcount] total_insns=<N>` の形式で報告する。
 INSTCOUNT_PLUGIN = tools/plugins/isiki_instcount.so
+# タイマー割り込み1回あたりの命令数。ゲート区間の中で割り込みが入ると、その
+# ハンドラの命令も数えてしまうので差し引く。**実測で求めた値**で、同じ区間を
+# 違う tick 数で 4 回測って傾きを取ったところ 4 回とも 914.0 だった
+# (documents/performance-measurement.md「手法1の改良案」)。ハンドラを
+# 変更したら測り直すこと
+ISR_INSNS_PER_TICK ?= 914
 
 $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 	docker run --rm --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder -c '\
@@ -861,14 +1226,148 @@ $(INSTCOUNT_PLUGIN): tools/plugins/isiki_instcount.c
 # 「構文別ベンチマークスイート」節)。src/c/bench_subprimitive.cの素のC実装と
 # src/lisp/bench_aot.lispの同等Lispコード(AOTトランスパイル済み)を、構文
 # カテゴリごとに1対1で命令数比較する。ケースごとに別々のQEMU起動が必要
-# (total_insnsはブート全体の合計しか得られないため)なので21回起動し、
-# 10〜20分程度かかる。test-qemu-perf等と同じくローカル専用でCIには含めない。
+# (total_insnsはブート全体の合計しか得られないため)なので起動を分ける。
+# **既定で 3 回繰り返す**(BENCH_REPEAT=3)ので 121 回起動し、
+# **実測 約 50 分**(2026-10-02。C 版の N を 200,000,000 にしたぶん伸びた)。
+# test-qemu-perf等と同じくローカル専用でCIには含めない。
+# **AOT経路とC実装しか測らない。**JIT経路は test-qemu-jit-bench。
+#
+# **測定前に 2 つのゲートを通す。**どちらが落ちても測定値を 1 つも出さない:
+#   ゲート1 Lisp 側のアサーション(" 0 failed" の grep で落ちる)
+#   ゲート2 **os_eval 区間の命令数の N に対する傾きが 0 であること**
+#           (反復ごとにインタプリタへ落ちていたら、その数字は AOT でも C でもない)
 # transpile.lisp/生成コードを変更した後に再実行して、構文単位の改善/退行を追う
-BENCH_N_C ?= 10000000
+# [性能測定] **C 版の N は 10,000,000 では足りなかった。**
+# 1 ブートあたり 11〜31M 命令のぶれ(ホスト時間に依存するポーリング回数の差)を
+# 2N で割った 1.4〜2.6 命令/単位が、C の値そのもの(4〜17)と同じ桁になり、
+# 校正点 c/for(真値 4.000。逆アセンブルで確定)が 2.44 と出ていた。
+# 200,000,000 なら 0.03〜0.08 まで下がり、実測で median が 3.9996 になる。
+# cons だけは N に比例して cons を確保するので上げられない(GC が支配的になる)。
+# documents/performance-measurement.md「推定量を校正点で決めた」節
+BENCH_N_C ?= 200000000
+BENCH_N_C_CONS ?= 10000000
 BENCH_N_AOT ?= 1000000
 
 test-qemu-construct-bench: $(INSTCOUNT_PLUGIN) build
-	BENCH_N_C=$(BENCH_N_C) BENCH_N_AOT=$(BENCH_N_AOT) tools/bench/run_construct_bench.sh
+	BENCH_N_C=$(BENCH_N_C) BENCH_N_C_CONS=$(BENCH_N_C_CONS) BENCH_N_AOT=$(BENCH_N_AOT) tools/bench/run_construct_bench.sh
+
+# [性能測定] JIT 経路の構文別ベンチマーク(documents/performance-measurement.md
+# 「JIT 経路の基準値」節)。**test-qemu-construct-bench は AOT 経路と C 実装しか
+# 測っていない。** defun した関数(型特化・インライン・declaim が効く経路)は
+# こちらで測る。同じ N・同じ傾き法で AOT 版も測るので、AOT と JIT の差が
+# そのまま出る。6 カテゴリ x 2 経路 x 2 点 x **3 回**(BENCH_REPEAT の既定)
+# + ウォームアップで 73 起動、**実測 約 14 分**(2026-10-02、KVM 無しの TCG)。
+# test-qemu-perf 等と同じくローカル専用。
+#
+# **測定の前に 2 つのゲートを通す。**どちらが落ちても測定値を 1 つも出さない:
+#   ゲート1 %%za-compiled-p が T であること(test/lisp/bench_jit_guard.lisp)
+#   ゲート2 **os_eval 区間の命令数の N に対する傾きが 0 であること**
+#           (%%za-compiled-p が T でも、本体が全部ネイティブで走るとは限らない)
+# ゲート2 の陽性対照:
+#   BENCH_PATHS=jit BENCH_CASES=evalfall BENCH_REPEAT=1 BENCH_NO_CHECK=1 \
+#     make test-qemu-jit-bench        -> ゲート2 が落ちる
+#
+# **記録する推定量は 3 回の最小値(min3)。試行回数を変えたら記録値は全部無効に
+# なる**(最小値は回数を増やすと系統的に下がる)。推定量は出力に 3 つとも出る
+# (documents/performance-measurement.md「推定量を『3 回の最小値』にした」)
+BENCH_N_JIT ?= 1000000
+
+test-qemu-jit-bench: $(INSTCOUNT_PLUGIN) build
+	BENCH_N=$(BENCH_N_JIT) tools/bench/run_jit_bench.sh
+
+# [性能測定] **解釈実行(インタプリタ)経路**の構文別ベンチマーク
+# (documents/performance-measurement.md「解釈実行の経路の基準値」節)。
+# **test-qemu-construct-bench(c / aot)と test-qemu-jit-bench(aot / jit)は
+# 解釈実行の経路を 1 行も測っていない。** したがって解釈実行に費用を足しても、
+# 記録された基準値は 1 つも動かない。M8-T4/T5 でヒープ枯渇の検査を評価の
+# 入口に置くと、その費用はここにしか現れない。
+# 3 カテゴリ x 2 点 x **3 回**(BENCH_REPEAT の既定)+ ウォームアップで 19 起動。
+# test-qemu-perf 等と同じくローカル専用。
+#
+# **N は他経路より 1 桁小さい**(既定 100,000 対 1,000,000)。
+# 解釈実行は AOT/JIT より 1〜2 桁遅いので、同じ N では測定時間が爆発する。
+# **したがってこの行を c / aot / jit の行と比べてはいけない**
+# (N が違う傾きは比較できない。check_bench_baseline.py が n 列を照合する)。
+# 用途は「解釈実行の経路の中での前後比較」だけである。
+#
+# **ゲートは JIT 側の逆向きである。**どちらが落ちても測定値を 1 つも出さない:
+#   ゲート1 %%za-compiled-p が **NIL** であること(test/lisp/bench_interp_guard.lisp)
+#   ゲート2 **os_eval 区間の命令数の N に対する傾きが 0 でないこと**
+#           (解釈実行なら仕事はすべて os_eval の中で起きる。0 なら
+#            それは解釈実行ではない)
+# 陽性対照(解釈実行に費用を足すと値が動くこと。規則 8):
+#   BENCH_CASES="loop loopcost" BENCH_REPEAT=1 BENCH_NO_CHECK=1 \
+#     make test-qemu-interp-bench
+BENCH_N_INTERP ?= 100000
+
+test-qemu-interp-bench: $(INSTCOUNT_PLUGIN) build
+	BENCH_N=$(BENCH_N_INTERP) tools/bench/run_interp_bench.sh
+
+# [性能測定] JIT 経路のベンチの正当性テスト(数秒)。
+#   - 測定対象が JIT に乗っていること(%%za-compiled-p)
+#   - AOT 版と同じ計算をしていること
+#   - JIT 化を確認するゲートの**陰性対照と陽性対照**(規則 8)
+# 計測と違い短時間で終わるので test-qemu-all に入れてある
+test-qemu-bench-jit:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_jit.lisp
+
+# [性能測定] 解釈実行の経路のベンチの正当性テスト(数秒)。
+#   - 測定対象が**インタプリタで走っている**こと(%%za-compiled-p が NIL。
+#     JIT 側の逆向き)
+#   - AOT 版と同じ計算をしていること
+#   - ゲートの**陰性対照と陽性対照**(規則 8)
+#   - 1 反復あたりの確保量が出ること(#interp-alloc-per-iter の行)
+# 計測と違い短時間で終わるので test-qemu-all に入れてある
+test-qemu-bench-interp:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_interp.lisp
+
+# [二重定義マクロの照合] src/lisp/init.lisp の defmacro と src/lisp/transpile.lisp の
+# *macro-expanders* が、同じフォームを同じ形に展開するかを突き合わせる。
+# **transpile.lisp:721 のコメントは for/while について「同じ展開規則」と書いていて、
+# それが嘘になっていた**(for だけ片方が作り直されていた)。2 つの実装が同じで
+# あると主張して、照合するものが何も無かった。
+# host 側(roswell で transpile.lisp の展開関数を呼ぶ)と guest 側(QEMU で
+# init.lisp の macroexpand-1 を呼ぶ)の両方を回すので QEMU を 1 回起動する。
+# 判定は tools/macro_parity_expected.tsv(same / cosmetic / DIVERGENT)。
+# documents/for-expansion.md §3
+test-qemu-macro-parity:
+	tools/check_macro_parity.sh
+
+# [調査] JIT 生成コードのスタックフレーム(ZA_FRAME_TOTAL)の内訳。
+# **ZA_FRAME_TOTAL は JIT 関数すべてのフレームで、再帰深さの上限をそのまま決める**
+# (256KB / 7480 = 35 段)。za.c からフレームレイアウトの #define を切り出して
+# プリプロセッサに計算させる(手計算しない)。QEMU もビルドも要らない。
+# 定数を上書きした試算もできる: python3 tools/jit_frame_breakdown.py DEPTH=8 LOCALS=8
+# documents/jit-frame-survey.md §2
+jit-frame-breakdown:
+	@python3 tools/jit_frame_breakdown.py
+
+# [調査] let / let* の束縛数(幅)と入れ子段数(深さ)のヒストグラム。
+# **ソース上の let ではなくマクロ展開後の IIFE 形を数える**(JIT が判定する対象)。
+# host 側(roswell)で全 Lisp ソースを macroexpand-all する。QEMU は要らない。
+# documents/jit-frame-survey.md §3
+let-histogram:
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
+		-c 'ros run --load tools/let_histogram.lisp --quit' 2>&1 | grep -E '^(IIFE|SKIP|FILE)'
+
+# [GCデバッグ] GC を強制しても for の結果が壊れないことを確かめる
+# (documents/for-expansion.md §1)。**GC_DEBUG=1 を自分で渡す。**
+# 渡し忘れると %%DIAG-GC-STRESS が無く「GC を強制したつもりで強制していない」
+# まま全部通るので、test/lisp/gc_debug_guard.lisp が通常ビルドで落とす。
+# %%DIAG-GC-STRESS=1(確保ごとに GC)を含むので **約 8 分**かかる。
+# test-qemu-all には入れない(通常ビルドでは意味を持たない)
+test-qemu-for-gc-stress:
+	$(MAKE) test-qemu-milestone GC_DEBUG=1 MILESTONE=test/lisp/qemu_boot_for_gc_stress.lisp
+
+# [GCデバッグ] **深い再帰から一気に巻き戻しても GC ルートの LIFO が壊れないこと。**
+# issue #110 / documents/stack-guard.md §6-2。<storage-exhausted> は深さ 27 付近で
+# signal されるので、そこからトップレベルまで戻る過程で GC_PROTECT の cleanup が
+# 一気に大量に走る。**GC_DEBUG=1 を自分で渡す。** 渡し忘れると
+# %%DIAG-GC-STRESS が無く「GC を強制したつもりで強制していない」まま通るので、
+# test/lisp/gc_debug_guard.lisp が通常ビルドで落とす。
+# test-qemu-all には入れない(通常ビルドでは意味を持たない)
+test-qemu-stack-guard-gc:
+	$(MAKE) test-qemu-milestone GC_DEBUG=1 MILESTONE=test/lisp/qemu_boot_stack_guard_gc.lisp
 
 # [性能測定] Phase1の受け入れ条件(documents/performance-measurement.md
 # 「letのImmobilized Spaceリーク」節)。クロージャ生成が実行回数に比例して
@@ -887,10 +1386,52 @@ test-qemu-for-expansion:
 test-qemu-bench-construct-check:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_bench_construct.lisp
 
+# [性能測定] float の型昇格(c-1)の効果。documents/float-contagion.md 6章。
+# single-float はタグ0x4の即値なので結果を包むヒープ確保が要らない。
+# double は MAGIC_FLOAT の instance なので1演算ごとに確保する。その差を測る。
+# 同一ブート内で single/double/mixed/fixnum を2往復し、bytes/call と ticks を
+# test-results.txt へ出す(確保量だけは回帰アサーションにしてある)
+test-qemu-float-contagion-bench:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_float_contagion_bench.lisp
+
 # 使い方: make test-qemu-instcount MILESTONE=test/lisp/qemu_boot_xxx.lisp
 # [QEMU_DISK_IMG=...]。既存のtest-qemu-milestoneと同じ引数を受け付ける
 test-qemu-instcount: $(INSTCOUNT_PLUGIN)
 	$(MAKE) test-qemu-milestone QEMU_EXTRA_FLAGS="-plugin file=$(INSTCOUNT_PLUGIN)"
+
+# ゲート版(documents/performance-measurement.md「手法1の改良案」)。
+# **2パスで走る。** ロード先のアドレスはディスク構成でも変わるので、
+# 同じQEMUコマンドラインでまず実行時アドレスを取り(パス1)、それを
+# gate_start=/gate_end= に渡して測る(パス2)。
+#
+# MILESTONE の Lisp は、どこかで
+#   (format *isiki-test-stream* "#gate ~A~%" (%%gate-plugin-args))
+# を出力すること。パス1はその1行だけを取りに行く。
+#
+# 使い方: make test-qemu-instcount-gate MILESTONE=test/lisp/qemu_boot_xxx.lisp
+test-qemu-instcount-gate: $(INSTCOUNT_PLUGIN)
+	@test -n "$(MILESTONE)" || { echo "ERROR: MILESTONE= を指定すること"; exit 1; }
+	@echo "=== パス1: ゲートの実行時アドレスを取る(プラグイン無し) ==="
+	$(MAKE) test-qemu-milestone MILESTONE=$(MILESTONE)
+	@GATE_ARGS=$$(sed -n 's/^#gate //p' test-results.txt | head -1); \
+	 test -n "$$GATE_ARGS" || { echo "ERROR: test-results.txt に #gate 行が無い"; exit 1; }; \
+	 echo "=== パス2: gate=$$GATE_ARGS ==="; \
+	 $(MAKE) test-qemu-milestone MILESTONE=$(MILESTONE) \
+	   QEMU_EXTRA_FLAGS="-plugin file=$(INSTCOUNT_PLUGIN),$$GATE_ARGS" 2>&1 | tee tmp/instcount-gate.out
+	@echo ""
+	@echo "=== 区間ごとの命令数(割り込み補正つき) ==="
+	@echo "補正後 = insns - $(ISR_INSNS_PER_TICK) * ticks"
+	@echo "  ISR_INSNS_PER_TICK はタイマー割り込み1回あたりの命令数。区間の中で"
+	@echo "  割り込みが入るとそのハンドラの命令も数えてしまうので差し引く"
+	@echo "  (documents/performance-measurement.md「手法1の改良案」§割り込みの補正)"
+	@awk -v isr=$(ISR_INSNS_PER_TICK) '\
+	  BEGIN { k=0; j=0 }   # **未初期化のまま添字に使うと ins[""] を引く**(awk の添字は文字列) \
+	  FNR==NR { if ($$0 ~ /^\[isiki_instcount\] SEG [0-9]+ insns=/) { v=$$0; sub(/.*insns=/,"",v); ins[k++]=v } next } \
+	  /^#seg / { label=$$2; ticks=0; \
+	             for (i=1;i<=NF;i++) { if ($$i ~ /^ticks=/) { t=$$i; sub(/^ticks=/,"",t); ticks=t } } \
+	             if (hdr==0) { printf "%-18s %14s %6s %14s\n","label","insns","ticks","corrected"; hdr=1 } \
+	             printf "%-18s %14d %6d %14d\n", label, ins[j], ticks, ins[j]-isr*ticks; j++ }' \
+	  tmp/instcount-gate.out test-results.txt
 
 # 決定論的実行モード(-icount)での計測(documents/performance-measurement.md
 # 参照)。1命令ごとに仮想時間を進めるため、ホストの実行速度と無関係に常に

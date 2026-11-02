@@ -41,9 +41,32 @@
  * 確認済み)。TB単位でGHashTableを使うため大量のTBがある場合はprofile
  * 無効時よりわずかにオーバーヘッドが増える。
  *
+ * オプション引数 gate_start=0xADDR,gate_end=0xADDR: **測定区間を「時間で」
+ * 区切る。** 指定すると、gate_start のTBが実行された時点からgate_endのTBが
+ * 実行される時点までの間だけ、**実行している場所によらず全命令**をgate_insnsへ
+ * 集計する。start/endによるアドレスのフィルタとは目的が違う:
+ *
+ *   start/end  ... その範囲に「居る」間だけ数える(アドレスの選別)
+ *   gate_*     ... その区間の「間」はどこに居ても数える(時間の選別)
+ *
+ * インライン化の効果測定にはgate_*でなければならない。インラインで消えるのは
+ * **呼び出し側のcallと引数の受け渡し**であって呼び先の中身ではないため、呼び先の
+ * アドレス範囲だけを数えるとインライン化した瞬間にその範囲が0になり、
+ * 「コストが呼び出し元へ移っただけ」なのに「全部消えた」と読めてしまう。
+ * また呼び先(primitive_*)は.textの別の場所に、JIT生成コードはヒープ上の動的
+ * アドレスに居るため、連続した1つのアドレス範囲では囲えない
+ * (documents/performance-measurement.md「手法1の改良案」)。
+ *
+ * ゲートのマーカーにはos_bench_gate_open/os_bench_gate_close
+ * (src/c/bench_subprimitive.c)を使い、実行時アドレスは%%GATE-PLUGIN-ARGSで
+ * ゲスト側から取得する(ロード先はディスク構成でも変わるため、計測と同じ
+ * QEMUコマンドラインで取ること)。マーカーのTB自身は数えない。
+ *
  * 終了時(qemu_plugin_register_atexit_cb)にstderrへ
  *   [isiki_instcount] total_insns=<N> range_insns=<M>
- * の形式で出力する。
+ *   [isiki_instcount] gate_insns=<N> gate_opens=<K> gate_closes=<K>
+ * の形式で出力する。**gate_opens が期待した回数でなければ、ゲートが開いて
+ * いないか開きっぱなしなので、命令数は信用してはならない。**
  */
 #include <inttypes.h>
 #include <stdio.h>
@@ -55,6 +78,21 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 static uint64_t total_insns = 0;
 static uint64_t range_insns = 0;
+static uint64_t gate_insns = 0;
+/* 区間ごとの内訳。1ブートで複数の区間(床・対照・本命)を測れるようにする。
+   1つの数字しか出さないと、区間ごとにブートし直すことになり、
+   そのたびにブート間のぶれが乗る */
+#define GATE_MAX_SEGMENTS 64
+static uint64_t seg_insns[GATE_MAX_SEGMENTS];
+static uint64_t seg_count = 0;
+static uint64_t gate_cur = 0;
+static uint64_t gate_opens = 0;
+static uint64_t gate_closes = 0;
+static uint64_t gate_start_addr = 0;
+static uint64_t gate_end_addr = 0;
+static int have_gate = 0;
+/* ゲートが開いているか。TB実行コールバックからのみ触る */
+static int gate_open = 0;
 static uint64_t range_start = 0;
 static uint64_t range_end = 0;
 static int have_range = 0;
@@ -83,6 +121,37 @@ static void vcpu_tb_exec_range(unsigned int cpu_index, void *udata) {
     __atomic_add_fetch(&range_insns, n, __ATOMIC_RELAXED);
 }
 
+/* ゲートを開く。マーカーのTB自身は数えない(開くのは実行後の扱いでよい) */
+static void vcpu_tb_exec_gate_open(unsigned int cpu_index, void *udata) {
+    (void)cpu_index;
+    (void)udata;
+    __atomic_store_n(&gate_cur, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate_open, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&gate_opens, 1, __ATOMIC_RELAXED);
+}
+
+static void vcpu_tb_exec_gate_close(unsigned int cpu_index, void *udata) {
+    (void)cpu_index;
+    (void)udata;
+    __atomic_store_n(&gate_open, 0, __ATOMIC_RELAXED);
+    uint64_t cur = __atomic_load_n(&gate_cur, __ATOMIC_RELAXED);
+    if (seg_count < GATE_MAX_SEGMENTS) {
+        seg_insns[seg_count] = cur;
+    }
+    seg_count++;
+    __atomic_add_fetch(&gate_insns, cur, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&gate_closes, 1, __ATOMIC_RELAXED);
+}
+
+/* ゲートが開いている間だけ数える。**アドレスは見ない**(どこに居ても数える) */
+static void vcpu_tb_exec_gated(unsigned int cpu_index, void *udata) {
+    (void)cpu_index;
+    if (__atomic_load_n(&gate_open, __ATOMIC_RELAXED)) {
+        uint64_t n = (uint64_t)(uintptr_t)udata;
+        __atomic_add_fetch(&gate_cur, n, __ATOMIC_RELAXED);
+    }
+}
+
 static void vcpu_tb_exec_hot(unsigned int cpu_index, void *udata) {
     (void)cpu_index;
     hot_entry_t *e = (hot_entry_t *)udata;
@@ -100,6 +169,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
         qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec_range,
                                               QEMU_PLUGIN_CB_NO_REGS,
                                               (void *)(uintptr_t)n);
+    }
+    if (have_gate) {
+        if (vaddr == gate_start_addr) {
+            qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec_gate_open,
+                                                  QEMU_PLUGIN_CB_NO_REGS, NULL);
+        } else if (vaddr == gate_end_addr) {
+            qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec_gate_close,
+                                                  QEMU_PLUGIN_CB_NO_REGS, NULL);
+        } else {
+            qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec_gated,
+                                                  QEMU_PLUGIN_CB_NO_REGS,
+                                                  (void *)(uintptr_t)n);
+        }
     }
     if (have_profile) {
         g_mutex_lock(&hot_table_lock);
@@ -138,6 +220,32 @@ static void plugin_exit(qemu_plugin_id_t id, void *p) {
         fprintf(stderr, "[isiki_instcount] total_insns=%" PRIu64 "\n",
                 total_insns);
     }
+    if (have_gate) {
+        fprintf(stderr, "[isiki_instcount] gate_insns=%" PRIu64
+                         " gate_opens=%" PRIu64 " gate_closes=%" PRIu64
+                         " gate=[0x%" PRIx64 ",0x%" PRIx64 "]\n",
+                gate_insns, gate_opens, gate_closes,
+                gate_start_addr, gate_end_addr);
+        if (gate_opens == 0) {
+            fprintf(stderr, "[isiki_instcount] WARNING: ゲートが一度も開いていない。"
+                             "アドレスが違うか、マーカーがインライン化されている\n");
+        }
+        uint64_t shown = seg_count < GATE_MAX_SEGMENTS ? seg_count : GATE_MAX_SEGMENTS;
+        for (uint64_t i = 0; i < shown; i++) {
+            fprintf(stderr, "[isiki_instcount] SEG %" PRIu64 " insns=%" PRIu64 "\n",
+                    i, seg_insns[i]);
+        }
+        if (seg_count > GATE_MAX_SEGMENTS) {
+            fprintf(stderr, "[isiki_instcount] WARNING: 区間が %" PRIu64
+                             " 個あり、先頭 %d 個しか記録していない\n",
+                    seg_count, GATE_MAX_SEGMENTS);
+        }
+        if (gate_opens != gate_closes) {
+            fprintf(stderr, "[isiki_instcount] WARNING: open(%" PRIu64
+                             ") と close(%" PRIu64 ") の回数が合わない\n",
+                    gate_opens, gate_closes);
+        }
+    }
     if (have_profile) {
         GPtrArray *arr = g_ptr_array_new();
         GHashTableIter iter;
@@ -171,6 +279,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else if (g_str_has_prefix(argv[i], "end=")) {
             range_end = g_ascii_strtoull(argv[i] + 4, NULL, 0);
             have_range = 1;
+        } else if (g_str_has_prefix(argv[i], "gate_start=")) {
+            gate_start_addr = g_ascii_strtoull(argv[i] + 11, NULL, 0);
+            have_gate = 1;
+        } else if (g_str_has_prefix(argv[i], "gate_end=")) {
+            gate_end_addr = g_ascii_strtoull(argv[i] + 9, NULL, 0);
+            have_gate = 1;
         } else if (g_str_has_prefix(argv[i], "profile=")) {
             have_profile = atoi(argv[i] + 8) != 0;
         }

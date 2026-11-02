@@ -1,6 +1,27 @@
 (load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
+;; テストフレームワーク自身の検証(assert-error-class の陽性/陰性対照を含む)。
+;; **道具が壊れていると全部の期待値が黙って無効になる**ので、何より先に走らせる
+(load "test/lisp/test_framework_test.lisp")
 (load "test/lisp/init_test.lisp")
+;; [P2] トップレベルの打ち切り(environment の巻き戻し / with-environment の
+;; 握り潰し解消 / report-condition の文字列)。init.lisp と条件システムが要る
+(load "test/lisp/toplevel_abort_test.lisp")
+;; [P3] with-handler の脱出先(ハンドラが正常 return したらその with-handler まで戻る)。
+;; インタプリタ版と JIT 版の両方を見る
+(load "test/lisp/handler_exit_test.lisp")
+;; [P4-1] 算術の EVAL-ERROR 返しを signal へ移した分(クラス・スロット・打ち切り)
+(load "test/lisp/arith_signal_test.lisp")
+;; [P4-2] 添字・範囲の EVAL-ERROR 返しを signal へ移した分
+(load "test/lisp/index_signal_test.lisp")
+;; [P4-3] 未定義関数 / immutable-binding / 非関数の呼び出し
+(load "test/lisp/undefined_signal_test.lisp")
+;; [P4-4] load / open-*-file / file-length
+(load "test/lisp/io_signal_test.lisp")
+;; [P5] 算術の型違い / 未束縛変数(正常系のコストがゼロの検出)
+(load "test/lisp/type_unbound_test.lisp")
+;; [P6] arity 不一致(固定引数エントリは無検査、cons エントリで検出)
+(load "test/lisp/arity_signal_test.lisp")
 (load "test/lisp/isiki_test.lisp")
 ;; リーダー構文依存の例(#nA 等)は別ファイル。load の戻り値(成功なら t)で構文エラーによる
 ;; 中断を検出する(qemu_boot_test.lisp と同じ。assert-equal の中に load を直接書かない)

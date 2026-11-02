@@ -1,0 +1,32 @@
+# [性能測定] **真の値が分かっている行(校正点)。**
+# tools/bench/check_bench_baseline.py が読む。
+#
+# **これはコードを検査するテストではなく、計器を検査するテストである。**
+# 推定量を変えたとき・N を変えたとき・プラグインを触ったとき・ベンチの C 実装を
+# 変えたときに、真の値から外れたら**計器が壊れている。**
+#
+# 真の値は逆アセンブルで数えた。いずれも**単一基本ブロック**なので、
+# TB 粒度で数える TCG プラグインでも 1 反復 = ちょうど n 命令になる
+# (2026-10-02、objdump -d esp_dir/EFI/BOOT/BOOTX64.EFI)。
+#
+#   cc_bench_c_for    add %rdx,%rax / add $1,%rdx / cmp %rdx,%rcx / jne   -> 4
+#   cc_bench_c_arith  add %rdx,%rax / add $1,%rdx / cmp %rdx,%rcx / jne   -> 4
+#   cc_bench_c_loop   sub $1,%rax / mov %rax,%rdx / mov %rdx,%rax
+#                     / test %rdx,%rdx / jne                              -> 5
+#
+# **許容値 0.10 の根拠**(documents/performance-measurement.md「推定量を校正点で決めた」):
+#   1 ブートあたり 11〜31M 命令のぶれがある(ゲストの状態はビット単位で同一
+#   なので、ホスト時間に依存する待ち=ポーリングの回数差である)。
+#   N=200,000,000 なら 2N = 400,000,000 で割って 0.03〜0.08 命令/単位。
+#   実測では median が 3.9996(誤差 0.0004)、外れたブートを引いても 0.075。
+#   **0.10 はその両方を通し、式の誤り(2N で割らない等)や
+#   プラグインの変更は確実に捕まえる幅である。**
+#
+#   **この幅では min 系の推定量(N=200,000,000 で 4.0695)は捕まらない。**
+#   推定量の優劣は、ドライバが毎回出す「校正点 vs 5 推定量」の表で見ること
+#   (N=10,000,000 では median 3.95 対 slope-of-mins 2.78 とはっきり分かれる)。
+#
+# path	case	true_value	tol	根拠
+c	for	4.000	0.10	cc_bench_c_for のループ本体 add/add/cmp/jne = 4 命令(単一基本ブロック。objdump で確定)
+c	arith	4.000	0.10	cc_bench_c_arith のループ本体 add/add/cmp/jne = 4 命令(単一基本ブロック。objdump で確定)
+c	loop	5.000	0.10	cc_bench_c_loop のループ本体 sub/mov/mov/test/jne = 5 命令(単一基本ブロック。objdump で確定)

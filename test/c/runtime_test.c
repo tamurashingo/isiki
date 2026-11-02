@@ -9,6 +9,8 @@
 #include "lisp.h"
 #include "process.h"
 #include "reader.h"
+/* [可用性/#110] 枯渇の印を見るのは os_eval の入口なので、評価器の宣言が要る */
+#include "eval.h"
 
 // reader.c は os_read_stream 経由でstream.cをリンクするため、stream.cが
 // 参照するos_virtio9p_open/read_chunk/closeが未定義シンボルにならないよう
@@ -1869,6 +1871,241 @@ void test_immediates_survive_gc_unchanged() {
     os_gc_unregister_root(&fix);
 }
 
+void test_single_float_bit_pattern_round_trip() {
+    /* float → 即値 → float でビットパターンが完全に戻ること。
+       union経由でしか触らないので、非正規化数・NaN・無限大も素通しできるはず */
+    union { float f; UINT32 u; } conv;
+    const UINT32 patterns[] = {
+        0x00000000UL,   /* +0.0 */
+        0x80000000UL,   /* -0.0 */
+        0x3F800000UL,   /* 1.0 */
+        0xBFC00000UL,   /* -1.5 */
+        0x00000001UL,   /* 最小の非正規化数 */
+        0x007FFFFFUL,   /* 最大の非正規化数 */
+        0x00800000UL,   /* 最小の正規化数 */
+        (UINT32)SINGLE_FLOAT_MAX_BITS,              /* FLT_MAX */
+        (UINT32)SINGLE_FLOAT_MAX_BITS | 0x80000000UL, /* -FLT_MAX */
+        0x7F800000UL,   /* +inf */
+        0xFF800000UL,   /* -inf */
+        0x7FC00000UL,   /* quiet NaN */
+    };
+    int bad_tag = 0, bad_bits = 0, bad_upper = 0;
+    for (UINT64 i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        conv.u = patterns[i];
+        lisp_val_t v = os_make_single_float(conv.f);
+        if ((v & TAG_MASK) != TAG_SINGLE_FLOAT) { bad_tag++; }
+        /* bit4-31 は未使用(0)でなければならない */
+        if ((v & ~(lisp_val_t)TAG_MASK & 0xFFFFFFFFULL) != 0) { bad_upper++; }
+        union { float f; UINT32 u; } back;
+        back.f = os_single_float_value(v);
+        if (back.u != patterns[i]) { bad_bits++; }
+    }
+    assert(bad_tag == 0, "single-floatのエンコードは全ケースでTAG_SINGLE_FLOATになる");
+    assert(bad_upper == 0, "single-floatの即値はbit4-31が0(タグとビットパターン以外を汚さない)");
+    assert(bad_bits == 0,
+           "single-floatはエンコード→デコードでビットパターンが完全に保たれる(0.0/-0.0/非正規化数/inf/NaNを含む)");
+
+    /* +0.0 と -0.0 は**別のビットパターン**なので即値としても別の値になる */
+    assert(os_make_single_float(0.0f) != os_make_single_float(-0.0f),
+           "+0.0と-0.0のsingle-floatは別のビットパターンになる");
+    /* ただし数としては等しい。equalは数値をeql比較する(ISLisp §13)。
+       引数はどちらも即値なので、consを組む間にGCが走っても壊れない */
+    lisp_val_t zero_args = os_make_cons(os_make_single_float(0.0f),
+                                        os_make_cons(os_make_single_float(-0.0f), nil));
+    assert(primitive_equal(zero_args, nil) == g_sym_t,
+           "+0.0と-0.0はequalで等しい(値として比較される)");
+}
+
+void test_single_float_is_a_number_and_a_float() {
+    lisp_val_t v = os_make_single_float(1.5f);
+    assert(primitive_floatp1(v) == g_sym_t, "single-floatはfloatpで真");
+    assert(primitive_numberp1(v) == g_sym_t, "single-floatはnumberpで真");
+    assert(primitive_single_float_p1(v) == g_sym_t, "single-floatは%%single-float-pで真");
+    assert(primitive_fixnump1(v) == nil, "single-floatはfixnumpで偽");
+
+    lisp_val_t d = os_make_float(1.5);
+    assert(primitive_floatp1(d) == g_sym_t, "double-floatもfloatpで真");
+    assert(primitive_single_float_p1(d) == nil, "double-floatは%%single-float-pで偽");
+
+    /* os_float_valueは両方を受ける。即値をアドレスとして読まないこと */
+    assert(os_float_value(v) == 1.5, "os_float_valueはsingle-floatも受ける");
+    assert(os_float_value(d) == 1.5, "os_float_valueはdouble-floatも受ける");
+}
+
+void test_single_float_limits_come_from_c() {
+    lisp_val_t pos = primitive_most_positive_single_float(nil, nil);
+    lisp_val_t neg = primitive_most_negative_single_float(nil, nil);
+    assert((pos & TAG_MASK) == TAG_SINGLE_FLOAT, "*most-positive-single-float*はsingle-float");
+    assert((neg & TAG_MASK) == TAG_SINGLE_FLOAT, "*most-negative-single-float*はsingle-float");
+    /* 有限であること: 10倍すると無限大になるが、自分自身は無限大ではない */
+    float p = os_single_float_value(pos);
+    assert(p == p && p * 10.0f != p, "*most-positive-single-float*は有限の最大値");
+    assert(os_single_float_value(neg) == -p, "負側は正側の符号反転ちょうど");
+
+    lisp_val_t dpos = primitive_most_positive_double_float(nil, nil);
+    lisp_val_t dneg = primitive_most_negative_double_float(nil, nil);
+    double dp = os_float_value(dpos);
+    assert(dp == dp && dp * 10.0 != dp, "*most-positive-double-float*は有限の最大値");
+    assert(os_float_value(dneg) == -dp, "double側も負は正の符号反転ちょうど");
+    /* singleの最大値はdoubleの最大値より小さい */
+    assert((double)p < dp, "単精度の最大値は倍精度の最大値より小さい");
+}
+
+void test_single_floats_survive_gc_unchanged() {
+    /* 即値なのでGCは追いかけない。大量に作ってGCを跨いでも値が壊れないこと */
+    lisp_val_t kept[8];
+    for (int i = 0; i < 8; i++) {
+        kept[i] = os_make_single_float((float)i + 0.5f);
+        os_gc_register_root(&kept[i]);
+    }
+    lisp_val_t before[8];
+    for (int i = 0; i < 8; i++) { before[i] = kept[i]; }
+
+    /* GCを確実に動かすため、間にヒープを使う値を挟んで2回回す */
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 64; i++) {
+            (void)os_make_cons(os_make_single_float((float)i), nil);
+        }
+        os_gc_collect();
+    }
+
+    int changed = 0;
+    for (int i = 0; i < 8; i++) {
+        if (kept[i] != before[i]) { changed++; }
+        if (os_single_float_value(kept[i]) != (float)i + 0.5f) { changed++; }
+    }
+    assert(changed == 0, "single-floatはGCを跨いでもビットパターンが変わらない");
+
+    for (int i = 0; i < 8; i++) { os_gc_unregister_root(&kept[i]); }
+}
+
+/* --- float の型昇格 (c-1) ----------------------------------------------
+   規則: より広い形式へ寄せる。整数は float に従う。
+   documents/float-contagion.md */
+
+/** ヒープのバンプポインタが進んだ量(byte)。確保がゼロかどうかを直接見る */
+static UINT64 heap_used_now(void) {
+    return os_fixnum_magnitude(primitive_heap_used_bytes(nil, nil));
+}
+
+void test_float_contagion_two_arg_result_types() {
+    lisp_val_t sf = os_make_single_float(1.5f);
+    lisp_val_t df = os_make_float(1.5);
+    lisp_val_t fx = os_make_fixnum(2);
+
+    struct { lisp_val_t a, b; int expect_single; const char *what; } cases[] = {
+        { sf, sf, 1, "single + single -> single" },
+        { fx, sf, 1, "fixnum + single -> single" },
+        { sf, fx, 1, "single + fixnum -> single" },
+        { sf, df, 0, "single + double -> double" },
+        { df, sf, 0, "double + single -> double" },
+        { df, df, 0, "double + double -> double" },
+        { fx, df, 0, "fixnum + double -> double" },
+        { df, fx, 0, "double + fixnum -> double" },
+    };
+    int bad_add = 0, bad_sub = 0, bad_mul = 0;
+    for (UINT64 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (os_is_single_float(primitive_add2(cases[i].a, cases[i].b))      != cases[i].expect_single) { bad_add++; }
+        if (os_is_single_float(primitive_subtract2(cases[i].a, cases[i].b)) != cases[i].expect_single) { bad_sub++; }
+        if (os_is_single_float(primitive_multiply2(cases[i].a, cases[i].b)) != cases[i].expect_single) { bad_mul++; }
+    }
+    assert(bad_add == 0, "primitive_add2の結果の型が全8通りで型昇格の規則どおり");
+    assert(bad_sub == 0, "primitive_subtract2の結果の型が全8通りで型昇格の規則どおり");
+    assert(bad_mul == 0, "primitive_multiply2の結果の型が全8通りで型昇格の規則どおり");
+
+    /* 値も確かめる。fixnum同士は従来どおりfixnumのまま */
+    assert(primitive_add2(os_make_fixnum(1), os_make_fixnum(2)) == os_make_fixnum(3),
+           "fixnum同士の加算は従来どおりfixnum");
+    assert(os_single_float_value(primitive_add2(sf, sf)) == 3.0f, "1.5f + 1.5f = 3.0f");
+    assert(os_float_value(primitive_add2(sf, df)) == 3.0, "1.5f + 1.5d = 3.0d");
+    assert(os_single_float_value(primitive_multiply2(sf, fx)) == 3.0f, "1.5f * 2 = 3.0f");
+}
+
+void test_single_float_arithmetic_allocates_nothing() {
+    /* **c-1 の性能上の眼目。** single はタグ0x4の即値なので、結果を包むための
+       ヒープ確保が要らない。以前は primitive_add2 が cons を2個作って
+       primitive_add へ委譲していたため、型が正しくても確保が残る形だった
+       (改善Aで見つけた「32byte/回」の正体と同じ構図)。
+
+       バンプポインタ(g_from_ptr - g_from_start)を直接見て、1byteも
+       進んでいないことを確認する。 */
+    lisp_val_t a = os_make_single_float(1.5f);
+    lisp_val_t b = os_make_single_float(2.25f);
+
+    UINT64 before = heap_used_now();
+    lisp_val_t r = a;
+    for (int i = 0; i < 1000; i++) {
+        r = primitive_add2(r, b);
+        r = primitive_subtract2(r, b);
+        r = primitive_multiply2(a, b);
+    }
+    UINT64 after = heap_used_now();
+    assert(after == before, "single x single の + - * はヒープを1byteも確保しない");
+    assert(os_is_single_float(r), "3000回まわしても結果はsingle-floatの即値のまま");
+
+    /* 対照: double は MAGIC_FLOAT の instance なので必ず確保が起きる。
+       この差が single 即値化の効果そのものである */
+    lisp_val_t da = os_make_float(1.5);
+    lisp_val_t db = os_make_float(2.25);
+    UINT64 dbefore = heap_used_now();
+    lisp_val_t dr = da;
+    for (int i = 0; i < 1000; i++) {
+        dr = primitive_add2(dr, db);
+    }
+    UINT64 dafter = heap_used_now();
+    assert(dafter > dbefore, "double x double の加算はヒープを確保する(対照)");
+    assert(!os_is_single_float(dr), "double同士の結果はsingle-floatではない");
+
+    /* 整数 x single も確保ゼロ(整数側は float に従うだけなので) */
+    UINT64 mbefore = heap_used_now();
+    lisp_val_t mr = a;
+    for (int i = 0; i < 1000; i++) {
+        mr = primitive_add2(mr, os_make_fixnum(0));
+    }
+    UINT64 mafter = heap_used_now();
+    assert(mafter == mbefore, "fixnum x single の加算もヒープを確保しない");
+    assert(os_is_single_float(mr), "fixnum x single の結果はsingle-float");
+}
+
+void test_float_comparison_widens_to_double() {
+    /* **狭いほうへ落としてはいけない。** double を single へ丸めてから比べると
+       (= 0.1f0 0.1d0) が真になってしまう(精度を捨てている)。
+       single を double へ広げるのが正しい。 */
+    lisp_val_t sf_tenth = os_make_single_float(0.1f);
+    lisp_val_t df_tenth = os_make_float(0.1);
+
+    lisp_val_t pair = os_make_cons(sf_tenth, os_make_cons(df_tenth, nil));
+    assert(primitive_num_equal(pair, nil) == nil,
+           "(= 0.1f0 0.1d0) は偽。singleをdoubleへ広げて比較している");
+    assert(primitive_less_than(pair, nil) == nil,
+           "single の 0.1 を double へ広げた値は double の 0.1 より大きいので < は偽");
+    assert(primitive_greater_than(pair, nil) == g_sym_t,
+           "同じ理由で > は真");
+
+    /* 1.5 は両形式で正確に表せるので、実装が誤っていても通る。
+       テストに 0.1 系を必ず含めるのはこのため */
+    lisp_val_t exact = os_make_cons(os_make_single_float(1.5f),
+                                    os_make_cons(os_make_float(1.5), nil));
+    assert(primitive_num_equal(exact, nil) == g_sym_t, "(= 1.5f0 1.5d0) は真");
+
+    /* 整数と float も整数側を広げる */
+    lisp_val_t int_vs_single = os_make_cons(os_make_fixnum(1),
+                                            os_make_cons(os_make_single_float(1.0f), nil));
+    assert(primitive_num_equal(int_vs_single, nil) == g_sym_t, "(= 1 1.0f0) は真");
+}
+
+void test_equal_still_requires_matching_tags() {
+    /* equal はタグ一致を要求する。= とは別物で、本作業で変えていない */
+    lisp_val_t mixed = os_make_cons(os_make_single_float(1.5f),
+                                    os_make_cons(os_make_float(1.5), nil));
+    assert(primitive_equal(mixed, nil) == nil, "(equal 1.5f0 1.5d0) は偽(型が違う)");
+    assert(primitive_num_equal(mixed, nil) == g_sym_t, "(= 1.5f0 1.5d0) は真(値が同じ)");
+
+    lisp_val_t same = os_make_cons(os_make_single_float(1.5f),
+                                   os_make_cons(os_make_single_float(1.5f), nil));
+    assert(primitive_equal(same, nil) == g_sym_t, "(equal 1.5f0 1.5f0) は真");
+}
+
 void test_gc_string_with_forward_tag_colliding_length_is_not_misdetected() {
     /* STRINGのword0は**生の長さ**なので、長さの下位ビットがたまたま TAG_FORWARD と
        一致する文字列が必ず存在する。長さは Lisp プログラムが決めるので制御できない
@@ -1974,30 +2211,66 @@ void test_gc_reclaims_unreferenced_garbage() {
 // さらに恒久消費になり、76KBではgcd/isqrtテストがGC後も確保不能になって停止する
 // ようになったため、その分だけ広げる
 //
-// [境界] os_alloc_bytes/gc_to_allocの切り上げ単位を8→16(OS_HEAP_ALIGN)へ変えた
-// ことで、os_bootstrap直後の生存量が実測 21,120 → 21,536 byte(+416 byte、+2.0%)に
+// 2026-09-15 declaim(Phase2): %%CURRENT-OPTIMIZE と %%OPTIMIZE-OF の2つを
+// os_bootstrapへ追加し、さらに全environmentへ10番目のスロット(declaim)を足した。
+//
+// [境界] さらに os_alloc_bytes/gc_to_alloc の切り上げ単位を 8→16(OS_HEAP_ALIGN)へ
+// 変えたことで、os_bootstrap直後の生存量が実測 21,120 → 21,536 byte(+416 byte)に
 // 増えた。増えるのはSTRINGだけで(CONS 16/SYMBOL 32/INSTANCE 32は元々16の倍数)、
 // 8+len が 8の奇数倍になる長さのsymbol名がここに当たる。
-// 77KBのままだとgcd/isqrtテストがGC後も確保不能になって停止するため、
-// 実測した最小値(下記の掃引)に基づいて広げる。
 //
-// 値を変えるときのために可変にしてある。-DSMALL_HEAP_SIZE=... で上書きして
-// 掃引すれば、「ぎりぎり通る最小値」を推測ではなく実測で決められる。
+// **この2つは独立に効き、生存量の増加が足し合わさる。** そのため
+// マージ後の窓は、どちらのブランチが単独で決めた値とも一致しない。
+//   declaim側(feature/compiler-optimization)単独の窓: 79〜80KB → 80KBを採用していた
+//   16byte切り上げ側(main)単独の窓:                  78〜80KB → 79KBを採用していた
+//   **マージ後の窓: 81〜84KB**
+// 両ブランチの値(79/80KB)はどちらもマージ後にはハングする。実際に80KBで
+// runtime_testが無限ループした(os_panicがユニットテストでは抜けないため、
+// CPU100%のまま止まらない)。
 //
-// 掃引結果(2026-09-17、16byte切り上げ後):
-//   77KB: ハング  — GC後も確保不能(os_panicがユニットテストでは無限ループになる)
-//   78KB: 5331 OK / 0 NG
-//   79KB: 5331 OK / 0 NG   ← 採用
-//   80KB: 5331 OK / 0 NG
-//   82KB: isqrtテストの「GCが発火する」アサーションがNG(ヒープが広すぎて発火しない)
-//   84KB: bignum加算テストの同アサーションもNG
-// 変更前(8byte切り上げ)の同じ掃引では 77〜79KB が窓だった(75/76KBはハング、
-// 80KBからGC未発火のNG)。**窓の幅は3KBのまま1KB上へずれただけ**で、これは
-// 生存量が一定量(+416 byte)増えたことと整合する。
-// 79KBは新旧どちらの窓にも入る唯一の値なので、これを採る
-// (「新しい実装でだけ通る値」へ逃げていないことが、この掃引から言える)。
+// 掃引結果(マージ後のツリー、2026-09-18):
+//   80KB: ハング  — GC後も確保不能
+//   81KB〜84KB: 5395 OK / 0 NG (82KBを採用していた)
+//   85KB: isqrtテストの「GCが発火する」アサーションがNG
+//   86KB: bignum加算テストのアサーションもNG
+//
+// [single-float] 2026-09-19: 組み込み関数を5個(%%SINGLE-FLOAT-P と
+// float境界の定数4つ)追加したため、os_bootstrap直後の生存量がまた増え、
+// 82KBはハングするようになった。**組み込みを1つ足すたびにここは動く**
+// (memory: builtin_count_small_heap_calibration)。
+//
+// 掃引結果(single-float導入後、2026-09-19):
+//   82KB: ハング — GC後も確保不能(4625件出たところで止まる)
+//   83KB: 5416 OK / 0 NG
+//   84KB: 5416 OK / 0 NG
+//   85KB: 5416 OK / 0 NG   ← 採用(窓83〜86の中央寄り。ハング側へ3KB、GC未発火側へ2KB)
+//   86KB: 5416 OK / 0 NG
+//   87KB: isqrtテストの「GCが発火する」アサーションがNG
+//   88KB: bignum加算テストのアサーションもNG
+//
+// 中央付近を採るのは、両端のどちらに寄っても壊れ方が違うためである。
+// 小さすぎるとGC後も確保不能でハングし(os_panicがユニットテストでは無限ループ)、
+// 大きすぎるとGCが発火せず「GCを跨いでも正しい」系のアサーションがNGになる。
+// ハングのほうが切り分けに時間がかかるので、下側に寄せない。
+//
+// 値を変えるときのために可変にしてある。**Makefile の SMALL_HEAP_SIZE= から**
+// -DSMALL_HEAP_SIZE=... として渡せるので(例: make test SMALL_HEAP_SIZE=80000、単位は byte)、
+// ソースを書き換えずに掃引して「ぎりぎり通る値」を推測ではなく実測で決められる。
+// この口は Makefile の BUILD_FLAG_SIGNATURE に入っているので、値を変えればビルドし直される
+// (署名の外に置くと「渡したつもりで古いバイナリを測る」事故が無言で成立する。2026-09-17 に実際に踏んだ)。
+// 掃引するときは timeout を**コンテナの中**で効かせること。
+// `timeout N docker run ...` は docker クライアントしか殺さず、ハングした
+// コンテナが生き残って掃引が進まなくなる。
+//
+// [落とし穴] **通る窓の余裕は 5KB 未満しかない。** 組み込み関数
+// (os_set_function(... native ...))を 1 つ足すだけで os_bootstrap の恒久消費が増え、
+// GC 後も確保できなくなる。そのとき os_panic はユニットテストでは無限ループになるため、
+// **テストの NG ではなく「make test が止まって見える」ハングとして現れる**。
+// 失敗件数が出ないので原因と結びつきにくい。
+// 2026-10-30 実測(PR #94 を取り込んで組み込みが 4 つ増えた構成): 85KB は通過、80KB は 60 秒で打ち切り。
+// **組み込みを足したら必ずここを掃引し直すこと。**
 #ifndef SMALL_HEAP_SIZE
-#define SMALL_HEAP_SIZE (79 * 1024)
+#define SMALL_HEAP_SIZE (85 * 1024)
 #endif
 
 static void setup_small_heap(void) {
@@ -2168,6 +2441,96 @@ void test_gc_fires_during_string_append_and_result_is_correct() {
     #undef GC_STRING_TEST_N
 }
 
+/* ===================== disassembler用のアドレス分類 ===================== */
+
+/** 1領域ぶんの境界を、内側と外側の両方から確認する。
+    半開区間なので start は範囲内、end は**範囲外**でなければならない
+    (ここを取り違えると、隣接する領域の先頭1バイトを誤分類する) */
+static void check_region_boundaries(os_addr_region_t region, const char *label) {
+    lisp_addr_t start = 0;
+    lisp_addr_t end = 0;
+    char msg[160];
+
+    if (!os_addr_region_bounds(region, &start, &end)) {
+        sprintf(msg, "%s: 境界が未確定なら start/end は 0 になる", label);
+        assert(start == 0 && end == 0, msg);
+        return;
+    }
+
+    sprintf(msg, "%s: start < end", label);
+    assert(start < end, msg);
+
+    sprintf(msg, "%s: start は範囲内", label);
+    assert(os_classify_addr(start) == region, msg);
+
+    sprintf(msg, "%s: end-1 は範囲内(上端の1バイト手前)", label);
+    assert(os_classify_addr(end - 1) == region, msg);
+
+    sprintf(msg, "%s: end は範囲外(半開区間の上端)", label);
+    assert(os_classify_addr(end) != region, msg);
+
+    sprintf(msg, "%s: start-1 は範囲外", label);
+    assert(os_classify_addr(start - 1) != region, msg);
+}
+
+void test_os_classify_addr_boundaries() {
+    /* Immobilized Space はカーネルイメージ内の静的配列なので、ヒープ初期化とは
+       無関係に常に境界が確定している */
+    check_region_boundaries(OS_ADDR_IMMOBILIZED, "immobilized");
+    /* GCヒープは setup_heap() 済みなので確定している */
+    check_region_boundaries(OS_ADDR_GC_HEAP, "gc-heap");
+    /* .text はネイティブgccのユニットテストビルド(ELF)では取得できず未確定。
+       os_addr_region_bounds が 0 を返し、check_region_boundaries は
+       「start/end が 0」だけを確認する。実機での .text 判定は
+       test/lisp/disassemble_test.lisp が確認する */
+    check_region_boundaries(OS_ADDR_KERNEL_TEXT, "kernel-text");
+}
+
+void test_os_classify_addr_rejects_out_of_range() {
+    assert(os_classify_addr(0) == OS_ADDR_UNKNOWN, "0 はどの領域にも属さない");
+    assert(os_classify_addr((lisp_addr_t)~(UINT64)0) == OS_ADDR_UNKNOWN,
+           "UINTPTR_MAX はどの領域にも属さない");
+    /* Cスタック上のローカル変数は3領域のいずれでもない */
+    int on_stack = 0;
+    assert(os_classify_addr((lisp_addr_t)(void *)&on_stack) == OS_ADDR_UNKNOWN,
+           "Cスタック上のアドレスはどの領域にも属さない");
+}
+
+void test_os_classify_addr_regions_do_not_overlap() {
+    /* 領域同士が重なっていれば、判定順序によって結果が変わる設計上の誤りになる。
+       確定している領域の組み合わせだけを総当たりで確認する */
+    for (int a = OS_ADDR_KERNEL_TEXT; a <= OS_ADDR_GC_HEAP; a++) {
+        for (int b = a + 1; b <= OS_ADDR_GC_HEAP; b++) {
+            lisp_addr_t a_start = 0, a_end = 0, b_start = 0, b_end = 0;
+            if (!os_addr_region_bounds((os_addr_region_t)a, &a_start, &a_end)) { continue; }
+            if (!os_addr_region_bounds((os_addr_region_t)b, &b_start, &b_end)) { continue; }
+            char msg[160];
+            sprintf(msg, "領域 %d と %d が重なっていない", a, b);
+            assert(a_end <= b_start || b_end <= a_start, msg);
+        }
+    }
+}
+
+void test_os_addr_region_name() {
+    assert(strcmp(os_addr_region_name(OS_ADDR_KERNEL_TEXT), "kernel") == 0, "kernel の表示名");
+    assert(strcmp(os_addr_region_name(OS_ADDR_IMMOBILIZED), "immobilized") == 0, "immobilized の表示名");
+    assert(strcmp(os_addr_region_name(OS_ADDR_GC_HEAP), "gc-heap") == 0, "gc-heap の表示名");
+    assert(os_addr_region_name(OS_ADDR_UNKNOWN) == 0, "UNKNOWN は名前を持たない(NULL)");
+}
+
+void test_os_classify_addr_matches_real_objects() {
+    /* 実際に確保したオブジェクトとFunction Cellが、期待どおりの領域に落ちること。
+       境界値だけでなく「本物がそこにある」ことを確認する */
+    lisp_val_t cell = os_get_function_cell(os_make_symbol("CAR"), global_environment);
+    assert(cell != nil, "CAR の Function Cell が引ける");
+    assert(os_classify_addr((lisp_addr_t)(cell & ~TAG_MASK)) == OS_ADDR_IMMOBILIZED,
+           "Function Cell は Immobilized Space にある");
+
+    lisp_val_t cons = os_make_cons(os_make_fixnum(1), os_make_fixnum(2));
+    assert(os_classify_addr((lisp_addr_t)(cons & ~TAG_MASK)) == OS_ADDR_GC_HEAP,
+           "os_make_cons が返した cons は GCヒープにある");
+}
+
 /* [境界] 可変長オブジェクトの長さが端数になるケースを、確保 -> GC -> 内容確認まで
    通す。STRINGのサイズは 8+len なので、len が 0/7/8/9/15/16/17 のとき切り上げ前の
    要求は 8/15/16/17/23/24/25 byte になり、8byte切り上げだと 8/16/16/24/24/24/32 と
@@ -2271,6 +2634,315 @@ void test_heap_init_aligns_both_half_spaces() {
     free(raw);
 }
 
+
+/* [Phase 4a-2] os_scan_declarations が nil 終端で止まること。
+ *
+ * **このテストが無かったために無限ループを実機まで持ち込んだ。**
+ * nil は g_nil_cell | TAG_CONS、つまり TAG_CONS タグを持つ Lisp 値なので、
+ * `(v & TAG_MASK) == TAG_CONS` をリストの終端判定に使うと
+ * cc_cdr(nil) == nil が返り続けて抜けられない。
+ * JIT はユニットテストのビルドでは常に断念するが、declare の走査は
+ * eval_defun 側(= インタプリタ経路)なのでここで踏める。 */
+void test_scan_declarations_terminates_on_nil() {
+    lisp_val_t x = os_make_symbol("DT-X");
+    lisp_val_t y = os_make_symbol("DT-Y");
+    lisp_val_t var_syms[2];
+    var_syms[0] = x;
+    var_syms[1] = y;
+
+    /* (declare (type <fixnum> x y)) を1つ持つ body。
+       <fixnum> は *classes* が未初期化(init_aot.lisp 未ロード)なので
+       解決できず OS_DECL_TYPE_UNKNOWN になるが、**終端判定の確認には十分**で、
+       むしろ「未知の型名でもエラーにせず抜ける」(§3-3)も同時に確認できる。 */
+    lisp_val_t cls = os_make_symbol("<FIXNUM>");
+    lisp_val_t vars = os_make_cons(x, os_make_cons(y, nil));
+    lisp_val_t spec = os_make_cons(os_make_symbol("TYPE"), os_make_cons(cls, vars));
+    lisp_val_t decl = os_make_cons(os_make_symbol("DECLARE"), os_make_cons(spec, nil));
+    lisp_val_t rest_form = os_make_cons(os_make_symbol("DT-BODY"), nil);
+    lisp_val_t body = os_make_cons(decl, os_make_cons(rest_form, nil));
+
+    os_decl_types_t types;
+    lisp_val_t after = os_scan_declarations(body, var_syms, 2, &types);
+
+    assert(after != nil, "declareを1つ剥がしても残りのbodyがある");
+    assert(cc_car(after) == rest_form, "剥がした後の先頭は declare の次のフォーム");
+    assert(cc_cdr(after) == nil, "bodyはそれで終わり");
+    assert(os_decl_types_get(types, 0) != OS_DECL_TYPE_NONE, "1つめの変数に符号が付く");
+    assert(os_decl_types_get(types, 1) != OS_DECL_TYPE_NONE, "2つめの変数にも符号が付く");
+
+    /* declare しか無い body は、剥がすと nil になる(ここも終端で止まること) */
+    lisp_val_t only = os_make_cons(decl, nil);
+    os_decl_types_t t2;
+    assert(os_scan_declarations(only, var_syms, 2, &t2) == nil,
+           "declareだけのbodyは剥がすとnilになる");
+
+    /* body が nil でも即座に戻ること */
+    os_decl_types_t t3;
+    assert(os_scan_declarations(nil, var_syms, 2, &t3) == nil, "nilのbodyはnilのまま戻る");
+    assert(os_decl_types_get(t3, 0) == OS_DECL_TYPE_NONE, "宣言が無ければ符号も付かない");
+
+    /* 宣言指定子が空の declare、変数の無い type: どちらも抜けること */
+    lisp_val_t empty_decl = os_make_cons(os_make_symbol("DECLARE"), nil);
+    lisp_val_t novars = os_make_cons(os_make_symbol("TYPE"), os_make_cons(cls, nil));
+    lisp_val_t decl2 = os_make_cons(os_make_symbol("DECLARE"), os_make_cons(novars, nil));
+    lisp_val_t body2 = os_make_cons(empty_decl, os_make_cons(decl2, os_make_cons(rest_form, nil)));
+    os_decl_types_t t4;
+    assert(os_scan_declarations(body2, var_syms, 2, &t4) == cc_cdr(cc_cdr(body2)),
+           "空のdeclareと変数無しのtypeも読み飛ばせる");
+}
+
+// ===========================================================================
+// [可用性/#110] ヒープ枯渇が**ハングではなく <storage-exhausted>** になる
+// (M8-T5/T6。設計は documents/heap-exhaustion.md、実装の註は runtime.c)
+// ===========================================================================
+//
+// **ここは「本物の枯渇」を起こす側の試験である。** ゲスト(QEMU)側は
+// test/lisp/heap_exhaustion_test.lisp が 3 経路(インタプリタ / AOT / JIT)から
+// 大口の要求を出す。2 つの手段の役割分担:
+//
+//   | 手段 | ここで見るもの |
+//   |---|---|
+//   | ネイティブ(このファイル) | 小口の枯渇 = 印 / 予備の開閉 / 重ねない / エラー値 |
+//   | ゲスト(lisp 側) | 大口の枯渇 = 3 経路から <storage-exhausted> が signal される |
+//
+// **条件システム(init.lisp)はネイティブのユニットテストには無い。** だから
+// os_signal_condition は g_sym_eval_error を返す。これは欠陥ではなく
+// 「最後はエラー値へ落ちる」という設計のいちばん外側の挙動そのものなので、
+// ここで固定する(ハングしないこと・値が返ること)。
+//
+// [枯渇専用のヒープを別に持つ理由]
+// **SMALL_HEAP_SIZE のつまみを共有してはいけない。** あちらは os_bootstrap の
+// 恒久消費ぎりぎり(通る窓が 5KB 未満)に調整されており、組み込みを 1 つ足すだけで
+// ハングする。こちらの要件は逆で「予備領域(定数 ~68KB)が半空間に収まる」ことなので、
+// 大きいほうが都合がよい。**同じ名前を使うと、片方の要件でもう片方が壊れる。**
+/* 枯渇テスト専用のヒープの大きさ(byte)。Makefile の HEAP_EXHAUSTION_SIZE= から
+   -DHEAP_EXHAUSTION_HEAP_SIZE=... として上書きできる(掃引のため)。
+   **4MB にしてあるのは、予備領域が丸ごと入る構成でなければ検査自体が無効になる**
+   ためである(runtime.c の heap_update_soft_end: 予備が半空間の 1/8 を超える構成では
+   予備 0 = 従来どおりその場で panic。1MB だと半空間 512KB で 1/8 = 64KB < 予備 ~68KB
+   なので**無効側に入り、この試験は何も検出しなくなる**)。
+   下の「予備領域が実在すること」の判定がその番犬である */
+#ifndef HEAP_EXHAUSTION_HEAP_SIZE
+#define HEAP_EXHAUSTION_HEAP_SIZE (4 * 1024 * 1024)
+#endif
+
+static void setup_exhaustion_heap(void) {
+    void *heap = malloc(HEAP_EXHAUSTION_HEAP_SIZE);
+    assert(heap != NULL, "枯渇テスト用のヒープをmallocで確保できる");
+    os_heap_init((UINT64)heap, HEAP_EXHAUSTION_HEAP_SIZE);
+    os_reset_runtime_state_for_test();
+    os_bootstrap();
+}
+
+void test_heap_exhaustion_marks_and_signals_at_eval_entry() {
+    setup_exhaustion_heap();
+
+    assert(os_heap_guard_hits() == 0, "起動直後は枯渇を一度も知らせていない");
+    assert(os_heap_exhaustion_pending() == 0, "起動直後は枯渇の印が立っていない");
+    /* 予備領域が実在すること。**ここが 0 だと以降の試験は何も検出しない**
+       (柔らかい端 == 床 == 真の端 になり、従来どおり panic するだけになる) */
+    /* **この判定は番犬である。** 予備領域が丸ごと入らない構成では検査ごと無効になる
+       (runtime.c の heap_update_soft_end)。無効な構成でこの先へ進むと、下の
+       「埋める」ループが**印を立てられないまま床まで埋め切って os_panic へ入り、
+       ユニットテストでは hlt が無いので NG ではなくハングになる**。
+       実際に踏んだ: 陽性対照 -DHEAP_SIGNAL_RESERVE=0 が exit=124 になり、
+       出力はバッファに残ったまま失われた(2026-11-01)。
+       **ハングは NG より切り分けに時間がかかる。** ここで引き返す */
+    int guard_active = os_heap_soft_limit_normal_bytes() < os_heap_floor_limit_bytes();
+    assert(guard_active,
+           "このヒープの大きさでは枯渇の検査が有効である(無効ならこの試験は何も検出しない)");
+    if (!guard_active) {
+        return;
+    }
+    assert(os_heap_soft_limit_bytes() == os_heap_soft_limit_normal_bytes(),
+           "起動直後の常道が比べる相手は通常の柔らかい端である");
+
+    // **生きている**consを積んでいくので、GCでは回収できず必ず枯渇する。
+    // 印が立った時点で止める。止めないと予備を食い潰して床を割り、os_panicへ入る
+    // (ユニットテストのos_panicはhltが無いので、NGではなくハングになる)
+    lisp_val_t live = nil;
+    GC_PROTECT(live);
+    UINT64 gc_before = os_gc_collect_count();
+    int iterations = 0;
+    while (!os_heap_exhaustion_pending() && iterations < 1000000) {
+        live = os_make_cons(os_make_fixnum((UINT64)iterations), live);
+        iterations++;
+    }
+    assert(os_heap_exhaustion_pending() == 1,
+           "生きているconsでヒープを埋めると、確保器が枯渇の印を立てる(panicしない)");
+    /* **印が最初の確保で立っていたら、この試験は何も見ていない。**
+       予備領域の計算が壊れて柔らかい端が先頭付近へ来た場合がそれである */
+    assert(iterations > 1000,
+           "印が立つまでに確保を何度も通っている(初回の確保で立つのは設定が壊れている合図)");
+
+    /* [回収器の最中に signal しないこと]
+       **埋める過程で回収器は必ず走る**(柔らかい端を越えるたびに 1 回)。
+       そのあいだ発火回数が 0 のままであること = **GC の最中に signal していない**。
+       これが観測できる形での保証である。構造の側の保証は
+       「os_alloc_bytes は印を立てるだけで、os_heap_signal_exhausted を呼ばない」で、
+       これは grep で確かめられる(呼び出し元は大口の primitive と os_eval だけ) */
+    assert(os_gc_collect_count() > gc_before,
+           "埋める過程で回収器が実際に走っている(走っていなければ次の判定は空振り)");
+    assert(os_heap_soft_limit_bytes() == os_heap_floor_limit_bytes(),
+           "印が立っているあいだは予備領域が開いている(柔らかい端が床まで下がる)");
+    assert(os_heap_guard_hits() == 0,
+           "確保器は印を立てるだけで、まだ知らせていない(確保器の中ではsignalできない)");
+
+    /* **印を見るのは評価の入口である。** ここが設計の肝で、
+       os_eval を 1 回通すと枯渇が「値として」返ってくる */
+    lisp_val_t r = os_eval(os_make_fixnum(1), global_environment);
+    assert(r == g_sym_eval_error,
+           "枯渇の印が立っているとos_evalは知らせる。条件システムが無い段階ではEVAL-ERRORへ落ちる");
+    assert(os_heap_guard_hits() == 1, "知らせたのは1回だけ");
+    assert(os_heap_exhaustion_pending() == 0, "知らせたら印は消える(同じ枯渇で何度も鳴らない)");
+    assert(os_heap_soft_limit_bytes() == os_heap_soft_limit_normal_bytes(),
+           "知らせ終わったら予備領域は閉じる(次の枯渇のために取っておく)");
+
+    /* 知らせたあとも機械は生きている。**ハングしないことがこの試験の主旨である** */
+    lisp_val_t again = os_eval(os_make_fixnum(1), global_environment);
+    assert(again == os_make_fixnum(1),
+           "知らせたあとの評価は普通に値を返す(印が消えているので素通りする)");
+}
+
+void test_heap_exhaustion_is_detected_before_the_multiply() {
+    setup_exhaustion_heap();
+
+    /* [測り方] **先に 1 回知らせて、signal 経路が使うものを温めておく。**
+       os_make_symbol("<STORAGE-EXHAUSTED>") は初回だけsymbolと名前文字列を確保するので、
+       温めずに測ると「桁あふれの検査が確保した」ように見えてしまう */
+    (void)os_heap_signal_exhausted(global_environment);
+    UINT64 hits_before = os_heap_guard_hits();
+
+    /* 2^32 × 2^32 = 2^64。**巻き上がってちょうど 0 になる次元**である。
+       入れる前の alloc_vector_block は `total *= dims[i]` を素で回していたので、
+       total = 0 として 8*(1+2+0) = 24 byte の塊を確保し、ヘッダに「各次元 2^32」と
+       書き込んでいた。aref/set-aref の範囲検査はそのヘッダを見るので、
+       (set-aref v a 0 0) は**範囲内と判定されたうえで塊の外へ書く。**
+       つまりこれは枯渇ではなく**ヒープの踏み越え**だった。
+       だから判定は掛け算より前(掛けているその場)でなければならない */
+    lisp_val_t dims_overflow_to_zero =
+        os_make_cons(os_make_fixnum(4294967296ULL),
+                     os_make_cons(os_make_fixnum(4294967296ULL), nil));
+    GC_PROTECT(dims_overflow_to_zero);
+    lisp_val_t args_overflow = os_make_cons(dims_overflow_to_zero, nil);
+    GC_PROTECT(args_overflow);
+    UINT64 used_before = os_fixnum_magnitude(primitive_heap_used_bytes(nil, nil));
+    lisp_val_t r1 = primitive_make_array(args_overflow, nil);
+    UINT64 used_after = os_fixnum_magnitude(primitive_heap_used_bytes(nil, nil));
+    assert(r1 == g_sym_eval_error,
+           "2^32×2^32(積が巻き上がって0になる)は枯渇として知らされる");
+    assert(os_heap_guard_hits() == hits_before + 1, "知らせたのは1回");
+    assert(used_after == used_before,
+           "桁あふれの要求はヒープを1byteも進めない(小さい塊を確保してから踏み越えない)");
+
+    /* 巻き上がり先が巨大になる場合。**byte 数が 1.7e19 になるので
+       `p + aligned` のポインタ演算が回り込む。** 差で見ないと「空きがある」と
+       判定されうる(heap_request_fits の註) */
+    lisp_val_t dims_huge =
+        os_make_cons(os_make_fixnum(2000000000ULL),
+                     os_make_cons(os_make_fixnum(2000000000ULL),
+                                  os_make_cons(os_make_fixnum(2000000000ULL), nil)));
+    GC_PROTECT(dims_huge);
+    lisp_val_t r2 = primitive_make_array(os_make_cons(dims_huge, nil), nil);
+    assert(r2 == g_sym_eval_error, "2e9の3乗(積が巻き上がって巨大になる)も枯渇として知らされる");
+
+    /* 巻き上がらないが入らない大きさ。**こちらが本来の「枯渇」である** */
+    lisp_val_t r3 = primitive_create_vector(os_make_cons(os_make_fixnum(100000000000ULL), nil), nil);
+    assert(r3 == g_sym_eval_error, "1e11要素のvectorは枯渇として知らされる");
+    lisp_val_t r4 = primitive_create_string(os_make_cons(os_make_fixnum(100000000000ULL), nil), nil);
+    assert(r4 == g_sym_eval_error, "1e11文字のstringは枯渇として知らされる");
+
+    /* 負の長さ。**fixnumは2の補数ではなく符号+マグニチュードなので、
+       生シフトすると符号ビットが値に混ざって 1e17 規模の非負の長さに見える。**
+       そこまで大きいとポインタ演算が回り込むので、入れる前は
+       「空きがある」と判定されたうえで要素の書き込みが始まりうる状態だった。
+       クラスは <domain-error>(= 引数が非負整数でない)。条件システムが無い
+       この試験では EVAL-ERROR へ落ちるので、見えるのは「値が返る」ことまでである */
+    lisp_val_t r5 = primitive_create_vector(
+        os_make_cons(os_make_fixnum_signed(1, 1), nil), nil);
+    assert(r5 == g_sym_eval_error, "負の長さのcreate-vectorは値を返す(確保に進まない)");
+
+    /* 正常系(変えていないこと)。枯渇の判定を入れても普通の確保は通る */
+    lisp_val_t ok = primitive_create_vector(
+        os_make_cons(os_make_fixnum(3), os_make_cons(os_make_fixnum(7), nil)), nil);
+    GC_PROTECT(ok);
+    lisp_val_t *header = os_vector_header(ok);
+    assert(header[0] == 1 && header[1] == 3, "普通のcreate-vectorはrank1・長さ3のまま");
+    lisp_val_t aref_args = os_make_cons(ok, os_make_cons(os_make_fixnum(2), nil));
+    assert(primitive_aref(aref_args, nil) == os_make_fixnum(7), "初期値も従来どおり入る");
+}
+
+/* ---- 重ねないこと / 予備領域の開閉を、本物の signal 経路で見る ----------------
+ *
+ * **条件システムのフェイクを置く。** os_signal_condition は MAKE-INSTANCE /
+ * SIGNAL-CONDITION / %FIND-CLASS をグローバル環境から引いて呼び戻すので、
+ * そこへネイティブ関数を差し込めば**本物の経路のまま**中へ入れる
+ * (repl_test.c が %REPORT-CONDITION-STRING のフェイクを置いているのと同じ手)。
+ *
+ * フェイクの MAKE-INSTANCE の中で**もう一度** os_heap_signal_exhausted を呼ぶ。
+ * これが「ハンドラの中で大口の確保に失敗した」状況そのものである。 */
+static lisp_val_t g_fake_inner_result = 0;
+static UINT64 g_fake_soft_limit_inside = 0;
+static UINT64 g_fake_hits_inside = 0;
+static int g_fake_make_instance_called = 0;
+
+static lisp_val_t fake_find_class_for_exhaustion(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    /* 非nil・非EVAL-ERRORであればよい(os_signal_conditionはクラスが引けるかだけを見る) */
+    return g_sym_t;
+}
+
+static lisp_val_t fake_make_instance_for_exhaustion(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    g_fake_make_instance_called = 1;
+    /* **知らせている最中である。** ここで予備領域が開いていなければならない */
+    g_fake_soft_limit_inside = os_heap_soft_limit_bytes();
+    g_fake_inner_result = os_heap_signal_exhausted(global_environment);
+    g_fake_hits_inside = os_heap_guard_hits();
+    return g_sym_t;
+}
+
+static lisp_val_t fake_signal_condition_for_exhaustion(lisp_val_t args, lisp_val_t env) {
+    (void)args; (void)env;
+    return os_make_symbol("FAKE-SIGNALLED");
+}
+
+void test_heap_exhaustion_does_not_nest_while_reporting() {
+    setup_exhaustion_heap();
+
+    os_set_function(os_make_symbol("%FIND-CLASS"),
+                    os_make_native_function((lisp_addr_t)(void *)fake_find_class_for_exhaustion),
+                    global_environment);
+    os_set_function(os_make_symbol("MAKE-INSTANCE"),
+                    os_make_native_function((lisp_addr_t)(void *)fake_make_instance_for_exhaustion),
+                    global_environment);
+    os_set_function(os_make_symbol("SIGNAL-CONDITION"),
+                    os_make_native_function((lisp_addr_t)(void *)fake_signal_condition_for_exhaustion),
+                    global_environment);
+
+    UINT64 floor_limit = os_heap_floor_limit_bytes();
+    UINT64 normal_limit = os_heap_soft_limit_normal_bytes();
+
+    lisp_val_t outer = os_heap_signal_exhausted(global_environment);
+
+    assert(g_fake_make_instance_called == 1, "フェイクの条件システムを通って本物の経路が走った");
+    assert(outer == os_make_symbol("FAKE-SIGNALLED"),
+           "外側のsignalはsignal-conditionの戻り値をそのまま返す");
+    assert(g_fake_soft_limit_inside == floor_limit,
+           "知らせている最中だけ予備領域が開いている(柔らかい端が床まで下がっている)");
+    assert(g_fake_inner_result == g_sym_eval_error,
+           "知らせている最中の枯渇はsignalを重ねずEVAL-ERRORを返す(重ねると予備を食い潰す)");
+    assert(g_fake_hits_inside == 2, "重ねなかった回も発火回数には数える(0は「守られていない」の合図なので)");
+    assert(os_heap_soft_limit_bytes() == normal_limit, "抜けたら予備領域は閉じる");
+    assert(os_heap_exhaustion_pending() == 0, "印は残らない");
+
+    /* [計器] 予備領域の見積り(★)を実測へ直すための値。**この試験のフェイクは
+       ほとんど確保しないので小さい値しか出ない。** 本物の値はゲスト側で出る。
+       ここで見るのは「予備領域を超えていないこと」= 予備が足りているかの向きだけ */
+    assert(os_heap_signal_path_bytes() < os_heap_floor_limit_bytes() - os_heap_soft_limit_normal_bytes(),
+           "signal経路が確保した量は予備領域に収まっている(超えたら予備が足りていない)");
+}
+
 int main(int argc, char** argv) {
    (void)argc;
    (void)argv;
@@ -2289,6 +2961,11 @@ int main(int argc, char** argv) {
    test_primitive_global_environment_returns_global_environment_regardless_of_caller_env();
    test_primitive_set_current_environment_returns_t_or_nil_and_rejects_invalid_env();
    test_os_function_cell();
+   test_os_classify_addr_boundaries();
+   test_os_classify_addr_rejects_out_of_range();
+   test_os_classify_addr_regions_do_not_overlap();
+   test_os_addr_region_name();
+   test_os_classify_addr_matches_real_objects();
    test_os_make_fixnum_signed();
    test_os_make_integer_promotes_to_bignum();
    test_primitive_add_signed_and_bignum();
@@ -2376,15 +3053,30 @@ int main(int argc, char** argv) {
    test_immediate_encode_decode_round_trip();
    test_char_high_code_points_do_not_corrupt_upper_bits();
    test_immediates_survive_gc_unchanged();
+   test_single_float_bit_pattern_round_trip();
+   test_single_float_is_a_number_and_a_float();
+   test_single_float_limits_come_from_c();
+   test_single_floats_survive_gc_unchanged();
+   test_float_contagion_two_arg_result_types();
+   test_single_float_arithmetic_allocates_nothing();
+   test_float_comparison_widens_to_double();
+   test_equal_still_requires_matching_tags();
    test_gc_string_with_forward_tag_colliding_length_is_not_misdetected();
    test_gc_instance_survives();
    test_gc_circular_cons_list_does_not_hang();
+   test_scan_declarations_terminates_on_nil();
    test_gc_reclaims_unreferenced_garbage();
 
    test_gc_fires_during_bignum_addition_and_result_is_correct();
    test_gc_fires_during_gcd_and_isqrt_and_results_are_correct();
    test_gc_fires_during_vector_construction_and_elements_are_preserved();
    test_gc_fires_during_string_append_and_result_is_correct();
+
+   /* [可用性/#110] 枯渇が <storage-exhausted> になる。**専用のヒープを作り直す**ので
+      GC発火の掃引(SMALL_HEAP_SIZE)より後に置く */
+   test_heap_exhaustion_marks_and_signals_at_eval_entry();
+   test_heap_exhaustion_is_detected_before_the_multiply();
+   test_heap_exhaustion_does_not_nest_while_reporting();
 
    test_heap_align_holds_for_variable_length_objects_across_gc();
    /* os_heap_initを別のヒープで呼び直すので、他のテストより後に置く */

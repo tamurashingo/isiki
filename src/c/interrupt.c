@@ -8,6 +8,7 @@
 #include "lisp.h"
 
 #include "interrupt.h"
+#include "za.h"
 
 
 
@@ -303,8 +304,22 @@ void c_keyboard_handler(uint8_t scancode) {
     }
 
     if (scancode >= 0x3B && scancode <= 0x3E) {
-        // F1〜F4: アクティブなプロセスを切り替える(表示中の仮想バッファも同時に切り替わる)
+        // F1〜F4: アクティブなプロセスを切り替える(表示中の仮想バッファも同時に切り替わる)。
+        // view_offsetはバッファごとに保持しているので、ここでは触らない。
+        // **この判定を下の「任意のキーで最下部へ復帰」より先に置くこと。** 逆にすると
+        // 切り替えのたびに遡り位置がリセットされ、バッファごとの保持と矛盾する
         switch_active_process(scancode - 0x3B);
+        return;
+    }
+
+    // Shift+PageUp / Shift+PageDown: 表示中のバッファをスクロールバックする。
+    // 0x49/0x51はSCANCODE_NORMAL/SHIFTがどちらも0で従来は無視されていたため、
+    // 既存の入力動作には影響しない。拡張キーの0xE0プレフィックスは上の
+    // `scancode & 0x80` で破棄済みなので、テンキーとナビゲーションキーの
+    // PgUp/PgDnは区別されない(この用途では問題にならない)
+    if (key_shift_pressed && (scancode == 0x49 || scancode == 0x51)) {
+        INT32 page = (INT32)os_vbuf_screen_rows();
+        os_vbuf_scroll(scancode == 0x49 ? -page : page);
         return;
     }
 
@@ -312,6 +327,10 @@ void c_keyboard_handler(uint8_t scancode) {
     if (c == 0) {
         return;
     }
+
+    // 遡って表示している最中に何か打ったら最下部へ復帰する。
+    // **キーは握り潰さない。** 打った文字はこのまま通常どおり入力として通る
+    os_vbuf_scroll_to_bottom();
 
     process_t *current = get_current_process();
 
@@ -550,6 +569,10 @@ UINT64 SYSV_ABI c_timer_switch(UINT64 current_rsp) {
     os_set_variable(g_sym_current_process, next_cell, global_environment);
 
     UINT64 next_rsp = os_process_get_saved_rsp(cc_car(next_cell));
+    /* [可用性] JIT のスタック残量検査の閾値を、切り替え先のスタックに合わせる。
+       プロセスごとにスタックが違う(g_stack_areaの320KBスロット)ので、
+       生成コードが読む閾値もここで切り替える(issue #110) */
+    os_za_set_stack_low(os_process_stack_low_for(next_rsp));
 #ifdef ISIKIOS_GC_DEBUG
     /* [GC監査] GCの実行中に入ったtickを数える。上の*current-process* / run-queue/PCBの
        読み書きは、その瞬間には半端な状態を触っている可能性がある */
@@ -694,7 +717,16 @@ void SYSV_ABI c_cpu_exception_handler(ExceptionContext *ctx, uint64_t fault_addr
                 os_diag_serial_write("\n   ** GUARD HIT (上端側): スタック溢れではない。"
                                      "基底/上限の破壊かバッファオーバーラン **\n   stack=");
             } else {
-                os_diag_serial_write("\n   ** STACK OVERFLOW (下端側): 再帰が深すぎる **\n   stack=");
+                os_diag_serial_write("\n   ** STACK OVERFLOW (下端側): 再帰が深すぎる **");
+                /* [可用性] JITのスタック残量検査(issue #110)が一度も発火して
+                   いないなら、この溢れは**守られていない経路**(インタプリタ /
+                   AOT)から来ている。1 以上なら、保護は働いたがそのあと
+                   (signal 経路の中で)溢れた = 予備領域が足りない。
+                   documents/stack-guard.md §4 / §6-4 */
+                os_diag_serial_write("\n   jit-stack-guard-hits=");
+                serial_write_hex64(os_za_stack_guard_hits());
+                os_diag_serial_write(" (0 = 守られていない経路、1以上 = 予備領域が足りない)");
+                os_diag_serial_write("\n   stack=");
             }
             serial_write_hex64(os_process_stack_base(0));
             os_diag_serial_write(" guard=");

@@ -98,10 +98,45 @@ typedef struct {
         「フィールドの値」、こちらは「構造体そのものへのポインタ」が古くなる
         ケース)。os_make_stream内で1回だけ設定する */
     lisp_val_t self_handle;
+
+    /** write-from!/read-into!(FAT系ストリームのflush/refillがos_apply_functionで
+        呼び戻すLisp関数)が非局所脱出した場合に、その制御転送値
+        (MAGIC_BLOCK_EXIT等)をここへ預ける。
+
+        **これが無いと、Lisp側のエラー脱出がCの境界で値に化ける。**
+        refill_read_buf_fatは戻り値をos_fixnum_magnitudeへ通すので、脱出シグナルの
+        アドレスを「読めたバイト数」として解釈してしまっていた
+        (documents/error-unwind-survey.md §A-3 / §F-6)。
+
+        os_stream_read_char等の公開APIはintしか返せないため、脱出は
+        「stream->error = 1」という既存の失敗経路に乗せたうえで、値そのものを
+        ここに置いておく。Lispへ戻る境界(stream_lisp.c/format.cのcc_*)が
+        os_stream_take_transferで取り出して呼び出し元へ返す。
+
+        mount_file_node/self_handleと同じく、gc_relocate_stream(runtime.c)が
+        コピー後にgc_copy_valueし直す(個別のGCルート登録は不要)。
+        脱出していないときは常にnil。 */
+    lisp_val_t pending_transfer;
 } os_stream_t;
 
 /** STREAM_STRING_OUTPUTの固定バッファ容量(realloc不可のため) */
 #define STREAM_STRING_OUTPUT_CAP 1024
+
+/**
+ * stream_handle(MAGIC_STREAMインスタンス)が預かっている制御転送値を取り出し、
+ * ストリーム側をクリアする。無ければnilを返す。
+ *
+ * **必ずハンドル経由で取り直す。** flush/refillはos_stream_tを再配置しうるので、
+ * 呼び出し前に持っていた生ポインタは古い実体を指している可能性がある
+ * ([ファイルI/O]#49(M6)と同じ理由)。
+ *
+ * errorフラグは**クリアしない**。write-from!が途中で脱出した以上、そのストリームの
+ * 内容が期待どおりかは分からないため、以後の読み書きは失敗させ続ける方が安全である。
+ *
+ * @param stream_handle MAGIC_STREAMインスタンス
+ * @return 預かっていた制御転送値。無ければnil
+ */
+lisp_val_t os_stream_take_transfer(lisp_val_t stream_handle);
 
 /**
  * 9Pファイルをopenし、streamを読み込み可能な状態に初期化する。

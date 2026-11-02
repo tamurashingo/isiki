@@ -13,6 +13,77 @@
 (defglobal *isiki-test-fail* 0)
 
 ;; ---------------------------------------------------------------------------
+;; 進捗マーカーと経過時間。
+;;
+;; **合計だけでは、ハングしたときに何も分からない。** test-results.txtは
+;; isiki-test-reportが最後に書くので、途中で止まると「空のファイル」しか残らず、
+;; どのファイルのどこまで進んだのかを外から知る手段が無い。
+;;
+;; そこでloadの単位で1行ずつ、開始からの経過時間つきで書き出す。
+;; **1ファイル1行**なので通常実行でも負担にならず、監査モード(*isiki-audit*、
+;; 全アサーションを1件ずつ出す)を有効にしなくても効く。
+;;
+;; 時間の単位はtick。get-internal-real-timeはPITの分周設定(約100Hz)の
+;; tick数をそのまま返すので、**100 tick = 1秒**(1 tick = 10ms)である
+;; (src/c/clock.c の TICKS_PER_SECOND)。
+;; **随時出力するか、結果だけにするかの切り替え。**
+;; #at の行は 9p 経由のファイルへ finish-output まで行うため、**1行あたりの
+;; コストが無視できない**(test-results.txt はホスト側の共有ディレクトリにあり、
+;; QEMU の 9p は msize <= 8192 で動いている)。
+;; ハングの切り分けをするときは t、時間を計測するときは nil にする。
+;; nil でも #elapsed(最後に1回)は出るので、総時間の比較はできる。
+(defglobal *isiki-test-progress* t)
+
+(defglobal *isiki-test-time-start* (get-internal-real-time))
+(defglobal *isiki-test-mark-prev* 0)   ; 直前のマーク時点の経過tick
+
+;; frameworkをloadしてからの経過tick
+(defun isiki-test-elapsed ()
+  (- (get-internal-real-time) *isiki-test-time-start*))
+
+;; 進捗を1行書いてフラッシュする。t=は開始からの経過tick、+=は直前のマークからの差分。
+;; **フラッシュまでやること。** バッファに溜めたままだとハング時に消える。
+(defun isiki-test-mark (label)
+  (if *isiki-test-progress*
+      (let ((now (isiki-test-elapsed)))
+        (format *isiki-test-stream* "#at ~A t=~D += ~D~%"
+                label now (- now *isiki-test-mark-prev*))
+        (setq *isiki-test-mark-prev* now)
+        (finish-output *isiki-test-stream*))
+    nil))
+
+;; 試験ファイルを進捗マーカーつきでloadする。boot-entryスクリプトは
+;; (load "test/lisp/xxx_test.lisp") の代わりにこれを使う。
+;; **loadの前に印をつける**ので、ハングしたときは最後に出ている行の
+;; ファイルが犯人になる(通り抜けていれば次の行が出る)。
+;; [declaim 漏れの検出] declaim は environment 単位で、**ファイルをまたいで残る。**
+;; テストファイルが打ち消し忘れると、後続の無関係なファイルが連鎖で落ちる。
+;; 実際に踏んだ: inline_builtin_test.lisp の 1 行の declaim が、同じファイルの
+;; 後続 assert を 10 件まとめて落とした(documents/inline-arith.md §7-4)。
+;;
+;; **落ちた場所と原因の場所が離れるのが、この事故のいちばん悪いところ。**
+;; ファイルの出口で見れば、両者が一致する。
+;;
+;; 宣言を試すファイルも、**最後に打ち消せば除外は要らない。** 除外リストを
+;; 作らなかったのは、リストに足すことで漏れを恒久化できてしまうからである。
+(defun isiki-test-load (path)
+  (isiki-test-mark path)
+  (isiki-audit-begin path)
+  (let* ((before (%%current-inline))
+         (before-count (+ *isiki-test-pass* *isiki-test-fail*))
+         (r (load path)))
+    ;; **検査本体は別関数にしてある。** assert-equal は**マクロ**で、この defun より
+    ;; 後ろで定義されている。ここへ直接書くとマクロ展開されず、ただの関数呼び出しと
+    ;; して解釈される。assert-equal は関数としては存在しないので EVAL-ERROR が
+    ;; 値として返り、**検査は黙って一度も走らない。**
+    ;; 実際に踏んだ: 陽性対照(わざと declaim を漏らす)が反応しなくて気づいた。
+    ;; **新しく置いた検出器は、それ自体が検証対象である**(規則 8)。
+    ;; 関数呼び出しなら実行時解決なので、定義が後ろでも問題ない。
+    (isiki-file-end-check path before before-count)
+    r))
+;; ---------------------------------------------------------------------------
+
+;; ---------------------------------------------------------------------------
 ;; [GC監査] 塗り潰し(ISIKIOS_GC_PAINT)下で全試験を流すための逐次出力モード。
 ;; documents/pitfalls.md 原則6。
 ;;
@@ -79,11 +150,12 @@
         (if (and (not ok) (= *isiki-audit-first-ng* 0))
             (setq *isiki-audit-first-ng* *isiki-audit-index*)
           nil)
-        (format *isiki-test-stream* "#t ~D ~A ~A gc=~D tick=~D trap=~D stale=~D~%"
+        (format *isiki-test-stream* "#t ~D ~A ~A gc=~D tick=~D t=~D trap=~D stale=~D~%"
                 *isiki-audit-index* *isiki-audit-label*
                 (if ok "OK" "NG")
                 (- gc *isiki-audit-gc-prev*)
                 (- tm *isiki-audit-time-prev*)
+                (isiki-test-elapsed)
                 (isiki-audit-trap-hits)
                 (isiki-audit-stale-hits))
         (setq *isiki-audit-gc-prev* gc)
@@ -143,6 +215,31 @@
            (format *isiki-test-stream* "[NG] ~S => ~S (expected ~~ ~S)~%"
                    ',form %isiki-actual %isiki-expected)))))
 
+;; isiki-test-load から呼ぶファイル出口の検査。**assert-equal より後に置くこと**
+;; (ここでマクロ展開される)。path を混ぜてあるのは NG の行にファイル名を出すため。
+;;
+;; 2 つ見る。
+;;
+;; 1. **declaim 漏れ。** declaim は environment 単位でファイルをまたいで残るので、
+;;    打ち消し忘れると後続の無関係なファイルが連鎖で落ちる。出口で見れば
+;;    落ちた場所と原因の場所が一致する。
+;;
+;; 2. **そのファイルが実際に何件走ったか。** 中断検出(*isiki-test-attempt*)は
+;;    assert-* の中の中断しか見ない。**assert でないトップレベル式が落ちて
+;;    以降が走らなかった場合、件数が静かに減るだけで誰も気づかない。**
+;;    実際、検出器が一度も走っていなかったことに気づけたのは合計件数が
+;;    増えなかったからで、**件数が唯一の証人だった**
+;;    (documents/inline-arith.md §8-1)。証人を制度にする。
+;;
+;;    #count 行を出すので、CI の出力差分に「どのファイルが何件減ったか」が出る。
+;;    0 件のファイルは「走らなかった」疑いとして NG にする。
+(defun isiki-file-end-check (path before before-count)
+  (let ((n (- (+ *isiki-test-pass* *isiki-test-fail*) before-count)))
+    (format *isiki-test-stream* "#count ~A ~D~%" path n)
+    (assert-equal (list path before) (list path (%%current-inline)))
+    (assert-equal (list path t) (list path (> n 0)))))
+
+
 ;; (assert-error form) : formの評価が何らかのconditionをsignalすること
 ;; (仕様の "an error shall be signaled" の例)を検証する。handlerは
 ;; return-fromで脱出するので、continuableかどうかにかかわらず捕捉した時点で
@@ -162,6 +259,56 @@
            (isiki-audit-record nil)
            (format *isiki-test-stream* "[NG] ~S => ~S (expected an error to be signaled)~%"
                    ',form (car (cdr %isiki-actual)))))))
+
+;; (assert-error-class class-designator form) : formの評価が
+;; class-designator(またはそのサブクラス)のコンディションをsignalすることを
+;; 検証する。assert-errorが「何かがsignalされた」までしか見ないのに対し、
+;; こちらは**どのクラスか**まで固定する。
+;;
+;; EVAL-ERROR返しをsignalへ寄せていく作業(documents/error-unwind-survey.md
+;; §A-4 / §6-3 B)では、「エラーになること」だけでなく「仕様のerror-idどおりの
+;; クラスであること」までが検証対象になる。assert-errorで通してしまうと、
+;; 0除算が<simple-error>でsignalされても誰も気づかない。
+;;
+;; class-designatorは**評価する**(typepと同じクラスdesignator: クラス名symbolでも
+;; クラスオブジェクトでもよい)。呼び出し側はquoteして渡す:
+;;   (assert-error-class '<division-by-zero> (div 1 0))
+;;
+;; ハンドラは仕様どおり必ず制御を転送する(spec:6927-6930)。continuableかどうかは
+;; 問わない。assert-errorと同じくisiki-test-beginを先に呼ぶので、中断検出
+;; (*isiki-test-attempt*)にも正しく乗る。
+;;
+;; 結果は3通りに分けてNGメッセージに出す:
+;;   signalされてクラスも一致     -> pass
+;;   signalされたがクラスが違う   -> NG(実際のクラス名を出す)
+;;   signalされず値を返した       -> NG(その値を出す。EVAL-ERRORもここに落ちる)
+(defmacro assert-error-class (class-designator form)
+  `(let ((%isiki-class ,class-designator))
+     (let ((%isiki-actual
+            (block %isiki-assert-error-class
+              (isiki-test-begin ',form)
+              (with-handler
+                  (lambda (%isiki-c)
+                    (return-from %isiki-assert-error-class
+                      (list '%isiki-signaled
+                            (typep %isiki-c %isiki-class)
+                            (%%class-name (class-of %isiki-c)))))
+                (list '%isiki-no-error ,form)))))
+       (if (eq (car %isiki-actual) '%isiki-signaled)
+           (if (car (cdr %isiki-actual))
+               (progn
+                 (setq *isiki-test-pass* (+ *isiki-test-pass* 1))
+                 (isiki-audit-record t))
+             (progn
+               (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+               (isiki-audit-record nil)
+               (format *isiki-test-stream* "[NG] ~S => signaled ~S (expected ~S)~%"
+                       ',form (car (cdr (cdr %isiki-actual))) %isiki-class)))
+         (progn
+           (setq *isiki-test-fail* (+ *isiki-test-fail* 1))
+           (isiki-audit-record nil)
+           (format *isiki-test-stream* "[NG] ~S => ~S (expected ~S to be signaled)~%"
+                   ',form (car (cdr %isiki-actual)) %isiki-class))))))
 
 ;; (assert-output (result-var output-var) form body...) : formを
 ;; *standard-output*が文字列出力ストリーム(create-string-output-stream)に
@@ -190,5 +337,8 @@
       (format *isiki-test-stream* "#audit total=~D first-ng=~D~%"
               *isiki-audit-index* *isiki-audit-first-ng*)
     nil)
+  ;; 総経過時間。100 tick = 1秒(src/c/clock.c の TICKS_PER_SECOND)
+  (let ((e (isiki-test-elapsed)))
+    (format *isiki-test-stream* "#elapsed ~D ticks = ~D sec~%" e (div e 100)))
   (format *isiki-test-stream* "~%==== isiki tests: ~D passed, ~D failed ====~%"
           *isiki-test-pass* *isiki-test-fail*))

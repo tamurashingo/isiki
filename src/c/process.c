@@ -201,9 +201,17 @@ int os_process_in_stack_guard(UINT64 va) {
    ゼロで、検査はスケジューラの切り替え時にのみ走る。
    ただし検出粒度はタイマ周期(約10ms)であり、深い再帰は10ms未満で256KBを
    消費しうる。その場合でも「溢れた後の次のtickで診断付きpanicに到達する」ため、
-   無言の停止よりは大幅に切り分けやすくなる(完全な即時検出にはガードページか
-   関数プロローグでの検査が要るが、後者はPhase4で削った呼び出しコストを
-   再び載せることになる) */
+   無言の停止よりは大幅に切り分けやすくなる。
+
+   **2026-10-07: 「関数プロローグでの検査はPhase4で削った呼び出しコストを再び
+   載せることになる」と書いてあったが、JIT 経路については実際に入れた**
+   (issue #110、documents/stack-guard.md)。費用は**通常経路 3 命令/呼び出し**
+   (mov r11,&閾値 / cmp rsp,[r11] / jae)で、タグ検査 1 組(10 命令/回)より小さい。
+   **ただし入れたのは JIT の生成コードだけである。** インタプリタ(os_eval の再帰、
+   実測 3,072 byte/段)と AOT(実測 320 byte/段)には検査が無く、
+   **そちらの溢れは従来どおりここ(tickごとの検査)とガードページでしか捕まらない。**
+   os_panic_stack_overflow が jit-stack-guard-hits を出すので、
+   溢れた現場で「守られていない経路から来た」ことが読める */
 #define STACK_CANARY 0x5441434B47554152ULL /* "STACKGUAR" 相当のマジック */
 /** カナリアの直上に置く安全マージン。rspがここより下に来た時点で溢れたと判定する */
 #define STACK_GUARD_MARGIN 4096
@@ -224,6 +232,16 @@ int os_process_stack_contains(UINT64 rsp) {
         UINT64 low = (UINT64)stack_usable_base(i);
         if (rsp >= low && rsp <= low + STACK_SIZE) {
             return 1;
+        }
+    }
+    return 0;
+}
+
+UINT64 os_process_stack_low_for(UINT64 rsp) {
+    for (UINT32 i = 0; i < PROCESS_COUNT; i++) {
+        UINT64 low = (UINT64)stack_usable_base(i);
+        if (rsp >= low && rsp <= low + STACK_SIZE) {
+            return low;
         }
     }
     return 0;

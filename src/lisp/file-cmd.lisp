@@ -244,39 +244,41 @@
 ;; 確保し、read-byteでオンデマンドに充填する。read-byteはC側のバッファ
 ;; (stream.cのrefill_read_buf_fat、1024byte単位でread-into!経由の一括転送)を
 ;; 通じて補充されるため、fat16-read-file/fat32-read-file(1byte=1consセル表現)
-;; のような#41の性能問題を引き継がない。*mounts*経由でのマウント解決自体が
-;; 失敗した場合はnil。
+;; のような#41の性能問題を引き継がない。
+;;
+;; [P4-4] **失敗はそのまま呼び出し元へ伝播する。** open-input-stream は
+;; 開けなければ <simple-error> を signal するようになったので、以前あった
+;; (eq stream 'eval-error) の分岐はもう起きない。捕まえたい側が with-handler /
+;; ignore-errors を張ること。file-length は仕様どおり「長さが決められなければ nil」
+;; を返す(spec:6858-6859)ので、そちらの nil 判定だけが残る。
 (defun read-file-into-vector (path)
   (let ((stream (open-input-stream path)))
-    (if (eq stream 'eval-error)
-        nil
-        (let ((len (file-length path)))
-          (if (or (null len) (eq len 'eval-error))
-              (progn (close stream) nil)
-              (let ((vec (create-vector len 0)) (i 0))
+    (let ((len (file-length path)))
+      (if (null len)
+          (progn (close stream) nil)
+          (let ((vec (create-vector len 0)) (i 0))
+            (progn
+              (while (< i len)
                 (progn
-                  (while (< i len)
-                    (progn
-                      (set-elt (read-byte stream) vec i)
-                      (setq i (+ i 1))))
-                  (close stream)
-                  vec)))))))
+                  (set-elt (read-byte stream) vec i)
+                  (setq i (+ i 1))))
+              (close stream)
+              vec))))))
 
 ;; (write-vector-to-file path vector) : vector(general-vector、1byte=1要素)の
 ;; 内容全体をpathへ書き込む。open-output-file/write-byteの上に立つ薄い
-;; ラッパー(read-file-into-vectorの対称版)。成功時t、マウント解決失敗時nil。
+;; ラッパー(read-file-into-vectorの対称版)。成功時t。開けなければ signal が伝播する。
+;; [P4-4] read-file-into-vector と同じく、開けなかった場合は signal が伝播する
 (defun write-vector-to-file (path vector)
   (let ((stream (open-output-file path)))
-    (if (eq stream 'eval-error)
-        nil
-        (let ((len (length vector)) (i 0))
+    (let ((len (length vector)) (i 0))
+      (progn
+        (while (< i len)
           (progn
-            (while (< i len)
-              (progn
-                (write-byte (elt vector i) stream)
-                (setq i (+ i 1))))
-            (close stream)
-            t)))))
+            (write-byte (elt vector i) stream)
+            (setq i (+ i 1))))
+        (close stream)
+        t))))
 
 ;;; --- [ファイルI/O]#51(M8): cat ---
 

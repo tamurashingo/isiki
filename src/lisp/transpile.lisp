@@ -192,6 +192,9 @@
     (fixnump . "primitive_fixnump")
     (bignump . "primitive_bignump")
     (floatp . "primitive_floatp")
+    ;; single-float導入: class-ofがfloatを<single-float>/<double-float>へ
+    ;; 振り分けるのに使う
+    (%%single-float-p . "primitive_single_float_p")
     (symbolp . "primitive_symbolp")
     (consp . "primitive_consp")
     (characterp . "primitive_characterp")
@@ -354,6 +357,24 @@
              (write-char ch out))
     (write-char #\" out)))
 
+(defun c-float-literal (x)
+  "CL の float を、同じビットパターンになる C の式へ変換する。
+
+   **10進の往復で正確さを保つ。** CL のプリンタは「読み直すと同じ値になる
+   最短の10進表記」を出し、C コンパイラは10進リテラルを正しく丸めるので、
+   両者を通してもビットパターンは変わらない。
+   *read-default-float-format* をその値自身の型へ束縛して印字することで、
+   指数マーカー(1.5d0 の d0 等)が付かない素の10進表記が得られる。
+
+   single-float はタグ0x4の即値(os_make_single_float)、
+   double-float はヒープ上の MAGIC_FLOAT(os_make_float)で、生成する式が違う。"
+  (let* ((single-p (typep x 'single-float))
+         (*read-default-float-format* (if single-p 'single-float 'double-float))
+         (text (prin1-to-string x)))
+    (if single-p
+        (format nil "os_make_single_float(~Af)" text)
+        (format nil "os_make_float(~A)" text))))
+
 (defun c-char-literal (ch)
   "CommonLisp文字からCのchar literal(シングルクオート込み)を作る。\\と'の
    みエスケープする(M15: fat16.lisp/fat32.lisp/file-cmd.lispが使うのは
@@ -462,7 +483,7 @@
                (mapcar #'find-lambda-forms (if (consp (car expr)) expr (cdr expr)))
                :initial-value nil))))
 
-(defun captured-params (body params)
+(defun captured-params (body params &optional transparent-inlinable-immediate)
   "BODY中のどこかにネストして現れるlambdaが自由変数として必要とする変数のうち、
    PARAMS(この関数自身のパラメータ)に含まれるものを集めて返す(=このパラメータは
    何らかのネストしたlambdaに捕捉される、という判定)。find-lambda-formsで見つけた
@@ -472,7 +493,9 @@
   (intersection params
                 (reduce #'union
                         (mapcar (lambda (l) (free-variables (third l) (second l)))
-                                (find-lambda-forms body))
+                                (if transparent-inlinable-immediate
+                                    (find-capturing-lambda-forms body)
+                                    (find-lambda-forms body)))
                         :initial-value nil)))
 
 (defun boxed-params (body params)
@@ -557,6 +580,7 @@
     (fixnump 1 . "primitive_fixnump1")
     (bignump 1 . "primitive_bignump1")
     (floatp 1 . "primitive_floatp1")
+    (%%single-float-p 1 . "primitive_single_float_p1")
     (symbolp 1 . "primitive_symbolp1")
     (consp 1 . "primitive_consp1")
     (characterp 1 . "primitive_characterp1")
@@ -696,9 +720,26 @@
           ((eq (car place) 'slot-value) `(set-slot-value ,@(cdr place) ,value))
           ((eq (car place) 'property) `(set-property ,value ,@(cdr place))))))
 
-;;; for/while: init.lispのdefmacro for/while(%for-vars/%for-inits/%for-next/
-;;; %for-nexts/%for-let-bindings/%for-setqs)と同じ展開規則。init.lisp側の同名
+;;; for/while: init.lispのdefmacro for/whileからポートしたもの。init.lisp側の同名
 ;;; ヘルパーと衝突しないよう%%接頭辞でポートする(%%let-vars等と同じ命名規則)。
+;;;
+;;; **whileは同じ展開規則。forは「一時変数方式」という点では同じだが、
+;;; 一時変数を置く場所だけ違う。**
+;;; 以前ここには「init.lispのdefmacro for/whileと**同じ展開規則**」と書いてあったが、
+;;; **それは嘘になっていた**(2026-10-04に発覚。expand-forだけ「ループ本体のlet廃止」で
+;;; 作り直され、init.lispは旧展開形のまま。コメントが古くなったことを誰も見ていなかった)。
+;;; 2026-10-04にinit.lisp側も一時変数方式へ移植した。
+;;;
+;;; 残る差: こちらは1つのletにappendし、init.lisp側は入れ子のletにする。
+;;; 理由はJITの単一letの束縛数の上限ZA_MAX_LOCALS_PER_LET=4(src/c/za.c:963)で、
+;;; 1つのletに2N個入れると**束縛3個のforがJITに乗らなくなる**。
+;;; AOT側にこの上限は無いのでこちらは1つのままでよい。意味は同じ。
+;;; 実測: 移植で確保量が JIT 32→0 byte/反復、インタプリタ 928→96 になった
+;;; (documents/for-expansion.md)。意味論(並列代入ほか)は3経路で一致している。
+;;;
+;;; **二重定義されたマクロの照合は `make test-qemu-macro-parity` が行う**
+;;; (tools/check_macro_parity.sh。判定は tools/macro_parity_expected.tsv)。
+;;; ここのコメントを信じる代わりに、そちらを回すこと。
 ;;; 展開結果はlet(基盤A)・if/progn/setqと、本コミットで追加するblock/
 ;;; return-from/tagbody/go(基盤D)のみに帰着する。tagbody/goのタグ
 ;;; (%for-loop/%while-loop)はこのform内だけで解決される局所的な識別子であり、
@@ -769,17 +810,34 @@
   (destructuring-bind (for-kw bindings test-and-result &rest body) form
     (declare (ignore for-kw))
     (let ((temps (%%for-temp-names bindings 1)))
-      `(let ,(append (%%for-let-bindings bindings) (%%for-temp-let-bindings temps))
-         (block nil
-           (tagbody
-            %for-loop
-            (if ,(car test-and-result)
-                (return-from nil (progn ,@(cdr test-and-result)))
-                (progn
-                  ,@body
-                  ,@(%%for-step-setqs bindings temps)
-                  ,@(%%for-commit-setqs bindings temps)
-                  (go %for-loop)))))))))
+      ;; [G7] **一時変数は入れ子の let に置く。** init.lisp の for と**同じ展開形**に
+      ;; するためである(macro-parity の FOR が cosmetic から same になる)。
+      ;;
+      ;; 以前は 1 つの let に append していた。AOT には 1 つの let の束縛数の上限が
+      ;; 無いのでそれでも動くが、**init.lisp 側は入れ子にせざるを得ない**:
+      ;; JIT の ZA_MAX_LOCALS_PER_LET = 4 を超えると束縛 3 個の for が JIT に
+      ;; 乗らなくなる(documents/for-expansion.md §5-4)。
+      ;; **揃えるなら、上限のある側に合わせるしかない。**
+      ;;
+      ;; **生成される C は 1 バイトも変わらない**(測って確かめた)。
+      ;; transpile-inline-binds が**束縛 1 個ごとに入れ子のブロックを出す**ので、
+      ;; 「1 つの let に 2N 束縛」と「N 束縛の let を 2 段」は同じ C に落ちる。
+      ;;
+      ;; **これが成り立つのは捕捉解析を直したあとだけである。** 直す前は
+      ;; 入れ子の let が入れ子の lambda と見なされてクロージャに落ち、
+      ;; **クロージャが 6 個増えた**(documents/aot-capture-analysis.md §1)。
+      `(let ,(%%for-let-bindings bindings)
+         (let ,(%%for-temp-let-bindings temps)
+           (block nil
+             (tagbody
+              %for-loop
+              (if ,(car test-and-result)
+                  (return-from nil (progn ,@(cdr test-and-result)))
+                  (progn
+                    ,@body
+                    ,@(%%for-step-setqs bindings temps)
+                    ,@(%%for-commit-setqs bindings temps)
+                    (go %for-loop))))))))))
 
 (defun expand-while (form)
   (destructuring-bind (while-kw test &rest body) form
@@ -991,6 +1049,13 @@
      ;; リーダは既にTAG_CHARの値へパース済み(reader.c)なので、os_make_charで
      ;; そのままタグ付けするだけでよい
      (format nil "os_make_char(~A)" (c-char-literal expr)))
+    ((floatp expr)
+     ;; c-2: floatリテラル。**ここが無いと下の(t (error ...))へ落ちて、
+     ;; float リテラルを含むファイルはAOT化そのものが失敗する。**
+     ;; 現状 src/lisp のAOT対象にfloatリテラルは1つも無いので踏まれていなかった
+     ;; (documents/float-math-contagion.md §4-3)。
+     ;; single は即値、double はヒープなので生成するCの関数が違う。
+     (c-float-literal expr))
     ((and (symbolp expr) (assoc expr scope))
      (let ((binding (cdr (assoc expr scope))))
        (if (cdr binding)
@@ -1064,6 +1129,64 @@
    『ベンチマークのletが実はフォールバックしていた』という取り違えを防ぐため、
    mainの最後に集計を標準エラーへ出す")
 
+(defun immediate-lambda-inlinable-quiet-p (params body args)
+  "immediate-lambda-inlinable-p と同じ判定を、**ログを書かずに**行う。
+   捕捉の判定(captured-params)の途中から呼ぶために要る: ログ付きのものを
+   呼ぶと、判定のための問い合わせが *inline-fallback-log* に積まれて
+   「インライン化し損ねた箇所」の記録が読めなくなる。
+   **判定の本体はこちらにあり、ログ付きは薄い包みである**(2 つの判定器に
+   分かれると食い違いがバグ源になる。captured-params の註と同じ理由)"
+  (multiple-value-bind (fixed-params rest-param) (split-rest-param params)
+    (and (not rest-param)
+         (every #'symbolp params)
+         (= (length fixed-params) (length args))
+         (null (captured-params body fixed-params t)))))
+
+(defun inlinable-immediate-app-p (expr)
+  "EXPR が ((lambda (params) body) args) の形で、しかも**インライン展開される**
+   即時適用かどうか。let/let* の展開形がこれである。
+   **この形の lambda は捕捉しない**: params は同じ C フレームのローカルに
+   なるので、束縛変数の寿命が C スタックフレームを超えない"
+  (and (consp expr)
+       (consp (car expr))
+       (eq (car (car expr)) 'lambda)
+       (= (length (car expr)) 3)
+       (immediate-lambda-inlinable-quiet-p (second (car expr)) (third (car expr)) (cdr expr))))
+
+(defun find-capturing-lambda-forms (expr)
+  "find-lambda-forms と同じだが、**インライン展開される即時適用の lambda を
+   透過する**(その body と args を同じフレームとして走査し、中にある
+   「本物の」lambda だけを集める)。
+
+   なぜ要るか(G7):
+     `let` は ((lambda (vars) body) inits) へ展開されるので、
+     **let を入れ子にすると lambda が入れ子になる。**
+     素の find-lambda-forms はそれを「捕捉する lambda」と数えるため、
+     外側の let がインライン展開を諦めてクロージャになる。
+     実測では for の展開形を入れ子にしただけで**クロージャが 6 個増えた**
+     (documents/for-expansion.md)。
+
+   安全側について:
+     透過した lambda の params が外側の名前を隠している場合、
+     さらに内側の本物の lambda がその名前を参照すると、外側の param への
+     捕捉として数えてしまう。**これは安全側の誤り**(インライン化を諦める)
+     なので許容する。逆向きの誤り(捕捉を見落とす)は GC タイミング依存の
+     破壊になるので、絶対に倒してはいけない側である"
+  (cond
+    ((atom expr) nil)
+    ((eq (car expr) 'quote) nil)
+    ((inlinable-immediate-app-p expr)
+     ;; 透過する。body と args の両方を同じフレームとして走査する
+     (append (find-capturing-lambda-forms (third (car expr)))
+             (reduce #'append
+                     (mapcar #'find-capturing-lambda-forms (cdr expr))
+                     :initial-value nil)))
+    ((and (eq (car expr) 'lambda) (= (length expr) 3)) (list expr))
+    (t (reduce #'append
+               (mapcar #'find-capturing-lambda-forms
+                       (if (consp (car expr)) expr (cdr expr)))
+               :initial-value nil))))
+
 (defun immediate-lambda-inlinable-p (params body args)
   "((lambda (params) body) args) をクロージャ生成を経由せずCブロックへ
    インライン展開してよいかを判定する。判定に迷うものは必ずフォールバック側
@@ -1080,9 +1203,12 @@
       ((not (= (length fixed-params) (length args)))
        (push (list :arity params) *inline-fallback-log*) nil)
       ;; 束縛変数がネストしたlambdaに捕捉される場合、その変数はCローカルに
-      ;; 置けない(クロージャの寿命がCスタックフレームより長くなりdanglingする)
-      ((captured-params body fixed-params)
-       (push (list :captured (captured-params body fixed-params)) *inline-fallback-log*) nil)
+      ;; 置けない(クロージャの寿命がCスタックフレームより長くなりdanglingする)。
+      ;; **ただしインライン展開される即時適用(let/let* の展開形)は透過する**:
+      ;; その lambda の params も同じ C フレームのローカルになるので、
+      ;; 寿命がフレームを超えない(G7。find-capturing-lambda-forms の註)
+      ((captured-params body fixed-params t)
+       (push (list :captured (captured-params body fixed-params t)) *inline-fallback-log*) nil)
       (t t))))
 
 (defun transpile-inline-binds (params temps inits body outer-scope inner-scope)
@@ -1497,18 +1623,22 @@
    1つのdefunを処理する間だけletで新しい束縛を張る")
 (defparameter *closure-temp-counter* 0)
 
-(defun emit-param-binding-stmt (c-var boxed-p)
+(defun emit-param-binding-stmt (c-var boxed-p &optional check-p)
   "step関数の先頭で、パラメータ1つをevaluated_argsから読み出しCローカル変数
    c-varへ束縛するC文を作る。boxed-pがnon-nilの場合(za.cの拡張4と同じ基準で
    setqされエスケープするlambdaに捕捉されるパラメータ)は、値そのものではなく
    (捨て値 . 実値)のconsをc-varへ束縛する。このconsが以後の全参照(このパラメータ
    自身への読み書きと、ネストしたlambdaが捕捉する際に共有するオブジェクト)で
-   共有される「box」そのものになる"
-  (if boxed-p
-      (format nil "lisp_val_t ~A = os_make_cons(nil, cc_car(evaluated_args)); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
-              c-var c-var)
-      (format nil "lisp_val_t ~A = cc_car(evaluated_args); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
-              c-var c-var)))
+   共有される「box」そのものになる。
+
+   [P6] CHECK-Pがnon-nilなら、読み出しの前に「実引数が尽きていないか」の検査を
+   前置する。**最後の固定パラメータにだけ付ける**(param-scope-and-preamble参照)"
+  (let ((guard (if check-p "if (evaluated_args == nil) { return os_tco_arity_error(); } " "")))
+    (if boxed-p
+        (format nil "~Alisp_val_t ~A = os_make_cons(nil, cc_car(evaluated_args)); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
+                guard c-var c-var)
+        (format nil "~Alisp_val_t ~A = cc_car(evaluated_args); evaluated_args = cc_cdr(evaluated_args); GC_PROTECT(~A);"
+                guard c-var c-var))))
 
 ;;; M14 基盤B: &restパラメータ。list/append/create-list/apply/mapcar/map-into等が
 ;;; 使う。呼び出し側(transpile-call/transpile-tail-call)はパラメータの個数に
@@ -1571,10 +1701,29 @@
        (mapcar (lambda (p) (cons p (cons (param-symbol-to-c-name p) (and (member p boxed) t))))
                all-params)
        (append
-        (mapcar (lambda (p) (emit-param-binding-stmt (param-symbol-to-c-name p) (and (member p boxed) t)))
-                fixed-params)
+        ;; [P6] arity 検査は**2回だけ**で、仮引数の個数に比例しない。
+        ;; cc_car(nil) / cc_cdr(nil) がどちらも nil なので、途中で実引数が
+        ;; 尽きていれば最後の固定パラメータの時点でも必ず nil になっている。
+        ;; よって「足りない」は最後の1回で全部捕まえられる。
+        ;;   - 足りない: 最後の固定パラメータを読む直前(check-p)
+        ;;   - 多すぎ  : 全部読み終えたあとの残り(&rest があれば起きないので不要)
+        ;; **この検査は cons リストエントリ(__step)にしか乗らない。**
+        ;; 固定引数エントリ(__step_fixed)は引数をCの仮引数で受けるので
+        ;; arity は呼び出し側の fixed_argc 照合で既に保証されている
+        ;; (documents/unbound-arity-survey.md §3-3)。
+        (let ((n (length fixed-params))
+              (i 0))
+          (mapcar (lambda (p)
+                    (setq i (+ i 1))
+                    (emit-param-binding-stmt (param-symbol-to-c-name p)
+                                             (and (member p boxed) t)
+                                             (= i n)))
+                  fixed-params))
         (when rest-param
-          (list (emit-rest-param-binding-stmt (param-symbol-to-c-name rest-param) (and (member rest-param boxed) t)))))))))
+          (list (emit-rest-param-binding-stmt (param-symbol-to-c-name rest-param) (and (member rest-param boxed) t))))
+        ;; 固定パラメータが0個でもここは要る(引数を取らない関数に渡した場合)
+        (unless rest-param
+          (list "if (evaluated_args != nil) { return os_tco_arity_error(); }")))))))
 
 (defun emit-direct-preamble-stmts (params scope arg-c-names)
   "ABI-M6: PARAMS(&restを持たない固定パラメータのみ。呼び出し元がarityの
@@ -2147,10 +2296,16 @@
           (format nil "~{~A~%~}~A" (reverse *lifted-lambda-decls*) fn-text))))))
 
 (defun read-all-forms (path)
-  (with-open-file (in path)
-    (loop for form = (read in nil :eof)
-          until (eq form :eof)
-          collect form)))
+  ;; **ホストCLの *read-default-float-format* を isiki-os の既定に合わせる。**
+  ;; CL の既定は single-float、isiki-os の既定は double-float(init.lisp、
+  ;; documents/single-float.md §2-3a)なので、揃えないと接尾辞なしの `1.5` が
+  ;; 「AOTでは single、インタプリタでは double」になって静かに食い違う。
+  ;; 接尾辞付き(1.5f0 / 1.5d0)はどちらの側でも同じ型に読まれるので影響しない。
+  (let ((*read-default-float-format* 'double-float))
+    (with-open-file (in path)
+      (loop for form = (read in nil :eof)
+            until (eq form :eof)
+            collect form))))
 
 (defun toplevel-defun-p (form)
   (and (consp form) (eq (car form) 'defun)))
@@ -2227,12 +2382,37 @@
     (format out "typedef struct tco_result tco_result_t;~%")
     (format out "typedef tco_result_t (*step_fn_t)(lisp_val_t, lisp_val_t);~%")
     (format out "struct tco_result {~%    int is_tail_call;~%    lisp_val_t value;~%    step_fn_t fn;~%    lisp_val_t args;~%    void *fixed_fn;~%    UINT64 fixed_argc;~%    lisp_val_t arg0;~%    lisp_val_t arg1;~%    lisp_val_t arg2;~%};~%~%")
+    ;; [P6] arity 不一致の cold 側。**noinline で out-of-line に固定する。**
+    ;; インライン展開されると tco_result_t のゼロ初期化(pxor+movups×4)が
+    ;; 検査地点ごとに展開され、生成コードが 4.93% 膨らんだ(3.65% まで下がる)。
+    (format out "static __attribute__((noinline)) __attribute__((unused)) tco_result_t os_tco_arity_error(void) {~%    return (tco_result_t){.is_tail_call = 0, .value = os_signal_arity_error(global_environment)};~%}~%~%")
     (dolist (p prototypes)
       (format out "~A~%" p))
     (format out "~%")
     (dolist (b bodies)
       (format out "~A~%" b))
     (format out "~%~A" tail-text)))
+
+;; [P3] **トランスパイラが落ちても make が緑のまま通ってしまう**問題への対処。
+;;
+;; ros/SBCL は未処理のエラーでデバッガへ入り、--quit がそれを**終了コード 0**で
+;; 抜ける。make は成功と判断し、**古い lisp_compiled.c のままビルドを続ける。**
+;; emit-c-file の :supersede は書き込み完了時に差し替わるので、生成物は
+;; 壊れずに「前回のまま」残る。つまり
+;;   - ビルドは通る
+;;   - テストも通る(前回の生成物で動くため)
+;;   - 生成物が入力より古い、という形でしか気づけない
+;; 実際に踏んだ: init_aot.lisp の括弧を 1 つ壊しただけで END-OF-FILE になり、
+;; make transpile が exit 0、生成物の mtime は据え置き、テストは全部通った。
+;;
+;; エラーを掴んで非ゼロで落とす。Makefile はこちらを呼ぶ。
+(defun main-or-die ()
+  (handler-case (main)
+    (error (e)
+      (format *error-output* "~&[transpile] ERROR: ~A~%" e)
+      (finish-output *error-output*)
+      #+sbcl (sb-ext:exit :code 1 :abort t)
+      #-sbcl (error e))))
 
 (defun main ()
   (let* ((fixture-defuns (remove-if-not #'toplevel-defun-p

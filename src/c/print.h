@@ -33,6 +33,18 @@ void os_print_to_sink(lisp_val_t val, os_char_sink_t *sink, int escaped);
 void os_print_double_to_sink(os_char_sink_t *sink, double value);
 
 /**
+ * float(single-floatの即値またはMAGIC_FLOATのINSTANCE)を、
+ * *read-default-float-format* に応じた接尾辞付きでsinkへ出力する。
+ *
+ * 既定の型と一致する float は接尾辞なし、一致しない型は指数マーカーを
+ * 'f'/'d' にして出す(指数部が要らない表記のときは "d0" のように0指数を補う)。
+ * これで read/print の往復で型が保存される。
+ * @param sink 出力先のシンク
+ * @param val 出力するfloatの値
+ */
+void os_print_float_to_sink(os_char_sink_t *sink, lisp_val_t val);
+
+/**
  * val を TAG に応じて fb に表示する(prin1相当、escaped=1でos_print_to_sinkを呼ぶ薄いラッパー)。
  * 表示した val 自身を返す(REPLでの `(print (eval (read)))` 的な合成のため)。
  * @param val 表示するLisp値

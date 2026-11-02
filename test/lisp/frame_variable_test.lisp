@@ -34,17 +34,18 @@
 
 ;; **定数として扱われること**(値とフラグの登録先が一致している証拠)。
 ;; 定数への setq は g_sym_eval_error を返す(eval.c の os_is_constant 保護)
-(assert-equal 'eval-error (setq +fv-k+ 99))
+;; [P4-3] immutable-binding(spec:435-437)-> <program-error>(spec:7239-7241)
+(assert-error-class '<program-error> (setq +fv-k+ 99))
 (assert-equal 21 +fv-k+)                ; 値は変わっていない
 
 ;; let の外で定義した定数も従来どおり
 (defconstant +fv-k2+ 22)
 (assert-equal 22 +fv-k2+)
-(assert-equal 'eval-error (setq +fv-k2+ 99))
+(assert-error-class '<program-error> (setq +fv-k2+ 99))
 
 ;; let の中から、外で定義された定数への setq も拒否される
 ;; (os_is_constant が frame を素通りして親チェーンを辿れていることの確認)
-(assert-equal 'eval-error (let ((fv-dummy 1)) (setq +fv-k+ 98)))
+(assert-error-class '<program-error> (let ((fv-dummy 1)) (setq +fv-k+ 98)))
 (assert-equal 21 +fv-k+)
 
 ;;; --- defvar ---

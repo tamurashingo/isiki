@@ -12,6 +12,7 @@
 #include "eval.h"
 #include "stream_lisp.h"
 #include "format.h"
+#include "disasm_lisp.h"
 #include "subprimitive.h"
 #include "interrupt.h"
 
@@ -297,6 +298,9 @@ int main(int argc, char** argv) {
                      global_environment);
     os_register_streams();
     os_register_format();
+    // disassemble(src/lisp/disassemble.lisp)がinit.lispからloadされるため、
+    // 実機(kernel.c)と同じく%%DISASM-*を登録しておく
+    os_register_disasm();
     os_register_aot_init_functions();
     os_run_aot_toplevel_forms();
 

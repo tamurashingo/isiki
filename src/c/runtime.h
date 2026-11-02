@@ -12,7 +12,7 @@
  *   値   種別    型
  *   0x0  即値    fixnum
  *   0x2  即値    character
- *   0x4  即値    single-float (**予約のみ。実装していない**)
+ *   0x4  即値    single-float (IEEE754 binary32)
  *   0x6  即値    未割当
  *   0x8  即値    未割当
  *   0xA  即値    未割当
@@ -46,8 +46,8 @@
 #define TAG_CHAR     0x2ULL
 /** symbolへのアドレス(0011) */
 #define TAG_SYMBOL   0x3ULL
-/** 即値のsingle-float(0100)。**枠を予約しているだけで実装していない**。
-    <float>はIEEE754 binary64のままヒープ(MAGIC_FLOAT)に置く */
+/** 即値のsingle-float(0100)。IEEE754 binary32のビットパターンはbit32-63の32bit。
+    double-float(<double-float>)はIEEE754 binary64のままヒープ(MAGIC_FLOAT)に置く */
 #define TAG_SINGLE_FLOAT 0x4ULL
 /** stringへのアドレス(0101) */
 #define TAG_STRING   0x5ULL
@@ -133,7 +133,15 @@ _Static_assert(TAG_MARKER != TAG_FORWARD,
  *    bit4-31        未使用(0)
  *    bit0-3         タグ
  *
- * TAG_SINGLE_FLOAT / TAG_MARKER / 未割当の即値: 値を作る経路が無い(枠の予約のみ)。
+ * TAG_SINGLE_FLOAT: ヒープなし
+ *    bit32-63       IEEE754 単精度(binary32)のビットパターンをそのまま格納
+ *                   (SINGLE_FLOAT_VALUE_SHIFT分ずらす)
+ *    bit4-31        未使用(0)
+ *    bit0-3         タグ
+ *    double-floatは即値にできない(仮数だけで52bitある)ので、従来どおり
+ *    MAGIC_FLOAT(TAG_INSTANCE)のまま。タグ0xBは将来のdouble即値化用に空けてある。
+ *
+ * TAG_MARKER / 未割当の即値: 値を作る経路が無い(枠の予約のみ)。
  *
  * ---- アドレス(bit0 = 1) ----
  *
@@ -248,7 +256,7 @@ static inline int os_tag_is_heap_ref(UINT64 tag) {
         /* 即値(bit0=0)はアドレスを持たない */
         case TAG_FIXNUM:
         case TAG_CHAR:
-        case TAG_SINGLE_FLOAT:   /* 予約。値は作られない */
+        case TAG_SINGLE_FLOAT:   /* 即値。ビットパターンそのものなので追いかけない */
         case TAG_MARKER:         /* 予約。MAGIC_*の下位4bit */
         case 0x6ULL:             /* 即値・未割当 */
         case 0x8ULL:             /* 即値・未割当 */
@@ -298,6 +306,22 @@ static inline int os_tag_holds_address(UINT64 tag) {
  */
 #define CHAR_VALUE_SHIFT 32
 
+/**
+ * [単一の真実源] SINGLE-FLOATのビットパターンをタグ付き表現へ入れるためのシフト量。
+ * CHAR_VALUE_SHIFT と同じ32だが、**別の概念なので別の定数にする**
+ * (CHARのコードポイント幅とfloatの仮数幅は独立に動きうる)。
+ */
+#define SINGLE_FLOAT_VALUE_SHIFT 32
+
+/** IEEE754 binary32 の最大有限値(FLT_MAX)のビットパターン。
+ *  freestandingビルドで <float.h> を使わないため、ビット列から導出する。
+ *  符号0 / 指数0xFE / 仮数all-1 = 0x7F7FFFFF = 3.40282347E38 */
+#define SINGLE_FLOAT_MAX_BITS 0x7F7FFFFFUL
+
+/** IEEE754 binary64 の最大有限値(DBL_MAX)のビットパターン。
+ *  符号0 / 指数0x7FE / 仮数all-1 = 0x7FEFFFFFFFFFFFFF = 1.7976931348623157E308 */
+#define DOUBLE_FLOAT_MAX_BITS 0x7FEFFFFFFFFFFFFFULL
+
 /* --- fixnum / char の64bit語レイアウトの不変条件 -------------------------
    1語を「符号bit + マグニチュード + タグ」で分け合っているので、シフト量と
    マスクとタグ幅のどれか1つだけを動かすと静かに食い違う。隙間も重なりも
@@ -306,6 +330,11 @@ _Static_assert((1ULL << FIXNUM_VALUE_SHIFT) > TAG_MASK,
                "FIXNUM_VALUE_SHIFT is too small: the value field would overlap the tag");
 _Static_assert((1ULL << CHAR_VALUE_SHIFT) > TAG_MASK,
                "CHAR_VALUE_SHIFT is too small: the char code would overlap the tag");
+_Static_assert((1ULL << SINGLE_FLOAT_VALUE_SHIFT) > TAG_MASK,
+               "SINGLE_FLOAT_VALUE_SHIFT is too small: the float bits would overlap the tag");
+/* binary32は32bit。シフトした値が64bitからはみ出さないこと */
+_Static_assert(SINGLE_FLOAT_VALUE_SHIFT + 32 <= 64,
+               "SINGLE_FLOAT_VALUE_SHIFT is too large: the binary32 pattern would not fit in a word");
 _Static_assert((FIXNUM_SIGN_BIT & (FIXNUM_SIGN_BIT - 1)) == 0 && FIXNUM_SIGN_BIT != 0,
                "FIXNUM_SIGN_BIT must be exactly one bit");
 _Static_assert(((FIXNUM_MAGNITUDE_MASK << FIXNUM_VALUE_SHIFT) & FIXNUM_SIGN_BIT) == 0,
@@ -534,6 +563,19 @@ extern lisp_val_t g_sym_unwind_protect;
 extern lisp_val_t g_sym_function;
 /** flet特殊形式を表すシンボル */
 extern lisp_val_t g_sym_flet;
+extern lisp_val_t g_sym_declaim;
+/** declare特殊形式を表すシンボル(Phase 4a-2。宣言は評価時にはno-opでnilを返す) */
+extern lisp_val_t g_sym_declare;
+extern lisp_val_t g_sym_null;
+extern lisp_val_t g_sym_eq;
+extern lisp_val_t g_sym_inline;
+extern lisp_val_t g_sym_notinline;
+/** declareの宣言指定子 (type <class> v...) のtypeを表すシンボル(Phase 4a-2) */
+extern lisp_val_t g_sym_type;
+extern lisp_val_t g_sym_optimize;
+extern lisp_val_t g_sym_speed;
+extern lisp_val_t g_sym_safety;
+extern lisp_val_t g_sym_space;
 /** labels特殊形式を表すシンボル */
 extern lisp_val_t g_sym_labels;
 /** defvar特殊形式を表すシンボル */
@@ -562,6 +604,16 @@ extern lisp_val_t g_sym_car;
 extern lisp_val_t g_sym_cdr;
 /** cons関数を表すシンボル */
 extern lisp_val_t g_sym_cons;
+/* [inline] 算術演算子。**g_sym_* の基準は「JIT の外の C コードがこのシンボルと
+   比較するか」**である(JIT は za_syms_t を自前で intern して GC へ繋いでいる)。
+   算術は長らく JIT の中だけで使われていたので g_sym_* を持たなかったが、
+   os_inline_bit_of(宣言の解釈)が runtime.c から比較するようになったので
+   基準に合致した。**事前に intern しておくと、名前を作るたびに確保が走る形を
+   構造ごと無くせる**(documents/inline-arith.md §8-2) */
+extern lisp_val_t g_sym_plus;
+extern lisp_val_t g_sym_minus;
+extern lisp_val_t g_sym_asterisk;
+extern lisp_val_t g_sym_slash;
 
 /** 構文エラーを表すシンボル */
 extern lisp_val_t g_sym_read_error;
@@ -615,6 +667,54 @@ void os_heap_init(UINT64 heap_base, UINT64 heap_size);
 /** NIL・global_environment・組み込みシンボル/関数を構築し、Lisp実行環境を起動する */
 void os_bootstrap();
 
+/* ===== [可用性] ヒープ枯渇を <storage-exhausted> にする(issue #110、D9) ======
+ *
+ * 設計は documents/heap-exhaustion.md、実装の註は runtime.c の
+ * 「ヒープ枯渇をハングではなくエラーにする」の節。**スタック側
+ * (documents/stack-guard.md / za.c の os_za_signal_stack_exhausted)と
+ * 同じ構造にしてある**: 本当の限界より上に閾値 / 床 / 知らせている間だけ
+ * 予備を開ける / 重ねない / 最後はエラー値へ落ちる。
+ *
+ * | | スタック | ヒープ |
+ * |---|---|---|
+ * | 枯渇が起きる場所 | 関数の入口(**値を返せる**) | **確保の内部**(番地を返す) |
+ * | 検査を置いた場所 | JIT のプロローグ | **確保を要求する primitive** |
+ * | 覆える経路 | JIT だけ | **3 経路(確保の要求は同じ C を通る)** |
+ *
+ * **守らない経路**: JIT / AOT の生成コードが小口(cons / instance)の確保だけを
+ * 続ける区間。印は立つが見る人がいないので、床まで達すると panic する。
+ */
+
+/** [印] ヒープ枯渇を知らせる必要があるか。**eval.c が評価の入口で直接読む。**
+ *  関数呼び出しにしないのは、常道に増える命令を 1 比較 + 1 分岐に抑えるため。
+ *  立てるのは os_alloc_bytes の遅い側だけ、消すのは os_heap_signal_exhausted だけ */
+extern int g_heap_exhausted_pending;
+
+/**
+ * ヒープ枯渇を <storage-exhausted> として signal する。
+ * **確保器(os_alloc_bytes)の中からは呼べない**(番地を返す関数で、cli で
+ * 割り込みを止めており、signal 自身が確保する)。呼ぶのは「確保を要求する
+ * primitive」と os_eval の評価の入口である。
+ * @param env signal に使う環境(通常は global_environment)
+ * @return signal-conditionの戻り値。条件システムが使えない段階では g_sym_eval_error
+ */
+lisp_val_t os_heap_signal_exhausted(lisp_val_t env);
+
+/** 枯渇の印が立っているか(診断・テスト用。常道は g_heap_exhausted_pending を直読する) */
+int os_heap_exhaustion_pending(void);
+/** 枯渇を知らせた延べ回数。**0 = 一度も発火していない**(= 守られていない経路からの停止) */
+UINT64 os_heap_guard_hits(void);
+/** signal 経路が 1 回で確保した最大バイト数の実測値(GC を挟んだ回は数えない)。
+ *  予備領域の見積り(HEAP_SIGNAL_LISP_FRAMES / HEAP_HANDLER_ALLOWANCE の ★)を
+ *  実測へ直すための計器。**これが予備領域を超えたら予備が足りていない** */
+UINT64 os_heap_signal_path_bytes(void);
+/** いま常道が比べている柔らかい端(From空間先頭からのバイト数) */
+UINT64 os_heap_soft_limit_bytes(void);
+/** 通常時の柔らかい端(予備を閉じた状態の値) */
+UINT64 os_heap_soft_limit_normal_bytes(void);
+/** 床(ここを割ったら panic する位置)。**小さいヒープでは半空間の端と一致する** */
+UINT64 os_heap_floor_limit_bytes(void);
+
 /**
  * From空間の使用率を返す(0.0〜1.0)。os_gc_collectを呼ぶべきかどうかの閾値判定に使う。
  * @return 使用中バイト数 / From空間全体のバイト数
@@ -659,6 +759,20 @@ void os_boot_alloc_init(UINT64 base, UINT64 size);
  * @return 確保した領域の先頭アドレス
  */
 void *os_boot_alloc(UINT64 size, UINT64 align);
+
+/**
+ * os_boot_allocの、枯渇時に停止しない版。領域が足りなければ0を返すだけで、
+ * bumpポインタも進めない。仮想バッファのcontentのように「取れなければ縮めて
+ * 続行する」余地がある確保に使う。
+ *
+ * os_boot_alloc自身は枯渇時にget_active_frame_buffer()へ書こうとするが、
+ * ブートのごく初期(仮想バッファの初期化より前)ではその関数ポインタがまだ
+ * 立っていないため、その時点の確保にはこちらを使うこと。
+ * @param size 確保するバイト数
+ * @param align アライメント(2のべき乗)
+ * @return 確保した領域の先頭アドレス。足りなければ0
+ */
+void *os_boot_alloc_try(UINT64 size, UINT64 align);
 
 /**
  * boot allocatorの使用を確定し、残りの領域をLispのGCヒープ(os_heap_init)へ
@@ -750,6 +864,126 @@ void os_align_audit_report(void);
 
 #endif /* ISIKIOS_ALIGN_AUDIT */
 
+/* ========================= [計器] 確保の理由別の数え上げ =========================
+ * documents/heap-allocation-reasons.md。M8-T1。
+ *
+ * ## なぜ要るか
+ *
+ * 既にある計器は 2 つとも**「何のために確保したか」では分けられない**:
+ *
+ *   %%HEAP-USED-BYTES  … From 空間の割り当てポインタの進んだ量。**合計しか出ない**
+ *   ALIGN_SITE_*       … 確保の**入口**ごと。Lisp の物体はほぼ全部が
+ *                        os_alloc_bytes という 1 つの入口を通るので、
+ *                        入口で分けても 1 本の棒にしかならない
+ *
+ * そのためインタプリタループの「96 byte/反復」の内訳が
+ * documents/for-expansion.md で「〜など」のまま止まっている。
+ * **単位(タグ付きの物体 32 / 対 16)は分かっていても、個数の組み合わせが
+ * 32×1+16×4 / 32×2+16×2 / 32×3 のどれか決められない。**
+ *
+ * ## 合計が合うことを、検査ではなく構造で保証する
+ *
+ * 「理由ごとに数える」実装でありがちな失敗は、**数え漏れと二重計上**である。
+ * ここでは次の形にして、**どちらも起こりえないように**した:
+ *
+ *   1. 理由は確保の**直前**に ALLOC_AUDIT_REASON() で置く(「次の確保の理由」)
+ *   2. 数えるのは os_alloc_bytes の**中の 1 箇所だけ**。整列後の量を、
+ *      置かれていた理由の桶へ入れ、理由を未分類へ戻す
+ *
+ * こうすると **1 回の確保はちょうど 1 つの桶に入る**ので、
+ * 合計は常に %%HEAP-USED-BYTES と一致する(数え漏れ・二重計上が構造的に不可能)。
+ *
+ * ## 数え漏れは「黙って」起きない
+ *
+ * 理由を置かずに確保すると ALLOC_REASON_UNATTRIBUTED に入る。
+ * **これ自身が検出器である**: 新しい確保を足した人が理由を置き忘れると、
+ * 未分類の桶が 0 でなくなって試験が落ちる。
+ * 検査スクリプトを別に用意して「呼び出し口を数える」形にしなかったのは、
+ * **その検査自身が腐る**(原則 12)のに対し、未分類の桶は実行時の事実だからである。
+ *
+ * ## 既定ビルドは 1 命令も増えない
+ *
+ * ALLOC_AUDIT=1 のときだけ有効になる。既定ビルドではマクロが空になり、
+ * **生成コードが 1 byte も変わらないことを M2 の同一性比較器で確かめられる**
+ * (make aot-identity-check / jit-identity-check)。
+ * 組み込み関数も**監査ビルドでしか登録しない**。既定の組み込み数を増やすと
+ * test/c/runtime_test.c の SMALL_HEAP_SIZE(余裕 5KB 未満)を再調整する必要が
+ * 生じるためで、この計器のためにその綱渡りを増やす価値はない。
+ *
+ * ## 測る量がぶれないこと
+ *
+ * 命令数と違い**確保量はぶれない**(規則 11 で「断言してよい計器」とされている)。
+ * したがって監査ビルドで測った内訳は、既定ビルドの内訳としてそのまま使える。
+ * 計器を入れたビルドで測っても結論が歪まない、数少ない量である。
+ */
+#define ALLOC_REASON_UNATTRIBUTED   0  /* 理由を置かずに確保した = 数え漏れ。0 であるべき */
+#define ALLOC_REASON_CONS           1  /* os_make_cons(対。16 byte) */
+#define ALLOC_REASON_SYMBOL         2  /* os_make_symbol(インターンされる記号) */
+#define ALLOC_REASON_SYMBOL_UNINT   3  /* os_make_uninterned_symbol(gensym 等) */
+#define ALLOC_REASON_SYMBOL_NAME    4  /* 記号名の文字列ブロック */
+#define ALLOC_REASON_BIGNUM_LIMB    5  /* os_make_integer の limb 配列 */
+#define ALLOC_REASON_VECTOR_BLOCK   6  /* alloc_vector_block(配列本体) */
+#define ALLOC_REASON_STRING         7  /* 文字列の本体ブロック */
+#define ALLOC_REASON_RAW            8  /* os_alloc_raw(公開版。呼び出し元の事情は分からない) */
+/* 以下はタグ付きの物体 32 byte。os_make_instance の magic で分かれる。
+ * **go / block / catch を分けているのが要点**: インタプリタループの 96 byte の
+ * 内訳を知るには、脱出の印をいくつ作っているかが分からないと決められない */
+#define ALLOC_REASON_INST_FN_NATIVE 9
+#define ALLOC_REASON_INST_FN_INTERP 10
+#define ALLOC_REASON_INST_PROCESS   11
+#define ALLOC_REASON_INST_MACRO     12
+#define ALLOC_REASON_INST_BLOCK     13  /* MAGIC_BLOCK_EXIT(block からの脱出の印) */
+#define ALLOC_REASON_INST_STREAM    14
+#define ALLOC_REASON_INST_CLASS_INST 15
+#define ALLOC_REASON_INST_CATCH     16  /* MAGIC_CATCH_EXIT */
+#define ALLOC_REASON_INST_GO        17  /* MAGIC_GO_EXIT(tagbody / for の go の印) */
+#define ALLOC_REASON_INST_BIGNUM    18
+#define ALLOC_REASON_INST_VECTOR    19
+#define ALLOC_REASON_INST_FLOAT     20
+#define ALLOC_REASON_INST_CLASS     21  /* BUILTIN_CLASS / STANDARD_CLASS */
+#define ALLOC_REASON_INST_OTHER     22  /* 上のどれでもない magic */
+#define ALLOC_REASON_COUNT          23
+
+#ifdef ISIKIOS_ALLOC_AUDIT
+
+/** 「次の 1 回の確保の理由」を置く。os_alloc_bytes が消費する */
+void os_alloc_audit_set_reason(int reason);
+/** 理由を桶へ入れる(os_alloc_bytes の中の 1 箇所だけが呼ぶ) */
+void os_alloc_audit_charge(UINT64 aligned_bytes);
+/** 理由別の確保量(byte)を返す */
+UINT64 os_alloc_audit_bytes(int reason);
+/** 理由別の確保回数を返す */
+UINT64 os_alloc_audit_count(int reason);
+/** 全部の桶を 0 に戻す(測る区間の前で呼ぶ) */
+void os_alloc_audit_reset(void);
+/** magic から理由を引く(os_make_instance が使う) */
+int os_alloc_audit_reason_of_magic(UINT64 magic);
+/** 桶の合計と「reset からヒープが進んだ量」の差。**計器が正しければ必ず 0**。
+    Lisp から 2 つの計器を読んで引き算する形は、測る行為自身が確保するため
+    原理的に成立しない(runtime.c の註を見ること)。だから C の中で差を取る */
+UINT64 os_alloc_audit_diff(void);
+/** reset 以降に GC が走った回数。0 でなければ上の差は意味を持たない */
+UINT64 os_alloc_audit_gc_since_reset(void);
+
+#define ALLOC_AUDIT_REASON(reason)        os_alloc_audit_set_reason((reason))
+#define ALLOC_AUDIT_REASON_MAGIC(magic)   os_alloc_audit_set_reason(os_alloc_audit_reason_of_magic((magic)))
+#define ALLOC_AUDIT_CHARGE(aligned)       os_alloc_audit_charge((UINT64)(aligned))
+
+/** 組み込み関数。**監査ビルドでしか登録しない**(上の「既定ビルドは〜」参照) */
+lisp_val_t primitive_alloc_audit_bytes(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_count(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_reset(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_diff(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_alloc_audit_gc_since_reset(lisp_val_t args, lisp_val_t env);
+
+#else
+
+#define ALLOC_AUDIT_REASON(reason)        ((void)0)
+#define ALLOC_AUDIT_REASON_MAGIC(magic)   ((void)0)
+#define ALLOC_AUDIT_CHARGE(aligned)       ((void)0)
+
+#endif /* ISIKIOS_ALLOC_AUDIT */
+
 /* ============================== Immobilized Space ==============================
  * GC(copy GC)が移動・破棄しない固定領域。JITコードやFunction Cellなど、Cのポインタとして
  * 直接掴んでおきたいデータの置き場所として使う。os_gc_collectのスキャン対象外であり、
@@ -797,7 +1031,80 @@ void os_imm_page_free(void *page);
  * @param count 確保するページ数
  * @return 確保できた先頭ページのアドレス。空き不足の場合はNULL
  */
+/* ---- declaim(optimize)。documents/declaim-design.md ----
+   speed | (safety << 2) | (space << 4) を1つのfixnumへ詰める。各2bitで値域0〜3。 */
+#define OPTIMIZE_SPEED(p)  ((UINT64)((p) & 3))
+#define OPTIMIZE_SAFETY(p) ((UINT64)(((p) >> 2) & 3))
+#define OPTIMIZE_SPACE(p)  ((UINT64)(((p) >> 4) & 3))
+#define OPTIMIZE_PACK(sp, sa, spc) ((UINT64)(((sp) & 3) | (((sa) & 3) << 2) | (((spc) & 3) << 4)))
+/** 既定は speed/safety/space すべて1(CommonLispの慣習に合わせる) */
+#define OPTIMIZE_DEFAULT OPTIMIZE_PACK(1, 1, 1)
+
+/* ---- declaim(inline / notinline)。documents/inline-builtin.md ----
+   optimizeと同じ1つのfixnumへ相乗りさせる(bit8以降)。environmentへスロットを
+   増やさずに済み、za_try_compile_defunへ渡す値も1つのままでよい。
+   fixnumのマグニチュードは60bitあり、optimizeが下位6bit、inlineがbit8〜39
+   (32個分)を使う。対象が32個を超えたらここを広げる。 */
+#define DECLAIM_INLINE_SHIFT 8
+#define DECLAIM_INLINE_MASK  0xFFFFFFFFULL
+#define DECLAIM_INLINE_BITS(p) (((UINT64)(p) >> DECLAIM_INLINE_SHIFT) & DECLAIM_INLINE_MASK)
+#define DECLAIM_WITH_INLINE_BITS(p, b)     ((((UINT64)(p)) & ~(DECLAIM_INLINE_MASK << DECLAIM_INLINE_SHIFT)) |      ((((UINT64)(b)) & DECLAIM_INLINE_MASK) << DECLAIM_INLINE_SHIFT))
+
+/** インライン展開の対象。ビット位置はdeclaim値の中で固定(永続化はしていないので
+ * 並べ替えても互換性の問題は無いが、%%CURRENT-INLINEの出力順と揃えておくこと) */
+#define INLINE_BIT_CAR  (1ULL << 0)
+#define INLINE_BIT_CDR  (1ULL << 1)
+#define INLINE_BIT_NULL (1ULL << 2)
+#define INLINE_BIT_EQ   (1ULL << 3)
+/* 算術(documents/inline-arith.md)。**ビットを足しただけでは展開されない。**
+   za.c 側が za_inline_enabled で門番するところまでが対になる */
+#define INLINE_BIT_ADD  (1ULL << 4)
+#define INLINE_BIT_SUB  (1ULL << 5)
+#define INLINE_BIT_MUL  (1ULL << 6)
+#define INLINE_BIT_DIV  (1ULL << 7)
+/** インライン展開の対象の個数。**ビットを足したらここも増やすこと。**
+ *  runtime.c の名前表(g_inline_names)の要素数と _Static_assert で突き合わせてある。
+ *  片方だけ直すとビルドが落ちる(documents/inline-arith.md §8-1) */
+#define INLINE_BIT_COUNT 8
+
+/** インライン展開の対象名に対応するビットを返す。対象外の名前は0
+ * (declaimが未知の名前を黙って無視するための判定に使う) */
+UINT64 os_inline_bit_of(lisp_val_t sym);
+
+/**
+ * bodyの先頭に連続する (declare ...) から (inline f...) / (notinline f...) を読み、
+ * inheritedへ重ねた結果のビット集合を返す。**bodyは変更しない**(剥がすのは
+ * os_scan_declarations の仕事で、こちらは剥がす前に呼ぶ)。確保は行わない。
+ *
+ * 合成の規則(documents/inline-arith.md §7):
+ *   - **内側が優先**。inherited に外側の値を渡し、内側の declare がそれを上書きする
+ *   - **同じ深さなら後から来たものが優先**。宣言指定子を現れた順に適用する
+ *   - 未知の名前は黙って無視する(declaim と同じ方針)
+ *
+ * @param body 走査対象のbody(フォームのリスト)
+ * @param inherited 外側のスコープで効いているビット集合
+ * @return 重ねた結果のビット集合
+ */
+UINT64 os_scan_declaration_inline(lisp_val_t body, UINT64 inherited);
+/** envが属するenvironmentのoptimize指定を読む(frameはos_definition_envで読み飛ばす) */
+UINT64 os_env_optimize(lisp_val_t env);
+/** envが属するenvironmentのoptimize指定を書き換える。書けたら1 */
+int os_env_set_optimize(lisp_val_t env, UINT64 packed);
+
 void *os_imm_pages_alloc_contiguous(UINT64 count);
+
+/**
+ * JITコードの配置先をImmobilized Spaceから切り出す(パッキング)。
+ * ページは環境ごとのbumpカーソルで分け合うが、**1ページは必ず1つの環境に属する**
+ * (destroy-environmentがページ単位で回収するため)。実装の詳細はruntime.c参照。
+ * @param owner_env 登録先の環境(capture_envではなくowner_env)
+ * @param size 必要なbyte数
+ * @param out_new_pages 新たに取ったページの先頭(取らなければ0)
+ * @param out_new_page_count 新たに取ったページ数(取らなければ0)
+ * @return 配置先アドレス(16byteアライン)。確保できなければ0
+ */
+void *os_imm_code_alloc(lisp_val_t owner_env, UINT64 size,
+                        void **out_new_pages, UINT64 *out_new_page_count);
 
 /** os_imm_slot_allocが使う、1ページ内でのバンプアロケーションの進行状況を保持するカーソル */
 typedef struct {
@@ -841,6 +1148,53 @@ void os_gc_unregister_root(lisp_val_t *root_ptr);
     「GCで動く領域」を指していないかを機械語のレベルで判定するために使う。
     0=From空間(生きている側) 1=To空間(GCのコピー先) 2=Immobilized Space 4=その他 */
 int os_addr_region(lisp_addr_t addr);
+
+/**
+ * アドレスの所属領域(disassemblerの注釈用)。
+ *
+ * 既存のos_addr_region(直上)とは目的が別なので分けてある。あちらはGC監査専用で、
+ * From空間とTo空間を**区別する**ことに意味がある(生成コードに焼き込まれた即値が
+ * 「GCで動く側」を指していないかの判定)。こちらは「そのアドレスが何であるか」を
+ * 人間に見せるためのもので、From/To の区別は意味を持たない。
+ * os_addr_regionの戻り値の意味はza_code_imm_test.lispが依存しているため変更しない。
+ */
+typedef enum {
+    /** どの領域にも属さない(境界が未確定の領域を含む) */
+    OS_ADDR_UNKNOWN = 0,
+    /** カーネルイメージの.textセクション。生Cで実装されたコード */
+    OS_ADDR_KERNEL_TEXT = 1,
+    /** Immobilized Space。JITが置いた機械語、Function Cell、リテラルスロット */
+    OS_ADDR_IMMOBILIZED = 2,
+    /** GCヒープ(From/To両方)。コードではなくGC対象オブジェクト */
+    OS_ADDR_GC_HEAP = 3
+} os_addr_region_t;
+
+/**
+ * addrがどの領域に属するかを返す。どの領域にも属さない場合はOS_ADDR_UNKNOWN。
+ * 境界が未確定の領域(ヒープ確保前、.text範囲が取得できないビルド)は判定対象から
+ * 外すため、やはりOS_ADDR_UNKNOWNになる。
+ * @param addr 判定するアドレス(タグは剥がしてから渡すこと)
+ * @return 所属領域
+ */
+os_addr_region_t os_classify_addr(lisp_addr_t addr);
+
+/**
+ * 表示用の短い名前("kernel"/"immobilized"/"gc-heap")。
+ * @param region os_classify_addrの戻り値
+ * @return 名前。OS_ADDR_UNKNOWNのときは0(NULL)
+ */
+const char *os_addr_region_name(os_addr_region_t region);
+
+/**
+ * 領域の実行時の境界を返す。境界が未確定(または未対応)の領域では*out_startと
+ * *out_endの両方に0を書き、0を返す。テストが「baseは範囲内、endは範囲外」の
+ * オフバイワンを確認するために必要なので、内部のstatic変数のままにはしない。
+ * @param region 対象の領域(OS_ADDR_UNKNOWNは常に0を返す)
+ * @param out_start 開始アドレス(範囲内)の書き込み先
+ * @param out_end 終了アドレス(**範囲外**、半開区間の上端)の書き込み先
+ * @return 境界が確定していれば1、していなければ0
+ */
+int os_addr_region_bounds(os_addr_region_t region, lisp_addr_t *out_start, lisp_addr_t *out_end);
 
 extern UINT64 g_gc_lifo_violations;
 
@@ -959,7 +1313,25 @@ static inline lisp_val_t os_make_fixnum(const UINT64 fixnum) {
  * @param magnitude 絶対値(0〜2^60-1)
  * @return タグ付けされたFIXNUM
  */
-lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude);
+/* [API の形を揃えるため] os_make_fixnum は static inline、符号つき版は
+   クロスTU呼び出し、という非対称に理由が無いので揃えた。改善A以降、
+   `+` `-` `*` `/` の fixnum 高速路はすべてここを通る。
+
+   **速度目的ではない。実測でも差は出なかった**(PR #93)。
+   「os_make_fixnum_signed が static inline でないことが、PR #92 で
+   『* の桁溢れ判定から除算を消しても速くならなかった』原因ではないか」
+   という仮説を立てて inline 化の有無で測ったが、`+` `-` `*` の差は
+   すべて雑音の幅の中だった。**仮説は外れである。**
+   PR #92 の件の原因は別にある(documents/declare-typed-arith.md §10)。
+
+   この否定の結果を消さないこと。同じ仮説を二度検証しないために書いてある。 */
+static inline lisp_val_t os_make_fixnum_signed(int negative, UINT64 magnitude) {
+    lisp_val_t val = (lisp_val_t)(magnitude << FIXNUM_VALUE_SHIFT);
+    if (negative && magnitude != 0) {
+        val |= FIXNUM_SIGN_BIT;
+    }
+    return val;
+}
 
 /**
  * FIXNUMのマグニチュード(絶対値)を取り出す。
@@ -1211,6 +1583,14 @@ lisp_val_t os_set_dynamic(lisp_val_t sym, lisp_val_t val);
 lisp_val_t os_get_variable(lisp_val_t sym, lisp_val_t env);
 
 /**
+ * [P5] os_get_variableと同じ探索を行い、**未束縛なら<unbound-variable>をsignalする。**
+ * ISLispの変数参照(eval.cのシンボル評価、za.cが生成するグローバル変数読み出し)が使う。
+ * process.c/interrupt.cのようにnilで「未束縛」を判定している内部の呼び出しは
+ * 従来どおりos_get_variableを使うこと。
+ */
+lisp_val_t os_get_variable_checked(lisp_val_t sym, lisp_val_t env);
+
+/**
  * envの変数slotにsymの値としてvalを設定する(既存なら破壊的に上書き、無ければ新規追加)。
  * @param sym 設定するsymbol
  * @param val 設定する値
@@ -1361,6 +1741,116 @@ void os_environment_register_literal_slot(lisp_val_t env, lisp_val_t *slot_addr)
  */
 void os_environment_reclaim_literal_slots(lisp_val_t env, void (*free_slot)(lisp_val_t *slot_addr));
 
+/* ===== declare による型宣言(Phase 4a-2) ==============================
+ *
+ * `(declare (type <fixnum> x y))` で宣言された型を記録するための表現。
+ *
+ * [なぜクラスオブジェクトやシンボルを持たないか]
+ * 記録先は za_fn_meta_t(Immobilized Space)と za_local_scope_t(Cスタック上の
+ * コンパイル時構造)で、どちらも **GCのルート走査の対象外** である。
+ * クラスオブジェクトもシンボルもGCで動く(gc_copy_valueがTAG_SYMBOL/TAG_INSTANCEを
+ * 追いかける)ため、生の lisp_val_t を置くと最初のGCでstaleになる。
+ * そこで「解決済みクラスの**正準名**に対応する小さな整数」へ畳んでから持つ。
+ * 型情報がGCと無関係になるので、ルート登録も保護も要らない。
+ *
+ * [別名(<short-float> / <long-float>)の扱い]
+ * 符号化は **利用者が書いた名前ではなく、解決したクラスオブジェクトの正準名**
+ * を見る。<short-float> は <single-float> と同一のクラスオブジェクトに登録されて
+ * いる(init_aot.lisp)ので、正準名は <SINGLE-FLOAT> になり、別名は自動的に
+ * 同じ符号になる。%convert が利用者の書いた名前をcaseで突き合わせていたために
+ * 別名が効かなかった件(documents/float-default.md §4-2)と同じ轍を踏まないための
+ * 設計である。
+ */
+
+/** 宣言が無い(または宣言指定子として読めなかった) */
+#define OS_DECL_TYPE_NONE        0
+/** 実在するクラスだが、本実装が符号を持たない(ユーザ定義クラス等) */
+#define OS_DECL_TYPE_OTHER     254
+/** クラスとして解決できなかった(§3-3: エラーにせず無視する) */
+#define OS_DECL_TYPE_UNKNOWN   255
+
+/* [型特化] 個別の型符号。**g_decl_type_names の並びと一致していなければならない**
+   (符号 i の名前が g_decl_type_names[i - 1])。runtime.c 側に
+   _Static_assert 相当の実行時検査は置けないため、表を変えたらここも直すこと。
+   型特化ディスパッチが「この符号なら fixnum 用の呼び先」と判断するのに使う
+   (documents/type-specialized-dispatch.md)。 */
+#define OS_DECL_TYPE_FIXNUM        20
+#define OS_DECL_TYPE_SINGLE_FLOAT  22
+
+/** 1つの関数/letで型を記録できる変数の個数。ZA_MAX_PARAMS(=16)と
+    ZA_MAX_LOCALS_PER_LET(=4)のどちらも覆う */
+#define OS_DECL_TYPES_MAX_VARS  16
+
+/**
+ * 変数位置ごとの型符号(1個1byte)を詰めた値。16変数×8bit = 128bit = UINT64 2個。
+ * lisp_val_tを1つも含まないのでGCと無関係であり、値渡しで持ち回れる。
+ */
+typedef struct {
+    UINT64 w[2];
+} os_decl_types_t;
+
+/** すべて OS_DECL_TYPE_NONE の os_decl_types_t */
+static inline os_decl_types_t os_decl_types_empty(void) {
+    os_decl_types_t t;
+    t.w[0] = 0;
+    t.w[1] = 0;
+    return t;
+}
+
+/** 変数位置iの型符号を読む(範囲外は OS_DECL_TYPE_NONE) */
+static inline UINT8 os_decl_types_get(os_decl_types_t t, UINT64 i) {
+    if (i >= OS_DECL_TYPES_MAX_VARS) {
+        return OS_DECL_TYPE_NONE;
+    }
+    return (UINT8)((t.w[i >> 3] >> ((i & 7) * 8)) & 0xFF);
+}
+
+/** 変数位置iへ型符号を書く(範囲外は無視) */
+static inline void os_decl_types_set(os_decl_types_t *t, UINT64 i, UINT8 code) {
+    if (i >= OS_DECL_TYPES_MAX_VARS) {
+        return;
+    }
+    UINT64 shift = (i & 7) * 8;
+    t->w[i >> 3] = (t->w[i >> 3] & ~(0xFFULL << shift)) | ((UINT64)code << shift);
+}
+
+/** 1つでも宣言が入っているか */
+static inline int os_decl_types_any(os_decl_types_t t) {
+    return (t.w[0] != 0 || t.w[1] != 0);
+}
+
+/**
+ * クラス名シンボルを型符号へ変換する。**%find-classと同じ *classes* を引く**
+ * (別の名前解決表を作らない)。確保を一切行わないため、コンパイル中に呼んでも
+ * GCが走らない。
+ * @param class_name_sym 利用者が (declare (type X v)) に書いた X
+ * @return 型符号。解決できなければ OS_DECL_TYPE_UNKNOWN、
+ *         実在するが符号を持たないクラスなら OS_DECL_TYPE_OTHER
+ */
+UINT8 os_decl_type_code_of(lisp_val_t class_name_sym);
+
+/**
+ * 型符号を表示用のシンボルへ戻す(%%DECLARED-TYPES-OF が使う)。
+ * @param code 型符号
+ * @return 正準クラス名のシンボル。NONEはnil、OTHERは<OTHER>、UNKNOWNは<UNKNOWN>
+ */
+lisp_val_t os_decl_type_name(UINT8 code);
+
+/**
+ * (declare ...) が先頭に連続しているぶんだけbodyを読み飛ばし、宣言から
+ * var_symsの各位置に対応する型符号を組み立てる。確保は行わない。
+ * @param body 走査対象のbody(フォームのリスト)
+ * @param var_syms 型を対応づける変数シンボルの配列
+ * @param var_count var_symsの要素数(OS_DECL_TYPES_MAX_VARS以下)
+ * @param out_types 組み立てた型符号(呼び出し前の内容は破棄される)
+ * @return 先頭のdeclareを取り除いた残りのbody
+ */
+lisp_val_t os_scan_declarations(lisp_val_t body, const lisp_val_t *var_syms, UINT64 var_count,
+                                os_decl_types_t *out_types);
+
+/** 関数オブジェクトのmetaへ、宣言された型を記録する */
+void os_fn_set_declared_types(lisp_val_t fn, os_decl_types_t types);
+
 /**
  * ABI-M4: MAGIC_FUNCTION_NATIVEのword1が指すメタデータ(dual-entry設計の土台)。
  * Immobilized Space上に確保する生データ構造体で、フィールドはいずれもコード
@@ -1376,6 +1866,31 @@ typedef struct {
     UINT64 cons_entry;  /* offset 0: 従来のconsリストABI fn(evaluated_args, env) */
     UINT64 fixed_entry; /* offset 8: ABI-M5で使う固定引数エントリ(現状は常に0) */
     UINT64 arity;       /* offset 16: ABI-M5で使う固定arity(現状は常に0) */
+    /* offset 24/32: disassembler(src/c/disasm.c)用のコード範囲。
+       za_try_compile_defunが1回のコンパイルで出力した機械語ブロック全体
+       (固定引数エントリ+consリストエントリ+共有本体)の先頭と長さで、
+       cons_entry/fixed_entryはこの範囲の内側を指す。
+       生成コードはこの2つを読まないので、オフセットが後ろにずれても影響しない
+       (生成コードが直接dereferenceするのはoffset 0とoffset 16だけ)。
+       組み込みprimitiveとAOTのlifted closureでは0のままで、
+       「逆アセンブル対象の機械語を持たない」ことをcode_len==0で表す。 */
+    UINT64 code_base;
+    UINT64 code_len;
+    /* offset 40: このコンパイル時に有効だったoptimize指定(詰めたfixnumのマグニチュード)。
+       %%OPTIMIZE-OF が事後確認のために読む。生成コードはoffset 0と16しか直接
+       dereferenceしないので、末尾への追加は機械語に影響しない。
+       5フィールド40byteはもともと16byte境界へ丸められて48byte確保されていたため、
+       6フィールド目を足しても実消費は変わらない(documents/declaim-design.md)。 */
+    UINT64 optimize;
+    /* offset 48/56: (declare (type ...)) で宣言された仮引数の型(Phase 4a-2)。
+       %%DECLARED-TYPES-OF が事後確認のために読む。os_decl_types_t と同じ
+       「16変数×8bitの符号」で、lisp_val_tを含まないのでGCは辿らない
+       (metaはImmobilized Space上でルート走査の対象外。os_decl_types_t参照)。
+       6フィールド48byteは16byte境界へ丸めるとちょうど48byteだが、
+       7フィールド目(56byte)も8フィールド目(64byte)も丸め後は同じ64byteになるため、
+       2ワード使っても実消費の増分は1ワードのときと変わらない
+       (documents/declare-types.md の測定)。 */
+    UINT64 declared_types[2];
 } za_fn_meta_t;
 
 /**
@@ -1414,6 +1929,21 @@ lisp_val_t os_make_jit_function(lisp_addr_t fnptr, lisp_val_t def_env);
  * @return MAGIC_FUNCTION_NATIVEのINSTANCE(word2=fixnum 1)
  */
 lisp_val_t os_make_jit_function_dual(lisp_addr_t cons_entry, lisp_addr_t fixed_entry, UINT64 arity, lisp_val_t def_env);
+
+/**
+ * JITコンパイル済み関数のza_fn_meta_tへ、逆アセンブル用のコード範囲を記録する
+ * (src/c/disasm.c の %%DISASM-CODE-BASE / %%DISASM-CODE-LEN が読む)。
+ * cons_entry/fixed_entryは「エントリポイント」であって機械語ブロックの先頭とは
+ * 限らないため、ブロック全体の先頭と長さは別に持たせる必要がある
+ * (documents/jit-metadata-investigation.md)。生ポインタと長さだけを書き込む
+ * 非allocatingな操作で、GCとは無関係。
+ * @param fn os_make_jit_function(_dual)が返したMAGIC_FUNCTION_NATIVEの関数
+ * @param code_base 機械語ブロックの先頭アドレス(Immobilized Space上)
+ * @param code_len 同ブロックのバイト長
+ */
+void os_fn_set_code_range(lisp_val_t fn, UINT64 code_base, UINT64 code_len);
+/** 関数オブジェクトのmetaへ、コンパイル時のoptimize指定を記録する */
+void os_fn_set_optimize(lisp_val_t fn, UINT64 packed);
 
 /**
  * fnptrをトランスパイラがリフトしたlambda本体のC関数として呼び出し、captured_envを
@@ -1521,6 +2051,67 @@ void os_set_panic_hook(void (*hook)(void));
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env);
 
 /**
+ * [P4-3] 未定義の関数を<undefined-function>としてsignalする(error-id. undefined-function。
+ * spec:1455-1457 / spec:1461 / spec:1512-1513、クラスはspec:7261-7263)。
+ * nameとnamespace(=function)のスロットを載せる(spec:7160-7163)。
+ * eval.c(eval_form / eval_function)とruntime.c(primitive_funcall_by_name)から呼ぶ。
+ * @param name_sym 未定義だった関数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_undefined_function(lisp_val_t name_sym, lisp_val_t env);
+
+/**
+ * [P5] 未束縛の変数を<unbound-variable>としてsignalする(error-id. undefined-entity /
+ * unbound-variable。spec:899-902、クラスはspec:7255-7257)。
+ * nameとnamespace(=variable)のスロットを載せる(spec:7160-7163)。
+ * @param name_sym 未束縛だった変数名のシンボル
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_unbound_variable(lisp_val_t name_sym, lisp_val_t env);
+
+/**
+ * [P6] arity 不一致を<program-error>としてsignalする(error-id. arity-error。
+ * spec:896-898 / spec:1549-1550、クラスはspec:7191-7194)。
+ * eval.cのbind_paramsと、za.cが生成するconsリストエントリのプロローグから呼ぶ。
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_arity_error(lisp_val_t env);
+
+/**
+ * [P4-3] 変更できない束縛(defconstant)への代入を<program-error>としてsignalする
+ * (error-id. immutable-binding。spec:435-437、クラスはspec:7239-7241)。
+ * eval.c(eval_setq)とruntime.c(os_setq_variable_checked。za.cのJIT生成コードが呼ぶ)から使う。
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_immutable_binding(lisp_val_t env);
+
+/**
+ * [P4-3] 関数でないものを関数として呼ぼうとした場合を<domain-error>としてsignalする
+ * (error-id. domain-error。spec:1667)。expected-classは<FUNCTION>。
+ * @param obj 関数ではなかった値
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_not_a_function(lisp_val_t obj, lisp_val_t env);
+
+/**
+ * [P4-4] 入出力の失敗(ファイルを開けない、マウントが解決できない等)を
+ * <simple-error> としてsignalする。メッセージは "what: path[: detail]" になる。
+ * **クラスの選択は仕様未確認**(open-*-file は「開き方は implementation-defined」
+ * spec:6266-6268 としか書かれておらず、load は仕様に無い)。理由は実装側のコメント参照。
+ * @param what 失敗した操作(例 "open-input-file")
+ * @param path 対象のパス
+ * @param detail 下位層のメッセージ。不要なら0
+ * @param env 呼び出し時の環境
+ * @return signal-conditionの戻り値。条件システムが使えない場合はg_sym_eval_error
+ */
+lisp_val_t os_signal_io_error(const char *what, const char *path, const char *detail, lisp_val_t env);
+
+/**
  * <control-error>をsignalする(ISLisp仕様§14.7: 既に抜けたblockへのreturn-from、
  * unwind-protectのcleanup中の別の非局所脱出など)。eval.cとza.c(JIT生成コード)の両方から呼ぶ。
  * @param env 呼び出し時の環境
@@ -1610,6 +2201,19 @@ lisp_val_t primitive_add(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_add2(lisp_val_t a, lisp_val_t b);
 
 /**
+ * 型特化した + (fixnum × fixnum)。**宣言された型を無検査で信じ、タグを見ない。**
+ * 宣言が嘘なら壊れる(documents/declare-typed-add.md §3-1)。
+ * 桁溢れは GENERIC と同じく bignum へ昇格する。
+ */
+lisp_val_t primitive_add2_fixnum(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した + (single-float × single-float)。**同上、タグを見ない。**
+ * GENERIC と同じく double を経由するので結果はビット単位で一致する。
+ */
+lisp_val_t primitive_add2_single(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数-。argsの第一引数から残りを順に減算する。1引数の場合は単項マイナス(0-x)として符号を反転する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -1625,6 +2229,19 @@ lisp_val_t primitive_subtract(lisp_val_t args, lisp_val_t env);
  * @return a-b(primitive_subtractと同じ規則で計算)
  */
 lisp_val_t primitive_subtract2(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した - (fixnum × fixnum)。**宣言された型を無検査で信じ、タグを見ない。**
+ * 宣言が嘘なら壊れる(documents/declare-typed-add.md §3-1)。
+ * GENERIC と同じく a-b を a+(-b) に帰着させ、桁溢れは bignum へ昇格する。
+ */
+lisp_val_t primitive_subtract2_fixnum(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した - (single-float × single-float)。**同上、タグを見ない。**
+ * GENERIC と同じく double を経由するので結果はビット単位で一致する。
+ */
+lisp_val_t primitive_subtract2_single(lisp_val_t a, lisp_val_t b);
 
 /**
  * 組み込み関数CONS。第一引数をcar、第二引数をcdrとするconsを返す。
@@ -1683,10 +2300,23 @@ lisp_val_t primitive_multiply(lisp_val_t args, lisp_val_t env);
 lisp_val_t primitive_multiply2(lisp_val_t a, lisp_val_t b);
 
 /**
+ * 型特化した * (fixnum × fixnum)。**宣言された型を無検査で信じ、タグを見ない。**
+ * 宣言が嘘なら壊れる(documents/declare-typed-add.md §3-1)。
+ * 桁溢れは GENERIC と同じく bignum へ昇格する。
+ */
+lisp_val_t primitive_multiply2_fixnum(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した * (single-float × single-float)。**同上、タグを見ない。**
+ * GENERIC と同じく double を経由するので結果はビット単位で一致する。
+ */
+lisp_val_t primitive_multiply2_single(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数/。argsの第一引数から残りを順に除算する(整数除算、商のみ返す)。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
- * @return 除算結果の整数。0除算の場合はg_sym_eval_error
+ * @return 除算結果の整数。0除算の場合は<division-by-zero>をsignalする
  */
 lisp_val_t primitive_divide(lisp_val_t args, lisp_val_t env);
 
@@ -1752,6 +2382,38 @@ lisp_val_t primitive_num_equal2(lisp_val_t a, lisp_val_t b);
 lisp_val_t primitive_num_not_equal(lisp_val_t args, lisp_val_t env);
 
 /**
+ * primitive_num_not_equalを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。**非順序(NaN)では真を返す**(/=は IEEE 754 でそうなる唯一の比較)。
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @return a≠b(非順序を含む)ならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_num_not_equal2(lisp_val_t a, lisp_val_t b);
+
+/**
+ * primitive_divideを2引数固定で呼ぶためのラッパー。JITコンパイル済みコードから
+ * 呼ばれる想定。floatが絡むならconsを構築しない。ゼロ除算はIEEE754どおり inf/nan。
+ * @param a 被除数
+ * @param b 除数
+ * @return a/b
+ */
+lisp_val_t primitive_divide2(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した / (fixnum × fixnum)。**型のタグは見ないが、ゼロ検査はする。**
+ * 宣言が嘘なら壊れる(documents/declare-typed-add.md §3-1)が、
+ * **除数 0 で #DE を出して止まることはない**(documents/declare-typed-arith.md §9)。
+ * 商はゼロ方向に切り捨て。除数が0ならEVAL-ERROR。
+ */
+lisp_val_t primitive_divide2_fixnum(lisp_val_t a, lisp_val_t b);
+
+/**
+ * 型特化した / (single-float × single-float)。**同上、タグを見ない。**
+ * GENERIC と同じく double を経由する(二重丸めごと一致させる)。
+ */
+lisp_val_t primitive_divide2_single(lisp_val_t a, lisp_val_t b);
+
+/**
  * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
  * @param env 呼び出し時の環境(未使用)
@@ -1814,7 +2476,7 @@ lisp_val_t primitive_abs(lisp_val_t args, lisp_val_t env);
  * 商は-∞方向へ切り捨てる)。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の商。z2が0の場合はg_sym_eval_error
+ * @return floor除算の商。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env);
 
@@ -1823,7 +2485,7 @@ lisp_val_t primitive_div(lisp_val_t args, lisp_val_t env);
  * 一致する)。
  * @param args 評価済みの引数リスト(整数2個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor除算の余り。z2が0の場合はg_sym_eval_error
+ * @return floor除算の余り。z2が0の場合は<division-by-zero>をsignalする(spec:4889)
  */
 lisp_val_t primitive_mod(lisp_val_t args, lisp_val_t env);
 
@@ -1847,7 +2509,7 @@ lisp_val_t primitive_lcm(lisp_val_t args, lisp_val_t env);
  * 組み込み関数ISQRT。第一引数の整数平方根floor(sqrt(z))を返す。zが負の場合は定義域エラー。
  * @param args 評価済みの引数リスト(非負整数1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floor(sqrt(z))。zが負の場合はg_sym_eval_error
+ * @return floor(sqrt(z))。zが負の場合は<domain-error>をsignalする(spec:4984)
  */
 lisp_val_t primitive_isqrt(lisp_val_t args, lisp_val_t env);
 
@@ -1905,11 +2567,138 @@ lisp_val_t primitive_bignump1(lisp_val_t val);
 lisp_val_t os_make_float(double value);
 
 /**
- * MAGIC_FLOATのINSTANCEからword1のビットパターンを読み出し、doubleへ戻す。
- * @param val MAGIC_FLOATのINSTANCE(タグ付きlisp_val_t)
- * @return 格納されているdouble値
+ * float(single/double)からdoubleの値を取り出す。
+ * MAGIC_FLOATのINSTANCEならword1のビットパターンを、TAG_SINGLE_FLOATの即値なら
+ * bit32-63のbinary32を、それぞれdoubleへ戻す。
+ *
+ * **この関数は両方を受ける。** single-floatを入れる前は「MAGIC_FLOATのword1を
+ * 読む」だけだったので、呼び出し側が先にis_floatで絞っていれば安全だったが、
+ * is_floatがsingleも真を返すようになった以上ここで分岐しないと即値をアドレスとして
+ * デリファレンスする。
+ * @param val floatの値(TAG_SINGLE_FLOATの即値、またはMAGIC_FLOATのINSTANCE)
+ * @return 格納されている値をdoubleにしたもの
  */
 double os_float_value(lisp_val_t val);
+
+/**
+ * float(IEEE754 binary32)の値をTAG_SINGLE_FLOATの即値にする。ヒープは使わない。
+ * ビットパターンの移動にはunionを使う(ポインタキャストはstrict aliasing違反)。
+ * @param value 格納するfloat値
+ * @return TAG_SINGLE_FLOATのタグ付き即値
+ */
+lisp_val_t os_make_single_float(float value);
+
+/**
+ * TAG_SINGLE_FLOATの即値からbit32-63のビットパターンを読み出し、floatへ戻す。
+ * @param val TAG_SINGLE_FLOATのタグ付き即値
+ * @return 格納されているfloat値
+ */
+float os_single_float_value(lisp_val_t val);
+
+/**
+ * valがsingle-float(TAG_SINGLE_FLOATの即値)かどうかを判定する。
+ * @param val 判定対象
+ * @return single-floatなら非0
+ */
+static inline int os_is_single_float(lisp_val_t val) {
+    return (val & TAG_MASK) == TAG_SINGLE_FLOAT;
+}
+
+/**
+ * 組み込み関数%%SINGLE-FLOAT-P。第一引数がsingle-float(TAG_SINGLE_FLOATの即値)か
+ * どうかを判定する。class-ofがfloatをsingle/doubleへ振り分けるのに使う。
+ * @param args 評価済みの引数リスト
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p(lisp_val_t args, lisp_val_t env);
+
+/**
+ * 組み込み関数%%NARROW-TO-SINGLE-FLOAT。数値をsingle-floatへ**狭める**。
+ *
+ * 型昇格(c-1)は広いほうへ寄せるので、Lispだけでは狭められない
+ * ((* double 1.0f0) は double のまま、(float x) は float をそのまま返す)。
+ * convert の double → <single-float> にはこの経路が要る。
+ *
+ * 範囲外(singleで表せない大きさ)と数値でない入力は**nilを返す**。
+ * domain-errorの送出は呼び出し側(%convert)に任せる。
+ * NaN・±無限大はsingleでも表現できるのでそのまま通す。
+ * FLT_MINより小さい値は0へ丸まるが、これは正しく丸めた結果なのでエラーにしない。
+ * @param args 評価済みの引数リスト(数値1個)
+ * @param env 呼び出し時の環境(未使用)
+ * @return single-floatへ丸めた値。数値でない、または範囲外ならnil
+ */
+lisp_val_t primitive_narrow_to_single_float(lisp_val_t args, lisp_val_t env);
+
+/**
+ * primitive_single_float_pの非allocatingな核ロジック(za向け)。
+ * @param val 判定対象
+ * @return single-floatならg_sym_t、そうでなければnil
+ */
+lisp_val_t primitive_single_float_p1(lisp_val_t val);
+
+/* 組み込み関数%%MOST-POSITIVE-SINGLE-FLOAT / %%MOST-NEGATIVE-SINGLE-FLOAT /
+   %%MOST-POSITIVE-DOUBLE-FLOAT / %%MOST-NEGATIVE-DOUBLE-FLOAT。
+   float境界の定数をC側(SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS)から導く。
+
+   **負側も専用のプリミティブにする。** Lisp側で (- 0 *most-positive-single-float*)
+   と書くと、演算の型昇格(未実装)を通ってsingleがdoubleへ落ちてしまう。 */
+lisp_val_t primitive_most_positive_single_float(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_most_negative_single_float(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_most_positive_double_float(lisp_val_t args, lisp_val_t env);
+lisp_val_t primitive_most_negative_double_float(lisp_val_t args, lisp_val_t env);
+
+/**
+ * リーダ・プリンタが参照する *read-default-float-format* の現在値を解決する。
+ *
+ * 動的変数が未定義・unbound・想定外の値のときは**C側の既定値へフォールバックする**
+ * (起動時に落ちないことのほうが優先)。フォールバック先は
+ * DEFAULT_FLOAT_FORMAT_IS_SINGLE(init.lisp の初期値と同じ定数)。
+ * @return single-floatなら非0、double-floatなら0
+ */
+int os_read_default_float_format_is_single(void);
+
+/**
+ * 組み込み関数%%DEFAULT-FLOAT-FORMAT。C側の既定 DEFAULT_FLOAT_FORMAT_IS_SINGLE を
+ * クラス名シンボル(<SINGLE-FLOAT> / <DOUBLE-FLOAT>)として返す。
+ *
+ * init.lisp の (defdynamic *read-default-float-format* ...) がこれを使う。
+ * **Lisp側にクラス名を直接書かないための経路**で、*most-positive-fixnum* が
+ * %%FIXNUM-MAGNITUDE-MASK を通しているのと同じ形である。
+ * @param args 評価済みの引数リスト(未使用)
+ * @param env 呼び出し時の環境(未使用)
+ * @return <SINGLE-FLOAT> または <DOUBLE-FLOAT> のシンボル
+ */
+lisp_val_t primitive_default_float_format(lisp_val_t args, lisp_val_t env);
+
+/**
+ * [単一の真実源] *read-default-float-format* の既定。
+ * 0 = <double-float> / 1 = <single-float>。
+ *
+ * **この1箇所が「isiki-os の既定の float 形式」を決める。**
+ * 次の2つを兼ねる:
+ *   1. init.lisp の (defdynamic *read-default-float-format* (%%default-float-format))
+ *      が読む初期値
+ *   2. 動的変数が読めないとき(ブート最初期・unbound・想定外の値・Cのユニット
+ *      テスト)に os_read_default_float_format_is_single が倒れる先
+ *
+ * 以前はこの2つが別の定数だった。**別々にすると、片方だけ動かしたときに
+ * 「init.lisp を評価するまでとそれ以降で既定が違う」という状態が作れてしまう。**
+ * 同じ値でなければならないものは同じ定数にする。
+ *
+ * **既定を <double-float> にしている理由**(documents/float-default.md):
+ *   - single 既定だと 1.5 の有効桁が約7桁になり、素朴に書いた数値計算が
+ *     黙って精度を失う(PR #79 で実際に14件落ちた)
+ *   - single 即値化の価値は既定とは独立に成立している。性能が要る場所で
+ *     1.5f0 と書けば、ヒープ確保ゼロの利益はすでに得られる(PR #80 の実測)
+ *   - 明示的に f0 を書いた人は精度を落とすことを承知している。既定を変えるのは
+ *     「明示せずに速い経路へ乗れる」利便性のために全体の精度を下げることになる
+ *
+ * **transpile.lisp(ホストCL上で動くのでこの定数を読めない)だけは手で合わせる。**
+ * ずれを検出するため、AOT対象に裸のfloatリテラルのprobeを置いてある
+ * (src/lisp/init_aot.lisp の %aot-float-format-probe)。
+ */
+#define DEFAULT_FLOAT_FORMAT_IS_SINGLE 0
 
 /**
  * bignum(MAGIC_BIGNUMのINSTANCE)をdoubleへ変換する。limb配列を上位から
@@ -1921,7 +2710,8 @@ double os_float_value(lisp_val_t val);
 double bignum_to_double(lisp_val_t val);
 
 /**
- * 組み込み関数FLOATP。第一引数がfloat(MAGIC_FLOATのINSTANCE)かどうかを判定する。
+ * 組み込み関数FLOATP。第一引数がfloat(TAG_SINGLE_FLOATの即値、または
+ * MAGIC_FLOATのINSTANCE)かどうかを判定する。
  * @param args 評価済みの引数リスト
  * @param env 呼び出し時の環境(未使用)
  * @return floatならg_sym_t、そうでなければnil
@@ -1939,7 +2729,7 @@ lisp_val_t primitive_floatp1(lisp_val_t val);
  * 組み込み関数FLOAT。第一引数を(既にfloatならそのまま、FIXNUM/bignumならdoubleへ変換して)floatとして返す。
  * @param args 評価済みの引数リスト(数値1個)
  * @param env 呼び出し時の環境(未使用)
- * @return floatに変換した値。数値以外が渡された場合はg_sym_eval_error
+ * @return floatに変換した値。数値以外が渡された場合は<domain-error>をsignalする(spec:4734)
  */
 lisp_val_t primitive_float(lisp_val_t args, lisp_val_t env);
 

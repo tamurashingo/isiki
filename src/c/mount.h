@@ -38,10 +38,14 @@ mount_kind_t os_mount_resolve(const char *path, char *out_relative, UINT32 relat
  * @param relative_path FATドライバへ渡す相対パス(NUL終端、例: "/DIR/FILE.TXT")
  * @param out_data 確保したバッファの格納先
  * @param out_len バッファのバイト数の格納先
+ * @param out_transfer FATドライバ(Lisp)が非局所脱出した場合に、その制御転送値を
+ *        格納する先(NULL可)。**脱出は失敗(戻り値0)として扱うので、呼び出し元は
+ *        0 が返ったときにここを見て、非nilならそれをLispへ返すこと**
+ *        (documents/error-unwind-survey.md §F-6)
  * @return 成功時1、ファイルが無い/読み込み失敗時0
  */
 int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                            UINT8 **out_data, UINT32 *out_len);
+                            UINT8 **out_data, UINT32 *out_len, lisp_val_t *out_transfer);
 
 /**
  * data(len byte)をfixnumのconsリストに変換し、(fat32-write-file|fat16-write-file
@@ -53,10 +57,14 @@ int os_mount_fat_read_file(mount_kind_t kind, lisp_val_t device, const char *rel
  * @param relative_path FATドライバへ渡す相対パス
  * @param data 書き込むバイト列
  * @param len dataのバイト数
+ * @param out_transfer FATドライバ(Lisp)が非局所脱出した場合に、その制御転送値を
+ *        格納する先(NULL可)。**脱出は失敗(戻り値0)として扱うので、呼び出し元は
+ *        0 が返ったときにここを見て、非nilならそれをLispへ返すこと**
+ *        (documents/error-unwind-survey.md §F-6)
  * @return 成功時1、失敗時0
  */
 int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                             const UINT8 *data, UINT32 len);
+                             const UINT8 *data, UINT32 len, lisp_val_t *out_transfer);
 
 /**
  * pathを解決し、(fat32-resolve-node|fat16-resolve-node handle relative_path)で
@@ -78,10 +86,15 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
  * @param truncate 真なら既存ファイルを0byteへ切り詰めてから解決する
  * @param create_if_missing 真ならファイルが存在しない場合に空ファイルを新規作成する
  * @param out_node 解決できた場合に<file-node>インスタンスを格納する先
+ * @param out_transfer FATドライバ(Lisp)が非局所脱出した場合に、その制御転送値を
+ *        格納する先(NULL可)。**脱出は失敗(戻り値0)として扱うので、呼び出し元は
+ *        0 が返ったときにここを見て、非nilならそれをLispへ返すこと**
+ *        (documents/error-unwind-survey.md §F-6)
  * @return 成功時1、失敗時0(パス解決不可・作成失敗等)
  */
 int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                                    int truncate, int create_if_missing, lisp_val_t *out_node);
+                                    int truncate, int create_if_missing, lisp_val_t *out_node,
+                                    lisp_val_t *out_transfer);
 
 /**
  * pathを解決し、(fat32-file-size|fat16-file-size handle relative_path)経由で
@@ -94,10 +107,14 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
  * @param device deviceシンボル
  * @param relative_path FATドライバへ渡す相対パス
  * @param out_len 解決できた場合にファイルサイズを格納する先
+ * @param out_transfer FATドライバ(Lisp)が非局所脱出した場合に、その制御転送値を
+ *        格納する先(NULL可)。**脱出は失敗(戻り値0)として扱うので、呼び出し元は
+ *        0 が返ったときにここを見て、非nilならそれをLispへ返すこと**
+ *        (documents/error-unwind-survey.md §F-6)
  * @return 成功時1、失敗時0(パス解決不可等)
  */
 int os_mount_fat_file_size(mount_kind_t kind, lisp_val_t device, const char *relative_path,
-                            UINT32 *out_len);
+                            UINT32 *out_len, lisp_val_t *out_transfer);
 
 /**
  * [性能測定] documents/performance-measurement.md「read-file-into-vector-native」
