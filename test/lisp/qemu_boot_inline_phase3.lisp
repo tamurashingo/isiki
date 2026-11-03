@@ -28,6 +28,13 @@
 (defun p3-dfix (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (/ x y))
 (defun p3-asgl (x y) (declare (type <single-float> x)) (declare (type <single-float> y)) (+ x y))
 (defun p3-adbl (x y) (declare (type <double-float> x)) (declare (type <double-float> y)) (+ x y))
+;; [#128 / M7] 比較の型特化。**single に得がある**(タグ 0x4 なので比較の常道
+;; 「両方が非負 fixnum」を必ず外し、number_compare4 へ落ちていた)。
+;; fixnum は対照: 符号＋絶対値なので符号検査が外せず、節約はタグ検査の分だけ
+(defun p3-ltsgen (x y) (< x y))
+(defun p3-ltsgl (x y) (declare (type <single-float> x)) (declare (type <single-float> y)) (< x y))
+(defun p3-ltfgen (x y) (< x y))
+(defun p3-ltfix (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (< x y))
 
 (defun p3-loop (f a b n)
   (let ((i 0) (r nil)) (while (< i n) (setq r (funcall f a b)) (setq i (+ i 1))) r))
@@ -40,6 +47,8 @@
 (p3-warm (function p3-sinl) 12345 6789)
 (p3-warm (function p3-mfix) 12345 6789) (p3-warm (function p3-dfix) 1000003 7)
 (p3-warm (function p3-asgl) 1.5f0 2.25f0) (p3-warm (function p3-adbl) 1.5d0 2.25d0)
+(p3-warm (function p3-ltsgen) 1.5f0 2.25f0) (p3-warm (function p3-ltsgl) 1.5f0 2.25f0)
+(p3-warm (function p3-ltfgen) 12345 6789) (p3-warm (function p3-ltfix) 12345 6789)
 
 ;; **切り替わったことを別の計器で確認してから測る**(完全一致が予測されるため)
 (format *isiki-test-stream* "#codelen agen=~D afix=~D ainl=~D | sgen=~D sfix=~D sinl=~D~%"
@@ -87,6 +96,10 @@
 (p3-seg "/fix-decl"     (function p3-dfix) 1000003 7)
 (p3-seg "+sgl-decl"     (function p3-asgl) 1.5f0 2.25f0)
 (p3-seg "+dbl-decl"     (function p3-adbl) 1.5d0 2.25d0)
+(p3-seg "<sgl-nodecl"   (function p3-ltsgen) 1.5f0 2.25f0)
+(p3-seg "<sgl-decl"     (function p3-ltsgl)  1.5f0 2.25f0)
+(p3-seg "<fix-nodecl"   (function p3-ltfgen) 12345 6789)
+(p3-seg "<fix-decl"     (function p3-ltfix)  12345 6789)
 
 (defglobal *p3-bn* 10000)
 (defun p3-bytes (label f a b)
@@ -100,6 +113,12 @@
 (p3-bytes "+fix-inline" (function p3-ainl) 12345 6789)
 (p3-bytes "-fix-inline" (function p3-sinl) 12345 6789)
 
-(assert-equal 12 (car (%%gate-hits)))
+;; [#128 / M7。規則 9] **12 -> 16。区間を 4 つ足したので更新した。**
+;;   <sgl-nodecl / <sgl-decl / <fix-nodecl / <fix-decl
+;; 比較の型特化の効果は**記録されている 29 行には現れない**(ベンチの関数は
+;; declare を書かないので特化版が選ばれない)。だから区間を足して測る。
+;; **対照群を同じビルドの中に置く**ので、ビルド間のぶれが入らない。
+;; documents/compare-type-specialized.md §5
+(assert-equal 16 (car (%%gate-hits)))
 (isiki-test-report)
 (close *isiki-test-stream*)

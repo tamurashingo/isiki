@@ -3318,6 +3318,29 @@ static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
         if (generic_fn == (void *)primitive_divide2) {
             return (void *)primitive_divide2_single;
         }
+        /* [#128 / M7] 比較も表に載せる。**配線は前からここを通っていた**
+           (za_compile_binary がこの振り分けを呼んでいる)。載っていなかったので
+           0 が返り、汎用のまま number_compare4 へ落ちていた。
+           **single は得が大きい**: タグ 0x4 なので比較の常道(両方が非負 fixnum)を
+           必ず外す。documents/compare-type-specialized.md */
+        if (generic_fn == (void *)primitive_less_than2) {
+            return (void *)primitive_less_than2_single;
+        }
+        if (generic_fn == (void *)primitive_greater_than2) {
+            return (void *)primitive_greater_than2_single;
+        }
+        if (generic_fn == (void *)primitive_less_equal2) {
+            return (void *)primitive_less_equal2_single;
+        }
+        if (generic_fn == (void *)primitive_greater_equal2) {
+            return (void *)primitive_greater_equal2_single;
+        }
+        if (generic_fn == (void *)primitive_num_equal2) {
+            return (void *)primitive_num_equal2_single;
+        }
+        if (generic_fn == (void *)primitive_num_not_equal2) {
+            return (void *)primitive_num_not_equal2_single;
+        }
         return 0;
     }
     return 0;
@@ -3692,9 +3715,15 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
 
     /* [型特化] **両方の型が宣言されているときだけ**呼び先を専用関数へ差し替える。
        za_compile_fold と同じ仕組みだが、`/` はこちらを通る
-       (documents/divide-direct-call.md §3-1)。za_specialized_wrapper は
-       GENERIC の関数ポインタで振り分けるので、比較演算子が誤って
-       差し替わることはない(表に載っていないので 0 が返る)。 */
+       (documents/divide-direct-call.md §3-1)。
+
+       **［2026-11-03 訂正］以前ここには「比較演算子が誤って差し替わることはない
+       (表に載っていないので 0 が返る)」と書いてあったが、#128 で比較を表に載せた
+       ので、いまは比較も差し替わる。** そしてそれがこの経路の値である:
+       **配線は前からここを通っていた。載っていなかっただけだった。**
+       single の比較は得が大きい(タグ 0x4 なので常道の「両方が非負 fixnum」を
+       必ず外し、number_compare4 へ落ちていた)。
+       documents/compare-type-specialized.md */
     {
         void *specialized = za_specialized_wrapper(
             wrapper_fn,
