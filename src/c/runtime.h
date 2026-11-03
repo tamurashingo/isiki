@@ -2413,6 +2413,19 @@ lisp_val_t primitive_divide2_fixnum(lisp_val_t a, lisp_val_t b);
  */
 lisp_val_t primitive_divide2_single(lisp_val_t a, lisp_val_t b);
 
+/* [#128 / M7] 型特化した比較(single × single)。**比較の特化関数は 1 つも無かった。**
+   single はタグ 0x4 なので比較の常道(両方が非負 fixnum)を必ず外し、
+   number_compare4(汎用)へ落ちていた。即値から直接比べれば飛ばせる。
+   **NaN の意味論は C の比較演算子と一致する**(4 値の論理が IEEE に合わせて
+   作られているため)。`/=` は非順序で真を返す唯一の比較である。
+   documents/compare-type-specialized.md */
+lisp_val_t primitive_less_than2_single(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_greater_than2_single(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_less_equal2_single(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_greater_equal2_single(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_num_equal2_single(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_num_not_equal2_single(lisp_val_t a, lisp_val_t b);
+
 /**
  * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)

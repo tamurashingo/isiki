@@ -8089,6 +8089,69 @@ lisp_val_t primitive_divide2_single(lisp_val_t a, lisp_val_t b) {
                                         (double)os_single_float_value(b)));
 }
 
+/* ============== 型特化した比較(single × single)。#128 / M7 の残り ==============
+ *
+ * **比較の特化関数は 1 つも無かった**(四則には `_fixnum` も `_single` も揃っている)。
+ * documents/compare-type-specialized.md。
+ *
+ * ## なぜ single に得があるのか
+ *
+ * 比較の常道は `num_both_nonneg_fixnum`(両方が非負 fixnum)である。
+ * **single はタグが 0x4 なのでここを必ず外し**、`primitive_*_slow` を経て
+ * **`number_compare4`(汎用)** へ落ちる。single は**即値**なので、
+ * 取り出して直接比べれば汎用を丸ごと飛ばせる。
+ *
+ * ## NaN — **C の比較演算子と意味論が一致する**
+ *
+ * `number_compare4` は 4 値(`LESS`/`EQUAL`/`GREATER`/**`UNORDERED`**)を返し、
+ * 述語はその上に作られている。**4 値の論理は IEEE に合わせて作ったもの**なので、
+ * C の比較演算子がそのまま同じ答えを出す:
+ *
+ *     <  >  <=  >=  =   … 非順序では偽。C の < > <= >= == も偽
+ *     /=                 … **非順序では真**(唯一)。C の != も真
+ *
+ * **`num_lt(a,b) || num_gt(a,b)` と書いてはいけない**(非順序がどちらにも
+ * 該当せず偽になり IEEE 754 に反する)。これは `/=` の既存の註と同じ理由である。
+ *
+ * 導出が合っていても書き間違いは試験でしか捕まらないので、
+ * **6 つすべてに NaN の試験を置いた**(test/lisp/compare_single_test.lisp)。
+ *
+ * ## double は対象外
+ *
+ * 宣言できる型は `<fixnum>` と `<single-float>` の 2 つだけである
+ * (`OS_DECL_TYPE_FIXNUM` / `OS_DECL_TYPE_SINGLE_FLOAT`)。
+ */
+#define COMPARE_SINGLE_BODY(fn_name, op)                                      \
+    DECLARE_AUDIT_SINGLE(fn_name, a);                                         \
+    DECLARE_AUDIT_SINGLE(fn_name, b);                                         \
+    return (os_single_float_value(a) op os_single_float_value(b))             \
+        ? g_sym_t : nil
+
+lisp_val_t primitive_less_than2_single(lisp_val_t a, lisp_val_t b) {
+    COMPARE_SINGLE_BODY("primitive_less_than2_single", <);
+}
+
+lisp_val_t primitive_greater_than2_single(lisp_val_t a, lisp_val_t b) {
+    COMPARE_SINGLE_BODY("primitive_greater_than2_single", >);
+}
+
+lisp_val_t primitive_less_equal2_single(lisp_val_t a, lisp_val_t b) {
+    COMPARE_SINGLE_BODY("primitive_less_equal2_single", <=);
+}
+
+lisp_val_t primitive_greater_equal2_single(lisp_val_t a, lisp_val_t b) {
+    COMPARE_SINGLE_BODY("primitive_greater_equal2_single", >=);
+}
+
+lisp_val_t primitive_num_equal2_single(lisp_val_t a, lisp_val_t b) {
+    COMPARE_SINGLE_BODY("primitive_num_equal2_single", ==);
+}
+
+/* **`/=` は非順序(NaN)で真を返す唯一の比較である。** C の != がそのまま一致する */
+lisp_val_t primitive_num_not_equal2_single(lisp_val_t a, lisp_val_t b) {
+    COMPARE_SINGLE_BODY("primitive_num_not_equal2_single", !=);
+}
+
 /* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す
    (**-O1 は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開する**ので、
     付けないと冷たい側のフレーム要求が常道に残る。M5 で実測)。 */

@@ -209,7 +209,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -1020,6 +1020,7 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_jit_limits.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_stack_guard.lisp
 	$(MAKE) test-qemu-heap-exhaustion
+	$(MAKE) test-qemu-compare-single
 
 # [可用性/#110] ヒープ枯渇が <storage-exhausted> になることを見る
 # (M8-T5/T6。documents/heap-exhaustion.md)。**専用の milestone にしてある**理由:
@@ -1027,6 +1028,13 @@ test-qemu-all:
 # (スタックガード(qemu_boot_stack_guard.lisp)と同じ扱い)。
 test-qemu-heap-exhaustion:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_heap_exhaustion.lisp
+
+# [#128 / M7] 型特化した比較(single)。**NaN の意味論が中心である**
+# (特化版は number_compare4 の 4 値を飛ばして C の比較演算子を直に使う。
+#  4 値の論理は IEEE に合わせて作られたものなので一致する、と導いたうえで試験を置く)。
+# documents/compare-type-specialized.md
+test-qemu-compare-single:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_compare_single.lisp
 
 # za_test.lisp(拡張1/4/6)のGC誘発を伴う大量ループ(N=50000)をローカルでのみ実行する。
 # GitHub ActionsはKVM無しでQEMUがTCG(ソフトウェアエミュレーション)にフォールバック
