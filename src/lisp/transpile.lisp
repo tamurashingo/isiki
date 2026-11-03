@@ -574,6 +574,17 @@
     ;; measurement.md「AOT側primitive_add2のstatic inline化」節参照)。
     (+ 2 . "primitive_add2")
     (- 2 . "primitive_subtract2")
+    ;; [#128] **`*` `/` `<=` `/=` が漏れていた。** `+` `-` や `=` `<` `>` `>=` は
+    ;; 載っていたのに、この 4 つだけ可変長版へ落ちて**呼び出しごとに cons を 2 つ**
+    ;; 作っていた(`primitive_multiply(os_make_cons(a, os_make_cons(b, nil)), env)`)。
+    ;; 対応する C 関数は 4 つとも最初から存在する。**表に載せるだけだった。**
+    ;; AOT 変換対象での使用は `*` 45 / `<=` 14 / `/=` 4 箇所で、
+    ;; fat16・fat32・device・partition のセクタ計算に集まっている。
+    ;; documents/aot-binary-muldiv.md
+    (* 2 . "primitive_multiply2")
+    (/ 2 . "primitive_divide2")
+    (<= 2 . "primitive_less_equal2")
+    (/= 2 . "primitive_num_not_equal2")
     (set-car 2 . "primitive_set_car2")
     (set-cdr 2 . "primitive_set_cdr2")
     (numberp 1 . "primitive_numberp1")
