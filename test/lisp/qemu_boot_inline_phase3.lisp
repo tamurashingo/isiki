@@ -34,6 +34,8 @@
 (defun p3-ltsgen (x y) (< x y))
 (defun p3-ltsgl (x y) (declare (type <single-float> x)) (declare (type <single-float> y)) (< x y))
 (defun p3-ltfgen (x y) (< x y))
+;; [#128] 負値の比較。**得があるのはここだけ**(非負は常道が同じ)
+(defun p3-ltnfix (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (< x y))
 (defun p3-ltfix (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (< x y))
 
 (defun p3-loop (f a b n)
@@ -49,6 +51,7 @@
 (p3-warm (function p3-asgl) 1.5f0 2.25f0) (p3-warm (function p3-adbl) 1.5d0 2.25d0)
 (p3-warm (function p3-ltsgen) 1.5f0 2.25f0) (p3-warm (function p3-ltsgl) 1.5f0 2.25f0)
 (p3-warm (function p3-ltfgen) 12345 6789) (p3-warm (function p3-ltfix) 12345 6789)
+(p3-warm (function p3-ltfgen) -12345 -6789) (p3-warm (function p3-ltnfix) -12345 -6789)
 
 ;; **切り替わったことを別の計器で確認してから測る**(完全一致が予測されるため)
 (format *isiki-test-stream* "#codelen agen=~D afix=~D ainl=~D | sgen=~D sfix=~D sinl=~D~%"
@@ -100,6 +103,8 @@
 (p3-seg "<sgl-decl"     (function p3-ltsgl)  1.5f0 2.25f0)
 (p3-seg "<fix-nodecl"   (function p3-ltfgen) 12345 6789)
 (p3-seg "<fix-decl"     (function p3-ltfix)  12345 6789)
+(p3-seg "<fixneg-nodecl" (function p3-ltfgen) -12345 -6789)
+(p3-seg "<fixneg-decl"  (function p3-ltnfix) -12345 -6789)
 
 (defglobal *p3-bn* 10000)
 (defun p3-bytes (label f a b)
@@ -119,6 +124,7 @@
 ;; declare を書かないので特化版が選ばれない)。だから区間を足して測る。
 ;; **対照群を同じビルドの中に置く**ので、ビルド間のぶれが入らない。
 ;; documents/compare-type-specialized.md §5
-(assert-equal 16 (car (%%gate-hits)))
+;; [#128。規則 9] 16 -> 18。負値の比較の区間を 2 つ足した
+(assert-equal 18 (car (%%gate-hits)))
 (isiki-test-report)
 (close *isiki-test-stream*)

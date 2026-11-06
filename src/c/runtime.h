@@ -2426,6 +2426,17 @@ lisp_val_t primitive_greater_equal2_single(lisp_val_t a, lisp_val_t b);
 lisp_val_t primitive_num_equal2_single(lisp_val_t a, lisp_val_t b);
 lisp_val_t primitive_num_not_equal2_single(lisp_val_t a, lisp_val_t b);
 
+/* [#128 / M7] 型特化した比較(fixnum × fixnum)。**得があるのは負値のときだけ**である
+   (`(declare (type <fixnum>))` は非負を意味しない。fixnum は符号＋絶対値)。
+   非負なら常道は同じでタグ検査が消えるだけ、負値なら number_compare4 までの
+   2 段の call が消える。documents/compare-type-specialized.md */
+lisp_val_t primitive_less_than2_fixnum(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_greater_than2_fixnum(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_less_equal2_fixnum(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_greater_equal2_fixnum(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_num_equal2_fixnum(lisp_val_t a, lisp_val_t b);
+lisp_val_t primitive_num_not_equal2_fixnum(lisp_val_t a, lisp_val_t b);
+
 /**
  * 組み込み関数>=。argsが単調非増加(a>=b>=c>=...)かどうかを判定する。
  * @param args 評価済みの引数リスト(すべて整数)
