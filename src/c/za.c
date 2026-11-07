@@ -3247,6 +3247,81 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
             is_div = 1;
         }
     }
+    /* [safety 3 / #148] **宣言した型を実際に検証する。**
+       safety 3 のときだけ、型特化した呼び先を選んでいる場合に検査を出す。
+       食い違ったら <domain-error> を signal する(**os_panic ではない**)。
+
+       **ここ 1 箇所で算術と比較の全部を覆える。** #165 で za_compile_binary も
+       この関数へ寄せたので、特化した呼び先はすべてここを通る。
+       宣言された型は wrapper_fn から分かる(_fixnum か _single か)。
+
+       **既定(safety 1/2)では 1 命令も増えない。** 監査ビルド(別ビルド)が
+       要らなくなるので、M6 の D6(監査ビルドでは展開を抑止する)の妥協も
+       ここでは不要である。documents/safety3-verify.md */
+    if (OPTIMIZE_SAFETY(g_za_declaim) == 3) {
+        UINT64 expected = 0;
+        if (wrapper_fn == (void *)primitive_add2_fixnum
+            || wrapper_fn == (void *)primitive_subtract2_fixnum
+            || wrapper_fn == (void *)primitive_multiply2_fixnum
+            || wrapper_fn == (void *)primitive_divide2_fixnum
+            || wrapper_fn == (void *)primitive_less_than2_fixnum
+            || wrapper_fn == (void *)primitive_greater_than2_fixnum
+            || wrapper_fn == (void *)primitive_less_equal2_fixnum
+            || wrapper_fn == (void *)primitive_greater_equal2_fixnum
+            || wrapper_fn == (void *)primitive_num_equal2_fixnum
+            || wrapper_fn == (void *)primitive_num_not_equal2_fixnum) {
+            expected = OS_DECL_TYPE_FIXNUM;
+        } else if (wrapper_fn == (void *)primitive_add2_single
+                   || wrapper_fn == (void *)primitive_subtract2_single
+                   || wrapper_fn == (void *)primitive_multiply2_single
+                   || wrapper_fn == (void *)primitive_divide2_single
+                   || wrapper_fn == (void *)primitive_less_than2_single
+                   || wrapper_fn == (void *)primitive_greater_than2_single
+                   || wrapper_fn == (void *)primitive_less_equal2_single
+                   || wrapper_fn == (void *)primitive_greater_equal2_single
+                   || wrapper_fn == (void *)primitive_num_equal2_single
+                   || wrapper_fn == (void *)primitive_num_not_equal2_single) {
+            expected = OS_DECL_TYPE_SINGLE_FLOAT;
+        }
+        if (expected != 0) {
+            UINT8 want_tag = (expected == OS_DECL_TYPE_SINGLE_FLOAT)
+                ? (UINT8)TAG_SINGLE_FLOAT : (UINT8)TAG_FIXNUM;
+            UINT64 bad[2];
+            UINT64 bad_count = 0;
+            /* 既存のタグ検査(za_emit_inline_car_cdr)と同じ形で出す */
+            jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
+            jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
+            jit_cmp_reg_imm8(ZA_REG_R10, want_tag);
+            bad[bad_count++] = jit_emit_jne_rel32_placeholder();
+            jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RDX);
+            jit_and_reg_imm8(ZA_REG_R10, (UINT8)TAG_MASK);
+            jit_cmp_reg_imm8(ZA_REG_R10, want_tag);
+            bad[bad_count++] = jit_emit_jne_rel32_placeholder();
+            /* 合流の作り方は za_emit_inline_car_cdr と同じで、
+               **悪い側も「正しい値を返す何か」を呼んで合流する**。
+               signal の戻り値は制御転送で、算術の冷たい経路が domain error を
+               signal するのと同じ形なので、そのまま結果として流れる。
+
+               **safety 3 では展開しない。** 検査 + 呼び出しだけを出す自己完結の形に
+               してある(展開の経路と絡めると合流点が増えて読めなくなる)。
+               **検査は呼び出し地点にあるので、展開を残しても見える** —— D6 の
+               「展開すると監査が何も見なくなる」はここでは起きない。
+               展開を残すのは別の仕事として開けてある。 */
+            jit_movabs_r11((UINT64)wrapper_fn);
+            jit_call_r11();
+            UINT64 ok_done = jit_emit_jmp_rel32_placeholder();
+            for (UINT64 k = 0; k < bad_count; k++) {
+                jit_patch_rel32(bad[k]);
+            }
+            /* rcx=a, rdx=b はそのまま。第 3 引数(r8)に期待した型を渡す */
+            jit_movabs_reg(ZA_REG_R8, expected);
+            jit_movabs_r11((UINT64)os_za_signal_declare_mismatch);
+            jit_call_r11();
+            jit_patch_rel32(ok_done);
+            return;
+        }
+    }
+
     if (!is_add && !is_sub && !is_mul && !is_div) {
         jit_movabs_r11((UINT64)wrapper_fn);
         jit_call_r11();

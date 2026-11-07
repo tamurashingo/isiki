@@ -2586,6 +2586,88 @@ static UINT64 decl_apply_inline_spec(lisp_val_t spec, UINT64 bits) {
     return bits;
 }
 
+/* [#148] 1 つの `(optimize ...)` 指定を packed へ適用する。
+ *
+ * **declaim と defun 本体の declare で同じものを使う。**
+ * もとは eval_declaim の中に直書きされていて、関数単位の declare からは
+ * 使えなかった(だから `(declare (optimize (safety 3)))` は**効かなかった**)。
+ * **2 箇所に書くと片方だけ直される**ので切り出した。
+ *
+ * @param spec `(optimize (safety 3) ...)` の形。それ以外は何もしない
+ * @param packed 現在の値
+ * @param invalid 値域(0〜3)を外れたものがあれば 1 を書く(呼び出し側が signal する)
+ * @return 適用後の値
+ */
+UINT64 os_apply_optimize_spec(lisp_val_t spec, UINT64 packed, int *invalid) {
+    if ((spec & TAG_MASK) != TAG_CONS || cc_car(spec) != g_sym_optimize) {
+        return packed;
+    }
+    for (lisp_val_t items = cc_cdr(spec); items != nil && (items & TAG_MASK) == TAG_CONS;
+         items = cc_cdr(items)) {
+        lisp_val_t item = cc_car(items);
+        /* (speed 3) の形のみ受け付ける。裸の speed(= 3 扱い)は非対応 */
+        if ((item & TAG_MASK) != TAG_CONS) {
+            continue;
+        }
+        lisp_val_t qual = cc_car(item);
+        lisp_val_t vcell = cc_cdr(item);
+        if ((vcell & TAG_MASK) != TAG_CONS) {
+            continue;
+        }
+        lisp_val_t vval = cc_car(vcell);
+        /* 値域は 0〜3。整数でない・負・4 以上はいずれも <domain-error> にする。
+           **負の fixnum は FIXNUM_SIGN_BIT が立つのでマグニチュードだけ見ると
+           -1 が 1 に化ける。** 符号ビットの有無を os_make_fixnum で作り直して弾く */
+        if ((vval & TAG_MASK) != TAG_FIXNUM ||
+            vval != os_make_fixnum(os_fixnum_magnitude(vval)) ||
+            os_fixnum_magnitude(vval) > 3) {
+            if (invalid != 0) {
+                *invalid = 1;
+            }
+            return packed;
+        }
+        UINT64 v = os_fixnum_magnitude(vval);
+        /* [重要] OPTIMIZE_PACK は下位 6bit だけを組み立てるので、そのまま代入すると
+           同じ fixnum へ相乗りしている inline ビット(bit8〜)が消える。
+           高位ビットを退避して被せ直すこと(この取りこぼしは
+           (declaim (optimize ...)) が直前の (declaim (inline ...)) を
+           無かったことにする、という形で回帰テストが捕まえた) */
+        UINT64 keep = DECLAIM_INLINE_BITS(packed);
+        if (qual == g_sym_speed) {
+            packed = OPTIMIZE_PACK(v, OPTIMIZE_SAFETY(packed), OPTIMIZE_SPACE(packed));
+        } else if (qual == g_sym_safety) {
+            packed = OPTIMIZE_PACK(OPTIMIZE_SPEED(packed), v, OPTIMIZE_SPACE(packed));
+        } else if (qual == g_sym_space) {
+            packed = OPTIMIZE_PACK(OPTIMIZE_SPEED(packed), OPTIMIZE_SAFETY(packed), v);
+        }
+        packed = DECLAIM_WITH_INLINE_BITS(packed, keep);
+        /* 未知の quality も無視する */
+    }
+    return packed;
+}
+
+/* [#148] defun 本体の先頭の `(declare (optimize ...))` を畳み込む。
+ * **os_scan_declaration_inline と同じ形**(先頭に連続する declare だけを見る)。
+ *
+ * これが無かったので **`(declare (optimize (safety 3)))` は効かなかった**
+ * (optimize は environment の declaim からしか読まれていなかった。
+ *  畳み込まれていたのは inline ビットだけである)。
+ */
+UINT64 os_scan_declaration_optimize(lisp_val_t body, UINT64 inherited, int *invalid) {
+    UINT64 packed = inherited;
+    for (lisp_val_t rest = body; rest != nil && (rest & TAG_MASK) == TAG_CONS; rest = cc_cdr(rest)) {
+        lisp_val_t form = cc_car(rest);
+        if ((form & TAG_MASK) != TAG_CONS || cc_car(form) != g_sym_declare) {
+            break;
+        }
+        for (lisp_val_t specs = cc_cdr(form); specs != nil && (specs & TAG_MASK) == TAG_CONS;
+             specs = cc_cdr(specs)) {
+            packed = os_apply_optimize_spec(cc_car(specs), packed, invalid);
+        }
+    }
+    return packed;
+}
+
 UINT64 os_scan_declaration_inline(lisp_val_t body, UINT64 inherited) {
     UINT64 bits = inherited & DECLAIM_INLINE_MASK;
     /* os_scan_declarations と同じ「先頭に連続する declare だけ」の規則 */
@@ -5249,6 +5331,45 @@ static lisp_val_t signal_domain_error_for_class(lisp_val_t offending_object, con
     initargs = os_make_cons(offending_object, initargs);
     initargs = os_make_cons(g_sym_kw_object, initargs);
     return os_signal_condition(g_sym_class_domain_error, initargs, env);
+}
+
+/* [safety 3 / #148] **宣言した型と実際の型が食い違ったときに signal する入口。**
+ *
+ * ## なぜ os_panic ではないのか
+ *
+ * 監査ビルド(`ISIKIOS_DECLARE_AUDIT`)は `declare_audit_fail` で **os_panic** する。
+ * freestanding には panic のハンドラが無いので、**外から見ると QEMU の無反応と
+ * 区別が付かない**(#110 の作業で族として扱った「結果が無い」と同じ形)。
+ * **signal なら REPL が生き残り、試験から観測できる。**
+ *
+ * ## なぜ別ビルドではなく safety 3 なのか
+ *
+ * 監査ビルドは**別ビルド**なので「本番と同じ生成コードで嘘を捕まえる」ことが
+ * できない。実際 M6 では D6 として「監査ビルドでは展開を抑止する」妥協を入れた
+ * (展開すると監査が何も見なくなるため)。
+ * **safety 3 は本番ビルドのまま関数単位で効く**ので、その妥協が要らない。
+ *
+ * ## 呼ばれ方
+ *
+ * JIT が safety 3 のときだけ、型特化した呼び先を選ぶ地点で検査を出す。
+ * **食い違った側を特定してから signal する**(両方おかしい場合は第一引数を報告する)。
+ *
+ * @param a 第一オペランド
+ * @param b 第二オペランド
+ * @param expected OS_DECL_TYPE_FIXNUM か OS_DECL_TYPE_SINGLE_FLOAT
+ * @return signal-condition の戻り値(制御転送)。
+ *         **算術の冷たい経路が domain error を signal するのと同じ形**なので、
+ *         JIT 側に新しい伝播の仕組みは要らない
+ */
+lisp_val_t os_za_signal_declare_mismatch(lisp_val_t a, lisp_val_t b, UINT64 expected) {
+    const char *class_name = (expected == OS_DECL_TYPE_SINGLE_FLOAT)
+        ? "<FLOAT>" : "<INTEGER>";
+    /* 既存の監査マクロ(DECLARE_AUDIT_FIXNUM / _SINGLE)と**同じ判定**を使う。
+       別の判定を書くと食い違いが将来のバグ源になる */
+    int a_ok = (expected == OS_DECL_TYPE_SINGLE_FLOAT)
+        ? os_is_single_float(a) : ((a & TAG_MASK) == TAG_FIXNUM);
+    lisp_val_t offending = a_ok ? b : a;
+    return signal_domain_error_for_class(offending, class_name, global_environment);
 }
 
 /**
