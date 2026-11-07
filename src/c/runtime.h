@@ -1086,6 +1086,14 @@ UINT64 os_inline_bit_of(lisp_val_t sym);
  * @return 重ねた結果のビット集合
  */
 UINT64 os_scan_declaration_inline(lisp_val_t body, UINT64 inherited);
+/* [#148] 1 つの `(optimize ...)` 指定を適用する。**declaim と defun 本体の
+   declare で同じものを使う**(もとは eval_declaim に直書きで、関数単位の
+   declare からは使えなかった = `(declare (optimize (safety 3)))` が効かなかった)。
+   値域を外れたら *invalid に 1 を書く(呼び出し側が signal する) */
+UINT64 os_apply_optimize_spec(lisp_val_t spec, UINT64 packed, int *invalid);
+/* [#148] defun 本体の先頭の `(declare (optimize ...))` を畳み込む。
+   os_scan_declaration_inline と同じ形(先頭に連続する declare だけを見る) */
+UINT64 os_scan_declaration_optimize(lisp_val_t body, UINT64 inherited, int *invalid);
 /** envが属するenvironmentのoptimize指定を読む(frameはos_definition_envで読み飛ばす) */
 UINT64 os_env_optimize(lisp_val_t env);
 /** envが属するenvironmentのoptimize指定を書き換える。書けたら1 */
@@ -2049,6 +2057,13 @@ void os_set_panic_hook(void (*hook)(void));
  *         init.lisp未ロードでmake-instance/signal-conditionが未定義の場合はg_sym_eval_error
  */
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env);
+
+/* [safety 3 / #148] 宣言した型と実際の型が食い違ったときに signal する入口。
+   **os_panic ではなく signal である**(panic は freestanding でハンドラが無く、
+   外から見ると QEMU の無反応と区別が付かない)。
+   JIT が safety 3 のときだけ検査を出して呼ぶ。
+   documents/declaim-design.md / documents/safety3-verify.md */
+lisp_val_t os_za_signal_declare_mismatch(lisp_val_t a, lisp_val_t b, UINT64 expected);
 
 /**
  * [P4-3] 未定義の関数を<undefined-function>としてsignalする(error-id. undefined-function。

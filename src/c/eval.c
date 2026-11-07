@@ -486,6 +486,20 @@ static lisp_val_t eval_defun(lisp_val_t args, lisp_val_t env) {
        返すようになる(documents/inline-arith.md §7)。 */
     optimize = DECLAIM_WITH_INLINE_BITS(
         optimize, os_scan_declaration_inline(body, DECLAIM_INLINE_BITS(optimize)));
+    /* [#148] **本体の `(declare (optimize ...))` も畳み込む。**
+       ここが無かったので `(declare (optimize (safety 3)))` は**効かなかった**
+       (optimize は environment の declaim からしか読まれておらず、
+        本体から畳まれていたのは上の inline ビットだけだった)。
+       #148 の主眼は「ビルドフラグの監査を**関数単位の宣言**に置き換える」ことなので、
+       関数単位で optimize が効くことがその前提である。
+       documents/safety3-verify.md */
+    {
+        int optimize_invalid = 0;
+        optimize = os_scan_declaration_optimize(body, optimize, &optimize_invalid);
+        if (optimize_invalid) {
+            return os_signal_condition(g_sym_class_domain_error, nil, env);
+        }
+    }
 
     /* 宣言を剥がすのはここ。**上の inline 走査より後**でなければならない */
     os_decl_types_t declared_types;
@@ -594,44 +608,13 @@ static lisp_val_t eval_declaim(lisp_val_t args, lisp_val_t env) {
         if (kind != g_sym_optimize) {
             continue;
         }
-        lisp_val_t items = cc_cdr(spec);
-        while (items != nil) {
-            lisp_val_t item = cc_car(items);
-            items = cc_cdr(items);
-            /* (speed 3) の形のみ受け付ける。裸の speed(= 3扱い)は本Phaseでは非対応 */
-            if ((item & TAG_MASK) != TAG_CONS) {
-                continue;
-            }
-            lisp_val_t qual = cc_car(item);
-            lisp_val_t vcell = cc_cdr(item);
-            if ((vcell & TAG_MASK) != TAG_CONS) {
-                continue;
-            }
-            lisp_val_t vval = cc_car(vcell);
-            /* 値域は0〜3。整数でない・負・4以上はいずれも<domain-error>にする。
-               負のfixnumはFIXNUM_SIGN_BITが立つのでマグニチュードだけ見ると-1が1に
-               化ける。符号ビットの有無をos_make_fixnumで作り直して比較することで弾く */
-            if ((vval & TAG_MASK) != TAG_FIXNUM ||
-                vval != os_make_fixnum(os_fixnum_magnitude(vval)) ||
-                os_fixnum_magnitude(vval) > 3) {
-                return os_signal_condition(g_sym_class_domain_error, nil, env);
-            }
-            UINT64 v = os_fixnum_magnitude(vval);
-            /* [重要] OPTIMIZE_PACKは下位6bitだけを組み立てるので、そのまま代入すると
-               同じfixnumへ相乗りしているinlineビット(bit8〜)が消える。
-               高位ビットを退避して被せ直すこと(この取りこぼしは
-               (declaim (optimize ...)) が直前の (declaim (inline ...)) を
-               無かったことにする、という形で回帰テストが捕まえた) */
-            UINT64 keep = DECLAIM_INLINE_BITS(packed);
-            if (qual == g_sym_speed) {
-                packed = OPTIMIZE_PACK(v, OPTIMIZE_SAFETY(packed), OPTIMIZE_SPACE(packed));
-            } else if (qual == g_sym_safety) {
-                packed = OPTIMIZE_PACK(OPTIMIZE_SPEED(packed), v, OPTIMIZE_SPACE(packed));
-            } else if (qual == g_sym_space) {
-                packed = OPTIMIZE_PACK(OPTIMIZE_SPEED(packed), OPTIMIZE_SAFETY(packed), v);
-            }
-            packed = DECLAIM_WITH_INLINE_BITS(packed, keep);
-            /* 未知のqualityも無視する */
+        /* [#148] 解析は os_apply_optimize_spec に集約した。
+           **defun 本体の declare と同じものを使う**(2 箇所に書くと片方だけ直される)。
+           もとはここに直書きされていて、関数単位の declare からは使えなかった */
+        int invalid = 0;
+        packed = os_apply_optimize_spec(spec, packed, &invalid);
+        if (invalid) {
+            return os_signal_condition(g_sym_class_domain_error, nil, env);
         }
     }
 
