@@ -26,6 +26,11 @@
 ;; 対照: 展開の対象外。Phase 0 から動いてはいけない
 (defun p3-mfix (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (* x y))
 (defun p3-dfix (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (/ x y))
+;; [#128 / M7-T1] inline 宣言つき。**ここだけ展開される**
+(defun p3-minl (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline *)) (* x y))
+(defun p3-dinl (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline /)) (/ x y))
 (defun p3-asgl (x y) (declare (type <single-float> x)) (declare (type <single-float> y)) (+ x y))
 (defun p3-adbl (x y) (declare (type <double-float> x)) (declare (type <double-float> y)) (+ x y))
 ;; [#128 / M7] 比較の型特化。**single に得がある**(タグ 0x4 なので比較の常道
@@ -48,6 +53,7 @@
 (p3-warm (function p3-sgen) 12345 6789) (p3-warm (function p3-sfix) 12345 6789)
 (p3-warm (function p3-sinl) 12345 6789)
 (p3-warm (function p3-mfix) 12345 6789) (p3-warm (function p3-dfix) 1000003 7)
+(p3-warm (function p3-minl) 12345 6789) (p3-warm (function p3-dinl) 1000003 7)
 (p3-warm (function p3-asgl) 1.5f0 2.25f0) (p3-warm (function p3-adbl) 1.5d0 2.25d0)
 (p3-warm (function p3-ltsgen) 1.5f0 2.25f0) (p3-warm (function p3-ltsgl) 1.5f0 2.25f0)
 (p3-warm (function p3-ltfgen) 12345 6789) (p3-warm (function p3-ltfix) 12345 6789)
@@ -97,6 +103,8 @@
 (p3-seg "-fix-inline"   (function p3-sinl) 12345 6789)
 (p3-seg "*fix-decl"     (function p3-mfix) 12345 6789)
 (p3-seg "/fix-decl"     (function p3-dfix) 1000003 7)
+(p3-seg "*fix-inline"   (function p3-minl) 12345 6789)
+(p3-seg "/fix-inline"   (function p3-dinl) 1000003 7)
 (p3-seg "+sgl-decl"     (function p3-asgl) 1.5f0 2.25f0)
 (p3-seg "+dbl-decl"     (function p3-adbl) 1.5d0 2.25d0)
 (p3-seg "<sgl-nodecl"   (function p3-ltsgen) 1.5f0 2.25f0)
@@ -125,6 +133,7 @@
 ;; **対照群を同じビルドの中に置く**ので、ビルド間のぶれが入らない。
 ;; documents/compare-type-specialized.md §5
 ;; [#128。規則 9] 16 -> 18。負値の比較の区間を 2 つ足した
-(assert-equal 18 (car (%%gate-hits)))
+;; [#128 M7-T1。規則 9] 18 -> 20。`*` `/` の inline 区間を 2 つ足した
+(assert-equal 20 (car (%%gate-hits)))
 (isiki-test-report)
 (close *isiki-test-stream*)

@@ -152,14 +152,33 @@
 ;; この assert がその変更を正しく検出して落ちた。** 期待値を更新した。
 ;; `+` `-` の展開は §9 で見る。
 ;;
-;; `*` `/` は展開命令列をまだ書いていないので、宣言しても call のままである。
+;; ~~`*` `/` は展開命令列をまだ書いていないので、宣言しても call のままである。~~
+;;
+;; **［2026-11-07 更新。#128 / M7-T1］`*` `/` も展開されるようになった。**
+;; **この assert が その変更を正しく検出して落ちた**(950 対 871)。
+;; **`+` `-` のときとまったく同じ形である**(上の段落)。期待値を更新した。
+;;
+;; いまは「宣言を付けると code-len が**変わる**」ことを固定する。
+;; 変わらなくなったら、展開が効かなくなったということである。
+;; documents/inline-muldiv.md
 (defun idt-len-mul (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (* x y))
 (defun idt-len-mul-i (x y)
   (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline *))
   (* x y))
-(assert-equal (%%disasm-code-len 'idt-len-mul) (%%disasm-code-len 'idt-len-mul-i))
+(assert-equal t (if (= (%%disasm-code-len 'idt-len-mul)
+                       (%%disasm-code-len 'idt-len-mul-i)) nil t))
 (assert-equal 12 (idt-len-mul 3 4))
 (assert-equal 12 (idt-len-mul-i 3 4))
+
+;; `/` も対称に見る(以前は `*` だけだった)
+(defun idt-len-div (x y) (declare (type <fixnum> x)) (declare (type <fixnum> y)) (/ x y))
+(defun idt-len-div-i (x y)
+  (declare (type <fixnum> x)) (declare (type <fixnum> y)) (declare (inline /))
+  (/ x y))
+(assert-equal t (if (= (%%disasm-code-len 'idt-len-div)
+                       (%%disasm-code-len 'idt-len-div-i)) nil t))
+(assert-equal 3 (idt-len-div 12 4))
+(assert-equal 3 (idt-len-div-i 12 4))
 
 ;;; --- 8. 既存の car/cdr/null/eq が壊れていないこと ---
 ;; **declare でも効くようになった**(以前は declaim だけだった)のが変化点
