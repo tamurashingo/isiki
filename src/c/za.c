@@ -2919,6 +2919,27 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  */
 #define ZA_MAX_COMPILE_NEST 60
 
+/* [#142] **コンパイルの 1 段が積む C フレームの合計(byte)。実測値である。**
+ *
+ *   za_compile_expr       sub rsp 104  + push 0 + 戻り番地 8 =  112   x 2 回/段
+ *   za_compile_expr_inner sub rsp 3160 + push 8 + 戻り番地 8 = 3232   x 2 回/段
+ *                                                              ------
+ *                                                               6688
+ *
+ * (progn (tagbody ...)) の 1 段で expr / inner を 2 回ずつ通る。
+ * za_compile_progn と za_compile_tagbody は -O1 で expr_inner に展開されるので
+ * 独立したフレームを積まない(シンボルも無い)。
+ *
+ * **測り方**: ビルドした esp_dir/EFI/BOOT/BOOTX64.EFI を
+ * x86_64-w64-mingw32-objdump -d にかけ、各関数のプロローグから
+ * `sub $imm,%rsp` と push の数を拾う(sub + push*8 + 戻り番地 8)。
+ * **push を数え落とすと 1 段を過小に見積もる。**
+ * documents/142-shape-bail-investigation.md §9 に手順と実測を置いた。
+ *
+ * **za.c のコンパイル経路に手を入れたら測り直すこと。** 大きくなると
+ * 下の残量検査が遅れて当たるようになり、余裕が黙って減る。 */
+#define ZA_COMPILE_LEVEL_BYTES 6688
+
 /** za_compile_exprの本体。段数の計上はラッパ側(za_compile_expr)が行う */
 static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
                             const za_local_scope_t *locals, const za_syms_t *syms,
@@ -4672,6 +4693,34 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         ZA_BAIL_LINE();   /* [診断] 容量上限 ZA_MAX_COMPILE_NEST */
         g_jit_overflow = 1;
         return 0;
+    }
+    /* [可用性][#142] **残量そのものを見る。段数の上限では足りない。**
+     *
+     * 上の ZA_MAX_COMPILE_NEST は**段数**を数える。しかし 1 段あたりのスタック消費は
+     * 構文によって違う(quasiquote や入れ子の let は 1 段で通る C 関数が増える)。
+     * だから段数の上限では、**1 段が太い構文**を守れない。
+     * 守れないときに起きるのは「ガードページ #PF でプロセスが止まる」= 外からは
+     * ハングに見える故障で、上の注記のとおり**その式は二度と評価されない**。
+     *
+     * 閾値は JIT 生成コードが使うのと**同じ g_za_stack_limit_normal**
+     * (= 下端 + ZA_FRAME_TOTAL + 予備領域)に 1 段ぶんを足したもの。
+     * 次の検査までに降りられるのは高々 1 段なので、これで予備領域を踏まない。
+     * **新しい定数を持ち込まない**のが要点である(予備領域の導出は 1 か所に置く)。
+     *
+     * 0 のときは検査しない(最初のタイマ tick より前、カーネルの idle ループ上。
+     * os_za_set_stack_low の注記と同じ扱い)。
+     *
+     * **これは 2026-11-07 時点で観測されている 30 段の「形の崩れ」を直さない。**
+     * 破壊は残量 50KB の時点で始まっており、枯渇そのものではない(§9)。
+     * ここが塞ぐのは**溢れ**(32 段以上)である。 */
+    if (g_za_stack_limit_normal != 0) {
+        UINT64 sp_here;   /* 番地を取るだけ。読まない(このフレームの中を指す) */
+        if ((UINT64)(void *)&sp_here
+                <= g_za_stack_limit_normal + ZA_COMPILE_LEVEL_BYTES) {
+            ZA_BAIL_LINE();   /* [診断] コンパイル経路のスタック残量 */
+            g_jit_overflow = 1;
+            return 0;
+        }
     }
     /* このラッパはform/params/envを触らずinnerへ渡すだけなので、GC_PROTECTは
        inner側の分だけでよい(ここで積むと段数分だけシャドースタックを余計に消費する) */
