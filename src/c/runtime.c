@@ -6595,6 +6595,32 @@ static double to_double(lisp_val_t v) {
    決して返らない**ので、整数どうしの比較(正常系)には命令が増えない。 */
 #define NUM_CMP_NOT_NUMBER 3
 
+/* [#128] fixnum どうしの比較。**符号＋絶対値**なので生の値を比べてはいけない
+ * (負値は bit63 が立つので、符号なしで比べると巨大な正の値に見える)。
+ *
+ * **実装はここ 1 つだけにする。** number_compare4 の fixnum 分岐から切り出したもので、
+ * 型特化した比較(primitive_*2_fixnum)も同じものを使う。
+ * **2 箇所に書くと片方だけ直される**(このリポジトリで繰り返している失敗)。
+ *
+ * fixnum どうしは**非順序にならない**ので 3 値で足りる
+ * (NUM_CMP_UNORDERED は float が絡むときだけ。documents/nan-comparison.md)。
+ *
+ * always_inline にしてあるのは、number_compare4 の中では**今までどおり展開された
+ * ままにする**ため(切り出しで呼び出しが増えると、冷たい経路の費用が変わって
+ * 前後の比較が濁る)。 */
+static inline __attribute__((always_inline))
+int fixnum_compare3(lisp_val_t a, lisp_val_t b) {
+    int neg_a = os_fixnum_is_negative(a);
+    int neg_b = os_fixnum_is_negative(b);
+    if (neg_a != neg_b) {
+        return neg_a ? -1 : 1;
+    }
+    UINT64 mag_a = os_fixnum_magnitude(a);
+    UINT64 mag_b = os_fixnum_magnitude(b);
+    int cmp = mag_a < mag_b ? -1 : (mag_a > mag_b ? 1 : 0);
+    return neg_a ? -cmp : cmp;
+}
+
 static int number_compare4(lisp_val_t a, lisp_val_t b) {
     if (is_float(a) || is_float(b)) {
         /* [P5] 片方が float でも、もう片方が数値とは限らない */
@@ -6612,15 +6638,7 @@ static int number_compare4(lisp_val_t a, lisp_val_t b) {
     }
 
     if ((a & TAG_MASK) == TAG_FIXNUM && (b & TAG_MASK) == TAG_FIXNUM) {
-        int neg_a = os_fixnum_is_negative(a);
-        int neg_b = os_fixnum_is_negative(b);
-        if (neg_a != neg_b) {
-            return neg_a ? -1 : 1;
-        }
-        UINT64 mag_a = os_fixnum_magnitude(a);
-        UINT64 mag_b = os_fixnum_magnitude(b);
-        int cmp = mag_a < mag_b ? -1 : (mag_a > mag_b ? 1 : 0);
-        return neg_a ? -cmp : cmp;
+        return fixnum_compare3(a, b);
     }
 
     /* [P5] float でもなく、両方 fixnum でもない。ここまで来たら bignum か非数値。
@@ -8150,6 +8168,68 @@ lisp_val_t primitive_num_equal2_single(lisp_val_t a, lisp_val_t b) {
 /* **`/=` は非順序(NaN)で真を返す唯一の比較である。** C の != がそのまま一致する */
 lisp_val_t primitive_num_not_equal2_single(lisp_val_t a, lisp_val_t b) {
     COMPARE_SINGLE_BODY("primitive_num_not_equal2_single", !=);
+}
+
+/* ============== 型特化した比較(fixnum × fixnum)。#128 / M7 の残り ==============
+ *
+ * ## 得があるのは**負値のとき**だけである
+ *
+ * 比較の常道は「両方が非負 fixnum」で、**宣言つきでもそこは変わらない**。
+ * `(declare (type <fixnum>))` は**非負を意味しない**(fixnum は符号＋絶対値で、
+ * 負値は bit63 が立つ)。したがって特化しても
+ *
+ *   非負のとき … タグ検査が消えるだけ。**命令数は変わらない**(定数が変わるだけ)
+ *   負値のとき … **number_compare4 までの 2 段の call が消える**
+ *
+ * 実測でも `<fix-decl` は特化前も後も 26.94 で動いていない(§6)。
+ * **「特化すれば速くなる」は型によって成り立たない。**
+ *
+ * ## 冷たい経路は別関数に出す
+ *
+ * `-O1` は「呼ばれる場所が 1 箇所だけの static 関数」を逆に展開するので、
+ * `noinline` を付けないと冷たい側のフレーム要求が常道に残る
+ * (M5 で 0x60 -> 0x70、ヒープ枯渇の作業で 15 -> 20 命令を実測)。
+ * **6 つの冷たい経路は 1 つの関数を共有する。**
+ */
+static int fixnum_compare3_cold(lisp_val_t a, lisp_val_t b) __attribute__((noinline, cold));
+static int fixnum_compare3_cold(lisp_val_t a, lisp_val_t b) {
+    return fixnum_compare3(a, b);
+}
+
+/* 常道(両方非負)は生のタグ付き値をそのまま比べてよい。
+   **タグは宣言で 0 と分かっているので、見るのは符号だけである。** */
+#define COMPARE_FIXNUM_BODY(fn_name, raw_op, cmp_op)                          \
+    DECLARE_AUDIT_FIXNUM(fn_name, a);                                         \
+    DECLARE_AUDIT_FIXNUM(fn_name, b);                                         \
+    if (((a | b) & FIXNUM_SIGN_BIT) == 0) {                                   \
+        return (a raw_op b) ? g_sym_t : nil;                                  \
+    }                                                                         \
+    return (fixnum_compare3_cold(a, b) cmp_op 0) ? g_sym_t : nil
+
+lisp_val_t primitive_less_than2_fixnum(lisp_val_t a, lisp_val_t b) {
+    COMPARE_FIXNUM_BODY("primitive_less_than2_fixnum", <, <);
+}
+
+lisp_val_t primitive_greater_than2_fixnum(lisp_val_t a, lisp_val_t b) {
+    COMPARE_FIXNUM_BODY("primitive_greater_than2_fixnum", >, >);
+}
+
+lisp_val_t primitive_less_equal2_fixnum(lisp_val_t a, lisp_val_t b) {
+    COMPARE_FIXNUM_BODY("primitive_less_equal2_fixnum", <=, <=);
+}
+
+lisp_val_t primitive_greater_equal2_fixnum(lisp_val_t a, lisp_val_t b) {
+    COMPARE_FIXNUM_BODY("primitive_greater_equal2_fixnum", >=, >=);
+}
+
+lisp_val_t primitive_num_equal2_fixnum(lisp_val_t a, lisp_val_t b) {
+    COMPARE_FIXNUM_BODY("primitive_num_equal2_fixnum", ==, ==);
+}
+
+/* **fixnum どうしは非順序にならない**ので、`/=` も他と同じ形でよい
+   (非順序で真になるのは float が絡むときだけである) */
+lisp_val_t primitive_num_not_equal2_fixnum(lisp_val_t a, lisp_val_t b) {
+    COMPARE_FIXNUM_BODY("primitive_num_not_equal2_fixnum", !=, !=);
 }
 
 /* [A] 常道をインラインで先に捌く。冷たい経路は noinline で別関数に出す

@@ -3303,6 +3303,28 @@ static void *za_specialized_wrapper(void *generic_fn, UINT8 ta, UINT8 tb) {
         if (generic_fn == (void *)primitive_divide2) {
             return (void *)primitive_divide2_fixnum;
         }
+        /* [#128 / M7] 比較も表に載せる。**得があるのは負値のときだけ**である
+           (宣言は非負を意味しない。fixnum は符号＋絶対値)。
+           非負ならタグ検査が消えるだけで命令数は変わらない。
+           documents/compare-type-specialized.md */
+        if (generic_fn == (void *)primitive_less_than2) {
+            return (void *)primitive_less_than2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_greater_than2) {
+            return (void *)primitive_greater_than2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_less_equal2) {
+            return (void *)primitive_less_equal2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_greater_equal2) {
+            return (void *)primitive_greater_equal2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_num_equal2) {
+            return (void *)primitive_num_equal2_fixnum;
+        }
+        if (generic_fn == (void *)primitive_num_not_equal2) {
+            return (void *)primitive_num_not_equal2_fixnum;
+        }
         return 0;
     }
     if (ta == OS_DECL_TYPE_SINGLE_FLOAT && tb == OS_DECL_TYPE_SINGLE_FLOAT) {
