@@ -396,6 +396,35 @@ static void jit_cmp_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x39, ds
 
 /** test dst, src (dst&srcのフラグのみ、"test r/m64, r64"opcode0x85) */
 static void jit_test_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x85, dst, src); }
+static void jit_xor_reg_reg(UINT8 dst, UINT8 src) { jit_emit_reg_reg_op(0x31, dst, src); }
+
+/* [#128 / M7-T1] `*` `/` の展開に要る 4 つ。**どれも無かった。**
+   documents/inline-muldiv.md
+
+   REX.W + C1 /5 ib = shr r64, imm8
+   REX.W + C1 /4 ib = shl r64, imm8
+   REX.W + F7 /4    = mul r64   (rdx:rax = rax * r64)
+   REX.W + F7 /6    = div r64   (rax = rdx:rax / r64、rdx = 余り)
+
+   /digit は ModRM の reg フィールドに入る(mod=11 でレジスタ直接)。 */
+static void jit_emit_shift_imm8(UINT8 digit, UINT8 reg, UINT8 imm8) {
+    jit_emit8((UINT8)(0x48 | ((reg >> 3) & 1)));
+    jit_emit8(0xC1);
+    jit_emit8((UINT8)(0xC0 | (digit << 3) | (reg & 7)));
+    jit_emit8(imm8);
+}
+static void jit_shr_reg_imm8(UINT8 reg, UINT8 imm8) { jit_emit_shift_imm8(5, reg, imm8); }
+static void jit_shl_reg_imm8(UINT8 reg, UINT8 imm8) { jit_emit_shift_imm8(4, reg, imm8); }
+
+static void jit_emit_f7_unary(UINT8 digit, UINT8 reg) {
+    jit_emit8((UINT8)(0x48 | ((reg >> 3) & 1)));
+    jit_emit8(0xF7);
+    jit_emit8((UINT8)(0xC0 | (digit << 3) | (reg & 7)));
+}
+/* **rdx を必ず書く。** b を持つレジスタが rdx のままだと消えるので、
+   呼び出し側は退避してから使うこと(documents/inline-muldiv.md §2) */
+static void jit_mul_reg(UINT8 reg) { jit_emit_f7_unary(4, reg); }
+static void jit_div_reg(UINT8 reg) { jit_emit_f7_unary(6, reg); }
 
 /** cmove dst, src (ZFが立っていればsrcをdstへ。"cmovcc r64, r/m64"はREX.W + 0F 4x /r)。
  * jit_emit_reg_reg_opが使っている0x89系は reg=src / rm=dst だが、cmovccは
@@ -3200,14 +3229,25 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
        「inline 宣言が無ければ展開しない」という方針へ寄せるのは、
        宣言なしの経路が遅くなる変更なので**別の PR**で行う
        (documents/inline-arith.md §1-3)。 */
+    /* [#128 / M7-T1] `*` `/` も展開する。**ただし宣言制御である。**
+       `+` `-` は宣言が無くても展開される(上の is_add / is_sub がそのまま真になる)が、
+       `*` `/` は `(declare (inline *))` があるときだけ展開する。
+       宣言なしの経路を触らないので R-set が狭いままになる。
+       documents/inline-muldiv.md */
+    int is_mul = 0;
+    int is_div = 0;
     if (!is_add && !is_sub) {
         if (wrapper_fn == (void *)primitive_add2_fixnum && za_inline_enabled(INLINE_BIT_ADD)) {
             is_add = 1;
         } else if (wrapper_fn == (void *)primitive_subtract2_fixnum && za_inline_enabled(INLINE_BIT_SUB)) {
             is_sub = 1;
+        } else if (wrapper_fn == (void *)primitive_multiply2_fixnum && za_inline_enabled(INLINE_BIT_MUL)) {
+            is_mul = 1;
+        } else if (wrapper_fn == (void *)primitive_divide2_fixnum && za_inline_enabled(INLINE_BIT_DIV)) {
+            is_div = 1;
         }
     }
-    if (!is_add && !is_sub) {
+    if (!is_add && !is_sub && !is_mul && !is_div) {
         jit_movabs_r11((UINT64)wrapper_fn);
         jit_call_r11();
         return;
@@ -3244,11 +3284,58 @@ static void za_emit_arith_call_or_inline(void *wrapper_fn) {
         jit_mov_reg_reg(ZA_REG_R10, ZA_REG_RCX);
         jit_sub_reg_reg(ZA_REG_R10, ZA_REG_RDX);
     }
-    jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R10);
+
+    /* [#128 / M7-T1] `*` `/`。**mul / div は rdx を必ず書く**ので、b を R8 へ退避し、
+       フォールバックへ落ちる前に復元する(R8 はこの関数では未使用)。
+       復元が要るのは `*` `/` の経路だけなので、**復元用のスタブもそのときだけ出す**
+       (add / sub の経路は 1 命令も変えない)。 */
+    UINT64 restore_patches[2];
+    UINT64 restore_count = 0;
+    if (is_mul) {
+        /* タグ付きのまま掛けると 2 回ぶんずれる((ma<<4)*(mb<<4) = ma*mb<<8)。
+           片方だけ戻せば ma*mb<<4 になる */
+        jit_mov_reg_reg(ZA_REG_R8, ZA_REG_RDX);          /* b を退避 */
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_RCX);
+        jit_shr_reg_imm8(ZA_REG_RAX, FIXNUM_VALUE_SHIFT);
+        jit_mul_reg(ZA_REG_R8);                           /* rdx:rax = magnitude(a) * b */
+        /* **桁あふれは 2 つ見る。** 上位 64bit と bit63 の両方である
+           (生の 64bit 乗算が巻き上がると符号 bit だけでは分からない。
+            A の fixnum_fast_mul と同じ理由) */
+        jit_test_reg_reg(ZA_REG_RDX, ZA_REG_RDX);
+        restore_patches[restore_count++] = jit_emit_jne_rel32_placeholder();
+        jit_test_reg_reg(ZA_REG_RAX, ZA_REG_RAX);
+        restore_patches[restore_count++] = jit_emit_js_rel32_placeholder();
+    } else if (is_div) {
+        jit_mov_reg_reg(ZA_REG_R8, ZA_REG_RDX);          /* b を退避 */
+        /* **ゼロ除算の検査は外せない**(#DE で機械が止まる)。
+           fixnum の 0 は生の値も 0 なので test でよい */
+        jit_test_reg_reg(ZA_REG_R8, ZA_REG_R8);
+        restore_patches[restore_count++] = jit_emit_je_rel32_placeholder();
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_RCX);
+        jit_xor_reg_reg(ZA_REG_RDX, ZA_REG_RDX);          /* 被除数の上位を 0 に */
+        jit_div_reg(ZA_REG_R8);                           /* rax = a / b(シフトが打ち消える) */
+        jit_shl_reg_imm8(ZA_REG_RAX, FIXNUM_VALUE_SHIFT); /* タグを戻す */
+        /* **商は被除数を超えないので桁あふれの検査は要らない** */
+    }
+
+    if (is_add || is_sub) {
+        jit_mov_reg_reg(ZA_REG_RAX, ZA_REG_R10);
+    }
     UINT64 fast_done_patch = jit_emit_jmp_rel32_placeholder();
 
     // フォールバック: rcx=a, rdx=bは上記のいずれの分岐でも変更していないため、
     // 従来通りwrapper_fn(a, b)をそのまま間接callできる。
+    /* [#128 / M7-T1] 復元用スタブ。**`*` `/` のときだけ出す。**
+       mul / div が rdx を壊しているので、呼び出し規約(rcx=a, rdx=b)へ戻してから
+       共通のフォールバックへ落ちる。直後に共通部が続くので jmp は要らない */
+    if (restore_count > 0) {
+        UINT64 restore_offset = g_jit_used;
+        for (UINT64 k = 0; k < restore_count; k++) {
+            jit_patch_rel32_target(restore_patches[k], restore_offset);
+        }
+        jit_mov_reg_reg(ZA_REG_RDX, ZA_REG_R8);
+    }
+
     UINT64 slow_offset = g_jit_used;
     for (UINT64 k = 0; k < fallback_count; k++) {
         jit_patch_rel32_target(fallback_patches[k], slow_offset);
@@ -3789,8 +3876,13 @@ static int za_compile_binary(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
         jit_cmp_reg_reg(ZA_REG_RCX, ZA_REG_RDX);
         za_emit_inline_bool_from_flags();
     } else {
-        jit_movabs_r11((UINT64)wrapper_fn);
-        jit_call_r11();
+        /* [#128 / M7-T1] **`/` はこの経路を通る**(`*` は za_compile_fold)。
+           算術の展開は za_emit_arith_call_or_inline に集約してあるので、
+           そちらへ寄せる。**比較など対象外の呼び先は、この関数の中で
+           movabs + call へそのまま落ちる**ので振る舞いは変わらない。
+           rcx=第一オペランド / rdx=第二オペランドの規約も fold と同じである。
+           documents/inline-muldiv.md */
+        za_emit_arith_call_or_inline(wrapper_fn);
     }
 
     if (skip_protect) {
