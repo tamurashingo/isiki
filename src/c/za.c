@@ -4183,6 +4183,66 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
  * 行わない — クロージャキャプチャはza_compile_lambda側の対策(a)で吸収する)。
  * @return 検証できれば1(個数をout_countに書く)、できなければ0
  */
+/* [#142 診断] **仮引数リストの形が崩れたときに「何になっているか」を残す。**
+ *
+ * 26 段の入れ子で `za_local_validate_lambda_vars` の「平坦なリストではない」が
+ * 当たるが、**なぜ深さで形が崩れるのかが未解明**である。
+ * 既存の `%%DIAG-ZA-BAIL-AT` は**行番号しか返さない**ので、
+ * 「cons ではない何か」の中身が分からず、2 つの仮説を分けられなかった:
+ *
+ *   (1) コンパイル中の GC で保護漏れの form が壊れている
+ *       (za_macroexpand は os_make_cons を呼ぶ = コンパイル中に確保がある)
+ *   (2) マクロ展開が途中で失敗し、展開しきれていない形か EVAL-ERROR(タグ 3)が渡っている
+ *
+ * **タグと生の値を見れば分かれる。** タグ 3 かつ EVAL-ERROR なら (2)、
+ * ゴミや fixnum なら (1) を疑う。
+ *
+ * **lambda_vars(全体)と cur(壊れた位置)の両方を出す。**
+ * 違えば「途中で切れている」、同じなら「先頭から別物」で、話が変わる。
+ *
+ * 組み込み関数は増やさない(1 つ足すと test/c/runtime_test.c の
+ * SMALL_HEAP_SIZE の再調整が要る。余裕 5KB 未満で症状はハング)。
+ * シリアルへ出すので `-serial file:` で捕まえられる。
+ */
+static void za_diag_write_hex(UINT64 v) {
+#ifndef ISIKIOS_UNIT_TEST
+    char buf[19];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        UINT64 nib = (v >> ((15 - i) * 4)) & 0xF;
+        buf[2 + i] = (char)(nib < 10 ? ('0' + nib) : ('a' + (nib - 10)));
+    }
+    buf[18] = '\0';
+    os_diag_serial_write(buf);
+#else
+    (void)v;
+#endif
+}
+
+static void za_diag_shape_bail(lisp_val_t lambda_vars, lisp_val_t cur) {
+#ifndef ISIKIOS_UNIT_TEST
+    os_diag_serial_write("\n[za][#142] 仮引数が平坦なリストではない: lambda_vars=");
+    za_diag_write_hex((UINT64)lambda_vars);
+    os_diag_serial_write(" tag=");
+    za_diag_write_hex((UINT64)(lambda_vars & TAG_MASK));
+    os_diag_serial_write(" / cur=");
+    za_diag_write_hex((UINT64)cur);
+    os_diag_serial_write(" tag=");
+    za_diag_write_hex((UINT64)(cur & TAG_MASK));
+    os_diag_serial_write((lambda_vars == cur)
+        ? " [先頭から別物]\n" : " [途中で切れている]\n");
+    os_diag_serial_write("    nil=");
+    za_diag_write_hex((UINT64)nil);
+    os_diag_serial_write(" EVAL-ERROR=");
+    za_diag_write_hex((UINT64)g_sym_eval_error);
+    os_diag_serial_write(" macroexpand-runaway=");
+    za_diag_write_hex((UINT64)g_za_macroexpand_runaway);
+    os_diag_serial_write("\n");
+#else
+    (void)lambda_vars; (void)cur;
+#endif
+}
+
 static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out_syms, UINT64 *out_count) {
     UINT64 count = 0;
     for (lisp_val_t cur = lambda_vars; cur != nil; cur = cc_cdr(cur)) {
@@ -4194,6 +4254,7 @@ static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out
            ここで記録しておけば、次に見る人が起点から追える。 */
         if ((cur & TAG_MASK) != TAG_CONS) {
             ZA_BAIL_LINE();   /* [形] 仮引数が平坦なリストではない */
+            za_diag_shape_bail(lambda_vars, cur);   /* [#142] 何になっているかを残す */
             return 0;
         }
         lisp_val_t sym = cc_car(cur);
