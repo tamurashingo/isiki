@@ -2,6 +2,7 @@
 #include "lisp.h"
 #include "runtime.h"
 #include "eval.h"
+#include "process.h"   /* PROCESS_STACK_SIZE(ZA_MAX_COMPILE_NEST の予算検査) */
 #include "za.h"
 #include "za_jit_tags.h"
 
@@ -2940,26 +2941,86 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
  */
 #define ZA_MAX_COMPILE_NEST 60
 
-/* [#142] **コンパイルの 1 段が積む C フレームの合計(byte)。実測値である。**
+/* [#142 / 校正] **コンパイルの「1 単位」が積む C フレームの合計(byte)。実測値である。**
  *
- *   za_compile_expr       sub rsp 104  + push 0 + 戻り番地 8 =  112   x 2 回/段
- *   za_compile_expr_inner sub rsp 3160 + push 8 + 戻り番地 8 = 3232   x 2 回/段
- *                                                              ------
- *                                                               6688
+ * **「単位」は za_compile_expr の 1 回であって、構文の 1 段ではない。**
+ * g_za_compile_nest もこの単位で増える:
+ *     `if` の 1 段             = **1 単位**
+ *     `(progn (tagbody ...))`  = **2 単位**
+ * **ここを「段」と混同すると 2 倍ずれる。** 2026-11-07 に実際に混同し、
+ * この定数を 6688(= 2 単位)として「1 段ぶん」と書いていた。
  *
- * (progn (tagbody ...)) の 1 段で expr / inner を 2 回ずつ通る。
- * za_compile_progn と za_compile_tagbody は -O1 で expr_inner に展開されるので
- * 独立したフレームを積まない(シンボルも無い)。
+ *     za_compile_expr        sub rsp  120 + push 4 + 戻り番地 8 =  160
+ *     za_compile_expr_inner  sub rsp 3160 + push 8 + 戻り番地 8 = 3232
+ *                                                                ----
+ *                                                                3392
+ *
+ * za_compile_progn / za_compile_tagbody は -O1 で expr_inner に展開されるので
+ * 独立したフレームを積まない(シンボルも残らない)。
  *
  * **測り方**: ビルドした esp_dir/EFI/BOOT/BOOTX64.EFI を
  * x86_64-w64-mingw32-objdump -d にかけ、各関数のプロローグから
  * `sub $imm,%rsp` と push の数を拾う(sub + push*8 + 戻り番地 8)。
- * **push を数え落とすと 1 段を過小に見積もる。**
- * documents/142-shape-bail-investigation.md §9 に手順と実測を置いた。
+ * **push を数え落とすと過小に見積もる。**
  *
- * **za.c のコンパイル経路に手を入れたら測り直すこと。** 大きくなると
- * 下の残量検査が遅れて当たるようになり、余裕が黙って減る。 */
-#define ZA_COMPILE_LEVEL_BYTES 6688
+ * **za.c のコンパイル経路に手を入れたら測り直すこと。実際に動く**:
+ * 2026-11-07 は 3344 だったが、残量検査(#142)と診断の合図を足したことで
+ * za_compile_expr が `sub 104/push 0` -> `sub 120/push 4` に太り **3392** になった。
+ * documents/stack-guard.md §8 に測った値と導出を置いた。 */
+#define ZA_COMPILE_UNIT_BYTES 3392
+
+/* 残量検査が「次の検査までに降りうる分」として足す量。
+ * 検査は za_compile_expr の入口にあるので、次の検査までに降りるのは **1 単位**。
+ * ただしその間に検査を通らない関数のフレームも積まれる
+ * (za_macroexpand 160 / za_analyze_var_usage 272 / za_analyze_body_with_shadow 336 など)。
+ * **1 単位ぶんの余裕を足して 2 単位**にしておく。 */
+#define ZA_COMPILE_CHECK_SLACK (2 * ZA_COMPILE_UNIT_BYTES)
+
+/* ===== [校正] 上限がスタックに収まることをビルド時に見る ==========================
+ *
+ *   上限の消費            = ZA_MAX_COMPILE_NEST x ZA_COMPILE_UNIT_BYTES
+ *   + 残量検査が残す分    = ZA_FRAME_TOTAL + ZA_STACK_SIGNAL_RESERVE
+ *   + 基礎の消費の見積り  = ZA_COMPILE_BASE_ALLOWANCE
+ *   <= PROCESS_STACK_SIZE
+ *
+ * **実測(2026-11-08、`if` の入れ子で単位精度。上限を一時的に外して測った)**:
+ *     64 単位 … 機械語化される
+ *     65 単位 … 残量検査が当たる      -> **導出できる上限は 64 単位**
+ * いまの 60 はその **4 単位(13,568 byte)下**である。
+ *
+ * 基礎の消費(コンパイルに入るまでに既に積まれている分)は直接は読めないが、
+ * この 2 点から挟める。残量検査の閾値は
+ * ZA_FRAME_TOTAL + ZA_STACK_SIGNAL_RESERVE + ZA_COMPILE_CHECK_SLACK なので:
+ *     262144 - base - 65 x 3392 <= 閾値 < 262144 - base - 64 x 3392
+ *     -> **base >= 3,064 かつ base < 6,456**
+ *
+ * 見積りには **実測の上限 + 測りの粒度(1 単位)**を使う。粒度を足すのは、
+ * 挟み方が 1 単位刻みでしか効かないからである(= 真の値は上端より最大 1 単位高い)。
+ *
+ * **この検査が落ちたら、上限か 1 単位のコストか予備領域のどれかが動いた。**
+ * 測り直して記録すること(規則 9: 黙って上げない)。
+ * 測り方は documents/stack-guard.md §8。 */
+#define ZA_COMPILE_BASE_MEASURED_MAX 6456
+#define ZA_COMPILE_BASE_ALLOWANCE \
+    (ZA_COMPILE_BASE_MEASURED_MAX + ZA_COMPILE_UNIT_BYTES)
+
+_Static_assert((UINT64)ZA_MAX_COMPILE_NEST * ZA_COMPILE_UNIT_BYTES
+                   + ZA_FRAME_TOTAL + ZA_STACK_SIGNAL_RESERVE
+                   + ZA_COMPILE_BASE_ALLOWANCE
+               <= PROCESS_STACK_SIZE,
+               /* **メッセージは ASCII で書く。** GCC は非 ASCII を 8 進エスケープで
+                  出すので、日本語だと読めない(実際に文字化けした)。
+                  事情は上の注記と documents/stack-guard.md §8 にある。 */
+               "ZA_MAX_COMPILE_NEST does not fit in PROCESS_STACK_SIZE: "
+               "re-measure ZA_COMPILE_UNIT_BYTES and the base usage "
+               "(see documents/stack-guard.md section 8)");
+
+/* 下限も縛る。test/lisp/jit_nest_depth_test.lisp が
+   「59 単位は機械語化される」を見ているので、上限はそれより大きくなければならない。
+   下げるときは試験も直すこと(黙って下げると試験が落ちて理由が分からない)。 */
+_Static_assert(ZA_MAX_COMPILE_NEST > 59,
+               "ZA_MAX_COMPILE_NEST too small: "
+               "jnd-59 in test/lisp/jit_nest_depth_test.lisp expects 59 units to compile");
 
 /** za_compile_exprの本体。段数の計上はラッパ側(za_compile_expr)が行う */
 static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixed_count,
@@ -4812,20 +4873,19 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
      * ハングに見える故障で、上の注記のとおり**その式は二度と評価されない**。
      *
      * 閾値は JIT 生成コードが使うのと**同じ g_za_stack_limit_normal**
-     * (= 下端 + ZA_FRAME_TOTAL + 予備領域)に 1 段ぶんを足したもの。
-     * 次の検査までに降りられるのは高々 1 段なので、これで予備領域を踏まない。
-     * **新しい定数を持ち込まない**のが要点である(予備領域の導出は 1 か所に置く)。
+     * (= 下端 + ZA_FRAME_TOTAL + 予備領域)に ZA_COMPILE_CHECK_SLACK を足したもの。
+     * **予備領域の導出は増やさない**のが要点である(1 か所に置く)。
      *
      * 0 のときは検査しない(最初のタイマ tick より前、カーネルの idle ループ上。
      * os_za_set_stack_low の注記と同じ扱い)。
      *
-     * **これは 2026-11-07 時点で観測されている 30 段の「形の崩れ」を直さない。**
-     * 破壊は残量 50KB の時点で始まっており、枯渇そのものではない(§9)。
-     * ここが塞ぐのは**溢れ**(32 段以上)である。 */
+     * **2026-11-08 追記**: 当時この検査では直らないと書いた「形の崩れ」は、
+     * qq_expand が非局所脱出を構造に組み込んでいたのが真因で、そちらで直した(#142)。
+     * ここが塞ぐのは**溢れ**である。実測では **65 単位**から当たる。 */
     if (g_za_stack_limit_normal != 0) {
         UINT64 sp_here;   /* 番地を取るだけ。読まない(このフレームの中を指す) */
         if ((UINT64)(void *)&sp_here
-                <= g_za_stack_limit_normal + ZA_COMPILE_LEVEL_BYTES) {
+                <= g_za_stack_limit_normal + ZA_COMPILE_CHECK_SLACK) {
             ZA_BAIL_LINE();   /* [診断] コンパイル経路のスタック残量 (BAIL-TAG: COMPILE_STACK_LEFT) */
             g_jit_overflow = 1;
             return 0;
