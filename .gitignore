@@ -7,6 +7,7 @@ images/
 test-results.txt
 src/c/lisp_compiled.c
 test/c/lisp_compiled_fixture.c
+src/c/init_lisp_src.c
 
 .envrc
 tools/plugins/build/
