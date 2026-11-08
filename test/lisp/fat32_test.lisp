@@ -416,19 +416,58 @@
 
 ;;; --- [ファイルI/O]#50(M7): file-length高速パス + read-file-into-vector/write-vector-to-file(FAT32) ---
 
-(defglobal fat32-test-filesize-t0 (get-internal-real-time))
+;; [#50 M7] file-size の高速パスを**確保量**で判定する(時間では判定しない)。
+;;
+;; **2026-11-08 に時間での判定をやめた。** 以前は get-internal-real-time の差を
+;; 比べていた(「絶対時間だと環境差でフレーキーになる」ので相対比較にしていた)。
+;; だが **tick は 10ms 単位**なので、file-size の窓にタイマ割り込みが 1 つ入るだけで
+;; 不等号が反転する。CI で**同一コードの 2 run が片方成功・片方失敗**した
+;; (差分は markdown 1 ファイルだけだった)。
+;; documents/records-and-measurement-rules.md の付録「3 つめの形」。
+;;
+;; **比べ方は変えず、量だけ時間から確保量に替えた。**
+;; セクタ 1 つを読むごとに 512 要素のリスト(= cons 512 個 = 8192 byte)を確保するので、
+;; 確保量は**読んだセクタ数に比例する**。ブートは決定的なので、
+;; 同じビルドなら必ず同じ値になる(時間と違ってゆらがない)。
+;;
+;; GC が挟まると used は縮んで測れない(差が負になって不等号を**素通りする**)。
+;; だから**どちらの窓でも GC が起きていないこと**を確かめる。
+;; 落ちたらゆらぎではなく、確保の履歴が変わった合図である。
+(defglobal fat32-test-fs-g0 (%%gc-collect-count))
+(defglobal fat32-test-fs-h0 (%%heap-used-bytes))
 (defglobal fat32-test-filesize-result (fat32-file-size *fat32-test-device* "/BIGWR.TXT"))
-(defglobal fat32-test-filesize-t1 (get-internal-real-time))
+(defglobal fat32-test-fs-h1 (%%heap-used-bytes))
+(defglobal fat32-test-fs-g1 (%%gc-collect-count))
 (assert-equal 10000 fat32-test-filesize-result)
+(assert-equal fat32-test-fs-g0 fat32-test-fs-g1)
 
-(defglobal fat32-test-readfile-t0 (get-internal-real-time))
+(defglobal fat32-test-rf-g0 (%%gc-collect-count))
+(defglobal fat32-test-rf-h0 (%%heap-used-bytes))
 (defglobal fat32-test-readfile-result (fat32-read-file *fat32-test-device* "/BIGWR.TXT"))
-(defglobal fat32-test-readfile-t1 (get-internal-real-time))
+(defglobal fat32-test-rf-h1 (%%heap-used-bytes))
+(defglobal fat32-test-rf-g1 (%%gc-collect-count))
 (assert-equal 10000 (length fat32-test-readfile-result))
+(assert-equal fat32-test-rf-g0 fat32-test-rf-g1)
 
-(assert-equal t (<= (- fat32-test-filesize-t1 fat32-test-filesize-t0)
-                     (- fat32-test-readfile-t1 fat32-test-readfile-t0)))
+;; **本題**: 高速パスは read-file より少ない確保で済む
+(assert-equal t (< (- fat32-test-fs-h1 fat32-test-fs-h0) (- fat32-test-rf-h1 fat32-test-rf-h0)))
 
+;; **陽性対照**(規則 8)。read-file は中身を読むので、
+;; 確保はファイルの大きさ(10000 byte)を超える。
+;; これが無いと「両方とも極小で、たまたま不等号が立っただけ」と区別できない。
+(assert-equal t (> (- fat32-test-rf-h1 fat32-test-rf-h0) 10000))
+
+;; **2026-11-08 の実測**(規則 9: 測った値を残す):
+;;   file-size = 134384 byte / read-file = 565824 byte(**4.2 倍**)
+;; どちらの窓でも GC は起きなかった。
+;; **絶対上限にしてはいけない。** 最初は「確保 < ファイルの大きさ(10000)」に
+;; しようとしたが、file-size も**ディレクトリの走査で何セクタも読む**ので
+;; 134384 byte 確保しており、**両方とも落ちる上限だった**。
+;; 相対比較(上の本題)と陽性対照の組で見ること。
+;;
+;; 実測値はシリアルに残す(余裕が縮んだら気づけるように)
+(format *isiki-test-stream* "#filesize-alloc fat32-test fs=~A rf=~A~%"
+        (- fat32-test-fs-h1 fat32-test-fs-h0) (- fat32-test-rf-h1 fat32-test-rf-h0))
 (assert-equal 10000 (file-length "/mnt/BIGWR.TXT"))
 
 (defglobal fat32-test-rfitv-vec (create-vector 300 0))
