@@ -448,7 +448,27 @@ expected=45 actual=8478517719083 ... NG
 `test/lisp/jit_limits_test.lisp` には **捕まえ手のない throw をするマクロ**で
 `za_macroexpand` の断念を踏ませる試験を足した(BAIL-LINE 付き)。
 
-## 12. 途中で間違えたこと
+## 12. 同じ漏れが他にないかの棚卸し
+
+「`os_eval` / `os_apply_function` の戻り値から構造を作っているのに
+制御転送を見ていない関数」を全 `.c` から機械で洗った。**`qq_expand` だけだった。**
+
+候補に挙がったものはすべて偽陽性:
+
+| 候補 | 実際 |
+|---|---|
+| `mount.c` の 4 関数 | **既に対処済み。** `mount_transfer_escaped()` 経由で見ている |
+| `runtime.c os_resolve_class` | `return os_apply_function(...)` の末尾返しなので素通しされる |
+| `za.c za_emit_fn_resolve_cached` | 一致せず(正規表現の誤検出) |
+| `eval.c os_eval` | ディスパッチャ本体。各分岐が見ている |
+
+> **`mount.c` には同じ族の既知の履歴がある。**
+> 「このファイルには `os_apply_function` が 14 箇所あり、検査は 1 つも無かった」
+> (`documents/error-unwind-survey.md` §A-3 / §F-6)。
+> **C と Lisp の境界で脱出が値に化ける**のは、このプロジェクトで繰り返し出る形である。
+> #142 はその族の 1 件で、**境界が「マクロ展開」だった**という違いしかない。
+
+## 13. 途中で間違えたこと
 
 ### 見張りの合図を待つループを放置した
 
