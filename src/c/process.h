@@ -102,8 +102,17 @@ UINT64 os_process_stack_low_for(UINT64 rsp);
 
 int os_process_stack_check(UINT64 rsp, UINT64 *out_low, UINT64 *out_used);
 
-/** プロセス1つあたりのスタックサイズ(panicの診断表示用) */
-#define STACK_SIZE_FOR_PANIC (256 * 1024)
+/** プロセス1つあたりのスタックサイズ。**ここが唯一の定義である。**
+ *
+ * **2026-11-08 までこの値は二重に書かれていた**: このヘッダの
+ * STACK_SIZE_FOR_PANIC と process.c の STACK_SIZE に同じ `(256 * 1024)` があり、
+ * **両者を縛るものが無かった**(片方だけ動かしてもビルドは通る)。
+ * za.c の ZA_MAX_COMPILE_NEST の予算検査もこの値を使うので、1 か所にまとめた。
+ * documents/stack-guard.md §8。 */
+#define PROCESS_STACK_SIZE (256 * 1024)
+
+/** 旧名。panic の診断表示で使っている(値は PROCESS_STACK_SIZE と同一) */
+#define STACK_SIZE_FOR_PANIC PROCESS_STACK_SIZE
 
 extern process_t g_processes[PROCESS_COUNT];
 extern UINT32 g_current_process_index;

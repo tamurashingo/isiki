@@ -24,7 +24,9 @@ UINT32 g_current_process_index = 0;
  * 相当でQEMUが無応答終了することを実機(QEMU)上で確認した。256KBに増やした状態では
  * 複数回の再現実験で例外なく完走することを確認している
  */
-#define STACK_SIZE (256 * 1024)
+/* [2026-11-08] 値は process.h の PROCESS_STACK_SIZE が唯一の定義。
+   ここは短い別名として残す(このファイル内に 10 箇所以上ある) */
+#define STACK_SIZE PROCESS_STACK_SIZE
 
 /** @brief プロセスごとの専用実行スタック。GCが関知しないOS層の生メモリなので静的配列で確保する */
 /* [原則6] 各スタックの**下**にガード領域を置く。ここを未マップにすることで、
