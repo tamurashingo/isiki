@@ -322,6 +322,92 @@ static void test_load_aborted_form_falls_back_when_report_missing(void) {
         "%REPORT-CONDITION-STRINGが未定義なら生の値の印字へ落とす");
 }
 
+// ---------------------------------------------------------------------------
+// [L1] os_load_from_stream: 「読んで評価する輪」をストリーム引数で呼ぶ経路。
+//
+// cc_loadは9Pのfakeに乗るが、この関数は入力元を問わないので**文字列入力
+// ストリーム**で直接叩ける(カーネルへ同梱したソースを読む経路と同じ形)。
+//
+// ここで確かめたいのは**打ち切り件数が見えること**である。輪は打ち切られた
+// フォームを飛ばして最後までg_sym_tを返すので、戻り値では「半分失敗した」が
+// 分からない(docs/plans/local-load-and-core-image.md 設計判断L1)。
+// 件数が0のままなら、同梱の読み込みを止める判断が実装できない。
+// 規則8の陽性対照として、**打ち切りのある入力で1、無い入力で0**を両方見る
+// ---------------------------------------------------------------------------
+
+#define FROM_STREAM_BUF_MAX 512
+static UINT8 g_from_stream_buf[FROM_STREAM_BUF_MAX];
+
+static lisp_val_t call_load_from_stream(const char *src, const char *name, int *out_count) {
+    UINT32 n = 0;
+    while (src[n] != '\0' && n < FROM_STREAM_BUF_MAX) {
+        g_from_stream_buf[n] = (UINT8)src[n];
+        n++;
+    }
+    os_stream_t stream;
+    os_stream_open_string_input(&stream, g_from_stream_buf, n);
+    return os_load_from_stream(&stream, name, global_environment, out_count);
+}
+
+static void test_load_from_stream_evaluates_forms(void) {
+    reset_capture();
+    uninstall_fake_report();
+
+    int aborted = 0;
+    lisp_val_t result = call_load_from_stream(
+        "(defun from-stream-add2 (x) (+ x 2))\n(setq from-stream-flag 7)\n",
+        "<memory>", &aborted);
+
+    assert(result == g_sym_t, "os_load_from_streamは最後まで読めればg_sym_tを返す");
+    assert(aborted == 0, "打ち切りが無ければ件数は0のまま(陰性対照)");
+
+    lisp_val_t call_result = os_eval(
+        os_make_cons(os_make_symbol("from-stream-add2"), os_make_cons(os_make_fixnum(5), nil)),
+        global_environment);
+    assert(call_result == os_make_fixnum(7), "ストリーム経由で定義した関数を後から呼び出せる");
+    lisp_val_t flag = os_get_variable(os_make_symbol("from-stream-flag"), global_environment);
+    assert(flag == os_make_fixnum(7), "ストリーム経由で設定した変数を後から参照できる");
+}
+
+static void test_load_from_stream_counts_aborted_forms(void) {
+    reset_capture();
+    uninstall_fake_report();
+
+    int aborted = 0;
+    lisp_val_t result = call_load_from_stream(
+        "(return-from %top-level 9)\n(setq from-stream-after 11)\n",
+        "<memory>", &aborted);
+
+    assert(result == g_sym_t, "打ち切りがあっても戻り値はg_sym_tのまま(従来の挙動)");
+    assert(aborted == 1, "打ち切られたフォームの件数が呼び出し元へ返る(陽性対照)");
+    assert(strcmp(captured(), "load: <memory>: 9\n") == 0,
+        "打ち切りの表示にはpathではなく引数で渡した名前が出る");
+
+    lisp_val_t after = os_get_variable(os_make_symbol("from-stream-after"), global_environment);
+    assert(after == os_make_fixnum(11), "打ち切られたフォームの次のフォームは評価される");
+}
+
+static void test_load_from_stream_accepts_null_count(void) {
+    reset_capture();
+    uninstall_fake_report();
+
+    // cc_loadが渡す形。件数を受け取らなくても落ちないこと
+    lisp_val_t result = call_load_from_stream("(return-from %top-level 9)\n", "<memory>", 0);
+
+    assert(result == g_sym_t, "件数の受け取り先が0でも打ち切りを飛ばして続行する");
+}
+
+static void test_load_from_stream_syntax_error_signals(void) {
+    reset_capture();
+    uninstall_fake_report();
+
+    int aborted = 0;
+    lisp_val_t result = call_load_from_stream("(defun from-stream-bad (x)\n", "<memory>", &aborted);
+
+    assert(result == g_sym_eval_error, "構文エラーはcc_loadと同じくsignalへ回る");
+    assert(aborted == 0, "構文エラーは打ち切り件数には数えない");
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -336,6 +422,11 @@ int main(int argc, char **argv) {
     test_load_normal_form_does_not_report();
     test_load_aborted_form_falls_back_when_report_missing();
     test_load_open_failure_returns_eval_error();
+
+    test_load_from_stream_evaluates_forms();
+    test_load_from_stream_counts_aborted_forms();
+    test_load_from_stream_accepts_null_count();
+    test_load_from_stream_syntax_error_signals();
 
     return g_test_failed ? 1 : 0;
 }
