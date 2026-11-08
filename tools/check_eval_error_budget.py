@@ -148,7 +148,8 @@ BUDGETS = {
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # トランスパイラ/ツールの生成物。行数も内容も再生成で変わるので数えない
-GENERATED = {"lisp_compiled.c", "lisp_compiled_fixture.c", "disasm_symtab.c"}
+GENERATED = {"lisp_compiled.c", "lisp_compiled_fixture.c", "disasm_symtab.c",
+             "init_lisp_src.c"}
 
 C_PATTERN = re.compile(r"\breturn\s+g_sym_eval_error\b")
 LISP_PATTERN = re.compile(r"'eval-error\b", re.IGNORECASE)
