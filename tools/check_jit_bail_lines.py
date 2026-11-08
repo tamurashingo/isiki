@@ -27,6 +27,21 @@ za.c 側の正は、その行に実際に書かれている注記:
 寄せる推量になり、**実際に 3 回取りこぼした**(NLX_DEPTH / FLET_BINDINGS /
 QQ_ELEMENTS)。**複数箇所ある定数には序数を書くこと。**
 
+**容量上限でない断念も見る(2026-11-08、#142)。**
+
+容量上限(`[診断] 容量上限 ZA_MAX_*`)以外の断念 — 形の検査、マクロ展開の非局所脱出、
+コンパイル経路のスタック残量 — は**この検出器の外にいた**。
+期待値を書いても照合されず、**ずれても黙って通って QEMU で落ちる**。
+そこで注記に明示の札を書けるようにした:
+
+    ZA_BAIL_LINE();   /* [診断] マクロ展開が非局所脱出した (BAIL-TAG: MACRO_NLX) */
+
+対応する期待値:
+
+    (assert-equal 2522 (%%diag-za-bail-at 0))   ; BAIL-LINE: MACRO_NLX
+
+**札は容量上限と同じ扱いで照合・--fix される。**
+
 使い方:
     tools/check_jit_bail_lines.py              照合する
     tools/check_jit_bail_lines.py --fix        ずれていたら書き換える
@@ -40,9 +55,12 @@ import re
 import sys
 import tempfile
 
+# 容量上限の注記(従来)と、明示の札(BAIL-TAG)の両方を拾う。
+# **札を足したのは #142 で、容量上限でない断念が照合の外にいたため。**
 ANNOT = re.compile(r"ZA_BAIL_LINE\(\);.*\[診断\] 容量上限 (ZA_MAX_[A-Z_0-9]+)")
+ANNOT_TAG = re.compile(r"ZA_BAIL_LINE\(\);.*BAIL-TAG:\s*([A-Z_0-9]+)")
 EXPECT = re.compile(
-    r"\(assert-equal\s+(\d+)\s+\(%%diag-za-bail-at\s+0\)\)(.*?);\s*BAIL-LINE:\s*(ZA_MAX_[A-Z_0-9]+)(#\d+)?"
+    r"\(assert-equal\s+(\d+)\s+\(%%diag-za-bail-at\s+0\)\)(.*?);\s*BAIL-LINE:\s*([A-Z_0-9]+)(#\d+)?"
 )
 
 
@@ -52,6 +70,11 @@ def read_annotations(za_path):
     with open(za_path, encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
             m = ANNOT.search(line)
+            if m:
+                out[i] = m.group(1)
+                continue
+            # 容量上限でない断念は明示の札で見る(#142)
+            m = ANNOT_TAG.search(line)
             if m:
                 out[i] = m.group(1)
     return out
