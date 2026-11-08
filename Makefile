@@ -70,6 +70,12 @@ LISP_COMPILED_FIXTURE = $(TESTDIR)/lisp_compiled_fixture.c
 # 宣言は手書きの$(SRCDIR)/init_lisp_src.hで、生成物がそれを#includeする
 INIT_LISP_SRC = $(SRCDIR)/init_lisp_src.c
 INIT_LISP_EMBED_SRC := $(shell python3 tools/gen_embedded_lisp.py --print-inputs)
+# $(shell)は失敗しても**空文字列を返すだけ**で、makeは止まらない。一覧が空になると
+# $(INIT_LISP_SRC)が「前提条件を持たないルール」に化け、**生成物が古いまま黙って
+# 使われる**(入力を変えても再生成されない)。静かに弱くなるより、ここで止める
+ifeq ($(strip $(INIT_LISP_EMBED_SRC)),)
+$(error 同梱対象の一覧が取れなかった: python3 tools/gen_embedded_lisp.py --print-inputs を確認すること)
+endif
 SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_symtab.c $(SRCDIR)/disasm_symtab_lookup.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED) $(INIT_LISP_SRC)
 # $(TARGET) の依存には生成物(disasm_symtab.c)を含めない。含めると自分が作る
 # ファイルに依存して毎回作り直しになる
