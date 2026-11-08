@@ -58,6 +58,7 @@
 (isiki-test-load "test/lisp/frame_variable_test.lisp")
 (isiki-test-load "test/lisp/frame_cell_gc_test.lisp")
 (isiki-test-load "test/lisp/jit_nest_depth_test.lisp")
+(isiki-test-load "test/lisp/go_exit_reuse_test.lisp")   ; #153 印の使い回し
 (isiki-test-load "test/lisp/jit_code_packing_test.lisp")
 (isiki-test-load "test/lisp/declaim_test.lisp")
 (isiki-test-load "test/lisp/inline_builtin_test.lisp")

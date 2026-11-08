@@ -3447,8 +3447,12 @@ static void gc_scan_queue(void) {
                 break;
 
             case TAG_SYMBOL:
-                // word0=name string。word1(gensymフラグ)/word2/word3(未使用)は常に
-                // nilまたはfixnumなのでgc_copy_valueに通しても素通しされるだけで安全
+                // word0=name string。word1=gensymフラグ(nilかfixnum)。
+                // **word2 は (go tag) の脱出の印(ヒープ参照)である**(#153)。
+                // 2026-11-08 まで「word2/word3 は常に nil か fixnum なので
+                // gc_copy_value に通しても素通しされるだけ」と書いてあったが、
+                // **word2 は本当に辿る必要があるフィールドになった**
+                // (4 つ全部を通していたので実装は変えなくて済んだ)。word3 は未使用。
                 g_gc_scan_field = 0; words[0] = gc_copy_value(words[0]);
                 g_gc_scan_field = 1; words[1] = gc_copy_value(words[1]);
                 g_gc_scan_field = 2; words[2] = gc_copy_value(words[2]);
@@ -4580,6 +4584,35 @@ lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3) {
     obj[2] = w2;
     obj[3] = w3;
     return (lisp_val_t)(addr | TAG_INSTANCE);
+}
+
+/* [#153] (go tag) の脱出の印を行き先ごとに 1 つだけ作って使い回す。
+   設計の理由と「なぜ使い回して安全か」は runtime.h の宣言に書いた。 */
+lisp_val_t os_make_go_exit(lisp_val_t tag) {
+    if ((tag & TAG_MASK) != TAG_SYMBOL) {
+        /* tagbody のタグは必ずシンボルなので、ここへ来る値はどのタグにも
+           一致せず上へ抜けるだけである。使い回す先が無いので毎回作る。 */
+        return os_make_instance(MAGIC_GO_EXIT, tag, nil, nil);
+    }
+    GC_PROTECT(tag);
+    {
+        UINT64 *sym = (UINT64 *)(tag & ~TAG_MASK);
+        lisp_val_t cached = (lisp_val_t)sym[2];
+        /* **magic まで見る。** word2 を別の用途に使われたときに
+           でたらめな値を印として返さないため(安全側に倒して作り直す) */
+        if ((cached & TAG_MASK) == TAG_INSTANCE
+            && ((UINT64 *)(cached & ~TAG_MASK))[0] == MAGIC_GO_EXIT) {
+            return cached;
+        }
+    }
+    {
+        lisp_val_t marker = os_make_instance(MAGIC_GO_EXIT, tag, nil, nil);
+        /* **os_make_instance は GC を起こしうる。** tag は GC_PROTECT してあるので
+           値は追随しているが、**上で取った生ポインタは無効**なので取り直す。 */
+        UINT64 *sym = (UINT64 *)(tag & ~TAG_MASK);
+        sym[2] = (UINT64)marker;
+        return marker;
+    }
 }
 
 
