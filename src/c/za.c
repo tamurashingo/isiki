@@ -2507,6 +2507,27 @@ static lisp_val_t za_macroexpand(lisp_val_t form, lisp_val_t env) {
         }
         lisp_val_t wrapped = os_make_cons(form, nil);
         lisp_val_t expanded = primitive_macroexpand_1(wrapped, env);
+        /* [#142] マクロ本体が**非局所脱出した**場合(signal / return-from / throw / go)。
+           os_eval は値ではなく脱出シグナル(TAG_INSTANCE + MAGIC_*_EXIT)を返す。
+           **脱出シグナルは「展開結果」ではない。** 形として扱うと
+           `((lambda <脱出の印>) ...)` のような壊れた形が組み立たり、
+           あとで「仮引数が平坦なリストではない」のような**遠くの検査**で初めて
+           気づくことになる。これが #142 の正体だった:
+           深い入れ子のコンパイル中に JIT のスタック残量検査が
+           `<storage-exhausted>` を signal し、ハンドラが `%TOP-LEVEL` へ脱出した印を
+           qq_expand が cons していた(gdb の watchpoint で現行犯を捕まえた)。
+           コンパイルは断念してインタプリタへ落とす(安全側。そこで正しく signal される)。
+           **返すのは展開前の form である**(脱出シグナルを返してはならない)。 */
+        if (os_is_control_transfer(expanded)) {
+            ZA_BAIL_LINE();   /* [診断] マクロ展開が非局所脱出した (BAIL-TAG: MACRO_NLX) */
+            /* **生成そのものを捨てる。** 展開前の form を返すだけでは、
+               マクロ呼び出しが「一般呼び出し」としてコンパイルされてしまい、
+               実行時にマクロの物体を関数として呼ぶ誤ったコードになる。
+               g_jit_overflow を立てれば za_try_compile_defun が生成を捨て、
+               インタプリタへ落ちる(そこで脱出が正しく扱われる)。 */
+            g_jit_overflow = 1;
+            return form;
+        }
         if (expanded == form) {
             return form;
         }
@@ -2948,6 +2969,27 @@ static int za_compile_expr_inner(lisp_val_t form, lisp_val_t params, UINT64 fixe
 
 /** 現在のza_compile_expr再帰段数。za_try_compile_defunの冒頭で0に戻す */
 static UINT64 g_za_compile_nest = 0;
+
+/* [#142 の watchpoint 用] **gdb に「ここから見張れ」と知らせるための踏み台。**
+ *
+ * なぜ要るか: 壊れる場所(za_compile_let / za_local_validate_lambda_vars)は
+ * static で -O1 に展開され、**記号が残らないので gdb が break できない**。
+ * また「入れ子が深いときだけ」という条件を gdb 側の条件つきブレークで見ると、
+ * za_macroexpand の 13 万回の呼び出しごとに遠隔プロトコルの往復が入って終わらない。
+ * **条件は C で見て、踏んだときだけ呼ぶ。**
+ *
+ * - `static` にしない(記号が残らないと break できない)
+ * - 空のままだと -O1 が呼び出しごと消すので、**volatile を 1 つ増やす**
+ * - 閾値 50 は「素の ZA_MAX_COMPILE_NEST 60 では実コードが到達しない」値
+ *   (1 段 2 単位なので 25 段以上。init.lisp の最深部でも届かない)
+ *
+ * 使い方は documents/142-shape-bail-investigation.md §11。 */
+volatile UINT64 g_za_diag_watch_arm_hits = 0;
+__attribute__((noinline)) void os_za_diag_watch_arm(void) {
+    g_za_diag_watch_arm_hits++;
+}
+/** 見張りを始めてよい深さ(1 段 2 単位)。素の上限 60 では実コードが到達しない */
+#define ZA_DIAG_WATCH_ARM_NEST 50
 
 /** このコンパイル試行に効いているdeclaim値(optimize下位6bit + inlineビットbit8〜)。
  * za_try_compile_defunの冒頭でownerから読んだ値を入れる。emitterへ引数で持ち回ると
@@ -4206,7 +4248,7 @@ static int za_compile_lambda(lisp_val_t form, lisp_val_t params, UINT64 fixed_co
  */
 /* [#142 診断] **仮引数リストの形が崩れたときに「何になっているか」を残す。**
  *
- * 26 段の入れ子で `za_local_validate_lambda_vars` の「平坦なリストではない」が
+ * 30 段(0562369 では 28 段)の入れ子で `za_local_validate_lambda_vars` の「平坦なリストではない」が
  * 当たるが、**なぜ深さで形が崩れるのかが未解明**である。
  * 既存の `%%DIAG-ZA-BAIL-AT` は**行番号しか返さない**ので、
  * 「cons ではない何か」の中身が分からず、2 つの仮説を分けられなかった:
@@ -4264,6 +4306,63 @@ static void za_diag_shape_bail(lisp_val_t lambda_vars, lisp_val_t cur) {
 #endif
 }
 
+/**
+ * [#142] **壊れた値が入っていた「番地」と、化けた先の正体を出す。**
+ *
+ * 既存の za_diag_shape_bail は**値**しか出さないので、
+ * **どこに書かれたか**が分からず watchpoint を置けなかった。
+ * `lambda_vars` は `cc_car(lrest)` で読んでいるので、
+ * 入っていた番地は `&((lisp_val_t *)(lrest & ~TAG_MASK))[0]` である。
+ *
+ * **化けた先も読む。** タグ 7(TAG_INSTANCE)なら word0 が MAGIC なので、
+ * float / vector / go の印 のどれに化けたかがここで分かる(gdb を出す前に片が付く)。
+ * ヒープの外を読むと run が無駄になるので、範囲を見てから読む
+ * (os_heap_bounds_for_test は本来テスト用だが、診断は本体のロジックではない)。
+ *
+ * **記号の基準も出す。** gdb に PE の記号を読ませるとき、実行時のロード先と
+ * nm の番地のずれが要る。T 記号 1 つの実行時番地を出しておけば
+ * 「ずれ = これ - nm の番地」で済む。
+ *
+ * 組み込み関数は増やさない(SMALL_HEAP_SIZE の再調整が要る)。
+ */
+static void za_diag_shape_slot(lisp_val_t lrest, lisp_val_t head, lisp_val_t form) {
+#ifndef ISIKIOS_UNIT_TEST
+    lisp_val_t *slot = (lisp_val_t *)(lrest & ~TAG_MASK);
+    os_diag_serial_write("\n[za][#142] 壊れた値の在処: &car(lrest)=");
+    za_diag_write_hex((UINT64)(void *)slot);
+    os_diag_serial_write(" lrest=");
+    za_diag_write_hex((UINT64)lrest);
+    os_diag_serial_write(" head=");
+    za_diag_write_hex((UINT64)head);
+    os_diag_serial_write(" form=");
+    za_diag_write_hex((UINT64)form);
+    os_diag_serial_write("\n");
+
+    lisp_val_t bad = slot[0];
+    if ((bad & TAG_MASK) == TAG_INSTANCE) {
+        UINT64 from_start = 0, from_end = 0, to_start = 0, to_end = 0;
+        os_heap_bounds_for_test(&from_start, &from_end, &to_start, &to_end);
+        UINT64 a = (UINT64)(bad & ~TAG_MASK);
+        os_diag_serial_write("    化けた先(tag=7)の番地=");
+        za_diag_write_hex(a);
+        if ((a >= from_start && a + 8 <= from_end) ||
+            (a >= to_start && a + 8 <= to_end)) {
+            os_diag_serial_write(" word0(MAGIC)=");
+            za_diag_write_hex(((UINT64 *)a)[0]);
+        } else {
+            os_diag_serial_write(" (ヒープの外なので読まない)");
+        }
+        os_diag_serial_write("\n");
+    }
+
+    os_diag_serial_write("    記号の基準 &os_za_set_stack_low=");
+    za_diag_write_hex((UINT64)(void *)&os_za_set_stack_low);
+    os_diag_serial_write("\n");
+#else
+    (void)lrest; (void)head; (void)form;
+#endif
+}
+
 static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out_syms, UINT64 *out_count) {
     UINT64 count = 0;
     for (lisp_val_t cur = lambda_vars; cur != nil; cur = cc_cdr(cur)) {
@@ -4272,7 +4371,12 @@ static int za_local_validate_lambda_vars(lisp_val_t lambda_vars, lisp_val_t *out
            let のコンパイルが断念されるのに記録が残らず、`%%diag-za-bail-at 0` が
            呼び出し側の伝播点を指していた(= 起点が消える)。実測で 26 段から当たる
            (PR #94 の取り込み前は 27 段から)。**なぜ深さで形が崩れるのかは未解明。**
-           ここで記録しておけば、次に見る人が起点から追える。 */
+           ここで記録しておけば、次に見る人が起点から追える。
+           **2026-11-07 訂正**: 「26 段から」は issue 本文の未検証の数字だった。
+           実測すると `0562369` では **28 段**から、いまの main では **30 段**から
+           当たる(26・27 段は正常)。上限 ZA_MAX_COMPILE_NEST 60 が許すのは 29 段で、
+           **余裕は 1 段しかない**(0562369 では -1 = 内側だったので症状が出ていた)。
+           documents/142-shape-bail-investigation.md §7 / §9。 */
         if ((cur & TAG_MASK) != TAG_CONS) {
             ZA_BAIL_LINE();   /* [形] 仮引数が平坦なリストではない */
             za_diag_shape_bail(lambda_vars, cur);   /* [#142] 何になっているかを残す */
@@ -4335,6 +4439,11 @@ static int za_compile_let(lisp_val_t form, lisp_val_t params, UINT64 fixed_count
         return 0;
     }
     lisp_val_t lambda_vars = cc_car(lrest);
+    if ((lambda_vars & TAG_MASK) != TAG_CONS) {
+        /* [#142] 下の za_local_validate_lambda_vars が断念する形。
+           **断念の前に在処と正体を残す**(値だけでは watchpoint を置けない) */
+        za_diag_shape_slot(lrest, head, form);
+    }
     lisp_val_t lambda_body = cc_cdr(lrest);
     GC_PROTECT(lambda_body);
 
@@ -4717,7 +4826,7 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
         UINT64 sp_here;   /* 番地を取るだけ。読まない(このフレームの中を指す) */
         if ((UINT64)(void *)&sp_here
                 <= g_za_stack_limit_normal + ZA_COMPILE_LEVEL_BYTES) {
-            ZA_BAIL_LINE();   /* [診断] コンパイル経路のスタック残量 */
+            ZA_BAIL_LINE();   /* [診断] コンパイル経路のスタック残量 (BAIL-TAG: COMPILE_STACK_LEFT) */
             g_jit_overflow = 1;
             return 0;
         }
@@ -4725,6 +4834,13 @@ static int za_compile_expr(lisp_val_t form, lisp_val_t params, UINT64 fixed_coun
     /* このラッパはform/params/envを触らずinnerへ渡すだけなので、GC_PROTECTは
        inner側の分だけでよい(ここで積むと段数分だけシャドースタックを余計に消費する) */
     g_za_compile_nest++;
+    /* [#142] 入れ子が深いコンパイルに入ったことを gdb へ知らせる。
+       let の ((lambda ...) ...) への展開(za_macroexpand が cons を作る)は
+       この降下の中で起きるので、ここから見張れば**壊れた cons の初期化も捕まえられる**。
+       **za_macroexpand の入口には置けない**(そこは g_za_compile_nest の定義より前)。 */
+    if (g_za_compile_nest > ZA_DIAG_WATCH_ARM_NEST) {
+        os_za_diag_watch_arm();
+    }
     int ok = za_compile_expr_inner(form, params, fixed_count, locals, syms, env, is_tail,
                                    trampoline_offset, nlx_depth, tb_ctx, call_depth, arith_depth);
     g_za_compile_nest--;

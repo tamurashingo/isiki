@@ -803,10 +803,23 @@ static lisp_val_t qq_wrap(lisp_val_t sym, lisp_val_t inner) {
  * ISLisp仕様§16.1: quasiquoteはネストでき、置換はネストレベルが同じunquoteだけに対して行う
  * (内側のquasiquoteで+1、unquoteで-1)。depth>0のunquote/unquote-splicingは評価せず、
  * その形のまま内側をdepth-1で展開して残す。
+ * **非局所脱出シグナルは組み立ててはならない(issue #142)。**
+ * `(unquote x)` の x が `return-from` / `throw` / `go` / signal で脱出すると、
+ * os_eval は値ではなく脱出シグナル(TAG_INSTANCE + MAGIC_*_EXIT)を返す。
+ * これを検査せずに os_make_cons / qq_append へ渡すと、**脱出の印が構造の中に
+ * 値として埋め込まれる**。埋め込まれた形は見た目がリストなので誰も気づかず、
+ * あとで「仮引数が平坦なリストではない」のような**遠くの場所で壊れて見える**。
+ * 2026-11-08 に #142 として実際に踏んだ: 深い入れ子のコンパイル中に
+ * `((lambda <MAGIC_BLOCK_EXIT の物体>) ...)` が組み立てられ、JIT の形の検査が当たっていた
+ * (gdb の watchpoint で `qq_expand` が os_make_cons に渡す現行犯を捕まえた)。
+ *
+ * **作法は同じファイルの eval_args と揃える**: os_eval / 再帰呼び出しのそれぞれの
+ * 戻り値を is_control_transfer で見て、真なら**組み立てずにそのまま返す**。
+ *
  * @param form 展開対象のフォーム(quasiquoteの直下、またはその再帰呼び出し)
  * @param env unquoteの評価に使う環境
  * @param depth 現在のネストレベル(最外のquasiquote直下が0)
- * @return 組み立てた値
+ * @return 組み立てた値。非局所脱出が起きた場合はその脱出シグナル
  */
 static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env, UINT64 depth) {
     if (form == nil || (form & TAG_MASK) != TAG_CONS) {
@@ -821,6 +834,9 @@ static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env, UINT64 depth) {
     if (elem == g_sym_quasiquote) {
         // ネストしたquasiquote: 形を保ったまま内側をdepth+1で展開する
         lisp_val_t inner = qq_expand(cc_car(cc_cdr(form)), env, depth + 1);
+        if (is_control_transfer(inner)) {
+            return inner;
+        }
         return qq_wrap(g_sym_quasiquote, inner);
     }
     if (elem == g_sym_unquote || elem == g_sym_unquote_splicing) {
@@ -828,31 +844,53 @@ static lisp_val_t qq_expand(lisp_val_t form, lisp_val_t env, UINT64 depth) {
         // (先頭やドット対の末尾)でのunquote-splicingはunquoteと同様に扱う。
         // depth>0なら形を保ち、内側をdepth-1で展開する
         if (depth == 0) {
+            // 脱出シグナルはここで素通りさせてよい(呼び出し元がそのまま受け取る)
             return os_eval(cc_car(cc_cdr(form)), env);
         }
         lisp_val_t inner = qq_expand(cc_car(cc_cdr(form)), env, depth - 1);
+        if (is_control_transfer(inner)) {
+            return inner;
+        }
         return qq_wrap(elem, inner);
     }
     if ((elem & TAG_MASK) == TAG_CONS && cc_car(elem) == g_sym_unquote_splicing) {
         if (depth == 0) {
             // リストの要素が(unquote-splicing x): xを評価し、その要素を残りに継ぎ足す
             lisp_val_t spliced = os_eval(cc_car(cc_cdr(elem)), env);
+            if (is_control_transfer(spliced)) {
+                return spliced;
+            }
             GC_PROTECT(spliced);
             lisp_val_t rest = qq_expand(cc_cdr(form), env, depth);
+            if (is_control_transfer(rest)) {
+                return rest;
+            }
             GC_PROTECT(rest);
             return qq_append(spliced, rest);
         }
         lisp_val_t inner = qq_expand(cc_car(cc_cdr(elem)), env, depth - 1);
+        if (is_control_transfer(inner)) {
+            return inner;
+        }
         GC_PROTECT(inner);
         lisp_val_t head = qq_wrap(g_sym_unquote_splicing, inner);
         GC_PROTECT(head);
         lisp_val_t tail = qq_expand(cc_cdr(form), env, depth);
+        if (is_control_transfer(tail)) {
+            return tail;
+        }
         return os_make_cons(head, tail);
     }
 
     lisp_val_t head = qq_expand(elem, env, depth);
+    if (is_control_transfer(head)) {
+        return head;
+    }
     GC_PROTECT(head);
     lisp_val_t tail = qq_expand(cc_cdr(form), env, depth);
+    if (is_control_transfer(tail)) {
+        return tail;
+    }
     return os_make_cons(head, tail);
 }
 
