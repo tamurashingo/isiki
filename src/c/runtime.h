@@ -154,7 +154,11 @@ _Static_assert(TAG_MARKER != TAG_FORWARD,
  *           symbolの値や関数は環境(environment)側が持つ
  *    word1: gensymフラグ。nilなら通常のinterned symbol(g_symbol_tableに登録済み)、
  *           非nilなら os_make_uninterned_symbol が作ったgensym由来
- *    word2, word3: 未使用(nilで予約)
+ *    word2: **このシンボルを行き先とする (go ...) の脱出の印のキャッシュ**(issue #153)。
+ *           nil なら未作成。os_make_go_exit が作って入れる。
+ *           **ここは空いていない。** 別の用途に使うなら os_make_go_exit を先に直すこと
+ *           (word2 は 2026-11-08 までは「未使用(nilで予約)」だった)
+ *    word3: 未使用(nilで予約)
  *
  * TAG_STRING: ヒープ可変長(8 + 長さbyte)
  *    word0:       文字列長さ(**タグなしの生の整数**)
@@ -1511,6 +1515,32 @@ void os_string_to_cstr(lisp_val_t str, char *out, UINT32 out_cap);
  * @return タグ付けされたINSTANCE
  */
 lisp_val_t os_make_instance(UINT64 magic, UINT64 w1, UINT64 w2, UINT64 w3);
+
+/**
+ * @brief (go tag) の脱出の印を返す。**行き先ごとに 1 つだけ作って使い回す**(issue #153)
+ *
+ * 解釈実行の `go` は、跳ぶことを知らせるためだけに毎回 32 byte の物体を作っていた。
+ * `for` の展開形は行き先に `%for-loop` を使い回すので、**1 反復あたり 32 byte**
+ * (解釈実行の `for` の確保 96 byte のうち 1/3)がこれだった。
+ *
+ * **使い回して安全な理由**:
+ *   - 印が運ぶのは magic と行き先の名前だけで、**作ったあと誰も書き換えない**
+ *     (eval_tagbody は word0/word1 を読むだけ。AOT/JIT も
+ *      os_control_transfer_magic / os_control_transfer_name で読むだけ)
+ *   - 入れ子の同名 tagbody は**元から名前だけで照合している**ので、
+ *     印を共有しても意味論は変わらない(内側が先に拾う、は不変)
+ *   - 印は**同一性で比較されない**(どこにも == による照合が無い)
+ *
+ * **置き場所はシンボルの word2 である。** 新しいグローバル表を作らないのが要点で、
+ * GC はもともとシンボルの word0..word3 を辿るので**ルートの追加漏れが起きない**
+ * (グローバルを増やすと gc_copy_value の追加漏れの余地が増える)。
+ *
+ * @param tag 行き先。**シンボルでなければ使い回さずに毎回作る**
+ *            (tagbody のタグは必ずシンボルなので、シンボル以外は
+ *             どのタグにも一致せず上へ抜けていくだけの値である)
+ * @return MAGIC_GO_EXIT の印
+ */
+lisp_val_t os_make_go_exit(lisp_val_t tag);
 
 /**
  * parent_envを親とする新しい環境(name/variables/functions/parent/constantsの5slotを持つリスト)を作る。

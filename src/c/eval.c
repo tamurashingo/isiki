@@ -1114,7 +1114,9 @@ static lisp_val_t eval_go(lisp_val_t args, lisp_val_t env) {
     (void)env;
     lisp_val_t tag = cc_car(args);
     GC_PROTECT(tag);
-    return os_make_instance(MAGIC_GO_EXIT, tag, nil, nil);
+    /* [#153] 印は行き先ごとに 1 つだけ作って使い回す(毎反復 32 byte 確保していた)。
+       使い回して安全な理由は runtime.h の os_make_go_exit の宣言に書いた。 */
+    return os_make_go_exit(tag);
 }
 
 /**
