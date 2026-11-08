@@ -17,7 +17,11 @@
 ;; *classes*/*generic-methods*/*handlers*と同じ理由でdefdynamic+%%set-dynamicを
 ;; 使う(defglobalは呼び出し元の環境にしか書き込まれず、複数ドライバから追加登録
 ;; されていくレジストリには使えない)。
-(defdynamic *devices* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *devices* (dynamic *devices*))
 
 ;; (%device-blk-name n) : n(fixnum)をblk0,blk1,...というシンボルにする。
 (defun %device-blk-name (n)

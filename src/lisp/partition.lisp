@@ -50,8 +50,12 @@
 ;; 内容を保持し、同一セクタへの重複read-sectorを避ける)を使う。GPT解析はディスク単位で
 ;; しか呼ばれないため、キャッシュはグローバルに1系統のみで良い(呼び出し前に必ず
 ;; 初期化する)。
-(defdynamic *gpt-entry-cache-lba* nil)
-(defdynamic *gpt-entry-cache-bytes* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *gpt-entry-cache-lba* (dynamic *gpt-entry-cache-lba*))
+(defdynamic *gpt-entry-cache-bytes* (dynamic *gpt-entry-cache-bytes*))
 
 ;; (%gpt-entry-sector-bytes handle lba) : GPTパーティションエントリ配列中のlbaセクタの
 ;; 内容(512byte)を返す。直前に読んだセクタと同じlbaならキャッシュを再利用する。

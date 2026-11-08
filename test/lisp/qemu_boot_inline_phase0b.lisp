@@ -7,7 +7,6 @@
 ;;
 ;; **結果を累積して最後に出力する形**でも測り、値が正しいことを確認する。
 
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 (format *isiki-test-stream* "#gate ~A~%" (%%gate-plugin-args))
 (finish-output *isiki-test-stream*)

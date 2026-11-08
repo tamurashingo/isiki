@@ -69,13 +69,21 @@
 ;; 直前に読んだFATセクタの(lba . bytes)キャッシュ。fat16.lispと同じ理由
 ;; (defglobal+setqは呼び出し元のenvironmentに反映されないため、複数呼び出しを
 ;; 跨いで共有するにはdefdynamic+%%set-dynamicを使う)。
-(defdynamic *fat32-fat-cache-lba* nil)
-(defdynamic *fat32-fat-cache-bytes* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *fat32-fat-cache-lba* (dynamic *fat32-fat-cache-lba*))
+(defdynamic *fat32-fat-cache-bytes* (dynamic *fat32-fat-cache-bytes*))
 ;; [ファイルI/O]#50付随の性能修正: fat16.lispの*fat16-fat-cache-dirty*と同じ理由
 ;; (コメントはそちら参照)。%fat32-set-fat-entryが1エントリごとにread-sector+
 ;; write-sector(num-fats分)をフルに行っていたため、大量のクラスタ確保時に
 ;; 同じFATセクタへ何十〜何百回も冗長な読み書きが発生していた。
-(defdynamic *fat32-fat-cache-dirty* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *fat32-fat-cache-dirty* (dynamic *fat32-fat-cache-dirty*))
 
 ;; (%fat32-flush-fat-cache device bpb) : fat16.lispの%fat16-flush-fat-cacheの
 ;; FAT32版(コメントはそちら参照)。

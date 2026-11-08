@@ -111,6 +111,21 @@ JIT_DUMP_FLAGS = $(if $(JIT_DUMP),-DISIKIOS_JIT_DUMP,)
 SMALL_HEAP_FLAGS = $(if $(SMALL_HEAP_SIZE),-DSMALL_HEAP_SIZE=$(SMALL_HEAP_SIZE),)
 HEAP_EXHAUSTION_FLAGS = $(if $(HEAP_EXHAUSTION_SIZE),-DHEAP_EXHAUSTION_HEAP_SIZE=$(HEAP_EXHAUSTION_SIZE),)
 
+# [同梱 / 設計判断L5] NO_EMBEDDED_INIT=1 で、カーネルへ同梱した基盤ライブラリを
+# **起動時に読まない**ビルドにする。既定(空)では必ず読む。
+# これが要るのは、**基盤ライブラリ未読込の状態そのものを要件とする試験が1件ある**
+# ためである(test/lisp/qemu_boot_no_init_signal.lisp。条件クラスが1つも無い状態で
+# signalしても戻ってくることを見る)。同梱を無条件にするとあの試験は前提から崩れる。
+# make test-qemu-no-embedded-init から使う
+NO_EMBEDDED_INIT_FLAGS = $(if $(NO_EMBEDDED_INIT),-DISIKIOS_NO_EMBEDDED_INIT,)
+
+# [同梱] BOOT_SMOKE=1 で、**9Pを使わずに**「立ち上がって(let ((x 1)) x)が通る」ことを
+# 確かめる段のビルドにする。判定結果はシリアルへ出して自分で電源断する
+# (9Pが無いと .qemu-test-trigger も test-results.txt も使えない。
+# 画面は -display none で見えないので、ホストから見える線はシリアルだけである)。
+# make test-qemu-no-9p から使う。**これがM1の本番の判定である**
+BOOT_SMOKE_FLAGS = $(if $(BOOT_SMOKE),-DISIKIOS_BOOT_SMOKE,)
+
 BUILD_TMPDIR = tmp
 
 # [GCデバッグ] $(TARGET)はSRC/HDRのファイル依存で追跡するため、**フラグだけ変えても
@@ -133,7 +148,7 @@ BUILD_TMPDIR = tmp
 # カーネル本体はこの値を使わないので$(TARGET)の再ビルドは本来不要だが、
 # 「新しいビルドフラグは必ず署名に入れる」を例外なしの規則にしておく方を採る
 GC_DEBUG_STAMP = $(BUILD_TMPDIR)/.gc-debug-flags
-BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) $(EXTRA_CFLAGS)
+BUILD_FLAG_SIGNATURE = $(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) $(NO_EMBEDDED_INIT_FLAGS) $(BOOT_SMOKE_FLAGS) $(EXTRA_CFLAGS)
 .PHONY: FORCE
 FORCE:
 $(GC_DEBUG_STAMP): FORCE
@@ -222,7 +237,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -304,7 +319,7 @@ KERNEL_LINK = docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint x86_64-w
 		-mno-stack-arg-probe \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
-		$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(EXTRA_CFLAGS) \
+		$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(NO_EMBEDDED_INIT_FLAGS) $(BOOT_SMOKE_FLAGS) $(EXTRA_CFLAGS) \
 		-Wl,--subsystem,10 \
 		-Wl,--entry,EfiMain \
 		-o $(TARGET) $(SRC)
@@ -346,7 +361,7 @@ $(BUILD_TMPDIR)/%.o: $(SRCDIR)/%.c $(HDR) | $(BUILD_TMPDIR)
 		-nostdlib -mno-red-zone -O1 -c \
 		-Wall -Wextra \
 		-mno-stack-arg-probe \
-		$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) \
+		$(GC_DEBUG_FLAGS) $(ALIGN_AUDIT_FLAGS) $(JIT_DUMP_FLAGS) $(NO_EMBEDDED_INIT_FLAGS) $(BOOT_SMOKE_FLAGS) \
 		-DISIKIOS_BUILD_HASH=\"$(GIT_HASH)\" \
 		-DISIKIOS_BUILD_DATE=\"$(BUILD_DATE)\" \
 		-o $@ $<
@@ -585,7 +600,34 @@ check-macro-order:
 check-macro-order-self-test:
 	@python3 tools/check_macro_forward_refs.py --self-test
 
-test: check-macro-order check-macro-order-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+# [#187] 共有される大域状態の初期宣言が「既存値があれば書き戻す」安全な形で
+# そろっていることを見る。defdynamicは**無条件に上書きする仕様**なので、
+# 素の初期値を書くと起動前半に機械語化された層が書き込んだ登録を無言で消す
+# (#47/#48の真因)。同梱で読み込みが**毎回**走るようになったので、
+# 露出が「試験のときだけ」から「毎回」に変わった。詳しくは
+# tools/check_defdynamic_safe.py の冒頭。--list で一覧が出る
+check-defdynamic-safe:
+	@python3 tools/check_defdynamic_safe.py
+
+# [規則 8] 上の検出器の自己試験。陽性 6 件(素のnil・素の初期値・別名を読む等)が
+# 落ち、陰性 3 件(2つの安全形と複数行の形)が通ることを確かめる
+check-defdynamic-safe-self-test:
+	@python3 tools/check_defdynamic_safe.py --self-test
+
+# [#184 / R8] 同梱済みのソース(init.lisp / disassemble.lisp)を
+# 試験や計測のドライバが**もう一度load していない**ことを見る。
+# 二重読み込みは黙って通る(マクロ31個が再定義され、JITしたコードページは
+# 解放されないのでImmobilized Spaceを恒久的に二重消費するだけで、
+# 試験は合格のまま出てくる)。**だから人は気づけない**
+check-no-double-init-load:
+	@python3 tools/check_no_double_init_load.py
+
+# [規則 8] 上の検出器の自己試験。boot-entryのloadと、生成器がechoするloadの
+# 両方を検出できること、コメントの中のものは拾わないことを確かめる
+check-no-double-init-load-self-test:
+	@python3 tools/check_no_double_init_load.py --self-test
+
+test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
@@ -1002,6 +1044,49 @@ debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 		-monitor stdio -serial null \
 		-d cpu_reset,int -D qemu.log
 
+
+# ======================= [M1の本番の判定] 9Pの無い起動 =======================
+# **-fsdev / -device virtio-9p-pci を外したQEMUで立ち上がり、(let ((x 1)) x) が
+# 通ること。** これがM1の完了条件そのものである(G2。
+# docs/plans/local-load-and-core-image.md)。
+#
+# 判定の中身は src/c/kernel.c の run_boot_smoke(BOOT_SMOKE=1 のビルドだけに入る)。
+# **9Pが無いと従来の試験の仕組みが3つとも使えない**ので、ここだけ形が違う:
+#   .qemu-test-trigger が開けない / cc_load が9P専用 / test-results.txt が9P経由
+# 残る線はシリアルだけなので、-serial file: で受けてホスト側でgrepする。
+#
+# **陰性対照はゲスト側に内蔵してある**(1件目の 9p-absent)。9Pを付けたまま
+# 走らせると落ちるので、「9Pが無くても動く」を確かめない形には倒れない。
+test-qemu-no-9p:
+	$(MAKE) BOOT_SMOKE=1 test-qemu-no-9p-run
+
+# 9Pを外した素のQEMU。ディスクはUEFIが読むブートイメージだけで、
+# IDEのデータディスクも渡さない(FAT層も使わないことを示すため)
+test-qemu-no-9p-run: build $(BOOT_FAT32_IMG)
+	mkdir -p $(BUILD_TMPDIR)
+	rm -f $(BUILD_TMPDIR)/no9p.serial.txt
+	qemu-system-x86_64 \
+		-m $(QEMU_MEM) \
+		-display none \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-serial file:$(PWD)/$(BUILD_TMPDIR)/no9p.serial.txt \
+		-no-reboot
+	@echo '--- シリアル出力 ---'
+	cat $(BUILD_TMPDIR)/no9p.serial.txt
+	@grep -q '\[no9p\] 4 passed, 0 failed' $(BUILD_TMPDIR)/no9p.serial.txt || \
+		{ echo 'ERROR: 9Pを外した起動の判定が「4 passed, 0 failed」になっていない。' >&2; \
+		  echo '  出力が1行も無いなら、立ち上がる前に止まっている(boot errorはPANIC行がシリアルへ出る)。' >&2; \
+		  exit 1; }
+
+# [設計判断L5] 同梱を**外した**ビルドで、基盤ライブラリ未読込の状態そのものを
+# 要件とする試験を走らせる。この試験(qemu_boot_no_init_signal.lisp)は
+# 「条件クラスが1つも無い状態でsignalしても戻ってくること」を見るもので、
+# 同梱を無条件にすると前提から崩れる。**これが同梱を外せる口を設けた理由である。**
+# 判定結果は9P経由のtest-results.txtなので、こちらは9Pを付けたまま走らせる
+test-qemu-no-embedded-init:
+	$(MAKE) NO_EMBEDDED_INIT=1 test-qemu-milestone MILESTONE=test/lisp/qemu_boot_no_init_signal.lisp
+
 # isiki_test.lispをQEMU上で全自動実行し、test-results.txtの結果でpass/failを判定する。
 # .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
 # ResetSystemでQEMUを電源断する
@@ -1034,9 +1119,13 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # g_gc_lifo_violations == 0 を確認する。通常ビルドではこのカウンタが存在しないため
 # test-qemuには含められず、ここで別ビルドとして回す。
 #
-# [P4] qemu_boot_no_init_signal.lispは**init.lispを読まない**唯一のboot-entryで、
-# 条件クラスが1つも無い状態でsignalしても戻ってくることを見る。他のmilestoneは
-# すべて先頭で(load "src/lisp/init.lisp")するため、この状態はここでしか通らない。
+# [P4 / 設計判断L5] qemu_boot_no_init_signal.lispは**基盤ライブラリ未読込の状態
+# そのものを要件とする**唯一のboot-entryで、条件クラスが1つも無い状態でsignalしても
+# 戻ってくることを見る。基盤ライブラリはカーネルへ同梱されて**起動ごとに必ず読まれる**
+# ようになったので、この試験だけは同梱を外したビルド(NO_EMBEDDED_INIT=1)で走らせる。
+# それが test-qemu-no-embedded-init である。
+# なお他のmilestoneの先頭にあった(load "src/lisp/init.lisp")は決定D2で全部外した
+# (同梱と併せると二重読み込みになる。tools/check_no_double_init_load.pyが見張っている)。
 #
 # [P1] qemu_boot_fat_callback_transfer.lispは**必ずqemu_boot_m6_fat16.lispより後**に
 # 置くこと。FAT16イメージのルートへP1BASE.TXT等を作るので、先に走らせると
@@ -1044,7 +1133,8 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
-	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_no_init_signal.lisp
+	$(MAKE) test-qemu-no-embedded-init
+	$(MAKE) test-qemu-no-9p
 	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img

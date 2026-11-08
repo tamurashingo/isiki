@@ -69,7 +69,6 @@ gen_boot() {
     local name="$1"
     local boot="tmp/audit_boot_${name}.lisp"
     {
-        echo '(load "src/lisp/init.lisp")'
         echo '(load "test/lisp/test_framework.lisp")'
         echo '(setq *isiki-audit* t)'
         if [ "$USE_CONTROL" = "1" ]; then
@@ -102,8 +101,7 @@ gen_boot() {
 # 捨てないと最初に流す試験だけ所要時間が系統的に長く出て、タイムアウト分類の
 # 基準が狂う。ベンチマークドライバと同じ理由(tools/bench/run_construct_bench.sh)。
 warmup_boot="tmp/audit_warmup.lisp"
-{ echo '(load "src/lisp/init.lisp")'
-  echo '(load "test/lisp/test_framework.lisp")'
+{ echo '(load "test/lisp/test_framework.lisp")'
   echo '(isiki-test-report)'
   echo '(close *isiki-test-stream*)'; } > "$warmup_boot"
 echo "--- ウォームアップ(捨てる) ---"

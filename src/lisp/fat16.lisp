@@ -180,8 +180,12 @@
 ;; (defglobal+setqはsetqが関数呼び出し内のenvironmentにしか書き込めず、呼び出し元に
 ;; 見えない)でdefdynamic+%%set-dynamicを使う。隣接クラスタへの連続アクセスでの
 ;; 重複読み込みを避けるための、1セクタ分のみの軽量キャッシュ(過剰最適化はしない)。
-(defdynamic *fat16-fat-cache-lba* nil)
-(defdynamic *fat16-fat-cache-bytes* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *fat16-fat-cache-lba* (dynamic *fat16-fat-cache-lba*))
+(defdynamic *fat16-fat-cache-bytes* (dynamic *fat16-fat-cache-bytes*))
 ;; [ファイルI/O]#50付随の性能修正: *fat16-fat-cache-bytes*がディスク上の内容と
 ;; 食い違っている(%fat16-set-fat-entryによる書き込みがまだwrite-sectorされて
 ;; いない)ことを示すフラグ。%fat16-set-fat-entryが1エントリごとに
@@ -193,7 +197,11 @@
 ;; %fat16-fat-sector-bytesのキャッシュを書き込み側でも使い、同じセクタへの
 ;; 連続書き込みをメモリ上でまとめ、セクタが切り替わる瞬間・処理完了時にだけ
 ;; 実際にwrite-sectorする(%fat16-flush-fat-cache)よう変更した。
-(defdynamic *fat16-fat-cache-dirty* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *fat16-fat-cache-dirty* (dynamic *fat16-fat-cache-dirty*))
 
 ;; (%fat16-flush-fat-cache device bpb) : *fat16-fat-cache-dirty*が真なら、
 ;; キャッシュ中のセクタ内容を全FATコピー(num-fats本、通常2)へwrite-sectorで

@@ -21,7 +21,6 @@
 ;; **前後で同じファイルを使う**ために、open-output-file と format だけで書く。
 ;; test-results.txt の " 0 failed" は make 側の門番が見るので自分で書く。
 
-(load "src/lisp/init.lisp")
 (load "src/lisp/mandelbrot.lisp")
 
 ;; 絵。前後で byte 比較するので、これが**同じ計算をした証拠**になる

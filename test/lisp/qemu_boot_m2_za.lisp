@@ -1,4 +1,3 @@
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 (isiki-test-load "test/lisp/za_test.lisp")
 (isiki-test-load "test/lisp/fn_cell_cache_test.lisp")

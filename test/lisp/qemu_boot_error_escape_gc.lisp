@@ -17,7 +17,6 @@
 ;; 発動していないことも見る。**発動していたら条件の構築自体が失敗している**ので、
 ;; 0 でなくなった時点で設計が崩れている。
 
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 
 (defglobal *ee-lifo-before* (%%diag-gc-lifo-violations))

@@ -124,7 +124,6 @@ done
 write_milestone() {
     local p="$1" c="$2" n="$3"
     {
-        echo '(load "src/lisp/init.lisp")'
         echo '(load "test/lisp/test_framework.lisp")'
         if [ "$p" = "jit" ]; then
             echo '(load "src/lisp/bench_jit.lisp")'

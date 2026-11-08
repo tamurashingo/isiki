@@ -298,8 +298,7 @@ int main(int argc, char** argv) {
                      global_environment);
     os_register_streams();
     os_register_format();
-    // disassemble(src/lisp/disassemble.lisp)がinit.lispからloadされるため、
-    // 実機(kernel.c)と同じく%%DISASM-*を登録しておく
+    // 下でdisassemble.lispを読むため、実機(kernel.c)と同じく%%DISASM-*を登録しておく
     os_register_disasm();
     os_register_aot_init_functions();
     os_run_aot_toplevel_forms();
@@ -322,6 +321,12 @@ int main(int argc, char** argv) {
     // がglobal_environmentから辿れなくなる(M12 #27の%%funcall-by-name経路で
     // 実際に発覚)ため、本番と同じglobal_environmentを使う
     run_lisp_file(proc, global_environment, "src/lisp/init.lisp");
+    // [設計判断L2] disassemble.lispは**init.lispの末尾からloadされなくなった**
+    // (あの1行は9P共有を要求し続けるため外した)。依存順(while/formatを使う)は
+    // 実機では src/c/kernel.c の run_boot_entry が「init.lisp -> disassemble.lisp」の
+    // 順で読むことで明示している。**ここでも同じ順で読む**(読まないと、
+    // 以前はinit.lisp経由で通っていた逆アセンブラの読み込みが黙って外れる)
+    run_lisp_file(proc, global_environment, "src/lisp/disassemble.lisp");
     run_lisp_file(proc, global_environment, "test/lisp/init_test.lisp");
     run_lisp_file(proc, global_environment, "test/lisp/environments_predefined_test.lisp");
     run_lisp_file(proc, global_environment, "test/lisp/qemu_boot_diag_m12_host.lisp");

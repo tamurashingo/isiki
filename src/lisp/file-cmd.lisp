@@ -18,7 +18,11 @@
 ;; *cwd* : 現在の作業ディレクトリを表す"/"始まりの絶対パス文字列。cdで更新する。
 ;; *devices*/*mounts*と同じ理由でdefdynamic+%%set-dynamicを使う(defglobalは
 ;; 呼び出し元の環境にしか書き込まれないため)。
-(defdynamic *cwd* "/")
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *cwd* (or (dynamic *cwd*) "/"))
 
 ;;; --- パス文字列のユーティリティ(fat16.lisp/fat32.lisp非依存の独立実装) ---
 ;;;

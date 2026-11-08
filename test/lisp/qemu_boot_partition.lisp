@@ -1,4 +1,3 @@
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 ;; device.lisp/ide.lisp/partition.lisp/mount.lisp/fat16.lisp/fat32.lisp/
 ;; file-cmd.lispはM15でAOTトランスパイル対象に移動し、ブート時に既に

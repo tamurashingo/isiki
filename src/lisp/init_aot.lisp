@@ -345,7 +345,11 @@
 ;; 先にinit_aot.lispを読むため、このdefdynamicと直後の21個の
 ;; %register-builtin-class呼び出しは常にfs-lisp-paths側のdefclassより先に
 ;; 実行される(os_run_aot_toplevel_forms内の実行順はソース上の順序のまま)。
-(defdynamic *classes* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *classes* (dynamic *classes*))
 
 ;; nameで登録済みクラスを引く。未登録ならnil。
 (defun %find-class (name)
@@ -560,8 +564,12 @@
 ;;; メソッドをnilで踏み潰して消してしまう(#48で発見した実際の障害)。
 ;;; main()がfs-lisp-pathsより先にinit_aot.lispを読むため、この2つのdefdynamicは
 ;;; 常にfs-lisp-paths側のdefmethodより先に実行される(*classes*と同じ保証)。
-(defdynamic *generic-methods* nil)
-(defdynamic *next-methods* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *generic-methods* (dynamic *generic-methods*))
+(defdynamic *next-methods* (dynamic *next-methods*))
 
 (defun %find-generic-methods (name)
   (cdr (assoc name (dynamic *generic-methods*))))

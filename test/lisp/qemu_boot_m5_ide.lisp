@@ -1,4 +1,3 @@
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 ;; device.lisp/ide.lispはM15でAOTトランスパイル対象に移動し、
 ;; os_register_aot_init_functions/os_run_aot_toplevel_forms経由で

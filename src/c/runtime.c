@@ -5190,10 +5190,11 @@ lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnpt
 
 /* [P4] **conditionの構築そのものが失敗する状態では、signalは再帰する。**
  *
- * os_signal_conditionは「init.lisp未ロード」をmake-instance/signal-conditionが
+ * os_signal_conditionは「条件システムが使えるか」をmake-instance/signal-conditionが
  * 未定義かどうかで判定しているが、**この2つはinit_aot.lisp側にある**。つまり
- * AOTフォームだけ実行してinit.lispを読んでいない状態(素のカーネル起動、
- * boot-entryスクリプトが(load "src/lisp/init.lisp")を持たない場合)では、
+ * AOTフォームだけ実行して基盤ライブラリ(src/lisp/init.lisp)をまだ読んでいない状態
+ * (**ブート前半**。同梱の読み込みはprocess 0のスタック上で走るのでそれより後になる。
+ * ほかにネイティブのユニット試験と-DISIKIOS_NO_EMBEDDED_INITビルド)では、
  * 関数はあるのに**条件クラスが1つも登録されていない**という食い違いが起きる。
  *
  * そこでmake-instanceは (%find-class '<DOMAIN-ERROR>) にnilを得て、
@@ -5205,8 +5206,8 @@ lisp_val_t os_make_lifted_closure_with_meta(za_fn_meta_t *meta, lisp_addr_t fnpt
  * EVAL-ERRORを「値として」返していたため再帰にならず、黙って壊れた値が
  * 流れるだけだった。
  *
- * 深さで打ち切り、未ロード時と同じフォールバック(EVAL-ERROR)へ落とす。
- * 正常系(init.lispロード済み)ではハンドラの入れ子がこの深さに達することは
+ * 深さで打ち切り、クラス未登録時と同じフォールバック(EVAL-ERROR)へ落とす。
+ * 正常系(基盤ライブラリ読み込み済み)ではハンドラの入れ子がこの深さに達することは
  * 無い(signal-conditionはハンドラを呼ぶ前に*handlers*をcdrへ進めるため、
  * 入れ子の深さはハンドラの数で頭打ちになる)。
  */
@@ -5247,9 +5248,10 @@ lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_v
     GC_PROTECT(signal_condition_fn);
     /* [P4] **関数の有無だけでは「条件システムが使えるか」を判定できない。**
        make-instance / signal-condition / %find-class はどれもinit_aot.lisp側に
-       あるので、init.lispを読んでいない起動(boot-entryスクリプトが
-       (load "src/lisp/init.lisp")を持たない場合)でも**存在する**。一方で
-       条件クラス(<simple-error>や<domain-error>)はinit.lispのdefclassで
+       あるので、基盤ライブラリ(src/lisp/init.lisp)をまだ読んでいない時点
+       (**ブート前半**。同梱の読み込みはprocess 0のスタック上で走る。ほかに
+       ネイティブのユニット試験と-DISIKIOS_NO_EMBEDDED_INITビルド)でも**存在する**。
+       一方で条件クラス(<simple-error>や<domain-error>)はinit.lispのdefclassで
        登録されるため、そちらは1つも無い。
        その食い違いのままmake-instanceへ進むと、classにnilが渡り、
        (%%class-slots nil)の生の読み出しを経てlengthがsignalし、signalがまた
@@ -5268,7 +5270,7 @@ lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_v
     }
     if (make_instance_fn == nil || signal_condition_fn == nil ||
         ((class_sym & TAG_MASK) == TAG_SYMBOL && resolved_class == nil)) {
-        // 条件システムが使えない(init.lisp未ロード等)ときのフォールバック
+        // 条件システムが使えない(条件クラスがまだ登録されていない等)ときのフォールバック
         return g_sym_eval_error;
     }
 
@@ -5299,7 +5301,8 @@ lisp_val_t os_resolve_class(lisp_val_t class_name_sym, lisp_val_t env) {
  * @param offending_object domain-errorの原因になった値
  * @param env 呼び出し時の環境
  * @return signal-conditionの戻り値(通常はハンドラ経由でトップレベルへabortするため到達しない)。
- *         init.lisp未ロードの場合はg_sym_eval_error
+ *         条件クラスがまだ登録されていない場合はg_sym_eval_error(ブート前半・
+ *         ネイティブのユニット試験で到達する。os_signal_conditionの注記参照)
  */
 lisp_val_t os_live_block_push(lisp_val_t name) {
     process_t *proc = get_current_process();
@@ -5346,7 +5349,7 @@ lisp_val_t os_signal_control_error(lisp_val_t env) {
  * @param offending_object domain-errorの原因になった値
  * @param class_name 期待クラスの名前(例 "<CONS>")
  * @param env 呼び出し時の環境
- * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ * @return signal-conditionの戻り値。条件クラスがまだ登録されていない場合はg_sym_eval_error(os_signal_conditionの注記参照)
  */
 static lisp_val_t signal_domain_error_for_class(lisp_val_t offending_object, const char *class_name, lisp_val_t env) {
     GC_PROTECT(offending_object);
@@ -5422,7 +5425,7 @@ lisp_val_t os_za_signal_declare_mismatch(lisp_val_t a, lisp_val_t b, UINT64 expe
  * @param operation_name 演算の名前(例 "/")
  * @param operands 受け取った引数のリスト
  * @param env 呼び出し時の環境
- * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ * @return signal-conditionの戻り値。条件クラスがまだ登録されていない場合はg_sym_eval_error(os_signal_conditionの注記参照)
  */
 static lisp_val_t signal_division_by_zero(const char *operation_name, lisp_val_t operands, lisp_val_t env) {
     GC_PROTECT(operands);
@@ -5459,7 +5462,7 @@ static lisp_val_t signal_division_by_zero(const char *operation_name, lisp_val_t
  * それは仕様に無いクラスの追加なので別途の判断とする(PRに記録した)。
  *
  * @param env 呼び出し時の環境
- * @return signal-conditionの戻り値。init.lisp未ロードの場合はg_sym_eval_error
+ * @return signal-conditionの戻り値。条件クラスがまだ登録されていない場合はg_sym_eval_error(os_signal_conditionの注記参照)
  */
 /* [P4-2] **signal には global_environment を渡す。** os_signal_conditionがenvを使うのは
    MAKE-INSTANCE / SIGNAL-CONDITION の解決だけで、どちらも global_environment にしか

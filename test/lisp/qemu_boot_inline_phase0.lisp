@@ -8,7 +8,6 @@
 ;;
 ;; 区間の並びは Makefile の補正表と 1 対 1 で対応する。**並べ替えたら表が狂う。**
 
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 
 (format *isiki-test-stream* "#gate ~A~%" (%%gate-plugin-args))

@@ -1,4 +1,3 @@
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 (load "src/lisp/bench_interp.lisp")
 ;; bench-jit-alloc-per-iter(1 反復あたりの確保量)を使うので読む。

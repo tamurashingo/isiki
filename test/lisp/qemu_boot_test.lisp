@@ -1,4 +1,3 @@
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 ;; テストフレームワーク自身の検証。**道具が壊れていると全部の期待値が黙って無効になる**ので、
 ;; 何より先に走らせる(assert-error-class の陽性/陰性対照を含む)

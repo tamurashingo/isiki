@@ -38,7 +38,6 @@ def main():
     if len(sys.argv) != 2:
         sys.exit("usage: gen_jit_nest_probe.py <段数>")
     n = int(sys.argv[1])
-    print('(load "src/lisp/init.lisp")')
     print('(defglobal *o* (open-output-file "/9p/tmp/jit_nest_probe.txt"))')
     print(probe_form(n))
     print('(format *o* "#probe %d compiled=~S bail-at0=~D bail-at1=~D count=~D~%%" '

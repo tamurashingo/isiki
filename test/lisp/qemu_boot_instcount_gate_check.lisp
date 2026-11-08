@@ -11,7 +11,6 @@
 ;;
 ;; 使い方: make test-qemu-instcount-gate MILESTONE=test/lisp/qemu_boot_instcount_gate_check.lisp
 
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 
 ;; **パス1(プラグイン無し)はこの行を取りに来る。**

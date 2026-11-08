@@ -100,10 +100,16 @@
 
 (assert-equal t (if (member (%environment-name (%%current-environment)) (list-environments)) t nil))
 
-;;; --- 6. %%global-environment: 複数プロセスがそれぞれ(load "src/lisp/init.lisp")する
+;;; --- 6. %%global-environment: 複数プロセスがそれぞれ基盤ライブラリを読み込む
 ;;; ことで発生する「同じ関数が別の環境に重複定義される」問題を、global_environmentへ
 ;;; 直接定義することで解消できることを確認する(F1/F2それぞれのproc->envを
 ;;; make-environmentで模して代用する)。
+;;;
+;;; [同梱] 実機ではこの問題は起きない。基盤ライブラリはカーネルへ同梱され、
+;;; process 0のスタック上でglobal_environmentへ**1回だけ**読まれる
+;;; (src/c/kernel.c の run_boot_entry)。ここで押さえているのは
+;;; 「global_environmentへの単一の定義が全プロセスから見える」という性質そのもので、
+;;; その性質に実機の読み込みが乗っている。
 
 ;; %%current-environmentはこのファイルの実行時点で既にプロセスの子envを遅延生成済み
 ;; (セクション2で初回呼び出し済み)なので、%%global-environmentとは異なる値になる
@@ -114,13 +120,15 @@
 (defglobal eutil-f1-env (make-environment 'eutil-f1 (%%global-environment)))
 (defglobal eutil-f2-env (make-environment 'eutil-f2 (%%global-environment)))
 
-;; global_environmentへ直接定義する(F1側が(load "src/lisp/init.lisp")する想定の代用)
+;; global_environmentへ直接定義する(実機で同梱した基盤ライブラリが
+;; global_environmentへ読まれるのと同じ置き方の代用)
 (with-environment (%%global-environment)
   (defun eutil-shared-fn (x) (+ x 1000)))
 
 ;; F1側・F2側どちらの子環境からも、global_environmentへの唯一の定義が
-;; (親envを辿って)同じ結果として見える。呼び出しごとに別々の定義を作る
-;; 従来の(load "src/lisp/init.lisp")とは異なり、重複無しに共有できている
+;; (親envを辿って)同じ結果として見える。**プロセスごとに自分の環境へ
+;; 読み込む形**(以前の利用手引きの手順)だと同じ定義が複数できるが、
+;; global_environmentへ1回置けば重複無しに共有できる
 (with-environment eutil-f1-env
   (assert-equal 1001 (eutil-shared-fn 1)))
 (with-environment eutil-f2-env

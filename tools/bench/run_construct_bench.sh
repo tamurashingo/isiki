@@ -85,7 +85,6 @@ BENCH_FLAKE_LOG="tmp/bench_construct_flakes.txt"
 write_milestone() {
     local call_form="$1"
     {
-        echo '(load "src/lisp/init.lisp")'
         echo '(load "test/lisp/test_framework.lisp")'
         echo '(format *isiki-test-stream* "#anchor ~D~%" (%%diag-image-anchor-pub))'
         echo '(finish-output *isiki-test-stream*)'

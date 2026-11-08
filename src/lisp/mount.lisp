@@ -17,7 +17,11 @@
 ;; マウント先の絶対パス、deviceはblk0s0等の*devices*キー(symbol)、fs-typeは
 ;; ':fat32/':fat16等のキーワードシンボル。*devices*と同じ理由でdefdynamic+
 ;; %%set-dynamicを使う(defglobalは呼び出し元の環境にしか書き込まれないため)。
-(defdynamic *mounts* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *mounts* (dynamic *mounts*))
 
 ;; (mount path device fs-type) : *mounts*の先頭へ(path . (device . fs-type))を
 ;; 追加登録し、pathを返す。同じpathを再度mountした場合は新しいエントリが先頭に
