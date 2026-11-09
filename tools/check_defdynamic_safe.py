@@ -31,6 +31,25 @@ nil で踏み潰した)。
 初期値が nil のものはどちらでも結果が nil なので区別が要らず、
 初期値が nil でないものは `or` で「偽なら初期値」に落とす。これが取れる最善の形である。
 
+## `(or (dynamic *x*) INIT)` の形が依存している前提 —— **これが壊れると黙って壊れる**
+
+`or` の形は **「その変数は nil / 偽を意味のある値として持たない」** ことに
+依存している。`(dynamic *x*)` は未登録でも静かに nil を返すだけなので、
+`or` で書けるのは「既存値が**偽**なら初期値へ落ちる」ところまでである。
+
+**その変数が nil / 偽を正当な値として取れるようになった時点で、この形は壊れる。**
+そのときは「登録済みの nil」を初期値で踏み潰す —— #187 が直したのとまったく同じ族の、
+**無言で成立する事故**になる(検出器も通ってしまう。形は `or` のままだからである)。
+
+直し方: 「登録済みか」を見る述語(`%%dynamic-bound-p` 相当。**いまは無い**)を
+足し、`(or ...)` をそれで書き換える。そのときはこの検出器の
+`is_safe` が認める形も入れ替えること。
+
+**この検出器は「形」しか見られない。** nil が意味を持つ値になったかどうかは
+見られないので、`or` を使う側のコード注記に前提を書く運用とセットである
+(現在の 2 件 `src/lisp/file-cmd.lisp` の `*cwd*`、
+`src/lisp/init.lisp` の `*read-default-float-format*` はどちらも書いてある)。
+
 ## 使い方
 
     python3 tools/check_defdynamic_safe.py             # 検査(make test から)
@@ -210,7 +229,10 @@ def is_safe(name, value):
     if value == want_read:
         return True, "既存値をそのまま書き戻す"
     if value.startswith("(or " + want_read + " ") and value.endswith(")"):
-        return True, "既存値が偽のときだけ初期値へ落とす"
+        # **形しか見ていない。** この形は「nil/偽が意味を持たない値であること」を
+        # 前提にしている(冒頭の docstring)。前提が崩れても検出器は通るので、
+        # 一覧の出力で毎回それを名乗らせる
+        return True, "既存値が偽のときだけ初期値へ落とす(nilが意味を持たない値である前提)"
     return False, ("value-form が %s でも (or %s INIT) でもない"
                    % (want_read, want_read))
 
@@ -222,6 +244,16 @@ def report(found, show_list):
         for rel, lineno, name, value, safe, why in found:
             print("  [%s] %s:%d  %s  <- %s" %
                   ("OK" if safe else "NG", rel, lineno, name, value or "(value-form 無し)"))
+            if safe and value.startswith("(or "):
+                # 前提つきの形であることを一覧に残す(PR 本文は消えるが、ここは残る)
+                print("       ^ %s" % why)
+        if any(f[4] and f[3].startswith("(or ") for f in found):
+            print("")
+            print("  注: (or (dynamic *x*) INIT) の形は **nil/偽が意味を持たない値である**")
+            print("      ことに依存している。「登録済みか」を見る述語がこの処理系に無いため、")
+            print("      or で書けるのは「偽なら初期値へ落ちる」までである。")
+            print("      その変数が nil を正当な値に取れるようになったら**この形は黙って壊れる**")
+            print("      (検出器は形しか見ないので通ってしまう)。詳しくはこのファイル冒頭。")
     if unsafe:
         print("", file=sys.stderr)
         print("ERROR: 安全でない初期宣言が %d 件ある" % len(unsafe), file=sys.stderr)
