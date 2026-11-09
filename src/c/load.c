@@ -49,11 +49,28 @@ lisp_val_t os_load_from_stream(os_stream_t *stream, const char *name, lisp_val_t
     // 転送マーカーで上書き済み)を参照してしまう
     GC_PROTECT(env);
 
+    // [M2-T0 / #196] **輪は反復ごとに包みから実体を取り直す。**
+    // MAGIC_STREAMに包まれたストリーム(ディスク経由のopen-input-streamが作る
+    // ものなど)のos_stream_t本体は、GCのたびに別アドレスへ複製される
+    // (gc_relocate_stream、runtime.c)。輪は毎反復でフォームを評価する=確保するので、
+    // 引数で受け取った生ポインタを輪の全体で使い回すと、1回目のGCでその参照は
+    // 古い複製を指し、**2回目のGCでその古い複製が別オブジェクトの複製先として
+    // 上書きされる。** 以後は化けた中身から読み続けるので、後ろのフォームが
+    // 評価されない / 二度評価される / 偽の構文エラーになる(= 静かな破壊。
+    // test/c/load_test.cのtest_load_from_wrapped_stream_survives_gcが陽性対照)。
+    //
+    // 包まれていない(self_handleがnil)ストリーム、すなわち9p経由のcc_loadと
+    // カーネル同梱の読み込み(kernel.c)はCのローカル/静的領域にあってGCで
+    // 動かないので、従来どおり引数の生ポインタをそのまま使う(挙動は変わらない)
+    lisp_val_t handle = stream->self_handle;
+    GC_PROTECT(handle);
+
     for (;;) {
-        lisp_val_t form = os_read_stream(stream);
+        os_stream_t *s = (handle != nil) ? os_stream_from_handle(handle) : stream;
+        lisp_val_t form = os_read_stream(s);
 
         if (form == g_sym_read_error) {
-            os_stream_close(stream);
+            os_stream_close((handle != nil) ? os_stream_from_handle(handle) : stream);
             return os_signal_io_error("load", name, "syntax error", env);
         }
 
@@ -63,8 +80,8 @@ lisp_val_t os_load_from_stream(os_stream_t *stream, const char *name, lisp_val_t
             // メモリ同梱の文字列入力ではerrorは立たないが、この関数は9P経由と
             // 共有するので判定は残す。g_sym_read_errorとnilの判別順も変えない
             // (nilはTAG_CONSを持つ。documents/pitfalls.md)
-            if (stream->error) {
-                os_stream_close(stream);
+            if (s->error) {
+                os_stream_close(s);
                 return os_signal_io_error("load", name, "I/O error", env);
             }
             break;
@@ -102,11 +119,22 @@ lisp_val_t os_load_from_stream(os_stream_t *stream, const char *name, lisp_val_t
         }
     }
 
-    os_stream_close(stream);
+    // 輪の中でGCが走っている可能性があるので、閉じる前にも取り直す
+    os_stream_close((handle != nil) ? os_stream_from_handle(handle) : stream);
     return g_sym_t;
 }
 
 lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
+    /* [M2-T0 / #196] **環境の値を開く前に守る。**
+       envは読んだ各フォームを評価する環境で、os_load_from_streamへ渡す値である。
+       いまの9pのopenは確保しないので守らなくても安全だったが、開き方を
+       マウント経由にすると(#193)os_mount_resolveがos_make_symbolを呼び、
+       FAT経路はLispを呼び戻すので**openの手前で確保が起きる。**
+       ここでGCが走ってenvが再配置されると、以後の全フォームが再配置前の
+       古い環境へ書き込まれる(load.c:45-50に同型の事故が記録されている)。
+       開き方を変えるのは#193だが、**守りは先に置く**(それが#196の趣旨である) */
+    GC_PROTECT(env);
+
     char path[LOAD_PATH_MAX];
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 

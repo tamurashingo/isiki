@@ -89,19 +89,45 @@ static int process_source_has_more(void *ctx) {
 
 /** 1バイトの先読みキャッシュを持つ、stream用のreader_sourceコンテキスト。
     os_stream_read_charは「読んだら進む」だけのAPIなので、readerが要求する
-    非破壊的なpeek()を実現するためにここでキャッシュする。 */
+    非破壊的なpeek()を実現するためにここでキャッシュする。
+
+    [M2-T0 / #196] **streamの実体は1文字ごとに取り直す。**
+    MAGIC_STREAMに包まれたストリーム(FAT経由のopen-input-streamが作る
+    STREAM_STRING_INPUT等)のos_stream_t本体は、GCのたびに別アドレスへ
+    複製される(gc_relocate_stream、runtime.c)。1つのS式を読む間に
+    read_list/read_list_restはconsを、read_atomはsymbol/string/整数を確保するので、
+    **式の途中でGCが走りうる。** 生ポインタを式全体にわたって持ち続けると、
+    以後その式の残りは古い複製から読まれ、**新しい実体の読取位置は進まない**
+    (= 同じ式を二度読む / 途中から中身が化ける。どちらも読み取りは成功を返す)。
+    そこでGC_PROTECT済みのハンドルを置いたローカル変数への**ポインタ**を持ち、
+    peek/advanceのたびにos_stream_from_handleで取り直す
+    (ハンドルそのものを構造体のフィールドに持つと、GC_PROTECTでは守れない。
+     documents/pitfalls.md 原則8)。 */
 typedef struct {
+    /** 包まれているストリームの、GC_PROTECT済みハンドルを置いたローカル変数への
+        ポインタ。包まれていなければ0(そのときはstreamを直接使う) */
+    lisp_val_t *handle_slot;
+    /** 包まれていないストリームの生ポインタ。9p経由のcc_load・カーネル同梱の
+        読み込みはCのローカル/静的領域にあり、GCで動かないのでこれで足りる */
     os_stream_t *stream;
     char lookahead;
     int has_lookahead;
 } stream_source_ctx_t;
+
+/** いま有効なos_stream_tを返す。包まれていればハンドルから取り直す */
+static os_stream_t *stream_source_stream(stream_source_ctx_t *ctx) {
+    if (ctx->handle_slot != 0) {
+        return os_stream_from_handle(*ctx->handle_slot);
+    }
+    return ctx->stream;
+}
 
 /** まだ先読みしていなければstream_read_charで1文字取得してlookaheadに積む */
 static int stream_source_fill(stream_source_ctx_t *ctx) {
     if (ctx->has_lookahead) {
         return 1;
     }
-    if (os_stream_read_char(ctx->stream, &ctx->lookahead)) {
+    if (os_stream_read_char(stream_source_stream(ctx), &ctx->lookahead)) {
         ctx->has_lookahead = 1;
         return 1;
     }
@@ -915,7 +941,16 @@ lisp_val_t os_read(process_t *proc) {
  * @return 読み取ったS式。読めるものが無ければnil、構文エラーならg_sym_read_error
  */
 lisp_val_t os_read_stream_ex(os_stream_t *stream, int *out_eof, int *out_has_pending, char *out_pending) {
+    // [M2-T0 / #196] **1つの式を読み切る処理の内部も守る。**
+    // 包まれているストリームなら、入口の(まだ有効な)生ポインタからself_handleを
+    // 読み出してGC_PROTECTしておき、以後は1文字ごとにそこから実体を取り直す
+    // (stream_source_ctx_tのコメント参照)。包まれていなければself_handleはnilで、
+    // そのストリームはGCで動かないので従来どおり生ポインタを使う
+    lisp_val_t handle = stream->self_handle;
+    GC_PROTECT(handle);
+
     stream_source_ctx_t stream_ctx;
+    stream_ctx.handle_slot = (handle != nil) ? &handle : 0;
     stream_ctx.stream = stream;
     stream_ctx.has_lookahead = 0;
 
