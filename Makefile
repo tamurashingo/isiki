@@ -1249,6 +1249,11 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 # [P1] qemu_boot_fat_callback_transfer.lispは**必ずqemu_boot_m6_fat16.lispより後**に
 # 置くこと。FAT16イメージのルートへP1BASE.TXT等を作るので、先に走らせると
 # fat16_test.lispのルートディレクトリ一覧のアサーションが落ちる
+#
+# [M2-T3 / #195] **$(APP_DISK_IMG) は rm しない。** 依存が apps/*.lisp だけなので、
+# アプリを触っていなければ作り直す必要が無い(**アプリだけ入れ替えられる**という
+# この専用ディスクの目的そのもの)。他のフィクスチャを rm するのは、破壊的な試験が
+# 書き込んだ跡が次回の期待値を壊すためで、アプリのディスクは誰も書き込まない
 test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
