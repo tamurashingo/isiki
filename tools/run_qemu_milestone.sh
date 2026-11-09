@@ -75,11 +75,11 @@ if [ "$1" = "--self-test" ]; then
     echo "[self-test] QEMU ミルストンの再試行(結果が無いときだけ)"
     _run "陽性対照1・結果が無い(2 回とも)" 1 1 "true"
     _run "陽性対照2・結果があって失敗 -> 再試行しない" 1 0 \
-         "printf '==== isiki tests: 3 passed, 1 failed ====\n' > test-results.txt"
+         "printf '==== isiki tests: 3 passed, 1 failed ====\n' > test-results.txt"  # PASS-LINE: FIXTURE 判定役にかける偽の成果物(不合格側。陽性対照2)
     _run "陰性対照・1 回目で成功" 0 0 \
-         "printf '==== isiki tests: 4 passed, 0 failed ====\n' > test-results.txt"
+         "printf '==== isiki tests: 4 passed, 0 failed ====\n' > test-results.txt"  # PASS-LINE: FIXTURE 判定役にかける偽の成果物(合格側。陰性対照)
     _run "陽性対照3・2 回目で成功 -> 通るが記録は残る" 0 1 \
-         'test -f tmp/.try && printf "==== isiki tests: 5 passed, 0 failed ====\n" > test-results.txt; touch tmp/.try'
+         'test -f tmp/.try && printf "==== isiki tests: 5 passed, 0 failed ====\n" > test-results.txt; touch tmp/.try'  # PASS-LINE: FIXTURE 判定役にかける偽の成果物(2回目で成功。陽性対照3)
     if [ "$ok" = 0 ]; then
         echo "self-test 成功: **結果が無いときだけ再試行し、失敗は再試行しない**ことを確かめた"
         exit 0

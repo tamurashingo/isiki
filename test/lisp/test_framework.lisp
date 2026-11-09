@@ -340,5 +340,6 @@
   ;; 総経過時間。100 tick = 1秒(src/c/clock.c の TICKS_PER_SECOND)
   (let ((e (isiki-test-elapsed)))
     (format *isiki-test-stream* "#elapsed ~D ticks = ~D sec~%" e (div e 100)))
+  ;; PASS-LINE: REAL 枠組みの本物の集計。**これが唯一の正規の出どころ**(#205)
   (format *isiki-test-stream* "~%==== isiki tests: ~D passed, ~D failed ====~%"
           *isiki-test-pass* *isiki-test-fail*))

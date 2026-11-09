@@ -51,7 +51,7 @@
 
 ;; 後始末。陽性対照で**意図的に**増やした failed を戻す。
 ;; 戻さないとこのテストファイル自身が " 0 failed" を壊す
-(setq *isiki-test-fail* bench-jit-fail-before)
+(setq *isiki-test-fail* bench-jit-fail-before)  ; TALLY-RESTORE: 陽性対照が意図的に増やした 1 件を戻す
 (setq *bench-jit-guard-ng* 0)
 
 ;; 増えたのがちょうど 1 件だったことを、戻した後に確認する

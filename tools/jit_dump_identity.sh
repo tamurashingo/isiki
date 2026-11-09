@@ -195,7 +195,7 @@ cmd_self_test() {
         echo "[JITDUMP] size=6 maskedbytes=0 hash=0123456789abcdef"
         echo "[JITDUMP] size=40 maskedbytes=16 hash=fedcba9876543210"
         echo "[JITDUMP] size=128 maskedbytes=24 hash=00112233445566aa"
-        echo "3269 passed, 0 failed"
+        echo "3269 passed, 0 failed"  # PASS-LINE: FIXTURE 比較器の駆動側の自己試験が作る偽のシリアルログ
     } > "$log"
 
     run() {   # $1 = save|check, $2 = 印, $3 = QEMU_MEM

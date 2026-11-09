@@ -557,7 +557,7 @@ def synth_body(reader, passed, failed):
         return [
             "#count test/lisp/synthetic_test.lisp %d\n" % passed,
             "\n",
-            "==== isiki tests: %d passed, %d failed ====\n" % (passed, failed),
+            "==== isiki tests: %d passed, %d failed ====\n" % (passed, failed),  # PASS-LINE: FIXTURE 合成ログ(isiki の読み取り方)
         ]
     if reader == "self-tally":
         # 台本の自前集計。**1 件 1 行の `#ck` が本体**で、不合格は `[NG]` も出す
@@ -567,13 +567,13 @@ def synth_body(reader, passed, failed):
             out.append("#ck synthetic-ng-%d\n" % i)
         out += ["#ck synthetic-%d\n" % i for i in range(passed)]
         out.append("\n")
-        out.append("==== isiki tests: %d passed, %d failed ====\n" % (passed, failed))
+        out.append("==== isiki tests: %d passed, %d failed ====\n" % (passed, failed))  # PASS-LINE: FIXTURE 合成ログ(self-tally の読み取り方)
         return out
     if reader == "no9p":
         out = ["[no9p] boot smoke begin\n"]
         out += ["[no9p] ok   synthetic-%d\n" % i for i in range(passed)]
         out += ["[no9p] NG   synthetic-ng-%d\n" % i for i in range(failed)]
-        out.append("[no9p] %d passed, %d failed\n" % (passed, failed))
+        out.append("[no9p] %d passed, %d failed\n" % (passed, failed))  # PASS-LINE: FIXTURE 合成ログ(no9p の読み取り方)
         return out
     raise AssertionError("合成できない読み取り方: %r" % reader)
 
@@ -679,7 +679,7 @@ def self_test():
     # 陽性対照 3: ログにあるが名簿に無い段
     stray = [
         "make test-qemu-milestone MILESTONE=test/lisp/qemu_boot_brand_new.lisp\n",
-        "==== isiki tests: 3 passed, 0 failed ====\n",
+        "==== isiki tests: 3 passed, 0 failed ====\n",  # PASS-LINE: FIXTURE 名簿に無い段の陽性対照の資料
     ]
     check("陽性 名簿に無い段で落ちる", passes(synth_log(ALL, extra=stray)), False)
     check(
@@ -694,14 +694,14 @@ def self_test():
     # 陽性対照 5: **読み取り方が 3 種類目の段**。黙って飛ばさないこと
     third_kind = [
         "make test-qemu-milestone MILESTONE=test/lisp/qemu_boot_third_kind.lisp\n",
-        "<<< third-kind tests >>> 7 passed, 0 failed\n",
+        "<<< third-kind tests >>> 7 passed, 0 failed\n",  # PASS-LINE: FIXTURE 知らない合否の形の陽性対照の資料
     ]
     check("陽性 3 種類目の形で落ちる", passes(synth_log(ALL, extra=third_kind)), False)
     # 名簿に無い段としても鳴るが、**名簿に書いた段で形が変わった場合**が本番である
     moved = synth_log(ALL, drop=victim)
     moved_lines = [line for _, line in moved]
     moved_lines.append(synth_stage_header(victim, "marker"))
-    moved_lines.append("<<< third-kind tests >>> 155 passed, 0 failed\n")
+    moved_lines.append("<<< third-kind tests >>> 155 passed, 0 failed\n")  # PASS-LINE: FIXTURE 段が入れ替わった陽性対照の資料
     moved = [(i, line) for i, line in enumerate(moved_lines, start=1)]
     check("陽性 名簿の段が別の形で出すと落ちる", passes(moved), False)
     check(
@@ -731,7 +731,7 @@ def self_test():
     self_tally_stage = "test/lisp/qemu_boot_no_init_signal.lisp"
     forged_lines = [line for _, line in synth_log(ALL, drop=self_tally_stage)]
     forged_lines.append(synth_stage_header(self_tally_stage, "marker"))
-    forged_lines.append("==== isiki tests: 15 passed, 0 failed ====\n")
+    forged_lines.append("==== isiki tests: 15 passed, 0 failed ====\n")  # PASS-LINE: FIXTURE 自前集計の段が一行だけを書く陽性対照の資料
     forged = [(i, line) for i, line in enumerate(forged_lines, start=1)]
     check("陽性 自前集計の段が一行だけを書くと落ちる", passes(forged), False)
     check(
@@ -750,7 +750,7 @@ def self_test():
     broken_lines = [line for _, line in broken_no9p]
     broken_lines.append(synth_stage_header("test-qemu-no-9p-run", "marker"))
     broken_lines.extend(
-        ["[no9p] ok   a\n", "[no9p] ok   b\n", "[no9p] 8 passed, 0 failed\n"]
+        ["[no9p] ok   a\n", "[no9p] ok   b\n", "[no9p] 8 passed, 0 failed\n"]  # PASS-LINE: FIXTURE no9p の読み取り方の陽性対照の資料
     )
     broken = [(i, line) for i, line in enumerate(broken_lines, start=1)]
     check("陽性 no9p の行数と集計の食い違いで落ちる", passes(broken), False)
