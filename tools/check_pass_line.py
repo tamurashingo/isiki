@@ -113,8 +113,9 @@ WRITERS = (
      "計測プローブ。旧 main と同一のドライバを使う制約で枠組みを読めない"),
     ("tools/gen_jit_nest_probe.py", "PROBE", 1,
      "計測プローブの生成器。生成した Lisp に一行を書かせる"),
-    ("tools/run_qemu_milestone.sh", "FIXTURE", 4,
-     "判定役の自己試験。4 経路を発火させるための偽の成果物"),
+    ("tools/run_qemu_milestone.sh", "FIXTURE", 7,
+     "判定役の自己試験。7 経路を発火させるための偽の成果物"
+     "(#197 で読み込みの打ち切りの配線に 3 本足した)"),
     ("tools/jit_dump_identity.sh", "FIXTURE", 1,
      "比較器の駆動側の自己試験が作る偽のシリアルログ"),
     ("tools/check_jit_dump_identity.py", "FIXTURE", 2,
@@ -804,11 +805,19 @@ def self_test():
         # 落ちることを見るのが、印が効いていることの対照である
         # ---------------------------------------------------------------
         print("--- 印が効いていることの対照(現物の資料 3 本) ---")
-        marked = (
-            ("tools/run_qemu_milestone.sh", "FIXTURE", 4, "判定役の自己試験"),
-            ("tools/jit_dump_identity.sh", "FIXTURE", 1, "比較器の駆動側"),
-            ("tools/check_jit_dump_identity.py", "FIXTURE", 2, "比較器本体"),
-        )
+        # **件数は WRITERS から引く。** ここに数字を写すと、現物が増えたときに
+        # この自己試験だけが落ちる(#197 で run_qemu_milestone.sh が 4 -> 7 に
+        # なったときに実際に落ちた)。規則 13 のとおり、数字は導出する
+        def _roster_count(rel):
+            return [n for f, c, n, _w in WRITERS if f == rel and c == "FIXTURE"][0]
+
+        marked = tuple(
+            (rel, "FIXTURE", _roster_count(rel), why)
+            for rel, why in (
+                ("tools/run_qemu_milestone.sh", "判定役の自己試験"),
+                ("tools/jit_dump_identity.sh", "比較器の駆動側"),
+                ("tools/check_jit_dump_identity.py", "比較器本体"),
+            ))
         tree5 = os.path.join(box, "tree5")
         for rel, _c, _n, _w in marked:
             dst = os.path.join(tree5, rel)

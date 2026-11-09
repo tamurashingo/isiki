@@ -17,8 +17,98 @@
 /** report-conditionの出力を受ける固定長バッファ。これを超えるメッセージは途中で切れる */
 #define LOAD_REPORT_MAX 256
 
+/** 直列線へ出す1行を組むバッファ。名前(最大LOAD_PATH_MAX)と理由(最大LOAD_REPORT_MAX)と
+    前置きが入る。あふれるぶんは切り捨てる(diag_appendが容量を見る) */
+#define LOAD_DIAG_MAX 640
+
+/* ===================== [#197] 打ち切りの集計 =====================
+   **ここが#197の真因の置き場である。** 加算は以前os_load_from_streamの
+   `if (out_aborted_count != 0)` の中にあった = **0を渡す呼び元では加算自体が
+   起きていなかった**(捨てられていたのではなく、数えられていなかった)。
+   0を渡していたのはcc_loadの3経路(相対 = 9P / マウント → 9P / FAT経由)、
+   つまり**通常のloadのすべて**である。
+
+   そこで総数は呼び元に依存しない静的変数へ積む。**呼び元が数えるかどうかと
+   無関係に数える**のが要点で、これなら新しい呼び元が足されても
+   「数え先を渡し忘れたので数えない」が起きない(原則6の形を作らない)。 */
+static int g_load_aborted_total = 0;
+
+/** 診断の1行の出し口。0なら何も出さない(os_load_set_diag_writerの宣言を参照) */
+static void (*g_load_diag_writer)(const char *) = 0;
+
+/** bufのpos以降へsを継ぎ足し、新しいposを返す。容量を超えるぶんは捨ててNUL終端する
+    (kernel.cのboot_msg_appendと同じ形。あちらはstaticなので持ってこられない) */
+static UINT32 diag_append(char *buf, UINT32 pos, const char *s) {
+    while (*s != '\0' && pos + 1 < LOAD_DIAG_MAX) {
+        buf[pos++] = *s++;
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+/** bufのpos以降へ10進数のvを継ぎ足す */
+static UINT32 diag_append_uint(char *buf, UINT32 pos, UINT32 v) {
+    char tmp[12];
+    UINT32 n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v != 0 && n < sizeof(tmp));
+    while (n > 0 && pos + 1 < LOAD_DIAG_MAX) {
+        buf[pos++] = tmp[--n];
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+static void diag_line(const char *line) {
+    if (g_load_diag_writer != 0) {
+        g_load_diag_writer(line);
+    }
+}
+
+void os_load_set_diag_writer(void (*writer)(const char *)) {
+    g_load_diag_writer = writer;
+}
+
+void os_load_abort_stats_reset(void) {
+    g_load_aborted_total = 0;
+}
+
+int os_load_aborted_total(void) {
+    return g_load_aborted_total;
+}
+
+void os_load_report_aborts(void) {
+    char line[LOAD_DIAG_MAX];
+    UINT32 pos = diag_append(line, 0, "[load] aborted top-level forms: ");
+    pos = diag_append_uint(line, pos, (UINT32)g_load_aborted_total);
+    diag_append(line, pos, "\n");
+    diag_line(line);
+}
+
 /**
- * [P2] エラーで打ち切られたフォームの理由を表示する。
+ * [#197] 宛先の無い非局所脱出が最上位まで戻ってきたときの理由の文面。
+ *
+ * **理由を「どの構文から来たか」で書く。** 実害の直し手は
+ * 「どのファイルのどの構文が消えたか」を知りたいのであって、
+ * 総数だけでは直せない(調査 §C-2)。
+ */
+static const char *transfer_reason(lisp_val_t v) {
+    switch (os_control_transfer_magic(v)) {
+    case MAGIC_BLOCK_EXIT:
+        return "uncaught block-exit (return-from to a block that is not live here)";
+    case MAGIC_CATCH_EXIT:
+        return "uncaught catch-exit (throw with no matching catch)";
+    case MAGIC_GO_EXIT:
+        return "uncaught go-exit (go with no matching tagbody tag)";
+    default:
+        return "uncaught control transfer";
+    }
+}
+
+/**
+ * [P2 / #197] 打ち切られたフォーム1件を**数えて、画面と直列線の両方へ出す。**
  *
  * **cc_loadは評価結果を捨てるので、以前はロード中にフォームが打ち切られても
  * 何も出なかった。** どのファイルで落ちたかが分かるよう読み込み元の名前を前置きする
@@ -26,20 +116,50 @@
  * 打ち切られたフォームは飛ばして次のフォームへ進む(ロード自体は続行する)。
  *
  * report-conditionのメッセージが得られなければ、REPLと同じく生の値の印字へ落とす。
+ *
+ * **画面へ出す文面は変えていない**(既存の単体試験が文字列で固定している)。
+ * 足したのは総数の加算と直列線への1行で、**画面だけに出す形では母艦から
+ * 見えない**のが#197の本体だからである。
+ *
+ * @param is_transfer 生の非局所脱出シグナル(= conditionではない)が戻ってきた場合に1。
+ *                    report-conditionにかけてはいけないのでここで分ける
  */
-static void print_load_abort(const char *name, lisp_val_t condition, lisp_val_t env) {
+static void record_load_abort(const char *name, lisp_val_t result, lisp_val_t env, int is_transfer) {
+    /* os_condition_report_cstrはLisp側の関数を呼ぶ = 確保する。resultとenvは
+       その呼び出しを跨いでこの関数のスロットで生き続ける必要がある(原則4) */
+    GC_PROTECT(result);
+    GC_PROTECT(env);
+
+    g_load_aborted_total++;
+
+    char msg[LOAD_REPORT_MAX];
+    const char *reason = 0;
+    if (is_transfer) {
+        reason = transfer_reason(result);
+    } else if (os_condition_report_cstr(result, env, msg, sizeof(msg))) {
+        reason = msg;
+    }
+
     process_t *proc = get_current_process();
     proc->stdout_buffer->write_string(proc->stdout_buffer, "load: ");
     proc->stdout_buffer->write_string(proc->stdout_buffer, name);
     proc->stdout_buffer->write_string(proc->stdout_buffer, ": ");
-
-    char msg[LOAD_REPORT_MAX];
-    if (os_condition_report_cstr(condition, env, msg, sizeof(msg))) {
-        proc->stdout_buffer->write_string(proc->stdout_buffer, msg);
+    if (reason != 0) {
+        proc->stdout_buffer->write_string(proc->stdout_buffer, reason);
     } else {
-        os_print(condition, proc->stdout_buffer);
+        os_print(result, proc->stdout_buffer);
     }
     proc->stdout_buffer->write_char(proc->stdout_buffer, '\n');
+
+    /* 直列線(= 母艦が読む側)。理由が引けないときも**行は出す。**
+       「理由が無いから1行も出さない」は、静かに欠けるのと同じことである */
+    char line[LOAD_DIAG_MAX];
+    UINT32 pos = diag_append(line, 0, "[load] abort ");
+    pos = diag_append(line, pos, name);
+    pos = diag_append(line, pos, ": ");
+    pos = diag_append(line, pos, (reason != 0) ? reason : "<reason unavailable>");
+    diag_append(line, pos, "\n");
+    diag_line(line);
 }
 
 lisp_val_t os_load_from_stream(os_stream_t *stream, const char *name, lisp_val_t env,
@@ -101,7 +221,27 @@ lisp_val_t os_load_from_stream(os_stream_t *stream, const char *name, lisp_val_t
         int aborted = 0;
         lisp_val_t result = os_eval_top_level_ex(form, env, &aborted);
         GC_PROTECT(result);
-        if (aborted) {
+
+        /* [#197] **宛先の無い脱出も「完了していない」として数える。**
+           os_eval_top_level_exが打ち切りとみなすのは**宛先が%TOP-LEVELで、かつ
+           MAGIC_BLOCK_EXIT**のときだけである(eval.c。%abort-top-levelが作るものだけに
+           限る意図があって、そこは変えない)。だが対応するcatchの無いthrowや
+           対応するtagbodyの無いgoは、**生の脱出シグナルのまま**ここへ戻ってくる。
+           いままではそれがabortedに入らないので**件数も増えず、理由の表示も
+           行われなかった**(= 画面にすら何も出ない。調査
+           docs/investigation/detector-t4-passline.refs.md §C-2)。
+
+           **最上位には行き先が無いので、そこへ戻ってきた制御移転は定義上
+           「その式は完了していない」。** 種類を問わず数える。
+
+           **判定をeval.c側ではなくここでするのはなぜか。** os_eval_top_level_exは
+           REPL(repl.c)と9Pの無い起動の判定(kernel.c)も通る。あちらの意味論を
+           変えずに済ませたいので、「読み込まれなかった最上位の式を数える」責務は
+           loadの輪だけが持つ。REPLは脱出を人間に見せる場であって、
+           静かに欠けることが問題になる場ではない */
+        int uncaught_transfer = (!aborted && os_is_control_transfer(result));
+
+        if (aborted || uncaught_transfer) {
             // saved_proc_envが0のときは「まだ遅延生成されていなかった」ので戻さない。
             // 0へ書き戻すと、フォームの中で生成されたprocess environmentが捨てられ、
             // 次の%%current-environmentが同名の環境をもう1つ*environments*へ足してしまう
@@ -117,13 +257,46 @@ lisp_val_t os_load_from_stream(os_stream_t *stream, const char *name, lisp_val_t
             if (out_aborted_count != 0) {
                 (*out_aborted_count)++;
             }
-            print_load_abort(name, result, env);
+            // [#197] **総数の加算はこの外(record_load_abort)で、呼び元に依存せず行う。**
+            // 以前は加算が上のifの中だけにあり、0を渡す呼び元(= 通常のloadの
+            // すべて)では加算自体が起きていなかった
+            record_load_abort(name, result, env, uncaught_transfer);
         }
     }
 
     // 輪の中でGCが走っている可能性があるので、閉じる前にも取り直す
     os_stream_close((handle != nil) ? os_stream_from_handle(handle) : stream);
     return g_sym_t;
+}
+
+/**
+ * [#197] 1本ぶんの読み込みを終えて、**打ち切りがあったファイル名と件数を直列線へ出す。**
+ *
+ * **cc_loadの3経路が0を渡していたのをやめる。** 渡していたせいで
+ * os_load_from_streamの加算(`if (out_aborted_count != 0)`の中)が起きておらず、
+ * 件数は「捨てられていた」のではなく**最初から数えられていなかった**。
+ *
+ * **総数だけでは直せない。** #197の実害は「ファイルが半分だけ静かに欠ける」ことで、
+ * 直し手が必要なのは**どのファイルか**である。だからここで1本ごとに出す。
+ * loadの戻り値と契約は変えない(打ち切りがあってもg_sym_tのまま)。
+ *
+ * @param name 表示に使う名前。**マウント接頭辞を剥がす前のパスを渡すこと**
+ *             (母艦の読み手が台本に書いたとおりの綴りで探せるように)
+ */
+static lisp_val_t load_one_file(os_stream_t *stream, const char *name, lisp_val_t env) {
+    GC_PROTECT(env);
+    int aborted = 0;
+    lisp_val_t result = os_load_from_stream(stream, name, env, &aborted);
+    if (aborted != 0) {
+        char line[LOAD_DIAG_MAX];
+        UINT32 pos = diag_append(line, 0, "[load] file ");
+        pos = diag_append(line, pos, name);
+        pos = diag_append(line, pos, ": aborted ");
+        pos = diag_append_uint(line, pos, (UINT32)aborted);
+        diag_append(line, pos, "\n");
+        diag_line(line);
+    }
+    return result;
 }
 
 lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
@@ -161,9 +334,10 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
                握り潰されずトップレベルまで上がれば repl.c / cc_load が報告する */
             return os_signal_io_error("load", path, err_msg, env);
         }
-        /* 打ち切り件数は受け取らない(0を渡す)。LOADの戻り値は従来どおり
-           「打ち切りがあってもg_sym_t」で、件数を使うのは同梱の読み込み(M1-T4)だけ */
-        return os_load_from_stream(&stream, path, env, 0);
+        /* [#197] **件数を受け取る。** LOADの戻り値は従来どおり
+           「打ち切りがあってもg_sym_t」のままで、受け取った件数は直列線へ出すだけである
+           (load_one_fileの注記) */
+        return load_one_file(&stream, path, env);
     }
 
     /* 絶対パスはマウント表で解決する。relativeの容量はSTREAM_PATH_MAX
@@ -180,7 +354,7 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
         if (!os_stream_open_9p_file(&stream, relative, err_msg, sizeof(err_msg))) {
             return os_signal_io_error("load", path, err_msg, env);
         }
-        return os_load_from_stream(&stream, path, env, 0);
+        return load_one_file(&stream, path, env);  /* [#197] 件数を受け取る */
     }
 
     if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
@@ -211,7 +385,7 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
            (os_load_from_streamがそうしている。M2-T0 / #196) */
         lisp_val_t handle = os_make_stream(raw);
         GC_PROTECT(handle);
-        return os_load_from_stream(os_stream_from_handle(handle), path, env, 0);
+        return load_one_file(os_stream_from_handle(handle), path, env);  /* [#197] 件数を受け取る */
     }
 
     /* [#193 の決定] **ホスト共有へ落とさない。**

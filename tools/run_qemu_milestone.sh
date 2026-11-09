@@ -57,12 +57,18 @@ if [ "$1" = "--self-test" ]; then
     ok=0
     # $0 は相対の場合があるので、cd する前に絶対パスへ直す
     self_script=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-    _run() {   # $1=説明 $2=期待rc $3=期待flake件数 $4=qemuコマンド
+    # 打ち切りログの名前。**$5 ではなく変数で渡す。**
+    # 位置引数を足すと、合否の一行を書く行が行末でなくなり、その行に
+    # `PASS-LINE:` の印を置けなくなる(印は**その行に**置く決まり。
+    #  tools/check_pass_line.py)。印の置けない形にしてはいけない
+    abort_log=""
+    _run() {   # $1=説明 $2=期待rc $3=期待flake件数 $4=qemuコマンド。打ち切りログは $abort_log
         # **set -e で落ちないように `|| rc=$?` で受ける**(部分シェルが 1 を返す
         #  のは期待どおりの経路であり、そこで打ち切ってはいけない)
         rc=0
         ( cd "$self_dir" && mkdir -p tmp \
-          && QEMU_FLAKE_LOG=tmp/f.txt sh "$self_script" "m.lisp" "$4" >out.txt 2>&1 ) || rc=$?
+          && QEMU_FLAKE_LOG=tmp/f.txt LOAD_ABORT_LOG="$abort_log" \
+             sh "$self_script" "m.lisp" "$4" >out.txt 2>&1 ) || rc=$?
         n=$(wc -l < "$self_dir/tmp/f.txt" 2>/dev/null | tr -d ' ' || true)
         n=${n:-0}
         if [ "$rc" = "$2" ] && [ "$n" = "$3" ]; then
@@ -71,7 +77,8 @@ if [ "$1" = "--self-test" ]; then
             echo "FAIL($1): rc=$rc flake=$n 件。期待は rc=$2 flake=$3" >&2
             ok=1
         fi
-        rm -f "$self_dir/tmp/f.txt" "$self_dir/test-results.txt" "$self_dir/tmp/.try"
+        rm -f "$self_dir/tmp/f.txt" "$self_dir/test-results.txt" "$self_dir/tmp/.try" \
+              "$self_dir/tmp/serial.txt"
     }
     echo "[self-test] QEMU ミルストンの再試行(結果が無いときだけ)"
     _run "陽性対照1・結果が無い(2 回とも)" 1 1 "true"
@@ -86,6 +93,19 @@ if [ "$1" = "--self-test" ]; then
     # **旧判定(部分一致)はこれを通していた。** 結果は出ているので再試行しない
     _run "陽性対照4・偽造された合否の一行 -> 落ちる(再試行しない)" 1 0 \
          'printf "[NG] (f) => expected \" 0 failed\" but got x\n==== isiki tests: 1 passed, 5 failed ====\n" > test-results.txt'  # PASS-LINE: FIXTURE 偽造(1)の資料。本物の一行は 5 failed である
+    # [#197] **6 本目から: 合否の一行は通るが、読み込みが半分欠けている。**
+    # 合否の一行だけを見ていた頃はこれを通していた。**再試行はしない**(結果は出ている)
+    abort_log=tmp/serial.txt
+    _run "陽性対照5・読み込みの打ち切りがある -> 落ちる(再試行しない)" 1 0 \
+         'printf "==== isiki tests: 7 passed, 0 failed ====\n" > test-results.txt; printf "[load] abort x.lisp: uncaught catch-exit (throw with no matching catch)\n[load] file x.lisp: aborted 1\n[load] aborted top-level forms: 1\n" > tmp/serial.txt'  # PASS-LINE: FIXTURE 合否は通るが打ち切りがある偽の成果物(陽性対照5)
+    # 陰性対照: 同じ配線で、打ち切りが 0 件なら通ること(**行はある**)
+    _run "陰性対照・打ち切り 0 件の行がある -> 通る" 0 0 \
+         'printf "==== isiki tests: 7 passed, 0 failed ====\n" > test-results.txt; printf "[load] aborted top-level forms: 0\n" > tmp/serial.txt'  # PASS-LINE: FIXTURE 同じ配線の陰性対照(打ち切り 0 件)
+    # 陽性対照: **行が無い**とき(ゲストが 1 周の終わりまで行かなかった形)
+    _run "陽性対照6・打ち切りの行が出ていない -> 落ちる" 1 0 \
+         'printf "==== isiki tests: 7 passed, 0 failed ====\n" > test-results.txt; printf "booting\n" > tmp/serial.txt'  # PASS-LINE: FIXTURE 打ち切りの行が出ない形(陽性対照6)
+    abort_log=""
+
     if [ "$ok" = 0 ]; then
         echo "self-test 成功: **結果が無いときだけ再試行し、失敗は再試行しない**ことを確かめた"
         exit 0
@@ -96,6 +116,11 @@ fi
 MILESTONE="$1"
 QEMU_CMD="$2"
 FLAKE_LOG="${QEMU_FLAKE_LOG:-tmp/qemu_flakes.txt}"
+# [#197] 直列線のログ(読み込みの打ち切りの件数が出る)。
+# **空なら判定しない。** 呼び出し側が自分で -serial を渡した周は、ゲストの COM1 が
+# 別のファイルへ行っているので、ここで見ると**空のログを 0 件と読む**ことになる
+# (Makefile の LOAD_ABORT_LOG の注記)。「見ていない」を「0 件」と言わない
+LOAD_ABORT_LOG="${LOAD_ABORT_LOG:-}"
 MAX_ATTEMPTS="${QEMU_MILESTONE_ATTEMPTS:-2}"
 
 if [ -z "$MILESTONE" ] || [ -z "$QEMU_CMD" ]; then
@@ -108,6 +133,13 @@ mkdir -p tmp
 attempt=1
 while :; do
     rm -f .qemu-test-trigger test-results.txt
+    # 前の試行のログを残さない(-serial file: は開くときに切り詰めるが、
+    # QEMU が起動しなかった周では古いログがそのまま残ってしまう)
+    # **`[ ... ] && rm` と書かないこと。** set -e のもとでは、空のときに
+    # 判定が偽になった時点でスクリプトがそこで終わる(黙って 1 周を飛ばす)
+    if [ -n "$LOAD_ABORT_LOG" ]; then
+        rm -f "$LOAD_ABORT_LOG"
+    fi
     echo "$MILESTONE" > .qemu-test-trigger
 
     # QEMU 自身が 0 以外で終わることもある(イメージのロック等)。
@@ -125,6 +157,19 @@ while :; do
         # 判定は 1 箇所に寄せた。**口が 3 つに分かれていたのが穴の元**なので、
         # Makefile の test-qemu も同じ者を呼ぶ。
         if python3 "$(dirname "$0")/check_pass_line.py" --verify test-results.txt; then
+            # [#197] **合否の一行が通っても、読み込みが半分欠けていないかは別に見る。**
+            # 合否の一行は「走った検査」の話で、**読まれなかった最上位の式**は
+            # 数えていない。打ち切りの件数はゲストが直列線へ出す
+            # (0 件でも 1 行出る。行が無ければここで落ちる)
+            if [ -n "$LOAD_ABORT_LOG" ]; then
+                if ! python3 "$(dirname "$0")/check_load_abort_line.py" \
+                        --verify "$LOAD_ABORT_LOG"; then
+                    echo "" >&2
+                    echo "NG: $MILESTONE は合否の一行は通ったが、**読み込みの打ち切り**で落ちました。" >&2
+                    echo "    結果は出ているので flake ではありません。**再試行しません**" >&2
+                    exit 1
+                fi
+            fi
             exit 0
         fi
         # **結果があって失敗している = 本物の失敗。再試行しない。**

@@ -187,6 +187,35 @@ static const char *captured(void) {
     return g_capture_buf;
 }
 
+// ---------------------------------------------------------------------------
+// [#197] **直列線へ出た行を捕まえる。**
+//
+// load.cはos_diag_serial_writeを直接呼ばない(load.hのos_load_set_diag_writer
+// の注記)。差せる形にしてあるので、**母艦が実際に読む文字列そのもの**を
+// 単体試験から読める。#197の完了条件は「構文ごとに数えられるかを**実測した表**」で、
+// 読みで埋めてはいけない。その実測をここで行う(QEMUを1周回さずに済む)。
+// ---------------------------------------------------------------------------
+
+#define DIAG_BUF_SIZE 2048
+static char g_diag_buf[DIAG_BUF_SIZE];
+static UINT32 g_diag_len = 0;
+
+static void diag_capture(const char *s) {
+    while (*s != '\0' && g_diag_len < DIAG_BUF_SIZE - 1) {
+        g_diag_buf[g_diag_len++] = *s++;
+    }
+}
+
+static void reset_diag(void) {
+    g_diag_len = 0;
+    g_diag_buf[0] = '\0';
+}
+
+static const char *diag_captured(void) {
+    g_diag_buf[g_diag_len] = '\0';
+    return g_diag_buf;
+}
+
 #define HEAP_SIZE (1024 * 1024)
 
 static void setup_heap(void) {
@@ -195,6 +224,8 @@ static void setup_heap(void) {
     os_heap_init((UINT64)heap, HEAP_SIZE);
     os_bootstrap();
     os_register_load();
+    /* [#197] 直列線の出し口を捕まえる側へ差す(実機ではos_diag_serial_write) */
+    os_load_set_diag_writer(diag_capture);
 }
 
 static void setup_process(void) {
@@ -419,6 +450,168 @@ static void test_load_from_stream_syntax_error_signals(void) {
 
     assert(result == g_sym_eval_error, "構文エラーはcc_loadと同じくsignalへ回る");
     assert(aborted == 0, "構文エラーは打ち切り件数には数えない");
+}
+
+
+// ===========================================================================
+// [#197] 構文ごとに「打ち切りとして数えられるか」を**実測する**
+//
+// 予測は documents/load-abort-visibility.md §2-1 に**実測より前に**宣言してある
+// (規則 11)。ここはその答え合わせであり、同時に将来の回帰を固定する検出器である。
+//
+// **なぜ表にするのか。** 調査(docs/investigation/detector-t4-passline.refs.md §C-2)は
+// 「宛先が %TOP-LEVEL かつ MAGIC_BLOCK_EXIT のときだけ打ち切りになる」ことまでは
+// 確かめたが、**go / tagbody 由来の脱出が同じ分類に入るかは読んでいない**と
+// ★ を立てていた。読みで埋めてはいけないので、構文ごとに1件ずつ置いて数える。
+//
+// **数えてはいけない3つ(block / catch / tagbody が自分で捕まえる形)を
+// 対照群として同じ表に入れてある。** 誤検出(正常な脱出を打ち切りと呼ぶ)は
+// 「1周で誤って鳴る」形で効くので、陰性対照を同じ仕掛けで見る必要がある。
+//
+// **ここで測れないもの:** 条件クラスを1つも登録していない試験環境では
+// signal が g_sym_eval_error で素通りする(runtime.c の os_signal_condition の注記)。
+// したがって
+//   - 宛先が生きていない return-from(<control-error> を signal する経路)
+//   - 引数不足などの素のエラー
+// の2つは**この試験では測れない**。実機(QEMU)側で測る。
+// ===========================================================================
+
+typedef struct {
+    const char *label;        // 表の行の名前
+    const char *src;          // 最上位に置く1つの式
+    int expect_counted;       // 打ち切りとして数えられるべきか
+    const char *expect_in_diag; // 直列線の理由に含まれるべき文字列(0なら見ない)
+} abort_case_t;
+
+static const abort_case_t g_abort_cases[] = {
+    // 数えるべき側
+    {"A  (return-from %top-level 9)",
+     "(return-from %top-level 9)\n", 1, "[load] abort "},
+    {"E  (throw 'tg 1) / catch 無し",
+     "(throw 'tg 1)\n", 1, "uncaught catch-exit"},
+    {"G  (go nowhere) / tagbody 無し",
+     "(go nowhere)\n", 1, "uncaught go-exit"},
+    {"H  (tagbody (go nowhere)) / 宛先のタグが無い",
+     "(tagbody (go nowhere))\n", 1, "uncaught go-exit"},
+    // 数えてはいけない側(陰性対照)
+    {"B  (block b (return-from b 1))",
+     "(block b (return-from b 1))\n", 0, 0},
+    {"D  (catch 'tg (throw 'tg 1))",
+     "(catch 'tg (throw 'tg 1))\n", 0, 0},
+    {"F  (tagbody (go done) ... done)",
+     "(tagbody (go done) (setq f197-x 1) done)\n", 0, 0},
+};
+
+static void test_load_counts_every_kind_of_escape(void) {
+    reset_fake_state();
+    uninstall_fake_report();
+
+    printf("  [#197] 構文ごとの実測(1 = 数えられる / 0 = 数えられない):\n");
+    for (UINT32 i = 0; i < sizeof(g_abort_cases) / sizeof(g_abort_cases[0]); i++) {
+        const abort_case_t *c = &g_abort_cases[i];
+        reset_capture();
+        reset_diag();
+        os_load_abort_stats_reset();
+
+        /* **「直す前」の列を同じ試験の中で測る。**
+           os_eval_top_level_ex は今回**変えていない**ので、この関数だけに
+           同じ式を食わせれば「直す前は数えられたか」がそのまま出る。
+           別の木を建てずに陽性対照が取れる(規則 8)。
+           ここで出る 0 が、調査 §C-2 の「数えられていない脱出」そのものである */
+        int eval_only = 0;
+        {
+            UINT8 buf[256];
+            UINT32 n = 0;
+            while (c->src[n] != '\0' && n < sizeof(buf)) {
+                buf[n] = (UINT8)c->src[n];
+                n++;
+            }
+            os_stream_t probe;
+            os_stream_open_string_input(&probe, buf, n);
+            lisp_val_t form = os_read_stream(&probe);
+            GC_PROTECT(form);
+            os_eval_top_level_ex(form, global_environment, &eval_only);
+        }
+        reset_capture();
+        reset_diag();
+        os_load_abort_stats_reset();
+
+        int aborted = 0;
+        lisp_val_t result = call_load_from_stream(c->src, "<memory>", &aborted);
+
+        int counted = os_load_aborted_total();
+        printf("    %-46s 直す前=%d 直した後=%d 第4引数=%d 直列線=%s",
+               c->label, eval_only, counted, aborted, diag_captured());
+        if (g_diag_len == 0) {
+            printf("(無し)\n");
+        }
+
+        assert(result == g_sym_t,
+            "どの構文でもloadは最後まで読んでg_sym_tを返す(契約は変えていない)");
+        if (c->expect_counted) {
+            assert(counted == 1, "この構文の脱出は打ち切りとして**数えられる**");
+            if (c->expect_in_diag != 0 && strncmp(c->expect_in_diag, "uncaught", 8) == 0) {
+                /* **穴そのものを固定する。** この3つは os_eval_top_level_ex だけでは
+                   0 のまま = 直す前は数えられていなかった(調査 §C-2)。
+                   ここが 1 に変わったら、脱出の分類が変わったということなので、
+                   load の輪の側の判定を見直す合図である */
+                assert(eval_only == 0,
+                    "宛先の無い脱出は os_eval_top_level_ex 単独では数えられない(直す前の形)");
+            }
+            assert(aborted == 1, "第4引数(呼び元が渡す数え先)にも同じ1件が入る");
+            assert(strstr(diag_captured(), c->expect_in_diag) != NULL,
+                "直列線に理由の1行が出る(母艦が読むのはこの文字列である)");
+        } else {
+            assert(counted == 0, "自分で捕まえる脱出は打ち切りではない(陰性対照)");
+            assert(g_diag_len == 0, "打ち切りでなければ直列線へ何も出さない(誤検出しない)");
+        }
+    }
+}
+
+// [#197] **0 を渡していた呼び元(cc_loadの3経路)が数えるようになったこと。**
+// 以前は加算が `if (out_aborted_count != 0)` の中にあったため、
+// 0 を渡す呼び元では**加算自体が起きていなかった**(= 捨てられていたのではなく
+// 数えられていなかった)。ここが#197の真因である
+static void test_cc_load_counts_and_names_the_file(void) {
+    reset_fake_state();
+    reset_capture();
+    reset_diag();
+    os_load_abort_stats_reset();
+    install_fake_report();
+    set_fake_data("(setq f197-a 1)\n(return-from %top-level 9)\n(setq f197-b 2)\n");
+
+    lisp_val_t result = call_load("fake/half.lisp");
+
+    assert(result == g_sym_t, "cc_loadの戻り値は従来どおりg_sym_t(契約は変えない)");
+    assert(os_load_aborted_total() == 1,
+        "**通常のloadでも総数が増える**(以前は0を渡していたので増えなかった)");
+    assert(strstr(diag_captured(), "[load] file fake/half.lisp: aborted 1") != NULL,
+        "**どのファイルで何件欠けたか**が直列線に出る(総数だけでは直せない)");
+    assert(strstr(diag_captured(), "[load] abort fake/half.lisp: p2 load reported") != NULL,
+        "理由も直列線に出る(画面だけに出す形では母艦から見えない)");
+    uninstall_fake_report();
+}
+
+// [#197] **0件でも1行出す。** 出ないことを成功と読ませてはいけない
+// (#204 / #208で学んだ形)。母艦側はこの行が無ければ落ちる
+static void test_report_line_is_emitted_even_for_zero(void) {
+    reset_diag();
+    os_load_abort_stats_reset();
+
+    os_load_report_aborts();
+
+    assert(strcmp(diag_captured(), "[load] aborted top-level forms: 0\n") == 0,
+        "打ち切りが0件でも総数の1行を必ず出す");
+
+    // 陽性対照: 件数が入れば同じ行がその数で出る
+    reset_diag();
+    int aborted = 0;
+    call_load_from_stream("(throw 'tg 1)\n(go nowhere)\n", "<memory>", &aborted);
+    reset_diag();
+    os_load_report_aborts();
+    assert(strcmp(diag_captured(), "[load] aborted top-level forms: 2\n") == 0,
+        "2件の脱出(catchの無いthrowとtagbodyの無いgo)が総数に積まれる");
+    os_load_abort_stats_reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +895,11 @@ int main(int argc, char **argv) {
     test_load_from_stream_counts_aborted_forms();
     test_load_from_stream_accepts_null_count();
     test_load_from_stream_syntax_error_signals();
+
+    // [#197] 構文ごとの実測と、母艦へ出る行
+    test_load_counts_every_kind_of_escape();
+    test_cc_load_counts_and_names_the_file();
+    test_report_line_is_emitted_even_for_zero();
 
     test_load_from_wrapped_stream_survives_gc();
     test_load_protects_env_across_open();
