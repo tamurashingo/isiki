@@ -29,7 +29,9 @@
  *             (9P経由ならパスそのもの)
  * @param env 評価に使う環境(読んだ各S式もこのenvで評価される)
  * @param out_aborted_count 打ち切られたフォームの件数を**加算**する先。
- *        不要なら0を渡す(呼び出し元が数えない場合は何も起きない)
+ *        不要なら0を渡せる。**ただし総数(os_load_aborted_total)はこことは無関係に
+ *        必ず数える**(#197)。以前はこの引数が0の呼び元では加算自体が起きず、
+ *        「捨てられていた」のではなく**最初から数えられていなかった**
  * @return 最後まで読めればg_sym_t。構文エラー・I/Oエラーのときは
  *         os_signal_io_errorの戻り値(signalが上がるので通常は戻らない)
  */
@@ -78,5 +80,55 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env);
 
 /** LOADをglobal_environmentに関数として登録する */
 void os_register_load(void);
+
+/* ===================== [#197] 打ち切りを母艦から見えるようにする =====================
+ *
+ * **loadの意味は変えない。** 上の契約(「打ち切りは失敗にならない」)はそのままで、
+ * 変えるのは「母艦から見えるか」だけである。打ち切りの理由は従来
+ * proc->stdout_buffer(= 画面)にしか出ず、-display noneで走るQEMU試験の
+ * 母艦側からは**何も見えなかった**。結果として「ファイルが半分だけ静かに欠ける」
+ * 事故が成果物に痕跡を残さない(docs/investigation/detector-t4-passline.logic.md §4-3)。
+ *
+ * **Lisp側へ組み込み関数で渡す案は採らない。** native関数を1つ足すと小さいヒープの
+ * 試験が固まる罠がある(SMALL_HEAP_SIZEの再調整が必要。documents/pitfalls.md)。
+ * 前例に寄せて**Cで数えて直列線へ出す**(kernel.cの9Pの無い起動の要約と同じ形)。
+ *
+ * 出る行は3種類で、**どれも合否の一行に似せていない**
+ * (tools/check_pass_line.pyの在庫に引っかからないようにするため):
+ *
+ *   [load] abort <名前>: <理由>              打ち切り1件ごと。**なぜ**欠けたか
+ *   [load] file <パス>: aborted <件数>       ファイル1本ごと。**どのファイル**か
+ *   [load] aborted top-level forms: <総数>   1周の終わりに1回。**0件でも出す**
+ *
+ * 母艦側の判定はtools/check_load_abort_line.py 1箇所。
+ */
+
+/**
+ * 診断の1行を書き出す先を差す(既定は0 = どこへも出さない)。
+ *
+ * **load.cからos_diag_serial_writeを直接呼ばないのは2つの理由からである。**
+ *   1. 単体試験(test/c/load_test.c)はinterrupt.cをリンクしない。直接呼ぶと
+ *      ダミー実装を足すことになり、**出た行そのものを試験から読めない**
+ *   2. 差せる形にしておけば、構文ごとに何が出るかを単体試験で**実測**できる
+ *      (#197の完了条件が「読みで埋めない表」を要求している)
+ *
+ * @param writer 1行(改行込み)を受け取る関数。0なら何も出さない
+ */
+void os_load_set_diag_writer(void (*writer)(const char *));
+
+/** 打ち切りの総数を0に戻す(1周の頭、または単体試験の各ケースの頭で呼ぶ) */
+void os_load_abort_stats_reset(void);
+
+/** これまでに数えた打ち切りの総数(**out_aborted_countを渡さない呼び元のぶんも入る**) */
+int os_load_aborted_total(void);
+
+/**
+ * 1周の終わりに総数の1行を直列線へ出す。**0件でも必ず出す。**
+ *
+ * **出ないことを成功と読ませてはいけない。** 行が無ければ母艦側が落ちるようにして
+ * ある(#204 / #208で学んだ形。「段がまるごと走らなくても何も出ない」が
+ * 最も危ない形である)。
+ */
+void os_load_report_aborts(void);
 
 #endif /* _LOAD_H_ */

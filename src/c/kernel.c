@@ -93,6 +93,14 @@ static char g_qemu_test_boot_script[256] = "test/lisp/qemu_boot_test.lisp";
 /** g_qemu_test_boot_scriptが指すboot-entryスクリプトをcc_loadしてからpower_offする(process 0専用スタック上で実行される) */
 static void run_qemu_boot_test(void) {
     cc_load(os_make_cons(os_make_string(g_qemu_test_boot_script), nil), global_environment);
+    /* [#197] **1周の終わりに打ち切りの総数を直列線へ出す。0件でも出す。**
+       cc_loadは打ち切りがあってもg_sym_tを返し、理由は画面(stdout_buffer)にしか
+       出ないので、-display noneで走るこの経路では**母艦から何も見えなかった**。
+       ここより前(cc_loadの中)で止めないのはloadの契約を変えないためである
+       (src/c/load.hの「打ち切りは失敗にならない」)。判定は母艦側に置く:
+       tools/check_load_abort_line.py。**行が無ければ母艦が落ちる**ようにしてあるので、
+       この呼び出しを消すと静かに緑になるのではなく落ちる */
+    os_load_report_aborts();
 #ifdef ISIKIOS_ALIGN_AUDIT
     /* [調査] 16byte境界監査(ALIGN_AUDIT=1ビルドのみ)。boot-entryスクリプトを
        変えずにどのQEMU試験でも集計が取れるよう、電源断の直前でシリアルへ出す */
@@ -311,6 +319,11 @@ static void run_boot_smoke(void) {
     smoke_ck("app-hello-42",
              SMOKE_EVAL("(isiki-hello)", &value) && value == os_make_fixnum(42));
 
+    /* [#197] 打ち切りの総数。**9Pの無い起動もloadを使う段である**
+       (app-disk-loadが(load "/app/hello.lisp")を走らせる)。0件でも出す。
+       要約の1行より**前**に出すのは、ホストが最後にgrepするのが要約の1行だから */
+    os_load_report_aborts();
+
     /* まとめ。**ホスト側はこの1行をgrepする** */
     char msg[BOOT_MSG_MAX];
     UINT32 pos = boot_msg_append(msg, 0, "[no9p] ");
@@ -407,6 +420,12 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     os_register_mount_native_subprimitives();
     os_register_bench_subprimitives();
     os_register_load();
+    /* [#197] 打ち切りの診断を**直列線へ**出せるようにする。load.cから
+       os_diag_serial_writeを直接呼ばないのは、単体試験がinterrupt.cをリンクせず、
+       かつ「出た行そのもの」を試験から読めるようにしておきたいからである
+       (load.hのos_load_set_diag_writerの注記)。**同梱の読み込みより前に差す**
+       (run_boot_entryはこのあとに走る) */
+    os_load_set_diag_writer(os_diag_serial_write);
     os_register_eval_primitives();
     os_register_streams();
     os_register_format();

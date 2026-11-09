@@ -239,7 +239,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test check-load-abort-line-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -406,6 +406,24 @@ check-pass-line:
 # 効いていると言えないため)
 check-pass-line-self-test:
 	@python3 tools/check_pass_line.py --self-test
+
+# [#197] **陽性対照。この段は落ちるのが正しい。**
+# 読み込みの打ち切りが実機で母艦へ出ることを 1 段で確かめる。
+# **test-qemu-all には入れない**(落ちる段を 1 周に混ぜない)。
+# 合否の一行は通り、そのあとで打ち切りの判定が落ちる = 「合否の一行だけを
+# 見ていたら気づけなかった」ことの対照である。記録は
+# documents/load-abort-visibility.md §3
+.PHONY: test-qemu-load-abort-positive
+test-qemu-load-abort-positive:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_load_abort_positive.lisp
+
+# [#197] **読み込みの打ち切りが母艦に残っているか**を見る。件数の照合(#204)でも
+# 合否の一行(#205)でもなく、**読み込まれなかった最上位の式の数**を見る。
+# 判定そのもの(--verify)は test-qemu / run_qemu_milestone.sh / test-qemu-no-9p-run が
+# 呼ぶ。ここで make test に入れるのは自己試験のほうで、合成したログで対照を見る(規則 8)
+.PHONY: check-load-abort-line-self-test
+check-load-abort-line-self-test:
+	@python3 tools/check_load_abort_line.py --self-test
 
 # 名簿そのものを見る(段の数と合計は**導出して出す**。規則 13)
 .PHONY: print-test-count-roster
@@ -696,7 +714,7 @@ check-small-heap-knob: | $(BUILD_TMPDIR)
 		exit 1; \
 	fi
 
-test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test check-load-abort-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
@@ -1211,6 +1229,7 @@ test-qemu-no-9p-run: build $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 		-no-reboot
 	@echo '--- シリアル出力 ---'
 	cat $(BUILD_TMPDIR)/no9p.serial.txt
+	@python3 tools/check_load_abort_line.py --verify $(BUILD_TMPDIR)/no9p.serial.txt
 	@python3 tools/check_test_count_ratchet.py --stage test-qemu-no-9p-run \
 		--log $(BUILD_TMPDIR)/no9p.serial.txt || \
 		{ echo 'ERROR: 9Pを外した起動の判定が名簿と合っていない(内訳は上の行)。' >&2; \
@@ -1249,7 +1268,7 @@ test-qemu-m1-cost:
 # ResetSystemでQEMUを電源断する
 test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
-	rm -f .qemu-test-trigger test-results.txt
+	rm -f .qemu-test-trigger test-results.txt $(QEMU_SERIAL_LOG)
 	touch .qemu-test-trigger
 	qemu-system-x86_64 \
 		-m $(QEMU_MEM) \
@@ -1260,6 +1279,7 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		$(QEMU_SERIAL_FLAG) \
 		-no-reboot
 	rm -f .qemu-test-trigger
 	test -f test-results.txt
@@ -1270,6 +1290,9 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 # tools/check_pass_line.py の 1 箇所に寄せた。**判定の口が 3 つに分かれていたのが
 # 穴の元**なので、run_qemu_milestone.sh と同じ者を呼ぶ
 	python3 tools/check_pass_line.py --verify test-results.txt
+# [#197] **読み込みの打ち切りが 1 件も無かったこと。** 合否の一行は「走った検査」の
+# 話で、**読まれなかった式**は見ていない。行が無ければ落ちる(0 件でも出る行である)
+	python3 tools/check_load_abort_line.py --verify $(QEMU_SERIAL_LOG)
 
 # test-qemu(デフォルトのqemu_boot_test.lisp)はdevice.lisp/ide.lisp/fat16.lispを
 # loadしないため、IDE/FAT16milestoneはtest-qemuだけでは検証されない。この3つを
@@ -1472,6 +1495,21 @@ test-qemu-perf-read: $(PERF_READ_FAT16_IMG) $(PERF_READ_FAT32_IMG)
 # 単体実行では空のままで既存の振る舞いを変えない
 QEMU_EXTRA_FLAGS ?=
 
+# [#197] **直列線の受け先を既定で母艦のファイルへ落とす。**
+# 読み込みの打ち切りの件数と理由はゲストが直列線へ出す(src/c/load.c /
+# src/c/kernel.c)。既定では -serial が付いていないので**母艦から読めなかった**
+# (documents/load-abort-visibility.md)。
+#
+# **QEMU_EXTRA_FLAGS に -serial があるときは足さない。** 足すとゲストが書く COM1 が
+# こちらのファイルへ行き、呼び出し側(jit-identity / 計測プローブ / 文書の手順)が
+# 掴むのは ttyS1 = **黙って空のログ**になる。空のログを「一致」や「0 件」と
+# 読ませるのは、いま塞いでいる穴とまったく同じ族である。
+QEMU_SERIAL_LOG ?= $(BUILD_TMPDIR)/serial.txt
+QEMU_SERIAL_FLAG = $(if $(findstring -serial,$(QEMU_EXTRA_FLAGS)),,-serial file:$(PWD)/$(QEMU_SERIAL_LOG))
+# 判定に使うログ。自前の -serial を渡された周では**判定できないので空にする**
+# (「見ていない」を「0 件」と言わない)
+LOAD_ABORT_LOG = $(if $(QEMU_SERIAL_FLAG),$(QEMU_SERIAL_LOG),)
+
 # [GC監査] 塗り潰し(GC_PAINT=1)下で試験を流すための実行ターゲット。
 # test-qemu-milestoneとの違いは3点だけで、いずれも監査に必須のもの:
 #   1. AUDIT_TIMEOUT秒でQEMU自体をtimeoutで打ち切る(makeを殺すとQEMUが孤児に
@@ -1531,7 +1569,7 @@ test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
-	@tools/run_qemu_milestone.sh "$(MILESTONE)" 'qemu-system-x86_64 \
+	@LOAD_ABORT_LOG="$(LOAD_ABORT_LOG)" tools/run_qemu_milestone.sh "$(MILESTONE)" 'qemu-system-x86_64 \
 		-m $(QEMU_MEM) \
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
@@ -1540,6 +1578,7 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
+		$(QEMU_SERIAL_FLAG) \
 		$(QEMU_EXTRA_FLAGS) \
 		-no-reboot'
 
