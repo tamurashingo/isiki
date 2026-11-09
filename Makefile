@@ -239,7 +239,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -383,6 +383,19 @@ check-eval-error-budget:
 .PHONY: check-eval-error-budget-self-test
 check-eval-error-budget-self-test:
 	@python3 tools/check_eval_error_budget.py --self-test
+
+# [#204 / T3] **段ごとの試験件数の名簿**の照合器。本体は 1 周のログを食うので
+# QEMU が要る(test-qemu-all の最後と CI の最後で走る)。ここで make test に
+# 入れるのは**自己試験のほう**で、合成したログで陽性/陰性対照を見る(規則 8)。
+# 名簿自身の筋(知らない読み取り方が無いか・段の重複が無いか)もここで落ちる。
+.PHONY: check-test-count-ratchet-self-test
+check-test-count-ratchet-self-test:
+	@python3 tools/check_test_count_ratchet.py --self-test
+
+# 名簿そのものを見る(段の数と合計は**導出して出す**。規則 13)
+.PHONY: print-test-count-roster
+print-test-count-roster:
+	@python3 tools/check_test_count_ratchet.py --list
 
 # [性能測定] src/lisp/bench_jit.lisp と src/lisp/bench_interp.lisp が
 # 真実源(src/lisp/bench_aot.lisp)から生成したものと一致していることを固定する。
@@ -668,7 +681,7 @@ check-small-heap-knob: | $(BUILD_TMPDIR)
 		exit 1; \
 	fi
 
-test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
@@ -1159,8 +1172,17 @@ test-qemu-no-9p:
 # **アプリ専用ディスク($(APP_DISK_IMG))だけは渡す。** M2-T3(#195)で
 # 「9Pが無くてもディスクのアプリが読める」ことをここで判定するようになったため
 # (付けないとアプリが読めず、M2 の本番の判定が置けない)。
-# 判定の件数は src/c/kernel.c の run_boot_smoke が出す。**件数を増やしたら
-# 下の grep の数字も直すこと**(直し忘れると判定が合わなくなる)
+# 判定の件数は src/c/kernel.c の run_boot_smoke が出す。
+#
+# [#204 / T3] **件数の基準値はここに書かない。** 以前はこのレシピの grep が
+# 「8 passed, 0 failed」と件数まで直書きしていて、**件数を保守している場所が
+# 2 つ**(ここと名簿)になってしまう。基準値は
+# tools/check_test_count_ratchet.py の COUNTS 1 箇所に寄せ、ここからは
+# その照合器を 1 段ぶんの形(--stage)で呼ぶ。
+# **件数を増やしたら名簿のほうを直すこと**(照合器が落ちて数字を教える)。
+# なおこの段は `[no9p] ok` を 1 件 1 行で出す形で、合否の一行は出ない。
+# **`isiki tests:` だけを探す検査はこの段を黙って飛ばす**ので、
+# 名簿では読み取り方を `no9p` として明示している
 test-qemu-no-9p-run: build $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	rm -f $(BUILD_TMPDIR)/no9p.serial.txt
@@ -1174,9 +1196,11 @@ test-qemu-no-9p-run: build $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 		-no-reboot
 	@echo '--- シリアル出力 ---'
 	cat $(BUILD_TMPDIR)/no9p.serial.txt
-	@grep -q '\[no9p\] 8 passed, 0 failed' $(BUILD_TMPDIR)/no9p.serial.txt || \
-		{ echo 'ERROR: 9Pを外した起動の判定が「8 passed, 0 failed」になっていない。' >&2; \
+	@python3 tools/check_test_count_ratchet.py --stage test-qemu-no-9p-run \
+		--log $(BUILD_TMPDIR)/no9p.serial.txt || \
+		{ echo 'ERROR: 9Pを外した起動の判定が名簿と合っていない(内訳は上の行)。' >&2; \
 		  echo '  出力が1行も無いなら、立ち上がる前に止まっている(boot errorはPANIC行がシリアルへ出る)。' >&2; \
+		  echo '  件数の基準値は tools/check_test_count_ratchet.py の COUNTS にある。' >&2; \
 		  exit 1; }
 
 # [設計判断L5] 同梱を**外した**ビルドで、基盤ライブラリ未読込の状態そのものを
@@ -1254,8 +1278,24 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 # アプリを触っていなければ作り直す必要が無い(**アプリだけ入れ替えられる**という
 # この専用ディスクの目的そのもの)。他のフィクスチャを rm するのは、破壊的な試験が
 # 書き込んだ跡が次回の期待値を壊すためで、アプリのディスクは誰も書き込まない
+#
+# [#204 / T3] **1 周の出力を切らずにログへ落とし、最後に件数の名簿と突き合わせる。**
+# 段がまるごと走らなくても、合否の一行が出ないだけで誰も気づかなかった(#208)。
+# 名簿(tools/check_test_count_ratchet.py の COUNTS)に無い段・名簿より減った段・
+# 増えた段のどれでも落ちる。**段を回す所(test-qemu-all-stages)と包む所を
+# 分けてあるのは、ログを 1 本にまとめるため**で、段の並びは従来どおりである。
+# `tail` で切らないこと —— 切ると段を見落とす(T1 で実際に起きた)。
+QEMU_ALL_LOG = $(BUILD_TMPDIR)/qemu-all.log
+
 test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
+	mkdir -p $(BUILD_TMPDIR)
+	rm -f $(QEMU_ALL_LOG)
+	tools/qemu_stage_log.sh $(QEMU_ALL_LOG) - $(MAKE) test-qemu-all-stages
+	@python3 tools/check_test_count_ratchet.py --round all --log $(QEMU_ALL_LOG)
+
+# 段の並び。**ここに段を足したら名簿にも足すこと**(足さないと照合器が落ちる)
+test-qemu-all-stages:
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-no-embedded-init
 	$(MAKE) test-qemu-no-9p
