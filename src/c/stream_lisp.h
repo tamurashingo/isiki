@@ -20,19 +20,32 @@ lisp_val_t os_make_stream(os_stream_t *raw);
 os_stream_t *os_stream_from_lisp(lisp_val_t stream);
 
 /**
- * 組み込み関数OPEN-INPUT-STREAM。第一引数のパスの9Pファイルをopenしたstreamを返す。
- * @param args (path) pathはSTRING(9Pエクスポートルートから見た相対パス)
- * @param env 呼び出し時の環境(未使用)
- * @return 成功時STREAM、失敗時g_sym_eval_error
+ * 組み込み関数OPEN-INPUT-STREAM。第一引数のパスをopenしたstreamを返す。
+ *
+ * **パスはマウント表(os_mount_resolve)で解決する絶対パスである。**
+ * "/9p"配下は*mounts*に登録が無くても常にホスト共有へ解決される。
+ * FATへ解決された場合は**ファイル全体を一括で読み**、その中身を抱えた
+ * 文字列入力ストリームになる(= 以後の読み取りはディスクへ行かない)。
+ * どのマウントにも解決できなければ"no such mount"でsignalする。
+ * **loadだけはパスの基準が違う**(先頭に区切りが無ければホスト共有の
+ * エクスポートルートからの相対指定。load.hの契約を参照)。
+ *
+ * @param args (path) pathはSTRING(マウント表で解決する絶対パス)
+ * @param env 呼び出し時の環境(未使用。signalにはglobal_environmentを使う)
+ * @return 成功時STREAM。失敗時は<simple-error>をsignalする
+ *         (FATの運転手が非局所脱出した場合はその制御転送値をそのまま返す)
  */
 lisp_val_t cc_open_input_stream(lisp_val_t args, lisp_val_t env);
 
 /**
- * 組み込み関数OPEN-OUTPUT-STREAM。現在実行中プロセスの画面(stdout_buffer)への
- * 出力専用streamを返す(9P書き込み・シリアル出力は未サポートのため引数は無視する)。
- * @param args 未使用
- * @param env 呼び出し時の環境(未使用)
- * @return 画面出力用のSTREAM
+ * 組み込み関数OPEN-OUTPUT-STREAM。
+ * **第一引数がSTRINGならファイルへの出力**(open-output-fileと同じ実装。
+ * パスの扱いもcc_open_input_streamと同じくマウント表で解決する)。
+ * **引数が無ければ**現在実行中プロセスの画面(stdout_buffer)への出力streamを返す
+ * (これはこのカーネル独自の拡張で、(standard-output)の既定値になる)。
+ * @param args () または (path [element-class])
+ * @param env 呼び出し時の環境(ファイル経路へ渡す)
+ * @return 画面出力用またはファイル出力用のSTREAM
  */
 lisp_val_t cc_open_output_stream(lisp_val_t args, lisp_val_t env);
 

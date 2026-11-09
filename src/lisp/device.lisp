@@ -60,6 +60,29 @@
 (defun %device-handle (name)
   (%plist-get (cdr (assoc name (dynamic *devices*))) ':handle nil))
 
+;; (%device-named name) : *devices*の中で:nameがname(文字列)と一致する最初の
+;; エントリのキー(blk0等のシンボル)を返す(無ければnil)。
+;;
+;; **装置の名前(blk0/blk1/...)は探査順の連番なので、付けるディスクの構成が
+;; 変わると同じディスクの名前が動く**(block_device.cのos_block_device_probe_allは
+;; secondary-master -> secondary-slave -> primary-master -> primary-slave の順で、
+;; 検出できたものだけを詰めて番号を振る)。構成に依らず同じディスクを指したい
+;; 呼び出し側は、チャネルの名前("ide-secondary-slave"等)で引く。
+;; test/lisp/fat32_primary_boot_test.lispが各自に書いていた名前引きの共通化で、
+;; M2(#195)のアプリ専用ディスクはマウントの前段でこれを使う
+;; (9Pの無い起動でも使えるよう、AOT側のこのファイルに置く)。
+(defun %device-named (name)
+  (%device-named-loop name (dynamic *devices*)))
+
+;; (%device-named-loop name alist) : %device-namedの再帰ヘルパー。
+;; alistは*devices*と同じ((name . info-plist) ...)の形。
+(defun %device-named-loop (name alist)
+  (if (null alist)
+      nil
+      (if (string= (%plist-get (cdr (car alist)) ':name "") name)
+          (car (car alist))
+          (%device-named-loop name (cdr alist)))))
+
 ;; (%device-output-stream) : *standard-output*が動的束縛されていればそれを使い、
 ;; なければ画面への新規出力ストリームを開く(utility.lisp/ide.lispと同じ慣習)。
 (defun %device-output-stream ()

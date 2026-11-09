@@ -64,12 +64,40 @@
 
 (assert-error-class '<simple-error> (load "/9p/io-no-such-file.lisp"))
 (defglobal *io-c3* (io-catch (lambda () (load "/9p/io-no-such-file.lisp"))))
-(assert-equal "load: " (subseq (car (simple-error-format-arguments *io-c3*)) 0 6))
+(defglobal *io-msg3* (car (simple-error-format-arguments *io-c3*)))
+(assert-equal "load: " (subseq *io-msg3* 0 6))
+
+;; [M2-T2 / #193] **どちらの理由で落ちたのかを固定する。**
+;; この件は M2 で**失敗の理由が入れ替わったのに結果が同じ**になった:
+;;   以前: cc_load は *mounts* を引かず、"/9p/io-no-such-file.lisp" を
+;;         そのまま 9p のパスとして開いていた(9p のルート直下に "9p" という
+;;         入口が無いので落ちていた)
+;;   いま: マウント表で "/9p" が剥がされ、「ホスト共有配下の存在しないファイル」
+;;         として 9p の下位層で落ちる
+;; **どちらも <simple-error> なので、クラスだけ見ていると意図が変わったことに
+;; 誰も気づかない。** そこで「9p の下位層まで到達して、そこで落ちた」ことを
+;; 文面で固定する(= 下の「解決できない」件とは別の理由であることを残す)。
+;; 下位層の文面は src/c/virtio9p.c が組む。walk が通らないので "Twalk" で始まる
+;; (Rerror でも "Twalk: Rerror: ..." になる)。**ここが落ちたら、まず
+;; 9p の失敗段が変わったのか、マウント解決へ戻ってしまったのかを見分けること。**
+(assert-equal "load: /9p/io-no-such-file.lisp: Twalk" (subseq *io-msg3* 0 37))
+
+;; [M2-T1 / #193] **解決できない絶対パスはホスト共有へ落とさない。**
+;; 落とすと、割り当て名の綴り間違いがホスト共有の文面で失敗して原因が
+;; 分からなくなる。文面を丸ごと固定して、**上の件と理由が違うことを残す**
+(assert-error-class '<simple-error> (load "/no-such-mount/x.lisp"))
+(defglobal *io-c3b* (io-catch (lambda () (load "/no-such-mount/x.lisp"))))
+(assert-equal "load: /no-such-mount/x.lisp: no such mount"
+              (car (simple-error-format-arguments *io-c3b*)))
 
 ;; 構文エラーのあるファイルをその場で作って load する
-;; **load と open-*-file ではパスの基準が違う。** open-*-file は *mounts* を
-;; 引くので "/9p/..." だが、load(cc_load)は os_mount_resolve を通さず
-;; 9p のルートからの相対パスを直接開く。同じファイルを両方から指すので2つ持つ
+;; [M2-T1 / #193] **load と open-*-file でパスの基準が違うのは、
+;; 先頭に区切りが無い場合だけになった。**
+;;   先頭が '/' でない -> ホスト共有(9p)のルートからの相対指定。**マウント表は引かない**
+;;   先頭が '/'        -> open-*-file と同じくマウント表を引く
+;; 2 つのグローバルを持つのは、**この両方を同じファイルで試すため**である
+;; (以前は「load はマウント表を通らない」ので持っていた。理由が変わった)。
+;; **心覚え: 相対 = 母艦(開発時)、絶対 = 機械の中。**
 (defglobal *io-broken-path* "/9p/tmp/io_broken_p44.lisp")
 (defglobal *io-broken-load* "tmp/io_broken_p44.lisp")
 (defglobal *io-broken-out* (open-output-file *io-broken-path*))
@@ -95,7 +123,13 @@
 (write-char #\Space *io-ok-out*)
 (write-char #\7 *io-ok-out*) (write-char #\) *io-ok-out*)
 (close *io-ok-out*)
+;; [陰性対照] 先頭に区切りが無い名前は従来どおりホスト共有から読まれる
 (assert-equal t (load *io-ok-load*))
+(assert-equal 7 *io-ld*)
+;; [M2-T1 / #193] **同じファイルを "/9p/..." の絶対パスでも load できる。**
+;; こちらはマウント表(組み込みの "/9p")を引く経路である
+(setq *io-ld* 0)
+(assert-equal t (load *io-ok-path*))
 (assert-equal 7 *io-ld*)
 
 ;;; ---------------------------------------------------------------------------

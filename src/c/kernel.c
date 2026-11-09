@@ -191,7 +191,9 @@ static void load_embedded_lisp(const UINT8 *src, UINT32 len, const char *name) {
 
    **なぜC側に書くことになるのか。** 9Pが無いと、従来の試験の仕組みが3つとも使えない:
      - .qemu-test-trigger が開けない        -> 台本を指定できない(試験モードにならない)
-     - cc_load が9P専用                     -> そもそも台本を読めない
+     - 台本がホスト共有にある               -> そもそも台本を読めない
+       (cc_load 自体は M2-T1 / #193 でマウント経由になり**ディスクも読める**。
+        読めないのは引き金のファイルと台本の置き場所がホスト共有だからである)
      - test-results.txt が9P経由            -> 判定結果をホストへ渡せない
    残る線はシリアル(os_diag_serial_write)だけである(-display none では画面は見えない)。
    したがってこの段は「式を直接持ち、判定をシリアルへ出し、自分で電源断する」。
@@ -273,6 +275,41 @@ static void run_boot_smoke(void) {
        9Pの無い起動ではここが黙って欠けていた。** その回帰を押さえる */
     smoke_ck("disassemble-defined",
              os_get_function(os_make_symbol("DISASSEMBLE"), global_environment) != nil);
+
+    /* [M2-T3 / #195] **9Pを外した起動でも、ディスクのアプリが読めること。**
+       これがM2の「アプリをディスクに置けるようにする」の本番の判定である
+       (ホスト共有が有る間は、アプリがディスクに在る必要がそもそも無い)。
+
+       **装置の名前(blk0/blk1/...)は探査順の連番**で、付けるディスクの構成が
+       変わると動く。9Pの無い起動にはデータディスクが付かないので、ここでの
+       blk番号は他の段と違う。**だからチャネルの名前で引く**
+       (%device-named、src/lisp/device.lisp)。アプリ専用ディスクは
+       Makefileが**どの起動にもPrimaryのslaveとして**付けるので、
+       名前は常に "ide-primary-slave" である。
+
+       **自動の割り当ては1つも無い**ので、読む前にmountを呼ぶ前段が要る。
+       名前引きが外れていてもmountは(nil . :fat32)を積んで成功してしまうので、
+       **引けたこと自体を1件に分けて数える**(でないと「読めない」が
+       別の理由で出たときに見分けられない)。 */
+    value = nil;
+    smoke_ck("app-disk-named",
+             SMOKE_EVAL("(%device-named \"ide-primary-slave\")", &value) && value != nil);
+
+    value = nil;
+    smoke_ck("app-disk-mounted",
+             SMOKE_EVAL("(mount \"/app\" (%device-named \"ide-primary-slave\") ':fat32)",
+                        &value) && value != nil);
+
+    /* **ここが完了条件。** 絶対パスの `.lisp` をディスクから読む。
+       `.lisp`(拡張子4文字)が置けるのはFAT32だから(旧方式は8.3名のみ) */
+    value = nil;
+    smoke_ck("app-disk-load",
+             SMOKE_EVAL("(load \"/app/hello.lisp\")", &value) && value == g_sym_t);
+
+    /* 読めただけでなく**中身が評価されている**こと。定数ではなく計算させる */
+    value = nil;
+    smoke_ck("app-hello-42",
+             SMOKE_EVAL("(isiki-hello)", &value) && value == os_make_fixnum(42));
 
     /* まとめ。**ホスト側はこの1行をgrepする** */
     char msg[BOOT_MSG_MAX];
