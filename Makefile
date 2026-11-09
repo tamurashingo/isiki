@@ -237,7 +237,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -437,6 +437,10 @@ check-pr-claims-self-test:
 # 下の 2 つのヘルパは、その口がビルドの印と生成器の入力を**Makefile から
 # 直接**受け取るためにある。スクリプト側に書き写すと、Makefile を直したときに
 # 黙って食い違う(BUILD_FLAG_SIGNATURE は Makefile:91 付近が唯一の真実源)
+# QEMU のメモリ量を計測の記録へ埋めるための口(規則 9: 設定値は出力に埋める)
+print-qemu-mem:
+	@echo '$(QEMU_MEM)'
+
 print-build-flag-signature:
 	@echo '$(BUILD_FLAG_SIGNATURE)'
 
@@ -626,6 +630,41 @@ check-no-double-init-load:
 # 両方を検出できること、コメントの中のものは拾わないことを確かめる
 check-no-double-init-load-self-test:
 	@python3 tools/check_no_double_init_load.py --self-test
+
+# ====== [規則 8] SMALL_HEAP_SIZE のつまみが本当に効くことの陽性対照 ======
+# **「既定の 85KB で通った」だけでは、つまみが死んでいても同じ結果になる。**
+# 窓の余裕は 5KB 未満で、下側へ外すと **os_panic がユニット試験では無限ループに
+# なるためハングとして現れる**(test/c/runtime_test.c の掃引記録)。
+# そこで **意図的に下側へ外した値でビルドして、打ち切られることを確かめる**。
+#
+# **timeout はコンテナの中で効かせる**(`timeout N docker run ...` は docker
+# クライアントしか殺さず、ハングしたコンテナが生き残る。既知の罠)。
+# 打ち切り = exit 124 を**期待する**ので、124 以外なら落とす。
+#
+# make test には入れない(わざと 1 分ハングさせる段なので)。M1-T6 の記録用。
+SMALL_HEAP_KNOB_SIZE ?= 80000
+SMALL_HEAP_KNOB_TIMEOUT ?= 60
+check-small-heap-knob: | $(BUILD_TMPDIR)
+	@echo '[陽性対照] SMALL_HEAP_SIZE=$(SMALL_HEAP_KNOB_SIZE) で runtime_test をビルドして走らせる。'
+	@echo '           **ハング(timeout の exit 124)を期待する。** 通ってしまったら'
+	@echo '           つまみが効いていないか、窓が動いている。'
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST -DSMALL_HEAP_SIZE=$(SMALL_HEAP_KNOB_SIZE) \
+		-I$(SRCDIR) \
+		-o $(BUILD_TMPDIR)/runtime_test_knob $(TEST_SRC_RUNTIME) -lm
+	@rc=0; docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint timeout \
+		-v "$(PWD)":/workspace isiki-builder \
+		$(SMALL_HEAP_KNOB_TIMEOUT) /workspace/$(BUILD_TMPDIR)/runtime_test_knob > $(BUILD_TMPDIR)/small_heap_knob.log 2>&1 || rc=$$?; \
+	tail -3 $(BUILD_TMPDIR)/small_heap_knob.log; \
+	if [ "$$rc" = 124 ]; then \
+		echo '[陽性対照] 発火: $(SMALL_HEAP_KNOB_SIZE) byte では $(SMALL_HEAP_KNOB_TIMEOUT) 秒で打ち切られた(ハング)。'; \
+		echo '           **つまみは生きており、窓の下端は既定の 85KB より上にある。**'; \
+	else \
+		echo "ERROR: exit=$$rc。打ち切り(124)を期待していた。" >&2; \
+		echo '  つまみが効いていないか、窓が下へ広がっている。掃引し直すこと。' >&2; \
+		exit 1; \
+	fi
 
 test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
@@ -1086,6 +1125,24 @@ test-qemu-no-9p-run: build $(BOOT_FAT32_IMG)
 # 判定結果は9P経由のtest-results.txtなので、こちらは9Pを付けたまま走らせる
 test-qemu-no-embedded-init:
 	$(MAKE) NO_EMBEDDED_INIT=1 test-qemu-milestone MILESTONE=test/lisp/qemu_boot_no_init_signal.lisp
+
+# ============ [M1-T6 / issue #185] 同梱を起動ごとに読む費用を測る ============
+# **これは計測であって合否の判定ではない。合格線は決めない**(決定 D5 / D6。
+# docs/plans/local-load-and-core-image.md)。記録は documents/boot-embedded-init-cost.md。
+#
+# 同梱あり / 同梱なし(NO_EMBEDDED_INIT=1 = 陽性対照)を**順に**走らせて表に組む。
+# QEMU は直列なので並行させない。両者はビルドフラグが違うが、フラグは
+# BUILD_FLAG_SIGNATURE に入っているので make が自動で作り直す。
+#
+# **test-qemu-all には入れない。** 閾値を置かない計測なので、常時走らせても
+# 落ちる形が無い(落ちない検査は検出器ではない)。台本自身の不変条件
+# (使用量 < 総量)だけは test-qemu-m1-cost で単発に確かめられる。
+boot-cost:
+	tools/boot_cost_report.sh
+
+# 同梱ありの側だけを単発で走らせる(台本の不変条件の確認用)
+test-qemu-m1-cost:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m1_cost.lisp
 
 # isiki_test.lispをQEMU上で全自動実行し、test-results.txtの結果でpass/failを判定する。
 # .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
