@@ -6,6 +6,8 @@
 #include "eval.h"
 #include "process.h"
 #include "print.h"
+#include "mount.h"
+#include "stream_lisp.h"
 
 /** LOADの引数として渡せるパスの最大長(NUL終端込み) */
 #define LOAD_PATH_MAX 256
@@ -139,20 +141,83 @@ lisp_val_t cc_load(lisp_val_t args, lisp_val_t env) {
     os_string_to_cstr(cc_car(args), path, sizeof(path));
 
     char err_msg[LOAD_ERR_MSG_MAX];
-    os_stream_t stream;
-    if (!os_stream_open_9p_file(&stream, path, err_msg, sizeof(err_msg))) {
-        /* [P4-4] **load は ISLisp 仕様に無い**(実装独自)ので error-id の指定も無い。
-           open-input-file に揃えて <simple-error> を signal する
-           (クラスの選択理由は os_signal_io_error のコメント参照)。
-           以前はここで自前に1行表示してから EVAL-ERROR を返していたが、
-           condition のメッセージが同じ内容を運ぶので表示はやめる。
-           握り潰されずトップレベルまで上がれば repl.c / cc_load が報告する */
-        return os_signal_io_error("load", path, err_msg, env);
+
+    /* [M2-T1 / #193] **先頭が'/'でなければホスト共有(9p)のまま。**
+       マウント表は引かない。いまloadへ渡っている名前はほぼ全部この形で、
+       マウント表の解決は絶対パス前提なので、ここをマウント表へ回すと
+       **どのマウントにも解決できず全試験が1行も走らなくなる**
+       (docs/investigation/m2-load-from-disk.logic.md §8-2、.refs.md §B-2)。
+       **心覚え: 相対 = 母艦(開発時)、絶対 = 機械の中。**
+       9pのストリームはCのローカルでよい(os_stream_open_9p_fileはLispを
+       呼ばず確保もしないので、GCで動く心配が無い) */
+    if (path[0] != '/') {
+        os_stream_t stream;
+        if (!os_stream_open_9p_file(&stream, path, err_msg, sizeof(err_msg))) {
+            /* [P4-4] **load は ISLisp 仕様に無い**(実装独自)ので error-id の指定も無い。
+               open-input-file に揃えて <simple-error> を signal する
+               (クラスの選択理由は os_signal_io_error のコメント参照)。
+               以前はここで自前に1行表示してから EVAL-ERROR を返していたが、
+               condition のメッセージが同じ内容を運ぶので表示はやめる。
+               握り潰されずトップレベルまで上がれば repl.c / cc_load が報告する */
+            return os_signal_io_error("load", path, err_msg, env);
+        }
+        /* 打ち切り件数は受け取らない(0を渡す)。LOADの戻り値は従来どおり
+           「打ち切りがあってもg_sym_t」で、件数を使うのは同梱の読み込み(M1-T4)だけ */
+        return os_load_from_stream(&stream, path, env, 0);
     }
 
-    // 打ち切り件数は受け取らない(0を渡す)。LOADの戻り値は従来どおり
-    // 「打ち切りがあってもg_sym_t」で、件数を使うのは同梱の読み込み(M1-T4)だけ
-    return os_load_from_stream(&stream, path, env, 0);
+    /* 絶対パスはマウント表で解決する。relativeの容量はSTREAM_PATH_MAX
+       (stream.h:8-10 が「stream_lisp.c/load.c/mount.c で共有する規約」と
+        明記している。LOAD_PATH_MAXと同じ値だが、os_mount_resolveへ渡す
+        バッファなので規約側の名前を使う) */
+    char relative[STREAM_PATH_MAX];
+    lisp_val_t device = nil;
+    GC_PROTECT(device);
+    mount_kind_t kind = os_mount_resolve(path, relative, sizeof(relative), &device);
+
+    if (kind == MOUNT_KIND_9P) {
+        os_stream_t stream;
+        if (!os_stream_open_9p_file(&stream, relative, err_msg, sizeof(err_msg))) {
+            return os_signal_io_error("load", path, err_msg, env);
+        }
+        return os_load_from_stream(&stream, path, env, 0);
+    }
+
+    if (kind == MOUNT_KIND_FAT32 || kind == MOUNT_KIND_FAT16) {
+        UINT8 *data;
+        UINT32 len;
+        /* FATドライバ(Lisp)が非局所脱出したらそれをそのまま返す。拾わないと
+           **その経路のエラーだけが静かに消える**(stream_lisp.c の omission list)。
+           **GC_PROTECTは呼び出しより前に置くこと**(mount.c側が書き込んだ値が、
+           以後の確保で再配置されても追随するように) */
+        lisp_val_t transfer = nil;
+        GC_PROTECT(transfer);
+        if (!os_mount_fat_read_file(kind, device, relative, &data, &len, &transfer)) {
+            if (transfer != nil) {
+                return transfer;
+            }
+            /* **ファイルが無いことと空ファイルは区別できない**(FATドライバの
+               既知の制約。mount.c)。どちらもここへ来る */
+            return os_signal_io_error("load", path, "cannot read file", env);
+        }
+        /* [#49 / M6] os_stream_t(raw)はMAGIC_STREAMに包まれるまでGCから到達不能
+           なので、**確保を伴う処理をすべて終えてから、包む直前に**確保する
+           (cc_open_input_streamと同じ並び)。dataはos_mount_fat_read_file内で
+           os_alloc_raw済みの専有バッファなので、そのままstr_bufとして渡せる */
+        os_stream_t *raw = (os_stream_t *)os_alloc_raw(sizeof(os_stream_t));
+        os_stream_open_string_input(raw, data, len);
+        /* **包むのは必須である。** 包まないとGCで本体ごとバッファが消える。
+           包んだ以上、輪は反復ごとにself_handleから実体を取り直す
+           (os_load_from_streamがそうしている。M2-T0 / #196) */
+        lisp_val_t handle = os_make_stream(raw);
+        GC_PROTECT(handle);
+        return os_load_from_stream(os_stream_from_handle(handle), path, env, 0);
+    }
+
+    /* [#193 の決定] **ホスト共有へ落とさない。**
+       落とすと「割り当て名の綴り間違い」がホスト共有の文面で失敗して
+       原因が分からなくなる(logic.md §9-5)。文面は cc_open_input_stream と揃える */
+    return os_signal_io_error("load", path, "no such mount", env);
 }
 
 void os_register_load(void) {

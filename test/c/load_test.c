@@ -10,6 +10,8 @@
 #include "reader.h"
 #include "eval.h"
 #include "load.h"
+#include "mount.h"
+#include "stream_lisp.h"
 
 // stream.c/reader.c/load.c は virtio9p.c/p9.c/drivers/*.c をリンクしない。
 // cc_load/os_read_stream/os_stream_* が参照する外部シンボルだけダミー実装を置く。
@@ -20,6 +22,14 @@ static UINT8 g_fake_data[FAKE_DATA_MAX];
 static UINT32 g_fake_data_len = 0;
 static UINT32 g_fake_chunk_size = 5; // 0以外なら1回のTreadで返す最大バイト数(不揃いな再充填を再現するため小さめ)
 static int g_fake_open_fail = 0;
+
+// [M2-T1 / #193] **ホスト共有へ落ちていないことを数で見るための計器。**
+// 「解決できない絶対パスはホスト共有へ落とさない」は、openが呼ばれなかったことで
+// 固定する(signalの種類だけでは、9pのopenが失敗した場合と見分けが付かない)。
+// g_fake_open_pathは9pへ渡された最終的なパス(= マウント接頭辞を剥がした相対パス)
+static int g_fake_open_calls = 0;
+#define FAKE_OPEN_PATH_MAX 256
+static char g_fake_open_path[FAKE_OPEN_PATH_MAX];
 
 static void set_fake_data(const char *s) {
     UINT32 n = 0;
@@ -33,11 +43,14 @@ static void set_fake_data(const char *s) {
 static void reset_fake_state(void) {
     g_fake_open_fail = 0;
     g_fake_chunk_size = 5;
+    g_fake_open_calls = 0;
+    g_fake_open_path[0] = '\0';
 }
 
 int os_virtio9p_open(const char *path, UINT8 mode, UINT32 *out_fid, char *err_msg, UINT32 err_msg_cap) {
-    (void)path;
     (void)mode;
+    g_fake_open_calls++;
+    snprintf(g_fake_open_path, sizeof(g_fake_open_path), "%s", path);
     if (g_fake_open_fail) {
         if (err_msg != 0 && err_msg_cap > 0) {
             snprintf(err_msg, err_msg_cap, "fake open failure");
@@ -463,10 +476,11 @@ static void install_force_gc(void) {
 
 /**
  * MAGIC_STREAMに包んだ文字列入力ストリームを作る。
- * stream_lisp.cのos_make_stream / cc_create_string_input_streamと同じ手順だが、
- * load_testはstream_lisp.cをリンクしないのでここに写している
- * (バッファ・rawをos_alloc_rawで取り、包む直前まで確保を挟まない。
- *  [ファイルI/O]#49のGC安全性の作法。stream_lisp.c:152-157)。
+ * バッファ・rawをos_alloc_rawで取り、**包む直前まで確保を挟まない**
+ * ([ファイルI/O]#49のGC安全性の作法。stream_lisp.c)。
+ * 包むのは本物のos_make_stream(stream_lisp.c)である
+ * (M2-T1 / #193 でload.cがstream_lisp.cを要するようになり、
+ *  このテストもstream_lisp.cをリンクするようになった。以前は手で写していた)。
  * **FAT経由のopen-input-streamが作るストリームと同じ種別・同じ包み方である。**
  */
 static lisp_val_t make_wrapped_string_input(const char *src) {
@@ -480,14 +494,12 @@ static lisp_val_t make_wrapped_string_input(const char *src) {
     }
     os_stream_t *raw = (os_stream_t *)(lisp_addr_t)os_alloc_raw(sizeof(os_stream_t));
     os_stream_open_string_input(raw, buf, n);
-    lisp_val_t handle = os_make_instance(MAGIC_STREAM, (UINT64)(lisp_addr_t)(void *)raw, 0, 0);
-    ((os_stream_t *)(lisp_addr_t)((UINT64 *)(lisp_addr_t)(handle & ~TAG_MASK))[1])->self_handle = handle;
-    return handle;
+    return os_make_stream(raw);
 }
 
-/** MAGIC_STREAMハンドルから生ポインタを取り直す(stream_lisp.cのstream_rawと同じ) */
+/** MAGIC_STREAMハンドルから生ポインタを取り直す */
 static os_stream_t *wrapped_raw(lisp_val_t handle) {
-    return (os_stream_t *)(lisp_addr_t)((UINT64 *)(lisp_addr_t)(handle & ~TAG_MASK))[1];
+    return os_stream_from_handle(handle);
 }
 
 /**
@@ -567,6 +579,110 @@ static void test_load_protects_env_across_open(void) {
         "読んだフォームは**呼び出し元の(再配置後の)環境**で評価されている");
 }
 
+
+// ---------------------------------------------------------------------------
+// [M2-T1] #193: パスの契約 — **先頭の区切りで経路が分かれる**
+//
+//   先頭が'/'でない -> ホスト共有(9p)。マウント表は引かない
+//   先頭が'/'       -> マウント表で解決。"/9p"配下は組み込みで常に解決できる
+//   解決できない    -> **signalする。ホスト共有へ落とさない**
+//
+// docs/investigation/m2-load-from-disk.logic.md §8、.refs.md §B-2。
+// **ここをゲスト無しで固められるのは mount.c が TEST_SRC_LOAD に入っているから**
+// (*MOUNTS*はLisp側の動的変数なので、mount_test.cと同じ形で直接積める)。
+// ---------------------------------------------------------------------------
+
+/** *MOUNTS*へ(path device fs-type)のエントリを1件追加する(test/c/mount_test.cと同じ形) */
+static void add_mount(const char *path, const char *device_name, const char *fs_type_name) {
+    lisp_val_t path_val = os_make_string(path);
+    GC_PROTECT(path_val);
+    lisp_val_t device = os_make_symbol(device_name);
+    GC_PROTECT(device);
+    lisp_val_t fs_type = os_make_symbol(fs_type_name);
+    GC_PROTECT(fs_type);
+    lisp_val_t entry = os_make_cons(path_val, os_make_cons(device, fs_type));
+    GC_PROTECT(entry);
+    lisp_val_t sym = os_make_symbol("*MOUNTS*");
+    GC_PROTECT(sym);
+    lisp_val_t existing = os_get_dynamic(sym);
+    GC_PROTECT(existing);
+    os_set_dynamic(sym, os_make_cons(entry, existing));
+}
+
+static void reset_mounts(void) {
+    os_set_dynamic(os_make_symbol("*MOUNTS*"), nil);
+}
+
+/**
+ * [陰性対照] **先頭に区切りが無い名前は、根("/")を割り当てても9pのまま。**
+ * ここが崩れると、根を割り当てる試験(test/lisp/partition_test.lisp)の後続のloadが
+ * ディスクへ流れて落ちる(.refs.md §E-3)。「相対に'/'を補う」案を採らない理由そのもの。
+ */
+static void test_load_relative_path_stays_on_9p_even_with_root_mount(void) {
+    reset_fake_state();
+    reset_capture();
+    uninstall_fake_report();
+    reset_mounts();
+    add_mount("/", "BLK0", ":FAT32");
+    set_fake_data("(setq m2t1-rel 1)\n");
+
+    lisp_val_t result = call_load("test/lisp/x.lisp");
+
+    assert(result == g_sym_t, "先頭に区切りが無い名前のloadは根の割り当てがあっても成功する");
+    assert(g_fake_open_calls == 1, "ホスト共有のopenが1回だけ呼ばれた(FATへ流れていない)");
+    assert(strcmp(g_fake_open_path, "test/lisp/x.lisp") == 0,
+        "**渡した名前がそのまま9pへ行く**(マウント表を引かないので接頭辞の剥がしも無い)");
+    assert(os_get_variable(os_make_symbol("m2t1-rel"), global_environment) == os_make_fixnum(1),
+        "相対指定のloadは中身まで評価される");
+    reset_mounts();
+}
+
+/**
+ * **先頭が'/'なら、マウント表を引いて"/9p"を剥がしてから9pへ渡す。**
+ * 剥がさないと「9pのルート直下に9pという入口が無い」ことが理由で落ちる
+ * (いままで test/lisp/io_signal_test.lisp がそうなっていた)。
+ */
+static void test_load_absolute_9p_path_strips_prefix(void) {
+    reset_fake_state();
+    reset_capture();
+    uninstall_fake_report();
+    reset_mounts();
+    set_fake_data("(setq m2t1-abs 2)\n");
+
+    lisp_val_t result = call_load("/9p/test/lisp/x.lisp");
+
+    assert(result == g_sym_t, "'/9p'配下の絶対パスは*mounts*が空でもloadできる");
+    assert(g_fake_open_calls == 1, "ホスト共有のopenが1回だけ呼ばれた");
+    assert(strcmp(g_fake_open_path, "/test/lisp/x.lisp") == 0,
+        "9pへ渡るのは'/9p'を剥がした相対パス");
+    assert(os_get_variable(os_make_symbol("m2t1-abs"), global_environment) == os_make_fixnum(2),
+        "'/9p'配下のloadは中身まで評価される");
+}
+
+/**
+ * [#193 の決定を固定する] **解決できない絶対パスはホスト共有へ落とさない。**
+ * 落ちていないことは「9pのopenが一度も呼ばれていない」で見る
+ * (戻り値だけでは9pのopen失敗と区別が付かない。.refs.md §B-5 / logic.md §9-5)。
+ */
+static void test_load_unresolvable_absolute_path_does_not_fall_back_to_9p(void) {
+    reset_fake_state();
+    reset_capture();
+    uninstall_fake_report();
+    reset_mounts();
+    add_mount("/mnt", "BLK0", ":FAT16");
+    // 9pが開けることを**わざと**有効にしておく。落ちてしまえばopenが呼ばれる
+    set_fake_data("(setq m2t1-leak 3)\n");
+
+    lisp_val_t result = call_load("/mnt2/typo.lisp");
+
+    assert(result == g_sym_eval_error, "どのマウントにも解決できない絶対パスのloadはsignalへ回る");
+    assert(g_fake_open_calls == 0,
+        "**ホスト共有のopenは1度も呼ばれない**(綴り間違いが9pの文面で失敗しない)");
+    assert(os_get_variable(os_make_symbol("m2t1-leak"), global_environment) != os_make_fixnum(3),
+        "解決できなかったのでファイルの中身は評価されていない(未束縛のまま)");
+    reset_mounts();
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -589,6 +705,10 @@ int main(int argc, char **argv) {
 
     test_load_from_wrapped_stream_survives_gc();
     test_load_protects_env_across_open();
+
+    test_load_relative_path_stays_on_9p_even_with_root_mount();
+    test_load_absolute_9p_path_strips_prefix();
+    test_load_unresolvable_absolute_path_does_not_fall_back_to_9p();
 
     return g_test_failed ? 1 : 0;
 }

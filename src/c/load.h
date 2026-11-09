@@ -37,14 +37,40 @@ lisp_val_t os_load_from_stream(os_stream_t *stream, const char *name, lisp_val_t
                                int *out_aborted_count);
 
 /**
- * 組み込み関数LOAD。第一引数のパスの9Pファイルをstreamで開き、
- * os_load_from_streamへ渡す(= 開き方だけを決める層)。
+ * 組み込み関数LOAD。第一引数のパスを開いてos_load_from_streamへ渡す
+ * (= 開き方だけを決める層)。
+ *
+ * **パスの契約(M2-T1 / #193)。先頭の区切りで経路が分かれる:**
+ *   - **先頭が'/'でない** -> ホスト共有(9P)のエクスポートルートから見た相対パス。
+ *     **マウント表は引かない**(従来どおりの挙動)
+ *   - **先頭が'/'** -> os_mount_resolveでマウント表を引く。"/9p"配下は
+ *     *mounts*に登録が無くても常にホスト共有へ解決される(mount.c)。
+ *     FATへ解決された場合はファイル全体を一括で読み、
+ *     **言語側の値(MAGIC_STREAM)に包んで**os_load_from_streamへ渡す
+ *     (包まないとGCで中身ごと消える。os_load_from_streamの注記を参照)
+ *   - **どのマウントにも解決できなければ"no such mount"でsignalする。
+ *     ホスト共有へ落とさない**
+ *
+ * **心覚え: 相対 = 母艦(開発時)、絶対 = 機械の中。**
+ * 相対をホスト共有に残すのは、いまloadへ渡っている名前がほぼ全部
+ * 「先頭に区切りが無い相対指定」で、マウント表は絶対パス前提だからである
+ * (素直に載せ替えると全試験が「落ちる」より先に「何も走らない」。
+ *  docs/investigation/m2-load-from-disk.logic.md §8)。
+ * 相対に'/'を補う案も、根("/")を割り当てる試験の後続のloadがディスクへ
+ * 流れて落ちるので採らない(同 §8-4、test/lisp/partition_test.lisp)。
+ * 解決できないときホスト共有へ落とす案も、**割り当て名の綴り間違いが
+ * ホスト共有の文面で失敗して原因が分からなくなる**ので採らない(同 §9-5)。
+ *
+ * **作業ディレクトリ(*cwd*)は効かない。** ls/cd/catは効かせているが、
+ * loadに効かせると「相対 = ホスト共有」の契約と正面からぶつかる(決定。#195)。
+ *
  * open失敗・構文エラー・I/Oエラーのときはos_signal_io_errorで
  * <simple-error>をsignalする(以前は自前で1行表示してg_sym_eval_errorを
  * 返していたが、conditionのメッセージが同じ内容を運ぶため改めた)。
  * ロード中の個々のフォームが打ち切られた場合は理由を表示して続行し、
  * **戻り値はg_sym_tのまま**である(件数を見たい場合はos_load_from_streamを直接呼ぶ)。
- * @param args (path) pathはSTRING(9Pエクスポートルートから見た相対パス)
+ * @param args (path) pathはSTRING(上の契約に従う。先頭が'/'なら絶対、でなければ
+ *             ホスト共有のエクスポートルートから見た相対)
  * @param env 評価に使う環境(読み込んだ各S式もこのenvで評価される)
  * @return 最後まで読めればg_sym_t
  */

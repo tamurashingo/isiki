@@ -193,7 +193,9 @@ TEST_BIN_SCRIPT = $(BUILD_TMPDIR)/script_test
 TEST_SRC_STREAM = $(SRCDIR)/stream.c $(TESTDIR)/stream_test.c
 TEST_BIN_STREAM = $(BUILD_TMPDIR)/stream_test
 
-TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/print.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
+# [M2-T1 / #193] load.c が FAT 経路で os_make_stream(stream_lisp.c)を呼ぶように
+# なったので stream_lisp.c をリンクする。mount.c は以前から入っている
+TEST_SRC_LOAD = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/print.c $(SRCDIR)/load.c $(TESTDIR)/load_test.c
 TEST_BIN_LOAD = $(BUILD_TMPDIR)/load_test
 
 TEST_SRC_STREAM_LISP = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/reader.c $(SRCDIR)/stream.c $(SRCDIR)/mount.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/za.c $(SRCDIR)/eval.c $(TESTDIR)/stream_lisp_test.c
@@ -237,7 +239,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -1049,6 +1051,55 @@ $(BOOT_FAT32_IMG): $(TARGET) $(SRC) $(HDR) | $(IMAGES_DIR)
 			umount /mnt/boot_fat32; \
 			losetup -d $$LOOPDEV'
 
+# ====================== [M2-T3 / #195] アプリ専用のディスク ======================
+# **アプリ(apps/*.lisp)を入れるだけの FAT32 ディスク。** 置き場所の決定(D2b):
+#   - データ用ディスク(QEMU_DISK_IMG)は**9P を外した起動に付いていない**ので、
+#     アプリが要る場所で使えない
+#   - 起動用の ESP($(BOOT_FAT32_IMG))は $(TARGET)/$(SRC)/$(HDR) 依存なので
+#     **ソースを触るたび作り直される** -> アプリだけ入れ替えられない。
+#     これは M2 が解消しようとしている結合そのものである
+#   - したがって**専用に 1 枚足す。** 依存は apps/*.lisp だけで、
+#     **カーネルの再ビルドから独立している**
+#
+# **FAT32 を選ぶのは `.lisp` を使うため。** 拡張子が 4 文字なので旧方式(FAT16)の
+# 8.3 名に収まらない(既存の FAT16 フィクスチャが TEST.LSP なのはこの制約)。
+# サイズ 40MB は FAT32_DISK_IMG と同じ理由(16MB だと mkfs.vfat -F 32 が
+# 「クラスタ数が推奨最小値未満」を警告する実測値)。
+#
+# **接続は Primary の slave(bus=0,unit=1)に固定する。** ここに置く理由:
+#   - **どの構成でも装置の名前が "ide-primary-slave" で変わらない。**
+#     探査順は secondary-master -> secondary-slave -> primary-master -> primary-slave で、
+#     検出できたものだけを詰めて blk0,blk1,... と振る(block_device.c)ので、
+#     **blk 番号は構成で動く。名前引き(%device-named、src/lisp/device.lisp)で吸収する**
+#   - 同じチャネルに master(起動ディスク)が必ず居る
+#
+# 中身はホスト側で cp して焼き込む(既存の作法。PERF_READ_* と同じ理由で、
+# **ゲスト内で書いてから読む形にすると書き込みの遅さを踏む**)。
+# loop マウントは権限が要るのでこのルールも --privileged で docker run する。
+APP_DISK_IMG = $(IMAGES_DIR)/app_fat32.img
+APP_DISK_IMG_SIZE_MB = 40
+APP_LISP_SRC := $(wildcard apps/*.lisp)
+
+# 一覧が空になったら止める(#180 の歯止めと同じ形)。空のイメージを黙って配ると
+# 「アプリが読めない」が試験の失敗としてしか出ず、原因が分かりにくい
+ifeq ($(strip $(APP_LISP_SRC)),)
+$(error apps/*.lisp が1つも見つからない。アプリ専用ディスクへ焼くものが無い)
+endif
+
+# [測定の落とし穴 / BOOT_FAT32_IMG と同じ理由] build にアプリのディスクまで含める。
+# この行は $(APP_DISK_IMG) の定義より**後**に書く必要がある
+build: $(APP_DISK_IMG)
+
+$(APP_DISK_IMG): $(APP_LISP_SRC) | $(IMAGES_DIR)
+	dd if=/dev/zero of=$@ bs=1M count=$(APP_DISK_IMG_SIZE_MB) 2>/dev/null
+	docker run --rm --privileged --entrypoint bash -v "$(PWD)":/workspace -w /workspace isiki-builder \
+		-c 'set -e; \
+			mkfs.vfat -F 32 $@; \
+			mkdir -p /mnt/app_fat32; \
+			mount -o loop $@ /mnt/app_fat32; \
+			cp $(APP_LISP_SRC) /mnt/app_fat32/; \
+			umount /mnt/app_fat32'
+
 # Secondaryチャネル(bus=1,unit=0)にアタッチするディスクイメージ。IDE milestone(既存)
 # はIDE_DISK_IMG(素の16MBイメージ+magic文字列)、FAT16milestone(documents/fs.md)は
 # FAT16_DISK_IMGを、test-qemu-milestone呼び出し時にQEMU_DISK_IMG=...で上書きして
@@ -1063,20 +1114,22 @@ QEMU_DISK_IMG = $(IDE_DISK_IMG)
 # (FAT32_DISK_IMGの実体、無ければ自動生成される)。
 RUN_DISK_IMG ?= $(FAT16_DISK_IMG)
 
-run: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
+run: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	qemu-system-x86_64 \
 		-m $(QEMU_MEM) \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd_app,file=$(APP_DISK_IMG),format=raw,if=ide,bus=0,unit=1 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
 
-debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
+debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	qemu-system-x86_64 \
 		-m $(QEMU_MEM) \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd_app,file=$(APP_DISK_IMG),format=raw,if=ide,bus=0,unit=1 \
 		-drive id=hd0,file=$(RUN_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
@@ -1084,14 +1137,17 @@ debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 		-d cpu_reset,int -D qemu.log
 
 
-# ======================= [M1の本番の判定] 9Pの無い起動 =======================
+# ============== [M1/M2の本番の判定] 9Pの無い起動 ==============
 # **-fsdev / -device virtio-9p-pci を外したQEMUで立ち上がり、(let ((x 1)) x) が
 # 通ること。** これがM1の完了条件そのものである(G2。
 # docs/plans/local-load-and-core-image.md)。
+# **M2-T3(#195)から、ここで「ディスクのアプリが読める」ことも判定する。**
 #
 # 判定の中身は src/c/kernel.c の run_boot_smoke(BOOT_SMOKE=1 のビルドだけに入る)。
 # **9Pが無いと従来の試験の仕組みが3つとも使えない**ので、ここだけ形が違う:
-#   .qemu-test-trigger が開けない / cc_load が9P専用 / test-results.txt が9P経由
+#   .qemu-test-trigger が開けない / 台本がホスト共有にある / test-results.txt が9P経由
+# (cc_load 自体は M2-T1 でディスクも読めるようになったが、**どの台本を読むかを
+#  決める引き金のファイルがホスト共有にある**ので、台本の指定はできないままである)
 # 残る線はシリアルだけなので、-serial file: で受けてホスト側でgrepする。
 #
 # **陰性対照はゲスト側に内蔵してある**(1件目の 9p-absent)。9Pを付けたまま
@@ -1099,9 +1155,13 @@ debug: $(RUN_DISK_IMG) $(BOOT_FAT32_IMG)
 test-qemu-no-9p:
 	$(MAKE) BOOT_SMOKE=1 test-qemu-no-9p-run
 
-# 9Pを外した素のQEMU。ディスクはUEFIが読むブートイメージだけで、
-# IDEのデータディスクも渡さない(FAT層も使わないことを示すため)
-test-qemu-no-9p-run: build $(BOOT_FAT32_IMG)
+# 9Pを外した素のQEMU。IDEのデータディスク(QEMU_DISK_IMG)は渡さない。
+# **アプリ専用ディスク($(APP_DISK_IMG))だけは渡す。** M2-T3(#195)で
+# 「9Pが無くてもディスクのアプリが読める」ことをここで判定するようになったため
+# (付けないとアプリが読めず、M2 の本番の判定が置けない)。
+# 判定の件数は src/c/kernel.c の run_boot_smoke が出す。**件数を増やしたら
+# 下の grep の数字も直すこと**(直し忘れると判定が合わなくなる)
+test-qemu-no-9p-run: build $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	rm -f $(BUILD_TMPDIR)/no9p.serial.txt
 	qemu-system-x86_64 \
@@ -1109,12 +1169,13 @@ test-qemu-no-9p-run: build $(BOOT_FAT32_IMG)
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd_app,file=$(APP_DISK_IMG),format=raw,if=ide,bus=0,unit=1 \
 		-serial file:$(PWD)/$(BUILD_TMPDIR)/no9p.serial.txt \
 		-no-reboot
 	@echo '--- シリアル出力 ---'
 	cat $(BUILD_TMPDIR)/no9p.serial.txt
-	@grep -q '\[no9p\] 4 passed, 0 failed' $(BUILD_TMPDIR)/no9p.serial.txt || \
-		{ echo 'ERROR: 9Pを外した起動の判定が「4 passed, 0 failed」になっていない。' >&2; \
+	@grep -q '\[no9p\] 8 passed, 0 failed' $(BUILD_TMPDIR)/no9p.serial.txt || \
+		{ echo 'ERROR: 9Pを外した起動の判定が「8 passed, 0 failed」になっていない。' >&2; \
 		  echo '  出力が1行も無いなら、立ち上がる前に止まっている(boot errorはPANIC行がシリアルへ出る)。' >&2; \
 		  exit 1; }
 
@@ -1147,7 +1208,7 @@ test-qemu-m1-cost:
 # isiki_test.lispをQEMU上で全自動実行し、test-results.txtの結果でpass/failを判定する。
 # .qemu-test-triggerの存在をkernel.cが検知し、qemu_boot_test.lispをloadしてから
 # ResetSystemでQEMUを電源断する
-test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
+test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	rm -f .qemu-test-trigger test-results.txt
 	touch .qemu-test-trigger
@@ -1156,6 +1217,7 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd_app,file=$(APP_DISK_IMG),format=raw,if=ide,bus=0,unit=1 \
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
@@ -1187,11 +1249,17 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # [P1] qemu_boot_fat_callback_transfer.lispは**必ずqemu_boot_m6_fat16.lispより後**に
 # 置くこと。FAT16イメージのルートへP1BASE.TXT等を作るので、先に走らせると
 # fat16_test.lispのルートディレクトリ一覧のアサーションが落ちる
+#
+# [M2-T3 / #195] **$(APP_DISK_IMG) は rm しない。** 依存が apps/*.lisp だけなので、
+# アプリを触っていなければ作り直す必要が無い(**アプリだけ入れ替えられる**という
+# この専用ディスクの目的そのもの)。他のフィクスチャを rm するのは、破壊的な試験が
+# 書き込んだ跡が次回の期待値を壊すためで、アプリのディスクは誰も書き込まない
 test-qemu-all:
 	rm -f $(IDE_DISK_IMG) $(FAT16_DISK_IMG) $(FAT32_DISK_IMG) $(BOOT_FAT32_IMG) $(GPT_MULTI_DISK_IMG) $(MBR_MULTI_DISK_IMG)
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-no-embedded-init
 	$(MAKE) test-qemu-no-9p
+	$(MAKE) test-qemu-load-disk
 	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
@@ -1372,7 +1440,7 @@ test-inline-expansion: $(LISP_COMPILED)
 test-qemu-error-escape-gc:
 	$(MAKE) GC_DEBUG=1 test-qemu-milestone MILESTONE=test/lisp/qemu_boot_error_escape_gc.lisp
 
-test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
+test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
 	rm -f .qemu-test-trigger test-results.txt $(BUILD_TMPDIR)/qemu-exit.txt
@@ -1382,6 +1450,7 @@ test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd_app,file=$(APP_DISK_IMG),format=raw,if=ide,bus=0,unit=1 \
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
@@ -1399,7 +1468,7 @@ test-qemu-audit-run: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 # **結果があって失敗している場合は再試行しない**(失敗の隠蔽をしない)。
 # 再試行したときは [FLAKE] を 1 行出し、tmp/qemu_flakes.txt に追記する。
 # **QEMU のオプションはここが唯一の真実源**で、スクリプトはコマンド行を受け取るだけ。
-test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
+test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	mkdir -p $(BUILD_TMPDIR)
 	test -n "$(MILESTONE)"
 	@tools/run_qemu_milestone.sh "$(MILESTONE)" 'qemu-system-x86_64 \
@@ -1407,6 +1476,7 @@ test-qemu-milestone: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG)
 		-display none \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive id=hd_boot,file=$(BOOT_FAT32_IMG),format=raw,if=ide,bus=0,unit=0 \
+		-drive id=hd_app,file=$(APP_DISK_IMG),format=raw,if=ide,bus=0,unit=1 \
 		-drive id=hd0,file=$(QEMU_DISK_IMG),format=raw,if=ide,bus=1,unit=0 \
 		-fsdev local,id=fsdev9p,path=$(PWD),security_model=none,readonly=off \
 		-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
@@ -1565,6 +1635,14 @@ let-histogram:
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
 		-c 'ros run --load tools/let_histogram.lisp --quit' 2>&1 | grep -E '^(IIFE|SKIP|FILE)'
 
+# [M2-T3 / #195] **ディスク(アプリ専用のFAT32)に置いた `.lisp` を load できること、
+# およびパスの契約**(相対 = ホスト共有 / 絶対 = マウント表 / 解決できなければ通知)。
+# アプリのディスクは**どの QEMU 起動にも**付くので QEMU_DISK_IMG の上書きは要らない。
+# **9Pの無い起動での判定は test-qemu-no-9p 側にある**(アプリが要るのはそちらで、
+# ここは「ホスト共有が有るときも絶対パスで読める」「相対が無傷」の側を見る)
+test-qemu-load-disk:
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_load_disk.lisp
+
 # [GCデバッグ / M2-T0 / #196] **記憶域の整理を強制しても、ディスク経由の
 # 読み取り・読み込みが壊れないことを確かめる。** 直すより先にこれで壊れることを
 # 見てから直した(規則 8 の陽性対照)。docs/investigation/m2-load-from-disk.logic.md §6。
@@ -1574,8 +1652,22 @@ let-histogram:
 # FAT16 の試験用イメージへ材料(GCSTRES.LSP)をゲスト内で書いてから読むので、
 # **test-qemu-all では qemu_boot_m6_fat16.lisp より後に置くこと**
 # (先に走らせると fat16_test.lisp のルート一覧の期待値が落ちる)。
-# 題材は小さく保っている(%%DIAG-GC-STRESS 1 は確保ごとに GC するので非常に遅い)
+# **ディスク経由の load は #195 で経路ができたので、#196 の申し送りどおり
+# この段へ足した**(材料は apps/load-gc-stress.lisp。アプリ専用ディスクは
+# どの起動にも付くので、こちらはホスト側で焼き込んだものをそのまま読む)。
+# 題材は小さく保っている(%%DIAG-GC-STRESS 1 は確保ごとに GC するので非常に遅い)。
+#
+# **イメージを毎回作り直す。** そうしないと、2 回目以降の実行で
+# 既にある GCSTRES.LSP に対する open-output-file が "cannot resolve file" で失敗し、
+# **試験本体は 1 つのトップレベルフォームなので以後の節が全部飛ぶ。**
+# しかも打ち切りの理由は画面バッファにしか出ない(#197)ので、
+# **"0 failed" のまま #count が 19 から 3 へ落ちるだけ**になる(実際に踏んだ。
+# pristine な main でも同じで、PR #198 以降ずっとこの形だった)。
+# 作り直せば段が「繰り返し走らせても同じ」になる。
+# 直前の m6_fat16 より後に置く制約は**残る**(この段が書いた GCSTRES.LSP が
+# 先にあると fat16_test.lisp のルート一覧の期待値が落ちる)
 test-qemu-load-gc-stress:
+	rm -f $(FAT16_DISK_IMG)
 	$(MAKE) test-qemu-milestone GC_DEBUG=1 MILESTONE=test/lisp/qemu_boot_load_gc_stress.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 
 # [GCデバッグ] GC を強制しても for の結果が壊れないことを確かめる
