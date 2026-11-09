@@ -115,7 +115,7 @@
 | F10 | GC ルート = `global_environment` / `g_dynamic_bindings` / `g_symbol_table` / `g_sym_*` / 登録ルート / **全プロセスの shadow stack** | `runtime.c:3520` |
 | F11 | 版の照合に使える定数が既にある | `version.h` の `ISIKIOS_BUILD_HASH` |
 | F12 | FAT は**読みは線形で速く、書きが遅い** | `documents/` の FAT 性能調査(既知の繰越課題) |
-| F13 | `init.lisp` は **72,220 byte**。埋め込みの費用はバイナリ 2.4MB・`.bss` 20MB に対して無視できる | `wc -c` |
+| F13 | `init.lisp` は **72,220 byte**(2026-11-08 時点)。埋め込みの費用はバイナリ 2.4MB・`.bss` 20MB に対して無視できる。**この数は固定値として書き写してある(規則 13 に反する)。M1 の作業中に増えており、現在値は `wc -c src/lisp/init.lisp` が出す**(2026-11-09 の計測時は 75,697) | `wc -c` |
 | F14 | `os_stream_open_string_input` は**ポインタと長さを持つだけ**(コピーも書き換えもしない) | `stream.c:325` |
 | F15 | **ブート時スタックで `cc_load` を呼ぶとクラッシュする。** `.qemu-test-trigger` の自動 load は **process 0 のスタック上**で走らせている | `kernel.c:165` |
 | F16 | **`init.lisp` の初回フルロードは C スタックを実測 35〜36KB 使う**(これがスタック 256KB の理由の 1 つ) | `process.c:13` |
@@ -231,6 +231,14 @@ QEMU 試験では電源断フックが働くので、**試験は固まらずに�
 
 #### M1-T6: 測る — imm space / ヒープ / 起動 tick
 **(c) の見積りはここで出る。合格線は設けない(D5/D6)。測って記録する。**
+
+> **測り終えた(2026-11-09、issue #185)。記録は `documents/boot-embedded-init-cost.md`。**
+> 走らせ方は `make boot-cost` / `make test` / `make check-small-heap-knob`。
+> 要点だけ: **imm 消費は 16MB の 2.72%(同梱ぶん 2.42%、不滅)**、
+> **ヒープは 1 ブート 330,320 byte(GC 0 回)**、
+> **割り込み許可から対話受付までの 65 tick のうち 64 tick(98.5%)が同梱の読み込み**、
+> **`SMALL_HEAP_SIZE` 試験は再調整なしで通った**。
+> **起動前半は刻みの外なので測っていない(L7)。0.65 秒は起動時間の全体ではない。**
 - **Immobilized Space の消費**(R9・F18)。16MB のうちいくら使うか
 - ブート時のヒープ確保量(`room` / `%%heap-used-bytes`)
 - **ブートから REPL が入力を受けるまでの tick**(M3 の基準値になる)
