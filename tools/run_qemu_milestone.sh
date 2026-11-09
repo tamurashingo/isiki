@@ -43,11 +43,12 @@
 
 set -e
 
-# [規則 8] この仕組み自身の自己試験。**4 つの経路すべてを意図的に発火させる。**
+# [規則 8] この仕組み自身の自己試験。**5 つの経路すべてを意図的に発火させる。**
 #   (1) 結果が無い(2 回とも)      -> 再試行して落ちる + [FLAKE] を残す
 #   (2) 結果があって失敗          -> **再試行しない**(失敗を隠さない)。flake 記録は 0 件
 #   (3) 1 回目で成功              -> 再試行も記録もしない
 #   (4) 1 回目は結果が無く 2 回目で成功 -> 通るが [FLAKE] が残る
+#   (5) **偽造された合否の一行**(別の行に " 0 failed" がある)-> 落ちる。#205 / T4
 # (2) が落ちることを確かめるのが要点である。ここが壊れると**本物の失敗を
 # 再試行で隠す**仕組みになってしまう。
 if [ "$1" = "--self-test" ]; then
@@ -80,6 +81,11 @@ if [ "$1" = "--self-test" ]; then
          "printf '==== isiki tests: 4 passed, 0 failed ====\n' > test-results.txt"  # PASS-LINE: FIXTURE 判定役にかける偽の成果物(合格側。陰性対照)
     _run "陽性対照3・2 回目で成功 -> 通るが記録は残る" 0 1 \
          'test -f tmp/.try && printf "==== isiki tests: 5 passed, 0 failed ====\n" > test-results.txt; touch tmp/.try'  # PASS-LINE: FIXTURE 判定役にかける偽の成果物(2回目で成功。陽性対照3)
+    # [#205 / T4] **5 本目: 偽造された合否の一行。**
+    # 別の行に `" 0 failed"` を出し、本物の合否の一行は不合格にしてある。
+    # **旧判定(部分一致)はこれを通していた。** 結果は出ているので再試行しない
+    _run "陽性対照4・偽造された合否の一行 -> 落ちる(再試行しない)" 1 0 \
+         'printf "[NG] (f) => expected \" 0 failed\" but got x\n==== isiki tests: 1 passed, 5 failed ====\n" > test-results.txt'  # PASS-LINE: FIXTURE 偽造(1)の資料。本物の一行は 5 failed である
     if [ "$ok" = 0 ]; then
         echo "self-test 成功: **結果が無いときだけ再試行し、失敗は再試行しない**ことを確かめた"
         exit 0
@@ -112,7 +118,13 @@ while :; do
 
     if [ -f test-results.txt ]; then
         cat test-results.txt
-        if grep -q " 0 failed" test-results.txt; then
+        # [#205 / T4] **部分一致をやめた。** 以前は `grep -q " 0 failed"` で、
+        # **成果物のどこかにその文字列があれば合格**だった。本物の合否の一行が
+        # 「5 failed」でも、別の行に `" 0 failed"` を出せば通る
+        # (`[NG]` 行は期待値をそのまま印字するので、文字列リテラルで作れる)。
+        # 判定は 1 箇所に寄せた。**口が 3 つに分かれていたのが穴の元**なので、
+        # Makefile の test-qemu も同じ者を呼ぶ。
+        if python3 "$(dirname "$0")/check_pass_line.py" --verify test-results.txt; then
             exit 0
         fi
         # **結果があって失敗している = 本物の失敗。再試行しない。**
