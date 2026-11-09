@@ -46,7 +46,7 @@ def main():
     print('(finish-output *o*) (close *o*)')
     # ミルストンの判定("0 failed" を grep される)を満たすために書く
     print('(defglobal *r* (open-output-file "/9p/test-results.txt"))')
-    print('(format *r* "~%==== isiki tests: 1 passed, 0 failed ====~%")')
+    print('(format *r* "~%==== isiki tests: 1 passed, 0 failed ====~%")')  # PASS-LINE: PROBE 計測プローブの生成器。生成したLispに一行を書かせる
     print('(finish-output *r*) (close *r*)')
 
 

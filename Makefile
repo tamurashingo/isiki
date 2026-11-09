@@ -239,7 +239,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -391,6 +391,21 @@ check-eval-error-budget-self-test:
 .PHONY: check-test-count-ratchet-self-test
 check-test-count-ratchet-self-test:
 	@python3 tools/check_test_count_ratchet.py --self-test
+
+# [#205 / T4] **合否の一行そのものが信用できるか**を見る。
+# 件数の照合(段ごとの名簿)は上の check_test_count_ratchet.py の仕事で、
+# こちらは「一行を書く箇所の在庫」と「集計を減らす代入の在庫」を固定する。
+# **増えたら落ちる。減っても落ちる**(規則 16)。
+# 判定そのもの(--verify)は test-qemu と run_qemu_milestone.sh が呼ぶ
+.PHONY: check-pass-line check-pass-line-self-test
+check-pass-line:
+	@python3 tools/check_pass_line.py
+
+# --self-test は規則 8 の陽性対照。**偽造の 3 形それぞれに対照があり、
+# 対象外の印を外すと落ちる**ことまで確かめる(印を付けただけでは
+# 効いていると言えないため)
+check-pass-line-self-test:
+	@python3 tools/check_pass_line.py --self-test
 
 # 名簿そのものを見る(段の数と合計は**導出して出す**。規則 13)
 .PHONY: print-test-count-roster
@@ -681,7 +696,7 @@ check-small-heap-knob: | $(BUILD_TMPDIR)
 		exit 1; \
 	fi
 
-test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
@@ -1249,7 +1264,12 @@ test-qemu: build $(QEMU_DISK_IMG) $(BOOT_FAT32_IMG) $(APP_DISK_IMG)
 	rm -f .qemu-test-trigger
 	test -f test-results.txt
 	cat test-results.txt
-	grep -q " 0 failed" test-results.txt
+# [#205 / T4] **部分一致をやめた。** 以前はここが `grep -q " 0 failed"` で、
+# **成果物のどこかにその文字列があれば合格**だった(本物の合否の一行が
+# 「5 failed」でも、別の行にその文字列があれば通る)。判定は
+# tools/check_pass_line.py の 1 箇所に寄せた。**判定の口が 3 つに分かれていたのが
+# 穴の元**なので、run_qemu_milestone.sh と同じ者を呼ぶ
+	python3 tools/check_pass_line.py --verify test-results.txt
 
 # test-qemu(デフォルトのqemu_boot_test.lisp)はdevice.lisp/ide.lisp/fat16.lispを
 # loadしないため、IDE/FAT16milestoneはtest-qemuだけでは検証されない。この3つを

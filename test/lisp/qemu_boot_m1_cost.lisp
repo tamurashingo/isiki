@@ -78,5 +78,5 @@
 (ck "imm-within-total" (< *m1-imm* *m1-imm-total*))
 (ck "fn-cells-positive" (> *m1-fncells* 0))
 
-(format *s* "~%==== isiki tests: ~D passed, ~D failed ====~%" *pass* *fail*)
+(format *s* "~%==== isiki tests: ~D passed, ~D failed ====~%" *pass* *fail*)  ;; PASS-LINE: SELF-TALLY 同梱の費用を測る段。枠組みを読むと測る対象が変わる
 (close *s*)

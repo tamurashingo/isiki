@@ -35,9 +35,9 @@
           (dfail (- *isiki-test-fail* saved-fail))
           (dattempt (- *isiki-test-attempt* saved-attempt)))
       (setq *isiki-test-stream* saved-stream)
-      (setq *isiki-test-pass* saved-pass)
-      (setq *isiki-test-fail* saved-fail)
-      (setq *isiki-test-attempt* saved-attempt)
+      (setq *isiki-test-pass* saved-pass)  ; TALLY-RESTORE: 陰性対照が出した不合格を退避値へ戻す(tf-capture)
+      (setq *isiki-test-fail* saved-fail)  ; TALLY-RESTORE: 同上
+      (setq *isiki-test-attempt* saved-attempt)  ; TALLY-RESTORE: 同上(attempt も戻す)
       (list dpass dfail dattempt out))))
 
 (defun tf-dpass (r) (car r))

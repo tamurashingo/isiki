@@ -111,5 +111,5 @@
 (format *s* "#sg signal-overflows=~D~%" (%%diag-signal-overflows))
 (finish-output *s*)
 
-(format *s* "~%==== isiki tests: ~D passed, ~D failed ====~%" *pass* *fail*)
+(format *s* "~%==== isiki tests: ~D passed, ~D failed ====~%" *pass* *fail*)  ;; PASS-LINE: SELF-TALLY 条件クラスが1つも無い状態を要件とする段。枠組みが使えない
 (close *s*)

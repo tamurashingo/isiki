@@ -380,7 +380,7 @@ def self_test():
             for (s, m, h, _i) in base:
                 f.write("[ALIGN] region=2 n=123\n")
                 f.write(_line(s, m, h))
-            f.write("3269 passed, 0 failed\n")
+            f.write("3269 passed, 0 failed\n")  # PASS-LINE: FIXTURE 比較器の自己試験(雑音耐性)の資料
         rows = parse_log(noisy)
         if [r[:3] for r in rows] == [r[:3] for r in base]:
             print("OK(雑音耐性): 他のシリアル出力が混ざっても %d 行だけを拾う" % len(rows))
@@ -392,7 +392,7 @@ def self_test():
         # ガード1: ダンプ行が 0 行なら比較は成立しない(= 計器が死んでいる)
         empty = os.path.join(d, "empty.txt")
         with open(empty, "w", encoding="utf-8") as f:
-            f.write("3269 passed, 0 failed\n")
+            f.write("3269 passed, 0 failed\n")  # PASS-LINE: FIXTURE 比較器の自己試験(ガード1)の資料
         sink = io.StringIO()
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             rc = cmd_save(empty, os.path.join(d, "box1"), {})

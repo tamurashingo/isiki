@@ -315,7 +315,7 @@ static void run_boot_smoke(void) {
     char msg[BOOT_MSG_MAX];
     UINT32 pos = boot_msg_append(msg, 0, "[no9p] ");
     pos = boot_msg_append_uint(msg, pos, g_smoke_pass);
-    pos = boot_msg_append(msg, pos, " passed, ");
+    pos = boot_msg_append(msg, pos, " passed, ");  /* PASS-LINE: REAL C側が1件ずつ数えた本物の要約(#205) */
     pos = boot_msg_append_uint(msg, pos, g_smoke_fail);
     boot_msg_append(msg, pos, " failed\n");
     os_diag_serial_write(msg);

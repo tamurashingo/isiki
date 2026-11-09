@@ -44,6 +44,11 @@
 ;; **heap-delta は gc が 0 のときだけ意味を持つ**(GC が走ると水位が戻る)。
 ;; mandelbrot は浮動小数を箱で作るので GC は必ず走る。だから主な量は ticks である
 (format m-res "#mandel note heap-delta is meaningful only when gc=0~%")
+;; **これは本物の集計ではない。** 検査は 1 件も走っていない。
+;; 新しい計測プローブを書くなら documents/pass-line-forgery.md §4 の
+;; 「最小の形」を写すこと。**この形(固定文字列)の在庫は固定されている**ので、
+;; 3 本目を足すと tools/check_pass_line.py が落ちる(#205)。
+;; PASS-LINE: PROBE 計測プローブ。旧mainと同一ドライバを使う制約で枠組みを読めない
 (format m-res "~%==== isiki tests: 1 passed, 0 failed ====~%")
 (finish-output m-res)
 (close m-res)
