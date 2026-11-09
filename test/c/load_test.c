@@ -408,6 +408,165 @@ static void test_load_from_stream_syntax_error_signals(void) {
     assert(aborted == 0, "構文エラーは打ち切り件数には数えない");
 }
 
+// ---------------------------------------------------------------------------
+// [M2-T0] #196: 読み込みが記憶域の整理(GC)に耐えること
+//
+// docs/investigation/m2-load-from-disk.logic.md §6 / .refs.md §A-5。
+// ディスク(FAT)経由の読み込み元はMAGIC_STREAMに包まないと中身ごと死ぬが、
+// 包んだ以上**os_stream_t本体はGCのたびに別アドレスへ複製される**
+// (gc_relocate_stream、runtime.c)。したがって「実体を指す生ポインタ」を
+// 確保を跨いで持ち続けてはならない。
+//
+// **ここでの陽性対照(規則8)の作り方**: readerの中はLispを呼ばないので、
+// 通常ビルドのユニットテストから「1つの式を読む途中でGCを起こす」ことはできない
+// (os_alloc_bytesのGCは枯渇時のみ、%%DIAG-GC-STRESSはGC_DEBUGビルド限定)。
+// そこでここでは**輪(os_load_from_stream)の側**を見る。輪はフォームを評価する
+// ので、評価がGCを起こせばよい。test-force-gcというテスト専用の組み込みを
+// フォームとして評価させることで、**実際にGCが走った状態**を作る。
+// 式を読む途中(reader)の窓はGC_DEBUGビルドでしか強制できないので、
+// test/lisp/load_gc_stress_test.lisp(%%DIAG-GC-STRESS 1)が見ている。
+// ---------------------------------------------------------------------------
+
+static int g_force_gc_calls = 0;
+
+/** テスト専用の組み込み。評価されると実際にGCを1回走らせる */
+static lisp_val_t fake_force_gc(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    g_force_gc_calls++;
+    os_gc_collect();
+    return g_sym_t;
+}
+
+/** テスト専用の組み込み。引数の個数だけconsを確保して**生きたまま**返す。
+    GCのたびに複製される生存集合を大きくし、「古い複製が別オブジェクトの
+    複製先として上書きされる」状況(stream_lisp.c:152-157の事故)を作るのに使う */
+static lisp_val_t fake_grow_live(lisp_val_t args, lisp_val_t env) {
+    (void)env;
+    UINT64 n = os_fixnum_magnitude(cc_car(args));
+    lisp_val_t acc = nil;
+    GC_PROTECT(acc);
+    for (UINT64 i = 0; i < n; i++) {
+        acc = os_make_cons(os_make_fixnum((UINT64)i), acc);
+    }
+    return acc;
+}
+
+static void install_force_gc(void) {
+    os_set_function(os_make_symbol("test-force-gc"),
+                     os_make_native_function((lisp_addr_t)(void *)fake_force_gc),
+                     global_environment);
+    os_set_function(os_make_symbol("test-grow-live"),
+                     os_make_native_function((lisp_addr_t)(void *)fake_grow_live),
+                     global_environment);
+}
+
+/**
+ * MAGIC_STREAMに包んだ文字列入力ストリームを作る。
+ * stream_lisp.cのos_make_stream / cc_create_string_input_streamと同じ手順だが、
+ * load_testはstream_lisp.cをリンクしないのでここに写している
+ * (バッファ・rawをos_alloc_rawで取り、包む直前まで確保を挟まない。
+ *  [ファイルI/O]#49のGC安全性の作法。stream_lisp.c:152-157)。
+ * **FAT経由のopen-input-streamが作るストリームと同じ種別・同じ包み方である。**
+ */
+static lisp_val_t make_wrapped_string_input(const char *src) {
+    UINT32 n = 0;
+    while (src[n] != '\0') {
+        n++;
+    }
+    UINT8 *buf = (UINT8 *)(lisp_addr_t)os_alloc_raw(n);
+    for (UINT32 i = 0; i < n; i++) {
+        buf[i] = (UINT8)src[i];
+    }
+    os_stream_t *raw = (os_stream_t *)(lisp_addr_t)os_alloc_raw(sizeof(os_stream_t));
+    os_stream_open_string_input(raw, buf, n);
+    lisp_val_t handle = os_make_instance(MAGIC_STREAM, (UINT64)(lisp_addr_t)(void *)raw, 0, 0);
+    ((os_stream_t *)(lisp_addr_t)((UINT64 *)(lisp_addr_t)(handle & ~TAG_MASK))[1])->self_handle = handle;
+    return handle;
+}
+
+/** MAGIC_STREAMハンドルから生ポインタを取り直す(stream_lisp.cのstream_rawと同じ) */
+static os_stream_t *wrapped_raw(lisp_val_t handle) {
+    return (os_stream_t *)(lisp_addr_t)((UINT64 *)(lisp_addr_t)(handle & ~TAG_MASK))[1];
+}
+
+/**
+ * [M2-T0 / 陽性対照] 包んだストリームを輪へ渡し、**輪の中でGCが2回走る**入力を
+ * 読み込ませる。輪が生ポインタを使い回していると、1回目のGCでos_stream_tは
+ * 別アドレスへ移り、2回目のGCでその古い複製が別オブジェクトの複製先として
+ * 上書きされる。以後の読み取りは化けた中身から進むので、
+ * **後ろのフォームが評価されない / 二度評価される / 構文エラーになる。**
+ * どれも「読み込みは成功を返す」ので、戻り値では見分けられない(静かな破壊)。
+ */
+static void test_load_from_wrapped_stream_survives_gc(void) {
+    reset_capture();
+    uninstall_fake_report();
+    install_force_gc();
+    g_force_gc_calls = 0;
+
+    lisp_val_t handle = make_wrapped_string_input(
+        "(setq m2t0-a 1)\n"
+        "(test-force-gc)\n"
+        "(setq m2t0-junk (test-grow-live 2000))\n"
+        "(setq m2t0-b 2)\n"
+        "(test-force-gc)\n"
+        "(setq m2t0-c 3)\n"
+        "(setq m2t0-d (+ m2t0-a m2t0-b m2t0-c))\n");
+    GC_PROTECT(handle);
+
+    int aborted = 0;
+    lisp_val_t result = os_load_from_stream(wrapped_raw(handle), "<wrapped>",
+                                            global_environment, &aborted);
+
+    assert(g_force_gc_calls == 2, "輪の中でGCが2回走った(陽性対照。走っていなければ何も確かめていない)");
+    assert(result == g_sym_t, "包んだストリームでも最後まで読めればg_sym_tを返す");
+    assert(aborted == 0, "GCを跨いでも打ち切りは起きない");
+
+    assert(os_get_variable(os_make_symbol("m2t0-a"), global_environment) == os_make_fixnum(1),
+        "GCより前のフォームが評価されている");
+    assert(os_get_variable(os_make_symbol("m2t0-b"), global_environment) == os_make_fixnum(2),
+        "1回目のGCより後のフォームが評価されている");
+    assert(os_get_variable(os_make_symbol("m2t0-c"), global_environment) == os_make_fixnum(3),
+        "2回目のGCより後のフォームが評価されている");
+    assert(os_get_variable(os_make_symbol("m2t0-d"), global_environment) == os_make_fixnum(6),
+        "最後のフォームまで1回ずつ評価されている(二度評価も取りこぼしも無い)");
+}
+
+/**
+ * [M2-T0 / 陽性対照] cc_loadはenvをGC_PROTECTしていなかった。
+ * いまは9pのopenが確保しないので安全だが、マウント経由(os_mount_resolveは
+ * os_make_symbolを呼び、FAT経路はLispを呼び戻す)にした瞬間に守りが要る。
+ * **漏らすと以後の全フォームが再配置前の古い環境へ書き込まれる。**
+ *
+ * ここではその保護が効いていることを、**openの前にGCを起こす**ことで見る。
+ * envはglobal_environmentではなく自前に作った環境で、GCで必ず動く位置にある。
+ */
+static void test_load_protects_env_across_open(void) {
+    reset_fake_state();
+    reset_capture();
+    uninstall_fake_report();
+    install_force_gc();
+
+    // 呼び出し元の環境を1つ作る。global_environmentを親に持つ普通の環境
+    lisp_val_t env = os_make_environment(os_make_symbol("m2t0-env"), global_environment);
+    GC_PROTECT(env);
+
+    set_fake_data("(setq m2t0-env-probe 55)\n");
+
+    // openの前にGCが走った状態を作る: ここで1回走らせておくと、
+    // 以後envは移動済みのアドレスを指す(GC_PROTECTが効いていれば追随する)
+    os_gc_collect();
+
+    lisp_val_t form = os_make_cons(os_make_symbol("LOAD"),
+                                    os_make_cons(os_make_string("fake/env.lisp"), nil));
+    GC_PROTECT(form);
+    lisp_val_t result = cc_load(cc_cdr(form), env);
+
+    assert(result == g_sym_t, "自前の環境を渡したloadも最後まで読めればg_sym_tを返す");
+    assert(os_get_variable(os_make_symbol("m2t0-env-probe"), env) == os_make_fixnum(55),
+        "読んだフォームは**呼び出し元の(再配置後の)環境**で評価されている");
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -427,6 +586,9 @@ int main(int argc, char **argv) {
     test_load_from_stream_counts_aborted_forms();
     test_load_from_stream_accepts_null_count();
     test_load_from_stream_syntax_error_signals();
+
+    test_load_from_wrapped_stream_survives_gc();
+    test_load_protects_env_across_open();
 
     return g_test_failed ? 1 : 0;
 }

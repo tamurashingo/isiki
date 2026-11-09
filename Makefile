@@ -237,7 +237,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -1196,6 +1196,7 @@ test-qemu-all:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat_callback_transfer.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+	$(MAKE) test-qemu-load-gc-stress
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
@@ -1563,6 +1564,19 @@ jit-frame-breakdown:
 let-histogram:
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint bash -v "$(PWD)":/workspace isiki-builder \
 		-c 'ros run --load tools/let_histogram.lisp --quit' 2>&1 | grep -E '^(IIFE|SKIP|FILE)'
+
+# [GCデバッグ / M2-T0 / #196] **記憶域の整理を強制しても、ディスク経由の
+# 読み取り・読み込みが壊れないことを確かめる。** 直すより先にこれで壊れることを
+# 見てから直した(規則 8 の陽性対照)。docs/investigation/m2-load-from-disk.logic.md §6。
+# **GC_DEBUG=1 を自分で渡す。** 渡し忘れると %%DIAG-GC-STRESS が無く
+# 「GC を強制したつもりで強制していない」まま通るので、
+# test/lisp/gc_debug_guard.lisp が通常ビルドで落とす。
+# FAT16 の試験用イメージへ材料(GCSTRES.LSP)をゲスト内で書いてから読むので、
+# **test-qemu-all では qemu_boot_m6_fat16.lisp より後に置くこと**
+# (先に走らせると fat16_test.lisp のルート一覧の期待値が落ちる)。
+# 題材は小さく保っている(%%DIAG-GC-STRESS 1 は確保ごとに GC するので非常に遅い)
+test-qemu-load-gc-stress:
+	$(MAKE) test-qemu-milestone GC_DEBUG=1 MILESTONE=test/lisp/qemu_boot_load_gc_stress.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 
 # [GCデバッグ] GC を強制しても for の結果が壊れないことを確かめる
 # (documents/for-expansion.md §1)。**GC_DEBUG=1 を自分で渡す。**

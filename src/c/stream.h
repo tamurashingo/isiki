@@ -180,6 +180,23 @@ int os_stream_open_9p_file_io(os_stream_t *stream, const char *path, int create_
 void os_stream_open_screen_output(os_stream_t *stream, frame_buffer *fb);
 
 /**
+ * MAGIC_STREAMインスタンス(handle)からos_stream_t*を取り出す。
+ *
+ * **os_stream_tはGCのたびに別アドレスへ複製される**(gc_relocate_stream、runtime.c)。
+ * したがって確保を跨いで生ポインタを持ち続けてはならず、確保を挟んだ後は必ず
+ * GC_PROTECT済みのハンドルからここで取り直す([ファイルI/O]#49(M6)の作法)。
+ *
+ * stream_lisp.cのos_stream_from_lispと同じロジックだが、**stream_lisp.cを
+ * リンクしないリンク対象(reader.cを含む全ユニットテスト、test/c/stream_test.c等)
+ * からも使えるよう**stream.c側に実体を持つ。reader.cは1つのS式を読み切る間に
+ * これを使って毎回取り直す(M2-T0 / #196)。
+ *
+ * @param handle MAGIC_STREAMインスタンス(nilを渡してはならない)
+ * @return handleが包んでいるos_stream_tの現在のアドレス
+ */
+os_stream_t *os_stream_from_handle(lisp_val_t handle);
+
+/**
  * キーボード入力ストリーム(STREAM_INPUT_KEYBOARD)として初期化する。
  * @param stream 初期化先
  * @param read_fn 1文字読む関数(reader.cのos_process_stdin_read_char)

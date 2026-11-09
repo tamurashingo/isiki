@@ -10,16 +10,7 @@
 /** デフォルトの作成パーミッション(ISLisp側にperm指定は無いため固定) */
 #define STREAM_CREATE_PERM 0644
 
-/**
- * [ファイルI/O]#49(M6): MAGIC_STREAMインスタンス(handle)からos_stream_t*を
- * 取り出す。stream_lisp.cのstream_raw/os_stream_from_lispと全く同じロジックだが、
- * stream_lisp.cをリンクしない一部のテストターゲット(test/c/stream_test.c等、
- * stream.cのみをリンクする)でも使えるよう、あえて重複させてここに直接持つ。
- * flush_write_buf_fat/refill_read_buf_fatが、Lisp呼び出し(GCを誘発しうる)の後に
- * (gc_relocate_stream(runtime.c)で再配置されたかもしれない)os_stream_t*を
- * 取り直すために使う。
- */
-static os_stream_t *stream_from_handle(lisp_val_t handle) {
+os_stream_t *os_stream_from_handle(lisp_val_t handle) {
     UINT64 *obj = (UINT64 *)(lisp_addr_t)(handle & ~TAG_MASK);
     return (os_stream_t *)(lisp_addr_t)obj[1];
 }
@@ -144,7 +135,7 @@ static os_stream_t *flush_write_buf_fat(os_stream_t *stream) {
     // ここまでのいずれかのアロケーションでstreamが再配置されている可能性があるため、
     // GC_PROTECT済みのself_handle経由で必ず生ポインタを取り直す
     if (self_handle != nil) {
-        stream = stream_from_handle(self_handle);
+        stream = os_stream_from_handle(self_handle);
     }
 
     // write-from!がエラーをsignalする等で非局所脱出した場合。**ここを見ないと、
@@ -218,7 +209,7 @@ static os_stream_t *refill_read_buf_fat(os_stream_t *stream) {
     // ここで返せば、下の cli 区間(buf_dataへのコピー)にも入らない
     if (os_is_control_transfer(result)) {
         if (self_handle != nil) {
-            stream = stream_from_handle(self_handle);
+            stream = os_stream_from_handle(self_handle);
         }
         // buf_count/buf_pos/next_offsetは触らない(何も読めていないので、
         // 呼び出し前の状態のまま据え置く)。eofも立てない
@@ -235,7 +226,7 @@ static os_stream_t *refill_read_buf_fat(os_stream_t *stream) {
     // ここまでのいずれかのアロケーションでstreamが再配置されている可能性があるため、
     // GC_PROTECT済みのself_handle経由で必ず生ポインタを取り直す
     if (self_handle != nil) {
-        stream = stream_from_handle(self_handle);
+        stream = os_stream_from_handle(self_handle);
     }
 
 #ifndef ISIKIOS_UNIT_TEST
@@ -267,7 +258,7 @@ lisp_val_t os_stream_take_transfer(lisp_val_t stream_handle) {
     }
     // **必ずハンドルから取り直す。** flush/refillはos_stream_tを再配置しうるので、
     // 呼び出し元が持っている生ポインタは古い実体を指している可能性がある
-    os_stream_t *raw = stream_from_handle(stream_handle);
+    os_stream_t *raw = os_stream_from_handle(stream_handle);
     lisp_val_t transfer = raw->pending_transfer;
     if (!os_is_control_transfer(transfer)) {
         return nil;
