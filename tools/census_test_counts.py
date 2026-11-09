@@ -3,7 +3,14 @@
 """試験件数の点検(#202 / T1)。**判定はしない。数えるだけの道具である。**
 
 規則 13(R-count)に従い、報告に書く件数を手で数えずに導出できる形にしてある。
-この道具は `make` からも CI からも呼ばれない。合否に一切影響しない。
+**この道具のモードは `make` からも CI からも呼ばれない。合否に一切影響しない。**
+
+ただし [#208] 以降、**コメントを剥がす 3 つの関数だけ**は
+`tools/check_test_count_ratchet.py`(= `make test` が呼ぶ検査)が取り込んで使う
+(`strip_lisp` / `strip_c_comments` / `strip_make_comments`)。
+剥がし方が 2 本に分かれると**道具によって「走っている」の答えが違う**状態になり、
+それは #208 の誤検出とまったく同じ族だからである。
+したがって**この 3 つを壊すと `make test` が落ちる。** モードのほうは落ちない。
 
 2 つのモード:
 
@@ -376,15 +383,106 @@ def deferred_audit(root="."):
     return rows
 
 
+def strip_c_comments(text):
+    """C の `//` と `/* */` を剥がす。**文字列リテラルの中は守る。**
+
+    [#208] コメントの中の名前を数えると**偽陽性**が出る。実例:
+    `test/c/repl_test.c` のコメントは `test/lisp/toplevel_abort_test.lisp` の
+    名前を含むが、その台本を走らせているのは別の段である。
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            out.append(c)
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append(text[i])
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def strip_make_comments(text):
+    """**行まるごとのコメント**(空白のみ先行する `#`)を落とす。
+
+    [#208] 行の途中の `#` は落とさない。レシピには `sed -n 's/^#gate //p'` の
+    ように `#` を含む本物のコマンドがあり、そこから先を切ると
+    **本当に走っている段が「走らない」に化ける**(= 新しい偽陰性を作る)。
+    """
+    return "\n".join(
+        "" if ln.lstrip().startswith("#") else ln for ln in text.split("\n")
+    )
+
+
+# [#208] 母艦側の単体試験が Lisp の台本を走らせる呼び出し。
+# **呼び出しの形だけを見る**(コメントの中の名前は数えない)
+RUN_LISP_FILE_RE = re.compile(r'run_lisp_file\s*\([^;{}]*?"([^"]+)"\s*\)')
+
+
+def host_unit_tests(root="."):
+    """母艦側の単体試験(`test/c/*.c`)が `run_lisp_file` で走らせる台本。
+
+    [#208] **これが元の誤検出の真因である。** 「どこで走るか」の導出が
+    `Makefile` と継続的検査の 2 経路しか見ていなかったので、
+    `test/lisp/qemu_boot_diag_m12_host.lisp`(`test/c/script_test.c:332` が
+    毎回読んでいて `make test` で必ず走る)を
+    **「どこからも走らない」と誤判定していた。**
+    その誤判定が #208 の「7 本」という報告を作った。
+    """
+    out = {}
+    testc = os.path.join(root, "test/c")
+    if not os.path.isdir(testc):
+        return out
+    for f in sorted(os.listdir(testc)):
+        if not f.endswith(".c"):
+            continue
+        rel = "test/c/" + f
+        with open(os.path.join(root, rel), encoding="utf-8") as fh:
+            src = strip_c_comments(fh.read())
+        for target in RUN_LISP_FILE_RE.findall(src):
+            out.setdefault(target, []).append(rel)
+    return out
+
+
 def where_it_runs(root="."):
-    """台本 → どこで走るか。**Makefile と CI の定義から導出する**(手で書かない)。
+    """台本 → どこで走るか。**定義から導出する**(手で書かない)。
+
+    起点は **3 種類**ある。2 種類しか見ていなかったのが #208 の誤検出の真因:
 
     - `make test-qemu-all` のレシピ本体に出てくるもの
     - `.github/workflows/ci.yml` に出てくるもの
-    - Makefile のどこかには出るが上の 2 つに無いもの = 手で走らせる段
+    - **母艦側の単体試験(`test/c/*.c`)が `run_lisp_file` で読むもの**(#208 で追加)
+    - 上のどれでもないが Makefile のどこかには出るもの = 手で走らせる段
+
+    起点を足したいときは、**足したことがここの docstring と出力に出る**ようにすること。
+    知らない起点を黙って「無い」と断定するのが穴である。
     """
-    mk = open(os.path.join(root, "Makefile"), encoding="utf-8").read()
-    ci = open(os.path.join(root, ".github/workflows/ci.yml"), encoding="utf-8").read()
+    mk = strip_make_comments(
+        open(os.path.join(root, "Makefile"), encoding="utf-8").read()
+    )
+    ci = strip_make_comments(
+        open(os.path.join(root, ".github/workflows/ci.yml"), encoding="utf-8").read()
+    )
+    hosts = host_unit_tests(root)
     # test-qemu-all のレシピ(タブで始まる行が続く範囲)
     i = mk.index("\ntest-qemu-all:")
     j = i + 1
@@ -396,6 +494,10 @@ def where_it_runs(root="."):
         if ln.startswith("\t"):
             recipe.append(ln)
         elif ln.strip() == "":
+            # 空行はレシピを終わらせない。**行まるごとのコメントも同じ**で、
+            # 上の strip_make_comments が空行にしてある(#208。レシピの中に
+            # コメントを書くと、ここで段の並びが途中で切れて
+            # 「それ以降が走らない」に化けていた)
             continue
         else:
             break
@@ -433,10 +535,14 @@ def where_it_runs(root="."):
             where.append("all")
         if path in ci:
             where.append("CI")
+        if path in hosts:
+            # [#208] 第 3 の起点。母艦側の単体試験が読むものは
+            # **`make test` で毎回走る**(QEMU も要らない)
+            where.append("母艦 " + ",".join(hosts[path]))
         if not where:
             # Makefile に名前があれば「手で打つ段(make のターゲットはある)」。
-            # 無ければ Makefile/CI のどこにも無く、文書の手順として残っているだけ
-            where.append("手" if path in mk else "**Makefile/CI に無い**")
+            # 無ければどの起点からも辿れず、文書の手順として残っているだけ
+            where.append("手" if path in mk else "**どの起点にも無い**")
         out[path] = where
     return out
 

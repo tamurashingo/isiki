@@ -91,7 +91,10 @@
 import argparse
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 # --- 周(どの 1 周で走るか) ------------------------------------------------
 ALL = "all"  # make test-qemu-all
@@ -198,6 +201,32 @@ COUNTS = (
     ("test/lisp/qemu_boot_compare_fixnum.lisp", 55, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_inline_muldiv.lisp", 46, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_safety3.lisp", 25, "isiki", (ALL,)),
+    #
+    # **[2026-11-09 / #208] ここから 6 段を足した。理由をここに書く(規則 16)。**
+    #
+    # この 6 段は **`Makefile` と CI の全 686 コミットのどの時点にも登録された
+    # ことがない。** 文書に手順だけが残っていて、**一度も走っていなかった。**
+    # 件数が名簿に入ることで、**段がまるごと消えても落ちる**ようになる(#208 の趣旨)。
+    #
+    # 件数は手で数えていない(規則 13)。出どころは
+    #
+    #     python3 tools/census_test_counts.py --detail --static <台本>
+    #
+    # で、6 / 21 / 6 / 5 / 6 / 5。うち 4 段は**実機の単一段で実測と一致**している
+    # (2026-11-09): inline_phase0 = 6 passed / inline_phase0b = 5 passed /
+    # declare_bench = 19 passed(素の load のとき。寄せて +2 = 21 ★)/
+    # inline_phase3 は下の表のとおり。
+    # instcount_gate_check と abi_bench は ★ 単一段を走らせていない。
+    #
+    # abi_bench と declare_bench は本体を**素の load から isiki-test-load へ寄せた**
+    # (#203 の決定)。寄せると出口の検査が 1 本あたり 2 件増えるので
+    # **4 -> 6 / 19 -> 21**。試験が増えたのではない。
+    ("test/lisp/qemu_boot_instcount_gate_check.lisp", 5, "isiki", (ALL,)),
+    ("test/lisp/qemu_boot_abi_bench.lisp", 6, "isiki", (ALL,)),
+    ("test/lisp/qemu_boot_inline_phase3.lisp", 6, "isiki", (ALL,)),
+    ("test/lisp/qemu_boot_inline_phase0.lisp", 6, "isiki", (ALL,)),
+    ("test/lisp/qemu_boot_inline_phase0b.lisp", 5, "isiki", (ALL,)),
+    ("test/lisp/qemu_boot_declare_bench.lisp", 21, "isiki", (ALL,)),
     # --- ここから下は CI だけで走る段(test-qemu-all に入っていない) ---
     ("test/lisp/qemu_boot_m1_base.lisp", 2785, "isiki", (CI,)),
     ("test/lisp/qemu_boot_m2_za.lisp", 678, "isiki", (CI,)),
@@ -439,6 +468,30 @@ FILES = {
     # test/lisp/qemu_boot_safety3.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 25 件
     "test/lisp/qemu_boot_safety3.lisp": (0, (
         ("test/lisp/safety3_test.lisp", 23),
+    )),
+    # [#208] 足した 6 段。**4 段は項目(= 証人つきで読むファイル)を持たない。**
+    # アサーションが全部台本の最上位にあるからで、
+    # 「どのファイルが縮んだか」の答えは**台本そのもの 1 つしかない。**
+    # 下の check_files_roster はこの形だけ項目が空であることを許す
+    # (台本自身の件数が 0 でないことを条件にしてある)
+    "test/lisp/qemu_boot_instcount_gate_check.lisp": (5, ()),
+    # 計測の仕組み自身の合格判定。**現役の計器の自己対照はここだけ**で、
+    # しかもいちばん安い(10 秒)。計器が黙って壊れるのを止める #208 の趣旨に合う
+    "test/lisp/qemu_boot_abi_bench.lisp": (0, (
+        ("test/lisp/abi_bench.lisp", 4),
+    )),
+    "test/lisp/qemu_boot_inline_phase3.lisp": (6, ()),
+    # **絶対値で固定した生成コード長 3 件はここだけが見ている。**
+    # 過去に実際に 181 byte の差で落ちたが、この段が周回の外だったので
+    # 全回帰では拾えず、計器を手で回したときに初めて分かった
+    # (documents/inline-arith.md:1085-1090)。それが #208 の穴そのものである
+    "test/lisp/qemu_boot_inline_phase0.lisp": (6, ()),
+    "test/lisp/qemu_boot_inline_phase0b.lisp": (5, ()),
+    # **型ごとの呼び先の選び方 4 件のうち 3 件は、常時走る段に同等物が無い**
+    # (double 宣言つき `+` が GENERIC を呼び、fixnum/single 特化版を呼ばないこと。
+    #  `-` `*` `/` には declare_typed_*_test.lisp に対応行があるが `+` には無い)
+    "test/lisp/qemu_boot_declare_bench.lisp": (0, (
+        ("test/lisp/declare_types_bench.lisp", 19),
     )),
     # test/lisp/qemu_boot_m1_base.lisp … 読み方 isiki / 台本自身 1 件 / 証人 13 本 / 導出の合計 2785 件
     "test/lisp/qemu_boot_m1_base.lisp": (1, (
@@ -898,7 +951,20 @@ def check_files_roster():
             continue
         script_own, items = entry
         if not items:
-            problems.append("段 %s の項目が空。内訳の無い名簿は何も見ていない" % stage)
+            # [#208] **台本自身にしかアサーションが無い段**は項目を持たない。
+            # 証人の行(`#count`)を出すのは isiki-test-load だけで、台本の最上位の
+            # アサーションはどの `#count` にも入らないからである。
+            # この形では「どのファイルが縮んだか」の答えは台本そのもの 1 つなので、
+            # 内訳が無くても**特定はできている。**
+            # ただし**件数まで 0 なら何も見ていない**ので、そこは落とす
+            # (COUNTS の「0 件の段は認めない」と同じ理由)
+            if script_own <= 0:
+                problems.append(
+                    "段 %s は項目が空で、台本自身の件数も %d である。"
+                    "**何も見ていない名簿になっている**(縮んでも差が出ない)。"
+                    "証人つきで読むファイルを書くか、台本自身の件数を入れること"
+                    % (stage, script_own)
+                )
             continue
         seen = set()
         for name, n in items:
@@ -1012,6 +1078,865 @@ def check_witness_sources(root="."):
                 )
     return problems
 
+
+
+# ===========================================================================
+# [#208] **配線の名簿** —— 試験台本が「どこから走るのか」を 1 箇所に固定する
+# ===========================================================================
+#
+# ## なぜ必要か
+#
+# 棚卸し(`documents/test-count-census.md`)で、**`Makefile` にも継続的検査にも
+# どこにも書かれていない試験台本が 6 本(+ その本体 2 本)**見つかった(#208)。
+# 文書に手順だけが残っていて、**一度も走っていない。**
+# 「落ちない検査は検出器ではない」の別の形で、書いた人は守られていると思っている。
+#
+# **しかも元の報告は 7 本で、1 本は誤検出だった。**
+# `test/lisp/qemu_boot_diag_m12_host.lisp` は `test/c/script_test.c` が読んでいて
+# `make test` で毎回走っている。数え上げの道具(`tools/census_test_counts.py` の
+# `where_it_runs`)が**起点を `Makefile` と継続的検査の 2 経路しか見ていなかった**のが
+# 原因で、**「どこからも走らない」という報告自体が道具の穴によるもの**だった。
+#
+# だから閉じる穴は 2 つある:
+#
+#   1. 配線されていない台本が増えるのを止める(本命)
+#   2. **起点の種類を取りこぼして誤検出するのを止める**(誤検出も計器を殺す)
+#
+# 2 は「知らない読み取り方を黙って飛ばすのが穴である」(上の `READERS`)と
+# まったく同じ形なので、**同じ形で閉じる: 起点の種類を名簿にし、知らない種類で落ちる。**
+#
+# ## 作法(この道具のほかの名簿と同じ)
+#
+# - **名簿は下の `WIRING` 1 箇所だけ**
+# - **両方向で落ちる。** 名簿に無い実物が現れたら落ちる / 名簿にあるのに実物が
+#   無くなったら落ちる / **名簿の「どこから走る」が導出と食い違ったら落ちる**
+#   (「意図して未配線」と書いたのに実は走っている場合も落ちる)
+# - 「意図して未配線」には**理由と日付**を必ず書く。空なら落ちる
+#   (`RESOURCES` と同じ作法。**理由の無い例外は、ただの穴である**)
+# - 次に名簿へ書くべき行をメッセージに出す
+# - `--wiring-self-test` で陽性対照・陰性対照を持つ(規則 8)。
+#   **対照に使う木はその場で合成する**(本物の木には「未配線」が 1 本も無いので、
+#   実物だけでは陽性対照が取れない)
+#
+# ## 名簿が覆う範囲
+#
+# `git ls-files test/` の**全部**(台本・本体・母艦側の単体試験の原簿・資料を含む)。
+# 「試験ファイルだけ」に絞らないのは、**絞った範囲の外に落ちたものが見えなくなる**のが
+# #208 そのものだからである。
+#
+# ## コメントの中の名前を数えないこと(誤検出の真因その 2)
+#
+# 調査(`docs/investigation/never-run-stages.logic.md` §9-6)は、同じ探索で
+#
+#   - **偽陽性**: `test/lisp/abi_bench.lisp` は `src/c/runtime.h` の**コメントに
+#     名前が書いてあるだけ**で「辿れた」と出た。実行はされていない
+#   - **偽陰性**: `test/c/test_assert.h` は同ディレクトリの
+#     `#include "test_assert.h"`(パス接頭辞なし)で読まれているのに「辿れない」と出た
+#
+# の両方を出している。だから導出は
+#
+#   (a) **コメントを剥がしてから**名前を探す
+#   (b) **同ディレクトリの相対参照を解決する**
+#
+# の 2 つを必ず行う。どちらも下の自己試験に陽性対照がある。
+# いま実際に効いている例: `test/c/load_test.c` のコメントは
+# `test/lisp/partition_test.lisp` と `test/c/mount_test.c` の名前を含み、
+# `test/c/repl_test.c` のコメントは `test/lisp/toplevel_abort_test.lisp` を含む。
+# **剥がさないと「母艦側の単体試験が走らせている」と誤って読める。**
+
+# 起点の種類の名簿。**知らない種類はここで落とす。** 値は (引数が要るか, 説明)
+WIRING_KINDS = {
+    "all": (False, "make test-qemu-all の 1 周(自動の周回)"),
+    "ci": (False, ".github/workflows/ci.yml の段"),
+    "manual": (True, "名前付きの手で呼ぶ make のターゲット(引数 = ターゲット名)"),
+    "host": (True, "母艦側の単体試験が run_lisp_file で読む(引数 = その C の原簿)"),
+    "hostbuild": (True, "母艦側の単体試験の原簿そのもの(引数 = Makefile の変数名)"),
+    "loaded": (False, "配線済みの台本が load / isiki-test-load で読む"),
+    "included": (False, "配線済みの原簿が #include で読む(同ディレクトリの相対参照を含む)"),
+    "fixture": (True, "道具が資料として名指しで読む(引数 = その道具)"),
+    "unwired": (True, "**意図して未配線。**引数 = 理由と日付(空なら落ちる)"),
+}
+
+# **配線の名簿。ここだけを書き換える。**
+#
+# 初期値は**手で書いていない**(規則 13)。出どころは
+#
+#     python3 tools/check_test_count_ratchet.py --wiring-derive
+#
+# の出力をそのまま貼ったもので、実物の木(`git ls-files test`)190 本と
+# 1 行ずつ対応している。**だから名簿そのものに「嘘」は入れられない** ——
+# 導出と食い違えば下の check_wiring が落ちる。
+#
+# **配線を変えたときは理由を同じ場所に書くこと**(規則 16)。
+# 「鳴ったから名簿を直した」だけの更新は、この計器を形骸化させる。
+#
+# [2026-11-09 / #208] **未配線 8 本を 0 本にした。** 内訳と理由:
+#   - 6 本の台本(+ 本体 2 本)を `test-qemu-all` へ配線した
+#     (`qemu_boot_instcount_gate_check` / `_abi_bench` / `_inline_phase3` /
+#      `_inline_phase0` / `_inline_phase0b` / `_declare_bench`)
+#   - 当初の設計は 4 本を消す判断だったが、**合否の項目が常時走る段で
+#     覆われていなかったので 3 本は消さなかった**
+#     (documents/never-run-stages-decisions.md)
+#   - `qemu_boot_diag_m12_host.lisp` は**元から走っていた。**
+#     数え上げの道具が起点を 2 種類しか見ていなかっただけである(= 誤検出)
+#
+WIRING = (
+    ("test/bench/estimator_fixture.tsv", ("fixture:tools/bench/check_estimator.sh",)),
+    ("test/c/clock_test.c", ("hostbuild:TEST_SRC_CLOCK",)),
+    ("test/c/disasm_test.c", ("hostbuild:TEST_SRC_DISASM",)),
+    ("test/c/eval_test.c", ("hostbuild:TEST_SRC_EVAL",)),
+    ("test/c/format_test.c", ("hostbuild:TEST_SRC_FORMAT",)),
+    ("test/c/framebuffer_test.c", ("hostbuild:TEST_SRC_FRAMEBUFFER",)),
+    ("test/c/ide_test.c", ("hostbuild:TEST_SRC_IDE",)),
+    ("test/c/lisp_compiled_test.c", ("hostbuild:TEST_SRC_LISP_COMPILED",)),
+    ("test/c/lisp_test.c", ("hostbuild:TEST_SRC_LISP",)),
+    ("test/c/load_test.c", ("hostbuild:TEST_SRC_LOAD",)),
+    ("test/c/mount_test.c", ("hostbuild:TEST_SRC_MOUNT",)),
+    ("test/c/p9_test.c", ("hostbuild:TEST_SRC_P9",)),
+    ("test/c/print_test.c", ("hostbuild:TEST_SRC_PRINT",)),
+    ("test/c/process_test.c", ("hostbuild:TEST_SRC_PROCESS",)),
+    ("test/c/reader_test.c", ("hostbuild:TEST_SRC_READER",)),
+    ("test/c/repl_test.c", ("hostbuild:TEST_SRC_REPL",)),
+    ("test/c/runtime_test.c", ("hostbuild:TEST_SRC_RUNTIME",)),
+    ("test/c/script_test.c", ("hostbuild:TEST_SRC_SCRIPT",)),
+    ("test/c/stream_lisp_test.c", ("hostbuild:TEST_SRC_STREAM_LISP",)),
+    ("test/c/stream_test.c", ("hostbuild:TEST_SRC_STREAM",)),
+    ("test/c/subprimitive_test.c", ("hostbuild:TEST_SRC_SUBPRIMITIVE",)),
+    ("test/c/test_assert.h", ("included",)),
+    ("test/c/virtio9p_test.c", ("hostbuild:TEST_SRC_VIRTIO9P",)),
+    ("test/fixtures/pr113_body.md", ("fixture:tools/check_pr_claims.py",)),
+    ("test/lisp/abi_bench.lisp", ("loaded",)),
+    ("test/lisp/alloc_breakdown.lisp", ("loaded",)),
+    ("test/lisp/alloc_reason_test.lisp", ("loaded",)),
+    ("test/lisp/aot_leaf_gc_test.lisp", ("loaded",)),
+    ("test/lisp/arith_signal_test.lisp", ("loaded",)),
+    ("test/lisp/arity_signal_test.lisp", ("loaded",)),
+    ("test/lisp/audit_control_post.lisp", ("fixture:tools/bench/run_paint_audit.sh",)),
+    ("test/lisp/audit_control_pre.lisp", ("fixture:tools/bench/run_paint_audit.sh",)),
+    ("test/lisp/bench_construct_test.lisp", ("loaded",)),
+    ("test/lisp/bench_interp_control.lisp", ("loaded",)),
+    ("test/lisp/bench_interp_guard.lisp", ("loaded",)),
+    ("test/lisp/bench_interp_test.lisp", ("loaded",)),
+    ("test/lisp/bench_jit_eval_control.lisp", ("loaded",)),
+    ("test/lisp/bench_jit_guard.lisp", ("loaded",)),
+    ("test/lisp/bench_jit_guard_test.lisp", ("loaded",)),
+    ("test/lisp/bench_jit_test.lisp", ("loaded",)),
+    ("test/lisp/bitwise_char_test.lisp", ("loaded",)),
+    ("test/lisp/compare_fixnum_test.lisp", ("loaded",)),
+    ("test/lisp/compare_single_test.lisp", ("loaded",)),
+    ("test/lisp/convert_float_test.lisp", ("loaded",)),
+    ("test/lisp/declaim_test.lisp", ("loaded",)),
+    ("test/lisp/declare_audit_test.lisp", ("loaded",)),
+    ("test/lisp/declare_typed_add_test.lisp", ("loaded",)),
+    ("test/lisp/declare_typed_div_test.lisp", ("loaded",)),
+    ("test/lisp/declare_typed_mul_test.lisp", ("loaded",)),
+    ("test/lisp/declare_typed_sub_test.lisp", ("loaded",)),
+    ("test/lisp/declare_types_bench.lisp", ("loaded",)),
+    ("test/lisp/declare_types_test.lisp", ("loaded",)),
+    ("test/lisp/defmacro_test.lisp", ("host:test/c/script_test.c",)),
+    ("test/lisp/device_test.lisp", ("loaded",)),
+    ("test/lisp/disassemble_test.lisp", ("loaded",)),
+    ("test/lisp/divide_direct_call_test.lisp", ("loaded",)),
+    ("test/lisp/environment_literal_slots_test.lisp", ("loaded",)),
+    ("test/lisp/environment_pages_test.lisp", ("loaded",)),
+    ("test/lisp/environment_utilities_test.lisp", ("loaded",)),
+    ("test/lisp/environments_predefined_test.lisp", ("host:test/c/script_test.c",)),
+    ("test/lisp/fat16_test.lisp", ("loaded",)),
+    ("test/lisp/fat32_primary_boot_test.lisp", ("loaded",)),
+    ("test/lisp/fat32_test.lisp", ("loaded",)),
+    ("test/lisp/fat_callback_transfer_test.lisp", ("loaded",)),
+    ("test/lisp/file_cmd_test.lisp", ("loaded",)),
+    ("test/lisp/fixnum_signed_arith_test.lisp", ("loaded",)),
+    ("test/lisp/float_contagion_bench.lisp", ("loaded",)),
+    ("test/lisp/float_contagion_test.lisp", ("loaded",)),
+    ("test/lisp/float_default_test.lisp", ("loaded",)),
+    ("test/lisp/float_math_contagion_test.lisp", ("loaded",)),
+    ("test/lisp/fn_cell_cache_test.lisp", ("loaded",)),
+    ("test/lisp/for_expansion_test.lisp", ("loaded",)),
+    ("test/lisp/for_gc_stress_test.lisp", ("loaded",)),
+    ("test/lisp/for_semantics_test.lisp", ("loaded",)),
+    ("test/lisp/frame_cell_gc_test.lisp", ("loaded",)),
+    ("test/lisp/frame_definition_test.lisp", ("loaded",)),
+    ("test/lisp/frame_variable_test.lisp", ("loaded",)),
+    ("test/lisp/gc_debug_guard.lisp", ("loaded",)),
+    ("test/lisp/go_exit_reuse_test.lisp", ("loaded",)),
+    ("test/lisp/handler_exit_test.lisp", ("loaded",)),
+    ("test/lisp/heap_exhaustion_test.lisp", ("loaded",)),
+    ("test/lisp/ide_test.lisp", ("loaded",)),
+    ("test/lisp/imm_leak_test.lisp", ("loaded",)),
+    ("test/lisp/index_signal_test.lisp", ("loaded",)),
+    ("test/lisp/init_test.lisp", ("host:test/c/script_test.c", "loaded",)),
+    ("test/lisp/inline_builtin_test.lisp", ("loaded",)),
+    ("test/lisp/inline_decl_test.lisp", ("loaded",)),
+    ("test/lisp/inline_muldiv_test.lisp", ("loaded",)),
+    ("test/lisp/io_signal_test.lisp", ("loaded",)),
+    ("test/lisp/isiki_test.lisp", ("loaded",)),
+    ("test/lisp/isiki_test_jit.lisp", ("loaded",)),
+    ("test/lisp/isiki_test_syntax.lisp", ("loaded",)),
+    ("test/lisp/jit_code_packing_test.lisp", ("loaded",)),
+    ("test/lisp/jit_frame_test.lisp", ("loaded",)),
+    ("test/lisp/jit_limits_test.lisp", ("loaded",)),
+    ("test/lisp/jit_mixed_frame_test.lisp", ("loaded",)),
+    ("test/lisp/jit_nest_depth_test.lisp", ("loaded",)),
+    ("test/lisp/jit_rsp_balance_test.lisp", ("loaded",)),
+    ("test/lisp/load_disk_test.lisp", ("loaded",)),
+    ("test/lisp/load_gc_stress_fixture.lisp", ("loaded",)),
+    ("test/lisp/load_gc_stress_test.lisp", ("loaded",)),
+    ("test/lisp/nan_comparison_test.lisp", ("loaded",)),
+    ("test/lisp/partition_test.lisp", ("loaded",)),
+    ("test/lisp/perf_fat16_test.lisp", ("loaded",)),
+    ("test/lisp/perf_fat32_test.lisp", ("loaded",)),
+    ("test/lisp/perf_read_fat16_test.lisp", ("loaded",)),
+    ("test/lisp/perf_read_fat32_test.lisp", ("loaded",)),
+    ("test/lisp/qemu_boot_abi_bench.lisp", ("all",)),
+    ("test/lisp/qemu_boot_alloc_audit.lisp", ("manual:test-qemu-alloc-audit",)),
+    ("test/lisp/qemu_boot_alloc_breakdown.lisp", ("manual:test-qemu-alloc-breakdown",)),
+    ("test/lisp/qemu_boot_bench_construct.lisp", ("manual:test-qemu-bench-construct-check",)),
+    ("test/lisp/qemu_boot_bench_interp.lisp", ("all",)),
+    ("test/lisp/qemu_boot_bench_jit.lisp", ("all",)),
+    ("test/lisp/qemu_boot_compare_fixnum.lisp", ("all",)),
+    ("test/lisp/qemu_boot_compare_single.lisp", ("all",)),
+    ("test/lisp/qemu_boot_declare_audit.lisp", ("manual:test-qemu-declare-audit",)),
+    ("test/lisp/qemu_boot_declare_bench.lisp", ("all",)),
+    ("test/lisp/qemu_boot_diag_m12_host.lisp", ("host:test/c/script_test.c",)),
+    ("test/lisp/qemu_boot_error_escape_gc.lisp", ("all",)),
+    ("test/lisp/qemu_boot_fat16_m0.lisp", ("ci",)),
+    ("test/lisp/qemu_boot_fat32.lisp", ("all", "ci",)),
+    ("test/lisp/qemu_boot_fat32_primary_boot.lisp", ("all", "ci",)),
+    ("test/lisp/qemu_boot_fat_callback_transfer.lisp", ("all", "ci",)),
+    ("test/lisp/qemu_boot_float_contagion_bench.lisp", ("manual:test-qemu-float-contagion-bench",)),
+    ("test/lisp/qemu_boot_for_expansion.lisp", ("manual:test-qemu-for-expansion",)),
+    ("test/lisp/qemu_boot_for_gc_stress.lisp", ("manual:test-qemu-for-gc-stress",)),
+    ("test/lisp/qemu_boot_for_semantics.lisp", ("all",)),
+    ("test/lisp/qemu_boot_heap_exhaustion.lisp", ("all",)),
+    ("test/lisp/qemu_boot_imm_leak.lisp", ("manual:test-qemu-imm-leak",)),
+    ("test/lisp/qemu_boot_inline_muldiv.lisp", ("all",)),
+    ("test/lisp/qemu_boot_inline_phase0.lisp", ("all",)),
+    ("test/lisp/qemu_boot_inline_phase0b.lisp", ("all",)),
+    ("test/lisp/qemu_boot_inline_phase3.lisp", ("all",)),
+    ("test/lisp/qemu_boot_instcount_gate_check.lisp", ("all",)),
+    ("test/lisp/qemu_boot_jit_frame.lisp", ("all",)),
+    ("test/lisp/qemu_boot_jit_limits.lisp", ("all",)),
+    ("test/lisp/qemu_boot_load_abort_positive.lisp", ("manual:test-qemu-load-abort-positive",)),
+    ("test/lisp/qemu_boot_load_disk.lisp", ("all",)),
+    ("test/lisp/qemu_boot_load_gc_stress.lisp", ("all",)),
+    ("test/lisp/qemu_boot_m1_base.lisp", ("ci",)),
+    ("test/lisp/qemu_boot_m1_cost.lisp", ("manual:test-qemu-m1-cost",)),
+    ("test/lisp/qemu_boot_m2_za.lisp", ("ci",)),
+    ("test/lisp/qemu_boot_m2_za_stress.lisp", ("manual:test-qemu-stress",)),
+    ("test/lisp/qemu_boot_m3_za_ext5.lisp", ("ci",)),
+    ("test/lisp/qemu_boot_m4_environment.lisp", ("ci",)),
+    ("test/lisp/qemu_boot_m5_ide.lisp", ("all", "ci",)),
+    ("test/lisp/qemu_boot_m6_fat16.lisp", ("all", "ci",)),
+    ("test/lisp/qemu_boot_no_init_signal.lisp", ("all",)),
+    ("test/lisp/qemu_boot_partition.lisp", ("all", "ci",)),
+    ("test/lisp/qemu_boot_perf_fat16.lisp", ("manual:test-qemu-perf",)),
+    ("test/lisp/qemu_boot_perf_fat32.lisp", ("manual:test-qemu-perf",)),
+    ("test/lisp/qemu_boot_perf_read_fat16.lisp", ("manual:test-qemu-perf-read",)),
+    ("test/lisp/qemu_boot_perf_read_fat32.lisp", ("manual:test-qemu-perf-read",)),
+    ("test/lisp/qemu_boot_read_file_native.lisp", ("manual:test-qemu-read-file-native",)),
+    ("test/lisp/qemu_boot_safety3.lisp", ("all",)),
+    ("test/lisp/qemu_boot_stack_guard.lisp", ("all",)),
+    ("test/lisp/qemu_boot_stack_guard_gc.lisp", ("manual:test-qemu-stack-guard-gc",)),
+    ("test/lisp/qemu_boot_test.lisp", ("all",)),
+    ("test/lisp/read_file_native_test.lisp", ("loaded",)),
+    ("test/lisp/rest_test.lisp", ("host:test/c/script_test.c",)),
+    ("test/lisp/room_test.lisp", ("loaded",)),
+    ("test/lisp/safety3_test.lisp", ("loaded",)),
+    ("test/lisp/single_float_test.lisp", ("loaded",)),
+    ("test/lisp/square_test.lisp", ("host:test/c/script_test.c",)),
+    ("test/lisp/stack_guard_gc_test.lisp", ("loaded",)),
+    ("test/lisp/stack_guard_test.lisp", ("loaded",)),
+    ("test/lisp/test_framework.lisp", ("loaded",)),
+    ("test/lisp/test_framework_test.lisp", ("loaded",)),
+    ("test/lisp/toplevel_abort_test.lisp", ("loaded",)),
+    ("test/lisp/transpile_fixture.lisp", ("fixture:tools/let_histogram_report.py",)),
+    ("test/lisp/type_unbound_test.lisp", ("loaded",)),
+    ("test/lisp/undefined_signal_test.lisp", ("loaded",)),
+    ("test/lisp/za_abi_probe_test.lisp", ("loaded",)),
+    ("test/lisp/za_code_imm_test.lisp", ("loaded",)),
+    ("test/lisp/za_test.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext10.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext11.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext12.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext13.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext14.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext15.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext16.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext17.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext18.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext19.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext5.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext7.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext8.lisp", ("loaded",)),
+    ("test/lisp/za_test_ext9.lisp", ("loaded",)),
+    ("test/lisp/za_test_stress.lisp", ("loaded",)),
+)
+
+
+TESTDIR_VAR = "test/c"
+SRCDIR_VAR = "src/c"
+
+# 母艦側の単体試験が Lisp の台本を走らせる呼び出し。**呼び出しの形だけを見る**
+# (コメントの中の名前は数えない)
+RUN_LISP_RE = re.compile(r'run_lisp_file\s*\([^;{}]*?"([^"]+)"\s*\)')
+# C の取り込み。**パス接頭辞の無い形(同ディレクトリ)を含む**
+INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.M)
+# 台本の読み込み。証人つき/素のどちらも「走る」ことの根拠にはなる
+# (どちらで読んだかは上の check_witness_sources の仕事である)
+WIRING_LOAD_RE = re.compile(r'\((?:load|isiki-test-load)\s+"([^"]+)"\s*\)')
+MAKE_RECUR_RE = re.compile(r"\$\(MAKE\)\s+(?:\S+=\S+\s+)*(\S+)")
+MAKE_VAR_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*[:+?]?=\s*(.*)$", re.M)
+MAKE_RULE_RE = re.compile(r"^([A-Za-z0-9_./$()-]+(?:\s+[A-Za-z0-9_./$()-]+)*)\s*:(?!=)")
+
+
+def _census():
+    """数え上げの道具を取り込む。
+
+    **「名前の出どころからコメントを剥がす」実装を 1 本にするため**である。
+    2 本に分かれると片方だけ直って**道具によって答えが違う**状態になり、
+    それはいま直している穴(#208 の誤検出)とまったく同じ族である。
+    `tools/census_test_counts.py` は数えるだけの道具だが、
+    剥がし方の実装はそちらが持っている(そちらが先に必要だった)。
+    """
+    # **バイトコードを書かせない。** `tools/__pycache__/` は版管理の対象外に
+    # なっていないので、取り込むだけで作業木に落とし物が増える
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import census_test_counts
+
+    return census_test_counts
+
+
+def strip_c_comments(text):
+    """C の `//` と `/* */` を剥がす(実装は数え上げの道具と共用)。"""
+    return _census().strip_c_comments(text)
+
+
+def strip_hash_full_line(text):
+    """**行まるごとのコメント**を落とす(実装は数え上げの道具と共用)。"""
+    return _census().strip_make_comments(text)
+
+
+def strip_lisp_comments(text):
+    """Lisp の行コメントを剥がす(実装は数え上げの道具と共用)。"""
+    return _census().strip_lisp(text, keep_strings=True)
+
+
+def _read(root, path):
+    with open(os.path.join(root, path), encoding="utf-8") as f:
+        return f.read()
+
+
+def make_rules(mk):
+    """`Makefile` を「ターゲット名 -> レシピ本体」にする。コメント行は先に落とす。"""
+    out = {}
+    lines = mk.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = MAKE_RULE_RE.match(line)
+        if m and not line.startswith("\t"):
+            body = []
+            j = i + 1
+            while j < len(lines) and (lines[j].startswith("\t") or lines[j].strip() == ""):
+                if lines[j].startswith("\t"):
+                    body.append(lines[j])
+                j += 1
+            text = "\n".join(body)
+            for nm in m.group(1).split():
+                out[nm] = out.get(nm, "") + "\n" + text
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def recipe_closure(rules, start):
+    """`$(MAKE) <t>` を辿って、そのターゲットから届くレシピ本体を全部つなげる。"""
+    seen = set()
+    queue = [start]
+    texts = []
+    while queue:
+        t = queue.pop()
+        if t in seen or t not in rules:
+            continue
+        seen.add(t)
+        texts.append(rules[t])
+        queue += MAKE_RECUR_RE.findall(rules[t])
+    return "\n".join(texts), seen
+
+
+def test_files(root="."):
+    """名簿が覆う実物の一覧。`git ls-files test` が真実源。
+
+    版管理の外のものを数えないのが要点(`tmp/` の作りかけが名簿に入ると
+    毎回鳴る)。git が使えない合成の木では木を歩く。
+    """
+    try:
+        r = subprocess.run(
+            ["git", "ls-files", "test"], cwd=root,
+            capture_output=True, text=True, check=True,
+        )
+        files = sorted(p for p in r.stdout.split("\n") if p)
+        if files:
+            return files
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    files = []
+    for base, _dirs, fs in os.walk(os.path.join(root, "test")):
+        for f in fs:
+            files.append(os.path.relpath(os.path.join(base, f), root))
+    return sorted(files)
+
+
+def _resolve_ref(origin, target, files):
+    """参照先を木のパスに直す。**同ディレクトリの相対参照を解決する**(偽陰性の修正)。"""
+    if target in files:
+        return target
+    cand = os.path.normpath(os.path.join(os.path.dirname(origin), target))
+    if cand in files:
+        return cand
+    return None
+
+
+def derive_wiring(root="."):
+    """**実物の木から**「どこから走るか」を導出する。
+
+    返り値 path -> set((種別, 引数))。名簿はこれと突き合わせるだけで、
+    名簿の側に「走る」と書いても導出できなければ落ちる(嘘を書けない)。
+    """
+    mk = strip_hash_full_line(_read(root, "Makefile"))
+    ci = strip_hash_full_line(_read(root, ".github/workflows/ci.yml"))
+    rules = make_rules(mk)
+    all_text, all_targets = recipe_closure(rules, "test-qemu-all")
+    # `make test-qemu` は台本の名前をコマンド行に書かない。ゲスト側の既定値から引く
+    m = KERNEL_DEFAULT_SCRIPT_RE.search(_read(root, "src/c/kernel.c"))
+    if m:
+        all_text += "\n" + m.group(1)
+    mkvars = {}
+    for name, val in MAKE_VAR_RE.findall(mk):
+        mkvars[name] = val.replace("$(TESTDIR)", TESTDIR_VAR).replace("$(SRCDIR)", SRCDIR_VAR)
+    mt = re.search(r"^test:(.*)$", mk, re.M)
+    test_deps = mt.group(1) if mt else ""
+
+    files = test_files(root)
+    found = {p: set() for p in files}
+
+    def mark(path, kind, arg=None):
+        if path in found:
+            found[path].add((kind, arg))
+
+    for p in files:
+        if p in all_text:
+            mark(p, "all")
+        if p in ci:
+            mark(p, "ci")
+    # 名前付きの手で呼ぶターゲット。**自動の周回から辿れるものは除く**
+    for t in rules:
+        if t in all_targets:
+            continue
+        text, _ = recipe_closure(rules, t)
+        for p in files:
+            if p in text and ("all", None) not in found[p]:
+                mark(p, "manual", t)
+    # 母艦側の単体試験が走らせる台本(**コメントを剥がしてから呼び出しの形だけを見る**)
+    for p in files:
+        if p.endswith(".c"):
+            for target in RUN_LISP_RE.findall(strip_c_comments(_read(root, p))):
+                mark(target, "host", p)
+    # 母艦側の単体試験の原簿そのもの。`Makefile` の変数に名前があり、
+    # **その変数が `test:` の前提に並んでいる**こと
+    for p in files:
+        for name, val in mkvars.items():
+            if p in val and ("$(%s)" % name) in test_deps:
+                mark(p, "hostbuild", name)
+    # 推移。**配線済みのものが読んでいるもの**だけを辿る(到達可能性である)
+    for _round in range(20):
+        changed = False
+        for p in files:
+            if not found[p]:
+                continue
+            if p.endswith(".lisp"):
+                for target in WIRING_LOAD_RE.findall(strip_lisp_comments(_read(root, p))):
+                    t = _resolve_ref(p, target, files)
+                    if t and ("loaded", None) not in found[t]:
+                        mark(t, "loaded")
+                        changed = True
+            elif p.endswith(".c") or p.endswith(".h"):
+                for target in INCLUDE_RE.findall(strip_c_comments(_read(root, p))):
+                    t = _resolve_ref(p, target, files)
+                    if t and ("included", None) not in found[t]:
+                        mark(t, "included")
+                        changed = True
+        if not changed:
+            break
+    # 道具が資料として名指しで読むもの(**ほかで説明がつかないものだけ**)。
+    #
+    # **この道具自身は走査から外す。** 下の WIRING は実物のパスを 190 行並べて
+    # いるので、自分を読むと「名簿に書いてあるから配線されている」という
+    # 円環になり、**名簿が自分で自分を正当化してしまう。**
+    # 名簿にしか名前が無いものは「配線されていない」が正しい答えである。
+    selfname = os.path.basename(os.path.abspath(__file__))
+    rest = [p for p in files if not found[p]]
+    if rest:
+        for base, _dirs, fs in os.walk(os.path.join(root, "tools")):
+            for f in fs:
+                rp = os.path.relpath(os.path.join(base, f), root)
+                if f == selfname:
+                    continue
+                if not rp.endswith((".py", ".sh", ".lisp", ".c")):
+                    continue
+                try:
+                    t = _read(root, rp)
+                except (UnicodeDecodeError, OSError):
+                    continue
+                t = strip_lisp_comments(t) if rp.endswith(".lisp") else (
+                    strip_c_comments(t) if rp.endswith(".c") else strip_hash_full_line(t))
+                for p in rest:
+                    if p in t:
+                        mark(p, "fixture", rp)
+    return found
+
+
+def _wiring_words(kinds):
+    return [k if a is None else "%s:%s" % (k, a) for k, a in sorted(kinds)]
+
+
+def fmt_wiring(kinds):
+    """導出の集合を人が読む形へ。"""
+    if not kinds:
+        return "unwired:<理由と日付を書くこと>"
+    return " + ".join(_wiring_words(kinds))
+
+
+def roster_line(path, kinds):
+    """**次に名簿へ書くべき行をそのまま出す**(規則: 次に書くものをメッセージに出す)。"""
+    words = _wiring_words(kinds) or ["unwired:<理由と日付を書くこと>"]
+    return '    ("%s", (%s)),' % (path, "".join('"%s", ' % w for w in words).rstrip())
+
+
+def check_wiring(root=".", roster=None):
+    """**起動を要さない静的検査。** 名簿と実物を両方向で突き合わせる。"""
+    roster = WIRING if roster is None else roster
+    problems = []
+    # --- 名簿自身の筋 ---
+    seen = set()
+    parsed = {}
+    for path, wiring in roster:
+        if path in seen:
+            problems.append("名簿に %s が 2 行ある" % path)
+        seen.add(path)
+        if not wiring:
+            problems.append(
+                "名簿の %s に配線が書かれていない。"
+                "%s のどれかを書くこと" % (path, "/".join(sorted(WIRING_KINDS)))
+            )
+            continue
+        kinds = set()
+        for entry in wiring:
+            kind, _, arg = entry.partition(":")
+            if kind not in WIRING_KINDS:
+                problems.append(
+                    "名簿の %s の起点の種類 %r を知らない。"
+                    "tools/check_test_count_ratchet.py の WIRING_KINDS に足すこと"
+                    "(**知らない起点を黙って飛ばしたのが #208 の誤検出の真因である**)"
+                    % (path, kind)
+                )
+                continue
+            needs_arg, _why = WIRING_KINDS[kind]
+            if needs_arg and not arg.strip():
+                if kind == "unwired":
+                    problems.append(
+                        "名簿の %s は「意図して未配線」だが**理由が空である。**"
+                        "`unwired:<何のために残すのか / いつ決めたのか>` の形で書くこと。"
+                        "**理由の無い例外は、ただの穴である**" % path
+                    )
+                else:
+                    problems.append(
+                        "名簿の %s の起点 %s に引数が無い(%s)" % (path, kind, _why)
+                    )
+                continue
+            if not needs_arg and arg.strip():
+                problems.append(
+                    "名簿の %s の起点 %s に引数は要らない(%r が付いている)" % (path, kind, arg)
+                )
+                continue
+            kinds.add((kind, arg.strip() or None))
+        parsed[path] = kinds
+
+    derived = derive_wiring(root)
+
+    # --- 両方向 ---
+    for path in sorted(set(derived) - seen):
+        problems.append(
+            "試験の木に %s があるが**名簿に無い。**次の行を WIRING に足すこと:\n"
+            "%s\n"
+            "  **どこからも走らないなら `unwired:<理由と日付>` と書く**"
+            "(理由を書かせるのがこの検査の目的である)"
+            % (path, roster_line(path, derived[path]))
+        )
+    for path in sorted(seen - set(derived)):
+        problems.append(
+            "名簿に %s があるが**実物が無い**(版管理から消えたか名前が変わった)。"
+            "名簿の行も外すこと(消した理由は documents/ に残す。規則 16)" % path
+        )
+
+    # --- 名簿の「どこから走る」が導出と合うか ---
+    for path in sorted(set(parsed) & set(derived)):
+        want = parsed[path]
+        got = derived[path]
+        if ("unwired", None) in {(k, None) for k, _ in want}:
+            pass
+        unwired = [a for k, a in want if k == "unwired"]
+        if unwired:
+            if got:
+                problems.append(
+                    "名簿は %s を「意図して未配線」と言っているが、**実際は走っている**"
+                    "(導出: %s)。名簿を直すこと —— "
+                    "**配線されたものを未配線のままにしておくと、"
+                    "次に本当に外れたときに気づけない**" % (path, fmt_wiring(got))
+                )
+            continue
+        if not got:
+            problems.append(
+                "名簿は %s を %s と言っているが、**どの起点からも辿れない。**\n"
+                "  走らせたいなら Makefile / CI / 母艦側の単体試験のどれかに配線し、\n"
+                "  配線しないと決めたなら `unwired:<理由と日付>` と書くこと(#208)"
+                % (path, fmt_wiring(want))
+            )
+            continue
+        missing = want - got
+        if missing:
+            problems.append(
+                "名簿の %s の配線 %s が**導出できない**(導出できたのは %s)。"
+                "名簿の行を次に直すこと:\n"
+                "%s"
+                % (path, fmt_wiring(missing), fmt_wiring(got), roster_line(path, got))
+            )
+    return problems
+
+
+# --- 配線の検査の自己対照(#208。規則 8)------------------------------------
+#
+# **本物の木では陽性対照が取れない。** いまの木には「意図して未配線」が 1 本も
+# 無く(#208 でぜんぶ配線した)、名簿にしか無い行も無いからである。
+# だから対照に使う木は**その場で合成する**(既存の synth_log と同じ考え方)。
+
+WIRING_SYNTH_MAKEFILE = """\
+SRCDIR = src/c
+TESTDIR = test/c
+TEST_SRC_FOO = $(SRCDIR)/foo.c $(TESTDIR)/foo_test.c
+
+test: check-something $(TEST_SRC_FOO)
+\t@echo building
+
+test-qemu-all:
+\t$(MAKE) test-qemu-all-stages
+
+test-qemu-all-stages:
+\t$(MAKE) test-qemu
+\t$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_wired.lisp
+
+test-qemu-hand:
+\t$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_byhand.lisp
+"""
+
+WIRING_SYNTH_CI = """\
+jobs:
+  qemu:
+    steps:
+      - run: make test-qemu-milestone MILESTONE=test/lisp/qemu_boot_ci.lisp
+"""
+
+WIRING_SYNTH_KERNEL = """\
+static void boot(void) {
+  g_qemu_test_boot_script[0] = "test/lisp/qemu_boot_test.lisp";
+}
+"""
+
+# 母艦側の単体試験。**走らせているのは 1 本だけで、もう 1 本は
+# コメントの中にしか名前が無い**(偽陽性の対照)。
+# 取り込みは**同ディレクトリの相対参照**で書く(偽陰性の対照)
+WIRING_SYNTH_HOST_C = """\
+#include "helper.h"
+/* test/lisp/only_in_comment_test.lisp がこの経路を説明している */
+static void t(void) {
+  // test/lisp/also_only_in_comment_test.lisp も走らせていない
+  run_lisp_file(proc, env, "test/lisp/by_host_test.lisp");
+}
+"""
+
+
+def wiring_synth_tree():
+    """対照に使う木をその場で作る。返り値は根のパス(呼び手が消す)。"""
+    root = tempfile.mkdtemp(prefix="wiring-selftest-")
+
+    def put(rel, text):
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    put("Makefile", WIRING_SYNTH_MAKEFILE)
+    put(".github/workflows/ci.yml", WIRING_SYNTH_CI)
+    put("src/c/kernel.c", WIRING_SYNTH_KERNEL)
+    put("test/c/foo_test.c", WIRING_SYNTH_HOST_C)
+    put("test/c/helper.h", "#define H 1\n")
+    # 自動の周回から呼ばれる台本。1 本は試験ファイルを読む(推移の対照)
+    put("test/lisp/qemu_boot_test.lisp", '(isiki-test-load "test/lisp/leaf_test.lisp")\n')
+    put("test/lisp/qemu_boot_wired.lisp", "(nothing)\n")
+    put("test/lisp/qemu_boot_ci.lisp", "(nothing)\n")
+    put("test/lisp/qemu_boot_byhand.lisp", "(nothing)\n")
+    put("test/lisp/leaf_test.lisp", "(assert-equal 1 1)\n")
+    put("test/lisp/by_host_test.lisp", "(assert-equal 1 1)\n")
+    # **コメントの中にしか名前が無い 2 本。** 走っていないのが正しい答え
+    put("test/lisp/only_in_comment_test.lisp", "(assert-equal 1 1)\n")
+    put("test/lisp/also_only_in_comment_test.lisp", "(assert-equal 1 1)\n")
+    return root
+
+
+WIRING_SYNTH_ROSTER = (
+    ("test/c/foo_test.c", ("hostbuild:TEST_SRC_FOO",)),
+    ("test/c/helper.h", ("included",)),
+    ("test/lisp/also_only_in_comment_test.lisp", ("unwired:名前がコメントにしか無い対照 2026-11-09",)),
+    ("test/lisp/by_host_test.lisp", ("host:test/c/foo_test.c",)),
+    ("test/lisp/leaf_test.lisp", ("loaded",)),
+    ("test/lisp/only_in_comment_test.lisp", ("unwired:名前がコメントにしか無い対照 2026-11-09",)),
+    ("test/lisp/qemu_boot_byhand.lisp", ("manual:test-qemu-hand",)),
+    ("test/lisp/qemu_boot_ci.lisp", ("ci",)),
+    ("test/lisp/qemu_boot_test.lisp", ("all",)),
+    ("test/lisp/qemu_boot_wired.lisp", ("all",)),
+)
+
+
+def _roster_without(path):
+    return tuple(r for r in WIRING_SYNTH_ROSTER if r[0] != path)
+
+
+def _roster_with(path, wiring):
+    return _roster_without(path) + ((path, wiring),)
+
+
+def wiring_self_test():
+    ok = True
+
+    def check(name, got, want):
+        nonlocal ok
+        if got != want:
+            ok = False
+        print("  [%s] %s: %s (期待 %s)" % ("OK" if got == want else "NG", name, got, want))
+
+    print("[wiring-self-test] 配線の名簿の検査の対照(規則 8)")
+    root = wiring_synth_tree()
+    try:
+        def probs(roster):
+            return check_wiring(root, roster)
+
+        # --- 陰性対照: 合成した木 + 正しい名簿では鳴らない ---
+        base = probs(WIRING_SYNTH_ROSTER)
+        check("陰性 合成の木で鳴らない", base, [])
+
+        # **偽陰性の対照**: 同ディレクトリの相対参照(`#include "helper.h"`)を
+        # 辿れていること。辿れていなければ上の名簿の `included` が導出できず鳴る
+        derived = derive_wiring(root)
+        check(
+            "陰性 同ディレクトリの相対参照を辿れる(偽陰性の修正)",
+            ("included", None) in derived["test/c/helper.h"],
+            True,
+        )
+        # **偽陽性の対照**: コメントの中にしか名前が無い 2 本は配線されていない
+        check(
+            "陰性 コメントの中の名前を配線と数えない(偽陽性の修正)",
+            derived["test/lisp/only_in_comment_test.lisp"]
+            | derived["test/lisp/also_only_in_comment_test.lisp"],
+            set(),
+        )
+
+        # --- 陽性 1: 台本を 1 本足して名簿に書かない ---
+        newfile = os.path.join(root, "test/lisp/brand_new_test.lisp")
+        with open(newfile, "w", encoding="utf-8") as f:
+            f.write("(assert-equal 1 1)\n")
+        p1 = probs(WIRING_SYNTH_ROSTER)
+        check("陽性 1 名簿に無い台本で落ちる", bool(p1), True)
+        check(
+            "陽性 1 次に書く行を出す",
+            any('("test/lisp/brand_new_test.lisp", ("unwired:' in x for x in p1),
+            True,
+        )
+        os.remove(newfile)
+        check("陰性 1 戻すと鳴らない", probs(WIRING_SYNTH_ROSTER), [])
+
+        # --- 陽性 2: 「意図して未配線」に理由が無い ---
+        p2 = probs(_roster_with("test/lisp/only_in_comment_test.lisp", ("unwired:",)))
+        check("陽性 2 理由の無い未配線で落ちる", bool(p2), True)
+        check(
+            "陽性 2 理由が空だと言う",
+            any("理由の無い例外は、ただの穴である" in x for x in p2),
+            True,
+        )
+        check(
+            "陽性 2b 引数ごと無いときも落ちる",
+            bool(probs(_roster_with("test/lisp/only_in_comment_test.lisp", ("unwired",)))),
+            True,
+        )
+
+        # --- 陽性 3: 名簿にあるのに実物が無い ---
+        p3 = probs(WIRING_SYNTH_ROSTER + (("test/lisp/vanished_test.lisp", ("loaded",)),))
+        check("陽性 3 実物の無い行で落ちる", bool(p3), True)
+        check(
+            "陽性 3 その名前を出す",
+            any("test/lisp/vanished_test.lisp" in x and "実物が無い" in x for x in p3),
+            True,
+        )
+
+        # --- 陽性 4: 名簿が「走っている」と嘘を書く ---
+        p4 = probs(_roster_with("test/lisp/only_in_comment_test.lisp", ("host:test/c/foo_test.c",)))
+        check("陽性 4 コメントだけの台本を host と書くと落ちる", bool(p4), True)
+        check(
+            "陽性 4 どの起点からも辿れないと言う",
+            any("どの起点からも辿れない" in x for x in p4),
+            True,
+        )
+        p4b = probs(_roster_with("test/lisp/qemu_boot_byhand.lisp", ("all",)))
+        check("陽性 4b 手で呼ぶ段を all と書くと落ちる", bool(p4b), True)
+
+        # --- 陽性 5: 配線されているのに「意図して未配線」と書く ---
+        p5 = probs(_roster_with("test/lisp/qemu_boot_wired.lisp", ("unwired:もう使わない 2026-11-09",)))
+        check("陽性 5 走っているのに未配線と書くと落ちる", bool(p5), True)
+        check(
+            "陽性 5 実際は走っていると言う",
+            any("実際は走っている" in x for x in p5),
+            True,
+        )
+
+        # --- 陽性 6: 知らない起点の種類 ---
+        p6 = probs(_roster_with("test/lisp/leaf_test.lisp", ("somehow:x",)))
+        check("陽性 6 知らない起点の種類で落ちる", bool(p6), True)
+        check(
+            "陽性 6 #208 の真因だと言う",
+            any("#208 の誤検出の真因" in x for x in p6),
+            True,
+        )
+        # 引数の要らない種別に引数を付けた / 要るのに付けない
+        check(
+            "陽性 6b 引数の過不足で落ちる",
+            bool(probs(_roster_with("test/lisp/leaf_test.lisp", ("loaded:よけいな引数",))))
+            and bool(probs(_roster_with("test/lisp/qemu_boot_byhand.lisp", ("manual",)))),
+            True,
+        )
+        # 名簿の行が 2 つある
+        check(
+            "陽性 6c 同じ台本が 2 行あると落ちる",
+            bool(probs(WIRING_SYNTH_ROSTER + (("test/lisp/leaf_test.lisp", ("loaded",)),))),
+            True,
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- 陰性対照の本番: **いまの木で誤って鳴らない** ---
+    check("陰性 本物の木で鳴らない", check_wiring("."), [])
+    return ok
 
 
 # --- 判定 ------------------------------------------------------------------
@@ -1685,10 +2610,57 @@ def main(argv):
         help="**ログを見ずに**証人の出どころを見る(台本と内訳の名簿の突き合わせ。#203)",
     )
     parser.add_argument("--self-test", action="store_true", help="計器自身の対照")
+    parser.add_argument(
+        "--wiring",
+        action="store_true",
+        help="**ログを見ずに**試験の木の配線を名簿と突き合わせる(#208)",
+    )
+    parser.add_argument(
+        "--wiring-derive",
+        action="store_true",
+        help="配線の名簿の初期値を**実物の木から導出して刷る**(手で書かないため。規則 13)",
+    )
+    parser.add_argument(
+        "--wiring-self-test", action="store_true", help="配線の検査自身の対照(#208)"
+    )
     args = parser.parse_args(argv)
 
     if args.self_test:
         return 0 if self_test() else 1
+
+    if args.wiring_self_test:
+        return 0 if wiring_self_test() else 1
+
+    if args.wiring_derive:
+        derived = derive_wiring(".")
+        print("WIRING = (")
+        for path in sorted(derived):
+            print(roster_line(path, derived[path]))
+        print(")")
+        print(
+            "# 導出した実物 %d 本 / うち未配線 %d 本"
+            % (len(derived), sum(1 for v in derived.values() if not v))
+        )
+        return 0
+
+    if args.wiring:
+        problems = check_wiring(".")
+        for prob in problems:
+            print("NG(配線): " + prob, file=sys.stderr)
+        if problems:
+            return 1
+        tally = {}
+        for _path, wiring in WIRING:
+            for entry in wiring:
+                tally[entry.split(":")[0]] = tally.get(entry.split(":")[0], 0) + 1
+        print(
+            "[test-file wiring] 実物 %d 本を名簿に列挙 —— "
+            "**どこからも走らない台本は無い**" % len(WIRING)
+        )
+        for kind in sorted(tally):
+            print("  %-10s %4d  (%s)" % (kind, tally[kind], WIRING_KINDS[kind][1]))
+        print("  OK")
+        return 0
 
     if args.witness:
         problems = check_files_roster() + check_witness_sources()
