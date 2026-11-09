@@ -115,7 +115,6 @@ done
 write_milestone() {
     local c="$1" n="$2"
     {
-        echo '(load "src/lisp/init.lisp")'
         echo '(load "test/lisp/test_framework.lisp")'
         echo '(load "src/lisp/bench_interp.lisp")'
         echo '(load "test/lisp/bench_interp_guard.lisp")'

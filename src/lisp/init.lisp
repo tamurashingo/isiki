@@ -613,7 +613,11 @@
 ;; ハンドラが非継続コンディションで正常returnしたとき、signal-conditionは
 ;; このタグへthrowして「そのwith-handlerまで」戻る(init_aot.lispのsignal-condition)。
 ;; *handlers*へ直接pushするコードは、この形に合わせること。
-(defdynamic *handlers* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *handlers* (dynamic *handlers*))
 
 ;; handler-formを1度だけ評価し、bodyの動的スコープの間だけ*handlers*の先頭に積む。
 ;; unwind-protectでbodyがどう脱出しても(非局所脱出でも)必ずpopする。
@@ -890,7 +894,11 @@
 ;;; 再定義(set-property)は既存entryを取り除いた上で新しいentryを前に積む、
 ;;; *classes*/*generic-methods*と同じ「shadowパターン」。
 
-(defdynamic *symbol-properties* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *symbol-properties* (dynamic *symbol-properties*))
 
 ;; objがsymbolでなければerror(domain-errorが未実装のため、assure/convertと
 ;; 同じ簡略化として通常のerrorで代替する)
@@ -1001,9 +1009,13 @@
 ;;; 改修することは対象外(documents/isiki-os.mdに注記)。したがって仕様例のような
 ;;; 引数無しの(read)は動かない。動的束縛そのものが正しく機能することのみ確認する。
 
-(defdynamic *standard-input* nil)
-(defdynamic *standard-output* nil)
-(defdynamic *error-output* nil)
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。
+(defdynamic *standard-input* (dynamic *standard-input*))
+(defdynamic *standard-output* (dynamic *standard-output*))
+(defdynamic *error-output* (dynamic *error-output*))
 
 ;; ISLisp仕様§26: (standard-input)/(standard-output)/(error-output)は常にストリームを返す。
 ;; with-standard-input等で動的束縛されていればそれを、されていなければ既定の
@@ -1056,7 +1068,25 @@
 ;;; 場所で 1.5f0 と書けばヒープ確保ゼロの利益はすでに得られる。
 ;;; 明示的に f0 を書いた人は精度を落とすことを承知している。
 ;;; 判断の経緯は documents/float-default.md。
-(defdynamic *read-default-float-format* (%%default-float-format))
+;; [初期宣言の安全形 / #187] 既存値があればそのまま書き戻す。defdynamicは
+;; **無条件に上書きする仕様**なので、素の初期値を書くと起動前半に機械語化された層が
+;; 書き込んだ登録を無言で消す(#47/#48の真因と同じ族)。規則は
+;; tools/check_defdynamic_safe.py が機械的に見ている。;;
+;; **[前提] この (or ...) の形は「この変数は nil / 偽を意味のある値として持たない」
+;; ことに依存している。** (dynamic *x*) は**未登録でも静かに nil を返す**だけで、
+;; 「登録済みで値が nil」と「未登録」を区別する述語が**この処理系には無い**
+;; (g_dynamic_bindings は Lisp へ公開されていない)。そのため or は
+;; 「既存値が**偽**なら初期値へ落ちる」ところまでしか書けない。
+;;
+;; **この変数が nil / 偽を正当な値として取れるようになったら、この形は壊れる。**
+;; そのときは黙って「登録済みの nil」を初期値で踏み潰す — #187 が直したのと
+;; 同じ族の、無言で成立する事故になる。直すには「登録済みか」を見る述語
+;; (%%dynamic-bound-p 相当)を足し、この行をそれで書き換えること。
+;; ここでの前提: この変数は常にクラスオブジェクト(<single-float>/<double-float>)で、
+;; **nilは浮動小数点数の既定形式として意味を持たない**(nilが入ったらリーダが
+;; 型を決められない)。
+(defdynamic *read-default-float-format*
+  (or (dynamic *read-default-float-format*) (%%default-float-format)))
 
 ;;; --- number class (§19) float の境界 ---
 ;;; 値は必ずC側(runtime.h の SINGLE_FLOAT_MAX_BITS / DOUBLE_FLOAT_MAX_BITS)から
@@ -1331,7 +1361,14 @@
         (%%set-dynamic '*environments* (%environment-remove env (dynamic *environments*)))
         t)))
 
-;;; JIT生成コードの逆アセンブラ((disassemble 'fib))。
-;;; init.lispが定義するwhile/formatに依存するため、最後にloadする。
+;;; JIT生成コードの逆アセンブラ((disassemble 'fib))は src/lisp/disassemble.lisp にある。
+;;; **ここからloadしない。** 依存の向き(disassemble.lispがこのファイルのwhile/formatを
+;;; 使う)は C 側(src/c/kernel.c の run_boot_entry)が「init.lisp → disassemble.lisp」の
+;;; 順で読むことで明示する。
+;;;
+;;; 以前はこの位置に (load "src/lisp/disassemble.lisp") があった。あの1行は
+;;; **ホスト共有(9P)を要求し続ける**ため、「9Pの無い機械で立ち上がる」という
+;;; 目的と直接矛盾していた(設計判断L2)。しかも読み込みの輪は打ち切られた
+;;; フォームを1行表示して飛ばすので、9Pが無い実機では **全体は成功を返したまま
+;;; disassemble系の定義が黙って欠ける** 形になっていた。
 ;;; 実体のデコーダはsrc/c/disasm.c(documents/disasm-backend-decision.md)。
-(load "src/lisp/disassemble.lisp")

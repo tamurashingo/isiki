@@ -108,8 +108,12 @@ cat test-results.txt
 
 ### `test/lisp/tmp_boot_gc_cell.lisp`
 
+> **[2026-11-08 追記]** 基盤ライブラリはカーネルへ同梱され、起動時に必ず読まれる
+> ようになった(`src/c/kernel.c` の `run_boot_entry`)。この再現手順の
+> 先頭にあった `(load "src/lisp/init.lisp")` は**外した**。残すと二重読み込みになり、
+> Immobilized Space を恒久的に二重消費する(`tools/check_no_double_init_load.py` が見張る)。
+
 ```lisp
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 (load "test/lisp/tmp_gc_cell.lisp")
 (isiki-test-report)

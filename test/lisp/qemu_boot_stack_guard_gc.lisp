@@ -1,4 +1,3 @@
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 ;; **gc_debug_guard.lisp は素の load で読む。** このファイルは関数を 2 つ
 ;; 定義するだけで、assert を 1 つも持たない。isiki-test-load で読むと

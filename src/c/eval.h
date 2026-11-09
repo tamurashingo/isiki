@@ -53,7 +53,10 @@ lisp_val_t os_eval_top_level_ex(lisp_val_t form, lisp_val_t env, int *out_aborte
  * トップレベルのドライバ(repl.c / load.c)が、打ち切られたフォームの理由を出すために
  * 使う。**中で任意のLispコード(report-conditionの特殊化メソッド)が走る**ので、
  * 次のどれかに当たったら0を返す。呼び出し元はそのとき生の値の印字へ落とすこと。
- *   - init.lisp未ロード等で%report-condition-stringが未定義
+ *   - %report-condition-stringが未定義。基盤ライブラリは同梱されて起動時に必ず
+ *     読まれる(src/c/kernel.cのrun_boot_entry)が、**ブート前半**(同梱の読み込みは
+ *     process 0のスタック上で走るのでそれより前)と**ネイティブのユニット試験**、
+ *     および同梱を外したビルド(-DISIKIOS_NO_EMBEDDED_INIT)では未定義である
  *   - 表示の途中でさらに脱出が起きた(Lisp側もハンドラを張っているので通常は
  *     nilが返るが、念のためここでも制御転送を見る)
  *   - 戻り値が文字列でない

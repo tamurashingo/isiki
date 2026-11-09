@@ -163,13 +163,23 @@ void SYSV_ABI process_trampoline_c(UINT64 proc_index);
 void process_scheduler_start(void);
 
 /**
- * make test-qemu用の自動テストモードを有効化する。有効化後、process_scheduler_start
- * によりprocess 0が最初にタイマー割り込み経由で起動された際、通常のREPLループの代わりに
- * test_entryを呼ぶ(process 0専用のスタック(STACK_SIZE、process.c参照)上で実行することで、kernel_mainの
- * ブート時スタック上で直接cc_loadを実行した場合に発生するクラッシュを避ける)。
- * @param test_entry process 0の初回起動時に呼ぶ関数(戻ってきた場合は通常のREPLループへ
- *   フォールバックする)
+ * 「起動時にやること」を登録する。登録後、process_scheduler_startにより
+ * process 0が最初にタイマー割り込み経由で起動された際、通常のREPLループへ入る**前**に
+ * boot_entryを呼ぶ(process 0専用のスタック(STACK_SIZE、process.c参照)上で
+ * 実行することで、kernel_mainのブート時スタック上で直接cc_loadを実行した場合に
+ * 発生するクラッシュを避ける)。
+ *
+ * [L4] **この間接化があるので、process.cは読み込みの下回り(load.c・reader.c・
+ * 同梱したソースの配列)に依存しない。** process.cはTEST_SRC_*の16本に
+ * リンクされているため、ここへ直接書くとその全部に依存を足すことになる。
+ * 登録が無いユニット試験では何も起きない(0判定で素通りする)。
+ *
+ * 中身(kernel.cのrun_boot_entry)は「同梱したLispソースの読み込み →
+ * (test-qemu時のみ)boot-entry台本」の順に実行する。**フックは1つである。**
+ *
+ * @param boot_entry process 0の初回起動時に呼ぶ関数(戻ってきた場合は通常の
+ *   REPLループへ進む。台本を走らせた場合は電源断するので戻ってこない)
  */
-void os_set_qemu_test_mode(void (*test_entry)(void));
+void os_set_boot_entry(void (*boot_entry)(void));
 
 #endif /* _PROCESS_H_ */

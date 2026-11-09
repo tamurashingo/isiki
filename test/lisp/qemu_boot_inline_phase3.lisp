@@ -9,7 +9,6 @@
 ;;
 ;; make test-qemu-instcount-gate MILESTONE=test/lisp/qemu_boot_inline_phase3.lisp
 
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 (format *isiki-test-stream* "#gate ~A~%" (%%gate-plugin-args))
 (finish-output *isiki-test-stream*)

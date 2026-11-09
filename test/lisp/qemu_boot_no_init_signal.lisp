@@ -1,8 +1,15 @@
 ;; test/lisp/qemu_boot_no_init_signal.lisp
 ;;
-;; [P4] **このファイルは (load "src/lisp/init.lisp") を意図的に行わない。**
-;; それがこの試験の要件である。他の boot-entry スクリプトを真似して
-;; init.lisp を足さないこと。
+;; [P4] **この試験は「基盤ライブラリ(src/lisp/init.lisp)が読まれていない状態」
+;; そのものを要件とする。** 他の boot-entry スクリプトを真似して init.lisp を
+;; 足さないこと。
+;;
+;; **走らせ方: make test-qemu-no-embedded-init(= NO_EMBEDDED_INIT=1 のビルド)。**
+;; 基盤ライブラリはカーネルへ同梱され、通常は**起動ごとに必ず読まれる**ように
+;; なった(src/c/kernel.c の run_boot_entry)。そのままでは下の前提
+;; (条件クラスが 1 つも無い)が崩れるので、**同梱を外せるビルドの口**を
+;; 設計判断 L5 で設けてある。素の make test-qemu-milestone で走らせると
+;; 先頭の 2 件(no-condition-class / no-simple-error)が落ちる。それが正しい。
 ;;
 ;; AOT フォーム(init_aot.lisp 由来)だけが走っている素のカーネル起動では、
 ;; make-instance / signal-condition は**ある**のに条件クラスは**1つも登録されて

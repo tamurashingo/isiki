@@ -12,7 +12,9 @@ UINT32 g_current_process_index = 0;
 
 /**
  * @brief プロセスごとの専用実行スタックのサイズ(バイト)
- * 16KBでは(load "src/lisp/init.lisp")のような初回フルロードでC側の再帰(reader等)が
+ * 16KBでは基盤ライブラリ(src/lisp/init.lisp。現在はカーネルへ同梱し、process 0の
+ * スタック上で起動時に読む。kernel.cのrun_boot_entry参照)のような初回フルロードで
+ * C側の再帰(reader等)が
  * 実測約35〜36KBまで達し、スタックを踏み越えてGPFになることを確認済み(ガードページが
  * 無いため隣接プロセスのスタック領域へ静かに侵入する)ため、一度64KBへ増やした。
  * その後FAT16-M7c(fat16-create-directory)で64KBでも再発することを確認した:
@@ -304,17 +306,19 @@ void os_process_set_saved_rsp(lisp_val_t pcb, UINT64 rsp) {
  * (呼び出し元には戻らない)
  * @param proc_index 動かすprocess_tのindex(0〜PROCESS_COUNT-1)
  */
-/** os_set_qemu_test_modeで登録されたテスト実行関数(未登録時は0=通常のREPLモード) */
-static void (*g_qemu_test_entry)(void) = 0;
+/** os_set_boot_entryで登録された「起動時にやること」(未登録時は0=そのままREPLへ) */
+static void (*g_boot_entry)(void) = 0;
 
-void os_set_qemu_test_mode(void (*test_entry)(void)) {
-    g_qemu_test_entry = test_entry;
+void os_set_boot_entry(void (*boot_entry)(void)) {
+    g_boot_entry = boot_entry;
 }
 
 void SYSV_ABI process_trampoline_c(UINT64 proc_index) {
     process_t *proc = get_process((UINT32)proc_index);
-    if (proc_index == 0 && g_qemu_test_entry != 0) {
-        g_qemu_test_entry();
+    // [L4] process 0だけ。全プロセスで走らせると同じソースを4回読み込み、
+    // Immobilized Space(解放されない)を4倍消費する
+    if (proc_index == 0 && g_boot_entry != 0) {
+        g_boot_entry();
     }
     for (;;) {
         os_repl_step(proc);

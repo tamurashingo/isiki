@@ -2084,7 +2084,10 @@ void os_set_panic_hook(void (*hook)(void));
  * @param initargs make-instanceに渡す評価済みの初期化引数リスト(:key val :key val ...)
  * @param env 呼び出し時の環境
  * @return signal-conditionの戻り値(通常はハンドラ経由でトップレベルへabortするため到達しない)。
- *         init.lisp未ロードでmake-instance/signal-conditionが未定義の場合はg_sym_eval_error
+ *         make-instance/signal-conditionが未定義、または条件クラスが引けない場合は
+ *         g_sym_eval_error(**ブート前半とネイティブのユニ試験で到達する。**
+ *         基盤ライブラリは同梱されて起動時に必ず読まれるが、読むのはprocess 0の
+ *         スタック上なのでブート前半はまだ「クラスが1つも無い」状態である)
  */
 lisp_val_t os_signal_condition(lisp_val_t class_sym, lisp_val_t initargs, lisp_val_t env);
 
@@ -2208,7 +2211,8 @@ int os_live_block_p(lisp_val_t name);
  * :expected-classスロット値を組み立てるために使う共通ヘルパー。
  * @param class_name_sym 解決したいクラスを表すシンボル(例: g_sym_class_number)
  * @param env 呼び出し時の環境
- * @return 解決されたクラスオブジェクト。init.lisp未ロードで%find-classが未定義の場合はg_sym_eval_error。
+ * @return 解決されたクラスオブジェクト。%find-classが未定義の場合はg_sym_eval_error
+ *         (ブート前半・ネイティブのユニット試験で到達する)。
  *         %find-class自体が非局所脱出/シグナルを返した場合はそれをそのまま返す
  */
 lisp_val_t os_resolve_class(lisp_val_t class_name_sym, lisp_val_t env);

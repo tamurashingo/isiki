@@ -39,7 +39,6 @@ HOST_TAIL = '''    ))
 '''
 
 GUEST_HEAD = ''';; 自動生成(tools/gen_macro_parity_drivers.py)。編集しない。
-(load "src/lisp/init.lisp")
 (load "test/lisp/test_framework.lisp")
 (defun %macro-parity-dump (label form)
   (progn

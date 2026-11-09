@@ -18,16 +18,23 @@ QEMUとOVMFをインストール後、 `make build` でイメージを作成し�
 make build && make run
 ```
 
-起動後、 REPL が立ち上がるので以下のコマンドで ISLisp 環境を構築します。
+起動後、 REPL が立ち上がります。**ISLisp 環境を手で読み込ませる必要はありません。**
+基盤ライブラリ(`src/lisp/init.lisp`)と逆アセンブラ(`src/lisp/disassemble.lisp`)は
+**カーネルへソースのまま同梱されていて、起動時に自動で読み込まれます**
+(`src/c/kernel.c` の `run_boot_entry`)。したがって 9P 共有の無い機械でも
+`(let ((x 1)) x)` から全部使えます。
 
 ```lisp
-(%%set-current-environment (%%global-environment))
-;; global-environment に ISLisp を読み込ませる
-(load "src/lisp/init.lisp")
-
-;; F1 のプロセスで実行していた場合は環境を F1 に戻します
-(switch-environment 'f1)
+> (let ((x 1)) x)
+1
 ```
+
+基盤ライブラリを直したいときは `src/lisp/init.lisp` を編集して `make build` し直します
+(同梱するバイト配列 `src/c/init_lisp_src.c` はビルドが生成します)。
+
+読み込みに失敗した場合は**縮退せず boot error で止まります**(画面に `PANIC: boot error: ...`
+が出る)。半分欠けた基盤ライブラリで立ち上がると、欠けた定義を使う所まで進んでから
+意味の分からない形で失敗するためです。
 
 9Pプロトコルにより、QEMU内からホストのファイルにアクセスすることができます。
 

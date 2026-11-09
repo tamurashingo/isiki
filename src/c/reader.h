@@ -32,7 +32,15 @@ lisp_val_t os_read_stream(os_stream_t *stream);
  * @param str 解析対象のSTRING
  * @param env 呼び出し時の環境(<parse-error>のsignal-conditionに使う)
  * @return 解析された数値。解析失敗時はos_signal_conditionの戻り値
- *         (通常はハンドラ経由でトップレベルへabortするため到達しない。init.lisp未ロード時はg_sym_eval_error)
+ *         (通常はハンドラ経由でトップレベルへabortするため到達しない。
+ *         **条件クラスがまだ登録されていない間はg_sym_eval_error**)
+ *
+ * [同梱] 基盤ライブラリ(src/lisp/init.lisp)はカーネルへ同梱され、起動時に必ず読まれる
+ * (src/c/kernel.cのrun_boot_entry)。それでもこの逃げ道は**到達可能なまま**である:
+ *   - ブート前半(os_bootstrap〜os_run_aot_toplevel_forms〜initialize_processes)。
+ *     同梱の読み込みはprocess 0のスタック上で走るので、この間はまだ条件クラスが1つも無い
+ *   - ネイティブのユニット試験(基盤ライブラリを読まない。test/c/load_test.c等)
+ *   - 同梱を外したビルド(-DISIKIOS_NO_EMBEDDED_INIT。test-qemu-no-embedded-init)
  */
 lisp_val_t os_parse_number(lisp_val_t str, lisp_val_t env);
 
