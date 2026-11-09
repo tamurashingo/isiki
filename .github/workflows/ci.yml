@@ -30,53 +30,67 @@ jobs:
           test -n "$OVMF_CODE"
           echo "OVMF_CODE=$OVMF_CODE" >> $GITHUB_ENV
 
+      # [#204 / T3] この周のログを 1 本にまとめる。**段ごとに追記**するので、
+      # 消すのは周の頭のここだけである(tools/qemu_stage_log.sh は追記しかしない)
+      - name: "Start the QEMU round log"
+        run: |
+          mkdir -p tmp
+          rm -f tmp/qemu-ci.log
+
       - name: "Run Lisp tests in QEMU (milestone 1: base)"
         timeout-minutes: 5
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m1_base.lisp
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_m1_base.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m1_base.lisp
 
       - name: "Run Lisp tests in QEMU (milestone 2: za base)"
         timeout-minutes: 20
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m2_za.lisp
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_m2_za.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m2_za.lisp
 
       - name: "Run Lisp tests in QEMU (milestone 3: za ext5 non-local-exit)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m3_za_ext5.lisp
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_m3_za_ext5.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m3_za_ext5.lisp
 
       - name: "Run Lisp tests in QEMU (milestone 4: environment)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m4_environment.lisp
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_m4_environment.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m4_environment.lisp
 
       - name: "Run Lisp tests in QEMU (milestone 5: IDE/ATA PIO block device)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_m5_ide.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 
       - name: "Run Lisp tests in QEMU (FAT16-M0: bitwise ops / char-code subprimitives)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat16_m0.lisp
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_fat16_m0.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat16_m0.lisp
 
       - name: "Run Lisp tests in QEMU (FAT16-M1/M2/M3/M4/M6a/M6b/M6c/M7a/M7b/M7c: BPB parse / root dir / cluster chain / file read / write / extend / create / subdirectories / mkdir)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 
       # [P1] **必ず上の m6_fat16 より後**に置くこと。FAT16 イメージのルートへ
       # P1BASE.TXT 等を作るので、先に走らせると fat16_test.lisp の
       # ルートディレクトリ一覧のアサーションが落ちる
       - name: "Run Lisp tests in QEMU (P1: FAT callback non-local exit propagation)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat_callback_transfer.lisp QEMU_DISK_IMG=tmp/fat16_test.img
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_fat_callback_transfer.lisp [fat16_test.img]" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat_callback_transfer.lisp QEMU_DISK_IMG=tmp/fat16_test.img
 
       - name: "Run Lisp tests in QEMU (FAT32-M1/M2/M3/M4: BPB parse / root+subdir listing / cluster chain / file read)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_fat32.lisp [fat32_test.img]" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat32.lisp QEMU_DISK_IMG=tmp/fat32_test.img
 
       - name: "Run Lisp tests in QEMU (FAT32-M9: boot from GPT+ESP+FAT32 image on primary IDE HDD)"
         timeout-minutes: 20
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_fat32_primary_boot.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_fat32_primary_boot.lisp
 
       - name: "Run Lisp tests in QEMU (PART: GPT multi-partition slice registration)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_partition.lisp [gpt_multi_test.img]" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/gpt_multi_test.img
 
       - name: "Run Lisp tests in QEMU (PART: legacy MBR multi-partition slice registration)"
         timeout-minutes: 10
-        run: make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_partition.lisp [mbr_multi_test.img]" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
+
+      # [#204 / T3] **この周の段と件数を名簿と突き合わせる。**
+      # 段がまるごと走らなくても、合否の一行が出ないだけで誰も気づかなかった(#208)。
+      # 名簿は tools/check_test_count_ratchet.py の COUNTS 1 箇所。
+      # ログは**切っていない**(切ると段を見落とす)
+      - name: "Check per-stage test counts against the roster (#204)"
+        run: python3 tools/check_test_count_ratchet.py --round ci --log tmp/qemu-ci.log
