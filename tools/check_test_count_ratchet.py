@@ -17,6 +17,16 @@
 この道具が**その 1 つ**になる。段ごとの件数を名簿として固定し、ログと突き合わせる。
 **名簿にある段がログに無ければ落ちる**ので、#200 と #208 を同じ検査で閉じられる。
 
+## 内訳の特定(#203 / T2)
+
+段の合計だけでは **「どこかが縮んだ」までしか言えない。** 1 周 12 分かかる機械で
+場所が分からないのは高くつくので、**ファイル単位(項目単位)の名簿**を同じ道具に足した。
+**新しい検出器を作らなかったのは、検出が二重になるのを避けるため**である:
+段の合計(`COUNTS`)が検出で、内訳(`FILES`)が特定。両者は等式で結んである。
+
+元は `documents/test-count-census.md` §5-2 の「測ったが『どのファイルが縮んだか』は
+言えない段」(12 段)である。
+
 ## 作法(`tools/check_eval_error_budget.py` にそろえる)
 
 - **基準値は下の `COUNTS` 1 箇所だけ**に書く
@@ -71,6 +81,8 @@
     # 1 段だけを見る(段の中から呼ぶ場合。ログ全体が 1 段ぶんだとみなす)
     python3 tools/check_test_count_ratchet.py --stage test-qemu-no-9p-run --log tmp/no9p.serial.txt
     python3 tools/check_test_count_ratchet.py --list        # 名簿を出す(合計は導出)
+    python3 tools/check_test_count_ratchet.py --files       # ファイル単位の名簿(#203)
+    python3 tools/check_test_count_ratchet.py --witness     # 証人の出どころ(ログ不要。#203)
     python3 tools/check_test_count_ratchet.py --self-test   # 計器自身の対照
 
 **ログは切らずに全部渡すこと。** `tail` で切ると段を見落とす(T1 で実際に起きた)。
@@ -86,6 +98,23 @@ ALL = "all"  # make test-qemu-all
 CI = "ci"  # .github/workflows/ci.yml の QEMU の段
 
 ROUNDS = (ALL, CI)
+
+# 出口の検査(`isiki-file-end-check`)自身のアサーション数。
+# **`#count` を書いた「あと」に走る**ので、どの `#count` にも入らず
+# **段の合計にだけ入る**(`documents/test-count-census.md` §2-1)。
+# 1 本読むごとに 2 件。ここを動かすときは test_framework.lisp のほうが真実源である
+END_CHECK_ASSERTS = 2
+
+# 台本の名前で名乗らない段の、台本のパス。`make test-qemu` は台本の名前を
+# コマンド行に書かないので、**ゲスト側の既定値**から引く
+# (`src/c/kernel.c:91` の `g_qemu_test_boot_script`。census §1-1 と同じ出どころ)。
+# 食い違いは下の check_witness_sources が落とす
+STAGE_SCRIPTS = {
+    "test-qemu": "test/lisp/qemu_boot_test.lisp",
+}
+KERNEL_DEFAULT_SCRIPT_RE = re.compile(
+    r'g_qemu_test_boot_script\[\d+\]\s*=\s*"([^"]+)"'
+)
 
 # --- 名簿。**ここだけを書き換える。** ---------------------------------------
 #
@@ -111,6 +140,35 @@ ROUNDS = (ALL, CI)
 # **期待 0 件の段は、縮んでも差が出ない。** 名簿の側で同じ罠を踏まないように、
 # 0 件は「正常な状態」ではなく「名簿の不備」として扱う。
 #
+#
+# **[2026-11-09 / #203] 10 段の件数を上げた。理由をここに書く(規則 16)。**
+#
+# 内訳が言えなかった 10 段で、試験ファイルの読み込みを素の `load` から
+# `isiki-test-load` へ寄せた(証人の経路を 1 本にする決定。下の RESOURCES 参照)。
+# `isiki-test-load` は**出口の検査 2 件**を足すので、
+#
+#     新しい件数 = 前の件数 + 2 × (新たに証人を付けた本数)
+#
+# で機械的に上がる。**試験が増えたのではない**(アサーションは 1 件も足していない)。
+# 1 本あたり +2 の内訳は 1 本あたり 1 回ずつの declaim 漏れの検査と件数 > 0 の検査で、
+# どちらも **new ではなく、ほかの 19 段ではすでに走っていたもの**である。
+#
+# | 段 | 前 | 新たな証人 | 後 |
+# |---|---:|---:|---:|
+# | m5_ide | 5 | 1 | 7 |
+# | m6_fat16 | 155 | 2 | 159 |
+# | fat32 | 138 | 1 | 140 |
+# | fat32_primary_boot | 11 | 1 | 13 |
+# | partition [gpt] | 38 | 2 | 42 |
+# | partition [mbr] | 38 | 2 | 42 |
+# | m1_base | 2759 | 13 | 2785 |
+# | m3_za_ext5 | 399 | 14 | 427 |
+# | m4_environment | 128 | 3 | 134 |
+# | fat16_m0 | 8 | 1 | 10 |
+#
+# 合計 +80 件 = 2 × 40 本。**この表は手で足した数字ではない**:
+# 下の FILES の内訳と `check_files_roster` の等式が同じ値を導き、
+# 食い違えば `make test` が落ちる(規則 13)。
 #        段の名前(ログの中での名乗り)                                    件数  読み方   周
 COUNTS = (
     ("test-qemu", 5178, "isiki", (ALL,)),
@@ -121,14 +179,14 @@ COUNTS = (
     ("test-qemu-no-9p-run", 8, "no9p", (ALL,)),
     ("test/lisp/qemu_boot_load_disk.lisp", 23, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_error_escape_gc.lisp", 378, "isiki", (ALL,)),
-    ("test/lisp/qemu_boot_m5_ide.lisp", 5, "isiki", (ALL, CI)),
-    ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 155, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_m5_ide.lisp", 7, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 159, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_fat_callback_transfer.lisp [fat16_test.img]", 17, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_load_gc_stress.lisp [fat16_test.img]", 21, "isiki", (ALL,)),
-    ("test/lisp/qemu_boot_fat32.lisp [fat32_test.img]", 138, "isiki", (ALL, CI)),
-    ("test/lisp/qemu_boot_fat32_primary_boot.lisp", 11, "isiki", (ALL, CI)),
-    ("test/lisp/qemu_boot_partition.lisp [gpt_multi_test.img]", 38, "isiki", (ALL, CI)),
-    ("test/lisp/qemu_boot_partition.lisp [mbr_multi_test.img]", 38, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_fat32.lisp [fat32_test.img]", 140, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_fat32_primary_boot.lisp", 13, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_partition.lisp [gpt_multi_test.img]", 42, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_partition.lisp [mbr_multi_test.img]", 42, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_bench_jit.lisp", 58, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_bench_interp.lisp", 29, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_for_semantics.lisp", 29, "isiki", (ALL,)),
@@ -141,12 +199,344 @@ COUNTS = (
     ("test/lisp/qemu_boot_inline_muldiv.lisp", 46, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_safety3.lisp", 25, "isiki", (ALL,)),
     # --- ここから下は CI だけで走る段(test-qemu-all に入っていない) ---
-    ("test/lisp/qemu_boot_m1_base.lisp", 2759, "isiki", (CI,)),
+    ("test/lisp/qemu_boot_m1_base.lisp", 2785, "isiki", (CI,)),
     ("test/lisp/qemu_boot_m2_za.lisp", 678, "isiki", (CI,)),
-    ("test/lisp/qemu_boot_m3_za_ext5.lisp", 399, "isiki", (CI,)),
-    ("test/lisp/qemu_boot_m4_environment.lisp", 128, "isiki", (CI,)),
-    ("test/lisp/qemu_boot_fat16_m0.lisp", 8, "isiki", (CI,)),
+    ("test/lisp/qemu_boot_m3_za_ext5.lisp", 427, "isiki", (CI,)),
+    ("test/lisp/qemu_boot_m4_environment.lisp", 134, "isiki", (CI,)),
+    ("test/lisp/qemu_boot_fat16_m0.lisp", 10, "isiki", (CI,)),
 )
+
+# --- ファイル単位の名簿(#203 / T2)----------------------------------------
+#
+# **上の COUNTS は「段がいくつ走ったか」までしか言わない。** 1 周 12 分の機械で
+# 「どこかが縮んだ」だけ分かって場所が分からないのは高くつく。
+# ここは**どのファイル(どの項目)が縮んだか**を言うための名簿である。
+#
+# 埋めている穴: `documents/test-count-census.md` §5-2
+# 「測ったが『どのファイルが縮んだか』は言えない段」。
+#
+# **検出はここで二重にならない。** 段の合計(COUNTS)は #204 の仕事で、
+# こちらは**内訳の特定**に足す。両者は下の等式で結ばれている:
+#
+#     段の合計 = Σ(ファイルの件数) + 2 × (証人の本数) + 台本自身の件数
+#
+# 2 は `isiki-file-end-check` が `#count` を書いた**あと**に走らせる 2 件で、
+# **どの `#count` にも入らず合計にだけ入る**(census §2-1)。
+# `self-tally` / `no9p` の段は枠組みを使わないので 2 は付かない。
+#
+# **この等式が、証人の無いアサーションを見つける者である。** 素の `load` で
+# 読んだファイルのアサーションは `#count` に出ないので、合計だけが増える。
+# 等式の残差がそれを指す(§B-2 の「進捗の行と件数の行は 1 対 1」の運用版)。
+#
+# 証人の形は読み方で違うが、**3 つとも「名前つきで 1 件 1 行」**である。
+# だから項目単位の特定が成り立つ:
+#
+# | 読み方 | 証人の行 | 1 項目 |
+# |---|---|---|
+# | `isiki` | `#count <ファイル> <件数>` | 試験ファイル 1 本 |
+# | `self-tally` | `#ck <名前>` | 検査 1 件 |
+# | `no9p` | `[no9p] ok <名前>` / `[no9p] NG <名前>` | 検査 1 件 |
+#
+# **初期値は手で数えていない**(規則 13)。出どころは
+#
+#     python3 tools/census_test_counts.py --file-roster
+#
+# の出力をそのまま貼ったもので、T1 の実測(`tmp/t1-qemu-all-20261109-143437.log`
+# / `tmp/t1-qemu-ci-20261109-144633.log`)の `#count` **95 点と 1 件も食い違わない**。
+# 証人の無かった段の値は**導出である**(★ 実機未確認のものは §5-2 に印をつけた)。
+# ただし導出は段の合計の等式で縛られており、合計は T1 で 29/29 実測と一致している。
+#
+# 書式: 段 -> (台本自身のトップレベルのアサーション数, ((項目, 件数), ...))
+# **順序はログに出る順**(台本の読み込み順)。照合は名前で行うので順序は
+# 判定に使わないが、台本との突き合わせ(check_witness_sources)で順序まで見る。
+#
+# **件数を直すときは理由を同じ場所に書くこと**(規則 16)。
+FILES = {
+    # test-qemu … 読み方 isiki / 台本自身 1 件 / 証人 59 本 / 導出の合計 5178 件
+    "test-qemu": (1, (
+        ("test/lisp/test_framework_test.lisp", 29),
+        ("test/lisp/init_test.lisp", 496),
+        ("test/lisp/toplevel_abort_test.lisp", 17),
+        ("test/lisp/handler_exit_test.lisp", 41),
+        ("test/lisp/arith_signal_test.lisp", 40),
+        ("test/lisp/index_signal_test.lisp", 51),
+        ("test/lisp/undefined_signal_test.lisp", 46),
+        ("test/lisp/io_signal_test.lisp", 33),
+        ("test/lisp/type_unbound_test.lisp", 79),
+        ("test/lisp/arity_signal_test.lisp", 51),
+        ("test/lisp/isiki_test.lisp", 653),
+        ("test/lisp/isiki_test_syntax.lisp", 11),
+        ("test/lisp/isiki_test_jit.lisp", 1211),
+        ("test/lisp/za_test.lisp", 245),
+        ("test/lisp/za_test_ext5.lisp", 69),
+        ("test/lisp/za_test_ext7.lisp", 24),
+        ("test/lisp/za_test_ext8.lisp", 31),
+        ("test/lisp/za_test_ext9.lisp", 22),
+        ("test/lisp/za_test_ext10.lisp", 23),
+        ("test/lisp/za_test_ext11.lisp", 8),
+        ("test/lisp/za_test_ext12.lisp", 10),
+        ("test/lisp/za_test_ext13.lisp", 32),
+        ("test/lisp/za_test_ext14.lisp", 24),
+        ("test/lisp/za_test_ext15.lisp", 25),
+        ("test/lisp/za_test_ext16.lisp", 31),
+        ("test/lisp/za_test_ext17.lisp", 28),
+        ("test/lisp/za_test_ext18.lisp", 50),
+        ("test/lisp/za_test_ext19.lisp", 22),
+        ("test/lisp/environment_pages_test.lisp", 20),
+        ("test/lisp/environment_literal_slots_test.lisp", 80),
+        ("test/lisp/environment_utilities_test.lisp", 28),
+        ("test/lisp/room_test.lisp", 13),
+        ("test/lisp/aot_leaf_gc_test.lisp", 6),
+        ("test/lisp/za_code_imm_test.lisp", 23),
+        ("test/lisp/za_abi_probe_test.lisp", 2),
+        ("test/lisp/fn_cell_cache_test.lisp", 11),
+        ("test/lisp/frame_definition_test.lisp", 33),
+        ("test/lisp/frame_variable_test.lisp", 18),
+        ("test/lisp/frame_cell_gc_test.lisp", 27),
+        ("test/lisp/jit_nest_depth_test.lisp", 8),
+        ("test/lisp/go_exit_reuse_test.lisp", 10),
+        ("test/lisp/jit_code_packing_test.lisp", 19),
+        ("test/lisp/declaim_test.lisp", 44),
+        ("test/lisp/inline_builtin_test.lisp", 64),
+        ("test/lisp/inline_decl_test.lisp", 103),
+        ("test/lisp/fixnum_signed_arith_test.lisp", 118),
+        ("test/lisp/single_float_test.lisp", 120),
+        ("test/lisp/float_contagion_test.lisp", 127),
+        ("test/lisp/float_math_contagion_test.lisp", 112),
+        ("test/lisp/convert_float_test.lisp", 86),
+        ("test/lisp/float_default_test.lisp", 19),
+        ("test/lisp/nan_comparison_test.lisp", 100),
+        ("test/lisp/divide_direct_call_test.lisp", 34),
+        ("test/lisp/declare_typed_add_test.lisp", 35),
+        ("test/lisp/declare_typed_sub_test.lisp", 69),
+        ("test/lisp/declare_typed_mul_test.lisp", 91),
+        ("test/lisp/declare_typed_div_test.lisp", 105),
+        ("test/lisp/declare_types_test.lisp", 63),
+        ("test/lisp/disassemble_test.lisp", 69),
+    )),
+    # test/lisp/qemu_boot_no_init_signal.lisp … 読み方 self-tally / 台本自身 0 件 / 証人 15 本 / 導出の合計 15 件
+    "test/lisp/qemu_boot_no_init_signal.lisp": (0, (
+        ("no-condition-class", 1),
+        ("no-simple-error", 1),
+        ("builtin-class-ok", 1),
+        ("length-returned", 1),
+        ("elt-returned", 1),
+        ("subseq-returned", 1),
+        ("div-returned", 1),
+        ("no-depth-overflow", 1),
+        ("still-alive", 1),
+        ("cons-alive", 1),
+        ("gc-alive", 1),
+        ("sg-compiled", 1),
+        ("sg-shallow", 1),
+        ("sg-deep-returns", 1),
+        ("sg-alive-after", 1),
+    )),
+    # test-qemu-no-9p-run … 読み方 no9p / 台本自身 0 件 / 証人 8 本 / 導出の合計 8 件
+    "test-qemu-no-9p-run": (0, (
+        ("9p-absent", 1),
+        ("let-returns-1", 1),
+        ("condition-class-registered", 1),
+        ("disassemble-defined", 1),
+        ("app-disk-named", 1),
+        ("app-disk-mounted", 1),
+        ("app-disk-load", 1),
+        ("app-hello-42", 1),
+    )),
+    # test/lisp/qemu_boot_load_disk.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 23 件
+    "test/lisp/qemu_boot_load_disk.lisp": (0, (
+        ("test/lisp/load_disk_test.lisp", 21),
+    )),
+    # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 378 件
+    "test/lisp/qemu_boot_error_escape_gc.lisp": (4, (
+        ("test/lisp/toplevel_abort_test.lisp", 17),
+        ("test/lisp/handler_exit_test.lisp", 41),
+        ("test/lisp/arith_signal_test.lisp", 40),
+        ("test/lisp/index_signal_test.lisp", 51),
+        ("test/lisp/undefined_signal_test.lisp", 46),
+        ("test/lisp/io_signal_test.lisp", 33),
+        ("test/lisp/type_unbound_test.lisp", 79),
+        ("test/lisp/arity_signal_test.lisp", 51),
+    )),
+    # test/lisp/qemu_boot_m5_ide.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 7 件
+    "test/lisp/qemu_boot_m5_ide.lisp": (0, (
+        ("test/lisp/ide_test.lisp", 5),
+    )),
+    # test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 159 件
+    "test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]": (0, (
+        ("test/lisp/fat16_test.lisp", 145),
+        ("test/lisp/device_test.lisp", 10),
+    )),
+    # test/lisp/qemu_boot_fat_callback_transfer.lisp [fat16_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 17 件
+    "test/lisp/qemu_boot_fat_callback_transfer.lisp [fat16_test.img]": (0, (
+        ("test/lisp/fat_callback_transfer_test.lisp", 15),
+    )),
+    # test/lisp/qemu_boot_load_gc_stress.lisp [fat16_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 21 件
+    "test/lisp/qemu_boot_load_gc_stress.lisp [fat16_test.img]": (0, (
+        ("test/lisp/load_gc_stress_test.lisp", 19),
+    )),
+    # test/lisp/qemu_boot_fat32.lisp [fat32_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 140 件
+    "test/lisp/qemu_boot_fat32.lisp [fat32_test.img]": (0, (
+        ("test/lisp/fat32_test.lisp", 138),
+    )),
+    # test/lisp/qemu_boot_fat32_primary_boot.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 13 件
+    "test/lisp/qemu_boot_fat32_primary_boot.lisp": (0, (
+        ("test/lisp/fat32_primary_boot_test.lisp", 11),
+    )),
+    # test/lisp/qemu_boot_partition.lisp [gpt_multi_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 42 件
+    "test/lisp/qemu_boot_partition.lisp [gpt_multi_test.img]": (0, (
+        ("test/lisp/partition_test.lisp", 19),
+        ("test/lisp/file_cmd_test.lisp", 19),
+    )),
+    # test/lisp/qemu_boot_partition.lisp [mbr_multi_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 42 件
+    "test/lisp/qemu_boot_partition.lisp [mbr_multi_test.img]": (0, (
+        ("test/lisp/partition_test.lisp", 19),
+        ("test/lisp/file_cmd_test.lisp", 19),
+    )),
+    # test/lisp/qemu_boot_bench_jit.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 58 件
+    "test/lisp/qemu_boot_bench_jit.lisp": (0, (
+        ("test/lisp/bench_jit_test.lisp", 39),
+        ("test/lisp/bench_jit_guard_test.lisp", 15),
+    )),
+    # test/lisp/qemu_boot_bench_interp.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 29 件
+    "test/lisp/qemu_boot_bench_interp.lisp": (0, (
+        ("test/lisp/bench_interp_test.lisp", 27),
+    )),
+    # test/lisp/qemu_boot_for_semantics.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 29 件
+    "test/lisp/qemu_boot_for_semantics.lisp": (0, (
+        ("test/lisp/for_semantics_test.lisp", 27),
+    )),
+    # test/lisp/qemu_boot_jit_frame.lisp … 読み方 isiki / 台本自身 0 件 / 証人 3 本 / 導出の合計 241 件
+    "test/lisp/qemu_boot_jit_frame.lisp": (0, (
+        ("test/lisp/jit_frame_test.lisp", 13),
+        ("test/lisp/jit_rsp_balance_test.lisp", 86),
+        ("test/lisp/jit_mixed_frame_test.lisp", 136),
+    )),
+    # test/lisp/qemu_boot_jit_limits.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 68 件
+    "test/lisp/qemu_boot_jit_limits.lisp": (0, (
+        ("test/lisp/jit_limits_test.lisp", 66),
+    )),
+    # test/lisp/qemu_boot_stack_guard.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 26 件
+    "test/lisp/qemu_boot_stack_guard.lisp": (0, (
+        ("test/lisp/stack_guard_test.lisp", 24),
+    )),
+    # test/lisp/qemu_boot_heap_exhaustion.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 42 件
+    "test/lisp/qemu_boot_heap_exhaustion.lisp": (0, (
+        ("test/lisp/heap_exhaustion_test.lisp", 40),
+    )),
+    # test/lisp/qemu_boot_compare_single.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 54 件
+    "test/lisp/qemu_boot_compare_single.lisp": (0, (
+        ("test/lisp/compare_single_test.lisp", 52),
+    )),
+    # test/lisp/qemu_boot_compare_fixnum.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 55 件
+    "test/lisp/qemu_boot_compare_fixnum.lisp": (0, (
+        ("test/lisp/compare_fixnum_test.lisp", 53),
+    )),
+    # test/lisp/qemu_boot_inline_muldiv.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 46 件
+    "test/lisp/qemu_boot_inline_muldiv.lisp": (0, (
+        ("test/lisp/inline_muldiv_test.lisp", 44),
+    )),
+    # test/lisp/qemu_boot_safety3.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 25 件
+    "test/lisp/qemu_boot_safety3.lisp": (0, (
+        ("test/lisp/safety3_test.lisp", 23),
+    )),
+    # test/lisp/qemu_boot_m1_base.lisp … 読み方 isiki / 台本自身 1 件 / 証人 13 本 / 導出の合計 2785 件
+    "test/lisp/qemu_boot_m1_base.lisp": (1, (
+        ("test/lisp/test_framework_test.lisp", 29),
+        ("test/lisp/init_test.lisp", 496),
+        ("test/lisp/toplevel_abort_test.lisp", 17),
+        ("test/lisp/handler_exit_test.lisp", 41),
+        ("test/lisp/arith_signal_test.lisp", 40),
+        ("test/lisp/index_signal_test.lisp", 51),
+        ("test/lisp/undefined_signal_test.lisp", 46),
+        ("test/lisp/io_signal_test.lisp", 33),
+        ("test/lisp/type_unbound_test.lisp", 79),
+        ("test/lisp/arity_signal_test.lisp", 51),
+        ("test/lisp/isiki_test.lisp", 653),
+        ("test/lisp/isiki_test_syntax.lisp", 11),
+        ("test/lisp/isiki_test_jit.lisp", 1211),
+    )),
+    # test/lisp/qemu_boot_m2_za.lisp … 読み方 isiki / 台本自身 0 件 / 証人 11 本 / 導出の合計 678 件
+    "test/lisp/qemu_boot_m2_za.lisp": (0, (
+        ("test/lisp/za_test.lisp", 245),
+        ("test/lisp/fn_cell_cache_test.lisp", 11),
+        ("test/lisp/frame_definition_test.lisp", 33),
+        ("test/lisp/frame_variable_test.lisp", 18),
+        ("test/lisp/frame_cell_gc_test.lisp", 27),
+        ("test/lisp/jit_nest_depth_test.lisp", 8),
+        ("test/lisp/jit_code_packing_test.lisp", 19),
+        ("test/lisp/declaim_test.lisp", 44),
+        ("test/lisp/inline_builtin_test.lisp", 64),
+        ("test/lisp/fixnum_signed_arith_test.lisp", 118),
+        ("test/lisp/disassemble_test.lisp", 69),
+    )),
+    # test/lisp/qemu_boot_m3_za_ext5.lisp … 読み方 isiki / 台本自身 0 件 / 証人 14 本 / 導出の合計 427 件
+    "test/lisp/qemu_boot_m3_za_ext5.lisp": (0, (
+        ("test/lisp/za_test_ext5.lisp", 69),
+        ("test/lisp/za_test_ext7.lisp", 24),
+        ("test/lisp/za_test_ext8.lisp", 31),
+        ("test/lisp/za_test_ext9.lisp", 22),
+        ("test/lisp/za_test_ext10.lisp", 23),
+        ("test/lisp/za_test_ext11.lisp", 8),
+        ("test/lisp/za_test_ext12.lisp", 10),
+        ("test/lisp/za_test_ext13.lisp", 32),
+        ("test/lisp/za_test_ext14.lisp", 24),
+        ("test/lisp/za_test_ext15.lisp", 25),
+        ("test/lisp/za_test_ext16.lisp", 31),
+        ("test/lisp/za_test_ext17.lisp", 28),
+        ("test/lisp/za_test_ext18.lisp", 50),
+        ("test/lisp/za_test_ext19.lisp", 22),
+    )),
+    # test/lisp/qemu_boot_m4_environment.lisp … 読み方 isiki / 台本自身 0 件 / 証人 3 本 / 導出の合計 134 件
+    "test/lisp/qemu_boot_m4_environment.lisp": (0, (
+        ("test/lisp/environment_pages_test.lisp", 20),
+        ("test/lisp/environment_literal_slots_test.lisp", 80),
+        ("test/lisp/environment_utilities_test.lisp", 28),
+    )),
+    # test/lisp/qemu_boot_fat16_m0.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 10 件
+    "test/lisp/qemu_boot_fat16_m0.lisp": (0, (
+        ("test/lisp/bitwise_char_test.lisp", 8),
+    )),
+}
+
+
+# 素の `load` で読んでよい `test/lisp/` のファイル。**理由を必ず書く。**
+#
+# [決定] **証人の経路は `isiki-test-load` 1 本に寄せた。** 試験ファイルを
+# 素の `load` で読むのを禁じ、素の `load` は「アサーションを 1 件も持たない
+# 資料・下敷き」にだけ許す。理由:
+#
+# - 経路が 2 本あると、ログを見た機械には**どちらで読まれたのか分からない。**
+#   「進捗の行と件数の行が 1 対 1」という不変条件(元調査 §B-2)が使えるのは、
+#   読み方が 1 本だからである
+# - 素の `load` は**本番の機能**でもある(`src/lisp/*.lisp` を読む)。
+#   試験の数え上げの都合をそちらへ持ち込むと、言語機能に試験の事情が混じる
+# - 寄せれば「証人が無いこと」が**静的に**言える(下の check_witness_sources)
+#
+# **この表は権威ではない。** 権威は上の等式のほうで、ここに載せたファイルが
+# あとからアサーションを持ち始めたら、合計だけが増えて等式の残差で鳴る。
+# つまり**この表に足しても漏れは恒久化しない。**
+RESOURCES = {
+    "test/lisp/qemu_boot_load_gc_stress.lisp": (
+        ("test/lisp/gc_debug_guard.lisp", "GC_DEBUG ビルドかどうかの下敷き。アサーション 0 件"),
+    ),
+    "test/lisp/qemu_boot_bench_jit.lisp": (
+        ("test/lisp/bench_jit_guard.lisp", "ベンチの前提を確かめる下敷き。アサーション 0 件"),
+        ("test/lisp/bench_jit_eval_control.lisp", "ベンチの対照の定義。アサーション 0 件"),
+    ),
+    "test/lisp/qemu_boot_bench_interp.lisp": (
+        ("test/lisp/bench_jit_guard.lisp", "同上"),
+        ("test/lisp/bench_interp_guard.lisp", "同上"),
+        ("test/lisp/bench_interp_control.lisp", "同上"),
+    ),
+    "test/lisp/qemu_boot_for_semantics.lisp": (
+        ("test/lisp/bench_jit_guard.lisp", "同上"),
+    ),
+}
+
+# 枠組み自身。アサーションは出口の検査の 2 件として合計へ入るので、
+# **ここだけは素の `load` でなければならない**(自分自身を証人つきで読めない)
+FRAMEWORK = "test/lisp/test_framework.lisp"
 
 # --- ログの読み取り --------------------------------------------------------
 
@@ -171,6 +561,25 @@ SELF_NG_RE = re.compile(r"^\[NG\]\s")
 NO9P_OK_RE = re.compile(r"\[no9p\] ok\s")
 NO9P_NG_RE = re.compile(r"\[no9p\] NG\s")
 NO9P_SUM_RE = re.compile(r"\[no9p\] (\d+) passed, (\d+) failed")
+
+# [#203 / T2] **項目単位の証人の行。**
+#
+# `#count <ファイル> <件数>`。**行末まで数字であることを要求する。**
+# `test/lisp/disassemble_test.lisp:319` が
+#   `#count dis-add    kernel=0 immobilized=0 gc-heap=0`
+# という**別の目的の `#count` 行**を出しているので、緩い正規表現だと拾ってしまう。
+# 拾っても「名簿に無い証人」として鳴る形にはしてあるが、**誤報は計器を殺す**ので
+# 形で切り分ける(規則 8 の陰性対照にこの行を入れてある)。
+FILE_COUNT_RE = re.compile(r"^#count (\S+) (\d+)\s*$")
+# 進捗の行。`isiki-test-load` が **load の前に**出す(test_framework.lisp の
+# `isiki-test-mark`)。**件数の行と 1 対 1 になる**のが元調査 §B-2 の不変条件で、
+# `#at` だけがあって `#count` が無いのは「そのファイルの途中で止まった」痕跡である
+# (調査 §9-4-7。**これを見る者がいなかった**)
+PROGRESS_RE = re.compile(r"^#at (\S+) t=")
+# `self-tally` の項目(名前つき)。上の SELF_CK_RE は数えるだけなので別に持つ
+SELF_CK_NAME_RE = re.compile(r"^#ck\s+(\S+)")
+# `no9p` の項目(名前つき)
+NO9P_NAME_RE = re.compile(r"\[no9p\] (?:ok|NG)\s+(\S+)")
 
 # **合否の形をした行**の総当たり。どの読み取り方でも拾えなかったものを
 # 「読み取り方が分からない」として落とすために使う(黙って飛ばさないため)
@@ -316,6 +725,295 @@ READERS = {
 }
 
 
+# --- 項目単位の照合(#203 / T2)---------------------------------------------
+
+
+def read_file_items(reader, segment):
+    """段の区間から**名前つき 1 件 1 行の証人**を取り出す。
+
+    返り値 (項目 {名前: 件数}, 進捗に名乗ったファイル集合, 重複した名前)。
+    進捗の集合は `isiki` のときだけ中身がある(ほかの読み方に `#at` は無い)。
+    """
+    items = {}
+    dup = []
+    progressed = set()
+    if reader == "isiki":
+        for _lineno, line in segment:
+            m = FILE_COUNT_RE.match(line)
+            if m:
+                name = m.group(1)
+                if name in items:
+                    dup.append(name)
+                items[name] = int(m.group(2))
+                continue
+            m = PROGRESS_RE.match(line)
+            if m:
+                progressed.add(m.group(1))
+        return items, progressed, dup
+    name_re = SELF_CK_NAME_RE if reader == "self-tally" else NO9P_NAME_RE
+    for _lineno, line in segment:
+        m = name_re.search(line)
+        if m:
+            name = m.group(1)
+            if name in items:
+                dup.append(name)
+            items[name] = items.get(name, 0) + 1
+    return items, progressed, dup
+
+
+def judge_files(stage, reader, segment, actual_total):
+    """**どの項目が縮んだか**を言う。返り値は NG の行のリスト。
+
+    段の合計(COUNTS)の照合とは別の仕事である。合計が合っていても
+    内訳が入れ替わっていたらここで鳴る(census §5-2 がまさにそれを
+    「言えない」と書いていた)。
+    """
+    ng = []
+    entry = FILES.get(stage)
+    if entry is None:
+        return [
+            "NG: 段 %s のファイル単位の名簿が無い。"
+            "tools/check_test_count_ratchet.py の FILES に書くこと" % stage
+        ]
+    script_own, expected_items = entry
+    found, progressed, dup = read_file_items(reader, segment)
+    what = "ファイル" if reader == "isiki" else "項目"
+
+    for name in dup:
+        ng.append(
+            "NG: 段 %s で%s %s の証人の行が 2 度出ている。"
+            "同じファイルを 2 回読んでいないか、ログの作り方を確かめること" % (stage, what, name)
+        )
+
+    for name, count in expected_items:
+        if name not in found:
+            if reader == "isiki" and name in progressed:
+                ng.append(
+                    "NG: 段 %s の%s %s に件数の行(#count)が無い。"
+                    "**進捗の行(#at)は出ている**ので、そのファイルを読み始めてから"
+                    "出口へ着く前に止まっている(ゲストが落ちた・ハングした)。期待 %d 件。"
+                    "これは合計だけを見ていたら「段が落ちた」までしか言えない形である"
+                    % (stage, what, name, count)
+                )
+            else:
+                ng.append(
+                    "NG: 段 %s の%s %s の証人の行が 1 行も無い(期待 %d 件)。"
+                    "**そのファイル・検査がまるごと走っていない。**"
+                    "読み込みを外したなら FILES の名簿からも外し、理由を書くこと(規則 16)"
+                    % (stage, what, name, count)
+                )
+            continue
+        actual = found[name]
+        if actual == count:
+            continue
+        ng.append(
+            "NG: 段 %s の%s %s の件数が %d 件%s(名簿 %d / 実測 %d)。"
+            "%s意図した変更なら FILES の \"%s\" の \"%s\" を %d に直し、"
+            "理由を同じ場所に書くこと(規則 16)"
+            % (
+                stage,
+                what,
+                name,
+                abs(count - actual),
+                "減っている" if actual < count else "増えている",
+                count,
+                actual,
+                "**静かにアサーションを失った可能性がある**(#200)。" if actual < count else "",
+                stage,
+                name,
+                actual,
+            )
+        )
+
+    expected_names = {n for n, _ in expected_items}
+    for name in sorted(found):
+        if name not in expected_names:
+            ng.append(
+                "NG: 段 %s に名簿に無い証人の行がある: %s(%d 件)。"
+                "試験ファイルを足したなら FILES に書くこと"
+                % (stage, name, found[name])
+            )
+    if reader == "isiki":
+        for name in sorted(progressed - set(found) - expected_names):
+            ng.append(
+                "NG: 段 %s に名簿に無いファイルの進捗の行(#at %s)がある。"
+                "件数の行も無いので、読み始めて止まったか名簿が古い" % (stage, name)
+            )
+
+    # --- 等式。**証人の無いアサーションを見つける者である** ---
+    #
+    #   段の合計 = Σ(実測の件数) + 2 × (証人の本数) + 台本自身の件数
+    #
+    # 2 は出口の検査自身の 2 件(`#count` を書いた**あと**に走るのでどの
+    # `#count` にも入らない。census §2-1)。素の `load` で試験ファイルを
+    # 読むと、そのアサーションは合計にだけ入って `#count` に出ないので、
+    # **残差がそのぶんだけ正になる。**
+    if actual_total is not None:
+        end_check = END_CHECK_ASSERTS * len(found) if reader == "isiki" else 0
+        accounted = sum(found.values()) + end_check + script_own
+        if accounted != actual_total:
+            ng.append(
+                "NG: 段 %s の合計 %d 件に対し、証人で説明がつくのは %d 件だけである"
+                "(Σ件数 %d + 出口の検査 %d + 台本自身 %d)。差 %+d。\n"
+                "    正なら**証人の無いアサーションが混ざっている**"
+                "(試験ファイルを素の load で読んでいないか。"
+                "読むなら isiki-test-load を使うこと)。\n"
+                "    負なら台本自身の件数が変わったので、"
+                "FILES の \"%s\" の 1 つめの数(いま %d)を直すこと"
+                % (
+                    stage,
+                    actual_total,
+                    accounted,
+                    sum(found.values()),
+                    end_check,
+                    script_own,
+                    actual_total - accounted,
+                    stage,
+                    script_own,
+                )
+            )
+    return ng
+
+
+def check_files_roster():
+    """ファイル単位の名簿**自身**の検査。ログを見る前に落とす。
+
+    いちばん大事なのは**段の合計との等式**で、これが通っていれば
+    内訳の名簿は T1 で実測された合計に縛られていることになる。
+    """
+    problems = []
+    stage_names = [n for n, _, _, _ in COUNTS]
+    for stage in stage_names:
+        if stage not in FILES:
+            problems.append(
+                "段 %s がファイル単位の名簿(FILES)に無い。"
+                "**内訳が言えない段を増やさないこと**(それが #203 で埋めた穴である)" % stage
+            )
+    for stage in FILES:
+        if stage not in stage_names:
+            problems.append("FILES にあるが COUNTS に無い段: %s" % stage)
+    for stage, count, reader, _rounds in COUNTS:
+        entry = FILES.get(stage)
+        if entry is None:
+            continue
+        script_own, items = entry
+        if not items:
+            problems.append("段 %s の項目が空。内訳の無い名簿は何も見ていない" % stage)
+            continue
+        seen = set()
+        for name, n in items:
+            if name in seen:
+                problems.append("段 %s の項目 %s が重複している" % (stage, name))
+            seen.add(name)
+            if n <= 0:
+                problems.append(
+                    "段 %s の項目 %s の件数が %d。**0 件の項目は認めない**"
+                    "(縮んでも差が出ない。COUNTS と同じ理由)" % (stage, name, n)
+                )
+        end_check = END_CHECK_ASSERTS * len(items) if reader == "isiki" else 0
+        derived = sum(n for _, n in items) + end_check + script_own
+        if derived != count:
+            problems.append(
+                "段 %s の内訳の和が段の合計と合わない(COUNTS %d / 内訳から導出 %d)。"
+                "Σ件数 %d + 出口の検査 %d + 台本自身 %d。"
+                "**どちらかが間違っている。**段の合計は T1 で実測されているので、"
+                "まず内訳(FILES)のほうを疑うこと"
+                % (
+                    stage,
+                    count,
+                    derived,
+                    sum(n for _, n in items),
+                    end_check,
+                    script_own,
+                )
+            )
+    return problems
+
+
+# 台本の中の読み込み。**どちらで読んでいるかを静的に区別する**
+SCRIPT_LOAD_RE = re.compile(r'\((load|isiki-test-load)\s+"([^"]+)"\)')
+
+
+def script_for_stage(stage):
+    """段の名乗りから台本のパスを出す。台本を持たない段(C 側)は None。"""
+    base = stage.split(" [")[0]
+    return base if base.endswith(".lisp") else STAGE_SCRIPTS.get(base)
+
+
+def check_witness_sources(root="."):
+    """**「証人が無いこと」を静的に落とす。**
+
+    いままで証人の有無は人が数えていた(census §3 の「証人の有無」の列)。
+    ここで見るのは 2 つ:
+
+    1. 台本が `isiki-test-load` で読むファイルの**並び**が名簿と一致すること。
+       足したのに名簿に書いていなければ落ちる。外したのに名簿に残っていても落ちる
+    2. 素の `load` で `test/lisp/` のファイルを読んでいないこと。
+       読んでよいのは RESOURCES に理由つきで載せたものと枠組み自身だけ
+
+    **1 周 12 分かからずに落ちる**のがこの検査の値で、`make test` に入っている。
+    """
+    problems = []
+    for stage, _count, reader, _rounds in COUNTS:
+        if reader != "isiki":
+            continue  # 枠組みを使わない段(C 側・自前集計)に load は無い
+        script = script_for_stage(stage)
+        if script is None:
+            problems.append(
+                "段 %s の台本が分からない。STAGE_SCRIPTS に足すこと" % stage
+            )
+            continue
+        path = os.path.join(root, script)
+        if not os.path.exists(path):
+            problems.append("段 %s の台本 %s が無い" % (stage, script))
+            continue
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        witnessed = []
+        for how, target in SCRIPT_LOAD_RE.findall(text):
+            if how == "isiki-test-load":
+                witnessed.append(target)
+                continue
+            if target == FRAMEWORK:
+                continue
+            if not target.startswith("test/lisp/"):
+                continue  # src/lisp の基盤ライブラリ。試験ファイルではない
+            allowed = [p for p, _why in RESOURCES.get(script, ())]
+            if target not in allowed:
+                problems.append(
+                    "台本 %s が %s を**素の load で**読んでいる。"
+                    "試験ファイルは isiki-test-load で読むこと"
+                    "(そうでないと件数の行が出ず、縮んでも**どのファイルか言えない**)。"
+                    "アサーションを 1 件も持たない資料なら、"
+                    "tools/check_test_count_ratchet.py の RESOURCES に理由つきで載せること"
+                    % (script, target)
+                )
+        expected = [n for n, _ in FILES.get(stage, (0, ()))[1]]
+        if witnessed != expected:
+            missing = [n for n in expected if n not in witnessed]
+            added = [n for n in witnessed if n not in expected]
+            detail = []
+            if missing:
+                detail.append("名簿にあるが台本が読まない: " + ", ".join(missing))
+            if added:
+                detail.append("台本が読むが名簿に無い: " + ", ".join(added))
+            if not detail:
+                detail.append("並びが違う(台本の読み込み順に合わせること)")
+            problems.append(
+                "段 %s の台本 %s と FILES の名簿が食い違う。%s"
+                % (stage, script, " / ".join(detail))
+            )
+    for script, entries in RESOURCES.items():
+        for target, why in entries:
+            if not why.strip():
+                problems.append(
+                    "RESOURCES の %s / %s に理由が書かれていない。"
+                    "**理由の無い例外は、ただの穴である**" % (script, target)
+                )
+    return problems
+
+
+
 # --- 判定 ------------------------------------------------------------------
 
 
@@ -375,6 +1073,8 @@ def judge(round_name, lines, single_stage=None):
     expected = {name: (count, reader) for name, count, reader, _ in roster}
     known = {name for name, _, _, _ in COUNTS}
     readings = {}  # 段 -> [(passed, failed, 行番号) ...]
+    # [#203 / T2] 段の区間そのもの。**内訳の特定**(judge_files)に渡す
+    stage_segments = {}
     strays = []  # 名簿に無い段で見つけた合否
     unreadable = []  # どの読み取り方でも拾えなかった合否の形の行
     unexpected_round = []  # 名簿にはあるが、この周では走らないはずの段
@@ -384,6 +1084,7 @@ def judge(round_name, lines, single_stage=None):
             reader = READERS[expected[name][1]]
             found, consumed = reader(segment)
             readings.setdefault(name, []).extend(found)
+            stage_segments.setdefault(name, []).extend(segment)
         elif name in known:
             # 名簿にはあるが、この周の段ではない。件数が読めたら鳴らす
             found = []
@@ -464,6 +1165,9 @@ def judge(round_name, lines, single_stage=None):
                 )
             else:
                 rows.append((name, count, actual, reader, "OK"))
+            # [#203 / T2] **ここで内訳を言う。** 合計が合っていても走らせる
+            # (合計が合ったまま内訳が入れ替わる形は、合計だけでは見えない)
+            ng.extend(judge_files(name, reader, stage_segments.get(name, []), actual))
 
     for name, hits in strays:
         where = name if name is not None else "(名乗りより前)"
@@ -499,7 +1203,7 @@ def read_log(path):
 
 
 def run(round_name, logpath, quiet=False, single_stage=None):
-    problems = check_roster()
+    problems = check_roster() + check_files_roster()
     if problems:
         for p in problems:
             print("NG(名簿): " + p, file=sys.stderr)
@@ -551,54 +1255,121 @@ def synth_stage_header(name, style):
     return "make %s\n" % name
 
 
-def synth_body(reader, passed, failed):
-    """段の中身(件数の出方)を作る。読み取り方ごとに形が違う。"""
+def synth_body(
+    stage,
+    reader,
+    failed=0,
+    item_delta=None,
+    drop_item=None,
+    drop_item_fully=None,
+    unwitnessed=0,
+):
+    """段の中身(件数の出方)を作る。読み取り方ごとに形が違う。
+
+    **[#203 / T2] 名簿の内訳どおりに 1 件 1 行の証人を出す。**
+    以前はここが `#count test/lisp/synthetic_test.lisp N` の 1 行だけだった。
+    内訳の照合を足したので、**合成ログも内訳を持たないと陰性対照が成立しない。**
+
+    つまみ:
+      item_delta       … (項目, 増減)。その項目の件数をずらす(本番の「縮み」)
+      drop_item        … 件数の行だけを落とす(`#at` は残る = 途中で止まった)
+      drop_item_fully  … 進捗の行も件数の行も落とす(まるごと読まれなかった)
+      unwitnessed      … 証人の無いアサーションを合計にだけ足す(素の load の形)
+    """
+    own, roster_items = FILES[stage]
+    items = [(n, c) for n, c in roster_items if n != drop_item_fully]
+    out = []
+    end_check = 0
+    total = own + unwitnessed
+    for name, count in items:
+        if item_delta and item_delta[0] == name:
+            count += item_delta[1]
+        if reader == "isiki":
+            # **進捗の行が先。** load の前に出る(test_framework.lisp)
+            out.append("#at %s t=100 += 10\n" % name)
+            if name == drop_item:
+                continue  # 件数の行が出ないまま止まった
+            out.append("#count %s %d\n" % (name, count))
+            end_check += END_CHECK_ASSERTS
+            total += count
+            continue
+        if name == drop_item:
+            continue
+        total += count
+        if reader == "self-tally":
+            out.append("#ck %s\n" % name)
+        else:
+            out.append("[no9p] ok   %s\n" % name)
+    total += end_check
+    passed = total - failed
     if reader == "isiki":
-        return [
-            "#count test/lisp/synthetic_test.lisp %d\n" % passed,
-            "\n",
-            "==== isiki tests: %d passed, %d failed ====\n" % (passed, failed),  # PASS-LINE: FIXTURE 合成ログ(isiki の読み取り方)
-        ]
-    if reader == "self-tally":
-        # 台本の自前集計。**1 件 1 行の `#ck` が本体**で、不合格は `[NG]` も出す
-        out = []
-        for i in range(failed):
-            out.append("[NG] synthetic-ng-%d\n" % i)
-            out.append("#ck synthetic-ng-%d\n" % i)
-        out += ["#ck synthetic-%d\n" % i for i in range(passed)]
         out.append("\n")
-        out.append("==== isiki tests: %d passed, %d failed ====\n" % (passed, failed))  # PASS-LINE: FIXTURE 合成ログ(self-tally の読み取り方)
+        verdict = "==== isiki tests: %d passed, %d failed ====\n" % (passed, failed)  # PASS-LINE: FIXTURE 合成ログ(isiki の読み取り方)
+        out.append(verdict)
+        return out
+    if reader == "self-tally":
+        for i in range(failed):
+            out.insert(0, "#ck synthetic-ng-%d\n" % i)
+            out.insert(0, "[NG] synthetic-ng-%d\n" % i)
+        out.append("\n")
+        verdict = "==== isiki tests: %d passed, %d failed ====\n" % (passed, failed)  # PASS-LINE: FIXTURE 合成ログ(self-tally の読み取り方)
+        out.append(verdict)
         return out
     if reader == "no9p":
-        out = ["[no9p] boot smoke begin\n"]
-        out += ["[no9p] ok   synthetic-%d\n" % i for i in range(passed)]
-        out += ["[no9p] NG   synthetic-ng-%d\n" % i for i in range(failed)]
+        out.insert(0, "[no9p] boot smoke begin\n")
         out.append("[no9p] %d passed, %d failed\n" % (passed, failed))  # PASS-LINE: FIXTURE 合成ログ(no9p の読み取り方)
         return out
     raise AssertionError("合成できない読み取り方: %r" % reader)
 
 
-def synth_log(round_name, style="make", drop=None, delta=None, fail=None, extra=None):
+def synth_log(
+    round_name,
+    style="make",
+    drop=None,
+    delta=None,
+    fail=None,
+    extra=None,
+    drop_item=None,
+    drop_item_fully=None,
+    unwitnessed=None,
+):
     """名簿どおりの 1 周のログを合成する。
 
-    drop  … この段をまるごと落とす(段が走らなかったログ)
-    delta … (段, 増減)。件数をずらす
-    fail  … (段, 失敗件数)。失敗を混ぜる
-    extra … 追加で書く行(名簿に無い段など)
+    drop             … この段をまるごと落とす(段が走らなかったログ)
+    delta            … (段, 増減)。**その段の最後の項目**の件数をずらす。
+                       内訳と合計が同じだけ動くので、本番の縮みと同じ形になる
+    fail             … (段, 失敗件数)。失敗を混ぜる
+    extra            … 追加で書く行(名簿に無い段など)
+    drop_item        … (段, 項目)。件数の行だけ落とす(進捗の行は残る)
+    drop_item_fully  … (段, 項目)。進捗の行も落とす
+    unwitnessed      … (段, 件数)。証人の無いアサーションを合計にだけ足す
     """
     lines = ["make[1]: Entering directory '/repo'\n"]
     for name, count, reader, rounds in COUNTS:
         if round_name not in rounds or name == drop:
             continue
-        passed = count
-        failed = 0
+        item_delta = None
         if delta and delta[0] == name:
-            passed += delta[1]
-        if fail and fail[0] == name:
-            failed = fail[1]
-            passed -= fail[1]
+            # **最後の項目**を動かす(どれでもよいが、固定しておくと対照が読める)
+            item_delta = (FILES[name][1][-1][0], delta[1])
         lines.append(synth_stage_header(name, style))
-        lines.extend(synth_body(reader, passed, failed))
+        lines.extend(
+            synth_body(
+                name,
+                reader,
+                failed=fail[1] if fail and fail[0] == name else 0,
+                item_delta=item_delta,
+                drop_item=drop_item[1] if drop_item and drop_item[0] == name else None,
+                drop_item_fully=(
+                    drop_item_fully[1]
+                    if drop_item_fully and drop_item_fully[0] == name
+                    else None
+                ),
+                unwitnessed=(
+                    unwitnessed[1] if unwitnessed and unwitnessed[0] == name else 0
+                ),
+            )
+        )
     if extra:
         lines.extend(extra)
     return [(i, line) for i, line in enumerate(lines, start=1)]
@@ -635,14 +1406,14 @@ def self_test():
     victim = "test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]"
     check("陽性 件数 -1 で落ちる", passes(synth_log(ALL, delta=(victim, -1))), False)
     check(
-        "陽性 件数 -1 のとき次に書く数字(154)を出す",
-        "COUNTS の \"%s\" を 154 に" % victim in ng_text(synth_log(ALL, delta=(victim, -1))),
+        "陽性 件数 -1 のとき次に書く数字(158)を出す",
+        "COUNTS の \"%s\" を 158 に" % victim in ng_text(synth_log(ALL, delta=(victim, -1))),
         True,
     )
     check("陽性 件数 +1 で落ちる", passes(synth_log(ALL, delta=(victim, 1))), False)
     check(
-        "陽性 件数 +1 のとき次に書く数字(156)を出す",
-        "COUNTS の \"%s\" を 156 に" % victim in ng_text(synth_log(ALL, delta=(victim, 1))),
+        "陽性 件数 +1 のとき次に書く数字(160)を出す",
+        "COUNTS の \"%s\" を 160 に" % victim in ng_text(synth_log(ALL, delta=(victim, 1))),
         True,
     )
 
@@ -769,6 +1540,128 @@ def self_test():
     wrapped = [(i, line) for i, line in enumerate(wrapped_lines, start=1)]
     check("陰性 包みのターゲットの echo で鳴らない", passes(wrapped), True)
 
+    # ------------------------------------------------------------------
+    # [#203 / T2] **内訳の特定**の対照。ここから下は「どのファイルが縮んだか」
+    # を言えることの対照である(census §5-2 で「言えない」と書かれていた穴)
+    # ------------------------------------------------------------------
+
+    # 名簿自身の等式(内訳の和 = 段の合計)
+    check("内訳の名簿の検査が通る", check_files_roster(), [])
+    # **証人の出どころ**(台本が素の load で試験ファイルを読んでいないこと)
+    check("証人の出どころの検査が通る", check_witness_sources(), [])
+
+    # 陽性対照 A: **ある試験ファイルのアサーションが 1 件減ったら、
+    # そのファイル名が出て落ちる。**無証人だった段で確かめる(これが本題)
+    # **1 項目 1 件の読み方では「1 件減る」は「その行が消える」である**
+    # (`#ck` / `[no9p] ok` は 1 件 1 行なので、件数だけを減らす形が無い)。
+    # だから自前集計と C 側の段は drop_item で縮ませる
+    for stage, victim_file, how in (
+        ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", "test/lisp/device_test.lisp", "delta"),
+        ("test/lisp/qemu_boot_m3_za_ext5.lisp", "test/lisp/za_test_ext19.lisp", "delta"),
+        ("test/lisp/qemu_boot_no_init_signal.lisp", "sg-alive-after", "drop"),
+        ("test-qemu-no-9p-run", "app-hello-42", "drop"),
+    ):
+        rnd = CI if stage == "test/lisp/qemu_boot_m3_za_ext5.lisp" else ALL
+        if how == "delta":
+            log = synth_log(rnd, delta=(stage, -1))
+        else:
+            log = synth_log(rnd, drop_item=(stage, victim_file))
+        check("陽性 %s の 1 件減で落ちる" % victim_file, passes(log, rnd), False)
+        check(
+            "陽性 縮んだ先の名前(%s)が出る" % victim_file,
+            victim_file in ng_text(log, rnd),
+            True,
+        )
+
+    # 陽性対照 B: **証人の無いファイルが増えたら落ちる。**
+    # 2 つの経路で見る。
+    #   B-1(静的): 台本が素の load で試験ファイルを読んだら、ログを見る前に落ちる
+    #   B-2(ログ): 合計だけが増えて証人が無ければ、等式の残差で落ちる
+    unwit = synth_log(ALL, unwitnessed=(victim, 7))
+    check("陽性 B-2 証人の無い 7 件で落ちる", passes(unwit), False)
+    check(
+        "陽性 B-2 その理由を「証人の無いアサーション」と言う",
+        "証人の無いアサーションが混ざっている" in ng_text(unwit),
+        True,
+    )
+
+    # 陽性対照 C: **ファイルが丸ごと落ちたら、そのファイル名が出て落ちる。**
+    # 2 つに分かれる(痕跡が違う。調査 §9-4-7)
+    #   C-1: 進捗の行はあるが件数の行が無い = 読み始めて出口へ着かなかった
+    #   C-2: どちらも無い = そもそも読まれなかった
+    died = synth_log(ALL, drop_item=(victim, "test/lisp/fat16_test.lisp"))
+    check("陽性 C-1 途中で止まったファイルで落ちる", passes(died), False)
+    check(
+        "陽性 C-1 そのファイル名が出る",
+        "test/lisp/fat16_test.lisp" in ng_text(died),
+        True,
+    )
+    check(
+        "陽性 C-1 進捗の行だけがある形だと言う",
+        "**進捗の行(#at)は出ている**" in ng_text(died),
+        True,
+    )
+    gone = synth_log(ALL, drop_item_fully=(victim, "test/lisp/fat16_test.lisp"))
+    check("陽性 C-2 読まれなかったファイルで落ちる", passes(gone), False)
+    check(
+        "陽性 C-2 そのファイル名が出る",
+        "test/lisp/fat16_test.lisp" in ng_text(gone),
+        True,
+    )
+
+    # 陽性対照 D: 名簿に無い証人の行(試験ファイルを足したのに名簿に書いていない)
+    added = [line for _, line in synth_log(ALL)]
+    for i, line in enumerate(added):
+        if line.startswith("#count test/lisp/fat16_test.lisp"):
+            added.insert(i, "#at test/lisp/brand_new_test.lisp t=1 += 1\n")
+            added.insert(i + 1, "#count test/lisp/brand_new_test.lisp 4\n")
+            break
+    added = [(i, line) for i, line in enumerate(added, start=1)]
+    check("陽性 D 名簿に無い証人の行で落ちる", passes(added), False)
+    check(
+        "陽性 D その名前を出す",
+        "test/lisp/brand_new_test.lisp" in ng_text(added),
+        True,
+    )
+
+    # 陰性対照の念押し: **別の目的の `#count` 行で鳴らないこと。**
+    # test/lisp/disassemble_test.lisp:319 が
+    #   `#count dis-add    kernel=0 immobilized=0 gc-heap=0`
+    # を出している。**形が似た行は誤報の種**なので、実物を入れて鳴らないことを見る
+    other_count = [line for _, line in synth_log(ALL)]
+    for i, line in enumerate(other_count):
+        if line.startswith("#count test/lisp/fat16_test.lisp"):
+            other_count.insert(i, "#count dis-add    kernel=0 immobilized=0 gc-heap=0\n")
+            other_count.insert(i, "#count dis-caller kernel=0 immobilized=0 gc-heap=0\n")
+            break
+    other_count = [(i, line) for i, line in enumerate(other_count, start=1)]
+    check("陰性 別の目的の #count 行で鳴らない", passes(other_count), True)
+
+    # 陽性対照 E: **静的な検査**。台本が素の load で試験ファイルを読む形
+    saved_files = FILES
+    try:
+        # 名簿から 1 本外す = 台本が読んでいるのに名簿に無い状態
+        globals()["FILES"] = dict(
+            FILES,
+            **{
+                "test/lisp/qemu_boot_m4_environment.lisp": (
+                    FILES["test/lisp/qemu_boot_m4_environment.lisp"][0],
+                    FILES["test/lisp/qemu_boot_m4_environment.lisp"][1][:-1],
+                )
+            }
+        )
+        problems = check_witness_sources()
+        check("陽性 E 台本と内訳の名簿が食い違うと落ちる", bool(problems), True)
+        check(
+            "陽性 E その名前を出す",
+            any("environment_utilities_test.lisp" in p for p in problems),
+            True,
+        )
+        check("陽性 E 等式も崩れる", bool(check_files_roster()), True)
+    finally:
+        globals()["FILES"] = saved_files
+    check("陰性 E 名簿を戻すと通る", check_witness_sources(), [])
+
     return ok
 
 
@@ -781,11 +1674,64 @@ def main(argv):
     )
     parser.add_argument("--log", help="1 周の出力を切らずに落としたログ")
     parser.add_argument("--list", action="store_true", help="名簿を出す(合計は導出)")
+    parser.add_argument(
+        "--files",
+        action="store_true",
+        help="ファイル単位の名簿を出す(段の合計は内訳から導出。#203)",
+    )
+    parser.add_argument(
+        "--witness",
+        action="store_true",
+        help="**ログを見ずに**証人の出どころを見る(台本と内訳の名簿の突き合わせ。#203)",
+    )
     parser.add_argument("--self-test", action="store_true", help="計器自身の対照")
     args = parser.parse_args(argv)
 
     if args.self_test:
         return 0 if self_test() else 1
+
+    if args.witness:
+        problems = check_files_roster() + check_witness_sources()
+        for p in problems:
+            print("NG(証人): " + p, file=sys.stderr)
+        if problems:
+            return 1
+        stages = len(FILES)
+        items = sum(len(v[1]) for v in FILES.values())
+        total = sum(c for _, c, _, _ in COUNTS)
+        print(
+            "[test-count witness] %d 段 / 証人 %d 項目 / 合計 %d 件 —— "
+            "**どの段でも内訳が言える**" % (stages, items, total)
+        )
+        print("  OK")
+        return 0
+
+    if args.files:
+        problems = check_files_roster()
+        for p in problems:
+            print("NG(内訳の名簿): " + p, file=sys.stderr)
+        for stage, count, reader, rounds in COUNTS:
+            own, items = FILES[stage]
+            end_check = END_CHECK_ASSERTS * len(items) if reader == "isiki" else 0
+            print(
+                "%s  (%s / %s)  合計 %d = Σ%d + 出口 %d + 台本 %d"
+                % (
+                    stage,
+                    reader,
+                    ",".join(rounds),
+                    count,
+                    sum(n for _, n in items),
+                    end_check,
+                    own,
+                )
+            )
+            for name, n in items:
+                print("    %-56s %5d" % (name, n))
+        print(
+            "内訳の名簿 全体 %d 段 / %d 項目"
+            % (len(FILES), sum(len(v[1]) for v in FILES.values()))
+        )
+        return 1 if problems else 0
 
     if args.list:
         problems = check_roster()

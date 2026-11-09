@@ -441,6 +441,61 @@ def where_it_runs(root="."):
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# [#203 / T2] **ファイル単位の名簿の初期値を導出して刷る。**
+#
+# `tools/check_test_count_ratchet.py` の `FILES` は**手で数えた数字を 1 つも
+# 置かない**(規則 13)。初期値はこのモードの出力をそのまま貼ったものである。
+#
+#     python3 tools/census_test_counts.py --file-roster
+#
+# **これは生成器であって権威ではない。** 権威は貼ったあとの literal のほうで、
+# 照合器はこの道具を実行時に呼ばない(§7-3 の「推定を権威にするな」)。
+# 静的な数え上げが壊れても、literal が実機のログと合わなくなる形で鳴る。
+
+# 自前集計の段の 1 件 1 行の名前(台本の ck の呼び出し)
+SELF_CK_LABEL_RE = re.compile(r'^\(ck\s+"([^"]+)"', re.M)
+# C 側の起動スモークの 1 件 1 行の名前(src/c/kernel.c の smoke_ck)
+SMOKE_CK_LABEL_RE = re.compile(r'^\s+smoke_ck\("([^"]+)"', re.M)
+
+
+def file_roster(root="."):
+    """段ごとの「1 件 1 行の証人」の一覧と件数を導出する。
+
+    返り値: [(段, 読み方, 台本自身の件数, [(名前, 件数), ...], 導出した段の合計)]
+
+    証人の形は読み方で違う。**3 つとも「名前つきで 1 件 1 行」である**ことが
+    ファイル単位(あるいは項目単位)の特定を成り立たせている:
+      isiki      … `#count <ファイル> <件数>`(isiki-test-load が出す)
+      self-tally … `#ck <名前>`(台本の ck)
+      no9p       … `[no9p] ok <名前>`(C 側の smoke_ck)
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import check_test_count_ratchet as ratchet
+
+    out = []
+    for stage, _count, reader, _rounds in ratchet.COUNTS:
+        script = stage_to_script(stage)
+        if reader == "no9p":
+            with open(os.path.join(root, "src/c/kernel.c"), encoding="utf-8") as f:
+                items = [(n, 1) for n in SMOKE_CK_LABEL_RE.findall(f.read())]
+            own = 0
+            total = sum(n for _, n in items)
+        elif reader == "self-tally":
+            with open(os.path.join(root, script), encoding="utf-8") as f:
+                items = [(n, 1) for n in SELF_CK_LABEL_RE.findall(f.read())]
+            own = 0
+            total = sum(n for _, n in items)
+        else:
+            a = analyze_script(script, root)
+            items = [(p, n) for how, p, n, _ in a["files"] if how == "isiki-test-load"]
+            own = a["script_own"]
+            # **出口の検査自身の 2 件**が 1 本あたり加わる(§2-1 の定義)
+            total = sum(n for _, n in items) + END_CHECK_ASSERTS * len(items) + own
+        out.append((stage, reader, own, items, total))
+    return out
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -450,9 +505,23 @@ def main():
     ap.add_argument("--detail", action="store_true", help="ファイル単位の内訳も出す")
     ap.add_argument("--inventory", action="store_true", help="全台本の棚卸し表を出す")
     ap.add_argument("--per-file", help="ログの #count 行を 1 ファイルずつ照合する")
+    ap.add_argument("--file-roster", action="store_true",
+                    help="ファイル単位の名簿(check_test_count_ratchet.py の FILES)の初期値を刷る")
     ap.add_argument("--deferred-audit", action="store_true",
                     help="入れ物(defun/lambda/defmacro)の中のアサーションを洗い出す")
     args = ap.parse_args()
+
+    if args.file_roster:
+        print("FILES = {")
+        for stage, reader, own, items, total in file_roster(args.root):
+            print('    # %s … 読み方 %s / 台本自身 %d 件 / 証人 %d 本 / 導出の合計 %d 件'
+                  % (stage, reader, own, len(items), total))
+            print('    "%s": (%d, (' % (stage, own))
+            for name, n in items:
+                print('        ("%s", %d),' % (name, n))
+            print("    )),")
+        print("}")
+        return 0
 
     if args.per_file:
         ok = bad = 0

@@ -239,7 +239,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test check-load-abort-line-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-pass-line check-pass-line-self-test check-load-abort-line-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -391,6 +391,27 @@ check-eval-error-budget-self-test:
 .PHONY: check-test-count-ratchet-self-test
 check-test-count-ratchet-self-test:
 	@python3 tools/check_test_count_ratchet.py --self-test
+
+# [#203 / T2] **証人の出どころ。ログを見ないので QEMU が要らない。**
+#
+# 名簿(FILES)は段ごとに「どのファイルが何件出すか」を持っている。ここで見るのは
+#
+#   1. 内訳の和 + 出口の検査 2 件 × 本数 + 台本自身 = 段の合計(COUNTS)
+#   2. 台本が `isiki-test-load` で読むファイルの並びが名簿と一致すること
+#   3. 試験ファイルを**素の `load`** で読んでいないこと
+#
+# **いままで「証人があるか」は人が数えていた**(census §3 の列)。
+# 試験ファイルを足して素の load で読むと、縮んでも**どのファイルか言えない**段が
+# 1 つ増える —— それが #203 で埋めた穴なので、**増やせないようにする。**
+# 1 周 12 分を待たずに落ちるのがこの検査の値である
+.PHONY: check-test-count-witness
+check-test-count-witness:
+	@python3 tools/check_test_count_ratchet.py --witness
+
+# ファイル単位の名簿そのものを見る(段の合計は内訳から**導出して出す**。規則 13)
+.PHONY: print-test-count-files
+print-test-count-files:
+	@python3 tools/check_test_count_ratchet.py --files
 
 # [#205 / T4] **合否の一行そのものが信用できるか**を見る。
 # 件数の照合(段ごとの名簿)は上の check_test_count_ratchet.py の仕事で、
@@ -714,7 +735,7 @@ check-small-heap-knob: | $(BUILD_TMPDIR)
 		exit 1; \
 	fi
 
-test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-pass-line check-pass-line-self-test check-load-abort-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-pass-line check-pass-line-self-test check-load-abort-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
