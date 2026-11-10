@@ -239,7 +239,7 @@ TEST_SRC_MOUNT = $(TEST_COMMON_SRC) $(SRCDIR)/process.c $(SRCDIR)/za.c $(SRCDIR)
 TEST_BIN_MOUNT = $(BUILD_TMPDIR)/mount_test
 
 
-.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-pass-line check-pass-line-self-test check-load-abort-line-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
+.PHONY: all setup image transpile embed-lisp check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-small-heap-knob test-qemu-no-9p test-qemu-no-9p-run test-qemu-no-embedded-init boot-cost test-qemu-m1-cost print-embed-lisp-src check-embedded-lisp-src check-embedded-lisp-src-self-test build compile run test test-qemu test-qemu-all clean check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-test-file-wiring check-test-file-wiring-self-test print-test-file-wiring check-pass-line check-pass-line-self-test check-load-abort-line-self-test print-test-count-roster test-qemu-all-stages check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims check-pr-claims-self-test check-macro-order-self-test test-qemu-bench-jit test-qemu-bench-interp test-qemu-jit-bench test-qemu-interp-bench test-qemu-macro-parity test-qemu-for-gc-stress test-qemu-stack-guard-gc test-qemu-load-gc-stress test-qemu-load-disk test-qemu-heap-exhaustion jit-frame-breakdown let-histogram print-build-flag-signature print-qemu-mem print-transpile-src aot-identity-save aot-identity-check aot-identity-positive-control aot-identity-self-test jit-identity-save jit-identity-check jit-identity-show jit-identity-self-test jit-reorder-check jit-reorder-self-test test-qemu-declare-audit test-qemu-alloc-audit test-qemu-alloc-breakdown test-qemu-compare-single test-qemu-compare-fixnum test-qemu-inline-muldiv test-qemu-safety3 check-qemu-retry-self-test check-frame-access-entries check-frame-access-entries-self-test
 
 all: build
 
@@ -412,6 +412,41 @@ check-test-count-witness:
 .PHONY: print-test-count-files
 print-test-count-files:
 	@python3 tools/check_test_count_ratchet.py --files
+
+# [#208] **試験台本の配線。起動を要さない静的検査である。**
+#
+# 埋める穴: `Makefile` にも継続的検査にもどこにも書かれていない試験台本が
+# **6 本(46 件)**あった。文書に手順だけが残っていて、**一度も走っていない。**
+# 「落ちない検査は検出器ではない」の別の形である。
+#
+# さらに元の報告は 7 本で、**1 本は誤検出だった**
+# (`test/lisp/qemu_boot_diag_m12_host.lisp` は `test/c/script_test.c` が読んでいる)。
+# 数え上げの道具が**起点を Makefile と CI の 2 経路しか見ていなかった**のが原因で、
+# **誤検出も計器を殺す**ので、起点の種類を名簿にして**知らない起点では落とす**形にした。
+#
+# 見るのは 3 つ:
+#
+#   1. `git ls-files test` の**全部**が名簿に載っていること(載っていなければ落ちる)
+#   2. 名簿にある行の実物があること(無ければ落ちる)
+#   3. 名簿の「どこから走る」が**実物の木から導出できる**こと
+#      (「意図して未配線」と書いたのに実は走っている場合も落ちる)
+#
+# 「意図して未配線」には**理由と日付**を必ず書く。空なら落ちる
+# (**理由の無い例外は、ただの穴である**)
+.PHONY: check-test-file-wiring
+check-test-file-wiring:
+	@python3 tools/check_test_count_ratchet.py --wiring
+
+# 上の検査自身の陽性対照・陰性対照(規則 8)。**対照に使う木はその場で合成する**
+# (いまの木には「意図して未配線」が 1 本も無いので、実物だけでは陽性対照が取れない)
+.PHONY: check-test-file-wiring-self-test
+check-test-file-wiring-self-test:
+	@python3 tools/check_test_count_ratchet.py --wiring-self-test
+
+# 配線の名簿の初期値を**実物の木から導出して刷る**(手で書かないため。規則 13)
+.PHONY: print-test-file-wiring
+print-test-file-wiring:
+	@python3 tools/check_test_count_ratchet.py --wiring-derive
 
 # [#205 / T4] **合否の一行そのものが信用できるか**を見る。
 # 件数の照合(段ごとの名簿)は上の check_test_count_ratchet.py の仕事で、
@@ -735,7 +770,7 @@ check-small-heap-knob: | $(BUILD_TMPDIR)
 		exit 1; \
 	fi
 
-test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-pass-line check-pass-line-self-test check-load-abort-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-test-file-wiring check-test-file-wiring-self-test check-pass-line check-pass-line-self-test check-load-abort-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
@@ -1359,6 +1394,32 @@ test-qemu-all:
 	@python3 tools/check_test_count_ratchet.py --round all --log $(QEMU_ALL_LOG)
 
 # 段の並び。**ここに段を足したら名簿にも足すこと**(足さないと照合器が落ちる)
+#
+# **レシピの中にコメント行(行頭 `#`)を書かないこと。** GNU make は読み飛ばすが、
+# `tools/census_test_counts.py` の `where_it_runs` はレシピを「タブで始まる行の
+# 連続」として読むので、行頭 `#` でレシピが**途中で終わったと判断され、
+# それ以降の段が「どこからも走らない」に化ける**(#208 の誤検出とまったく同じ族)。
+# 説明はこの位置に書く。
+#
+# [#208] 末尾の 6 本は「**どこからも走らなかった台本**」である。
+# `Makefile` と継続的検査の**全 686 コミットのどの時点にも登録されたことがない**
+# (= 外されたのではなく、一度も書かれなかった)。文書に手順だけが残っていて、
+# 書いた人は守られているつもりだった。**落ちない検査は検出器ではない。**
+#
+# 6 本とも「量の記録は手のまま / 合否だけ自動の周回に入れる」形で足せる。
+# 命令数の 2 段構えの**1 回目は普通の 1 段と同じ**(`test-qemu-instcount-gate` の
+# パス 1 = プラグイン指定なしの `test-qemu-milestone`)で、印の通過回数は
+# ゲスト側の C が数える(`src/c/bench_subprimitive.c`)から、
+# **補助部品(版管理外のプラグイン)が無くても合否は出る。**
+#
+# 並びは**安いものから**(落ちたときに早く分かる)。1 段あたりの実測/見込み:
+#   instcount_gate_check 10 秒 ★ / abi_bench 秒 ★ / inline_phase3 1 分 ★ /
+#   inline_phase0 1〜2 分 / inline_phase0b 90 秒 / declare_bench 82 秒
+#   (★ = 2026-11-09 時点で単一段を走らせていないもの)
+#
+# **「消す」と決まっていた 4 本のうち 3 本は消さなかった。** 合否の項目が
+# 常時走る段で覆われていなかったからである(消すと検出器が減る)。
+# 1 本ごとの判断と根拠は documents/never-run-stages-decisions.md。
 test-qemu-all-stages:
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-no-embedded-init
@@ -1384,6 +1445,12 @@ test-qemu-all-stages:
 	$(MAKE) test-qemu-compare-fixnum
 	$(MAKE) test-qemu-inline-muldiv
 	$(MAKE) test-qemu-safety3
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_instcount_gate_check.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_abi_bench.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_inline_phase3.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_inline_phase0.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_inline_phase0b.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_declare_bench.lisp
 
 # [可用性/#110] ヒープ枯渇が <storage-exhausted> になることを見る
 # (M8-T5/T6。documents/heap-exhaustion.md)。**専用の milestone にしてある**理由:
