@@ -241,6 +241,9 @@
 ;; **控え(FAT キャッシュ)の書き戻しまで済んでいないとここは 0 に見えない**
 ;; (fat16-fat-entry はキャッシュ経由でも読むので、下の再利用の確認と 2 つで見る)
 (assert-equal 0 (fat16-fat-entry *test-device* fat16-test-bpb fat16-test-shrink-freed))
+;; 印は件数に入らない進捗出力(test_framework.lisp の isiki-test-mark)。
+;; **どこまで通ったかが記録に残る**ようにしておく(規則 1)
+(isiki-test-mark "199-fat16-shrink-freed-and-chain-1")
 
 ;; 他のファイルが巻き込まれていないこと(二重使用があれば中身が壊れる)
 (assert-equal 2500 (length (fat16-read-file *test-device* "/BIG.TXT")))
@@ -258,6 +261,7 @@
   (fat16-cluster-chain *test-device* fat16-test-bpb (slot-value fat16-test-shrink-node-regrown 'start-cluster)))
 (assert-equal (list (car fat16-test-shrink-chain-before) fat16-test-shrink-freed)
               fat16-test-shrink-chain-regrown)
+(isiki-test-mark "199-fat16-freed-cluster-reused")
 (assert-equal fat16-test-write1-2clusters (fat16-read-file *test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0))
@@ -661,18 +665,21 @@
 (assert-equal t (if (write-vector-to-file "/mnt/OVW16.TXT" fat16-test-ovw-100) t nil))
 (assert-equal 100 (file-length "/mnt/OVW16.TXT"))
 (assert-equal fat16-test-ovw-100 (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-overwrite-smaller")
 
 ;; (2) **同じ大きさで**上書き(塊数が変わらない既存経路。回帰していないこと)
 (defglobal fat16-test-ovw-100b (create-vector 100 67))
 (assert-equal t (if (write-vector-to-file "/mnt/OVW16.TXT" fat16-test-ovw-100b) t nil))
 (assert-equal 100 (file-length "/mnt/OVW16.TXT"))
 (assert-equal fat16-test-ovw-100b (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-overwrite-same")
 
 ;; (3) **大きくする**上書き(塊が増える既存経路。回帰していないこと)
 (defglobal fat16-test-ovw-5000b (create-vector 5000 68))
 (assert-equal t (if (write-vector-to-file "/mnt/OVW16.TXT" fat16-test-ovw-5000b) t nil))
 (assert-equal 5000 (file-length "/mnt/OVW16.TXT"))
 (assert-equal fat16-test-ovw-5000b (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-overwrite-larger")
 
 ;; **#199 の症状そのもの: 中身のある既存ファイルを open-output-file で開けること。**
 ;; 開いた時点で 0 へ切り詰められている(= 余った塊が解放されている)。
@@ -691,3 +698,4 @@
 (write-byte 92 fat16-test-ovw-stream2)
 (close fat16-test-ovw-stream2)
 (assert-equal #(92) (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-open-output-file-on-existing")

@@ -224,6 +224,8 @@
 
 ;; 余った塊の FAT 項目が 0(未使用)に戻っている = 解放されている
 (assert-equal 0 (fat32-fat-entry *fat32-test-device* fat32-test-bpb fat32-test-shrink-freed))
+;; 印は件数に入らない進捗出力(規則 1。どこまで通ったかを記録に残す)
+(isiki-test-mark "199-fat32-shrink-freed-and-chain-1")
 
 ;; 他のファイルが巻き込まれていないこと(二重使用があれば中身が壊れる)
 (assert-equal 1000 (length (fat32-read-file *fat32-test-device* "/BIG.TXT")))
@@ -239,6 +241,7 @@
   (fat32-cluster-chain *fat32-test-device* fat32-test-bpb (slot-value fat32-test-shrink-node-regrown 'start-cluster)))
 (assert-equal (list (car fat32-test-shrink-chain-before) fat32-test-shrink-freed)
               fat32-test-shrink-chain-regrown)
+(isiki-test-mark "199-fat32-freed-cluster-reused")
 (assert-equal fat32-test-write1-2clusters (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000)                      (list "WRITE1.TXT" ':file 513)
                      (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
@@ -571,18 +574,21 @@
 (assert-equal t (if (write-vector-to-file "/mnt/OVW32.TXT" fat32-test-ovw-100) t nil))
 (assert-equal 100 (file-length "/mnt/OVW32.TXT"))
 (assert-equal fat32-test-ovw-100 (read-file-into-vector "/mnt/OVW32.TXT"))
+(isiki-test-mark "199-fat32-overwrite-smaller")
 
 ;; (2) **同じ大きさで**上書き
 (defglobal fat32-test-ovw-100b (create-vector 100 67))
 (assert-equal t (if (write-vector-to-file "/mnt/OVW32.TXT" fat32-test-ovw-100b) t nil))
 (assert-equal 100 (file-length "/mnt/OVW32.TXT"))
 (assert-equal fat32-test-ovw-100b (read-file-into-vector "/mnt/OVW32.TXT"))
+(isiki-test-mark "199-fat32-overwrite-same")
 
 ;; (3) **大きくする**上書き
 (defglobal fat32-test-ovw-3000b (create-vector 3000 68))
 (assert-equal t (if (write-vector-to-file "/mnt/OVW32.TXT" fat32-test-ovw-3000b) t nil))
 (assert-equal 3000 (file-length "/mnt/OVW32.TXT"))
 (assert-equal fat32-test-ovw-3000b (read-file-into-vector "/mnt/OVW32.TXT"))
+(isiki-test-mark "199-fat32-overwrite-larger")
 
 ;; **#199 の症状そのもの: 中身のある既存ファイルを open-output-file で開けること。**
 (defglobal fat32-test-ovw-stream (open-output-file "/mnt/OVW32.TXT"))
@@ -599,3 +605,4 @@
 (write-byte 92 fat32-test-ovw-stream2)
 (close fat32-test-ovw-stream2)
 (assert-equal #(92) (read-file-into-vector "/mnt/OVW32.TXT"))
+(isiki-test-mark "199-fat32-open-output-file-on-existing")
