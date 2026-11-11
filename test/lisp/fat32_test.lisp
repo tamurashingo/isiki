@@ -181,10 +181,64 @@
                      (list "SUBDIR" ':dir 0))
               (fat32-read-dir *fat32-test-device* "/"))
 
-;; クラスタ数が減る書き込み(縮小)は対象外としてnilを返す(現在2クラスタ確保済みの
-;; WRITE1.TXTへ、1クラスタで収まる10byteを書こうとする)。直前の(失敗した)呼び出し
-;; でデータ/ディレクトリエントリが変更されていないことも確認する。
-(assert-equal nil (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new))
+;;; --- [#199] クラスタ数が減る書き込み(縮小) ---
+;;
+;; **期待値を nil から t へ変えた。理由をここに書く(規則 16)。**
+;;
+;; 2026-11-11 まで、この行は
+;;     (assert-equal nil (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new))
+;; だった。「クラスタ数が減る書き込みは対象外」という**実装の欠落を、仕様として
+;; 固定していた**。FAT16 側(fat16_test.lisp の同じ節)とまったく同じ欠落で、
+;; **双子の実装が同じ穴を持ち、実機でも同一結果だった**(#199 の調査)。
+;;
+;; 書き込み用に開く操作(open-output-file)は「中身を空にする」を**空ベクタでの
+;; 全体書き換え**で表現しているので、中身のある既存ファイルは必ずこの枝に落ちる。
+;; つまりこの 1 行が「**既存ファイルを上書き保存できない**」を固定していた。
+;; FAT32 で表に出ていなかったのは、**そちらのディスクを読む用途でしか使って
+;; いなかった**ため(ページャとファイラは FAT32 から読んでいるだけ)。
+;;
+;; → %fat32-shrink-file を入れて**縮小は成功する**ようになったので、期待値は t。
+
+;; 縮小前の鎖を控えておく(あとで「どの塊が解放されたか」を名指しするため)
+(defglobal fat32-test-shrink-node-before (%fat32-test-resolve-node *fat32-test-device* "/WRITE1.TXT"))
+(defglobal fat32-test-shrink-chain-before
+  (fat32-cluster-chain *fat32-test-device* fat32-test-bpb (slot-value fat32-test-shrink-node-before 'start-cluster)))
+(assert-equal 2 (length fat32-test-shrink-chain-before))
+(defglobal fat32-test-shrink-freed (car (cdr fat32-test-shrink-chain-before)))
+
+;; 2 クラスタ確保済みの WRITE1.TXT へ、1 クラスタ(512byte)で収まる 10byte を書く
+(assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-new) t nil))
+(assert-equal fat32-test-write1-new (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
+;; **大きさが正しく縮んでいる**(513 → 10)
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000)                      (list "WRITE1.TXT" ':file 10)
+                     (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
+                     (list "SUBDIR" ':dir 0))
+              (fat32-read-dir *fat32-test-device* "/"))
+
+;; **二重使用が起きていないことの陽性対照(規則 8)。** 鎖の長さがちょうど 1 本。
+(defglobal fat32-test-shrink-node-after (%fat32-test-resolve-node *fat32-test-device* "/WRITE1.TXT"))
+(defglobal fat32-test-shrink-chain-after
+  (fat32-cluster-chain *fat32-test-device* fat32-test-bpb (slot-value fat32-test-shrink-node-after 'start-cluster)))
+(assert-equal 1 (length fat32-test-shrink-chain-after))
+(assert-equal (car fat32-test-shrink-chain-before) (car fat32-test-shrink-chain-after))
+
+;; 余った塊の FAT 項目が 0(未使用)に戻っている = 解放されている
+(assert-equal 0 (fat32-fat-entry *fat32-test-device* fat32-test-bpb fat32-test-shrink-freed))
+
+;; 他のファイルが巻き込まれていないこと(二重使用があれば中身が壊れる)
+(assert-equal 1000 (length (fat32-read-file *fat32-test-device* "/BIG.TXT")))
+(assert-equal 18 (length (fat32-read-file *fat32-test-device* "/TEST.LSP")))
+
+;; **解放された塊が再利用されることの陽性対照(規則 8)。**
+;; 伸ばし直すと、いま解放した塊がそのまま再び使われるはず(空き探索は番号の
+;; 小さい側から走る)。**この伸ばし直しは既存フィクスチャ(513byte)を元に戻す役も
+;; 兼ねている**(この節より後ろの一覧の期待値を動かさないため)。
+(assert-equal t (if (fat32-write-file *fat32-test-device* "/WRITE1.TXT" fat32-test-write1-2clusters) t nil))
+(defglobal fat32-test-shrink-node-regrown (%fat32-test-resolve-node *fat32-test-device* "/WRITE1.TXT"))
+(defglobal fat32-test-shrink-chain-regrown
+  (fat32-cluster-chain *fat32-test-device* fat32-test-bpb (slot-value fat32-test-shrink-node-regrown 'start-cluster)))
+(assert-equal (list (car fat32-test-shrink-chain-before) fat32-test-shrink-freed)
+              fat32-test-shrink-chain-regrown)
 (assert-equal fat32-test-write1-2clusters (fat32-read-file *fat32-test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 1000)                      (list "WRITE1.TXT" ':file 513)
                      (list "Long_File_Name.txt" ':file 17) (list "This_Is_A_Very_Long_File_Name.txt" ':file 1)
@@ -499,3 +553,49 @@
 ;; 大きいファイル(1MB超)に対するcatの検証は、fat16_test.lispと同じ理由で
 ;; M9(#52)のローカル専用マイルストーン(qemu_boot_perf_fat32.lisp)へ移した
 ;; (コメントはfat16_test.lisp参照)。
+
+
+;;; --- [#199] 既存の中身があるファイルの上書き保存(3 通り) ---
+;;
+;; FAT16 側(fat16_test.lisp の同名の節)と同じ確認を FAT32 でも行う。
+;; **双子の実装が同じ欠落を持っていたので、確認も両方に要る**(#199 の設計)。
+;; クラスタサイズは 512byte(Makefile 参照)なので、3000byte は 6 クラスタ、
+;; 100byte は 1 クラスタ。**(1) で塊が 6 → 1 に減る。**
+
+(defglobal fat32-test-ovw-3000 (create-vector 3000 65))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW32.TXT" fat32-test-ovw-3000) t nil))
+(assert-equal 3000 (file-length "/mnt/OVW32.TXT"))
+
+;; (1) **小さい内容で**上書き(塊が減る。直す前はここで中断していた)
+(defglobal fat32-test-ovw-100 (create-vector 100 66))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW32.TXT" fat32-test-ovw-100) t nil))
+(assert-equal 100 (file-length "/mnt/OVW32.TXT"))
+(assert-equal fat32-test-ovw-100 (read-file-into-vector "/mnt/OVW32.TXT"))
+
+;; (2) **同じ大きさで**上書き
+(defglobal fat32-test-ovw-100b (create-vector 100 67))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW32.TXT" fat32-test-ovw-100b) t nil))
+(assert-equal 100 (file-length "/mnt/OVW32.TXT"))
+(assert-equal fat32-test-ovw-100b (read-file-into-vector "/mnt/OVW32.TXT"))
+
+;; (3) **大きくする**上書き
+(defglobal fat32-test-ovw-3000b (create-vector 3000 68))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW32.TXT" fat32-test-ovw-3000b) t nil))
+(assert-equal 3000 (file-length "/mnt/OVW32.TXT"))
+(assert-equal fat32-test-ovw-3000b (read-file-into-vector "/mnt/OVW32.TXT"))
+
+;; **#199 の症状そのもの: 中身のある既存ファイルを open-output-file で開けること。**
+(defglobal fat32-test-ovw-stream (open-output-file "/mnt/OVW32.TXT"))
+(assert-equal t (if (open-stream-p fat32-test-ovw-stream) t nil))
+(assert-equal 0 (file-length "/mnt/OVW32.TXT"))
+(write-byte 90 fat32-test-ovw-stream)
+(write-byte 91 fat32-test-ovw-stream)
+(close fat32-test-ovw-stream)
+(assert-equal 2 (file-length "/mnt/OVW32.TXT"))
+(assert-equal #(90 91) (read-file-into-vector "/mnt/OVW32.TXT"))
+
+;; もう一度同じことができること(#199 は「2 回目で落ちる」形で出た)
+(defglobal fat32-test-ovw-stream2 (open-output-file "/mnt/OVW32.TXT"))
+(write-byte 92 fat32-test-ovw-stream2)
+(close fat32-test-ovw-stream2)
+(assert-equal #(92) (read-file-into-vector "/mnt/OVW32.TXT"))

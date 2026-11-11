@@ -257,11 +257,23 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
 
 int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
                                     int truncate, int create_if_missing, lisp_val_t *out_node,
-                                    lisp_val_t *out_transfer) {
+                                    lisp_val_t *out_transfer, const char **out_detail) {
     GC_PROTECT(device);
+
+    // [#199] **どの段で落ちたのかを呼び出し元へ返す。** 以前は失敗が 1 ビットで、
+    // 呼び出し元(cc_open_output_file)が常に "cannot resolve file" と名乗っていた。
+    // 解決は成功していて切り詰めだけが失敗していた #199 では、**その文面が原因を
+    // 別の場所へ誘導した**(調査した本人も最初そう読んだ)。
+    // 既定は「解決できない」で、段を通るたびに上書きする。
+    if (out_detail) {
+        *out_detail = "cannot resolve file";
+    }
 
     lisp_val_t handle_fn = os_get_function(os_make_symbol("%DEVICE-HANDLE"), global_environment);
     if (handle_fn == nil) {
+        if (out_detail) {
+            *out_detail = "fat driver not available";
+        }
         return 0;
     }
     GC_PROTECT(handle_fn);
@@ -274,6 +286,9 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
     const char *resolve_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-RESOLVE-NODE" : "FAT16-RESOLVE-NODE";
     lisp_val_t resolve_fn = os_get_function(os_make_symbol(resolve_name), global_environment);
     if (resolve_fn == nil) {
+        if (out_detail) {
+            *out_detail = "fat driver not available";
+        }
         return 0;
     }
     GC_PROTECT(resolve_fn);
@@ -292,9 +307,17 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
     }
 
     if (node != nil && truncate) {
+        // ここから先は**解決は成功している**。失敗しても "cannot resolve file" と
+        // 名乗らせない([#199])
+        if (out_detail) {
+            *out_detail = "cannot truncate existing file";
+        }
         const char *write_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-WRITE-FILE" : "FAT16-WRITE-FILE";
         lisp_val_t write_fn = os_get_function(os_make_symbol(write_name), global_environment);
         if (write_fn == nil) {
+            if (out_detail) {
+                *out_detail = "fat driver not available";
+            }
             return 0;
         }
         GC_PROTECT(write_fn);
@@ -319,9 +342,16 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
     }
 
     if (node == nil && create_if_missing) {
+        // 解決はできた(= ファイルが無い、と分かった)。失敗の理由は作成の失敗
+        if (out_detail) {
+            *out_detail = "cannot create file";
+        }
         const char *create_name = (kind == MOUNT_KIND_FAT32) ? "FAT32-CREATE-FILE" : "FAT16-CREATE-FILE";
         lisp_val_t create_fn = os_get_function(os_make_symbol(create_name), global_environment);
         if (create_fn == nil) {
+            if (out_detail) {
+                *out_detail = "fat driver not available";
+            }
             return 0;
         }
         GC_PROTECT(create_fn);
@@ -345,6 +375,10 @@ int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const c
     }
 
     if (node == nil) {
+        // 本当に解決できなかった場合だけ、既定の文面のまま落ちる
+        if (out_detail) {
+            *out_detail = "cannot resolve file";
+        }
         return 0;
     }
     *out_node = node;

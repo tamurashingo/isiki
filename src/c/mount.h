@@ -90,11 +90,18 @@ int os_mount_fat_write_file(mount_kind_t kind, lisp_val_t device, const char *re
  *        格納する先(NULL可)。**脱出は失敗(戻り値0)として扱うので、呼び出し元は
  *        0 が返ったときにここを見て、非nilならそれをLispへ返すこと**
  *        (documents/error-unwind-survey.md §F-6)
- * @return 成功時1、失敗時0(パス解決不可・作成失敗等)
+ * @param out_detail [#199] 失敗時に、**どの段で落ちたのか**を表す短い英語の
+ *        文面(静的文字列)を格納する先(NULL可)。"cannot resolve file" /
+ *        "cannot truncate existing file" / "cannot create file" /
+ *        "fat driver not available" のいずれか。**呼び出し元はこれをそのまま
+ *        condition の文面へ載せること。** 以前は失敗が1ビットしか無く、
+ *        解決が成功していて切り詰めだけが失敗した #199 でも
+ *        「cannot resolve file」と名乗っていた(原因を別の場所へ誘導した)
+ * @return 成功時1、失敗時0(パス解決不可・切り詰め失敗・作成失敗等)
  */
 int os_mount_fat_resolve_file_node(mount_kind_t kind, lisp_val_t device, const char *relative_path,
                                     int truncate, int create_if_missing, lisp_val_t *out_node,
-                                    lisp_val_t *out_transfer);
+                                    lisp_val_t *out_transfer, const char **out_detail);
 
 /**
  * pathを解決し、(fat32-file-size|fat16-file-size handle relative_path)経由で

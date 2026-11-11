@@ -59,6 +59,41 @@
 (assert-equal "open-output-file: " (subseq (car (simple-error-format-arguments *io-c2*)) 0 18))
 
 ;;; ---------------------------------------------------------------------------
+;;; 2-b. [#199] **失敗の理由が区別できること**
+;;; ---------------------------------------------------------------------------
+;;
+;; 直す前、FAT 経路の open-output-file は **どの段で落ちても
+;; "cannot resolve file" と名乗っていた**。#199 では解決は成功していて
+;; 切り詰め(= 中身を空にする)だけが失敗していたので、
+;; **この文面が原因を別の場所へ誘導した**(調査した本人も最初そう読んだ)。
+;;
+;; いまは段ごとに別の文面を返す(src/c/mount.c の os_mount_fat_resolve_file_node
+;; の out_detail、src/c/stream_lisp.c がそれをそのまま載せる):
+;;
+;;   解決できない        … "cannot resolve file"
+;;   切り詰めができない  … "cannot truncate existing file"
+;;   作成できない        … "cannot create file"
+;;   下回りが居ない      … "fat driver not available"
+;;   マウントが無い      … "no such mount"(FAT 経路に入る前で落ちる)
+;;
+;; **縮小を実装したあとも、ディスクフル等で切り詰めは失敗しうる**ので区別は残す。
+;; この試験ファイルは FAT の円盤を持たない段でも走る(qemu_boot_m1_base.lisp 等)
+;; ため、ここで固定できるのは最後の 1 つ。**要点は、解決の失敗を名乗って
+;; いないこと。** FAT 経路側(切り詰めが通るようになったこと)は
+;; test/lisp/fat16_test.lisp / fat32_test.lisp の「[#199] 既存の中身がある
+;; ファイルの上書き保存」の節で見ている。
+(assert-equal "open-output-file: /no-such-mount/x.txt: no such mount"
+              (car (simple-error-format-arguments *io-c2*)))
+
+(defglobal *io-c2b* (io-catch (lambda () (open-io-file "/no-such-mount/x.txt"))))
+(assert-equal "open-io-file: /no-such-mount/x.txt: no such mount"
+              (car (simple-error-format-arguments *io-c2b*)))
+
+(defglobal *io-c2c* (io-catch (lambda () (open-input-file "/no-such-mount/x.txt"))))
+(assert-equal "open-input-file: /no-such-mount/x.txt: no such mount"
+              (car (simple-error-format-arguments *io-c2c*)))
+
+;;; ---------------------------------------------------------------------------
 ;;; 3. load
 ;;; ---------------------------------------------------------------------------
 

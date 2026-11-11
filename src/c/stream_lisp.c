@@ -359,12 +359,17 @@ lisp_val_t cc_open_output_file(lisp_val_t args, lisp_val_t env) {
         lisp_val_t node;
         lisp_val_t transfer = nil;
         GC_PROTECT(transfer);
+        // [#199] 失敗の理由をdetailで受け取ってそのまま載せる。**ここで常に
+        // "cannot resolve file" と名乗っていたのが、#199の原因探しを遠回りさせた**
+        // (解決は成功していて、切り詰めだけが失敗していた)。縮小を実装した後も
+        // ディスクフル等で切り詰めは失敗しうるので、区別は残す
+        const char *detail = "cannot resolve file";
         if (!os_mount_fat_resolve_file_node(kind, device, relative, 1 /* truncate */, 1 /* create_if_missing */,
-                                             &node, &transfer)) {
+                                             &node, &transfer, &detail)) {
             if (transfer != nil) {
                 return transfer;
             }
-            return os_signal_io_error("open-output-file", path, "cannot resolve file", global_environment);
+            return os_signal_io_error("open-output-file", path, detail, global_environment);
         }
         // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
         // ため、書き込み先(os_stream_open_fat_file_write)に渡すまでGC_PROTECTする
@@ -404,12 +409,16 @@ lisp_val_t cc_open_io_file(lisp_val_t args, lisp_val_t env) {
         lisp_val_t node;
         lisp_val_t transfer = nil;
         GC_PROTECT(transfer);
+        // [#199] こちらは truncate=0 なので切り詰めでは落ちないが、作成の失敗と
+        // 解決の失敗は区別できるようにしておく(同じ関数を使う以上、文面を
+        // 片方だけ嘘のままにしない)
+        const char *detail = "cannot resolve file";
         if (!os_mount_fat_resolve_file_node(kind, device, relative, 0 /* truncate */, 1 /* create_if_missing */,
-                                             &node, &transfer)) {
+                                             &node, &transfer, &detail)) {
             if (transfer != nil) {
                 return transfer;
             }
-            return os_signal_io_error("open-io-file", path, "cannot resolve file", global_environment);
+            return os_signal_io_error("open-io-file", path, detail, global_environment);
         }
         // nodeはこの後のrawのアロケーション(GCを誘発しうる)を跨いで生存する必要がある
         // ため、書き込み先(os_stream_open_fat_file_io)に渡すまでGC_PROTECTする
