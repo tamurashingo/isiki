@@ -184,6 +184,9 @@ COUNTS = (
     # [#215] 初期アプリ: ページャ。**新しく足した段**(試験が増えた分で、
     # 既存の段の件数は 1 つも動かしていない)。内訳は下の FILES に 2 本ある
     ("test/lisp/qemu_boot_app_pager.lisp", 46, "isiki", (ALL, CI)),
+    # [#214] 初期アプリ: inspect(値の構造の探索)。**新しく足した段**で、
+    # 既存の段の件数は 1 つも動かしていない。内訳は下の FILES に 2 本ある
+    ("test/lisp/qemu_boot_app_inspect.lisp", 123, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_error_escape_gc.lisp", 378, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_m5_ide.lisp", 7, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 159, "isiki", (ALL, CI)),
@@ -383,6 +386,11 @@ FILES = {
     "test/lisp/qemu_boot_app_pager.lisp": (0, (
         ("test/lisp/pager_app_disk_test.lisp", 14),
         ("test/lisp/pager_test.lisp", 28),
+    )),
+    # test/lisp/qemu_boot_app_inspect.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 123 件
+    "test/lisp/qemu_boot_app_inspect.lisp": (0, (
+        ("test/lisp/inspect_app_disk_test.lisp", 18),
+        ("test/lisp/inspect_test.lisp", 101),
     )),
     # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 378 件
     "test/lisp/qemu_boot_error_escape_gc.lisp": (4, (
@@ -1195,6 +1203,15 @@ WIRING_KINDS = {
 #     その段が `isiki-test-load` で読む
 # **既存の配線は 1 つも変えていない。**
 #
+# [2026-11-11 / #214] **3 本足した**(初期アプリ: inspect)。
+#   - `test/lisp/qemu_boot_app_inspect.lisp` …… `make test-qemu-all` と CI の両方へ
+#     段として足した(Makefile の test-qemu-all-stages と .github/workflows/ci.yml)。
+#     **CI にも段を入れたのは、#214 の完了条件が「文字列入力ストリームを渡した
+#     試験が CI で走る」だからである**(`test-qemu-all` だけでは足りない)
+#   - `test/lisp/inspect_app_disk_test.lisp` / `test/lisp/inspect_test.lisp` ……
+#     その段が `isiki-test-load` で読む
+# **既存の配線は 1 つも変えていない。**
+#
 WIRING = (
     ("test/bench/estimator_fixture.tsv", ("fixture:tools/bench/check_estimator.sh",)),
     ("test/c/clock_test.c", ("hostbuild:TEST_SRC_CLOCK",)),
@@ -1284,6 +1301,8 @@ WIRING = (
     ("test/lisp/inline_builtin_test.lisp", ("loaded",)),
     ("test/lisp/inline_decl_test.lisp", ("loaded",)),
     ("test/lisp/inline_muldiv_test.lisp", ("loaded",)),
+    ("test/lisp/inspect_app_disk_test.lisp", ("loaded",)),
+    ("test/lisp/inspect_test.lisp", ("loaded",)),
     ("test/lisp/io_signal_test.lisp", ("loaded",)),
     ("test/lisp/isiki_test.lisp", ("loaded",)),
     ("test/lisp/isiki_test_jit.lisp", ("loaded",)),
@@ -1308,6 +1327,7 @@ WIRING = (
     ("test/lisp/qemu_boot_abi_bench.lisp", ("all",)),
     ("test/lisp/qemu_boot_alloc_audit.lisp", ("manual:test-qemu-alloc-audit",)),
     ("test/lisp/qemu_boot_alloc_breakdown.lisp", ("manual:test-qemu-alloc-breakdown",)),
+    ("test/lisp/qemu_boot_app_inspect.lisp", ("all", "ci",)),
     ("test/lisp/qemu_boot_app_pager.lisp", ("all", "ci",)),
     ("test/lisp/qemu_boot_bench_construct.lisp", ("manual:test-qemu-bench-construct-check",)),
     ("test/lisp/qemu_boot_bench_interp.lisp", ("all",)),

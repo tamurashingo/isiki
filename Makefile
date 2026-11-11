@@ -1426,12 +1426,21 @@ test-qemu-all:
 # QEMU_DISK_IMG の上書きは要らず、順序の制約も無い。並べたのは
 # 「/app から読む」仲間を隣に置いて、片方が落ちたときに原因の切り分けを
 # 短くするためである。**CI でも走る**(ci.yml 側にも段がある)。
+#
+# [#214] **inspect の段(qemu_boot_app_inspect.lisp)はページャの直後に置く。**
+# 要るものは同じ(アプリ専用の円盤だけ)で QEMU_DISK_IMG の上書きは要らず、
+# 順序の制約も無い。「/app から読む」仲間を 3 段続けて並べたのは、
+# 片方が落ちたときに「円盤が読めないのか、アプリが壊れているのか」の
+# 切り分けを短くするためである。**CI でも走る**(ci.yml 側にも段がある。
+# #214 の完了条件が「文字列入力ストリームを渡した試験が CI で走る」なので、
+# test-qemu-all だけでは足りない)。
 test-qemu-all-stages:
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-no-embedded-init
 	$(MAKE) test-qemu-no-9p
 	$(MAKE) test-qemu-load-disk
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_pager.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_inspect.lisp
 	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
