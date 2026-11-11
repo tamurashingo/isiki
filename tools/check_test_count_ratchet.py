@@ -183,10 +183,19 @@ COUNTS = (
     ("test/lisp/qemu_boot_load_disk.lisp", 23, "isiki", (ALL,)),
     # [#215] 初期アプリ: ページャ。**新しく足した段**(試験が増えた分で、
     # 既存の段の件数は 1 つも動かしていない)。内訳は下の FILES に 2 本ある
-    ("test/lisp/qemu_boot_app_pager.lisp", 46, "isiki", (ALL, CI)),
+    # [#216] 46 -> 56。ページャを 1 打鍵で動かした分の対照が増えた
+    # (pager_test.lisp に §10 を 6 件、pager_app_disk_test.lisp に §5/§6 を 4 件。
+    # 内訳 18 + 34 = 52 に、ファイルの出口の検査 2 本 x 2 件 = 4 を足した 56)。
+    # **既定値や既存の対照は 1 つも書き換えていない**(規則 16: 期待値を黙って上げない)
+    ("test/lisp/qemu_boot_app_pager.lisp", 56, "isiki", (ALL, CI)),
     # [#214] 初期アプリ: inspect(値の構造の探索)。**新しく足した段**で、
     # 既存の段の件数は 1 つも動かしていない。内訳は下の FILES に 2 本ある
     ("test/lisp/qemu_boot_app_inspect.lisp", 123, "isiki", (ALL, CI)),
+    # [#216] 端末の土台(カーソル位置指定とキー 1 つ待ち)。**新しく足した段**で、
+    # 既存の段の件数は ページャの 46 -> 52 以外は 1 つも動かしていない。
+    # 内訳は下の FILES に 1 本ある
+    # (内訳 64 + ファイルの出口の検査 2 件 = 66)
+    ("test/lisp/qemu_boot_term.lisp", 66, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_error_escape_gc.lisp", 378, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_m5_ide.lisp", 7, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 159, "isiki", (ALL, CI)),
@@ -382,15 +391,19 @@ FILES = {
     "test/lisp/qemu_boot_load_disk.lisp": (0, (
         ("test/lisp/load_disk_test.lisp", 21),
     )),
-    # test/lisp/qemu_boot_app_pager.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 46 件
+    # test/lisp/qemu_boot_app_pager.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 56 件
     "test/lisp/qemu_boot_app_pager.lisp": (0, (
-        ("test/lisp/pager_app_disk_test.lisp", 14),
-        ("test/lisp/pager_test.lisp", 28),
+        ("test/lisp/pager_app_disk_test.lisp", 18),
+        ("test/lisp/pager_test.lisp", 34),
     )),
     # test/lisp/qemu_boot_app_inspect.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 123 件
     "test/lisp/qemu_boot_app_inspect.lisp": (0, (
         ("test/lisp/inspect_app_disk_test.lisp", 18),
         ("test/lisp/inspect_test.lisp", 101),
+    )),
+    # test/lisp/qemu_boot_term.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 66 件
+    "test/lisp/qemu_boot_term.lisp": (0, (
+        ("test/lisp/term_test.lisp", 64),
     )),
     # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 378 件
     "test/lisp/qemu_boot_error_escape_gc.lisp": (4, (
@@ -1212,6 +1225,15 @@ WIRING_KINDS = {
 #     その段が `isiki-test-load` で読む
 # **既存の配線は 1 つも変えていない。**
 #
+# [2026-11-11 / #216] **3 本足した**(端末の土台: カーソル位置指定とキー 1 つ待ち)。
+#   - `test/c/keymap_test.c` …… 母艦の試験として足した
+#     (`TEST_SRC_KEYMAP` / `TEST_BIN_KEYMAP`。**キーの取り扱いに付いた最初の試験**で、
+#     それまで 0 件だった)
+#   - `test/lisp/qemu_boot_term.lisp` …… `make test-qemu-all` と CI の両方へ
+#     段として足した(Makefile の test-qemu-all-stages と .github/workflows/ci.yml)
+#   - `test/lisp/term_test.lisp` …… その段が `isiki-test-load` で読む
+# **既存の配線は 1 つも変えていない。**
+#
 WIRING = (
     ("test/bench/estimator_fixture.tsv", ("fixture:tools/bench/check_estimator.sh",)),
     ("test/c/clock_test.c", ("hostbuild:TEST_SRC_CLOCK",)),
@@ -1220,6 +1242,7 @@ WIRING = (
     ("test/c/format_test.c", ("hostbuild:TEST_SRC_FORMAT",)),
     ("test/c/framebuffer_test.c", ("hostbuild:TEST_SRC_FRAMEBUFFER",)),
     ("test/c/ide_test.c", ("hostbuild:TEST_SRC_IDE",)),
+    ("test/c/keymap_test.c", ("hostbuild:TEST_SRC_KEYMAP",)),
     ("test/c/lisp_compiled_test.c", ("hostbuild:TEST_SRC_LISP_COMPILED",)),
     ("test/c/lisp_test.c", ("hostbuild:TEST_SRC_LISP",)),
     ("test/c/load_test.c", ("hostbuild:TEST_SRC_LOAD",)),
@@ -1376,6 +1399,7 @@ WIRING = (
     ("test/lisp/qemu_boot_safety3.lisp", ("all",)),
     ("test/lisp/qemu_boot_stack_guard.lisp", ("all",)),
     ("test/lisp/qemu_boot_stack_guard_gc.lisp", ("manual:test-qemu-stack-guard-gc",)),
+    ("test/lisp/qemu_boot_term.lisp", ("all", "ci",)),
     ("test/lisp/qemu_boot_test.lisp", ("all",)),
     ("test/lisp/read_file_native_test.lisp", ("loaded",)),
     ("test/lisp/rest_test.lisp", ("host:test/c/script_test.c",)),
@@ -1385,6 +1409,7 @@ WIRING = (
     ("test/lisp/square_test.lisp", ("host:test/c/script_test.c",)),
     ("test/lisp/stack_guard_gc_test.lisp", ("loaded",)),
     ("test/lisp/stack_guard_test.lisp", ("loaded",)),
+    ("test/lisp/term_test.lisp", ("loaded",)),
     ("test/lisp/test_framework.lisp", ("loaded",)),
     ("test/lisp/test_framework_test.lisp", ("loaded",)),
     ("test/lisp/toplevel_abort_test.lisp", ("loaded",)),
@@ -1410,6 +1435,8 @@ WIRING = (
     ("test/lisp/za_test_ext9.lisp", ("loaded",)),
     ("test/lisp/za_test_stress.lisp", ("loaded",)),
 )
+# 導出した実物 199 本 / うち未配線 0 本
+# 導出した実物 196 本 / うち未配線 0 本
 
 
 TESTDIR_VAR = "test/c"

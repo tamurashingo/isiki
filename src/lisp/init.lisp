@@ -1041,6 +1041,87 @@
 (defmacro with-error-output (stream-form &rest body)
   `(dynamic-let ((*error-output* ,stream-form)) ,@body))
 
+;;; ---------------------------------------------------------------------------
+;;; 端末(全画面を使うアプリの土台。#216)
+;;;
+;;; 下にあるのは C 側の 5 個の口(src/c/terminal.c)である:
+;;;   %%TERM-SIZE / %%TERM-SET-CURSOR / %%TERM-CLEAR /
+;;;   %%TERM-READ-CELL / %%TERM-RAW-INPUT
+;;;
+;;; **読みやすい名前をここに置くのは、アプリが %% を直に書かずに済むため**である。
+;;; ここに置いた理由(別ファイルにしなかった理由): アプリ専用の円盤(/app)から
+;;; 読まれるアプリは**ホスト共有の無い起動でも動かなければならない**ので、
+;;; 使えるのはカーネルへ同梱した層だけである。同梱されているのは
+;;; init.lisp と disassemble.lisp の 2 本だけ(tools/gen_embedded_lisp.py)。
+;;;
+;;; **「キーを 1 つ待つ」はここには無い。** 待つのは `read-char` そのものである。
+;;; 素の入力に入れておけば read-char が 1 打鍵で返る(C 側の
+;;; reader.c os_process_stdin_read_char に分岐がある)。むき出しの関数にすると
+;;; *standard-input* の差し替えを通らず、アプリを試験できなくなる。
+;;; だから term-read-key は**ストリームを引数で受け取る**形にしてある。
+
+;; 画面の行数・桁数。**起動時の解像度から決まる実行時の値**で、固定値ではない
+;; (framebuffer.c の cols = width / 8、rows = height / 16)。
+;; これが無かったので、ページャと inspect は頁の高さを自前の変数で持っていた
+(defun term-rows () (car (%%term-size)))
+(defun term-cols () (car (cdr (%%term-size))))
+
+;; カーソルを画面内の (row col) へ置く。置けたら t、範囲外なら nil。
+;; **範囲外を黙って捨てない。** 格子への書き込み(content_put)は捨てるが、
+;; それでは位置指定が効いたかどうかを呼び出し側が言えない
+(defun term-set-cursor (row col) (%%term-set-cursor row col))
+
+;; いま見えている 1 画面を、**格子と物理画面の両方**で消す。
+;; 片方だけでは戻ってくる(格子だけ消すと画面に残り、画面だけ塗ると
+;; 描き直しで復活する)
+(defun term-clear () (%%term-clear))
+
+;; 格子の 1 マスを読む。**これで画面の検査が初めて可能になる。**
+;; 位置指定が効いているかは、書いたマスを読み返すことでしか機械で確かめられない
+(defun term-read-cell (row col) (%%term-read-cell row col))
+
+;; 素の入力の入切。t で入れると、キーは画面へエコーされず、行の確定を待たずに
+;; 1 つずつ read-char で取れる。**返るのは切り替える前の状態**なので、
+;; アプリは終わりに元へ戻せる
+(defun term-raw-input (on) (%%term-raw-input on))
+
+;; 位置を指定して文字列を書く。`out` は出力ストリーム(皮が 1 回だけ
+;; (standard-output) を呼んで持ち回る)。
+;; **位置指定が効かなかったら何も書かない。** 書いてしまうと、指した場所と
+;; 違うところに出て、画面が静かに崩れる
+(defun term-write-at (row col str out)
+  (if (null (term-set-cursor row col))
+      nil
+    (let ((i 0) (n (length str)))
+      (while (< i n)
+        (write-char (elt str i) out)
+        (setq i (+ i 1)))
+      t)))
+
+;; キーを 1 つ受け取る。終端では nil を返す(eos-error-p を nil にしてある)。
+;; **ストリームを引数で受けるのが要点。** 文字列入力ストリームを渡せば、
+;; ゲストへキーを送る仕組みが無くてもアプリを試験できる
+(defun term-read-key (in) (read-char in nil nil))
+
+;; 変換表に無いキーの文字コード。**C 側(src/c/keymap.h)の値を書き写してある。**
+;;
+;; 引けない理由: 記号の名前から番地を引く仕組みが無く、C の定数を Lisp から
+;; 読む手段がどこにも無い(調査 refs §7)。だから**ずれたら気づく仕掛け**を
+;; C 側に置いた: test/c/keymap_test.c が値そのものを固定しているので、
+;; C 側を動かすと母艦の試験が落ちる。**値を変えるときは両方直すこと。**
+;;
+;; ESC / Tab / Delete は ASCII の定位置なので、ここには置かない
+;; (#\escape のような名前が無いので、必要なら (code-char 27) と書く)。
+(defglobal *key-up* (code-char 128))
+(defglobal *key-down* (code-char 129))
+(defglobal *key-left* (code-char 130))
+(defglobal *key-right* (code-char 131))
+(defglobal *key-home* (code-char 132))
+(defglobal *key-end* (code-char 133))
+(defglobal *key-page-up* (code-char 134))
+(defglobal *key-page-down* (code-char 135))
+(defglobal *key-insert* (code-char 136))
+
 ;;; --- miscellaneous (§30) ---
 (defun identity (obj) obj)
 

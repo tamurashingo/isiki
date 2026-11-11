@@ -103,6 +103,15 @@ jobs:
         timeout-minutes: 10
         run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_app_inspect.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_app_inspect.lisp
 
+      # [#216] 端末の土台(カーソル位置指定・1 マス読み・行数桁数・素の入力)。
+      # **完了条件が「試験を #204 の名簿に入れ(all と ci の両方)」なので、
+      # ここに段を置くこと自体が完了条件の一部である。**
+      # キー入力は要らない(キー 1 つ待ちは標準入力の差し替えで試験する)。
+      # ディスクも要らない(ホスト共有からアプリを読むだけ)
+      - name: "Run Lisp tests in QEMU (term: cursor placement, cell read, screen size, raw input)"
+        timeout-minutes: 10
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_term.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_term.lisp
+
       # [#204 / T3] **この周の段と件数を名簿と突き合わせる。**
       # 段がまるごと走らなくても、合否の一行が出ないだけで誰も気づかなかった(#208)。
       # 名簿は tools/check_test_count_ratchet.py の COUNTS 1 箇所。

@@ -176,13 +176,17 @@ static void content_scroll_up(frame_buffer *self) {
  * @param row 書き込む行(画面内)
  * @param c 書き込む文字
  */
+static UINT8 *content_screen_row(const frame_buffer *self, UINT32 row) {
+    /* 画面行 row に対応する論理行(view_offsetは書き込みには効かせない。
+       書き込みは常に最下部の1画面に対して行われる) */
+    return logical_row(self, self->count - self->rows + row);
+}
+
 static void content_put(frame_buffer *self, UINT32 col, UINT32 row, UINT8 c) {
     if (row >= self->rows || col >= self->cols) {
         return;
     }
-    /* 画面行 row に対応する論理行(view_offsetは書き込みには効かせない。
-       書き込みは常に最下部の1画面に対して行われる) */
-    logical_row(self, self->count - self->rows + row)[col] = c;
+    content_screen_row(self, row)[col] = c;
 }
 
 /* ============================== スクロールバック ============================== */
@@ -411,6 +415,82 @@ void switch_active_frame_buffer(UINT32 index) {
     }
     active_index = index;
     render_frame_buffer(&frame_buffers[index]);
+}
+
+/* ============================== 位置指定・読み出し・消去(#216) ============================== */
+
+/*
+ * [#216] 全画面を使うアプリの土台。**この 3 つがこの層に無かった。**
+ * 調査(logic §9-7/9-8/9-9)は「カーソルの位置を外から指定できない / 消去の手段が
+ * 外に無い / 格子の内容を読み返す手段が無い」と報告している。
+ *
+ * **3 つを同時に入れたのは、読み出しが無いと位置指定が効いていることを
+ * 機械で確かめられないからである**(規則 8 の陽性対照が置けない)。
+ * 範囲外の扱いは「黙って捨てる」ではなく**0 を返して呼び出し側に見せる**
+ * (content_put は黙って捨てる。framebuffer.c:180-182。同じ作りにすると
+ * Lisp 側の口が「効いたのか効かなかったのか」を言えなくなる)。
+ */
+
+int os_vbuf_set_cursor(frame_buffer *self, UINT32 row, UINT32 col) {
+    if (row >= self->rows || col >= self->cols) {
+        return 0;
+    }
+    /* さかのぼり中なら最下部へ戻す。カーソルは**表示窓の中の位置**であり
+       (framebuffer.h:29)、書き込みは常に最下部の 1 画面に対して行われるので、
+       さかのぼったまま位置を指定すると「指した場所」と「書かれる場所」が
+       食い違う。write_char が入口で同じことをしている(framebuffer.c:308-313) */
+    if (self->view_offset != 0) {
+        self->view_offset = 0;
+        if (is_active(self)) {
+            render_frame_buffer(self);
+        }
+    }
+    if (is_active(self)) {
+        erase_cursor(self);
+    }
+    self->cursor_position.x = col;
+    self->cursor_position.y = row;
+    if (is_active(self)) {
+        draw_cursor(self);
+    }
+    return 1;
+}
+
+int os_vbuf_cell(const frame_buffer *self, UINT32 row, UINT32 col, UINT8 *out_ch) {
+    if (row >= self->rows || col >= self->cols) {
+        return 0;
+    }
+    /* **書き込みと同じ行の対応を使う**(content_screen_row)。
+       os_vbuf_visible_row は view_offset を見る「いま見えている行」で、
+       さかのぼり中に読むと書いた場所と違う行が返る。
+       この口は「アプリが書いた格子を読み返す」ためのものなので、
+       書き込み側と同じ対応に揃えた */
+    *out_ch = content_screen_row(self, row)[col];
+    return 1;
+}
+
+void os_vbuf_clear(frame_buffer *self) {
+    /* **格子と物理画面の両方を空にする。** 片方だけでは戻ってくる:
+       clear_screen は物理ピクセルだけを塗るので、バッファを切り替えて戻ると
+       render_frame_buffer が格子から描き直して文字が復活する
+       (kernel.c:403-405 のコメントが同じ食い違いの危険を書いている)。
+       逆に格子だけ消すと画面には残る。
+
+       **履歴は消さない。** 消すのは「いま見えている 1 画面」であり、
+       さかのぼれる過去を捨てる口ではない */
+    self->view_offset = 0;
+    for (UINT32 row = 0; row < self->rows; row++) {
+        UINT8 *line = content_screen_row(self, row);
+        for (UINT32 col = 0; col < self->cols; col++) {
+            line[col] = 0;
+        }
+    }
+    self->cursor_position.x = 0;
+    self->cursor_position.y = 0;
+    if (is_active(self)) {
+        clear_screen(self);
+        draw_cursor(self);
+    }
 }
 
 UINT32 os_vbuf_effective_hist_rows(UINT32 height, UINT32 hist_rows) {

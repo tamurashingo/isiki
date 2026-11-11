@@ -7,6 +7,7 @@
 #include "block_device.h"
 #include "repl.h"
 #include "subprimitive.h"
+#include "terminal.h"
 #include "ide_subprimitive.h"
 #include "bench_subprimitive.h"
 #include "virtio9p.h"
@@ -416,6 +417,10 @@ void kernel_main(UINT64 fb_base, UINT32 fb_width, UINT32 fb_height, UINT32 fb_pi
     za_assert_slot_alignment();
     os_bootstrap();
     os_register_subprimitives();
+    /* [#216] 端末の下位の口。**os_bootstrap の外に置くことに意味がある**
+       (小さいヒープの試験は os_bootstrap しか呼ばないので、
+       SMALL_HEAP_SIZE の掃引し直しが要らない。terminal.h の注記) */
+    os_register_terminal_primitives();
     os_register_ide_subprimitives();
     os_register_mount_native_subprimitives();
     os_register_bench_subprimitives();
