@@ -41,16 +41,42 @@
 (defun isiki-test-elapsed ()
   (- (get-internal-real-time) *isiki-test-time-start*))
 
-;; 進捗を1行書いてフラッシュする。t=は開始からの経過tick、+=は直前のマークからの差分。
+;; 進捗を1行書いてフラッシュする実体。prefixは行の前置き("#at" か "#mark")。
+;; t=は開始からの経過tick、+=は直前のマークからの差分。
 ;; **フラッシュまでやること。** バッファに溜めたままだとハング時に消える。
-(defun isiki-test-mark (label)
+;;
+;; [#199 / #203 の穴] **前置きを引数で受け取るのが肝心。**
+;; 2026-11-11 まで、ファイルの読み込みの進捗(isiki-test-load)と、試験ファイルの
+;; 中から任意の地点につける印(isiki-test-mark)が、**どちらも同じ "#at" を
+;; 出していた**。検出器(tools/check_test_count_ratchet.py)は
+;; 「#at は isiki-test-load だけが出す」= **#at と #count は 1 対 1** という
+;; 不変条件(docs/investigation/detector-integrity.logic.md §B-2)に乗っていて、
+;; **#at があって #count が無ければ「そのファイルの途中で止まった」**と断定する。
+;; 素の印は #count を伴わないので、**印を 1 つ置くだけで CI が落ちた**(#199 の PR)。
+;;
+;; **ラベルの見た目(パスかどうか)で判定する形にはしない。**
+;; 「/ を含むから読み込み」のような判定はまた破れる(ラベルにパスを書いたら誤判定する)。
+;; **どちらの意味で呼んだかは呼び出し側しか知らないので、呼び出し側が前置きを渡す。**
+(defun %isiki-test-progress-line (prefix label)
   (if *isiki-test-progress*
       (let ((now (isiki-test-elapsed)))
-        (format *isiki-test-stream* "#at ~A t=~D += ~D~%"
-                label now (- now *isiki-test-mark-prev*))
+        (format *isiki-test-stream* "~A ~A t=~D += ~D~%"
+                prefix label now (- now *isiki-test-mark-prev*))
         (setq *isiki-test-mark-prev* now)
         (finish-output *isiki-test-stream*))
     nil))
+
+;; 試験ファイルを読み始めたことの進捗。**"#at" を出すのはこの 1 箇所だけ。**
+;; これが「#at と #count が 1 対 1」を成り立たせている
+;; (isiki-test-load からのみ呼ぶ)。
+(defun %isiki-test-mark-load (path)
+  (%isiki-test-progress-line "#at" path))
+
+;; 試験ファイルの中から任意の地点に印をつける(公開の仕組み)。
+;; **"#mark" を出す。** 検出器はこの行をファイルの読み込みとして扱わない。
+;; 件数には入らない(アサーションではない)ので、名簿の数字は動かない。
+(defun isiki-test-mark (label)
+  (%isiki-test-progress-line "#mark" label))
 
 ;; 試験ファイルを進捗マーカーつきでloadする。boot-entryスクリプトは
 ;; (load "test/lisp/xxx_test.lisp") の代わりにこれを使う。
@@ -86,7 +112,7 @@
 ;; 宣言を試すファイルも、**最後に打ち消せば除外は要らない。** 除外リストを
 ;; 作らなかったのは、リストに足すことで漏れを恒久化できてしまうからである。
 (defun isiki-test-load (path)
-  (isiki-test-mark path)
+  (%isiki-test-mark-load path)
   (isiki-audit-begin path)
   (let* ((before (%%current-inline))
          (before-count (+ *isiki-test-pass* *isiki-test-fail*))

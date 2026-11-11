@@ -241,7 +241,10 @@
 ;; **控え(FAT キャッシュ)の書き戻しまで済んでいないとここは 0 に見えない**
 ;; (fat16-fat-entry はキャッシュ経由でも読むので、下の再利用の確認と 2 つで見る)
 (assert-equal 0 (fat16-fat-entry *test-device* fat16-test-bpb fat16-test-shrink-freed))
-;; 印は件数に入らない進捗出力(test_framework.lisp の isiki-test-mark)。
+;; 印は件数に入らない進捗出力(test_framework.lisp の isiki-test-mark)で、
+;; ログには **#mark** の行として出る(ファイルの読み込みの #at とは別の前置き。
+;; 同じ前置きだった頃は、印を置くだけで名簿の検査が誤判定した。
+;; documents/test-count-census.md §4-b)。
 ;; **どこまで通ったかが記録に残る**ようにしておく(規則 1)
 (isiki-test-mark "199-fat16-shrink-freed-and-chain-1")
 

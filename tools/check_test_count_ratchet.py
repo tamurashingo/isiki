@@ -688,6 +688,24 @@ FILE_COUNT_RE = re.compile(r"^#count (\S+) (\d+)\s*$")
 # `#at` だけがあって `#count` が無いのは「そのファイルの途中で止まった」痕跡である
 # (調査 §9-4-7。**これを見る者がいなかった**)
 PROGRESS_RE = re.compile(r"^#at (\S+) t=")
+# **進捗の行の形をした行**の総当たり。`#at` と `#mark` の 2 種類だけが既知で、
+# **3 種類目が黙って素通りするのがいちばん悪い結果**なので、知らない前置きが
+# あったらその段を落とす(#204 の「読み取り方が未知の段があったら失敗する」と同じ趣旨)。
+#
+# [#199 / #203 の穴] 2026-11-11 まで、**ファイルの読み込みの進捗と、試験ファイルの
+# 中から任意の地点につける印が、どちらも `#at` を出していた**
+# (`isiki-test-load` が `isiki-test-mark` を呼んでいた)。上の 1 対 1 の不変条件は
+# 「`#at` は読み込みだけが出す」に乗っているので、**印を 1 つ置くだけで
+# 「読み始めて止まった」と誤判定した**(#199 の PR で実際に落ちた。
+# **この PR が印の最初の利用者だったので、それまで鳴らなかった**)。
+# 直したのは**出す側**で、素の印は `#mark` になった(test_framework.lisp の
+# `%isiki-test-progress-line`)。**ラベルの見た目で切り分けてはいない**
+# (パスらしいかどうかで判定すると、ラベルにパスを書いたときまた破れる)。
+PROGRESS_SHAPED_RE = re.compile(r"^#(\S+) (\S+) t=")
+# 読み込みの進捗 = `#at`、ただの印 = `#mark`。印はファイルの読み込みとして扱わない
+PROGRESS_KIND_LOAD = "at"
+PROGRESS_KIND_MARK = "mark"
+PROGRESS_KINDS_KNOWN = (PROGRESS_KIND_LOAD, PROGRESS_KIND_MARK)
 # `self-tally` の項目(名前つき)。上の SELF_CK_RE は数えるだけなので別に持つ
 SELF_CK_NAME_RE = re.compile(r"^#ck\s+(\S+)")
 # `no9p` の項目(名前つき)
@@ -843,12 +861,15 @@ READERS = {
 def read_file_items(reader, segment):
     """段の区間から**名前つき 1 件 1 行の証人**を取り出す。
 
-    返り値 (項目 {名前: 件数}, 進捗に名乗ったファイル集合, 重複した名前)。
+    返り値 (項目 {名前: 件数}, 進捗に名乗ったファイル集合, 重複した名前,
+    知らない前置きの進捗の行)。
     進捗の集合は `isiki` のときだけ中身がある(ほかの読み方に `#at` は無い)。
+    **`#mark`(ただの印)はファイルの読み込みではないので集合に入れない。**
     """
     items = {}
     dup = []
     progressed = set()
+    unknown_progress = []
     if reader == "isiki":
         for _lineno, line in segment:
             m = FILE_COUNT_RE.match(line)
@@ -858,10 +879,16 @@ def read_file_items(reader, segment):
                     dup.append(name)
                 items[name] = int(m.group(2))
                 continue
-            m = PROGRESS_RE.match(line)
+            m = PROGRESS_SHAPED_RE.match(line)
             if m:
-                progressed.add(m.group(1))
-        return items, progressed, dup
+                kind = m.group(1)
+                if kind == PROGRESS_KIND_LOAD:
+                    progressed.add(m.group(2))
+                elif kind == PROGRESS_KIND_MARK:
+                    pass
+                else:
+                    unknown_progress.append(line.rstrip("\n"))
+        return items, progressed, dup, unknown_progress
     name_re = SELF_CK_NAME_RE if reader == "self-tally" else NO9P_NAME_RE
     for _lineno, line in segment:
         m = name_re.search(line)
@@ -870,7 +897,7 @@ def read_file_items(reader, segment):
             if name in items:
                 dup.append(name)
             items[name] = items.get(name, 0) + 1
-    return items, progressed, dup
+    return items, progressed, dup, unknown_progress
 
 
 def judge_files(stage, reader, segment, actual_total):
@@ -888,7 +915,7 @@ def judge_files(stage, reader, segment, actual_total):
             "tools/check_test_count_ratchet.py の FILES に書くこと" % stage
         ]
     script_own, expected_items = entry
-    found, progressed, dup = read_file_items(reader, segment)
+    found, progressed, dup, unknown_progress = read_file_items(reader, segment)
     what = "ファイル" if reader == "isiki" else "項目"
 
     for name in dup:
@@ -950,6 +977,19 @@ def judge_files(stage, reader, segment, actual_total):
             ng.append(
                 "NG: 段 %s に名簿に無いファイルの進捗の行(#at %s)がある。"
                 "件数の行も無いので、読み始めて止まったか名簿が古い" % (stage, name)
+            )
+        # **知らない前置きの進捗の行は、黙って飛ばさずに落とす。**
+        # 既知は `#at`(ファイルの読み込み)と `#mark`(ただの印)の 2 種類だけ。
+        # 3 種類目が素通りすると、それが「読み込み」なのか「印」なのかを
+        # 機械が決められないまま上の 1 対 1 の判定が走る(#203 の穴がまさにそれ)。
+        for line in unknown_progress:
+            ng.append(
+                "NG: 段 %s に**知らない前置きの進捗の行**がある: %s。"
+                "既知は #at(isiki-test-load が出すファイルの読み込み)と "
+                "#mark(isiki-test-mark が出すただの印)の 2 種類だけである。"
+                "新しい種類を足したなら、この検出器の PROGRESS_KINDS_KNOWN にも足し、"
+                "**ファイルの読み込みとして数えるのかどうかを決めて書くこと**"
+                % (stage, line)
             )
 
     # --- 等式。**証人の無いアサーションを見つける者である** ---
@@ -2364,6 +2404,7 @@ def synth_log(
     drop_item=None,
     drop_item_fully=None,
     unwitnessed=None,
+    inject=None,
 ):
     """名簿どおりの 1 周のログを合成する。
 
@@ -2375,6 +2416,10 @@ def synth_log(
     drop_item        … (段, 項目)。件数の行だけ落とす(進捗の行は残る)
     drop_item_fully  … (段, 項目)。進捗の行も落とす
     unwitnessed      … (段, 件数)。証人の無いアサーションを合計にだけ足す
+    inject           … (段, [行...])。その段の中身へそのまま差し込む。
+                       **進捗の行の種類の対照に使う**(#mark / 知らない前置き)。
+                       件数には関係しない行を入れるためのつまみなので、
+                       合計の等式は動かない
     """
     lines = ["make[1]: Entering directory '/repo'\n"]
     for name, count, reader, rounds in COUNTS:
@@ -2385,6 +2430,8 @@ def synth_log(
             # **最後の項目**を動かす(どれでもよいが、固定しておくと対照が読める)
             item_delta = (FILES[name][1][-1][0], delta[1])
         lines.append(synth_stage_header(name, style))
+        if inject and inject[0] == name:
+            lines.extend(inject[1])
         lines.extend(
             synth_body(
                 name,
@@ -2446,6 +2493,46 @@ def self_test():
     check(
         "陽性 件数 +1 のとき次に書く数字(186)を出す",
         "COUNTS の \"%s\" を 186 に" % victim in ng_text(synth_log(ALL, delta=(victim, 1))),
+        True,
+    )
+
+    # --- [#199 / #203 の穴] 進捗の行の種類の対照 -----------------------------
+    #
+    # **この衝突は実際に CI を落とした。** ファイルの読み込みの進捗と、試験ファイルの
+    # 中から任意の地点につける印が、**どちらも `#at` を出していた**ので、
+    # 印を 1 つ置くだけで「名簿に無いファイルを読み始めて止まった」と誤判定した。
+    # 直したのは出す側(素の印は `#mark` になった)。ここはその対照である。
+
+    # 陰性対照: **`#mark` の行があっても鳴らない。** 印はファイルの読み込みではない。
+    # ラベルは #199 の PR が実際に使ったものをそのまま置く(見た目で判定していない
+    # ことの対照にもなる。パスらしいラベルでも読み込みとして数えてはいけない)
+    mark_lines = [
+        "#mark 199-fat16-freed-cluster-reused t=68 += 8\n",
+        "#mark test/lisp/looks-like-a-path.lisp t=70 += 2\n",
+    ]
+    check(
+        "陰性 #mark の行があっても鳴らない",
+        passes(synth_log(ALL, inject=(victim, mark_lines))),
+        True,
+    )
+
+    # 陽性対照: **知らない前置きの進捗の行があったら落ちる。**
+    # 3 種類目が黙って素通りするのがいちばん悪い(読み込みなのか印なのかを
+    # 機械が決められないまま 1 対 1 の判定が走る)
+    unknown_lines = ["#step 199-some-new-kind t=80 += 4\n"]
+    check(
+        "陽性 知らない前置きの進捗の行で落ちる",
+        passes(synth_log(ALL, inject=(victim, unknown_lines))),
+        False,
+    )
+    check(
+        "陽性 その理由を「知らない前置きの進捗の行」と言う",
+        "知らない前置きの進捗の行" in ng_text(synth_log(ALL, inject=(victim, unknown_lines))),
+        True,
+    )
+    check(
+        "陽性 その行をそのまま見せる",
+        "#step 199-some-new-kind t=80 += 4" in ng_text(synth_log(ALL, inject=(victim, unknown_lines))),
         True,
     )
 

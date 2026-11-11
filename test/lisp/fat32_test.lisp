@@ -224,7 +224,8 @@
 
 ;; 余った塊の FAT 項目が 0(未使用)に戻っている = 解放されている
 (assert-equal 0 (fat32-fat-entry *fat32-test-device* fat32-test-bpb fat32-test-shrink-freed))
-;; 印は件数に入らない進捗出力(規則 1。どこまで通ったかを記録に残す)
+;; 印は件数に入らない進捗出力(規則 1。どこまで通ったかを記録に残す)。
+;; ログには #mark の行として出る(documents/test-count-census.md §4-b)
 (isiki-test-mark "199-fat32-shrink-freed-and-chain-1")
 
 ;; 他のファイルが巻き込まれていないこと(二重使用があれば中身が壊れる)
