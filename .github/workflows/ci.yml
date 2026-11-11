@@ -112,6 +112,14 @@ jobs:
         timeout-minutes: 10
         run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_term.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_term.lisp
 
+      # [#217] 初期アプリ: ファイラ。**完了条件が「文字列入力ストリームを渡した
+      # 試験が CI で走る」なので、ここに段を置くこと自体が完了条件の一部である**
+      # (test-qemu-all だけでは足りない)。キー入力は要らない。
+      # アプリの円盤はどの QEMU 起動にも付くので QEMU_DISK_IMG の上書きは要らない
+      - name: "Run Lisp tests in QEMU (app: filer — list/move/enter/open with string streams and cell reads)"
+        timeout-minutes: 10
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_app_filer.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_app_filer.lisp
+
       # [#204 / T3] **この周の段と件数を名簿と突き合わせる。**
       # 段がまるごと走らなくても、合否の一行が出ないだけで誰も気づかなかった(#208)。
       # 名簿は tools/check_test_count_ratchet.py の COUNTS 1 箇所。
