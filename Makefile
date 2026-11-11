@@ -1191,6 +1191,27 @@ $(BOOT_FAT32_IMG): $(TARGET) $(SRC) $(HDR) | $(IMAGES_DIR)
 # 中身はホスト側で cp して焼き込む(既存の作法。PERF_READ_* と同じ理由で、
 # **ゲスト内で書いてから読む形にすると書き込みの遅さを踏む**)。
 # loop マウントは権限が要るのでこのルールも --privileged で docker run する。
+#
+# [#217] **ディレクトリ 1 つ($(APP_DISK_SUBDIR))を焼き込む。**
+# ファイラの完了条件に「ディレクトリに入る / 親へ戻る」があり、
+# **入れる先が 1 つも無いとそれを機械で確かめられない**(apps/*.lisp は平らに
+# 並ぶだけなのでディレクトリが存在しない)。
+#
+# ほかに 3 つの道があったが、どれも採らなかった:
+#   - **ゲスト内で mkdir する** … 円盤へ書くことになる。この 1 枚は
+#     **すべての QEMU 起動に付く共有のフィクスチャ**なので、書くと次の周の
+#     一覧が変わる(= 試験が前回の実行に依存する)。おまけに #199(上書き保存の
+#     壊れ)と同じ層を踏む
+#   - **tmp/fat32_test.img を使う**(SUBDIR/DEEPER を持っている) …
+#     test/lisp/fat32_test.lisp が**同じ円盤へ書く**(NEWDIR / BIGWR.TXT など)ので、
+#     一覧の期待値が「その段が先に走ったか」で変わる
+#   - **ディレクトリを読む口を差し替えられるようにする** … 試験のために
+#     アプリに継ぎ目を増やすことになる。実物の FAT を読む経路が試験から外れる
+#
+# **読むだけのフィクスチャなら、どの周でも同じものが見える。**
+# cp より**先**に作るのは、一覧の先頭(FAT の項目は作成順に並ぶ)に来るようにして、
+# 試験が「apps/*.lisp が増えても動かない位置」で入れるようにするためである。
+APP_DISK_SUBDIR = NOTES
 APP_DISK_IMG = $(IMAGES_DIR)/app_fat32.img
 APP_DISK_IMG_SIZE_MB = 40
 APP_LISP_SRC := $(wildcard apps/*.lisp)
@@ -1212,6 +1233,8 @@ $(APP_DISK_IMG): $(APP_LISP_SRC) | $(IMAGES_DIR)
 			mkfs.vfat -F 32 $@; \
 			mkdir -p /mnt/app_fat32; \
 			mount -o loop $@ /mnt/app_fat32; \
+			mkdir /mnt/app_fat32/$(APP_DISK_SUBDIR); \
+			printf "alpha\nbeta\n" > /mnt/app_fat32/$(APP_DISK_SUBDIR)/NOTE.TXT; \
 			cp $(APP_LISP_SRC) /mnt/app_fat32/; \
 			umount /mnt/app_fat32'
 
@@ -1455,6 +1478,14 @@ test-qemu-all:
 # **落ちたときに「土台か、アプリか」を段の順で切り分けられる**からである。
 # **CI でも走る**(ci.yml 側にも段がある。#216 の完了条件に
 # 「試験を #204 の名簿に入れ(all と ci の両方)」があるため)。
+#
+# [#217] **ファイラの段(qemu_boot_app_filer.lisp)は端末の土台の直後に置く。**
+# 要るものはページャ・inspect と同じ(アプリ専用の円盤だけ)で QEMU_DISK_IMG の
+# 上書きは要らず、順序の制約も無い。土台の**後**に置いたのは、ファイラが
+# #216 の口(位置指定・1 マス読み・素の入力)をすべて使う唯一のアプリで、
+# **落ちたときに「土台か、ファイラか」を段の順で切り分けられる**からである。
+# **CI でも走る**(ci.yml 側にも段がある。#217 の完了条件に
+# 「文字列入力ストリームを渡した試験が CI で走る」があるため)。
 test-qemu-all-stages:
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-no-embedded-init
@@ -1463,6 +1494,7 @@ test-qemu-all-stages:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_pager.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_inspect.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_term.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_filer.lisp
 	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
