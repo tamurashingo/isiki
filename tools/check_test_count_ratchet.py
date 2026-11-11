@@ -181,6 +181,9 @@ COUNTS = (
     # C 側の起動スモーク。**合否の一行が出ない唯一の段**で、`[no9p] ok` を数える
     ("test-qemu-no-9p-run", 8, "no9p", (ALL,)),
     ("test/lisp/qemu_boot_load_disk.lisp", 23, "isiki", (ALL,)),
+    # [#215] 初期アプリ: ページャ。**新しく足した段**(試験が増えた分で、
+    # 既存の段の件数は 1 つも動かしていない)。内訳は下の FILES に 2 本ある
+    ("test/lisp/qemu_boot_app_pager.lisp", 46, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_error_escape_gc.lisp", 378, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_m5_ide.lisp", 7, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 159, "isiki", (ALL, CI)),
@@ -375,6 +378,11 @@ FILES = {
     # test/lisp/qemu_boot_load_disk.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 23 件
     "test/lisp/qemu_boot_load_disk.lisp": (0, (
         ("test/lisp/load_disk_test.lisp", 21),
+    )),
+    # test/lisp/qemu_boot_app_pager.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 46 件
+    "test/lisp/qemu_boot_app_pager.lisp": (0, (
+        ("test/lisp/pager_app_disk_test.lisp", 14),
+        ("test/lisp/pager_test.lisp", 28),
     )),
     # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 378 件
     "test/lisp/qemu_boot_error_escape_gc.lisp": (4, (
@@ -1180,6 +1188,13 @@ WIRING_KINDS = {
 #   - `qemu_boot_diag_m12_host.lisp` は**元から走っていた。**
 #     数え上げの道具が起点を 2 種類しか見ていなかっただけである(= 誤検出)
 #
+# [2026-11-11 / #215] **3 本足した**(初期アプリ: ページャ)。
+#   - `test/lisp/qemu_boot_app_pager.lisp` …… `make test-qemu-all` と CI の両方へ
+#     段として足した(Makefile の test-qemu-all-stages と .github/workflows/ci.yml)
+#   - `test/lisp/pager_app_disk_test.lisp` / `test/lisp/pager_test.lisp` ……
+#     その段が `isiki-test-load` で読む
+# **既存の配線は 1 つも変えていない。**
+#
 WIRING = (
     ("test/bench/estimator_fixture.tsv", ("fixture:tools/bench/check_estimator.sh",)),
     ("test/c/clock_test.c", ("hostbuild:TEST_SRC_CLOCK",)),
@@ -1283,6 +1298,8 @@ WIRING = (
     ("test/lisp/load_gc_stress_fixture.lisp", ("loaded",)),
     ("test/lisp/load_gc_stress_test.lisp", ("loaded",)),
     ("test/lisp/nan_comparison_test.lisp", ("loaded",)),
+    ("test/lisp/pager_app_disk_test.lisp", ("loaded",)),
+    ("test/lisp/pager_test.lisp", ("loaded",)),
     ("test/lisp/partition_test.lisp", ("loaded",)),
     ("test/lisp/perf_fat16_test.lisp", ("loaded",)),
     ("test/lisp/perf_fat32_test.lisp", ("loaded",)),
@@ -1291,6 +1308,7 @@ WIRING = (
     ("test/lisp/qemu_boot_abi_bench.lisp", ("all",)),
     ("test/lisp/qemu_boot_alloc_audit.lisp", ("manual:test-qemu-alloc-audit",)),
     ("test/lisp/qemu_boot_alloc_breakdown.lisp", ("manual:test-qemu-alloc-breakdown",)),
+    ("test/lisp/qemu_boot_app_pager.lisp", ("all", "ci",)),
     ("test/lisp/qemu_boot_bench_construct.lisp", ("manual:test-qemu-bench-construct-check",)),
     ("test/lisp/qemu_boot_bench_interp.lisp", ("all",)),
     ("test/lisp/qemu_boot_bench_jit.lisp", ("all",)),

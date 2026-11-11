@@ -1420,11 +1420,18 @@ test-qemu-all:
 # **「消す」と決まっていた 4 本のうち 3 本は消さなかった。** 合否の項目が
 # 常時走る段で覆われていなかったからである(消すと検出器が減る)。
 # 1 本ごとの判断と根拠は documents/never-run-stages-decisions.md。
+#
+# [#215] **ページャの段(qemu_boot_app_pager.lisp)は load-disk の直後に置く。**
+# どちらもアプリ専用の円盤(APP_DISK_IMG。**どの起動にも付く**)しか要らないので
+# QEMU_DISK_IMG の上書きは要らず、順序の制約も無い。並べたのは
+# 「/app から読む」仲間を隣に置いて、片方が落ちたときに原因の切り分けを
+# 短くするためである。**CI でも走る**(ci.yml 側にも段がある)。
 test-qemu-all-stages:
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-no-embedded-init
 	$(MAKE) test-qemu-no-9p
 	$(MAKE) test-qemu-load-disk
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_pager.lisp
 	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img
