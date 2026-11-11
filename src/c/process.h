@@ -9,6 +9,18 @@
 /** 標準入力として蓄積できる最大バイト数 */
 #define PROCESS_STDIN_BUF_SIZE 256
 
+/** [#216] 素の入力で 1 キーずつ溜める受け皿の大きさ。
+ *
+ * **行の溜め場(stdin_buf)とは別に持つ。** 行の溜め場は「改行で確定する 1 行」
+ * 専用で、確定の印(ready)を合図に読み手が動く作りになっており、
+ * 1 キーずつ返す用途には使えない(調査 §12 の C 側 3 番目)。
+ *
+ * 16 で足りる: 素の入力を読むアプリは 1 打鍵ごとに描き直すので、
+ * 溜まるのは「描いている間に打たれたぶん」だけである。**溢れたら捨てる**
+ * (行の溜め場と同じ約束。ただしエコーしないので「画面には出たのに
+ * 入力に入っていない」という食い違いは起きない)。 */
+#define PROCESS_RAW_KEY_BUF_SIZE 16
+
 typedef enum {
     PROCESS_STATE_READY,
     PROCESS_STATE_RUNNING,
@@ -29,6 +41,24 @@ typedef struct _process {
 
     /** os_read の読取カーソル(stdin_buf内の未読み取り位置) */
     UINT32 read_pos;
+
+    /** [#216] 素の入力(raw)かどうか。1 ならキーボード割り込みは
+     * エコーせず、行の確定を待たず、読み切り待ちでキーを捨てず、
+     * raw_keys へ 1 キーずつ積む。
+     *
+     * **GC が触る値を増やしていない**(ここも下の受け皿も素のスカラである)。
+     * process_t は GC ヒープの外にある静的な配列なので、lisp_val_t を足すと
+     * 根の登録が要るが、この 4 つはどれもそうではない。
+     *
+     * 割り込みハンドラから非同期に書き換えられるので volatile を付ける */
+    volatile UINT32 raw_input;
+
+    /** 素の入力のときの 1 キーずつの受け皿(環状に使う) */
+    volatile UINT8 raw_keys[PROCESS_RAW_KEY_BUF_SIZE];
+    /** 次に読む位置 */
+    volatile UINT32 raw_head;
+    /** 次に書く位置。raw_head == raw_tail が「空」である */
+    volatile UINT32 raw_tail;
 
     /** 直前のEnterで1行が確定し、readerの消費を待っている状態かどうか。
      * キーボード割り込みハンドラから非同期に書き換えられ、os_wait_for_more_input の
@@ -139,6 +169,36 @@ void switch_active_process(UINT32 index);
  * @param c 積む文字
  */
 void process_stdin_push(process_t *proc, UINT8 c);
+
+/**
+ * [#216] 素の入力の受け皿へ 1 キー積む。満杯なら捨てる。
+ *
+ * **積んだら ready を立てる。** 素の入力でも読み手を起こす合図は
+ * 既存の os_wait_for_more_input(ready が立つまで hlt)を使い回す。
+ * 新しい待ち関数を足さないのは、それを足すと reader.c を
+ * リンクしている母艦の単体試験**全部**にダミー実装が要るからである
+ * (os_wait_for_more_input が 8 本の試験でそうなっている)。
+ *
+ * @param proc 対象プロセス
+ * @param code 積むキーの文字コード
+ */
+void process_raw_key_push(process_t *proc, UINT8 code);
+
+/**
+ * [#216] 素の入力の受け皿から 1 キー取り出す。
+ * @param proc 対象プロセス
+ * @param out_code 取り出したキーの格納先
+ * @return 取り出せたら 1、空なら 0
+ */
+int process_raw_key_pop(process_t *proc, UINT8 *out_code);
+
+/**
+ * [#216] 素の入力の入切を切り替える。
+ * @param proc 対象プロセス
+ * @param on 非 0 で素の入力にする
+ * @return 切り替える前の状態(1 なら素の入力だった)
+ */
+int process_set_raw_input(process_t *proc, int on);
 
 /**
  * PCB(TAG_INSTANCE, MAGIC_PROCESS)に保存されているsaved_rspを読み書きする。

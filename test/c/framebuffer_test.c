@@ -327,6 +327,157 @@ void test_wrapped_line_survives_buffer_switch(void) {
     assert(strcmp(before, after) == 0, "バッファを切り替えて戻っても内容が変わらない");
 }
 
+
+/* ---- 位置指定・読み出し・消去(#216) ----
+ *
+ * **3 つを同じ節で見るのは、読み出しが無いと位置指定が効いていることを
+ * 確かめられないからである**(規則 8 の陽性対照)。
+ * 「書いた場所を読み返したら同じ文字が返る」が陽性、
+ * 「置いていない場所は空白」「範囲外は 0 を返す」が陰性にあたる。 */
+
+void test_set_cursor_moves_where_the_next_char_lands(void) {
+    frame_buffer *fb = setup(640, 160, 20);   /* 80桁 x 10行 */
+
+    /* 【陽性対照】位置を指定して書いたら、その位置の格子から読み返せる */
+    assert(os_vbuf_set_cursor(fb, 3, 5) == 1, "画面内なら置ける");
+    assert(fb->cursor_position.y == 3, "行が入る");
+    assert(fb->cursor_position.x == 5, "桁が入る");
+    fb->write_char(fb, 'X');
+
+    UINT8 ch = 0;
+    assert(os_vbuf_cell(fb, 3, 5, &ch) == 1, "書いたマスは読める");
+    assert(ch == 'X', "書いた文字が返る");
+
+    /* 【陰性対照】隣は空白のまま。位置指定を無視して先頭に書いていたら
+       (0,0) に 'X' が入り、ここが崩れる */
+    assert(os_vbuf_cell(fb, 3, 4, &ch) == 1, "隣も読める");
+    assert(ch == 0, "書いていない桁は空白(0)");
+    assert(os_vbuf_cell(fb, 0, 0, &ch) == 1, "左上も読める");
+    assert(ch == 0, "左上には何も書かれていない");
+
+    /* 書いたあとカーソルは1つ進んでいる(write_char の約束は変えていない) */
+    assert(fb->cursor_position.x == 6, "書いたら桁が1つ進む");
+}
+
+void test_set_cursor_rejects_out_of_range(void) {
+    frame_buffer *fb = setup(640, 160, 20);   /* 80桁 x 10行 */
+    os_vbuf_set_cursor(fb, 2, 2);
+
+    /* 範囲外は 0 を返し、**カーソルを動かさない**。
+       content_put(framebuffer.c:180-182)は範囲外を黙って捨てるが、
+       この口は呼び出し側に見せる(そうしないと Lisp 側が
+       「効いたのか効かなかったのか」を言えない) */
+    assert(os_vbuf_set_cursor(fb, 10, 0) == 0, "行が画面行数以上なら置けない");
+    assert(os_vbuf_set_cursor(fb, 0, 80) == 0, "桁が桁数以上なら置けない");
+    assert(fb->cursor_position.y == 2, "失敗しても行は動かない");
+    assert(fb->cursor_position.x == 2, "失敗しても桁は動かない");
+
+    /* 端ちょうどは入る(境界の off-by-one) */
+    assert(os_vbuf_set_cursor(fb, 9, 79) == 1, "右下の端は置ける");
+}
+
+void test_cell_rejects_out_of_range(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+    UINT8 ch = 0xEE;
+    assert(os_vbuf_cell(fb, 10, 0, &ch) == 0, "行が範囲外なら読めない");
+    assert(ch == 0xEE, "読めなかったときは格納先に触らない");
+    assert(os_vbuf_cell(fb, 0, 80, &ch) == 0, "桁が範囲外なら読めない");
+    assert(ch == 0xEE, "こちらも触らない");
+}
+
+void test_cell_reads_the_page_that_writes_go_to(void) {
+    frame_buffer *fb = setup(640, 160, 20);   /* 80桁 x 10行、履歴20行 */
+    /* 履歴を進めてから書く。**書き込みと同じ行の対応で読めること**を見る
+       (os_vbuf_visible_row は view_offset を見るので、この口とは別物である) */
+    for (UINT32 i = 0; i < 15; i++) {
+        write_line(fb, "pad");
+    }
+    os_vbuf_set_cursor(fb, 4, 1);
+    fb->write_char(fb, 'Z');
+
+    UINT8 ch = 0;
+    assert(os_vbuf_cell(fb, 4, 1, &ch) == 1, "履歴が進んだあとでも読める");
+    assert(ch == 'Z', "書いた文字が返る");
+
+    /* さかのぼっても、読めるのは**書き込み先の1画面**である */
+    os_vbuf_scroll(-5);
+    assert(fb->view_offset == 5, "さかのぼっている");
+    ch = 0;
+    assert(os_vbuf_cell(fb, 4, 1, &ch) == 1, "さかのぼり中でも読める");
+    assert(ch == 'Z', "返るのは書き込み先の1画面の内容");
+    os_vbuf_scroll_to_bottom();
+}
+
+void test_set_cursor_snaps_back_to_bottom(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+    for (UINT32 i = 0; i < 15; i++) {
+        write_line(fb, "pad");
+    }
+    os_vbuf_scroll(-5);
+    assert(fb->view_offset == 5, "さかのぼっている");
+
+    /* さかのぼったまま位置を指定すると「指した場所」と「書かれる場所」が
+       食い違うので、入口で最下部へ戻す(write_char と同じ) */
+    assert(os_vbuf_set_cursor(fb, 1, 1) == 1, "置ける");
+    assert(fb->view_offset == 0, "位置指定は最下部へ戻してから置く");
+}
+
+void test_clear_empties_both_grid_and_screen(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+    write_line(fb, "hello");
+    write_line(fb, "world");
+
+    UINT8 ch = 0;
+    assert(os_vbuf_cell(fb, 0, 0, &ch) == 1 && ch == 'h', "消す前は文字がある");
+
+    os_vbuf_clear(fb);
+
+    /* **格子が空になっている。** 物理画面だけを塗る clear_screen と違い、
+       消したものが描き直しで戻ってこない(kernel.c の食い違いの危険) */
+    UINT32 nonblank = 0;
+    for (UINT32 row = 0; row < fb->rows; row++) {
+        for (UINT32 col = 0; col < fb->cols; col++) {
+            UINT8 c = 0xFF;
+            assert(os_vbuf_cell(fb, row, col, &c) == 1, "全マス読める");
+            if (c != 0) {
+                nonblank++;
+            }
+        }
+    }
+    assert(nonblank == 0, "消したあとは1マスも残らない");
+    assert(fb->cursor_position.x == 0, "カーソルは左上へ戻る");
+    assert(fb->cursor_position.y == 0, "カーソルは左上へ戻る(行)");
+    assert(fb->view_offset == 0, "さかのぼりは解除される");
+
+    /* 【陰性対照】消したのは「いま見えている1画面」だけで、**履歴は残る**。
+       count が縮んでいないことで見る(縮めていたら過去が捨てられている) */
+    assert(fb->count == fb->rows, "この時点の有効行数は画面1枚ぶん");
+
+    /* 消したあとも普通に書ける */
+    fb->write_char(fb, 'a');
+    ch = 0;
+    assert(os_vbuf_cell(fb, 0, 0, &ch) == 1 && ch == 'a', "消したあとは左上から書ける");
+}
+
+void test_clear_keeps_history(void) {
+    frame_buffer *fb = setup(640, 160, 20);   /* 10行、履歴20行 */
+    for (UINT32 i = 0; i < 15; i++) {
+        write_line(fb, "pad");
+    }
+    UINT32 count_before = fb->count;
+    os_vbuf_clear(fb);
+    assert(fb->count == count_before, "消しても履歴の行数は減らない");
+    assert(os_vbuf_max_view_offset(fb) == count_before - fb->rows, "さかのぼれる量も変わらない");
+    /* さかのぼれば過去がまだ見える(消したのは見えている1画面だけ)。
+       **1 行さかのぼったときの画面行 0** が、消した 1 画面の 1 つ手前の行である
+       (画面行 1〜9 は消した 1 画面の中に入るので空のまま。ここを間違えて
+       最下行で見ると「消えている」と読めてしまう) */
+    os_vbuf_scroll(-1);
+    expect_row(fb, 0, "pad", "1行さかのぼると消す前の行が見える");
+    expect_row(fb, 1, "", "消した1画面の中は空のまま");
+    os_vbuf_scroll_to_bottom();
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -346,6 +497,15 @@ int main(int argc, char **argv) {
     test_hist_rows_below_screen_is_raised();
     test_line_wraps_exactly_at_cols();
     test_wrapped_line_survives_buffer_switch();
+
+    /* [#216] 位置指定・読み出し・消去 */
+    test_set_cursor_moves_where_the_next_char_lands();
+    test_set_cursor_rejects_out_of_range();
+    test_cell_rejects_out_of_range();
+    test_cell_reads_the_page_that_writes_go_to();
+    test_set_cursor_snaps_back_to_bottom();
+    test_clear_empties_both_grid_and_screen();
+    test_clear_keeps_history();
 
     free(g_pixels);
     free(g_content);

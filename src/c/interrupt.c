@@ -8,6 +8,7 @@
 #include "lisp.h"
 
 #include "interrupt.h"
+#include "keymap.h"
 #include "za.h"
 
 
@@ -48,42 +49,6 @@ static struct gdt_ptr g_gdt_ptr;
 static struct idt_entry g_idt[256];
 /** lidt命令に渡すIDTポインタ */
 static struct idt_ptr g_idt_ptr;
-
-/** Shiftキーが押されている間は1になる */
-static volatile uint8_t key_shift_pressed = 0;
-
-/** スキャンコード→ASCII文字の変換テーブル(Shift未押下時) */
-static const char SCANCODE_NORMAL[128] = {
-    [0x02]='1', [0x03]='2', [0x04]='3', [0x05]='4', [0x06]='5',
-    [0x07]='6', [0x08]='7', [0x09]='8', [0x0A]='9', [0x0B]='0',
-    [0x0C]='-', [0x0D]='=', [0x0E]='\b',
-    [0x10]='q', [0x11]='w', [0x12]='e', [0x13]='r', [0x14]='t',
-    [0x15]='y', [0x16]='u', [0x17]='i', [0x18]='o', [0x19]='p',
-    [0x1A]='[', [0x1B]=']', [0x1C]='\n',
-    [0x1E]='a', [0x1F]='s', [0x20]='d', [0x21]='f', [0x22]='g',
-    [0x23]='h', [0x24]='j', [0x25]='k', [0x26]='l',
-    [0x27]=';', [0x28]='\'', [0x29]='`',
-    [0x2B]='\\', [0x2C]='z', [0x2D]='x', [0x2E]='c', [0x2F]='v',
-    [0x30]='b', [0x31]='n', [0x32]='m', [0x33]=',', [0x34]='.', [0x35]='/',
-    [0x39]=' ',
-};
-
-/** スキャンコード→ASCII文字の変換テーブル(Shift押下時) */
-static const char SCANCODE_SHIFT[128] = {
-    [0x02]='!', [0x03]='@', [0x04]='#', [0x05]='$', [0x06]='%',
-    [0x07]='^', [0x08]='&', [0x09]='*', [0x0A]='(', [0x0B]=')',
-    [0x0C]='_', [0x0D]='+', [0x0E]='\b',
-    [0x10]='Q', [0x11]='W', [0x12]='E', [0x13]='R', [0x14]='T',
-    [0x15]='Y', [0x16]='U', [0x17]='I', [0x18]='O', [0x19]='P',
-    [0x1A]='{', [0x1B]='}', [0x1C]='\n',
-    [0x1E]='A', [0x1F]='S', [0x20]='D', [0x21]='F', [0x22]='G',
-    [0x23]='H', [0x24]='J', [0x25]='K', [0x26]='L',
-    [0x27]=':', [0x28]='"', [0x29]='~',
-    [0x2B]='|', [0x2C]='Z', [0x2D]='X', [0x2E]='C', [0x2F]='V',
-    [0x30]='B', [0x31]='N', [0x32]='M', [0x33]='<', [0x34]='>', [0x35]='?',
-    [0x39]=' ',
-};
-
 
 /**
  * I/Oポートへ1バイト出力する
@@ -286,46 +251,35 @@ void os_wait_for_more_input(process_t *proc) {
 }
 
 /**
- * キーボード割り込みの本体処理。スキャンコードをASCII文字へ変換し、
- * カレントプロセスの標準入力へ積む(F1〜F4はプロセス切替えとして処理する)
+ * キーボード割り込みの本体処理の「皮」。**何をするかは keymap.c が決め、
+ * ここは効果を起こすだけ**である(#216)。
+ *
+ * 分けた理由: このファイルは GDT/IDT/TSS と手書きアセンブラを抱えているので
+ * 母艦の単体試験からリンクできない。だから判定を keymap.c へ移し、
+ * test/c/keymap_test.c が**キーの取り扱いを初めて試験できる**ようにした
+ * (調査 §9-15「キー入力の仕組みは全体が無試験」への答え)。
+ *
  * @param scancode PS/2キーボードから受け取ったスキャンコード
  */
 void c_keyboard_handler(uint8_t scancode) {
-    if (scancode == 0x2A || scancode == 0x36) {
-        key_shift_pressed = 1;
-        return;
-    }
-    if (scancode == 0xAA || scancode == 0xB6) {
-        key_shift_pressed = 0;
-        return;
-    }
-    if (scancode & 0x80) {
-        return;  // その他のBreakコードは無視
-    }
+    key_action_t act = os_keymap_decode(scancode);
 
-    if (scancode >= 0x3B && scancode <= 0x3E) {
-        // F1〜F4: アクティブなプロセスを切り替える(表示中の仮想バッファも同時に切り替わる)。
-        // view_offsetはバッファごとに保持しているので、ここでは触らない。
-        // **この判定を下の「任意のキーで最下部へ復帰」より先に置くこと。** 逆にすると
-        // 切り替えのたびに遡り位置がリセットされ、バッファごとの保持と矛盾する
-        switch_active_process(scancode - 0x3B);
-        return;
-    }
-
-    // Shift+PageUp / Shift+PageDown: 表示中のバッファをスクロールバックする。
-    // 0x49/0x51はSCANCODE_NORMAL/SHIFTがどちらも0で従来は無視されていたため、
-    // 既存の入力動作には影響しない。拡張キーの0xE0プレフィックスは上の
-    // `scancode & 0x80` で破棄済みなので、テンキーとナビゲーションキーの
-    // PgUp/PgDnは区別されない(この用途では問題にならない)
-    if (key_shift_pressed && (scancode == 0x49 || scancode == 0x51)) {
-        INT32 page = (INT32)os_vbuf_screen_rows();
-        os_vbuf_scroll(scancode == 0x49 ? -page : page);
-        return;
-    }
-
-    char c = key_shift_pressed ? SCANCODE_SHIFT[scancode] : SCANCODE_NORMAL[scancode];
-    if (c == 0) {
-        return;
+    switch (act.kind) {
+        case KEY_ACTION_NONE:
+        case KEY_ACTION_MODIFIER:
+            return;
+        case KEY_ACTION_SWITCH_PROCESS:
+            // アクティブなプロセスを切り替える(表示中の仮想バッファも同時に切り替わる)。
+            // view_offsetはバッファごとに保持しているので、ここでは触らない
+            switch_active_process(act.value);
+            return;
+        case KEY_ACTION_SCROLLBACK: {
+            INT32 page = (INT32)os_vbuf_screen_rows();
+            os_vbuf_scroll(act.value ? -page : page);
+            return;
+        }
+        case KEY_ACTION_CHAR:
+            break;
     }
 
     // 遡って表示している最中に何か打ったら最下部へ復帰する。
@@ -333,6 +287,18 @@ void c_keyboard_handler(uint8_t scancode) {
     os_vbuf_scroll_to_bottom();
 
     process_t *current = get_current_process();
+    UINT8 c = (UINT8)act.value;
+
+    if (current->raw_input) {
+        // [#216] **素の入力**。アプリが自分で描くので、ここでは
+        //   - 画面へエコーしない(アプリの表示を壊さない)
+        //   - 行の確定(改行)を待たない
+        //   - 「直前の行を読み切るまで捨てる」もしない
+        // の 3 つを飛ばし、1 キーずつの受け皿へ積むだけにする。
+        // 読み手を起こすのは process_raw_key_push の中(ready を立てる)
+        process_raw_key_push(current, c);
+        return;
+    }
 
     if (current->ready) {
         // 直前のEnterで確定した行をreaderが消費し切るまでは入力を無視する
@@ -350,8 +316,8 @@ void c_keyboard_handler(uint8_t scancode) {
     }
 
     frame_buffer *fb = current->stdout_buffer;
-    fb->write_char(fb, (UINT8)c);
-    process_stdin_push(current, (UINT8)c);
+    fb->write_char(fb, c);
+    process_stdin_push(current, c);
 }
 
 /** asm_keyboard_handlerから呼ばれるC本体。scancodeを読んでc_keyboard_handlerへ渡し、最後にEOIを送る */

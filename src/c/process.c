@@ -422,6 +422,11 @@ void initialize_processes(frame_buffer *buffers) {
         proc->stdin_len = 0;
         proc->read_pos = 0;
         proc->ready = 0;
+        /* [#216] 素の入力は切った状態から始める。**既定は従来どおりの行入力**で、
+           アプリが明示的に入れたときだけ 1 キーずつになる */
+        proc->raw_input = 0;
+        proc->raw_head = 0;
+        proc->raw_tail = 0;
         proc->env = 0;
         os_gc_register_root(&proc->env);
         proc->live_blocks = 0;
@@ -477,4 +482,59 @@ void process_stdin_push(process_t *proc, UINT8 c) {
     if (c == '\n') {
         proc->ready = 1;
     }
+}
+
+/**
+ * @brief [#216] 素の入力の受け皿へ 1 キー積む。満杯なら捨てる
+ * @param proc 対象プロセス
+ * @param code 積むキーの文字コード
+ */
+void process_raw_key_push(process_t *proc, UINT8 code) {
+    UINT32 next = (proc->raw_tail + 1) % PROCESS_RAW_KEY_BUF_SIZE;
+    if (next == proc->raw_head) {
+        /* 満杯。**捨てる。** 1 つ空けておく環なので、満杯の判定は
+           「書いたら読み位置に重なる」である(重ねると空と区別できない) */
+        return;
+    }
+    proc->raw_keys[proc->raw_tail] = code;
+    proc->raw_tail = next;
+    /* 読み手を起こす。素の入力では「行が確定した」ではなく
+       「1 キー届いた」の意味になる(process.h の注記) */
+    proc->ready = 1;
+}
+
+/**
+ * @brief [#216] 素の入力の受け皿から 1 キー取り出す
+ * @param proc 対象プロセス
+ * @param out_code 取り出したキーの格納先
+ * @return 取り出せたら 1、空なら 0
+ */
+int process_raw_key_pop(process_t *proc, UINT8 *out_code) {
+    if (proc->raw_head == proc->raw_tail) {
+        return 0;
+    }
+    *out_code = proc->raw_keys[proc->raw_head];
+    proc->raw_head = (proc->raw_head + 1) % PROCESS_RAW_KEY_BUF_SIZE;
+    return 1;
+}
+
+/**
+ * @brief [#216] 素の入力の入切を切り替える
+ *
+ * **入れるときに受け皿を空にする。** 行入力のときに打たれて溜まっていたものが
+ * アプリの最初の 1 打鍵として流れ込むと、アプリが勝手に動いて見える。
+ * 出るときは触らない(アプリが読み残したキーは行入力側へは流れない)。
+ *
+ * @param proc 対象プロセス
+ * @param on 非 0 で素の入力にする
+ * @return 切り替える前の状態
+ */
+int process_set_raw_input(process_t *proc, int on) {
+    int was = proc->raw_input != 0;
+    if (on) {
+        proc->raw_head = 0;
+        proc->raw_tail = 0;
+    }
+    proc->raw_input = on ? 1 : 0;
+    return was;
 }

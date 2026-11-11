@@ -986,6 +986,33 @@ lisp_val_t os_read_stream(os_stream_t *stream) {
 
 int os_process_stdin_read_char(char *out_ch) {
     process_t *proc = get_current_process();
+
+    if (proc->raw_input) {
+        /* [#216] **素の入力: 行の確定を待たず、1 キー届いたら返す。**
+         *
+         * ここに分岐を置くのが #216 の譲れない設計である。キー 1 つ待ちを
+         * 新しい「むき出しの関数」にすると、*standard-input* の差し替え
+         * (create-string-input-stream)を通らなくなり、**アプリを試験できない**
+         * (ゲストへキーを送る自動化は無い。調査 §9-15)。
+         * この関数はキーボード入力ストリームの読み口そのもの
+         * (stream_lisp.c の make_keyboard_input_stream が渡している)なので、
+         * ここに置けば read-char から素のキーが取れ、かつ試験では
+         * 文字列入力ストリームに差し替えられる。
+         *
+         * **ready を先に落としてから取り出す。** 逆順にすると、空と分かった後に
+         * 届いたキーの合図を消してしまい、次の打鍵まで眠り続ける(起こし漏れ) */
+        UINT8 code;
+        for (;;) {
+            proc->ready = 0;
+            if (process_raw_key_pop(proc, &code)) {
+                break;
+            }
+            os_wait_for_more_input(proc);
+        }
+        *out_ch = (char)code;
+        return 1;
+    }
+
     ensure_data(proc);
     if (proc->read_pos >= proc->stdin_len) {
         return 0;

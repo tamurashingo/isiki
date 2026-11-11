@@ -76,7 +76,7 @@ INIT_LISP_EMBED_SRC := $(shell python3 tools/gen_embedded_lisp.py --print-inputs
 ifeq ($(strip $(INIT_LISP_EMBED_SRC)),)
 $(error 同梱対象の一覧が取れなかった: python3 tools/gen_embedded_lisp.py --print-inputs を確認すること)
 endif
-SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_symtab.c $(SRCDIR)/disasm_symtab_lookup.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED) $(INIT_LISP_SRC)
+SRC = $(SRCDIR)/main.c $(SRCDIR)/kernel.c $(SRCDIR)/interrupt.c $(SRCDIR)/keymap.c $(SRCDIR)/framebuffer.c $(SRCDIR)/process.c $(SRCDIR)/runtime.c $(SRCDIR)/lisp.c $(SRCDIR)/reader.c $(SRCDIR)/za.c $(SRCDIR)/disasm.c $(SRCDIR)/disasm_symtab.c $(SRCDIR)/disasm_symtab_lookup.c $(SRCDIR)/disasm_lisp.c $(SRCDIR)/eval.c $(SRCDIR)/print.c $(SRCDIR)/repl.c $(SRCDIR)/subprimitive.c $(SRCDIR)/terminal.c $(SRCDIR)/drivers/pci.c $(SRCDIR)/drivers/virtio.c $(SRCDIR)/drivers/virtqueue.c $(SRCDIR)/drivers/ide.c $(SRCDIR)/block_device.c $(SRCDIR)/ide_subprimitive.c $(SRCDIR)/bench_subprimitive.c $(SRCDIR)/p9.c $(SRCDIR)/transport_virtio9p.c $(SRCDIR)/virtio9p.c $(SRCDIR)/stream.c $(SRCDIR)/stream_lisp.c $(SRCDIR)/mount.c $(SRCDIR)/format.c $(SRCDIR)/load.c $(SRCDIR)/clock.c $(LISP_COMPILED) $(INIT_LISP_SRC)
 # $(TARGET) の依存には生成物(disasm_symtab.c)を含めない。含めると自分が作る
 # ファイルに依存して毎回作り直しになる
 SRC_NO_SYMTAB = $(filter-out $(SRCDIR)/disasm_symtab.c,$(SRC))
@@ -229,6 +229,13 @@ TEST_BIN_IDE = $(BUILD_TMPDIR)/ide_test
 # 単体でリンクできる。履歴リングと表示窓の境界条件を検証する
 TEST_SRC_FRAMEBUFFER = $(SRCDIR)/framebuffer.c $(TESTDIR)/framebuffer_test.c
 TEST_BIN_FRAMEBUFFER = $(BUILD_TMPDIR)/framebuffer_test
+
+# [#216] keymap.cはハードウェアに触らない「キーの判定だけ」なので、
+# framebuffer.c と同じく単体でリンクできる。**interrupt.c はリンクしない**
+# (GDT/IDT/TSS と手書きアセンブラを抱えていて母艦では動かない)。
+# これがキーの取り扱いに初めて付いた試験である(それまで 0 件)
+TEST_SRC_KEYMAP = $(SRCDIR)/keymap.c $(TESTDIR)/keymap_test.c
+TEST_BIN_KEYMAP = $(BUILD_TMPDIR)/keymap_test
 
 # disasm.cはランタイムに依存しない純粋なデコーダ(Lispからの入口はdisasm_lisp.c側)
 # なので、stream_testと同じく単体でリンクしてバイト列を直接食わせて検証できる
@@ -770,7 +777,7 @@ check-small-heap-knob: | $(BUILD_TMPDIR)
 		exit 1; \
 	fi
 
-test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-test-file-wiring check-test-file-wiring-self-test check-pass-line check-pass-line-self-test check-load-abort-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(HDR) | $(BUILD_TMPDIR)
+test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-defdynamic-safe-self-test check-no-double-init-load check-no-double-init-load-self-test check-embedded-lisp-src check-embedded-lisp-src-self-test check-eval-error-budget check-eval-error-budget-self-test check-test-count-ratchet-self-test check-test-count-witness check-test-file-wiring check-test-file-wiring-self-test check-pass-line check-pass-line-self-test check-load-abort-line-self-test check-bench-jit-sync check-estimator check-jit-bail-lines check-pr-claims-self-test aot-identity-self-test jit-identity-self-test jit-reorder-self-test check-frame-access-entries check-frame-access-entries-self-test check-qemu-retry-self-test $(TEST_SRC_RUNTIME) $(TEST_SRC_LISP) $(TEST_SRC_PROCESS) $(TEST_SRC_READER) $(TEST_SRC_EVAL) $(TEST_SRC_PRINT) $(TEST_SRC_REPL) $(TEST_SRC_SUBPRIMITIVE) $(TEST_SRC_SCRIPT) $(TEST_SRC_STREAM) $(TEST_SRC_LOAD) $(TEST_SRC_STREAM_LISP) $(TEST_SRC_FORMAT) $(TEST_SRC_P9) $(TEST_SRC_VIRTIO9P) $(TEST_SRC_CLOCK) $(TEST_SRC_LISP_COMPILED) $(TEST_SRC_IDE) $(TEST_SRC_MOUNT) $(TEST_SRC_DISASM) $(TEST_SRC_FRAMEBUFFER) $(TEST_SRC_KEYMAP) $(HDR) | $(BUILD_TMPDIR)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
 		-std=c11 -Wall -Wextra \
 		-DISIKIOS_UNIT_TEST $(ALIGN_AUDIT_FLAGS) $(SMALL_HEAP_FLAGS) $(HEAP_EXHAUSTION_FLAGS) \
@@ -876,6 +883,11 @@ test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-
 		-DISIKIOS_UNIT_TEST \
 		-I$(SRCDIR) \
 		-o $(TEST_BIN_FRAMEBUFFER) $(TEST_SRC_FRAMEBUFFER)
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint gcc -v "$(PWD)":/workspace isiki-builder \
+		-std=c11 -Wall -Wextra \
+		-DISIKIOS_UNIT_TEST \
+		-I$(SRCDIR) \
+		-o $(TEST_BIN_KEYMAP) $(TEST_SRC_KEYMAP)
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_RUNTIME) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_LISP) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_PROCESS) -v "$(PWD)":/workspace isiki-builder
@@ -897,6 +909,7 @@ test: check-macro-order check-macro-order-self-test check-defdynamic-safe check-
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_MOUNT) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_DISASM) -v "$(PWD)":/workspace isiki-builder
 	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_FRAMEBUFFER) -v "$(PWD)":/workspace isiki-builder
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint /workspace/$(TEST_BIN_KEYMAP) -v "$(PWD)":/workspace isiki-builder
 
 clean:
 	rm -rf esp_dir $(BUILD_TMPDIR) $(IMAGES_DIR)
@@ -1434,6 +1447,14 @@ test-qemu-all:
 # 切り分けを短くするためである。**CI でも走る**(ci.yml 側にも段がある。
 # #214 の完了条件が「文字列入力ストリームを渡した試験が CI で走る」なので、
 # test-qemu-all だけでは足りない)。
+#
+# [#216] **端末の土台の段(qemu_boot_term.lisp)は inspect の直後に置く。**
+# 要るのはホスト共有だけ(アプリ専用の円盤も使わない)で QEMU_DISK_IMG の
+# 上書きは要らず、順序の制約も無い。並べたのは、この段が
+# 「ページャ・inspect が使う土台」を見ているので、その 2 つの隣にあると
+# **落ちたときに「土台か、アプリか」を段の順で切り分けられる**からである。
+# **CI でも走る**(ci.yml 側にも段がある。#216 の完了条件に
+# 「試験を #204 の名簿に入れ(all と ci の両方)」があるため)。
 test-qemu-all-stages:
 	$(MAKE) test-qemu
 	$(MAKE) test-qemu-no-embedded-init
@@ -1441,6 +1462,7 @@ test-qemu-all-stages:
 	$(MAKE) test-qemu-load-disk
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_pager.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_inspect.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_term.lisp
 	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img

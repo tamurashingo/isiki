@@ -174,6 +174,103 @@ void test_process_stdin_push_sets_ready_on_newline() {
     assert(current->ready == 1, "改行を積むとreadyが立つ");
 }
 
+/* ---- 素の入力の受け皿(#216) ----
+ *
+ * **行の溜め場とは別に持つ。** 行の溜め場は改行で確定する 1 行専用で、
+ * 1 キーずつ返す用途には使えない(調査 §12 の C 側 3 番目)。
+ * ここで見るのは「順に出る」「空なら 0」「溢れたら捨てる」「積むと起きる合図が立つ」
+ * の 4 つで、どれも割り込みハンドラ側が依存している性質である。 */
+
+void test_process_raw_key_ring() {
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+    UINT8 code = 0xEE;
+
+    assert(current->raw_input == 0, "素の入力は既定で切れている(従来どおりの行入力)");
+    assert(process_raw_key_pop(current, &code) == 0, "空なら取り出せない");
+    assert(code == 0xEE, "取り出せなかったときは格納先に触らない");
+
+    process_raw_key_push(current, 'a');
+    process_raw_key_push(current, 'b');
+    assert(process_raw_key_pop(current, &code) == 1, "積んだぶんは取り出せる");
+    assert(code == 'a', "積んだ順に出る(1つめ)");
+    assert(process_raw_key_pop(current, &code) == 1, "2つめも取り出せる");
+    assert(code == 'b', "積んだ順に出る(2つめ)");
+    assert(process_raw_key_pop(current, &code) == 0, "全部出したら空に戻る");
+}
+
+void test_process_raw_key_push_sets_ready() {
+    /* **積んだら ready を立てる。** 素の入力でも読み手を起こす合図は
+       既存の os_wait_for_more_input(ready を待つ)を使い回している。
+       立てなければ、キーが届いても読み手が眠り続ける */
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+
+    assert(current->ready == 0, "初期状態では合図は立っていない");
+    process_raw_key_push(current, 'x');
+    assert(current->ready == 1, "1キー積んだだけで合図が立つ(改行を待たない)");
+}
+
+void test_process_raw_key_ring_drops_when_full() {
+    /* 溢れたら捨てる。**エコーしないので「画面には出たのに入力に入っていない」
+       という食い違いは起きない**(行入力側の問題。調査 §9-5) */
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+
+    for (UINT32 i = 0; i < PROCESS_RAW_KEY_BUF_SIZE + 10; i++) {
+        process_raw_key_push(current, (UINT8)('0' + (i % 10)));
+    }
+    /* 1 つ空けておく環なので、保持できるのは BUF_SIZE - 1 個である */
+    UINT32 got = 0;
+    UINT8 code;
+    while (process_raw_key_pop(current, &code)) {
+        got++;
+    }
+    assert(got == PROCESS_RAW_KEY_BUF_SIZE - 1, "受け皿に収まるぶんだけ残り、残りは捨てられる");
+}
+
+void test_process_raw_key_ring_wraps() {
+    /* 環が一周しても順序が崩れないこと(読み書きを交互にする) */
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+    UINT8 code;
+
+    for (UINT32 i = 0; i < PROCESS_RAW_KEY_BUF_SIZE * 3; i++) {
+        process_raw_key_push(current, (UINT8)i);
+        assert(process_raw_key_pop(current, &code) == 1, "積んだらすぐ取り出せる");
+        assert(code == (UINT8)i, "一周しても積んだ値がそのまま出る");
+    }
+}
+
+void test_process_set_raw_input() {
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+
+    assert(process_set_raw_input(current, 1) == 0, "切り替える前の状態を返す(切れていた)");
+    assert(current->raw_input == 1, "素の入力に入った");
+    assert(process_set_raw_input(current, 1) == 1, "すでに入っていれば1を返す");
+    assert(process_set_raw_input(current, 0) == 1, "切るときも前の状態を返す");
+    assert(current->raw_input == 0, "素の入力から出た");
+}
+
+void test_set_raw_input_empties_the_ring_on_entry() {
+    /* **入れるときに受け皿を空にする。** 行入力のときに打たれて溜まっていたものが
+       アプリの最初の 1 打鍵として流れ込むと、アプリが勝手に動いて見える */
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+    UINT8 code;
+
+    process_raw_key_push(current, 'q');
+    process_set_raw_input(current, 1);
+    assert(process_raw_key_pop(current, &code) == 0, "素の入力に入ると古いキーは残っていない");
+
+    /* 出るときは触らない(アプリが読み残したキーは行入力側へは流れない) */
+    process_raw_key_push(current, 'z');
+    process_set_raw_input(current, 0);
+    assert(process_raw_key_pop(current, &code) == 1, "出るときは受け皿を空にしない");
+    assert(code == 'z', "残っているのは積んだキー");
+}
+
 void test_os_process_saved_rsp_get_set() {
     lisp_val_t pcb = os_make_instance(MAGIC_PROCESS, os_make_fixnum(0), 0, g_sym_process_ready);
     assert(os_process_get_saved_rsp(pcb) == 0, "初期状態のsaved_rspは0");
@@ -192,6 +289,14 @@ int main(int argc, char** argv) {
     test_switch_active_process();
     test_process_stdin_push();
     test_process_stdin_push_sets_ready_on_newline();
+
+    /* [#216] 素の入力の受け皿 */
+    test_process_raw_key_ring();
+    test_process_raw_key_push_sets_ready();
+    test_process_raw_key_ring_drops_when_full();
+    test_process_raw_key_ring_wraps();
+    test_process_set_raw_input();
+    test_set_raw_input_empties_the_ring_on_entry();
     test_os_process_saved_rsp_get_set();
 
     return g_test_failed ? 1 : 0;

@@ -203,5 +203,36 @@ int os_vbuf_scroll_to_bottom(void);
  */
 UINT32 os_vbuf_screen_rows(void);
 
+/* [#216] 全画面を使うアプリの土台。この 3 つがこの層に無かった(調査 §9-7/9-8/9-9)。
+ * **範囲外は黙って捨てずに 0 を返す。** content_put(:180-182)は捨てるが、
+ * それでは位置指定が効いたかどうかを呼び出し側が言えない。 */
+
+/**
+ * カーソルを画面内の (row, col) へ置く。さかのぼり中なら最下部へ戻してから置く。
+ * @param self frame buffer
+ * @param row 画面内の行(0〜rows-1)
+ * @param col 画面内の桁(0〜cols-1)
+ * @return 置けたら1、範囲外なら0(何もしない)
+ */
+int os_vbuf_set_cursor(frame_buffer *self, UINT32 row, UINT32 col);
+
+/**
+ * 画面内の (row, col) の格子の内容を読む。**書き込みと同じ行の対応を使う**
+ * (os_vbuf_visible_row と違い view_offset を見ない)。
+ * @param self frame buffer
+ * @param row 画面内の行(0〜rows-1)
+ * @param col 画面内の桁(0〜cols-1)
+ * @param out_ch 読んだ文字の格納先(空白は0)
+ * @return 読めたら1、範囲外なら0(out_chには触らない)
+ */
+int os_vbuf_cell(const frame_buffer *self, UINT32 row, UINT32 col, UINT8 *out_ch);
+
+/**
+ * いま見えている1画面ぶんを、**格子と物理画面の両方**で空にし、
+ * カーソルを左上へ戻す。履歴は消さない。
+ * @param self frame buffer
+ */
+void os_vbuf_clear(frame_buffer *self);
+
 
 #endif /* _FRAMEBUFFER_H_ */
