@@ -837,6 +837,12 @@
                 (if (not ok)
                     nil
                     (progn
+                      ;; [#199 と一緒に検討した] ここは **max のままにする**
+                      ;; (理由は src/lisp/fat16.lisp の同じ場所のコメント。
+                      ;; write-from! は位置指定の書き込みなので、書いた範囲より
+                      ;; 後ろを捨ててはいけない)。**大きさを縮めたいときは
+                      ;; fat32-write-file(縮小は%fat32-shrink-file)を使う** =
+                      ;; open-output-file / write-vector-to-file。
                       (setq new-size (if (> end-offset (slot-value node 'size)) end-offset (slot-value node 'size)))
                       (set-slot-value node 'size new-size)
                       (set-slot-value node 'last-cluster-index nil)
@@ -1118,15 +1124,75 @@
     (%fat32-patch-bytes! dir-bytes (+ dir-offset 28) (%fat32-u32-to-bytes new-size))
     (write-sector device dir-lba dir-bytes)))
 
+;;; --- #199: クラスタ数が減る上書き(縮小) ---
+;;
+;; FAT16 側(%fat16-shrink-file)と同じ欠落が FAT32 にもあった
+;; (cond 末尾が (t nil))。**差は無いので両方に同じ形で入れる。**
+;; 違うのは終端マーカー(#x0FFFFFFF)と、エントリが 4 バイトであることだけ。
+;; 順番の理由は %fat16-shrink-file の長いコメントを参照(札を先に書き換え、
+;; それから鎖を切り、最後に余りを解放して控えを書き戻す)。
+
+;; (%fat32-chain-nthcdr chain n) : chain(fat32-cluster-chain の戻り値)の n 要素目
+;; 以降のセルを返す。n が chain の長さ以上なら nil。クラスタ数に比例して深くなる
+;; ため Lisp 再帰ではなく while で辿る。
+(defun %fat32-chain-nthcdr (chain n)
+  (let ((cell chain) (i 0))
+    (while (and cell (< i n))
+      (setq cell (cdr cell))
+      (setq i (+ i 1)))
+    cell))
+
+;; (%fat32-free-cluster-list device bpb clusters) : clusters の各クラスタの FAT
+;; エントリを 0(未使用)へ戻す。1 つでも失敗したら中断して nil、全部成功で t。
+;; 円盤へ出るのは呼び出し元が %fat32-flush-fat-cache を呼んだ時点
+;; (%fat32-set-fat-entry は控えへ溜めるだけ)。
+(defun %fat32-free-cluster-list (device bpb clusters)
+  (let ((cell clusters) (ok t))
+    (while (and ok cell)
+      (if (%fat32-set-fat-entry device bpb (car cell) 0)
+          (setq cell (cdr cell))
+          (setq ok nil)))
+    ok))
+
+;; (%fat32-shrink-file device bpb dir-lba dir-bytes dir-offset start-cluster
+;;  current-cluster-count required-cluster-count bytes) : %fat16-shrink-file の
+;; FAT32 版。段取りと順番の理由はそちらのコメントを参照
+;; (1 データ → 2 札 → 3 鎖を切る → 4 余りを解放 → 5 控えを書き戻す)。
+;; 呼び出し元は required-cluster-count < current-cluster-count を保証する前提。
+(defun %fat32-shrink-file (device bpb dir-lba dir-bytes dir-offset start-cluster current-cluster-count required-cluster-count bytes)
+  (let* ((chain (fat32-cluster-chain device bpb start-cluster))
+         (keep-last (if (= required-cluster-count 0)
+                        nil
+                        (car (%fat32-chain-nthcdr chain (- required-cluster-count 1)))))
+         (surplus (%fat32-chain-nthcdr chain required-cluster-count))
+         (new-start-cluster (if (= required-cluster-count 0) 0 start-cluster)))
+    ;; 壊れた表の上で解放を走らせないための門(FAT16 側と同じ)
+    (if (or (not (= (length chain) current-cluster-count))
+            (null surplus)
+            (and (> required-cluster-count 0) (null keep-last)))
+        nil
+        (if (not (%fat32-write-file-data device bpb start-cluster bytes))
+            nil
+            ;; 札を先に書き換える(逆順だと同じ塊を 2 つのファイルが指す表ができる)
+            (if (not (%fat32-finish-directory-update device dir-lba dir-bytes dir-offset
+                       new-start-cluster (length bytes)))
+                nil
+                (if (and (> required-cluster-count 0)
+                         (not (%fat32-set-fat-entry device bpb keep-last #x0FFFFFFF)))
+                    nil
+                    (if (not (%fat32-free-cluster-list device bpb surplus))
+                        nil
+                        (%fat32-flush-fat-cache device bpb))))))))
+
 ;; (fat32-write-file device path bytes) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"
 ;; のような多階層パス)の既存ファイルへbytes(fixnum 0-255のgeneral-vector、
 ;; [ファイルI/O]#46(M3)でconsリストから変更)を上書きする。
 ;; 必要クラスタ数が現在のクラスタ数と同じ場合はFAT32-M6aの経路(データ→sizeフィールド
 ;; のみ更新)、必要クラスタ数が増える場合はFAT32-M6bの経路(新規クラスタ確保・FAT
 ;; チェイン延長→データ→start-cluster/sizeフィールド更新)で書き込む。必要クラスタ数
-;; が減る場合(縮小)は対象外としてnilを返し、既存データ/ディレクトリエントリは
-;; 変更しない。パスが解決できない・エントリが見つからない・各段階の書き込みに失敗
-;; した場合もnil、成功時はt。
+;; が減る場合(縮小)は%fat32-shrink-file([#199])で余ったクラスタを解放する
+;; (2026-11-11 までは対象外でnilを返していた)。パスが解決できない・エントリが
+;; 見つからない・各段階の書き込みに失敗した場合もnil、成功時はt。
 (defun fat32-write-file (device path bytes)
   (let* ((bpb (fat32-read-bpb device)))
     (if (null bpb)
@@ -1159,7 +1225,10 @@
                            (if (null new-start-cluster)
                                nil
                                (%fat32-finish-directory-update device dir-lba dir-bytes dir-offset new-start-cluster (length bytes)))))
-                        (t nil))))))))))
+                        ;; [#199] 必要クラスタ数が減る場合(縮小)。以前はここが
+                        ;; (t nil) で、**何もせず nil を返していた**(FAT16 と同じ欠落)。
+                        (t (%fat32-shrink-file device bpb dir-lba dir-bytes dir-offset
+                             start-cluster current-cluster-count required-cluster-count bytes)))))))))))
 
 ;;; --- FAT32-M6c: 新規ファイル作成 ---
 

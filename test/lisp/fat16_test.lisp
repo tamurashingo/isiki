@@ -189,12 +189,82 @@
                      (list "SUBDIR" ':dir 0))
               (fat16-read-dir *test-device* "/"))
 
-;; クラスタ数が減る書き込み(縮小)はFAT16-M6bの対象外としてnilを返す(現在2
-;; クラスタ確保済みのWRITE1.TXTへ、1クラスタで収まる10byteを書こうとする)。
-(assert-equal nil (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-new))
+;;; --- [#199] クラスタ数が減る書き込み(縮小) ---
+;;
+;; **期待値を nil から t へ変えた。理由をここに書く(規則 16)。**
+;;
+;; 2026-11-11 まで、この行は
+;;     (assert-equal nil (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-new))
+;; だった。「クラスタ数が減る書き込みは FAT16-M6b の対象外」という**実装の欠落を、
+;; 仕様として固定していた**。
+;;
+;; **欠陥だったと分かったのは #199 の調査で。** 書き込み用に開く操作
+;; (open-output-file)は「中身を空にする」を**空ベクタでの全体書き換え**で表現
+;; しているので、中身のある既存ファイルは必ずこの枝に落ちる。つまりこの 1 行が
+;; 「**既存ファイルを上書き保存できない**」= 利用者のデータを保存できない状態を
+;; 固定していた(`docs/investigation/fat-overwrite.logic.md` / `.refs.md`)。
+;; 解放の処理は FAT16/FAT32 のどちらにも 1 件も無かった。
+;;
+;; → %fat16-shrink-file を入れて**縮小は成功する**ようになったので、期待値は t。
+;;   「変更されていないこと」を見ていた直後の 2 行も、**縮んでいること**を
+;;   見る側へ変えた。
 
-;; 直前の(クラスタ数減少で失敗した)呼び出しでデータ/ディレクトリエントリが
-;; 変更されていないことを確認する
+;; 縮小前の鎖を控えておく(あとで「どの塊が解放されたか」を名指しするため)
+(defglobal fat16-test-shrink-node-before (%fat16-test-resolve-node *test-device* "/WRITE1.TXT"))
+(defglobal fat16-test-shrink-chain-before
+  (fat16-cluster-chain *test-device* fat16-test-bpb (slot-value fat16-test-shrink-node-before 'start-cluster)))
+(assert-equal 2 (length fat16-test-shrink-chain-before))
+;; 2 つ目の塊がこれから余る側
+(defglobal fat16-test-shrink-freed (car (cdr fat16-test-shrink-chain-before)))
+
+;; 2 クラスタ確保済みの WRITE1.TXT へ、1 クラスタで収まる 10byte を書く
+(assert-equal t (if (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-new) t nil))
+
+;; 中身が新しいものに替わっている(データは解放より前に書くので、ここが
+;; 読めることは順番が守られている証拠でもある)
+(assert-equal fat16-test-write1-new (fat16-read-file *test-device* "/WRITE1.TXT"))
+;; **大きさが正しく縮んでいる**(2049 → 10)
+(assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 10)
+                     (list "SUBDIR" ':dir 0))
+              (fat16-read-dir *test-device* "/"))
+
+;; **二重使用が起きていないことの陽性対照(規則 8)。**
+;; 鎖の長さがちょうど必要な分(1 本)になっていること = 余りが切り離されている。
+;; 先頭の塊は変わらない(縮小で start-cluster は動かない)。
+(defglobal fat16-test-shrink-node-after (%fat16-test-resolve-node *test-device* "/WRITE1.TXT"))
+(defglobal fat16-test-shrink-chain-after
+  (fat16-cluster-chain *test-device* fat16-test-bpb (slot-value fat16-test-shrink-node-after 'start-cluster)))
+(assert-equal 1 (length fat16-test-shrink-chain-after))
+(assert-equal (car fat16-test-shrink-chain-before) (car fat16-test-shrink-chain-after))
+
+;; 余った塊の FAT 項目が 0(未使用)に戻っている = 解放されている。
+;; **控え(FAT キャッシュ)の書き戻しまで済んでいないとここは 0 に見えない**
+;; (fat16-fat-entry はキャッシュ経由でも読むので、下の再利用の確認と 2 つで見る)
+(assert-equal 0 (fat16-fat-entry *test-device* fat16-test-bpb fat16-test-shrink-freed))
+;; 印は件数に入らない進捗出力(test_framework.lisp の isiki-test-mark)で、
+;; ログには **#mark** の行として出る(ファイルの読み込みの #at とは別の前置き。
+;; 同じ前置きだった頃は、印を置くだけで名簿の検査が誤判定した。
+;; documents/test-count-census.md §4-b)。
+;; **どこまで通ったかが記録に残る**ようにしておく(規則 1)
+(isiki-test-mark "199-fat16-shrink-freed-and-chain-1")
+
+;; 他のファイルが巻き込まれていないこと(二重使用があれば中身が壊れる)
+(assert-equal 2500 (length (fat16-read-file *test-device* "/BIG.TXT")))
+(assert-equal 18 (length (fat16-read-file *test-device* "/TEST.LSP")))
+
+;; **解放された塊が再利用されることの陽性対照(規則 8)。**
+;; ここで WRITE1.TXT を 2049byte へ伸ばし直す。拡張は空き塊を番号の小さい側から
+;; 探すので、**いま解放した塊がそのまま再び使われるはず**。使われなければ
+;; 「0 と書いたが円盤に出ていない」か「空き探索から見えていない」。
+;; **この伸ばし直しは、以降の既存フィクスチャ(WRITE1.TXT = 2049byte)を
+;; 元に戻す役も兼ねている**(この節より後ろの一覧の期待値を動かさないため)。
+(assert-equal t (if (fat16-write-file *test-device* "/WRITE1.TXT" fat16-test-write1-2clusters) t nil))
+(defglobal fat16-test-shrink-node-regrown (%fat16-test-resolve-node *test-device* "/WRITE1.TXT"))
+(defglobal fat16-test-shrink-chain-regrown
+  (fat16-cluster-chain *test-device* fat16-test-bpb (slot-value fat16-test-shrink-node-regrown 'start-cluster)))
+(assert-equal (list (car fat16-test-shrink-chain-before) fat16-test-shrink-freed)
+              fat16-test-shrink-chain-regrown)
+(isiki-test-mark "199-fat16-freed-cluster-reused")
 (assert-equal fat16-test-write1-2clusters (fat16-read-file *test-device* "/WRITE1.TXT"))
 (assert-equal (list (list "HELLO.TXT" ':file 0) (list "TEST.LSP" ':file 18) (list "BIG.TXT" ':file 2500) (list "WRITE1.TXT" ':file 2049)
                      (list "SUBDIR" ':dir 0))
@@ -576,3 +646,59 @@
 ;; (TCG、KVM無し)環境で時間がかかりすぎるため、M9(#52)のローカル専用
 ;; マイルストーン(qemu_boot_perf_fat16.lisp)へ移した。カーネル自身の
 ;; ブートバイナリ(#41)を使った実データでの検証も兼ねる。
+
+
+;;; --- [#199] 既存の中身があるファイルの上書き保存(3 通り) ---
+;;
+;; #199 の症状: **同じイメージで 2 回目を走らせると、既存ファイルへの
+;; open-output-file が「cannot resolve file」で中断する。** 真因は
+;; 「必要クラスタ数が減る全体書き換え」が未実装(cond 末尾が (t nil))だったこと。
+;; 切り詰めは空ベクタでの全体書き換えなので、**中身があると必ずそこに落ちた**。
+;;
+;; ここは高い層(write-vector-to-file / open-output-file)から 3 通りを確かめる。
+;; クラスタサイズは 2048byte(Makefile 参照)なので、5000byte は 3 クラスタ、
+;; 100byte は 1 クラスタ。**(1) で塊が 3 → 1 に減る。**
+
+(defglobal fat16-test-ovw-5000 (create-vector 5000 65))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW16.TXT" fat16-test-ovw-5000) t nil))
+(assert-equal 5000 (file-length "/mnt/OVW16.TXT"))
+
+;; (1) **小さい内容で**上書き(塊が減る。直す前はここで中断していた)
+(defglobal fat16-test-ovw-100 (create-vector 100 66))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW16.TXT" fat16-test-ovw-100) t nil))
+(assert-equal 100 (file-length "/mnt/OVW16.TXT"))
+(assert-equal fat16-test-ovw-100 (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-overwrite-smaller")
+
+;; (2) **同じ大きさで**上書き(塊数が変わらない既存経路。回帰していないこと)
+(defglobal fat16-test-ovw-100b (create-vector 100 67))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW16.TXT" fat16-test-ovw-100b) t nil))
+(assert-equal 100 (file-length "/mnt/OVW16.TXT"))
+(assert-equal fat16-test-ovw-100b (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-overwrite-same")
+
+;; (3) **大きくする**上書き(塊が増える既存経路。回帰していないこと)
+(defglobal fat16-test-ovw-5000b (create-vector 5000 68))
+(assert-equal t (if (write-vector-to-file "/mnt/OVW16.TXT" fat16-test-ovw-5000b) t nil))
+(assert-equal 5000 (file-length "/mnt/OVW16.TXT"))
+(assert-equal fat16-test-ovw-5000b (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-overwrite-larger")
+
+;; **#199 の症状そのもの: 中身のある既存ファイルを open-output-file で開けること。**
+;; 開いた時点で 0 へ切り詰められている(= 余った塊が解放されている)。
+;; 直す前はこの 1 行が <simple-error> で中断していた。
+(defglobal fat16-test-ovw-stream (open-output-file "/mnt/OVW16.TXT"))
+(assert-equal t (if (open-stream-p fat16-test-ovw-stream) t nil))
+(assert-equal 0 (file-length "/mnt/OVW16.TXT"))
+(write-byte 90 fat16-test-ovw-stream)
+(write-byte 91 fat16-test-ovw-stream)
+(close fat16-test-ovw-stream)
+(assert-equal 2 (file-length "/mnt/OVW16.TXT"))
+(assert-equal #(90 91) (read-file-into-vector "/mnt/OVW16.TXT"))
+
+;; もう一度同じことができること(#199 は「2 回目で落ちる」形で出た)
+(defglobal fat16-test-ovw-stream2 (open-output-file "/mnt/OVW16.TXT"))
+(write-byte 92 fat16-test-ovw-stream2)
+(close fat16-test-ovw-stream2)
+(assert-equal #(92) (read-file-into-vector "/mnt/OVW16.TXT"))
+(isiki-test-mark "199-fat16-open-output-file-on-existing")

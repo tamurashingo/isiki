@@ -636,6 +636,18 @@
                 (if (not ok)
                     nil
                     (progn
+                      ;; [#199 と一緒に検討した] ここは **max のままにする**。
+                      ;; write-from! は「file-offsetからcountバイトを置き換える」
+                      ;; 位置指定の書き込みなので、書いた範囲より後ろを捨てては
+                      ;; いけない(set-file-positionで途中へ書けるため、
+                      ;; end-offsetへ縮めると70000byteのファイルが50001byteに
+                      ;; なる。test/lisp/fat16_test.lisp の open-io-file の節が
+                      ;; 「サイズは変化しない」ことを仕様として固定している)。
+                      ;; **大きさを縮めたいときはこの経路ではなく
+                      ;; fat16-write-file(全体書き換え。縮小は%fat16-shrink-file)
+                      ;; を使う** = open-output-file / write-vector-to-file。
+                      ;; 読み書き両用(open-io-file)で短い中身を書いても末尾が
+                      ;; 残るのは、POSIXの"r+"と同じ意味で正しい。
                       (setq new-size (if (> end-offset (slot-value node 'size)) end-offset (slot-value node 'size)))
                       (set-slot-value node 'size new-size)
                       (set-slot-value node 'last-cluster-index nil)
@@ -923,13 +935,105 @@
     (%fat16-patch-bytes! dir-bytes (+ dir-offset 28) (%fat16-u32-to-bytes new-size))
     (write-sector device dir-lba dir-bytes)))
 
+;;; --- #199: クラスタ数が減る上書き(縮小) ---
+;;
+;; FAT16-M6b までは「必要クラスタ数 < 現クラスタ数」を対象外として nil を返して
+;; いた(fat16-write-file の cond 末尾が (t nil) だった)。書き込み用に開く操作
+;; (open-output-file)は「中身を空にする」を**空ベクタでの全体書き換え**で表現
+;; しているため、中身のある既存ファイルは必ずこの枝に落ち、#199 の
+;; 「cannot resolve file で開けない」になっていた。解放の処理は FAT16/FAT32 の
+;; どちらにも 1 件も無かったので、両方へ同じ形で入れる。
+
+;; (%fat16-chain-nthcdr chain n) : chain(fat16-cluster-chain の戻り値)の n 要素目
+;; 以降のセルを返す。n が chain の長さ以上なら nil。クラスタ数に比例して深くなる
+;; ため Lisp 再帰ではなく while で辿る(fat16-cluster-chain のコメントと同じ理由)。
+(defun %fat16-chain-nthcdr (chain n)
+  (let ((cell chain) (i 0))
+    (while (and cell (< i n))
+      (setq cell (cdr cell))
+      (setq i (+ i 1)))
+    cell))
+
+;; (%fat16-free-cluster-list device bpb clusters) : clusters の各クラスタの FAT
+;; エントリを 0(未使用)へ戻す。1 つでも失敗したら残りは処理せず中断して nil、
+;; 全部成功で t(%fat16-set-fat-entry の既存の失敗規約と同じ)。
+;; 書き込みは %fat16-set-fat-entry のキャッシュへ溜まるだけなので、**呼び出し元が
+;; 最後に %fat16-flush-fat-cache を呼ぶまで円盤には出ない**(そこまで含めて
+;; %fat16-shrink-file が面倒を見る)。クラスタ数に比例するため while で書く。
+(defun %fat16-free-cluster-list (device bpb clusters)
+  (let ((cell clusters) (ok t))
+    (while (and ok cell)
+      (if (%fat16-set-fat-entry device bpb (car cell) 0)
+          (setq cell (cdr cell))
+          (setq ok nil)))
+    ok))
+
+;; (%fat16-shrink-file device bpb dir-lba dir-bytes dir-offset start-cluster
+;;  current-cluster-count required-cluster-count bytes) : start-cluster から始まる
+;; 既存チェイン(current-cluster-count 個)を required-cluster-count 個へ縮め、
+;; bytes 全体を書き込み、ディレクトリエントリの start-cluster と size も更新する。
+;; 呼び出し元(fat16-write-file)は required-cluster-count < current-cluster-count
+;; を保証する前提。成功時 t、失敗時 nil。
+;;
+;; **順番がこの関数のいちばん大事なところ。** 下の 5 段をこの順で行う。
+;;
+;;   1. データを書く(残す側のクラスタだけ。まだ誰の持ち物も変わらない)
+;;   2. **札(ディレクトリエントリ)を先に書き換える** … 新しい size と、
+;;      0 バイトなら start-cluster=0
+;;   3. 残す側の末尾クラスタへ終端マーカー(#xFFFF)を書いて鎖を切る
+;;   4. 余ったクラスタの FAT エントリを 0 へ戻す(= 解放)
+;;   5. 控え(FAT キャッシュ)を円盤へ書き戻す
+;;
+;; **なぜこの順番でなければならないか。** 逆順(先に解放してから札を書き換える)に
+;; すると、解放済みなのに**ディレクトリエントリはまだその塊を自分のものだと
+;; 名乗っている**瞬間ができる。その瞬間に別のファイルの作成・拡張が走ると、
+;; 空き探索は 0 になった塊を拾うので、**同じ塊を 2 つのファイルが指す表**ができる。
+;; これは失敗を返さない静かなデータ破壊で、あとから直せない。
+;; 札を先に書き換えておけば、途中で止まった場合に残るのは
+;; **「誰のものでもない塊」(リーク)だけ**で、読み書きの正しさは壊れない
+;; (ディスクフル時のクラスタリークを許容する既存方針と同じ、documents/fs.md 参照)。
+;; 3 を 4 より先にやるのも同じ理由で、逆だと
+;; **「まだ鎖が指しているのに空きと書かれた塊」**という同じ危うさが生まれる。
+(defun %fat16-shrink-file (device bpb dir-lba dir-bytes dir-offset start-cluster current-cluster-count required-cluster-count bytes)
+  (let* ((chain (fat16-cluster-chain device bpb start-cluster))
+         (keep-last (if (= required-cluster-count 0)
+                        nil
+                        (car (%fat16-chain-nthcdr chain (- required-cluster-count 1)))))
+         (surplus (%fat16-chain-nthcdr chain required-cluster-count))
+         ;; 0 バイトになる場合は、この札はもうどの塊も指さない
+         (new-start-cluster (if (= required-cluster-count 0) 0 start-cluster)))
+    ;; 鎖の実測長が呼び出し元の数え方と食い違う場合(FAT が壊れている等)は
+    ;; 何も触らずに諦める。**壊れた表の上で解放を走らせない**ための門。
+    (if (or (not (= (length chain) current-cluster-count))
+            (null surplus)
+            (and (> required-cluster-count 0) (null keep-last)))
+        nil
+        ;; 1. データ(%fat16-write-file-data は chunks が尽きたところで止まるので、
+        ;;    鎖が長いままでも必要な先頭クラスタ分だけ書く)
+        (if (not (%fat16-write-file-data device bpb start-cluster bytes))
+            nil
+            ;; 2. 札を先に(上のコメントの理由)
+            (if (not (%fat16-finish-directory-update device dir-lba dir-bytes dir-offset
+                       new-start-cluster (length bytes)))
+                nil
+                ;; 3. 残す側の末尾で鎖を切る
+                (if (and (> required-cluster-count 0)
+                         (not (%fat16-set-fat-entry device bpb keep-last #xFFFF)))
+                    nil
+                    ;; 4. 余りを解放 → 5. 控えを書き戻す
+                    (if (not (%fat16-free-cluster-list device bpb surplus))
+                        nil
+                        (%fat16-flush-fat-cache device bpb))))))))
+
 ;; (fat16-write-file device path bytes) : path("/NAME.EXT"、または"/DOCS/NAME.EXT"
 ;; のような多階層パス、FAT16-M7b)の既存ファイルへbytes(fixnum 0-255の
 ;; general-vector、[ファイルI/O]#46(M3)でconsリストから変更)を上書きする。必要クラスタ数が現在のクラスタ数と同じ場合はFAT16-M6aの経路
 ;; (データ→sizeフィールドのみ更新)、必要クラスタ数が増える場合はFAT16-M6bの経路
 ;; (新規クラスタ確保・FATチェイン延長→データ→start-cluster/sizeフィールド更新)で
-;; 書き込む。必要クラスタ数が減る場合(縮小)はFAT16-M6bの対象外としてnilを返し、
-;; 既存データ/ディレクトリエントリは変更しない。パスが解決できない・エントリが
+;; 書き込む。必要クラスタ数が減る場合(縮小)は%fat16-shrink-file([#199])で
+;; 余ったクラスタを解放する(2026-11-11 まではここが対象外でnilを返していた。
+;; そのためopen-output-fileが中身のある既存ファイルを開けなかった)。
+;; パスが解決できない・エントリが
 ;; 見つからない・各段階の書き込みに失敗した場合もnil、成功時はt。パス解決の実体は
 ;; %fat16-resolve-file(FAT16-M7a節)。
 (defun fat16-write-file (device path bytes)
@@ -963,7 +1067,10 @@
                            (if (null new-start-cluster)
                                nil
                                (%fat16-finish-directory-update device dir-lba dir-bytes dir-offset new-start-cluster (length bytes)))))
-                        (t nil))))))))))
+                        ;; [#199] 必要クラスタ数が減る場合(縮小)。以前はここが
+                        ;; (t nil) で、**何もせず nil を返していた**。
+                        (t (%fat16-shrink-file device bpb dir-lba dir-bytes dir-offset
+                             start-cluster current-cluster-count required-cluster-count bytes)))))))))))
 
 ;;; --- FAT16-M6c: 新規ファイル作成 ---
 

@@ -174,7 +174,26 @@ KERNEL_DEFAULT_SCRIPT_RE = re.compile(
 # 食い違えば `make test` が落ちる(規則 13)。
 #        段の名前(ログの中での名乗り)                                    件数  読み方   周
 COUNTS = (
-    ("test-qemu", 5178, "isiki", (ALL,)),
+    #
+    # **[2026-11-11 / #199] ここから 5 段の件数が動いた。理由をここに書く(規則 16)。**
+    #
+    # 「クラスタ数が減る上書き(縮小)」を FAT16/FAT32 の両方へ実装した
+    # (src/lisp/fat16.lisp の %fat16-shrink-file / fat32.lisp の %fat32-shrink-file)。
+    # それまでは `(t nil)` で**何もせず nil を返していた**ため、
+    # open-output-file が中身のある既存ファイルを開けなかった(#199)。
+    # 足した確認は
+    #   - 塊が減る上書きが成功すること / 大きさが縮むこと
+    #   - **解放された塊が再利用されること**(陽性対照。規則 8)
+    #   - **二重使用が起きていないこと**(鎖の長さと他ファイルの中身。陽性対照)
+    #   - 高い層からの 3 通りの上書き(小さく / 同じ / 大きく)と open-output-file
+    #   - 失敗の文面が区別できること(io_signal_test.lisp。#199 は
+    #     「解決は成功しているのに cannot resolve file」で原因探しを遠回りさせた)
+    # **件数は手で数えていない(規則 13)。出どころは**
+    #     python3 tools/census_test_counts.py --detail --static <台本>
+    # で、fat16_test.lisp 145→171 / fat32_test.lisp 138→164 /
+    # io_signal_test.lisp 33→36(io_signal_test.lisp は 3 段から読まれる)。
+    #
+    ("test-qemu", 5181, "isiki", (ALL,)),
     # 枠組みを使えない段(条件クラスが 1 つも無い状態を要件とする)。**自前集計**で、
     # 合否の一行の形は枠組みと同じだが出している主体が別である。`#ck` を数える
     ("test/lisp/qemu_boot_no_init_signal.lisp", 15, "self-tally", (ALL,)),
@@ -202,12 +221,12 @@ COUNTS = (
     # 件数は手で数えていない(規則 13)。出どころは
     #     python3 tools/census_test_counts.py --detail --static test/lisp/qemu_boot_app_filer.lisp
     ("test/lisp/qemu_boot_app_filer.lisp", 182, "isiki", (ALL, CI)),
-    ("test/lisp/qemu_boot_error_escape_gc.lisp", 378, "isiki", (ALL,)),
+    ("test/lisp/qemu_boot_error_escape_gc.lisp", 381, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_m5_ide.lisp", 7, "isiki", (ALL, CI)),
-    ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 159, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 185, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_fat_callback_transfer.lisp [fat16_test.img]", 17, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_load_gc_stress.lisp [fat16_test.img]", 21, "isiki", (ALL,)),
-    ("test/lisp/qemu_boot_fat32.lisp [fat32_test.img]", 140, "isiki", (ALL, CI)),
+    ("test/lisp/qemu_boot_fat32.lisp [fat32_test.img]", 166, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_fat32_primary_boot.lisp", 13, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_partition.lisp [gpt_multi_test.img]", 42, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_partition.lisp [mbr_multi_test.img]", 42, "isiki", (ALL, CI)),
@@ -249,7 +268,7 @@ COUNTS = (
     ("test/lisp/qemu_boot_inline_phase0b.lisp", 5, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_declare_bench.lisp", 21, "isiki", (ALL,)),
     # --- ここから下は CI だけで走る段(test-qemu-all に入っていない) ---
-    ("test/lisp/qemu_boot_m1_base.lisp", 2785, "isiki", (CI,)),
+    ("test/lisp/qemu_boot_m1_base.lisp", 2788, "isiki", (CI,)),
     ("test/lisp/qemu_boot_m2_za.lisp", 678, "isiki", (CI,)),
     ("test/lisp/qemu_boot_m3_za_ext5.lisp", 427, "isiki", (CI,)),
     ("test/lisp/qemu_boot_m4_environment.lisp", 134, "isiki", (CI,)),
@@ -302,7 +321,7 @@ COUNTS = (
 #
 # **件数を直すときは理由を同じ場所に書くこと**(規則 16)。
 FILES = {
-    # test-qemu … 読み方 isiki / 台本自身 1 件 / 証人 59 本 / 導出の合計 5178 件
+    # test-qemu … 読み方 isiki / 台本自身 1 件 / 証人 59 本 / 導出の合計 5181 件
     "test-qemu": (1, (
         ("test/lisp/test_framework_test.lisp", 29),
         ("test/lisp/init_test.lisp", 496),
@@ -311,7 +330,7 @@ FILES = {
         ("test/lisp/arith_signal_test.lisp", 40),
         ("test/lisp/index_signal_test.lisp", 51),
         ("test/lisp/undefined_signal_test.lisp", 46),
-        ("test/lisp/io_signal_test.lisp", 33),
+        ("test/lisp/io_signal_test.lisp", 36),
         ("test/lisp/type_unbound_test.lisp", 79),
         ("test/lisp/arity_signal_test.lisp", 51),
         ("test/lisp/isiki_test.lisp", 653),
@@ -416,14 +435,14 @@ FILES = {
         ("test/lisp/filer_app_disk_test.lisp", 47),
         ("test/lisp/filer_test.lisp", 131),
     )),
-    # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 378 件
+    # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 381 件
     "test/lisp/qemu_boot_error_escape_gc.lisp": (4, (
         ("test/lisp/toplevel_abort_test.lisp", 17),
         ("test/lisp/handler_exit_test.lisp", 41),
         ("test/lisp/arith_signal_test.lisp", 40),
         ("test/lisp/index_signal_test.lisp", 51),
         ("test/lisp/undefined_signal_test.lisp", 46),
-        ("test/lisp/io_signal_test.lisp", 33),
+        ("test/lisp/io_signal_test.lisp", 36),
         ("test/lisp/type_unbound_test.lisp", 79),
         ("test/lisp/arity_signal_test.lisp", 51),
     )),
@@ -431,9 +450,9 @@ FILES = {
     "test/lisp/qemu_boot_m5_ide.lisp": (0, (
         ("test/lisp/ide_test.lisp", 5),
     )),
-    # test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 159 件
+    # test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 185 件
     "test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]": (0, (
-        ("test/lisp/fat16_test.lisp", 145),
+        ("test/lisp/fat16_test.lisp", 171),
         ("test/lisp/device_test.lisp", 10),
     )),
     # test/lisp/qemu_boot_fat_callback_transfer.lisp [fat16_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 17 件
@@ -444,9 +463,9 @@ FILES = {
     "test/lisp/qemu_boot_load_gc_stress.lisp [fat16_test.img]": (0, (
         ("test/lisp/load_gc_stress_test.lisp", 19),
     )),
-    # test/lisp/qemu_boot_fat32.lisp [fat32_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 140 件
+    # test/lisp/qemu_boot_fat32.lisp [fat32_test.img] … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 166 件
     "test/lisp/qemu_boot_fat32.lisp [fat32_test.img]": (0, (
-        ("test/lisp/fat32_test.lisp", 138),
+        ("test/lisp/fat32_test.lisp", 164),
     )),
     # test/lisp/qemu_boot_fat32_primary_boot.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 13 件
     "test/lisp/qemu_boot_fat32_primary_boot.lisp": (0, (
@@ -533,7 +552,7 @@ FILES = {
     "test/lisp/qemu_boot_declare_bench.lisp": (0, (
         ("test/lisp/declare_types_bench.lisp", 19),
     )),
-    # test/lisp/qemu_boot_m1_base.lisp … 読み方 isiki / 台本自身 1 件 / 証人 13 本 / 導出の合計 2785 件
+    # test/lisp/qemu_boot_m1_base.lisp … 読み方 isiki / 台本自身 1 件 / 証人 13 本 / 導出の合計 2788 件
     "test/lisp/qemu_boot_m1_base.lisp": (1, (
         ("test/lisp/test_framework_test.lisp", 29),
         ("test/lisp/init_test.lisp", 496),
@@ -542,7 +561,7 @@ FILES = {
         ("test/lisp/arith_signal_test.lisp", 40),
         ("test/lisp/index_signal_test.lisp", 51),
         ("test/lisp/undefined_signal_test.lisp", 46),
-        ("test/lisp/io_signal_test.lisp", 33),
+        ("test/lisp/io_signal_test.lisp", 36),
         ("test/lisp/type_unbound_test.lisp", 79),
         ("test/lisp/arity_signal_test.lisp", 51),
         ("test/lisp/isiki_test.lisp", 653),
@@ -669,6 +688,24 @@ FILE_COUNT_RE = re.compile(r"^#count (\S+) (\d+)\s*$")
 # `#at` だけがあって `#count` が無いのは「そのファイルの途中で止まった」痕跡である
 # (調査 §9-4-7。**これを見る者がいなかった**)
 PROGRESS_RE = re.compile(r"^#at (\S+) t=")
+# **進捗の行の形をした行**の総当たり。`#at` と `#mark` の 2 種類だけが既知で、
+# **3 種類目が黙って素通りするのがいちばん悪い結果**なので、知らない前置きが
+# あったらその段を落とす(#204 の「読み取り方が未知の段があったら失敗する」と同じ趣旨)。
+#
+# [#199 / #203 の穴] 2026-11-11 まで、**ファイルの読み込みの進捗と、試験ファイルの
+# 中から任意の地点につける印が、どちらも `#at` を出していた**
+# (`isiki-test-load` が `isiki-test-mark` を呼んでいた)。上の 1 対 1 の不変条件は
+# 「`#at` は読み込みだけが出す」に乗っているので、**印を 1 つ置くだけで
+# 「読み始めて止まった」と誤判定した**(#199 の PR で実際に落ちた。
+# **この PR が印の最初の利用者だったので、それまで鳴らなかった**)。
+# 直したのは**出す側**で、素の印は `#mark` になった(test_framework.lisp の
+# `%isiki-test-progress-line`)。**ラベルの見た目で切り分けてはいない**
+# (パスらしいかどうかで判定すると、ラベルにパスを書いたときまた破れる)。
+PROGRESS_SHAPED_RE = re.compile(r"^#(\S+) (\S+) t=")
+# 読み込みの進捗 = `#at`、ただの印 = `#mark`。印はファイルの読み込みとして扱わない
+PROGRESS_KIND_LOAD = "at"
+PROGRESS_KIND_MARK = "mark"
+PROGRESS_KINDS_KNOWN = (PROGRESS_KIND_LOAD, PROGRESS_KIND_MARK)
 # `self-tally` の項目(名前つき)。上の SELF_CK_RE は数えるだけなので別に持つ
 SELF_CK_NAME_RE = re.compile(r"^#ck\s+(\S+)")
 # `no9p` の項目(名前つき)
@@ -824,12 +861,15 @@ READERS = {
 def read_file_items(reader, segment):
     """段の区間から**名前つき 1 件 1 行の証人**を取り出す。
 
-    返り値 (項目 {名前: 件数}, 進捗に名乗ったファイル集合, 重複した名前)。
+    返り値 (項目 {名前: 件数}, 進捗に名乗ったファイル集合, 重複した名前,
+    知らない前置きの進捗の行)。
     進捗の集合は `isiki` のときだけ中身がある(ほかの読み方に `#at` は無い)。
+    **`#mark`(ただの印)はファイルの読み込みではないので集合に入れない。**
     """
     items = {}
     dup = []
     progressed = set()
+    unknown_progress = []
     if reader == "isiki":
         for _lineno, line in segment:
             m = FILE_COUNT_RE.match(line)
@@ -839,10 +879,16 @@ def read_file_items(reader, segment):
                     dup.append(name)
                 items[name] = int(m.group(2))
                 continue
-            m = PROGRESS_RE.match(line)
+            m = PROGRESS_SHAPED_RE.match(line)
             if m:
-                progressed.add(m.group(1))
-        return items, progressed, dup
+                kind = m.group(1)
+                if kind == PROGRESS_KIND_LOAD:
+                    progressed.add(m.group(2))
+                elif kind == PROGRESS_KIND_MARK:
+                    pass
+                else:
+                    unknown_progress.append(line.rstrip("\n"))
+        return items, progressed, dup, unknown_progress
     name_re = SELF_CK_NAME_RE if reader == "self-tally" else NO9P_NAME_RE
     for _lineno, line in segment:
         m = name_re.search(line)
@@ -851,7 +897,7 @@ def read_file_items(reader, segment):
             if name in items:
                 dup.append(name)
             items[name] = items.get(name, 0) + 1
-    return items, progressed, dup
+    return items, progressed, dup, unknown_progress
 
 
 def judge_files(stage, reader, segment, actual_total):
@@ -869,7 +915,7 @@ def judge_files(stage, reader, segment, actual_total):
             "tools/check_test_count_ratchet.py の FILES に書くこと" % stage
         ]
     script_own, expected_items = entry
-    found, progressed, dup = read_file_items(reader, segment)
+    found, progressed, dup, unknown_progress = read_file_items(reader, segment)
     what = "ファイル" if reader == "isiki" else "項目"
 
     for name in dup:
@@ -931,6 +977,19 @@ def judge_files(stage, reader, segment, actual_total):
             ng.append(
                 "NG: 段 %s に名簿に無いファイルの進捗の行(#at %s)がある。"
                 "件数の行も無いので、読み始めて止まったか名簿が古い" % (stage, name)
+            )
+        # **知らない前置きの進捗の行は、黙って飛ばさずに落とす。**
+        # 既知は `#at`(ファイルの読み込み)と `#mark`(ただの印)の 2 種類だけ。
+        # 3 種類目が素通りすると、それが「読み込み」なのか「印」なのかを
+        # 機械が決められないまま上の 1 対 1 の判定が走る(#203 の穴がまさにそれ)。
+        for line in unknown_progress:
+            ng.append(
+                "NG: 段 %s に**知らない前置きの進捗の行**がある: %s。"
+                "既知は #at(isiki-test-load が出すファイルの読み込み)と "
+                "#mark(isiki-test-mark が出すただの印)の 2 種類だけである。"
+                "新しい種類を足したなら、この検出器の PROGRESS_KINDS_KNOWN にも足し、"
+                "**ファイルの読み込みとして数えるのかどうかを決めて書くこと**"
+                % (stage, line)
             )
 
     # --- 等式。**証人の無いアサーションを見つける者である** ---
@@ -2345,6 +2404,7 @@ def synth_log(
     drop_item=None,
     drop_item_fully=None,
     unwitnessed=None,
+    inject=None,
 ):
     """名簿どおりの 1 周のログを合成する。
 
@@ -2356,6 +2416,10 @@ def synth_log(
     drop_item        … (段, 項目)。件数の行だけ落とす(進捗の行は残る)
     drop_item_fully  … (段, 項目)。進捗の行も落とす
     unwitnessed      … (段, 件数)。証人の無いアサーションを合計にだけ足す
+    inject           … (段, [行...])。その段の中身へそのまま差し込む。
+                       **進捗の行の種類の対照に使う**(#mark / 知らない前置き)。
+                       件数には関係しない行を入れるためのつまみなので、
+                       合計の等式は動かない
     """
     lines = ["make[1]: Entering directory '/repo'\n"]
     for name, count, reader, rounds in COUNTS:
@@ -2366,6 +2430,8 @@ def synth_log(
             # **最後の項目**を動かす(どれでもよいが、固定しておくと対照が読める)
             item_delta = (FILES[name][1][-1][0], delta[1])
         lines.append(synth_stage_header(name, style))
+        if inject and inject[0] == name:
+            lines.extend(inject[1])
         lines.extend(
             synth_body(
                 name,
@@ -2419,14 +2485,54 @@ def self_test():
     victim = "test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]"
     check("陽性 件数 -1 で落ちる", passes(synth_log(ALL, delta=(victim, -1))), False)
     check(
-        "陽性 件数 -1 のとき次に書く数字(158)を出す",
-        "COUNTS の \"%s\" を 158 に" % victim in ng_text(synth_log(ALL, delta=(victim, -1))),
+        "陽性 件数 -1 のとき次に書く数字(184)を出す",
+        "COUNTS の \"%s\" を 184 に" % victim in ng_text(synth_log(ALL, delta=(victim, -1))),
         True,
     )
     check("陽性 件数 +1 で落ちる", passes(synth_log(ALL, delta=(victim, 1))), False)
     check(
-        "陽性 件数 +1 のとき次に書く数字(160)を出す",
-        "COUNTS の \"%s\" を 160 に" % victim in ng_text(synth_log(ALL, delta=(victim, 1))),
+        "陽性 件数 +1 のとき次に書く数字(186)を出す",
+        "COUNTS の \"%s\" を 186 に" % victim in ng_text(synth_log(ALL, delta=(victim, 1))),
+        True,
+    )
+
+    # --- [#199 / #203 の穴] 進捗の行の種類の対照 -----------------------------
+    #
+    # **この衝突は実際に CI を落とした。** ファイルの読み込みの進捗と、試験ファイルの
+    # 中から任意の地点につける印が、**どちらも `#at` を出していた**ので、
+    # 印を 1 つ置くだけで「名簿に無いファイルを読み始めて止まった」と誤判定した。
+    # 直したのは出す側(素の印は `#mark` になった)。ここはその対照である。
+
+    # 陰性対照: **`#mark` の行があっても鳴らない。** 印はファイルの読み込みではない。
+    # ラベルは #199 の PR が実際に使ったものをそのまま置く(見た目で判定していない
+    # ことの対照にもなる。パスらしいラベルでも読み込みとして数えてはいけない)
+    mark_lines = [
+        "#mark 199-fat16-freed-cluster-reused t=68 += 8\n",
+        "#mark test/lisp/looks-like-a-path.lisp t=70 += 2\n",
+    ]
+    check(
+        "陰性 #mark の行があっても鳴らない",
+        passes(synth_log(ALL, inject=(victim, mark_lines))),
+        True,
+    )
+
+    # 陽性対照: **知らない前置きの進捗の行があったら落ちる。**
+    # 3 種類目が黙って素通りするのがいちばん悪い(読み込みなのか印なのかを
+    # 機械が決められないまま 1 対 1 の判定が走る)
+    unknown_lines = ["#step 199-some-new-kind t=80 += 4\n"]
+    check(
+        "陽性 知らない前置きの進捗の行で落ちる",
+        passes(synth_log(ALL, inject=(victim, unknown_lines))),
+        False,
+    )
+    check(
+        "陽性 その理由を「知らない前置きの進捗の行」と言う",
+        "知らない前置きの進捗の行" in ng_text(synth_log(ALL, inject=(victim, unknown_lines))),
+        True,
+    )
+    check(
+        "陽性 その行をそのまま見せる",
+        "#step 199-some-new-kind t=80 += 4" in ng_text(synth_log(ALL, inject=(victim, unknown_lines))),
         True,
     )
 
