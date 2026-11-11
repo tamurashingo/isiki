@@ -88,6 +88,13 @@ jobs:
         timeout-minutes: 10
         run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_partition.lisp [mbr_multi_test.img]" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_partition.lisp QEMU_DISK_IMG=tmp/mbr_multi_test.img
 
+      # [#215] 初期アプリ: ページャ。**アプリ専用の円盤(/app)から読み込んで動かす段**で、
+      # 核は文字列入力ストリームで試験するのでキー入力は要らない。
+      # アプリの円盤はどの QEMU 起動にも付くので QEMU_DISK_IMG の上書きは要らない
+      - name: "Run Lisp tests in QEMU (app: pager — load from /app and page with string streams)"
+        timeout-minutes: 10
+        run: tools/qemu_stage_log.sh tmp/qemu-ci.log "test/lisp/qemu_boot_app_pager.lisp" make test-qemu-milestone OVMF_CODE="$OVMF_CODE" MILESTONE=test/lisp/qemu_boot_app_pager.lisp
+
       # [#204 / T3] **この周の段と件数を名簿と突き合わせる。**
       # 段がまるごと走らなくても、合否の一行が出ないだけで誰も気づかなかった(#208)。
       # 名簿は tools/check_test_count_ratchet.py の COUNTS 1 箇所。
