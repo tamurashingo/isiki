@@ -46,6 +46,9 @@
 ;; | D3 | どの窓でも回収は **0 回**                                 | 1 画面ぶんはヒープに対して小さい |
 ;; | D4 | 差分(1 行 + 合図)は全画面の **5 分の 1 以下**           | 行数 ぶんの比。窓は 48 行ある |
 ;;
+;; 起動時に画面を消すこと(#230)の宣言 D5〜D9 は §8 の頭に置いた
+;; (置き場所と対照の作り方の説明が長いので、使う場所の隣に書いてある)。
+;;
 ;; **外れたら「外れた」と書く**(規則 16: 期待値を黙って上げない)。
 ;; 幅に余裕を持たせてあるのは、画面の大きさが起動時の解像度で決まる
 ;; **実行時の値**だからである(固定値ではない)。
@@ -313,7 +316,175 @@
         (elt *ea-screen2* 1) (elt *ea-screen3* 1))
 
 ;;; ---------------------------------------------------------------------------
-;;; 8. 【完了条件 / 陽性対照】素の入力が**必ず**戻る
+;;; 8. 【完了条件 / 陽性対照】**起動時に 1 回だけ**画面を消す(#230)
+;;;
+;;;    利用者が実機で踏んだ不具合である: エディタを起動すると、それまで
+;;;    コンソールに出ていた文字の上に本文やコマンドが重なって出る。
+;;;    差分再描画(§5)は**意図して塗り直さない**ので、
+;;;    **起動時に 1 回消す**以外に前の表示を落とす機会が無い。
+;;;
+;;;    ## 見張りの文字を置く場所 —— **エディタが描かない行**
+;;;
+;;;    核が触るのは 行 0..h-1(本文)と 行 h(合図)だけで、
+;;;    **行 h+1 以降は 1 マスも書かない**(ファイル頭「画面の割り付け」)。
+;;;    だから見張りを最下行に置けば、消えたのは `term-clear` が走ったからだと
+;;;    言える。**本文の行に置くと、描き直しで上書きされたのと見分けがつかない**
+;;;    —— 置き場所そのものが陰性対照になっている。
+;;;
+;;;    ## 断る経路で `out` に文字列ストリームを渡す理由
+;;;
+;;;    断りの文面を実画面へ出すと**行送りで画面が巻き上がり**、見張りの行が
+;;;    1 行ずれて「消えた」と読める**偽の失敗**になる。文字列ストリームへ流せば
+;;;    実画面に触りうるのは `term-clear` だけなので、**見張りの生死が
+;;;    「消したか・消さなかったか」だけを指す。**
+;;;
+;;;    ## 測る前の宣言(規則 11。**走らせる前に書いた**)
+;;;
+;;;    | #  | 宣言                                                      | 根拠 |
+;;;    |----|-----------------------------------------------------------|------|
+;;;    | D5 | 起動すると見張りは**空白**になっている                    | 起動時に 1 回消す |
+;;;    | D6 | 511 文字以上の行で断ったときは見張りが**残っている**      | 断る検査より後で消す |
+;;;    | D7 | 行数の上限で断ったときも見張りが**残っている**            | 同じ |
+;;;    | D8 | **1 打鍵あたり**の増分は**全画面 1 回ぶん(§5 の full)より小さい** | 消すのは 1 回だけ・右移動は合図だけ描く |
+;;;    | D10| 行を分ける打鍵(全画面)4 つは、右移動 4 つより**全画面 1 回ぶん以上**高い | 打鍵ごとに全画面を描く実装ではこの差が消える |
+;;;    | D9 | D8 / D10 の窓で回収は **0 回**                            | §4 は 495,008 byte の窓でも 0 回だった |
+;;;
+;;;    ### **D8 は 1 回外した。外れたまま書き残す**(規則 16)
+;;;
+;;;    最初に宣言したのは「**打鍵 4 つぶんの増分**が全画面 1 回ぶんより小さい」で、
+;;;    実測は **37,696 対 35,968 で外れた**(1 打鍵あたり 9,424 byte)。
+;;;    外れた理由は描き直しではなく**周回そのもの**である —— 1 周には打鍵の読み取り
+;;;    (`term-read-key`)と `cond` の判定が入り、解釈実行ではそれ自体が
+;;;    合図 1 回(§5 の diff = 2,704)より高い。**直したのは宣言のほうで、
+;;;    期待値を緩めたのではない** —— 言いたかったのは
+;;;    「**1 打鍵で全画面 1 枚ぶんを払っていない**」であり、
+;;;    それは打鍵あたりで比べなければ言えない。
+;;;    打鍵あたりでなお足りない差を埋めるために D10 を足した(こちらは
+;;;    **同じ周回費用どうしの比較**なので、周回の費用が差で消える)。
+;;;
+;;;    **外れたら「外れた」と書く**(規則 16: 期待値を黙って上げない)。
+;;; ---------------------------------------------------------------------------
+
+;; 見張りの行は**実画面の寸法から導く**(固定値を書かない。規則 13)。
+;; 合図の行(16)より下でなければ意味を持たないので、そこも検査する
+(defglobal *ea-watch-row* (- (term-rows) 1))
+(assert-equal t (> *ea-watch-row* 16))
+
+;; D5: 起動したら見張りが消える。
+;;     **置いてから読み返すまでを 1 つの式で済ませる**(間に出力が入ると行がずれる)。
+;;     先頭の "WATCH" は**探針そのものの陰性対照**である —— 置けていなければ
+;;     「消えた」も意味を持たない
+(defglobal *ea-watch-start*
+  (progn
+    (term-write-at *ea-watch-row* 0 "WATCH" *ea-out*)
+    (let ((before (%ea-row *ea-watch-row* 5)))
+      (let ((r (editor-run *ea-note* (create-string-input-stream "") *ea-out*)))
+        (list before (%ea-row *ea-watch-row* 5) r (%ea-row 0 8))))))
+
+(assert-equal "WATCH" (elt *ea-watch-start* 0))
+(assert-equal "     " (elt *ea-watch-start* 1))
+;; 消したあとに本文が描かれている(**消すだけして描かない**実装はここで落ちる)
+(assert-equal (list 'editor-eof 0 0 2) (elt *ea-watch-start* 2))
+(assert-equal "alpha   " (elt *ea-watch-start* 3))
+
+;; 断る経路の題材。**/app へは 1 バイトも書かない**ので母艦共有へ置く
+;; (test/lisp/editor_test.lisp §12 と同じ置き場。`~A` はディスクに対して
+;;  安全でないと注記があるので 1 文字ずつ書く)
+(defglobal *ea-long-path* "/9p/tmp/editor_clear_long.txt")
+
+(defglobal *ea-long-put*
+  (progn
+    (with-open-output-file (dst *ea-long-path*)
+      (let ((s (create-string 600 #\a)) (i 0))
+        (while (< i 600) (write-char (elt s i) dst) (setq i (+ i 1)))
+        (write-char #\newline dst)))
+    t))
+(assert-equal t *ea-long-put*)
+(assert-equal 'ed-too-long (%ed-read-lines *ea-long-path*))
+
+;; D6: 511 文字以上の行で断ったときは消さない
+(defglobal *ea-watch-refuse-long*
+  (progn
+    (term-write-at *ea-watch-row* 0 "WATCH" *ea-out*)
+    (let ((o (create-string-output-stream)))
+      (let ((r (editor-run *ea-long-path* (create-string-input-stream "") o)))
+        (list (%ea-row *ea-watch-row* 5) r (get-output-stream-string o))))))
+
+(assert-equal "WATCH" (elt *ea-watch-refuse-long* 0))
+(assert-equal (list 'editor-too-long 0 0 0) (elt *ea-watch-refuse-long* 1))
+(assert-equal t (if (string-index "not opened" (elt *ea-watch-refuse-long* 2) 0) t nil))
+
+;; D7: 行数の上限で断ったときも消さない(**もう 1 つの早期離脱**)
+(defglobal *ea-watch-refuse-max*
+  (progn
+    (term-write-at *ea-watch-row* 0 "WATCH" *ea-out*)
+    (let ((o (create-string-output-stream)))
+      (let ((r (dynamic-let ((*editor-max-lines* 1))
+                 (editor-run *ea-note* (create-string-input-stream "") o))))
+        (list (%ea-row *ea-watch-row* 5) r (get-output-stream-string o))))))
+
+(assert-equal "WATCH" (elt *ea-watch-refuse-max* 0))
+(assert-equal (list 'editor-too-long 0 0 2) (elt *ea-watch-refuse-max* 1))
+(assert-equal t (if (string-index "too many lines" (elt *ea-watch-refuse-max* 2) 0) t nil))
+
+;;; D8 / D10: **消すのは起動時の 1 回だけ**であることを確保量で言う(規則 9)。
+;;;
+;;;     打鍵なしの 1 周・右へ 4 回・行を分けるを 4 回、の 3 つを同じ尺度で測る。
+;;;     ファイルを読む費用は**どの窓にも等しく入る**ので差で消える(陰性対照)。
+;;;
+;;;     D8  … (run4 - run0) / 4 < full。**1 打鍵で全画面 1 枚ぶんを払っていない。**
+;;;           打鍵ごとに消して全画面を描く実装なら、1 打鍵あたりが full を超える
+;;;     D10 … run-split4 - run4 > full。右移動は合図だけ・行を分けると全画面
+;;;           なので、**4 打鍵ぶんで全画面 4 枚ぶんの差が開く。**
+;;;           打鍵ごとに全画面を描く実装では**この差がほぼ 0 になる** ——
+;;;           周回の費用が両辺で等しいので、差は描き直しの違いだけを指す。
+;;;           ★ **閾値の `full` は §5 の値(h=48 / w=159)で、核が実際に描く
+;;;           全画面(皮を通さないので h=16 / w=40)より大きい。** つまり
+;;;           この閾値は**安全側に厳しい**(実測 43,232 = 1 打鍵あたり 10,808 で、
+;;;           これが核の全画面 1 枚ぶんにあたる)。**大きいほうで比べて通る**ので
+;;;           そのままにしてある —— 核が窓の寸法を引数で受ける形を崩さずに
+;;;           §5 と同じ尺度を使うには、こう置くしかない
+(defglobal *ea-m-run0*
+  (let ((g0 (%%gc-collect-count)) (b0 (%%heap-used-bytes)))
+    (editor-run *ea-note* (create-string-input-stream "") *ea-out*)
+    (list (- (%%heap-used-bytes) b0) (- (%%gc-collect-count) g0))))
+
+(defglobal *ea-m-run4*
+  (let ((g0 (%%gc-collect-count)) (b0 (%%heap-used-bytes)))
+    (editor-run *ea-note*
+                (create-string-input-stream (create-string 4 *key-right*))
+                *ea-out*)
+    (list (- (%%heap-used-bytes) b0) (- (%%gc-collect-count) g0))))
+
+(defglobal *ea-m-run-split4*
+  (let ((g0 (%%gc-collect-count)) (b0 (%%heap-used-bytes)))
+    (editor-run *ea-note*
+                (create-string-input-stream (create-string 4 #\newline))
+                *ea-out*)
+    (list (- (%%heap-used-bytes) b0) (- (%%gc-collect-count) g0))))
+
+;; D9: 窓が読めること
+(assert-equal 0 (car (cdr *ea-m-run0*)))
+(assert-equal 0 (car (cdr *ea-m-run4*)))
+(assert-equal 0 (car (cdr *ea-m-run-split4*)))
+;; D8: **1 打鍵あたり**の増分 < 全画面 1 回ぶん
+(assert-equal t (< (div (- (car *ea-m-run4*) (car *ea-m-run0*)) 4)
+                   (car *ea-m-draw-full*)))
+;; D10: 全画面を描く打鍵と合図だけの打鍵の差が、全画面 1 回ぶん以上開いている
+(assert-equal t (> (- (car *ea-m-run-split4*) (car *ea-m-run4*))
+                   (car *ea-m-draw-full*)))
+
+;; **読み返した値そのものを記録へ残す**(規則 13。枠組みは落ちた件しか印字しない)
+(format *isiki-test-stream*
+        "#editor clear-on-start watch-row=~D start=~S refuse-long=~S refuse-max=~S | run0=~D run4=~D split4=~D per-key=~D full=~D~%"
+        *ea-watch-row*
+        (elt *ea-watch-start* 1) (elt *ea-watch-refuse-long* 0)
+        (elt *ea-watch-refuse-max* 0)
+        (car *ea-m-run0*) (car *ea-m-run4*) (car *ea-m-run-split4*)
+        (div (- (car *ea-m-run4*) (car *ea-m-run0*)) 4) (car *ea-m-draw-full*))
+
+;;; ---------------------------------------------------------------------------
+;;; 9. 【完了条件 / 陽性対照】素の入力が**必ず**戻る
 ;;;
 ;;;    #215 で実際に踏んだバグがこれである。「終わりに戻す」と素直に書くと、
 ;;;    **途中で脱出したとき素の入力が入ったまま残り、以後 REPL で打鍵が
@@ -329,7 +500,7 @@
 ;;;    つまりこの探針は 2 つの状態を見分けている。
 ;;;
 ;;;    **ここから先は皮を通すので画面が消える**(皮は終わりに `term-clear` する)。
-;;;    格子を見る節(§4〜§7)より**後に置くこと。**
+;;;    格子を見る節(§4〜§8)より**後に置くこと。**
 ;;; ---------------------------------------------------------------------------
 
 (assert-equal nil (term-raw-input nil))
@@ -359,7 +530,7 @@
         *ea-raw-after-escape* *ea-raw-after-normal* *ea-shell*)
 
 ;;; ---------------------------------------------------------------------------
-;;; 9. 皮が実画面に合わせて切り下げる
+;;; 10. 皮が実画面に合わせて切り下げる
 ;;;
 ;;;    皮が使う式(`%ed-clamp` と上限 `(- (term-rows) 2)` / `(- (term-cols) 1)`)を
 ;;;    ここに写してある。**式を変えたらここが落ちる。それが狙いである。**
