@@ -342,12 +342,17 @@
 (defglobal *et-c-long* (et-run 3 20 *et-flong* ""))
 (assert-equal (list 'editor-too-long 0 0 0) (car *et-c-long*))
 (assert-equal t (et-has "not opened" (car (cdr *et-c-long*))))
+;; 断りは**ちょうど 1 行**である(#230 の裏取り: 断る経路では画面を消す処理も
+;; 描き直しも通っていない。`term-clear` は文字列に何も足さないので、
+;; ここが 1 行から増えたら「断る前に何かを描いた」ということになる)
+(assert-equal 1 (et-lines (car (cdr *et-c-long*))))
 
 ;; 行数の上限でも断る(**半端に開かせない**)
 (defglobal *et-c-max*
   (dynamic-let ((*editor-max-lines* 2)) (et-run 3 20 *et-f3* "")))
 (assert-equal (list 'editor-too-long 0 0 3) (car *et-c-max*))
 (assert-equal t (et-has "too many lines" (car (cdr *et-c-max*))))
+(assert-equal 1 (et-lines (car (cdr *et-c-max*))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 13. 書き出して読み返す(往復)
@@ -608,6 +613,9 @@
 ;;;       知らないキー        … 4 + **0**
 ;;;
 ;;;     **これが「変わった行だけ描き直す」の機械的な証拠である。**
+;;;     #230 で起動時に `term-clear` を 1 回入れたが、**この数は変わらない** ——
+;;;     `term-clear` は実画面を触るだけで、渡したストリームには何も足さない。
+;;;     逆に、消すのを while の中へ入れた実装はここの 5 件すべてが壊れる。
 ;;;     全部を描き直す実装は、どの行も 4 ずつ増えるので 3 件が落ちる。
 ;;;     確保量での裏取りは test/lisp/editor_app_disk_test.lisp §5(実機)。
 ;;; ---------------------------------------------------------------------------
