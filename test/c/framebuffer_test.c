@@ -4,6 +4,7 @@
 #include "test_assert.h"
 #include "types.h"
 #include "framebuffer.h"
+#include "font8x16.h"   /* 字形の立っているビット数を導出するために使う(#227。規則13) */
 
 /*
  * 仮想バッファの履歴リングと表示窓の検証。
@@ -478,6 +479,318 @@ void test_clear_keeps_history(void) {
     os_vbuf_scroll_to_bottom();
 }
 
+/* ---- 画素を見る(#227) ----
+ *
+ * **このファイルには画素を見る試験が1件も無かった。** カーソルの試験は 23 箇所
+ * あり、`%%TERM-READ-CELL`(#216)や editor_ / filer_ 系 の画面検査もあったが、
+ * どれも**論理的な文字の格子**しか読んでいなかった。だから
+ * 「真っ白な矩形がカーソルの下の文字を潰している」「カーソルが通り過ぎたマスの
+ * 文字が黒く消えている」ことを**誰も見ていなかった**(#227。利用者が実機の
+ * エディタで踏んだ)。これは「検出器が黙って効かなくなる」の画素版である。
+ *
+ * ここの計器は `fb->buffer` を直接読む。framebuffer_test は母艦で走り、
+ * 物理フレームバッファは setup() が calloc で本物と同じ大きさを確保しているので、
+ * 描いた画素をそのまま数えられる。
+ *
+ * **陽性対照は 2 段で置いてある**(規則 8):
+ *  (1) 同じ 1 周の中で、直す前の塗り方(old_draw_cursor_pixels /
+ *      old_erase_cursor_pixels)を同じマスへ当て、**同じ計器が 0 を返す**ことを見る。
+ *  (2) framebuffer.c の draw_cursor / erase_cursor から字形の描き直しを外し、
+ *      os_vbuf_backspace から content_put を外した版(= 直す前の姿)で
+ *      この試験を走らせると **9 件が NG になる**ことを確かめた(#227 の PR に出力あり)。
+ *      (1) だけでは「計器が区別できる」までしか言えず、
+ *      「直す前の framebuffer.c なら落ちる」は (2) で示す。
+ */
+
+/** セル1つぶんの画素数。期待値を書き写さずに字形の立っているビット数から導出する */
+#define CELL_PIXELS (VBUF_GLYPH_WIDTH * VBUF_GLYPH_HEIGHT)
+
+/** セル(row,col)の 8x16 の画素のうち、色が color のものを数える */
+static UINT32 cell_count_color(const frame_buffer *fb, UINT32 row, UINT32 col, UINT32 color) {
+    UINT32 x = col * VBUF_GLYPH_WIDTH;
+    UINT32 y = row * VBUF_GLYPH_HEIGHT;
+    UINT32 n = 0;
+    for (UINT32 dy = 0; dy < VBUF_GLYPH_HEIGHT; dy++) {
+        for (UINT32 dx = 0; dx < VBUF_GLYPH_WIDTH; dx++) {
+            if (fb->buffer[(y + dy) * fb->pixels_per_scanline + (x + dx)] == color) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/**
+ * 文字 c の字形で立っているビットの数。**フォント表から導出する**(規則13)。
+ * 「'c' は 24 画素」などと数えて書き写すと、フォントを差し替えた日に腐る。
+ */
+static UINT32 glyph_bits(char c) {
+    UINT32 n = 0;
+    for (UINT32 dy = 0; dy < VBUF_GLYPH_HEIGHT; dy++) {
+        for (UINT32 dx = 0; dx < VBUF_GLYPH_WIDTH; dx++) {
+            if (font8x16[(unsigned char)c][dy] & (0x80 >> dx)) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/**
+ * セル(row,col)に「文字 c が fg 色で、残りが bg 色で」描かれているかを判定する。
+ * **これがこのファイルで初めての画素の計器である。**
+ * 真っ白(全画素 fg)でも真っ黒(全画素 bg)でも 0 を返す ——
+ * つまり #227 の 2 つの症状はどちらもここで落ちる。
+ * @return 文字が見えるなら1
+ */
+static int cell_shows_glyph(const frame_buffer *fb, UINT32 row, UINT32 col,
+                            char c, UINT32 bg, UINT32 fg) {
+    UINT32 bits = glyph_bits(c);
+    return cell_count_color(fb, row, col, fg) == bits
+        && cell_count_color(fb, row, col, bg) == CELL_PIXELS - bits;
+}
+
+/* ---- 直す前の実装の写し(陽性対照。規則 8) ----
+ *
+ * #227 より前の framebuffer.c:71-100 の draw_cursor / erase_cursor を写してある。
+ * 元は `cursor_x(self)` / `cursor_y(self)` を使っていたが、その中身は
+ * `cursor_position.x * VBUF_GLYPH_WIDTH` / `.y * VBUF_GLYPH_HEIGHT` なので、
+ * ここでは見たいマスを (row, col) で直に渡す形にしてある(塗る画素は同じ)。
+ *
+ * **これを同じ計器(cell_shows_glyph)にかけて落ちることを、直した版が通る
+ * 同じ試験の中で示す。** 「直したから通る」ではなく「直す前なら落ちる」。
+ */
+static void old_draw_cursor_pixels(frame_buffer *self, UINT32 row, UINT32 col) {
+    UINT32 x = col * VBUF_GLYPH_WIDTH;
+    UINT32 y = row * VBUF_GLYPH_HEIGHT;
+    for (UINT32 dy = 0; dy < VBUF_GLYPH_HEIGHT; dy++) {
+        for (UINT32 dx = 0; dx < VBUF_GLYPH_WIDTH; dx++) {
+            self->buffer[(y + dy) * self->pixels_per_scanline + (x + dx)] = 0x00FFFFFF;
+        }
+    }
+}
+
+static void old_erase_cursor_pixels(frame_buffer *self, UINT32 row, UINT32 col) {
+    UINT32 x = col * VBUF_GLYPH_WIDTH;
+    UINT32 y = row * VBUF_GLYPH_HEIGHT;
+    for (UINT32 dy = 0; dy < VBUF_GLYPH_HEIGHT; dy++) {
+        for (UINT32 dx = 0; dx < VBUF_GLYPH_WIDTH; dx++) {
+            self->buffer[(y + dy) * self->pixels_per_scanline + (x + dx)] = 0x00000000;
+        }
+    }
+}
+
+/** セル1つを好きな色で塗る(さかのぼり中に「触っていない」ことを見るための見張り) */
+static void paint_cell(frame_buffer *fb, UINT32 row, UINT32 col, UINT32 color) {
+    UINT32 x = col * VBUF_GLYPH_WIDTH;
+    UINT32 y = row * VBUF_GLYPH_HEIGHT;
+    for (UINT32 dy = 0; dy < VBUF_GLYPH_HEIGHT; dy++) {
+        for (UINT32 dx = 0; dx < VBUF_GLYPH_WIDTH; dx++) {
+            fb->buffer[(y + dy) * fb->pixels_per_scanline + (x + dx)] = color;
+        }
+    }
+}
+
+void test_pixels_written_char_is_fg_on_bg(void) {
+    frame_buffer *fb = setup(640, 160, 20);   /* 80桁 x 10行 */
+
+    /* 計器の足場。字形が空っぽの文字では「見える/見えない」を区別できないので、
+       使う 3 文字にビットが立っていることを先に見ておく(陰性対照の足場) */
+    assert(glyph_bits('a') > 0 && glyph_bits('b') > 0 && glyph_bits('c') > 0,
+           "a/b/c の字形にはビットが立っている(空白ではない)");
+    assert(glyph_bits(0) == 0, "格子の初期値 0 の字形は全ビット 0(描いても何も出ない)");
+    assert(glyph_bits(' ') == 0, "空白 ' ' の字形も全ビット 0");
+
+    fb->write_string(fb, "abc");
+
+    /* 書いた3文字は白地ではなく**黒地に白**で描かれている */
+    assert(cell_shows_glyph(fb, 0, 0, 'a', VBUF_COLOR_BG, VBUF_COLOR_FG) == 1, "'a' が描かれている");
+    assert(cell_shows_glyph(fb, 0, 1, 'b', VBUF_COLOR_BG, VBUF_COLOR_FG) == 1, "'b' が描かれている");
+    assert(cell_shows_glyph(fb, 0, 2, 'c', VBUF_COLOR_BG, VBUF_COLOR_FG) == 1, "'c' が描かれている");
+
+    /* カーソルは次のマスにいる。そこは格子が空なので真っ白な矩形になる */
+    assert(fb->cursor_position.x == 3, "カーソルは 'c' の右");
+    assert(cell_count_color(fb, 0, 3, VBUF_COLOR_FG) == CELL_PIXELS,
+           "空のマスのカーソルは白い矩形");
+
+    /* 【陰性対照】書いていないマスは真っ黒のまま */
+    assert(cell_count_color(fb, 0, 4, VBUF_COLOR_BG) == CELL_PIXELS, "書いていないマスは黒");
+}
+
+void test_pixels_cursor_shows_the_char_underneath(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+    fb->write_string(fb, "abc");
+
+    /* 利用者の操作: 'c' の右から左を押して 'c' の位置へ */
+    assert(os_vbuf_set_cursor(fb, 0, 2) == 1, "'c' の位置へカーソルを置ける");
+
+    /* 【完了条件】カーソルの下の文字が見える(反転表示: 白地に黒の字形) */
+    assert(cell_shows_glyph(fb, 0, 2, 'c', VBUF_COLOR_FG, VBUF_COLOR_BG) == 1,
+           "カーソルの下の 'c' が見える(白地に黒)");
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_FG) == CELL_PIXELS - glyph_bits('c'),
+           "白い画素は字形のビット以外のぶんだけ");
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_FG) != CELL_PIXELS,
+           "真っ白に潰れていない");
+
+    /* 【陽性対照】同じマスに**直す前の塗り方**を当てると、同じ計器が落ちる。
+       真っ白になり、cell_shows_glyph は 0 を返す */
+    old_draw_cursor_pixels(fb, 0, 2);
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_FG) == CELL_PIXELS,
+           "【陽性対照】直す前は真っ白に塗っていた");
+    assert(cell_shows_glyph(fb, 0, 2, 'c', VBUF_COLOR_FG, VBUF_COLOR_BG) == 0,
+           "【陽性対照】直す前の塗り方では文字が見えない(この計器が落ちる)");
+}
+
+void test_pixels_moving_cursor_leaves_the_char_behind(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+    fb->write_string(fb, "abc");
+
+    /* 報告された操作そのまま: 左、左 */
+    assert(os_vbuf_set_cursor(fb, 0, 2) == 1, "左を押して 'c' の位置へ");
+    assert(os_vbuf_set_cursor(fb, 0, 1) == 1, "さらに左を押して 'b' の位置へ");
+
+    /* 【完了条件】通り過ぎたマスの 'c' が画面に残っている(黒地に白へ戻る)。
+       直す前はここが真っ黒で、「c が画面から消える」に見えていた */
+    assert(cell_shows_glyph(fb, 0, 2, 'c', VBUF_COLOR_BG, VBUF_COLOR_FG) == 1,
+           "通り過ぎたマスの 'c' が描き直されている");
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_FG) == glyph_bits('c'),
+           "白い画素は字形のビットのぶんだけ");
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_BG) != CELL_PIXELS,
+           "真っ黒に消えていない");
+
+    /* いるマスの 'b' は反転して見えている */
+    assert(cell_shows_glyph(fb, 0, 1, 'b', VBUF_COLOR_FG, VBUF_COLOR_BG) == 1,
+           "いまカーソルがいる 'b' も見える");
+
+    /* 報告どおり**格子は壊れていない**(壊れていたのは画素だけ) */
+    UINT8 ch = 0;
+    assert(os_vbuf_cell(fb, 0, 2, &ch) == 1 && ch == 'c', "格子の 'c' はそのまま");
+
+    /* 【陽性対照】同じマスに**直す前の消し方**を当てると、同じ計器が落ちる */
+    old_erase_cursor_pixels(fb, 0, 2);
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_BG) == CELL_PIXELS,
+           "【陽性対照】直す前は真っ黒に塗って文字を描き直さなかった");
+    assert(cell_shows_glyph(fb, 0, 2, 'c', VBUF_COLOR_BG, VBUF_COLOR_FG) == 0,
+           "【陽性対照】直す前の消し方では文字が消える(この計器が落ちる)");
+}
+
+void test_pixels_cursor_on_blank_cell_is_a_solid_block(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+
+    /* 格子の初期値 0(未書き込み)の上のカーソル。
+       **初期化だけではカーソルは描かれない**(initialize_virtual_buffers は画素に
+       触らない)。kernel_main が起動時にこの 2 つを呼ぶのと同じ順で呼ぶ */
+    fb->clear_screen(fb);
+    fb->draw_cursor(fb);
+    assert(cell_count_color(fb, 0, 0, VBUF_COLOR_FG) == CELL_PIXELS,
+           "未書き込み(格子 0)のマスのカーソルは白い矩形");
+
+    /* アプリが空白 ' '(0x20)を書いたマスも同じ見た目になる。
+       **格子は 0 と ' ' を別の値として持つ**が、どちらの字形も全ビット 0 なので
+       反転表示の見え方は同じである(0 のときだけ字形を引かない。framebuffer.c の
+       cursor_cell_char のコメント参照) */
+    fb->write_char(fb, ' ');
+    UINT8 ch = 0xEE;
+    assert(os_vbuf_cell(fb, 0, 0, &ch) == 1 && ch == ' ',
+           "空白を書いたマスの格子は ' '(0x20)で、0 ではない");
+    assert(os_vbuf_set_cursor(fb, 0, 0) == 1, "書いた空白の上へ戻す");
+    assert(cell_count_color(fb, 0, 0, VBUF_COLOR_FG) == CELL_PIXELS,
+           "空白(' ')のマスのカーソルも白い矩形");
+}
+
+void test_pixels_backspace_clears_grid_and_screen(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+    fb->write_string(fb, "abc");
+
+    assert(os_vbuf_backspace(fb) == 1, "カーソルの手前の1文字を消せる");
+    assert(fb->cursor_position.x == 2, "カーソルが1桁戻る");
+
+    UINT8 ch = 0xEE;
+    assert(os_vbuf_cell(fb, 0, 2, &ch) == 1 && ch == 0, "**格子からも**消える");
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_FG) == CELL_PIXELS,
+           "消した位置はカーソルの白い矩形になる");
+
+    /* 【陰性対照】消しすぎていない。隣の 'b' は描かれたまま */
+    assert(cell_shows_glyph(fb, 0, 1, 'b', VBUF_COLOR_BG, VBUF_COLOR_FG) == 1,
+           "隣の 'b' は消えない");
+
+    /* 面を切り替えて戻っても 'c' は**復活しない**。格子を更新していなかった
+       直す前の backspace(interrupt.c)は、ここで文字が戻ってきていた */
+    switch_active_frame_buffer(1);
+    switch_active_frame_buffer(0);
+    assert(os_vbuf_cell(fb, 0, 2, &ch) == 1 && ch == 0, "戻ってきても格子は空のまま");
+    assert(cell_shows_glyph(fb, 0, 2, 'c', VBUF_COLOR_BG, VBUF_COLOR_FG) == 0,
+           "描き直しで 'c' が復活しない");
+    /* 戻ってきたカーソルは消した位置(0,2)にいる。格子が空なので白い矩形 */
+    assert(cell_count_color(fb, 0, 2, VBUF_COLOR_FG) == CELL_PIXELS,
+           "戻ってきてもカーソルは消した位置の白い矩形");
+    assert(cell_shows_glyph(fb, 0, 1, 'b', VBUF_COLOR_BG, VBUF_COLOR_FG) == 1,
+           "隣の 'b' は描き直しでも黒地に白のまま");
+
+    /* 行頭では何もしない(プロンプトを食わないため) */
+    assert(os_vbuf_set_cursor(fb, 0, 0) == 1, "行頭へ置く");
+    assert(os_vbuf_backspace(fb) == 0, "行頭では消さない");
+    assert(fb->cursor_position.x == 0, "行頭のままで動かない");
+}
+
+void test_pixels_cursor_not_drawn_while_scrolled_back(void) {
+    frame_buffer *fb = setup(640, 160, 20);
+    for (UINT32 i = 0; i < 15; i++) {
+        write_line(fb, "pad");
+    }
+    os_vbuf_scroll(-5);
+    assert(fb->view_offset == 5, "さかのぼっている");
+
+    /* さかのぼり中はカーソルの実位置が窓の外にあるので描かない・消さない
+       (framebuffer.c の view_offset の番人。**この振る舞いは #227 で変えていない**)。
+       見張りの色で塗っておき、画素が1つも書き換わらないことで見る */
+    UINT32 row = fb->cursor_position.y;
+    UINT32 col = fb->cursor_position.x;
+    const UINT32 sentinel = 0x00123456u;
+    paint_cell(fb, row, col, sentinel);
+
+    fb->draw_cursor(fb);
+    assert(cell_count_color(fb, row, col, sentinel) == CELL_PIXELS,
+           "さかのぼり中の draw_cursor は画素に触らない");
+    fb->erase_cursor(fb);
+    assert(cell_count_color(fb, row, col, sentinel) == CELL_PIXELS,
+           "さかのぼり中の erase_cursor も画素に触らない");
+
+    /* 最下部へ戻せば描き直される(ここで初めてカーソルが出る) */
+    assert(os_vbuf_scroll_to_bottom() == 1, "最下部へ戻る");
+    assert(cell_count_color(fb, row, col, sentinel) == 0, "戻ると描き直される");
+    assert(cell_count_color(fb, row, col, VBUF_COLOR_FG) == CELL_PIXELS,
+           "戻った先の空のマスにカーソルの白い矩形が出る");
+}
+
+void test_cursor_is_per_buffer_not_shared(void) {
+    /* 4面は**物理画面を共有し、カーソルは面ごとに持つ**。
+       だから描画はすべて is_active の番人の内側にある */
+    frame_buffer *fb0 = setup(640, 160, 20);
+    fb0->write_string(fb0, "abc");
+
+    switch_active_frame_buffer(1);
+    frame_buffer *fb1 = get_active_frame_buffer();
+    assert(fb1 != fb0, "面ごとに別の frame_buffer がある");
+    assert(fb1->buffer == fb0->buffer, "物理画面は共有している");
+    assert(fb1->cursor_position.x == 0 && fb1->cursor_position.y == 0,
+           "切り替え先のカーソルは自分の位置(共有されていない)");
+
+    os_vbuf_set_cursor(fb1, 5, 7);
+    assert(fb0->cursor_position.x == 3, "他の面でカーソルを動かしてもこちらは動かない");
+    assert(fb0->cursor_position.y == 0, "行も動かない");
+
+    /* 戻ってくると自分の格子から描き直され、カーソルも自分の位置に出る */
+    switch_active_frame_buffer(0);
+    assert(cell_shows_glyph(fb0, 0, 0, 'a', VBUF_COLOR_BG, VBUF_COLOR_FG) == 1,
+           "戻ってくると 'a' が描き直される");
+    assert(cell_count_color(fb0, 0, 3, VBUF_COLOR_FG) == CELL_PIXELS,
+           "カーソルは自分の面の位置(0,3)に出る");
+    /* 【陰性対照】他の面で動かした位置(5,7)にはカーソルが出ていない */
+    assert(cell_count_color(fb0, 5, 7, VBUF_COLOR_BG) == CELL_PIXELS,
+           "他の面のカーソル位置には何も出ない");
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -506,6 +819,16 @@ int main(int argc, char **argv) {
     test_set_cursor_snaps_back_to_bottom();
     test_clear_empties_both_grid_and_screen();
     test_clear_keeps_history();
+
+    /* [#227] 画素を見る試験。カーソルがセルの中身を壊していないことを
+       fb->buffer から直接確かめる(それまで画素の計器は0件だった) */
+    test_pixels_written_char_is_fg_on_bg();
+    test_pixels_cursor_shows_the_char_underneath();
+    test_pixels_moving_cursor_leaves_the_char_behind();
+    test_pixels_cursor_on_blank_cell_is_a_solid_block();
+    test_pixels_backspace_clears_grid_and_screen();
+    test_pixels_cursor_not_drawn_while_scrolled_back();
+    test_cursor_is_per_buffer_not_shared();
 
     free(g_pixels);
     free(g_content);
