@@ -223,19 +223,21 @@ asm(
 );
 
 
-/** アクティブなプロセスの画面上でカーソルを1文字分戻し、その位置を消す */
+/**
+ * アクティブなプロセスの画面上でカーソルを1文字分戻し、その位置を消す。
+ *
+ * [#227] **消すのは framebuffer.c の仕事にした。** ここは以前
+ * 「erase_cursor でセルを黒く塗る」ことで文字を消していたが、
+ *   - erase_cursor はカーソルを消す口であって文字を消す口ではない
+ *     (いまは格子から文字を描き直すので、その使い方では消えない)
+ *   - **格子を更新していなかった**ので、消した文字は content に残り、
+ *     面を切り替えて戻ると復活していた
+ * の 2 つが壊れていた。os_vbuf_backspace が格子と画素の両方を消す。
+ * あわせて、この動きが**母艦の単体試験から見られる**ようになった
+ * (このファイルは GDT/IDT を抱えていてリンクできない。#216 と同じ分担)
+ */
 static void backspace(void) {
-    frame_buffer *fb = get_active_frame_buffer();
-    if (fb->cursor_position.x <= 0) {
-        return;
-    }
-    fb->erase_cursor(fb);
-
-    // clear prev char
-    fb->cursor_position.x -= 1;
-    fb->erase_cursor(fb);
-
-    fb->draw_cursor(fb);
+    os_vbuf_backspace(get_active_frame_buffer());
 }
 
 /**

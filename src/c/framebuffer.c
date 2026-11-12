@@ -9,6 +9,8 @@ static frame_buffer frame_buffers[VBUF_COUNT];
 static UINT32 active_index = 0;
 
 static void render_frame_buffer(frame_buffer *self);
+/* カーソルの描画が格子を引けるように前方宣言する(定義は履歴リングの節にある) */
+static UINT8 *content_screen_row(const frame_buffer *self, UINT32 row);
 
 
 /**
@@ -63,8 +65,56 @@ static void draw_char(volatile UINT32 *buffer, UINT32 pixels_per_scanline, UINT3
     }
 }
 
+/* ============================== カーソル(#227) ==============================
+ * **カーソルはセルの中身を壊してはならない。**
+ *
+ * 直す前は draw_cursor が 8x16 を真っ白で塗るだけ、erase_cursor が真っ黒で塗る
+ * だけだった。draw_char(:50-64)は**立っているビットだけを塗り、背景には触らない**
+ * ので、この 2 つはこう壊れていた(利用者が実機のエディタで踏んだ。#227):
+ *   - カーソルの下の文字が白い矩形に潰れて見えない
+ *   - カーソルが通り過ぎたマスは黒いまま残り、文字が画面から消える
+ *     (格子は壊れていないので、その行に何か入力すると描き直されて復活する)
+ *
+ * だから**どちらも格子から文字を引いて描き直す**。カーソルの位置は反転表示
+ * (白地に黒)にする —— 端末ソフトの標準的な見た目であり、1 マス 1 バイト・
+ * 色なしの格子のままできる。
+ */
+
+/** セル1つ(8x16)を単色で塗る */
+static void fill_cell(frame_buffer *self, UINT32 x, UINT32 y, UINT32 color) {
+    for (UINT32 row = 0; row < VBUF_GLYPH_HEIGHT; row++) {
+        for (UINT32 col = 0; col < VBUF_GLYPH_WIDTH; col++) {
+            self->buffer[(y + row) * self->pixels_per_scanline + (x + col)] = color;
+        }
+    }
+}
+
 /**
- * カーソルを表示する。さかのぼって表示している最中はカーソルの実位置が
+ * カーソル位置の格子にある文字を返す。何も書かれていなければ 0。
+ *
+ * **格子の初期値は 0 であり、空白文字 ' '(0x20)とは別の値である**
+ * (clear_logical_row / os_vbuf_clear / initialize_virtual_buffers がいずれも 0 で
+ * 埋める。アプリが空白で塗ると 0x20 が入るので、両方が現れる)。
+ * **0 のときは字形を引かない。** render_frame_buffer が格子を描くときの判定
+ * (`if (c != 0)`、:437)と同じにして、「格子の 0 は描かない」を 1 つの約束に揃える。
+ *
+ * なお font8x16[0x00] と font8x16[0x20] は**どちらも 16 バイトすべて 0** である
+ * ことを確かめた(src/c/font8x16.h。表は tools/gen_font.py が spleen から生成する)。
+ * つまり今のフォントでは描いても画素は変わらない。それでも 0 を弾いておくのは、
+ * フォント表が差し替わったときに**未書き込みのマスに 0x00 の字形が出る**ことを
+ * 防ぐためである。
+ * @param self frame buffer
+ * @return カーソル位置の文字(空なら0)
+ */
+static UINT8 cursor_cell_char(const frame_buffer *self) {
+    if (self->cursor_position.y >= self->rows || self->cursor_position.x >= self->cols) {
+        return 0;
+    }
+    return content_screen_row(self, self->cursor_position.y)[self->cursor_position.x];
+}
+
+/**
+ * カーソルを**反転表示**で描く。さかのぼって表示している最中はカーソルの実位置が
  * 窓の外にあるため描かない
  * @param self frame buffer
  */
@@ -74,15 +124,16 @@ static void draw_cursor(frame_buffer *self) {
     }
     UINT32 x = cursor_x(self);
     UINT32 y = cursor_y(self);
-    for (UINT32 row = 0; row < VBUF_GLYPH_HEIGHT; row++) {
-        for (UINT32 col = 0; col < VBUF_GLYPH_WIDTH; col++) {
-            self->buffer[(y + row) * self->pixels_per_scanline + (x + col)] = 0x00FFFFFF;
-        }
+    fill_cell(self, x, y, VBUF_COLOR_FG);
+    UINT8 c = cursor_cell_char(self);
+    if (c != 0) {
+        /* 白で塗ったあと**同じ文字を黒で**描く。これで下の文字が見える */
+        draw_char(self->buffer, self->pixels_per_scanline, x, y, (char)c, VBUF_COLOR_BG);
     }
 }
 
 /**
- * カーソルを消す
+ * カーソルを消し、**そのマスの文字を描き直す**
  * @param self frame buffer
  */
 static void erase_cursor(frame_buffer *self) {
@@ -91,10 +142,11 @@ static void erase_cursor(frame_buffer *self) {
     }
     UINT32 x = cursor_x(self);
     UINT32 y = cursor_y(self);
-    for (UINT32 row = 0; row < VBUF_GLYPH_HEIGHT; row++) {
-        for (UINT32 col = 0; col < VBUF_GLYPH_WIDTH; col++) {
-            self->buffer[(y + row) * self->pixels_per_scanline + (x + col)] = 0x00000000;
-        }
+    fill_cell(self, x, y, VBUF_COLOR_BG);
+    UINT8 c = cursor_cell_char(self);
+    if (c != 0) {
+        /* 黒で塗っただけで戻ると、通り過ぎたマスの文字が消える(#227 の症状1) */
+        draw_char(self->buffer, self->pixels_per_scanline, x, y, (char)c, VBUF_COLOR_FG);
     }
 }
 
@@ -112,7 +164,7 @@ static void scroll_up(frame_buffer *self) {
     }
     for (; y < self->height; y++) {
         for (UINT32 x = 0; x < self->width; x++) {
-            self->buffer[y * self->pixels_per_scanline + x] = 0x00000000;
+            self->buffer[y * self->pixels_per_scanline + x] = VBUF_COLOR_BG;
         }
     }
 }
@@ -241,12 +293,12 @@ static void draw_scroll_indicator(frame_buffer *self) {
     /* 最終行を一度黒で塗ってから描く(下の本文と重ならないように) */
     for (UINT32 row = 0; row < VBUF_GLYPH_HEIGHT; row++) {
         for (UINT32 x = 0; x < self->width; x++) {
-            self->buffer[(y + row) * self->pixels_per_scanline + x] = 0x00000000;
+            self->buffer[(y + row) * self->pixels_per_scanline + x] = VBUF_COLOR_BG;
         }
     }
     for (UINT32 i = 0; i < pos && i < self->cols; i++) {
         draw_char(self->buffer, self->pixels_per_scanline,
-                  i * VBUF_GLYPH_WIDTH, y, text[i], 0x00FFFFFF);
+                  i * VBUF_GLYPH_WIDTH, y, text[i], VBUF_COLOR_FG);
     }
 }
 
@@ -329,7 +381,7 @@ static void write_char(frame_buffer *self, UINT8 c) {
 
     content_put(self, self->cursor_position.x, self->cursor_position.y, c);
     if (is_active(self)) {
-        draw_char(self->buffer, self->pixels_per_scanline, cursor_x(self), cursor_y(self), (char)c, 0x00FFFFFF);
+        draw_char(self->buffer, self->pixels_per_scanline, cursor_x(self), cursor_y(self), (char)c, VBUF_COLOR_FG);
     }
     self->cursor_position.x += 1;
     /* 桁数ちょうどで折り返す。以前はピクセル数で `> width` と比較しており、
@@ -362,7 +414,7 @@ static void write_string(frame_buffer *self, const char *s) {
 static void clear_screen(frame_buffer *self) {
     for (UINT32 y = 0; y < self->height; y++) {
         for (UINT32 x = 0; x < self->width; x++) {
-            self->buffer[y * self->pixels_per_scanline + x] = 0x00000000;
+            self->buffer[y * self->pixels_per_scanline + x] = VBUF_COLOR_BG;
         }
     }
 }
@@ -384,7 +436,7 @@ static void render_frame_buffer(frame_buffer *self) {
             UINT8 c = row[x];
             if (c != 0) {
                 draw_char(self->buffer, self->pixels_per_scanline,
-                          x * VBUF_GLYPH_WIDTH, y * VBUF_GLYPH_HEIGHT, (char)c, 0x00FFFFFF);
+                          x * VBUF_GLYPH_WIDTH, y * VBUF_GLYPH_HEIGHT, (char)c, VBUF_COLOR_FG);
             }
         }
     }
@@ -491,6 +543,40 @@ void os_vbuf_clear(frame_buffer *self) {
         clear_screen(self);
         draw_cursor(self);
     }
+}
+
+/*
+ * [#227] カーソルの手前の 1 文字を消す。**格子と画素の両方**を消す。
+ *
+ * これを framebuffer.c に移したのには 2 つ理由がある。
+ *
+ * (1) 直す前は interrupt.c の backspace() が erase_cursor を
+ *     「セルを黒く塗る道具」として使っていた(interrupt.c:232-238)。
+ *     erase_cursor が文字を描き直すようになると、その使い方では
+ *     **消したはずの文字がその場で描き直されてしまう。**
+ * (2) そもそも直す前には別の食い違いもあった: **格子を更新していなかった**ので、
+ *     消した文字は content に残り、面を切り替えて戻る/さかのぼって戻ると
+ *     render_frame_buffer が描き直して**復活していた**(os_vbuf_clear の
+ *     コメントが書いているのと同じ食い違いである)。
+ *
+ * 消す責任をこの層に持たせると、母艦の単体試験から呼べるようにもなる
+ * (interrupt.c は GDT/IDT と手書きアセンブラを抱えていてリンクできない。#216 と同じ分担)。
+ */
+int os_vbuf_backspace(frame_buffer *self) {
+    if (self->cursor_position.x == 0) {
+        /* 行頭では消さない。プロンプト自体を食ってしまうため(従来どおり) */
+        return 0;
+    }
+    if (is_active(self)) {
+        erase_cursor(self);   /* いまのカーソルの跡を消す(下に文字があれば描き直される) */
+    }
+    self->cursor_position.x -= 1;
+    content_put(self, self->cursor_position.x, self->cursor_position.y, 0);
+    if (is_active(self)) {
+        /* 格子を空にしたので、ここの draw_cursor は白い矩形だけを描く */
+        draw_cursor(self);
+    }
+    return 1;
 }
 
 UINT32 os_vbuf_effective_hist_rows(UINT32 height, UINT32 hist_rows) {

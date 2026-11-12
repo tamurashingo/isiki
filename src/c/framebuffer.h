@@ -12,6 +12,14 @@
 #define VBUF_GLYPH_HEIGHT 16
 
 /**
+ * 文字色と背景色。**ヘッダに出してあるのは試験が同じ定義を見るためである**(#227)。
+ * それまで framebuffer.c の中に同じリテラルが 6 箇所あり、画素を見る試験は
+ * 1 件も無かった(だから白い矩形が文字を潰していることを誰も見ていなかった)。
+ */
+#define VBUF_COLOR_FG 0x00FFFFFFu
+#define VBUF_COLOR_BG 0x00000000u
+
+/**
  * 1バッファあたりの履歴行数の既定値。
  * 実測で (disassemble 'dis-caller) が見出し込み約253行、物理画面が50行なので、
  * 逆アセンブル3〜4回分が遡れる。1280x800(160桁)の場合、
@@ -233,6 +241,15 @@ int os_vbuf_cell(const frame_buffer *self, UINT32 row, UINT32 col, UINT8 *out_ch
  * @param self frame buffer
  */
 void os_vbuf_clear(frame_buffer *self);
+
+/**
+ * [#227] カーソルの手前の1文字を消し、カーソルを1桁戻す。
+ * **格子と物理画面の両方**を消すので、面を切り替えて戻っても消した文字は復活しない。
+ * カーソルの下の文字は反転表示で描き直される。
+ * @param self frame buffer
+ * @return 消したら1、行頭で何もしなかったら0
+ */
+int os_vbuf_backspace(frame_buffer *self);
 
 
 #endif /* _FRAMEBUFFER_H_ */
