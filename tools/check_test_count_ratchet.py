@@ -221,6 +221,13 @@ COUNTS = (
     # 件数は手で数えていない(規則 13)。出どころは
     #     python3 tools/census_test_counts.py --detail --static test/lisp/qemu_boot_app_filer.lisp
     ("test/lisp/qemu_boot_app_filer.lisp", 182, "isiki", (ALL, CI)),
+    # [#218] 初期アプリ: エディタ(表示・カーソル・挿入削除・分割結合・保存)。
+    # **新しく足した段**で、既存の段の件数は 1 つも動かしていない。
+    # 内訳は下の FILES に 2 本ある(44 + 145 = 189 に、ファイルの出口の検査
+    # 2 本 x 2 件 = 4 を足した 193)。
+    # 件数は手で数えていない(規則 13)。出どころは
+    #     python3 tools/census_test_counts.py --detail --static test/lisp/qemu_boot_app_editor.lisp
+    ("test/lisp/qemu_boot_app_editor.lisp", 193, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_error_escape_gc.lisp", 381, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_m5_ide.lisp", 7, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 185, "isiki", (ALL, CI)),
@@ -434,6 +441,11 @@ FILES = {
     "test/lisp/qemu_boot_app_filer.lisp": (0, (
         ("test/lisp/filer_app_disk_test.lisp", 47),
         ("test/lisp/filer_test.lisp", 131),
+    )),
+    # test/lisp/qemu_boot_app_editor.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 193 件
+    "test/lisp/qemu_boot_app_editor.lisp": (0, (
+        ("test/lisp/editor_app_disk_test.lisp", 44),
+        ("test/lisp/editor_test.lisp", 145),
     )),
     # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 381 件
     "test/lisp/qemu_boot_error_escape_gc.lisp": (4, (
@@ -1313,6 +1325,15 @@ WIRING_KINDS = {
 #     その段が `isiki-test-load` で読む
 # **既存の配線は 1 つも変えていない。**
 #
+# [2026-11-12 / #218] **3 本足した**(初期アプリ: エディタ)。
+#   - `test/lisp/qemu_boot_app_editor.lisp` …… `make test-qemu-all` と CI の両方へ
+#     段として足した(Makefile の test-qemu-all-stages と .github/workflows/ci.yml)。
+#     **CI にも段を入れたのは、#218 の完了条件が「文字列入力ストリームを渡した
+#     試験が CI で走る」だからである**(`test-qemu-all` だけでは足りない)
+#   - `test/lisp/editor_app_disk_test.lisp` / `test/lisp/editor_test.lisp` ……
+#     その段が `isiki-test-load` で読む
+# **既存の配線は 1 つも変えていない。**
+#
 WIRING = (
     ("test/bench/estimator_fixture.tsv", ("fixture:tools/bench/check_estimator.sh",)),
     ("test/c/clock_test.c", ("hostbuild:TEST_SRC_CLOCK",)),
@@ -1380,6 +1401,8 @@ WIRING = (
     ("test/lisp/fat32_test.lisp", ("loaded",)),
     ("test/lisp/fat_callback_transfer_test.lisp", ("loaded",)),
     ("test/lisp/file_cmd_test.lisp", ("loaded",)),
+    ("test/lisp/editor_app_disk_test.lisp", ("loaded",)),
+    ("test/lisp/editor_test.lisp", ("loaded",)),
     ("test/lisp/filer_app_disk_test.lisp", ("loaded",)),
     ("test/lisp/filer_test.lisp", ("loaded",)),
     ("test/lisp/fixnum_signed_arith_test.lisp", ("loaded",)),
@@ -1431,6 +1454,7 @@ WIRING = (
     ("test/lisp/qemu_boot_abi_bench.lisp", ("all",)),
     ("test/lisp/qemu_boot_alloc_audit.lisp", ("manual:test-qemu-alloc-audit",)),
     ("test/lisp/qemu_boot_alloc_breakdown.lisp", ("manual:test-qemu-alloc-breakdown",)),
+    ("test/lisp/qemu_boot_app_editor.lisp", ("all", "ci",)),
     ("test/lisp/qemu_boot_app_filer.lisp", ("all", "ci",)),
     ("test/lisp/qemu_boot_app_inspect.lisp", ("all", "ci",)),
     ("test/lisp/qemu_boot_app_pager.lisp", ("all", "ci",)),
