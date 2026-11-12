@@ -1479,6 +1479,16 @@ test-qemu-all:
 # **CI でも走る**(ci.yml 側にも段がある。#216 の完了条件に
 # 「試験を #204 の名簿に入れ(all と ci の両方)」があるため)。
 #
+# [#218] **エディタの段(qemu_boot_app_editor.lisp)はファイラの直後に置く。**
+# 要るものはファイラと同じ(アプリ専用の円盤だけ)で QEMU_DISK_IMG の上書きは
+# 要らない。ファイラの**後**に置いたのは、エディタが #216 の口に加えて
+# **保存の経路(#199)**まで使う唯一のアプリで、落ちたときに
+# 「土台か、ファイラか、エディタか」を段の順で切り分けられるからである。
+# **CI でも走る**(ci.yml 側にも段がある。#218 の完了条件に
+# 「文字列入力ストリームを渡した試験が CI で走る」があるため)。
+# この段は**円盤へ書かない**(保存の試験は母艦共有の /9p/tmp/ を使う。
+# アプリ専用の円盤は段をまたいで共有されるので、1 件でも足すとファイラが落ちる)。
+#
 # [#217] **ファイラの段(qemu_boot_app_filer.lisp)は端末の土台の直後に置く。**
 # 要るものはページャ・inspect と同じ(アプリ専用の円盤だけ)で QEMU_DISK_IMG の
 # 上書きは要らず、順序の制約も無い。土台の**後**に置いたのは、ファイラが
@@ -1495,6 +1505,7 @@ test-qemu-all-stages:
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_inspect.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_term.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_filer.lisp
+	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_app_editor.lisp
 	$(MAKE) test-qemu-error-escape-gc
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m5_ide.lisp
 	$(MAKE) test-qemu-milestone MILESTONE=test/lisp/qemu_boot_m6_fat16.lisp QEMU_DISK_IMG=tmp/fat16_test.img

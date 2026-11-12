@@ -33,7 +33,12 @@
 ;; **アプリ専用の円盤(/app)へ書いてはならない。** あの円盤は make が 1 度だけ
 ;; 焼いて**段をまたいで共有する**ので、1 件でも足すと
 ;; test/lisp/filer_app_disk_test.lisp の「/app は 7 件」が別の段で落ちる。
-;; 母艦共有の `tmp/` なら使い捨てで、ほかの段が中身を見ていない。
+;; 母艦共有の `/9p/tmp/` なら使い捨てで、ほかの段が中身を見ていない。
+;;
+;; **母艦共有は `/9p` に在る**(src/c/mount.c:15 の `MOUNT_9P_PREFIX`)。
+;; `load` は先頭に区切りの無い名前を母艦共有として扱うが、
+;; **ファイルのストリームはマウント表で引く**ので `/9p/` を書かないと解決できない
+;; (test/lisp/aot_leaf_gc_test.lisp などが同じ書き方をしている)。
 ;;
 ;; ★ **したがって「FAT 上の既存ファイルを上書きする」経路はここでは通っていない。**
 ;; 同じ `with-open-output-file` の口を使っており、FAT 側の上書き(#199)は
@@ -310,26 +315,26 @@
 ;;;     **見分けられないものを編集させない。**
 ;;; ---------------------------------------------------------------------------
 
-(defglobal *et-f3* "tmp/editor_ci_3lines.txt")
+(defglobal *et-f3* "/9p/tmp/editor_ci_3lines.txt")
 (assert-equal t (et-put *et-f3* (list "alpha" "beta" "gamma") t))
 (assert-equal (list "alpha" "beta" "gamma") (%ed-read-lines *et-f3*))
 
 ;; 空のファイルでも **1 行(空文字列)** を返す(カーソルの載る行が要る)
-(defglobal *et-f0* "tmp/editor_ci_empty.txt")
+(defglobal *et-f0* "/9p/tmp/editor_ci_empty.txt")
 (assert-equal t (et-put *et-f0* nil nil))
 (assert-equal (list "") (%ed-read-lines *et-f0*))
 
 ;; ★ 末尾に改行が無くても同じ結果になる = **区別が読んだ時点で失われる**
-(defglobal *et-fnn* "tmp/editor_ci_nonl.txt")
+(defglobal *et-fnn* "/9p/tmp/editor_ci_nonl.txt")
 (assert-equal t (et-put *et-fnn* (list "alpha" "beta") nil))
 (assert-equal (list "alpha" "beta") (%ed-read-lines *et-fnn*))
 
 ;; **511 文字以上の行があったら開かない**
-(defglobal *et-flong* "tmp/editor_ci_long.txt")
+(defglobal *et-flong* "/9p/tmp/editor_ci_long.txt")
 (assert-equal t (et-put *et-flong* (list (create-string 600 #\a)) t))
 (assert-equal 'ed-too-long (%ed-read-lines *et-flong*))
 ;; 510 文字は通る(**境界のすぐ下。陰性対照**)
-(defglobal *et-f510* "tmp/editor_ci_510.txt")
+(defglobal *et-f510* "/9p/tmp/editor_ci_510.txt")
 (assert-equal t (et-put *et-f510* (list (create-string 510 #\b)) t))
 (assert-equal 510 (length (car (%ed-read-lines *et-f510*))))
 
@@ -350,7 +355,7 @@
 ;;;     **各行の後ろに改行を 1 つ書く**(最後の行も)。
 ;;; ---------------------------------------------------------------------------
 
-(defglobal *et-frt* "tmp/editor_ci_roundtrip.txt")
+(defglobal *et-frt* "/9p/tmp/editor_ci_roundtrip.txt")
 (assert-equal t (%ed-write-lines *et-frt* (list "one" "two")))
 (assert-equal (list "one" "two") (et-get *et-frt*))
 ;; 空の行も残る
@@ -478,8 +483,8 @@
 ;;;     のほうである。
 ;;; ---------------------------------------------------------------------------
 
-(defglobal *et-fsv* "tmp/editor_ci_save.txt")
-(defglobal *et-fsv-bak* "tmp/editor_ci_save.BAK")
+(defglobal *et-fsv* "/9p/tmp/editor_ci_save.txt")
+(defglobal *et-fsv-bak* "/9p/tmp/editor_ci_save.BAK")
 (assert-equal t (et-put *et-fsv* (list "alpha" "beta" "gamma") t))
 
 (defglobal *et-c16*
@@ -549,7 +554,12 @@
 (assert-equal (list 'editor-quit 0 0 3) (car *et-c18*))
 
 ;; 変更があると 1 回目は止まる(**打鍵が尽きて終わる = やめていない**)
-(defglobal *et-c19* (et-run 3 20 *et-f3* (string-append "X" *et-quit*)))
+;;
+;; **ここだけ桁を 40 にしてある。** 聞き返しの文面は
+;; "L1 C2 of 3 * modified! C-q again to quit" でちょうど 40 桁あり、
+;; 20 桁だと合図が切り詰められて文面が画面に出ない(**切り詰め自体は正しい
+;; 振る舞い**なので、試験の側を実際の幅に合わせる)
+(defglobal *et-c19* (et-run 3 40 *et-f3* (string-append "X" *et-quit*)))
 (assert-equal (list 'editor-eof 1 0 3) (car *et-c19*))
 (assert-equal t (et-has "C-q again to quit" (car (cdr *et-c19*))))
 

@@ -267,10 +267,10 @@
 
 (defglobal *fl-entries* (%filer-list "/app"))
 
-(assert-equal 6 (%filer-length *fl-entries*))
+(assert-equal 7 (%filer-length *fl-entries*))
 (assert-equal "NOTES" (%filer-entry-name (%filer-nth *fl-entries* 0)))
 (assert-equal t (%filer-dir-p (%filer-nth *fl-entries* 0)))
-(assert-equal "filer.lisp" (%filer-entry-name (%filer-nth *fl-entries* 1)))
+(assert-equal "editor.lisp" (%filer-entry-name (%filer-nth *fl-entries* 1)))
 (assert-equal nil (%filer-dir-p (%filer-nth *fl-entries* 1)))
 ;; 割り当てが無い場所は nil(= 入れない)
 (assert-equal nil (%filer-list "/no-such-mount"))
@@ -283,26 +283,30 @@
 ;;;
 ;;;     **陰性対照がここに 3 つ入っている:**
 ;;;       - 記号を全行に置く実装 … `"> "` が 1 個でないので落ちる
-;;;       - 一覧を出さない実装 … 行の本数(見出し 1 + 6 件 + 合図 1 = 8)で落ちる
+;;;       - 一覧を出さない実装 … 行の本数(見出し 1 + 7 件 + 合図 1 = 9)で落ちる
+;;;
+;;;     [#218] 件数が 6 から 7 になったのは apps/editor.lisp が増えたからである
+;;;     (`/app` の中身は `$(wildcard apps/*.lisp)`)。**題材が変わっただけで、
+;;;     期待値を緩めてはいない**(規則 16)。
 ;;;       - 種別を出さない実装 … `"<DIR>"` で落ちる
 ;;; ---------------------------------------------------------------------------
 
 (defglobal *fl-c1* (fl-run 16 "/app" ""))
 
 (assert-equal (list 'filer-eof 0 0 "/app") (car *fl-c1*))
-(assert-equal 0 (string-index "/app  6 items" (car (cdr *fl-c1*))))
+(assert-equal 0 (string-index "/app  7 items" (car (cdr *fl-c1*))))
 (assert-equal 1 (fl-count "> " (car (cdr *fl-c1*))))
 (assert-equal t (fl-has "> NOTES  <DIR>" (car (cdr *fl-c1*))))
 (assert-equal t (fl-has "  filer.lisp  " (car (cdr *fl-c1*))))
 (assert-equal t (fl-has "up/down enter u=up q=quit" (car (cdr *fl-c1*))))
-(assert-equal 8 (fl-lines (car (cdr *fl-c1*))))
+(assert-equal 9 (fl-lines (car (cdr *fl-c1*))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 12. 【完了条件】上下に選択を動かせる
 ;;;
 ;;;     矢印(#216 の `*key-down*` / `*key-up*`)と j/k の両方で動く。
 ;;;     **2 画面ぶんの文字で見る**: 1 画面目は NOTES に記号、2 画面目は
-;;;     filer.lisp に記号 —— つまり**記号が動いている。**
+;;;     editor.lisp に記号 —— つまり**記号が動いている。**
 ;;;
 ;;;     矢印が文字として届くことは test/c/keymap_test.c と
 ;;;     test/lisp/term_test.lisp §5 が見ている。
@@ -313,21 +317,21 @@
 (assert-equal (list 'filer-quit 1 0 "/app") (car *fl-c2*))
 (assert-equal 2 (fl-count "> " (car (cdr *fl-c2*))))
 (assert-equal t (fl-has "> NOTES  <DIR>" (car (cdr *fl-c2*))))
-(assert-equal t (fl-has "> filer.lisp  " (car (cdr *fl-c2*))))
+(assert-equal t (fl-has "> editor.lisp  " (car (cdr *fl-c2*))))
 (assert-equal t (fl-has "  NOTES  <DIR>" (car (cdr *fl-c2*))))
 
 ;; j/k も同じように効く(2 つ下げて 1 つ戻す = 選択は 1 つ下)
 (defglobal *fl-c3* (fl-run 16 "/app" "jjkq"))
 
 (assert-equal (list 'filer-quit 3 0 "/app") (car *fl-c3*))
-(assert-equal t (fl-has "> filer.lisp  " (car (cdr *fl-c3*))))
+(assert-equal t (fl-has "> editor.lisp  " (car (cdr *fl-c3*))))
 ;; 上向きの矢印も同じ(j で下げてから矢印で戻す)
 (defglobal *fl-c4*
   (fl-run 16 "/app" (string-append "j" (string-append (create-string 1 *key-up*) "q"))))
 (assert-equal (list 'filer-quit 2 0 "/app") (car *fl-c4*))
-;; 3 画面出て、1 画面目と 3 画面目が NOTES を選んでいる(2 画面目は filer.lisp)
+;; 3 画面出て、1 画面目と 3 画面目が NOTES を選んでいる(2 画面目は editor.lisp)
 (assert-equal 2 (fl-count "> NOTES  <DIR>" (car (cdr *fl-c4*))))
-(assert-equal 1 (fl-count "> filer.lisp  " (car (cdr *fl-c4*))))
+(assert-equal 1 (fl-count "> editor.lisp  " (car (cdr *fl-c4*))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 13. 端では断る(**動いた回数に数えない**)
@@ -404,7 +408,7 @@
 (defglobal *fl-c11* (fl-run 16 "/app/NOTES" "uq"))
 
 (assert-equal (list 'filer-quit 1 0 "/app") (car *fl-c11*))
-(assert-equal t (fl-has "/app  6 items" (car (cdr *fl-c11*))))
+(assert-equal t (fl-has "/app  7 items" (car (cdr *fl-c11*))))
 
 ;; 左向きの矢印も同じ
 (defglobal *fl-c12*
@@ -414,7 +418,7 @@
 ;; ".." を選んで入る(先頭の "." の次なので 1 つ下げてから改行)
 (defglobal *fl-c13* (fl-run 16 "/app/NOTES" (string-append "j" (string-append *fl-nl* "q"))))
 (assert-equal (list 'filer-quit 2 0 "/app") (car *fl-c13*))
-(assert-equal t (fl-has "/app  6 items" (car (cdr *fl-c13*))))
+(assert-equal t (fl-has "/app  7 items" (car (cdr *fl-c13*))))
 
 ;; "." を選んで入ると同じ場所に留まる(見出しが伸びない)
 (defglobal *fl-c14* (fl-run 16 "/app/NOTES" (string-append *fl-nl* "q")))
@@ -433,7 +437,7 @@
 
 (assert-equal (list 'filer-quit 0 0 "/app") (car *fl-c15*))
 (assert-equal t (fl-has "/: cannot read" (car (cdr *fl-c15*))))
-(assert-equal t (fl-has "/app  6 items" (car (cdr *fl-c15*))))
+(assert-equal t (fl-has "/app  7 items" (car (cdr *fl-c15*))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 18. 【完了条件】ファイルを選んで **pager-run** で開く

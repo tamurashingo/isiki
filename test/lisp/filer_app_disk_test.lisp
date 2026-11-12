@@ -95,12 +95,12 @@
 
 (defglobal *fd-entries* (%filer-list "/app"))
 
-(assert-equal 6 (%filer-length *fd-entries*))
+(assert-equal 7 (%filer-length *fd-entries*))
 (assert-equal "NOTES" (%filer-entry-name (%filer-nth *fd-entries* 0)))
 (assert-equal t (%filer-dir-p (%filer-nth *fd-entries* 0)))
 ;; **陰性対照: すべてディレクトリと答える実装では通らない**
 (assert-equal nil (%filer-dir-p (%filer-nth *fd-entries* 1)))
-(assert-equal "filer.lisp" (%filer-entry-name (%filer-nth *fd-entries* 1)))
+(assert-equal "editor.lisp" (%filer-entry-name (%filer-nth *fd-entries* 1)))
 ;; NOTES の中身(3 件 = "." / ".." / NOTE.TXT)。大きさは 11 バイト("alpha\nbeta\n")
 (defglobal *fd-notes* (%filer-list "/app/NOTES"))
 (assert-equal 3 (%filer-length *fd-notes*))
@@ -139,8 +139,12 @@
 ;;;      行 0        見出し(場所と項目数)
 ;;;      行 1        選択中の項目。**頭に "> " が在る**
 ;;;      行 2        次の項目。**頭は空白**(= 記号を全行に置いていない)
-;;;      行 7        合図(6 件 + 見出し 1 の下)
-;;;      行 8        **空**(= 合図の行より下を書いていない)
+;;;      行 8        合図(7 件 + 見出し 1 の下)
+;;;      行 9        **空**(= 合図の行より下を書いていない)
+;;;
+;;;    [#218] **行が 1 つ下がったのは apps/editor.lisp が増えたからである。**
+;;;    `/app` の中身は `$(wildcard apps/*.lisp)` で決まるので、アプリを足すと
+;;;    ここが動く。**期待値を上げたのではなく、題材が変わった**(規則 16)。
 ;;;
 ;;;    **陰性対照がこの 5 行に入っている:**
 ;;;      - 位置を無視して上から流す実装 … 行 0 以外が空白になり落ちる
@@ -155,14 +159,14 @@
           (%fd-row 0 13)
           (%fd-row 1 14)
           (%fd-row 2 14)
-          (%fd-row 7 25)
-          (%fd-row 8 8))))
+          (%fd-row 8 25)
+          (%fd-row 9 8))))
 
 ;; 1 画面描いて、打鍵が尽きて終わった(動いた回数 0・開いた本数 0・場所は /app)
 (assert-equal (list 'filer-eof 0 0 "/app") (elt *fd-screen1* 0))
-(assert-equal "/app  6 items" (elt *fd-screen1* 1))
+(assert-equal "/app  7 items" (elt *fd-screen1* 1))
 (assert-equal "> NOTES  <DIR>" (elt *fd-screen1* 2))
-(assert-equal "  filer.lisp  " (elt *fd-screen1* 3))
+(assert-equal "  editor.lisp " (elt *fd-screen1* 3))
 (assert-equal "up/down enter u=up q=quit" (elt *fd-screen1* 4))
 (assert-equal "        " (elt *fd-screen1* 5))
 
@@ -170,7 +174,7 @@
 ;; 枠組みは落ちた件だけを印字するので、通っているあいだ「何が返ったか」が
 ;; ログに出ない。画面の検査は #217 の完了条件そのものなので、値を行で残す
 (format *isiki-test-stream*
-        "#filer screen rows=~D cols=~D row0=~S row1=~S row2=~S row7=~S row8=~S~%"
+        "#filer screen rows=~D cols=~D row0=~S row1=~S row2=~S row8=~S row9=~S~%"
         (term-rows) (term-cols)
         (elt *fd-screen1* 1) (elt *fd-screen1* 2) (elt *fd-screen1* 3)
         (elt *fd-screen1* 4) (elt *fd-screen1* 5))
@@ -198,7 +202,7 @@
 
 (assert-equal (list 'filer-eof 1 0 "/app") (elt *fd-screen2* 0))
 (assert-equal "  NOTES  <DIR>" (elt *fd-screen2* 1))
-(assert-equal "> filer.lisp  " (elt *fd-screen2* 2))
+(assert-equal "> editor.lisp " (elt *fd-screen2* 2))
 
 (format *isiki-test-stream*
         "#filer move row1=~S row2=~S~%" (elt *fd-screen2* 1) (elt *fd-screen2* 2))
@@ -271,7 +275,7 @@
 (assert-equal nil (term-raw-input t))
 (assert-equal t (term-raw-input nil))
 
-;; 打鍵: 1 つ下げて(filer.lisp を選ぶ)改行。**ファイルなので開こうとする**
+;; 打鍵: 1 つ下げて(editor.lisp を選ぶ)改行。**ファイルなので開こうとする**
 (defglobal *fd-open-keys*
   (string-append (create-string 1 *key-down*)
                  (string-append (create-string 1 #\newline) "qq")))
@@ -314,7 +318,7 @@
 ;;;    皮は実画面から行数と桁数を決めるので、**実機の寸法で一度も通していない
 ;;;    経路を残さない**ためである。
 ;;;
-;;;    打鍵 4 つの行き先: 下(選択を filer.lisp へ)→ 改行(開く)→
+;;;    打鍵 4 つの行き先: 下(選択を editor.lisp へ)→ 改行(開く)→
 ;;;    q(**ページャ**が頁の合図として読んでやめる)→ q(ファイラがやめる)。
 ;;;    **合図のストリームが 1 本であることがここに出ている。**
 ;;;
