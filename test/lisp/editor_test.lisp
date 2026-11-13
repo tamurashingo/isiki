@@ -72,6 +72,7 @@
 ;;   §23 知らないキーは何もしない
 ;;   §24 開けないファイルは signal(皮の unwind-protect の前提)
 ;;   §25 差分再描画が効いている(**出た行数で言う**)
+;;   §26 【#225】取りこぼしを合図の行で知らせる(**差し込んだ落ち数で言う**)
 
 ;;; ---------------------------------------------------------------------------
 ;;; 0. 道具立て
@@ -285,12 +286,25 @@
 ;;;     人に合わせて **1 から数える。**
 ;;; ---------------------------------------------------------------------------
 
-(assert-equal "L1 C1 of 3 - C-s=save C-q=quit" (%ed-status-text 0 0 3 nil nil))
-(assert-equal "L12 C3 of 40 * C-s=save C-q=quit" (%ed-status-text 11 2 40 t nil))
-(assert-equal "L2 C1 of 9 * saved" (%ed-status-text 1 0 9 t "saved"))
+(assert-equal "L1 C1 of 3 - C-s=save C-q=quit" (%ed-status-text 0 0 3 nil nil 0))
+(assert-equal "L12 C3 of 40 * C-s=save C-q=quit" (%ed-status-text 11 2 40 t nil 0))
+(assert-equal "L2 C1 of 9 * saved" (%ed-status-text 1 0 9 t "saved" 0))
+
+;; [#225] 取りこぼしの印。**0 のときは 1 文字も足さない**(上の 3 件が
+;; 1 桁もずれていないことが陰性対照である)。落ちたときだけ、変更の印の直後に出る
+(assert-equal "L1 C1 of 3 - !DROPPED 1 C-s=save C-q=quit"
+              (%ed-status-text 0 0 3 nil nil 1))
+(assert-equal "L12 C3 of 40 * !DROPPED 27 C-s=save C-q=quit"
+              (%ed-status-text 11 2 40 t nil 27))
+;; 合図(msg)が出ているときでも**印は消えない。** 印のほうが前にあるのは
+;; 桁が足りないときに切り落とされるのが末尾だからである(%ed-fit)
+(assert-equal "L2 C1 of 9 * !DROPPED 3 saved"
+              (%ed-status-text 1 0 9 t "saved" 3))
+;; **行番号と桁の位置は動いていない**(格子の試験が桁で読んでいる)
+(assert-equal t (et-has "L1 C1 of 3 - !" (%ed-status-text 0 0 3 nil nil 2)))
 ;; 変更の印は**常に 1 文字**(長さが変わると後ろの桁がずれて格子が読みにくい)
-(assert-equal t (et-has " - " (%ed-status-text 0 0 1 nil nil)))
-(assert-equal t (et-has " * " (%ed-status-text 0 0 1 t nil)))
+(assert-equal t (et-has " - " (%ed-status-text 0 0 1 nil nil 0)))
+(assert-equal t (et-has " * " (%ed-status-text 0 0 1 t nil 0)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 11. 控えの名前
@@ -636,3 +650,90 @@
 (format *isiki-test-stream*
         "#editor redraw lines: none=~D move=~D insert=~D split=~D unknown=~D~%"
         *et-r-none* *et-r-move* *et-r-ins* *et-r-split* *et-r-unk*)
+
+;;; ---------------------------------------------------------------------------
+;;; 26. [#225] 取りこぼしを合図の行で知らせる
+;;;
+;;;     **観測できるようにしただけでは、取りこぼしは静かなままである。**
+;;;     利用者が押しっぱなしで打鍵を落としたとき、**その場で気づける**ことが
+;;;     #225 の目的なので、核が落ち数を見ていることをここで機械的に言う。
+;;;
+;;;     ## 落ちる事実をどう起こすか —— **読み口を差し込む**
+;;;
+;;;     数を増やせるのはキーボード割り込みだけで、ゲストへキーを送る自動化は
+;;;     無い。つまり**本物の溢れは試験から起こせない。** そこで核は
+;;;     `*editor-drop-reader*`(nil なら実物)を通して数を読む形にしてある。
+;;;     ここでは**呼ばれるたびに 1 増える偽の読み口**を差し込む ——
+;;;     「1 打鍵ごとに 1 個落ちている」状況そのものである。
+;;;
+;;;     ★ **本物の割り込みで溢れてから印が出るまでを通した試験は無い。**
+;;;     ここが見るのは核の側(引き算と表示)で、C 側の計数は
+;;;     test/c/process_test.c が陽性対照つきで見ている。繋ぎ目(口 1 つ)は
+;;;     test/lisp/term_test.lisp §8 が読めることだけ確かめている。
+;;;
+;;;     **桁は 40 にしてある。** §25 までの 20 桁だと、印まで入れた合図が
+;;;     `%ed-fit` に切り落とされて**印そのものが画面から消える**
+;;;     (器は 1024 バイトだが、ここは全画面 1 枚 + 数行なので収まる)。
+;;;
+;;;     陰性対照を 2 つ置いた:
+;;;       - 差し込まない(= 実物。溢れていない)ときは**印が出ない**
+;;;       - 偽の読み口そのものが**本当に増えている**こと(増えない探針では
+;;;         「印が出ない」が探針の不具合と区別できない)
+;;; ---------------------------------------------------------------------------
+
+;; 探針の陰性対照: 呼ぶたびに 1 増えることを先に確かめる
+(defglobal *et-probe-drop* (let ((n 0)) (lambda () (setq n (+ n 1)) n)))
+(assert-equal 1 (funcall *et-probe-drop*))
+(assert-equal 2 (funcall *et-probe-drop*))
+(assert-equal 3 (funcall *et-probe-drop*))
+
+;; 本番用(上とは別の数え手。上で 3 まで進めてしまったため)
+(defglobal *et-fake-drop* (let ((n 0)) (lambda () (setq n (+ n 1)) n)))
+
+;; 文字を 1 つ入れる。読み口は**入るときに 1 回・打鍵ごとに 1 回**呼ばれるので、
+;; 1 打鍵目を読んだ時点で「原点から 1 個落ちた」ことになる
+(defglobal *et-c26*
+  (dynamic-let ((*editor-drop-reader* *et-fake-drop*))
+    (et-run 3 40 *et-f3* "X")))
+
+;; 編集そのものは従来どおり進む(印を出すために打鍵を食べたりしない)
+(assert-equal (list 'editor-eof 1 0 3) (car *et-c26*))
+;; **印が出ている**
+(assert-equal t (et-has "!DROPPED 1" (car (cdr *et-c26*))))
+
+;; 【陰性対照】差し込まなければ印は出ない(実物の累計は動いていない)
+(defglobal *et-c27* (et-run 3 40 *et-f3* "X"))
+(assert-equal (list 'editor-eof 1 0 3) (car *et-c27*))
+(assert-equal nil (et-has "!DROPPED" (car (cdr *et-c27*))))
+
+;; 【陰性対照】**開く前に落ちていたぶんは印に混ざらない。**
+;; 一定の値を返す読み口では、入ったときの値が原点になるので差は 0 である
+(defglobal *et-c28*
+  (dynamic-let ((*editor-drop-reader* (lambda () 41)))
+    (et-run 3 40 *et-f3* "X")))
+(assert-equal nil (et-has "!DROPPED" (car (cdr *et-c28*))))
+
+;; 落ちた数は**足し上がる**(2 打鍵なら 2)。打鍵ごとに 1 ずつ増える読み口なので、
+;; 2 打鍵目を読んだあとの合図には 2 が出る
+(defglobal *et-fake-drop2* (let ((n 0)) (lambda () (setq n (+ n 1)) n)))
+(defglobal *et-c29*
+  (dynamic-let ((*editor-drop-reader* *et-fake-drop2*))
+    (et-run 3 40 *et-f3* "XY")))
+(assert-equal t (et-has "!DROPPED 2" (car (cdr *et-c29*))))
+
+;; **知らないキーでも印は出る。** §23 は「知らないキーは描き直さない」だが、
+;; 取りこぼしたときだけは合図を描き直す —— **描かなければ気づけない**
+(defglobal *et-fake-drop3* (let ((n 0)) (lambda () (setq n (+ n 1)) n)))
+(defglobal *et-c30*
+  (dynamic-let ((*editor-drop-reader* *et-fake-drop3*))
+    (et-run 3 40 *et-f3* (string-append *et-unknown* *et-unknown*))))
+(assert-equal t (et-has "!DROPPED" (car (cdr *et-c30*))))
+
+;; **読み返した値そのものを記録に残す**(枠組みは落ちた件しか印字しない)
+(format *isiki-test-stream*
+        "#editor dropped-mark: injected=~S plain=~S frozen=~S two=~S unknown=~S~%"
+        (et-has "!DROPPED 1" (car (cdr *et-c26*)))
+        (et-has "!DROPPED" (car (cdr *et-c27*)))
+        (et-has "!DROPPED" (car (cdr *et-c28*)))
+        (et-has "!DROPPED 2" (car (cdr *et-c29*)))
+        (et-has "!DROPPED" (car (cdr *et-c30*))))

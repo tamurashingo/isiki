@@ -109,10 +109,25 @@ lisp_val_t cc_term_raw_input(lisp_val_t args, lisp_val_t env) {
     return process_set_raw_input(get_current_process(), on) ? g_sym_t : nil;
 }
 
+lisp_val_t cc_term_dropped_keys(lisp_val_t args, lisp_val_t env) {
+    (void)args;
+    (void)env;
+    /* [#225] **満杯で捨てた打鍵の累計**(現在のプロセスのもの)。
+       **単調に増えるだけで、読んでも戻らない。** 区間の落ち数が要るときは
+       呼び出し側が前後で引き算する —— 読んだ側で 0 に戻すと、読み手が
+       2 人いるときに片方が落ちた事実を食べてしまう。
+
+       触るのは term_target() と同じく**呼び出したプロセス**であって、
+       アクティブな面ではない(このファイルの先頭の注記と揃えてある)。
+       確保は 1 回だけなので GC_PROTECT は要らない */
+    return os_make_fixnum(get_current_process()->raw_dropped);
+}
+
 void os_register_terminal_primitives(void) {
     os_set_function(os_make_symbol("%%TERM-SIZE"), os_make_native_function((lisp_addr_t)(void *)cc_term_size), global_environment);
     os_set_function(os_make_symbol("%%TERM-SET-CURSOR"), os_make_native_function((lisp_addr_t)(void *)cc_term_set_cursor), global_environment);
     os_set_function(os_make_symbol("%%TERM-CLEAR"), os_make_native_function((lisp_addr_t)(void *)cc_term_clear), global_environment);
     os_set_function(os_make_symbol("%%TERM-READ-CELL"), os_make_native_function((lisp_addr_t)(void *)cc_term_read_cell), global_environment);
     os_set_function(os_make_symbol("%%TERM-RAW-INPUT"), os_make_native_function((lisp_addr_t)(void *)cc_term_raw_input), global_environment);
+    os_set_function(os_make_symbol("%%TERM-DROPPED-KEYS"), os_make_native_function((lisp_addr_t)(void *)cc_term_dropped_keys), global_environment);
 }

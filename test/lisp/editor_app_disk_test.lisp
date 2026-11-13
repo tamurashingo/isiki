@@ -79,7 +79,7 @@
 
 (assert-error (editor-run "/app/NOTES/NOTE.TXT" 1 2))
 (assert-error (editor "/app/NOTES/NOTE.TXT"))
-(assert-error (%ed-status-text 0 0 1 nil nil))
+(assert-error (%ed-status-text 0 0 1 nil nil 0))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 2. 【完了条件】/app から読み込める
@@ -206,13 +206,13 @@
 
 (defglobal *ea-m-draw-full*
   (let ((g0 (%%gc-collect-count)) (b0 (%%heap-used-bytes)))
-    (%ed-draw-all *ea-wlines* *ea-h* 0 0 1 nil nil *ea-w* *ea-blank* *ea-out*)
+    (%ed-draw-all *ea-wlines* *ea-h* 0 0 1 nil nil 0 *ea-w* *ea-blank* *ea-out*)
     (list (- (%%heap-used-bytes) b0) (- (%%gc-collect-count) g0))))
 
 (defglobal *ea-m-draw-line*
   (let ((g0 (%%gc-collect-count)) (b0 (%%heap-used-bytes)))
     (%ed-draw-line 0 "x" *ea-w* *ea-blank* *ea-out*)
-    (%ed-draw-status *ea-h* 0 0 1 nil nil *ea-w* *ea-blank* *ea-out*)
+    (%ed-draw-status *ea-h* 0 0 1 nil nil 0 *ea-w* *ea-blank* *ea-out*)
     (list (- (%%heap-used-bytes) b0) (- (%%gc-collect-count) g0))))
 
 (assert-equal 0 (car (cdr *ea-m-draw-full*)))
@@ -230,7 +230,7 @@
 
 (defglobal *ea-diff*
   (progn
-    (%ed-draw-all (list "one" "two" "three") 4 0 0 3 nil nil 20 *ea-blank20* *ea-out*)
+    (%ed-draw-all (list "one" "two" "three") 4 0 0 3 nil nil 0 20 *ea-blank20* *ea-out*)
     (term-write-at 2 0 "ZZZZ" *ea-out*)
     (%ed-draw-line 0 "ONE!" 20 *ea-blank20* *ea-out*)
     (list (%ea-row 0 8) (%ea-row 1 8) (%ea-row 2 8) (%ea-row 3 8))))
@@ -545,3 +545,64 @@
                     (term-rows)))
 (assert-equal 16 (%ed-clamp (dynamic *editor-text-lines*) (- (term-rows) 2)))
 (assert-equal 40 (%ed-clamp (dynamic *editor-row-cols*) (- (term-cols) 1)))
+
+;;; ---------------------------------------------------------------------------
+;;; 11. [#225] 取りこぼしの印が**格子の上に**出る
+;;;
+;;;     **ここまでやらないと利用者の役に立たない。** 落とした数を数えて
+;;;     読めるようにしただけでは、**取りこぼしは静かなままである。**
+;;;     押しっぱなしで打鍵が消えたとき、**利用者がその場で気づける**ことが
+;;;     #225 の目的なので、印が**実画面の合図の行に出ている**ことを見る。
+;;;
+;;;     ## 落ちる事実をどう起こすか
+;;;
+;;;     数を増やせるのはキーボード割り込みだけで、ゲストへキーを送る自動化は
+;;;     無い。だから**本物の溢れは起こせない** —— 核が数を読む 1 段
+;;;     (`*editor-drop-reader*`)へ**呼ぶたびに 1 増える偽の読み口**を差し込む。
+;;;     C 側の計数そのものの陽性対照は test/c/process_test.c にある。
+;;;
+;;;     ★ **割り込みで本当に溢れてから印が出るまでを通した道は、自動では
+;;;     見ていない。** 見ているのは (a) C 側が正しく数える (b) Lisp から
+;;;     読める (c) 核が読んで印にする、の 3 つに分けた形である。
+;;;
+;;;     陰性対照: 落ちていない §6 の合図には印が無い
+;;;     (`"L1 C1 of 2 - C-s=save C-q=quit"`。1 桁もずれていない)。
+;;;
+;;;     **この節は画面を使うので §9 より後に置いてよい** —— 核は起動時に
+;;;     自分で画面を消すので、皮が消したあとでも読み返せる。
+;;; ---------------------------------------------------------------------------
+
+;; 呼ぶたびに 1 増える偽の読み口(= 1 打鍵ごとに 1 個落ちている状況)
+(defglobal *ea-fake-drop* (let ((n 0)) (lambda () (setq n (+ n 1)) n)))
+
+;; 探針の陰性対照: 増えない探針では「印が出ない」が探針の不具合と区別できない
+(defglobal *ea-probe-drop* (let ((n 0)) (lambda () (setq n (+ n 1)) n)))
+(assert-equal 1 (funcall *ea-probe-drop*))
+(assert-equal 2 (funcall *ea-probe-drop*))
+
+;; 文字を 1 つ入れる。合図の行(行 16)を格子から読み返す
+(defglobal *ea-dropped*
+  (let ((r (dynamic-let ((*editor-drop-reader* *ea-fake-drop*))
+             (editor-run *ea-note*
+                         (create-string-input-stream "X")
+                         *ea-out*))))
+    (list r (%ea-row 16 23) (%ea-row 0 8))))
+
+;; 編集そのものは従来どおり進む(印を出すために打鍵を食べていない)
+(assert-equal (list 'editor-eof 1 0 2) (elt *ea-dropped* 0))
+;; **印が格子の上に在る。** 位置を無視して流す実装・印を出さない実装は落ちる
+(assert-equal "L1 C2 of 2 * !DROPPED 1" (elt *ea-dropped* 1))
+;; 本文も描かれている(合図だけ描いて本文を壊す実装ではない)
+(assert-equal "Xalpha  " (elt *ea-dropped* 2))
+
+;; 【陰性対照】差し込まなければ印は出ない。**同じ道をもう一度通す**
+(defglobal *ea-not-dropped*
+  (let ((r (editor-run *ea-note* (create-string-input-stream "X") *ea-out*)))
+    (list r (%ea-row 16 23))))
+(assert-equal (list 'editor-eof 1 0 2) (elt *ea-not-dropped* 0))
+(assert-equal "L1 C2 of 2 * C-s=save C" (elt *ea-not-dropped* 1))
+
+;; **読み返した値そのものを記録へ残す**(規則 13)
+(format *isiki-test-stream*
+        "#editor dropped-mark status=~S plain=~S body=~S~%"
+        (elt *ea-dropped* 1) (elt *ea-not-dropped* 1) (elt *ea-dropped* 2))

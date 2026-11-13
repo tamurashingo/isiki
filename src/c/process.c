@@ -427,6 +427,8 @@ void initialize_processes(frame_buffer *buffers) {
         proc->raw_input = 0;
         proc->raw_head = 0;
         proc->raw_tail = 0;
+        /* [#225] 落とした打鍵の累計。**ここでだけ 0 に戻る**(プロセスを作り直すとき) */
+        proc->raw_dropped = 0;
         proc->env = 0;
         os_gc_register_root(&proc->env);
         proc->live_blocks = 0;
@@ -485,7 +487,27 @@ void process_stdin_push(process_t *proc, UINT8 c) {
 }
 
 /**
- * @brief [#216] 素の入力の受け皿へ 1 キー積む。満杯なら捨てる
+ * @brief [#216] 素の入力の受け皿へ 1 キー積む。満杯なら捨て、[#225] 捨てた数を数える
+ *
+ * ## [#225] **書き手が 1 つだけであることを検めた**(読みで埋めていない)
+ *
+ * 素の加算(`proc->raw_dropped++`)が安全なのは、この関数を呼ぶ道が
+ * **同時に 2 つ走らない**ときだけである。次の 3 つを確かめた:
+ *
+ *   1. **呼び手は 1 箇所しかない。** `grep -rn process_raw_key_push src/`
+ *      の結果は `src/c/interrupt.c:301`(`c_keyboard_handler`)だけである
+ *      (ほかは宣言・逆アセンブラの記号表・母艦の単体試験)。
+ *      Lisp から押し込む口は無い —— `src/c/terminal.c` の口は**読むだけ**である
+ *   2. **その割り込みは自分に割り込めない。** IRQ1 の入口は
+ *      **割り込みゲート**(`interrupt.c:827` の `type_attr = 0x8E`)なので
+ *      CPU が IF を落として入る。ハンドラの中で `sti` はしていない
+ *   3. **EOI はハンドラから戻ったあと**に送っている
+ *      (`c_keyboard_isr`。`interrupt.c:390-394`)。つまり処理中に PIC が
+ *      次の IRQ1 を上げてくることもない
+ *
+ * 2 と 3 から、タイマー割り込み(IRQ0)に横取りされることも無い。
+ * **この 3 つのどれかが変わったら、素の加算はもう安全ではない。**
+ *
  * @param proc 対象プロセス
  * @param code 積むキーの文字コード
  */
@@ -493,7 +515,12 @@ void process_raw_key_push(process_t *proc, UINT8 code) {
     UINT32 next = (proc->raw_tail + 1) % PROCESS_RAW_KEY_BUF_SIZE;
     if (next == proc->raw_head) {
         /* 満杯。**捨てる。** 1 つ空けておく環なので、満杯の判定は
-           「書いたら読み位置に重なる」である(重ねると空と区別できない) */
+           「書いたら読み位置に重なる」である(重ねると空と区別できない)。
+
+           [#225] **捨てたことを数えてから返る。** 数えないと、利用者から見て
+           「キーを押したのに入らなかった」が**アプリにも分からない**
+           (この企画がいちばん嫌う静かな消失である) */
+        proc->raw_dropped++;
         return;
     }
     proc->raw_keys[proc->raw_tail] = code;
@@ -534,6 +561,8 @@ int process_set_raw_input(process_t *proc, int on) {
     if (on) {
         proc->raw_head = 0;
         proc->raw_tail = 0;
+        /* [#225] **raw_dropped はここで戻さない。** 空にしたのは中身であって、
+           落ちた事実ではない。戻すと「アプリに入る直前に落ちたぶん」が消える */
     }
     proc->raw_input = on ? 1 : 0;
     return was;

@@ -214,7 +214,15 @@ COUNTS = (
     # 既存の段の件数は ページャの 46 -> 52 以外は 1 つも動かしていない。
     # 内訳は下の FILES に 1 本ある
     # (内訳 64 + ファイルの出口の検査 2 件 = 66)
-    ("test/lisp/qemu_boot_term.lisp", 66, "isiki", (ALL, CI)),
+    #
+    # **[2026-11-13 / #225] 66 -> 72。** 落とした打鍵の数を読む口
+    # (`%%TERM-DROPPED-KEYS` → `term-dropped-keys`)を足したので、
+    # term_test.lisp に §8 を 6 件(整数が返る / 0 以上 / **陰性対照の 0** /
+    # 読んでも減らない / 素の入力の入切で戻らない / 最後に切れている)。
+    # **既存の対照は 1 つも書き換えていない**(規則 16)。
+    # 件数は手で数えていない(規則 13)。出どころは
+    #     python3 tools/census_test_counts.py --detail --static test/lisp/qemu_boot_term.lisp
+    ("test/lisp/qemu_boot_term.lisp", 72, "isiki", (ALL, CI)),
     # [#217] 初期アプリ: ファイラ(一覧・移動・ファイルを開く)。**新しく足した段**で、
     # 既存の段の件数は 1 つも動かしていない。内訳は下の FILES に 2 本ある
     # (内訳 47 + 131 = 178 に、ファイルの出口の検査 2 本 x 2 件 = 4 を足した 182)。
@@ -230,7 +238,17 @@ COUNTS = (
     # を足したぶんだけ増えている。
     # 件数は手で数えていない(規則 13)。出どころは
     #     python3 tools/census_test_counts.py --detail --static test/lisp/qemu_boot_app_editor.lisp
-    ("test/lisp/qemu_boot_app_editor.lisp", 213, "isiki", (ALL, CI)),
+    #
+    # **[2026-11-13 / #225] 213 -> 234。** 取りこぼしを合図の行で知らせる形に
+    # したので、editor_test.lisp へ §26 を 14 件(差し込んだ読み口で印が出る /
+    # **陰性対照 3 つ**: 差し込まなければ出ない・一定値なら出ない・探針自身が
+    # 増えている / 足し上がる / 知らないキーでも出る)と §10 へ 4 件
+    # (印つきの文面と**桁がずれていないこと**)、
+    # editor_app_disk_test.lisp へ §11 を 7 件(**格子の上に印が在る**ことと
+    # その陰性対照)を足した。**既存の期待値は 1 つも上げていない**(規則 16) ——
+    # 動かしたのは `%ed-status-text` / `%ed-draw-status` / `%ed-draw-all` の
+    # 引数が 1 つ増えたぶんの呼び出し側だけである。
+    ("test/lisp/qemu_boot_app_editor.lisp", 234, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_error_escape_gc.lisp", 381, "isiki", (ALL,)),
     ("test/lisp/qemu_boot_m5_ide.lisp", 7, "isiki", (ALL, CI)),
     ("test/lisp/qemu_boot_m6_fat16.lisp [fat16_test.img]", 185, "isiki", (ALL, CI)),
@@ -436,19 +454,19 @@ FILES = {
         ("test/lisp/inspect_app_disk_test.lisp", 18),
         ("test/lisp/inspect_test.lisp", 101),
     )),
-    # test/lisp/qemu_boot_term.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 66 件
+    # test/lisp/qemu_boot_term.lisp … 読み方 isiki / 台本自身 0 件 / 証人 1 本 / 導出の合計 72 件
     "test/lisp/qemu_boot_term.lisp": (0, (
-        ("test/lisp/term_test.lisp", 64),
+        ("test/lisp/term_test.lisp", 70),
     )),
     # test/lisp/qemu_boot_app_filer.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 182 件
     "test/lisp/qemu_boot_app_filer.lisp": (0, (
         ("test/lisp/filer_app_disk_test.lisp", 47),
         ("test/lisp/filer_test.lisp", 131),
     )),
-    # test/lisp/qemu_boot_app_editor.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 213 件
+    # test/lisp/qemu_boot_app_editor.lisp … 読み方 isiki / 台本自身 0 件 / 証人 2 本 / 導出の合計 234 件
     "test/lisp/qemu_boot_app_editor.lisp": (0, (
-        ("test/lisp/editor_app_disk_test.lisp", 62),
-        ("test/lisp/editor_test.lisp", 147),
+        ("test/lisp/editor_app_disk_test.lisp", 69),
+        ("test/lisp/editor_test.lisp", 161),
     )),
     # test/lisp/qemu_boot_error_escape_gc.lisp … 読み方 isiki / 台本自身 4 件 / 証人 8 本 / 導出の合計 381 件
     "test/lisp/qemu_boot_error_escape_gc.lisp": (4, (

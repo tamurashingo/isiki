@@ -229,6 +229,92 @@ void test_process_raw_key_ring_drops_when_full() {
     assert(got == PROCESS_RAW_KEY_BUF_SIZE - 1, "受け皿に収まるぶんだけ残り、残りは捨てられる");
 }
 
+void test_process_raw_key_counts_drops() {
+    /* [#225] **落とした数がちょうど溢れた数だけ増える。**
+       「増えた」ではなく**数が合う**ことを見るのが陽性対照である ——
+       1 足りない / 1 多いまま通ると、利用者側の引き算がずれる。
+
+       導出(規則 13。手で数えた数字をここに書かない):
+         受け皿 PROCESS_RAW_KEY_BUF_SIZE 枠のうち 1 枠は空けておくので
+         収まるのは BUF_SIZE - 1 個。N 個積めば落ちるのは N - (BUF_SIZE - 1) 個 */
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+
+    assert(current->raw_dropped == 0, "作ったばかりのプロセスは1つも落としていない");
+
+    /* 【陰性対照】**溢れない範囲では 0 のまま。**
+       積んだだけで数える実装(満杯の枝に置き忘れた実装)はここで落ちる */
+    for (UINT32 i = 0; i < PROCESS_RAW_KEY_BUF_SIZE - 1; i++) {
+        process_raw_key_push(current, (UINT8)('0' + (i % 10)));
+    }
+    assert(current->raw_dropped == 0, "収まるぶんだけ積んでも落とした数は0のまま");
+
+    /* 【陽性対照】ここから先は 1 つ積むごとに 1 つ落ちる */
+    const UINT32 overflow = 7;
+    for (UINT32 i = 0; i < overflow; i++) {
+        process_raw_key_push(current, 'x');
+    }
+    assert(current->raw_dropped == overflow, "溢れた数とちょうど同じだけ増える");
+
+    /* **取り出しても戻らない。** 空にしたのは中身であって、落ちた事実ではない */
+    UINT8 code;
+    while (process_raw_key_pop(current, &code)) {
+    }
+    assert(current->raw_dropped == overflow, "受け皿を空にしても落とした数は戻らない");
+
+    /* 空いた受け皿へ積み直しても、累計は**単調に増えるだけ**である */
+    for (UINT32 i = 0; i < PROCESS_RAW_KEY_BUF_SIZE - 1; i++) {
+        process_raw_key_push(current, 'y');
+    }
+    assert(current->raw_dropped == overflow, "空いたぶんに積み直しても増えない");
+    process_raw_key_push(current, 'z');
+    assert(current->raw_dropped == overflow + 1, "また溢れたら1つだけ増える");
+}
+
+void test_raw_dropped_survives_set_raw_input() {
+    /* [#225] **素の入力へ入るときに受け皿は空にするが、落とした数は戻さない。**
+       戻すと「アプリが読み始める直前に落ちたぶん」が静かに消える
+       (それは #225 が直した症状そのものである) */
+    initialize_processes(g_buffers);
+    process_t *current = get_current_process();
+
+    const UINT32 pushed = PROCESS_RAW_KEY_BUF_SIZE + 3;
+    for (UINT32 i = 0; i < pushed; i++) {
+        process_raw_key_push(current, 'a');
+    }
+    UINT32 before = current->raw_dropped;
+    /* 期待値は**導出する**(規則 13)。収まるのは BUF_SIZE - 1 個 */
+    assert(before == pushed - (PROCESS_RAW_KEY_BUF_SIZE - 1),
+           "積んだ数から収まる数を引いたぶんだけ落ちている");
+
+    process_set_raw_input(current, 1);
+    assert(current->raw_dropped == before, "素の入力に入っても落とした数は戻らない");
+    process_set_raw_input(current, 0);
+    assert(current->raw_dropped == before, "素の入力から出ても落とした数は戻らない");
+
+    /* 【陰性対照】受け皿のほうは空になっている(上の「戻さない」が
+       「そもそも空にしていない」で通っていないことの確認) */
+    UINT8 code;
+    process_set_raw_input(current, 1);
+    assert(process_raw_key_pop(current, &code) == 0, "受け皿のほうは空になっている");
+}
+
+void test_raw_dropped_is_per_process() {
+    /* [#225] 数は**プロセスごと**である(4 面はそれぞれ別の受け皿を持つ)。
+       1 つの静的な数に足し込む実装はここで落ちる */
+    initialize_processes(g_buffers);
+    process_t *p0 = get_process(0);
+    process_t *p1 = get_process(1);
+
+    const UINT32 pushed = PROCESS_RAW_KEY_BUF_SIZE + 2;
+    for (UINT32 i = 0; i < pushed; i++) {
+        process_raw_key_push(p0, 'a');
+    }
+    assert(p0->raw_dropped == pushed - (PROCESS_RAW_KEY_BUF_SIZE - 1),
+           "F1では積んだ数から収まる数を引いたぶんだけ落ちている");
+    assert(p1->raw_dropped == 0, "F2は1個も落としていない");
+}
+
 void test_process_raw_key_ring_wraps() {
     /* 環が一周しても順序が崩れないこと(読み書きを交互にする) */
     initialize_processes(g_buffers);
@@ -294,6 +380,10 @@ int main(int argc, char** argv) {
     test_process_raw_key_ring();
     test_process_raw_key_push_sets_ready();
     test_process_raw_key_ring_drops_when_full();
+    /* [#225] 落とした数を数える */
+    test_process_raw_key_counts_drops();
+    test_raw_dropped_survives_set_raw_input();
+    test_raw_dropped_is_per_process();
     test_process_raw_key_ring_wraps();
     test_process_set_raw_input();
     test_set_raw_input_empties_the_ring_on_entry();
