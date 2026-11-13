@@ -23,12 +23,16 @@
  * この推定は #216 の着手時に実物で確かめた: この 5 個を足して
  * `make test` が通る(固まらない)ことが確認である。
  *
- * ## 5 個の内訳(4 つの口)
+ * ## 6 個の内訳(5 つの口)
  *
  *   位置を指定して書く / 画面を消す … %%TERM-SET-CURSOR + %%TERM-CLEAR(2 個)
  *   キーを 1 つ待つ                 … %%TERM-RAW-INPUT(待つのは read-char。下記)
  *   格子の 1 マスを読む             … %%TERM-READ-CELL
  *   画面の行数・桁数を読む          … %%TERM-SIZE
+ *   **落とした打鍵の数を読む**      … %%TERM-DROPPED-KEYS([#225])
+ *
+ * [#225] 6 個目を足した場所も**ここ**である(os_bootstrap の外)。
+ * 上の段の話がそのまま当てはまるので、SMALL_HEAP_SIZE は掃引し直していない。
  *
  * **「キーを 1 つ待つ」は新しい関数にしていない。** むき出しの関数にすると
  * *standard-input* の差し替えを通らず、アプリを試験できなくなる
@@ -52,9 +56,11 @@ lisp_val_t cc_term_clear(lisp_val_t args, lisp_val_t env);
 lisp_val_t cc_term_read_cell(lisp_val_t args, lisp_val_t env);
 /** %%TERM-RAW-INPUT … 素の入力の入切。切り替える前の状態を返す */
 lisp_val_t cc_term_raw_input(lisp_val_t args, lisp_val_t env);
+/** [#225] %%TERM-DROPPED-KEYS … 満杯で捨てた打鍵の**累計**を返す(単調に増える) */
+lisp_val_t cc_term_dropped_keys(lisp_val_t args, lisp_val_t env);
 
 /**
- * 上の 5 個を global_environment へ登録する。
+ * 上の 6 個を global_environment へ登録する。
  * **os_bootstrap の外から呼ぶこと**(上の注記の理由)。
  */
 void os_register_terminal_primitives(void);

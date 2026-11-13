@@ -133,15 +133,23 @@
 ;;;; ディスクに対して安全でないとコード中に注記がある(format.c:158-163)★。
 ;;;; 画面と違って保存は明示的な操作のときだけなので、これで困らない。
 ;;;;
-;;;; ## 打鍵の取りこぼしは**観測できない**(調べた。#218 の報告事項)
+;;;; ## 打鍵の取りこぼしを**知らせる**(#225。#218 では観測できなかった)
 ;;;;
-;;;; 受け皿は 16 個(`PROCESS_RAW_KEY_BUF_SIZE`、process.h:22)で、満杯のとき
-;;;; `process_raw_key_push`(process.c:492-498)は **何も数えずに `return` する。**
-;;;; 落とした数を持つ場所が無く、Lisp へ出す口(terminal.c:112-118 の 5 個)にも
-;;;; 無い。**つまり溢れたことはアプリからは分からない。**
-;;;; 描き直しを軽くして**起こりにくく**はしたが、**無くしてはいない。**
-;;;; 知らせる形にするには C 側に数え場所と口を足すことになる(= この仕事の範囲外。
-;;;; #218 の設計は「C を触らない。新しい口はゼロ」)。
+;;;; 受け皿は 16 枠(`PROCESS_RAW_KEY_BUF_SIZE`、process.h:22。1 枠空ける環なので
+;;;; **実質 15**)で、満杯なら捨てる。描き直しを軽くして**起こりにくく**は
+;;;; したが、**無くしてはいない** —— 押しっぱなしでは今でも溢れる。
+;;;;
+;;;; #218 の時点では、落とした数を持つ場所が無く、Lisp へ出す口にも無かったので
+;;;; **溢れたことがアプリからは分からなかった。** 利用者から見ると
+;;;; 「キーを押したのに入らなかった」で、**アプリ側には何も分からないので
+;;;; 知らせようもない。** #225 で C 側に数え場所(`raw_dropped`)と口
+;;;; (`%%TERM-DROPPED-KEYS` → `term-dropped-keys`)が入った。
+;;;;
+;;;; **このアプリは、打鍵のたびに前後で引き算して合図の行へ印を出す。**
+;;;; 観測できるようにしただけでは取りこぼしは静かなままで、
+;;;; **利用者の役には立たない**(#225 の設計の 3 つ目)。
+;;;; 累計は単調に増えるだけなので、**この一周で何個落ちたか**は
+;;;; 「前に見た値との差」でしか言えない。
 ;;;;
 ;;;; ## 範囲外(設計コメントのとおり)
 ;;;;
@@ -168,6 +176,26 @@
 ;;; 測っていない。logic §16-1)。**破綻の点が分かったら下げる・上げる。**
 ;;; いま要るのは「際限なく読み込んで、途中で記憶が尽きて落ちる」道を塞ぐことだけ。
 (defdynamic *editor-max-lines* (or (dynamic *editor-max-lines*) 2000))
+
+;;; 落とした打鍵の数の読み口。**nil なら実物(`term-dropped-keys`)を読む。**
+;;;
+;;; なぜ 1 段挟むのか: **落ちる事実を試験から起こす手段が無い**からである。
+;;; 数を増やすのはキーボード割り込みだけで(#225 の「書き手は 1 つ」はその
+;;; 裏返しである)、ゲストへキーを送る自動化も無い。この 1 段が無いと
+;;; 「核が落ち数を見ている」ことを**機械で言える試験が 1 本も書けず**、
+;;; 誰かが見るのをやめても全部の試験が通ってしまう —— **それこそが #225 で
+;;; 直した「静かに効かなくなる」の形**である。
+;;;
+;;; 差し込むのは**引数を取らず整数を返す関数**で、`dynamic-let` で束ねる。
+;;; 実機では常に nil なので、余計な呼び出しは 1 つも増えない。
+(defdynamic *editor-drop-reader* (or (dynamic *editor-drop-reader*) nil))
+
+;;; いまの累計を 1 つ返す。**呼ぶのは 1 打鍵につき 1 回だけ**である
+;;; (輪の中で 2 回読むと、2 回のあいだに落ちたぶんの帰属が曖昧になる)。
+(defun %ed-drop-count ()
+  (if (null (dynamic *editor-drop-reader*))
+      (term-dropped-keys)
+    (funcall (dynamic *editor-drop-reader*))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 数を文字列にする
@@ -300,11 +328,27 @@
 ;;; してある —— 長さが変わると後ろの桁がずれて、格子の試験が読みにくくなる。
 ;;;
 ;;; `msg` があれば打てるキーの代わりにそれを出す。**数字の部分は動かさない。**
-(defun %ed-status-text (crow ccol nlines dirty msg)
+;;;
+;;; ### [#225] 取りこぼしの印 `!DROPPED n`
+;;;
+;;; `dropped` が 0 より大きいとき、**変更の印の直後**に差し込む。
+;;; `"L12 C3 of 40 * !DROPPED 2 C-s=save C-q=quit"`
+;;;
+;;; 後ろ(`msg` の後)ではなく**前**に置くのは、桁が足りないときに
+;;; `%ed-fit` が切り落とすのが**末尾**だからである ——
+;;; **いちばん知らせたいものが最初に消える**のでは意味がない。
+;;;
+;;; 0 のときは**1 文字も足さない。** 足すと既存の桁が全部ずれる
+;;; (合図の行は格子の試験が桁で読んでいる)。つまり
+;;; **ずれるのは実際に落ちたときだけ**である。
+(defun %ed-status-text (crow ccol nlines dirty msg dropped)
   (string-append "L" (%ed-number-text (+ crow 1))
                  " C" (%ed-number-text (+ ccol 1))
                  " of " (%ed-number-text nlines)
                  " " (if dirty "*" "-")
+                 (if (> dropped 0)
+                     (string-append " !DROPPED " (%ed-number-text dropped))
+                   "")
                  " " (if (null msg) "C-s=save C-q=quit" msg)))
 
 ;;; ---------------------------------------------------------------------------
@@ -449,20 +493,21 @@
   (format out "~%"))
 
 ;;; 合図の行。**行 h に出す**(本文は 0..h-1)
-(defun %ed-draw-status (h crow ccol nlines dirty msg w blank out)
+(defun %ed-draw-status (h crow ccol nlines dirty msg dropped w blank out)
   (term-write-at h 0
-                 (%ed-fit (%ed-status-text crow ccol nlines dirty msg) w blank)
+                 (%ed-fit (%ed-status-text crow ccol nlines dirty msg dropped)
+                          w blank)
                  out)
   (format out "~%"))
 
 ;;; 窓ぜんぶ + 合図。**窓が動いたときと、行の本数が変わったときだけ呼ぶ**
-(defun %ed-draw-all (wlines h crow ccol nlines dirty msg w blank out)
+(defun %ed-draw-all (wlines h crow ccol nlines dirty msg dropped w blank out)
   (let ((i 0) (cur wlines))
     (while (< i h)
       (%ed-draw-line i (if (null cur) nil (car cur)) w blank out)
       (if cur (setq cur (cdr cur)) nil)
       (setq i (+ i 1))))
-  (%ed-draw-status h crow ccol nlines dirty msg w blank out))
+  (%ed-draw-status h crow ccol nlines dirty msg dropped w blank out))
 
 ;;; ---------------------------------------------------------------------------
 ;;; 核。**ここがアプリの全部で、ファイルとストリームしか触らない**
@@ -515,13 +560,22 @@
                 (crow 0) (ccol 0) (wtop 0)
                 (dirty nil) (edits 0) (saves 0) (msg nil)
                 (quit-armed nil) (reason 'editor-eof) (running t)
+                ;; [#225] 取りこぼし。**dropped はこの一回の編集で落ちた数**、
+                ;; dseen は**最後に見た累計**である。累計は単調に増えるだけで
+                ;; 戻らないので、**入ったときの値を引き算の原点にする** ——
+                ;; そうしないと、エディタを開く前に落ちたぶんが印に混ざる。
+                ;; dnow は毎周の読み値を置く場所(ここで束ねておくのは、
+                ;; 輪の中で let を開くと**1 打鍵ごとに環境が 1 つ増える**ため)
+                (dropped 0) (dseen (%ed-drop-count)) (dnow 0)
                 ;; 'full / 'line / 'status / 'none
                 (redraw 'full))
             ;; **画面を消すのはここ —— 検査を通ったあと、最初の全画面描画の
             ;; 直前である**(#230。利用者が実機で踏んだ)。
             ;;
             ;; 消さなければならない理由: 差分再描画(#218)は「変わった行だけ
-            ;; 書く」ことで 13.3 倍を得ているので、**意図して塗り直さない。**
+            ;; 書く」ことで 13 倍を得ているので、**意図して塗り直さない**
+            ;; (#225 で合図に引数が 1 つ増えて 13.31 → 13.09 倍。実測は
+            ;;  documents/editor-redraw-cost.md)。
             ;; 起動時に消さないと、それまでコンソールに出ていた文字の上に本文が
             ;; 重なって出る(ファイラは `%filer-draw` が毎回 `term-clear` を
             ;; 呼ぶのでこの症状が出ない。apps/filer.lisp:284)。
@@ -546,19 +600,38 @@
                  (%ed-draw-all (%ed-window-lines above line below
                                                  (- crow wtop)
                                                  (- (- h 1) (- crow wtop)))
-                               h crow ccol nlines dirty msg w blank out))
+                               h crow ccol nlines dirty msg dropped w blank out))
                 ((eq redraw 'line)
                  (progn
                    (%ed-draw-line (- crow wtop) line w blank out)
-                   (%ed-draw-status h crow ccol nlines dirty msg w blank out)))
+                   (%ed-draw-status h crow ccol nlines dirty msg dropped
+                                    w blank out)))
                 ((eq redraw 'status)
-                 (%ed-draw-status h crow ccol nlines dirty msg w blank out))
+                 (%ed-draw-status h crow ccol nlines dirty msg dropped
+                                  w blank out))
                 (t nil))
               (setq redraw 'none)
               ;; **カーソルを編集位置へ置く。** 副の示し方である
               ;; (主は合図の数字。ファイル頭を参照)。桁が窓の外なら端に置く
               (term-set-cursor (- crow wtop) (if (< ccol w) ccol (- w 1)))
               (let ((k (term-read-key in)))
+                ;; [#225] **打鍵の前後で引き算する。**
+                ;;
+                ;; ここで見るのは「直前の描き直しと、この打鍵が届くまでの
+                ;; あいだに溢れたか」である。描き直しが重いほど落ちやすい ——
+                ;; **落ちたのは、いま読んだこのキーの前にあったはずの打鍵**で、
+                ;; 利用者は「打ったのに入っていない」を見ている。
+                ;;
+                ;; 合図を出すために `'status` を立てる。既に `'line` や
+                ;; `'full` が立つ経路でも**合図の行は必ず描き直される**ので、
+                ;; あとから上書きされても印は出る(下の cond が立てるのは
+                ;; より広い範囲だけで、`'none` へ下げる経路は無い)
+                (setq dnow (%ed-drop-count))
+                (if (> dnow dseen)
+                    (progn (setq dropped (+ dropped (- dnow dseen)))
+                           (setq dseen dnow)
+                           (setq redraw 'status))
+                  nil)
                 (if (null k)
                     nil
                   (progn
